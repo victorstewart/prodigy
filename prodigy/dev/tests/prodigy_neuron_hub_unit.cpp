@@ -13,8 +13,12 @@
 #include <prodigy/sdk/cpp/opinionated/aegis_stream.h>
 #include <prodigy/neuron.hub.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <sys/un.h>
 
 class TestSuite {
 public:
@@ -42,6 +46,37 @@ public:
   void beginShutdown(void) override
   {}
 };
+
+class NeuronHubReconnectTimeout final : public TimeoutDispatcher {
+public:
+
+  void dispatchTimeout(TimeoutPacket *) override
+  {
+    Ring::exit = true;
+  }
+};
+
+static bool neuronHubReplayContainsReadyTopics(const uint8_t *bytes, size_t size)
+{
+  bool healthy = false;
+  bool runtimeReady = false;
+  size_t offset = 0;
+  while (offset + Message::headerBytes <= size)
+  {
+    Message frame = {};
+    std::memcpy(&frame, bytes + offset, Message::headerBytes);
+    if (frame.size < Message::headerBytes || (frame.size & 15) != 0 || frame.size > size - offset)
+    {
+      return false;
+    }
+
+    healthy |= ContainerTopic(frame.topic) == ContainerTopic::healthy;
+    runtimeReady |= ContainerTopic(frame.topic) == ContainerTopic::runtimeReady;
+    offset += frame.size;
+  }
+
+  return offset == size && healthy && runtimeReady;
+}
 
 class TestNeuronControlRuntime final : public Neuron {
 public:
@@ -176,6 +211,115 @@ static void testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(TestSuit
   suite.expect(
       prodigyNeuronHubShouldFlushBufferedNeuronFrames(true, false, 0) == false,
       "neuron_hub_does_not_flush_empty_buffer");
+}
+
+static void testNeuronHubAcceptedReconnectReplaysLatchedReadiness(TestSuite& suite)
+{
+  int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  suite.expect(listener >= 0, "neuron_hub_accepted_reconnect_creates_listener");
+  if (listener < 0)
+  {
+    return;
+  }
+
+  sockaddr_un address = {};
+  address.sun_family = AF_UNIX;
+  char name[96] = {};
+  const int nameLength = snprintf(name, sizeof(name), "prodigy-neuron-hub-unit-%d", int(getpid()));
+  suite.expect(nameLength > 0 && size_t(nameLength) + 1 < sizeof(address.sun_path), "neuron_hub_accepted_reconnect_abstract_name_fits");
+  if (nameLength <= 0 || size_t(nameLength) + 1 >= sizeof(address.sun_path))
+  {
+    ::close(listener);
+    return;
+  }
+  address.sun_path[0] = '\0';
+  std::memcpy(address.sun_path + 1, name, size_t(nameLength));
+  const socklen_t addressLength = socklen_t(offsetof(sockaddr_un, sun_path) + 1 + nameLength);
+  const bool listening = ::bind(listener, reinterpret_cast<sockaddr *>(&address), addressLength) == 0 && ::listen(listener, 1) == 0;
+  suite.expect(listening, "neuron_hub_accepted_reconnect_binds_listener");
+  if (listening == false)
+  {
+    ::close(listener);
+    return;
+  }
+
+  char listenerText[32] = {};
+  snprintf(listenerText, sizeof(listenerText), "%d", listener);
+  const char *existingListenerText = getenv("PRODIGY_NEURON_LISTENER_FD");
+  const bool hadListenerText = existingListenerText != nullptr;
+  const std::string savedListenerText = existingListenerText ? existingListenerText : "";
+  setenv("PRODIGY_NEURON_LISTENER_FD", listenerText, 1);
+
+  RingDispatcher *savedDispatcher = RingDispatcher::dispatcher;
+  RingInterface *savedInterfacer = Ring::interfacer;
+  RingLifecycle *savedLifecycler = Ring::lifecycler;
+  const bool savedExit = Ring::exit;
+  const bool savedShuttingDown = Ring::shuttingDown;
+  {
+    RingDispatcher dispatcher(false);
+    RingDispatcher::dispatcher = &dispatcher;
+    Ring::interfacer = &dispatcher;
+    Ring::lifecycler = &dispatcher;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(64, 64, 8, 4, -1, -1, 8);
+
+    TestNeuronHubDispatch dispatch = {};
+    NeuronHub hub(&dispatch);
+    hub.afterRing();
+    hub.signalReady();
+    hub.signalRuntimeReady();
+    hub.neuron.wBuffer.clear();
+
+    int client = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    const bool connected = client >= 0 &&
+        ::connect(client, reinterpret_cast<sockaddr *>(&address), addressLength) == 0;
+    suite.expect(connected, "neuron_hub_accepted_reconnect_connects_new_control_stream");
+    if (connected)
+    {
+      NeuronHubReconnectTimeout timeout;
+      TimeoutPacket deadline = {};
+      deadline.dispatcher = &timeout;
+      deadline.setTimeoutMs(500);
+      Ring::queueTimeout(&deadline);
+      Ring::start();
+
+      uint8_t replay[256] = {};
+      size_t replaySize = 0;
+      while (replaySize < sizeof(replay))
+      {
+        const ssize_t received = ::recv(client, replay + replaySize, sizeof(replay) - replaySize, MSG_DONTWAIT);
+        if (received <= 0)
+        {
+          break;
+        }
+        replaySize += size_t(received);
+      }
+      suite.expect(neuronHubReplayContainsReadyTopics(replay, replaySize),
+                   "neuron_hub_accepted_reconnect_replays_latched_healthy_and_runtime_ready");
+      ::close(client);
+    }
+    else if (client >= 0)
+    {
+      ::close(client);
+    }
+
+    Ring::shutdownForExec();
+  }
+
+  RingDispatcher::dispatcher = savedDispatcher;
+  Ring::interfacer = savedInterfacer;
+  Ring::lifecycler = savedLifecycler;
+  Ring::exit = savedExit;
+  Ring::shuttingDown = savedShuttingDown;
+  if (hadListenerText)
+  {
+    setenv("PRODIGY_NEURON_LISTENER_FD", savedListenerText.c_str(), 1);
+  }
+  else
+  {
+    unsetenv("PRODIGY_NEURON_LISTENER_FD");
+  }
 }
 
 static void testNeuronHubRetainsBuffersUntilCloseRetirement(TestSuite& suite)
@@ -653,15 +797,18 @@ int main(void)
   testContainerUnixSocketRecreate(suite);
   testRetainedNonChildPidfdLiveness(suite);
 
-  ScopedRing ring = {};
-  testContainerControlExecQuiesce(suite);
-  testRetainedNonChildPidfdExecQuiesce(suite);
-  testNeuronHubCanQueueToNeuron(suite);
-  testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
-  testNeuronHubRetainsBuffersUntilCloseRetirement(suite);
-  testNeuronRetiredBrainCloseDoesNotDeleteReplacement(suite);
-  testNeuronActiveBrainCloseRetainsPendingStreamUntilRecvDrain(suite);
-  testContainerRestartWaitsForControlRetirement(suite);
+  {
+    ScopedRing ring = {};
+    testContainerControlExecQuiesce(suite);
+    testRetainedNonChildPidfdExecQuiesce(suite);
+    testNeuronHubCanQueueToNeuron(suite);
+    testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
+    testNeuronHubRetainsBuffersUntilCloseRetirement(suite);
+    testNeuronRetiredBrainCloseDoesNotDeleteReplacement(suite);
+    testNeuronActiveBrainCloseRetainsPendingStreamUntilRecvDrain(suite);
+    testContainerRestartWaitsForControlRetirement(suite);
+  }
+  testNeuronHubAcceptedReconnectReplaysLatchedReadiness(suite);
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

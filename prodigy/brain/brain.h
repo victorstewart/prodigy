@@ -29091,6 +29091,7 @@ public:
     };
 
     if (active.wormholes.size() != successor.wormholes.size() ||
+        active.whiteholes.size() != successor.whiteholes.size() ||
         active.publicTLS.size() != successor.publicTLS.size() ||
         active.advertisements.size() != successor.advertisements.size() ||
         active.hasApiCredentialPolicy != successor.hasApiCredentialPolicy ||
@@ -29113,6 +29114,8 @@ public:
       wormhole.quicCidKeyState = {};
     }
     if (equalSerialized(activeWormholes, successorWormholes) == false ||
+        equalSerialized(active.whiteholes, successor.whiteholes) == false ||
+        active.networkAccess != successor.networkAccess ||
         equalSerialized(active.publicTLS, successor.publicTLS) == false)
     {
       return false;
@@ -29130,6 +29133,70 @@ public:
     }
 
     return equalSerialized(active.advertisements, successor.advertisements);
+  }
+
+  // Whiteholes are egress address/port allocations, not a published endpoint.
+  // They are released by containerDestroyed after the Neuron destruction ack;
+  // this admission check proves each retained lease belongs to exactly one
+  // canonical member of the cancelled cohort.  It never transfers a port.
+  bool operatorCancellationWhiteholesCanReleaseAfterDestruction(
+      uint64_t activeDeploymentID, const ApplicationDeployment& active,
+      const ApplicationDeployment& successor) const
+  {
+    if (operatorCancellationPublishedContractsMatch(active.plan, successor.plan) == false)
+    {
+      return false;
+    }
+    for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+    {
+      if (lease.owner.deploymentID != activeDeploymentID ||
+          lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort)
+      {
+        continue;
+      }
+      bool ownedByCanonicalContainer = false;
+      for (ContainerView *container : active.containers)
+      {
+        if (container == nullptr || container->deploymentID != activeDeploymentID ||
+            container->state == ContainerState::destroyed)
+        {
+          continue;
+        }
+        auto canonical = containers.find(container->uuid);
+        if (canonical == containers.end() || canonical->second != container)
+        {
+          return false;
+        }
+        for (const Whitehole& whitehole : container->whiteholes)
+        {
+          if (whitehole.hasAddress && whitehole.address.equals(lease.address) &&
+              whitehole.sourcePort == lease.sourcePort)
+          {
+            ownedByCanonicalContainer = true;
+            break;
+          }
+        }
+        if (ownedByCanonicalContainer)
+        {
+          break;
+        }
+      }
+      if (ownedByCanonicalContainer == false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool deploymentHasWhiteholeAddressPortLease(uint64_t deploymentID) const
+  {
+    return std::any_of(routableResourceLeaseRuntimeState.begin(),
+                       routableResourceLeaseRuntimeState.end(),
+                       [deploymentID](const RoutableResourceLease& lease) {
+                         return lease.owner.deploymentID == deploymentID &&
+                                lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort;
+                       });
   }
 
   bool operatorCancellationResourcesCanTransfer(
@@ -29151,6 +29218,12 @@ public:
     {
       if (lease.owner.deploymentID != activeDeploymentID)
       {
+        continue;
+      }
+      if (lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort)
+      {
+        // Admission has bound this lease to a retained active container.  It
+        // must be released by its destruction acknowledgement, never moved.
         continue;
       }
       if (lease.kind == RoutableResourceLeaseKind::dnsRecord &&
@@ -29442,7 +29515,8 @@ public:
       }
       if (activePlan != nullptr)
       {
-        return operatorCancellationResourcesCanTransfer(deploymentID, *activePlan, *successor);
+        return deploymentHasWhiteholeAddressPortLease(deploymentID) == false &&
+               operatorCancellationResourcesCanTransfer(deploymentID, *activePlan, *successor);
       }
       // Once the transfer is committed, the old deployment need not be in the
       // snapshot. Resume its durable successor intent only when no old resource
@@ -32469,19 +32543,64 @@ public:
           const DeploymentPlan& activePlan = deployment->plan;
           const bool activeTransitioning =
               deployment->state == DeploymentState::deploying;
+          const bool activeMaterializedNone = [&]() {
+            if (deployment->operatorCancellationMaterializedNoneTransitionIsSafe() == false)
+            {
+              return false;
+            }
+            if (deployment->nHealthy() != 0 || deployment->nDeployed() != deployment->nTarget() ||
+                deployment->containers.size() != deployment->nDeployed())
+            {
+              return false;
+            }
+            // The recovered deployment set is authoritative only when every
+            // retained pointer is also the canonical Brain inventory entry on
+            // an active Neuron owner.
+            for (ContainerView *container : deployment->containers)
+            {
+              auto canonical = containers.find(container->uuid);
+              if (canonical == containers.end() || canonical->second != container ||
+                  neuronControlStreamActive(container->machine) == false ||
+                  container->machine->runtimeReady == false)
+              {
+                return false;
+              }
+            }
+            for (Machine *machine : machines)
+            {
+              if (machine == nullptr)
+              {
+                continue;
+              }
+              for (const Machine::Claim& claim : machine->claims)
+              {
+                if (claim.ticket != nullptr &&
+                    (claim.ticket->deployment == deployment || claim.ticket->deployment == successor))
+                {
+                  return false;
+                }
+              }
+            }
+            return true;
+          }();
           const bool unsafeActivePlan =
               activePlan.config.applicationID != request.applicationID ||
               activePlan.config.versionID != request.activeVersionID ||
               activePlan.config.type == ApplicationType::task || activePlan.isStateful ||
-              activePlan.whiteholes.empty() == false || activePlan.useHostNetworkNamespace;
-          if (unsafeActivePlan || activeTransitioning == false || deployment->nHealthy() != 0 ||
+              activePlan.useHostNetworkNamespace;
+          if (weAreMaster == false || ignited == false || persistedMachineInventoryEnumerated == false ||
+              recoveringPersistedNeuronInventory ||
+              unsafeActivePlan || (activeTransitioning == false && activeMaterializedNone == false) ||
+              deployment->nHealthy() != 0 ||
               deployment->next != successor || successor->previous != deployment ||
               successor->plan.config.applicationID != request.applicationID ||
               successor->plan.config.versionID != request.successorVersionID ||
               successor->plan.config.type == ApplicationType::task || successor->plan.isStateful ||
-              successor->plan.whiteholes.empty() == false || successor->plan.useHostNetworkNamespace ||
-              successor->state != DeploymentState::waitingToDeploy || successor->containers.empty() == false ||
-              deployment->operatorCancellationTransitionIsSafe() == false ||
+              successor->plan.useHostNetworkNamespace ||
+              successor->state != DeploymentState::waitingToDeploy ||
+              successor->lifecycleIsUnmaterialized() == false ||
+              (activeTransitioning && deployment->operatorCancellationTransitionIsSafe() == false) ||
+              operatorCancellationWhiteholesCanReleaseAfterDestruction(cancelledID, *deployment, *successor) == false ||
               operatorCancellationResourcesCanTransfer(cancelledID, deployment->plan, *successor) == false)
           {
             reject("cancelDeployment safety precondition failed");
@@ -32513,6 +32632,9 @@ public:
           armFailedDeploymentCleaner();
           if (cancellationDevPaused == false)
           {
+            // The NONE shape is intentionally changed only after accepted has
+            // committed.  Restart recovery re-enters the same helper.
+            (void)deployment->recoverAcceptedOperatorCancellationTransition();
             spinApplicationFailed(deployment, "operator cancellation accepted"_ctv);
             deployment->cancelUnhealthyStatelessForSuccessor();
           }

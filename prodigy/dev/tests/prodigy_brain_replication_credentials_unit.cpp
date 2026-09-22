@@ -2949,6 +2949,8 @@ static void testSpinApplicationInvalidPlanUsesSingleTopicFrame(TestSuite& suite)
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.ignited = true;
+  brain.persistedMachineInventoryEnumerated = true;
   brain.mothership = &mothership;
   mothership.isFixedFile = true;
   mothership.fslot = 1;
@@ -24894,6 +24896,8 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.ignited = true;
+  brain.persistedMachineInventoryEnumerated = true;
 
   BrainBase *previousBrain = thisBrain;
   thisBrain = &brain;
@@ -25115,6 +25119,61 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   active->schedulingStack.execution = nullptr;
   active->nSuspended = 0;
 
+  // A restored stateless predecessor can be fully materialized while NONE.
+  // It has no pending scheduler, so it may only become deploying through the
+  // post-acceptance recovery helper.
+  ApplicationDeployment materializedNone = {};
+  materializedNone.plan = active->plan;
+  materializedNone.state = DeploymentState::none;
+  materializedNone.next = successor;
+  materializedNone.nTargetBase = 1;
+  materializedNone.nDeployedBase = 1;
+  Machine materializedMachine = {};
+  ContainerView materializedContainer = {};
+  materializedContainer.uuid = 0x63110001;
+  materializedContainer.deploymentID = activeDeploymentID;
+  materializedContainer.machine = &materializedMachine;
+  materializedContainer.state = ContainerState::scheduled;
+  materializedNone.containers.insert(&materializedContainer);
+  suite.expect(materializedNone.operatorCancellationMaterializedNoneTransitionIsSafe(),
+               "operator_cancellation_accepts_exact_materialized_none_predecessor");
+  suite.expect(materializedNone.state == DeploymentState::none,
+               "operator_cancellation_materialized_none_predicate_does_not_mutate_before_acceptance");
+  materializedNone.waitingOnCompactions = true;
+  suite.expect(materializedNone.operatorCancellationMaterializedNoneTransitionIsSafe() == false,
+               "operator_cancellation_rejects_materialized_none_compaction_owner");
+  materializedNone.waitingOnCompactions = false;
+  materializedContainer.plannedWork = reinterpret_cast<DeploymentWork *>(uintptr_t(1));
+  suite.expect(materializedNone.operatorCancellationMaterializedNoneTransitionIsSafe() == false,
+               "operator_cancellation_rejects_materialized_none_container_claim");
+  materializedContainer.plannedWork = nullptr;
+  materializedNone.retiredSchedulingExecution = &pendingScheduler;
+  suite.expect(materializedNone.operatorCancellationMaterializedNoneTransitionIsSafe() == false,
+               "operator_cancellation_rejects_materialized_none_deferred_continuation");
+  materializedNone.retiredSchedulingExecution = nullptr;
+  suite.expect(materializedNone.recoverAcceptedOperatorCancellationTransition() &&
+                   materializedNone.state == DeploymentState::deploying &&
+                   materializedNone.operatorCancellationOwnsTransition,
+               "operator_cancellation_recovers_materialized_none_only_after_acceptance");
+  // A restart can observe the accepted cancellation after one container has
+  // already acknowledged destruction.  Resume must not require the original
+  // full cohort that admission required before acceptance.
+  ApplicationDeployment partialMaterializedNone = {};
+  partialMaterializedNone.plan = active->plan;
+  partialMaterializedNone.state = DeploymentState::none;
+  partialMaterializedNone.next = successor;
+  partialMaterializedNone.nTargetBase = 2;
+  partialMaterializedNone.nDeployedBase = 1;
+  ContainerView partialMaterializedContainer = {};
+  partialMaterializedContainer.uuid = 0x63110004;
+  partialMaterializedContainer.deploymentID = activeDeploymentID;
+  partialMaterializedContainer.machine = &materializedMachine;
+  partialMaterializedContainer.state = ContainerState::scheduled;
+  partialMaterializedNone.containers.insert(&partialMaterializedContainer);
+  suite.expect(partialMaterializedNone.recoverAcceptedOperatorCancellationTransition() &&
+                   partialMaterializedNone.state == DeploymentState::deploying,
+               "operator_cancellation_restart_recovers_partially_destroyed_none_cohort");
+
   pendingHealth.state = ContainerState::destroying;
   Machine pendingHealthMachine = {};
   pendingHealth.machine = &pendingHealthMachine;
@@ -25137,6 +25196,107 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   request.reason.assign("bounded test repair"_ctv);
 
   Mothership mothership = {};
+  // Exercise the real Mothership admission path for a recovered NONE owner.
+  // A durable-write failure must leave it NONE; the separate predicate test
+  // above proves the accepted-record recovery transition.
+  Machine materializedRequestMachine = {};
+  materializedRequestMachine.neuron.isFixedFile = true;
+  materializedRequestMachine.neuron.fslot = 191;
+  materializedRequestMachine.neuron.connected = true;
+  materializedRequestMachine.runtimeReady = true;
+  ContainerView materializedRequestContainer = {};
+  materializedRequestContainer.uuid = 0x63110002;
+  materializedRequestContainer.applicationID = applicationID;
+  materializedRequestContainer.deploymentID = activeDeploymentID;
+  materializedRequestContainer.machine = &materializedRequestMachine;
+  materializedRequestContainer.state = ContainerState::scheduled;
+  active->state = DeploymentState::none;
+  active->nTargetBase = 1;
+  active->nDeployedBase = 1;
+  active->containers.insert(&materializedRequestContainer);
+  brain.containers.insert_or_assign(materializedRequestContainer.uuid, &materializedRequestContainer);
+  Machine unrelatedClaimMachine = {};
+  MachineTicket retainedCohortTicket = {};
+  retainedCohortTicket.deployment = active;
+  Machine::Claim retainedCohortClaim = {};
+  retainedCohortClaim.ticket = &retainedCohortTicket;
+  retainedCohortClaim.nFit = 1;
+  unrelatedClaimMachine.claims.push_back(std::move(retainedCohortClaim));
+  brain.machines.insert(&unrelatedClaimMachine);
+  CancelDeploymentResponse retainedClaimResponse = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(
+                   brain, mothership, request, retainedClaimResponse) &&
+                   retainedClaimResponse.success == false && active->state == DeploymentState::none,
+               "operator_cancellation_materialized_none_rejects_claim_on_unrelated_machine");
+  brain.machines.erase(&unrelatedClaimMachine);
+  brain.persistSucceeds = false;
+  CancelDeploymentResponse materializedPersistFailure = {};
+  suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(
+                   brain, mothership, request, materializedPersistFailure) &&
+                   materializedPersistFailure.success == false &&
+                   active->state == DeploymentState::none &&
+                   active->operatorCancellationOwnsTransition == false &&
+                   brain.failedDeployments.contains(activeDeploymentID) == false,
+               "operator_cancellation_materialized_none_request_does_not_mutate_before_durable_acceptance");
+  brain.persistSucceeds = true;
+  active->containers.erase(&materializedRequestContainer);
+  brain.containers.erase(materializedRequestContainer.uuid);
+  active->nTargetBase = 0;
+  active->nDeployedBase = 0;
+  active->state = DeploymentState::deploying;
+  Whitehole egressWhitehole = {};
+  egressWhitehole.hasAddress = true;
+  egressWhitehole.address = IPAddress("2001:db8::6311", true);
+  egressWhitehole.sourcePort = 53'111;
+  active->plan.whiteholes.push_back(egressWhitehole);
+  successor->plan.whiteholes = active->plan.whiteholes;
+  ContainerView *egressContainer = new ContainerView();
+  egressContainer->uuid = 0x63110003;
+  egressContainer->applicationID = applicationID;
+  egressContainer->deploymentID = activeDeploymentID;
+  egressContainer->machine = &materializedRequestMachine;
+  egressContainer->state = ContainerState::scheduled;
+  egressContainer->whiteholes = active->plan.whiteholes;
+  active->containers.insert(egressContainer);
+  brain.containers.insert_or_assign(egressContainer->uuid, egressContainer);
+  RoutableResourceLease egressLease = {};
+  egressLease.kind = RoutableResourceLeaseKind::whiteholeAddressPort;
+  egressLease.owner = deploymentRoutableResourceLeaseOwner(active->plan);
+  egressLease.address = egressWhitehole.address;
+  egressLease.sourcePort = egressWhitehole.sourcePort;
+  brain.routableResourceLeaseRuntimeState.push_back(egressLease);
+  suite.expect(brain.operatorCancellationWhiteholesCanReleaseAfterDestruction(
+                   activeDeploymentID, *active, *successor) &&
+                   brain.operatorCancellationResourcesCanTransfer(activeDeploymentID, active->plan, *successor),
+               "operator_cancellation_allows_exact_canonical_egress_whitehole_release");
+  successor->plan.whiteholes[0].sourcePort += 1;
+  suite.expect(brain.operatorCancellationWhiteholesCanReleaseAfterDestruction(
+                   activeDeploymentID, *active, *successor) == false,
+               "operator_cancellation_rejects_changed_whitehole_contract");
+  successor->plan.whiteholes = active->plan.whiteholes;
+  successor->plan.networkAccess =
+      active->plan.networkAccess == ContainerNetworkAccess::declaredOnly
+          ? ContainerNetworkAccess::unrestricted
+          : ContainerNetworkAccess::declaredOnly;
+  suite.expect(brain.operatorCancellationWhiteholesCanReleaseAfterDestruction(
+                   activeDeploymentID, *active, *successor) == false,
+               "operator_cancellation_rejects_changed_network_access_contract");
+  successor->plan.networkAccess = active->plan.networkAccess;
+  RoutableResourceLease foreignEgressLease = egressLease;
+  foreignEgressLease.sourcePort += 1;
+  brain.routableResourceLeaseRuntimeState.push_back(foreignEgressLease);
+  suite.expect(brain.operatorCancellationWhiteholesCanReleaseAfterDestruction(
+                   activeDeploymentID, *active, *successor) == false,
+               "operator_cancellation_rejects_whitehole_lease_without_canonical_container_owner");
+  brain.routableResourceLeaseRuntimeState.pop_back();
+  suite.expect(brain.deploymentHasWhiteholeAddressPortLease(activeDeploymentID),
+               "operator_cancellation_keeps_egress_whitehole_until_container_destruction_ack");
+  active->destructContainer(egressContainer);
+  active->containerDestroyed(egressContainer);
+  suite.expect(brain.deploymentHasWhiteholeAddressPortLease(activeDeploymentID) == false,
+               "operator_cancellation_releases_egress_whitehole_after_container_destruction_ack");
+  active->plan.whiteholes.clear();
+  successor->plan.whiteholes.clear();
   CancelDeploymentResponse response = {};
   suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::cancelDeployment>(brain, mothership, request, response),
                "operator_cancellation_response_decodes");

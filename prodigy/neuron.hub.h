@@ -103,6 +103,10 @@ private:
   bool neuronInstalled = false;
   bool neuronMultiplexed = false;
   int pendingAcceptedNeuronSlot = -1;
+  bool readyLatched = false;
+  bool readySentOnCurrentNeuron = false;
+  bool runtimeReadyLatched = false;
+  bool runtimeReadySentOnCurrentNeuron = false;
   bool pendingResourceDeltaValid = false;
   uint16_t pendingResourceDeltaCores = 0;
   uint32_t pendingResourceDeltaMemoryMB = 0;
@@ -220,18 +224,10 @@ private:
   {
     neuron.fslot = fslot;
     neuron.isFixedFile = true;
-    neuronInstalled = true;
-    if (neuronMultiplexed == false)
-    {
-      RingDispatcher::installMultiplexee(&neuron, this);
-      neuronMultiplexed = true;
-    }
-    Ring::queueRecv(&neuron);
-
-    if (neuron.wBuffer.size() > 0)
-    {
-      queueSendToNeuron();
-    }
+    neuronInstalled = false;
+    readySentOnCurrentNeuron = false;
+    runtimeReadySentOnCurrentNeuron = false;
+    installNeuronIfReady();
   }
 
   void installNeuronIfReady(void)
@@ -269,6 +265,24 @@ private:
     writeNeuronStage("worker:neuron:installNeuronIfReady-before-queueRecv");
     Ring::queueRecv(&neuron);
     writeNeuronStage("worker:neuron:installNeuronIfReady-after-queueRecv");
+
+    if (readyLatched && readySentOnCurrentNeuron == false &&
+        prodigyNeuronHubCanQueueToNeuron(Ring::socketIsClosing(&neuron), neuron.isFixedFile, neuron.fslot))
+    {
+      if (queueEmptyFrame(ContainerTopic::healthy))
+      {
+        readySentOnCurrentNeuron = true;
+      }
+    }
+
+    if (runtimeReadyLatched && runtimeReadySentOnCurrentNeuron == false &&
+        prodigyNeuronHubCanQueueToNeuron(Ring::socketIsClosing(&neuron), neuron.isFixedFile, neuron.fslot))
+    {
+      if (queueEmptyFrame(ContainerTopic::runtimeReady))
+      {
+        runtimeReadySentOnCurrentNeuron = true;
+      }
+    }
 
     if (prodigyNeuronHubShouldFlushBufferedNeuronFrames(
             prodigyNeuronHubCanQueueToNeuron(Ring::socketIsClosing(&neuron), neuron.isFixedFile, neuron.fslot),
@@ -509,7 +523,11 @@ public:
 
   void signalReady(void)
   {
-    (void)queueEmptyFrame(ContainerTopic::healthy);
+    readyLatched = true;
+    if (queueEmptyFrame(ContainerTopic::healthy))
+    {
+      readySentOnCurrentNeuron = true;
+    }
   }
 
   void signalReadyToNeuron(void)
@@ -519,7 +537,11 @@ public:
 
   void signalRuntimeReady(void)
   {
-    (void)queueEmptyFrame(ContainerTopic::runtimeReady);
+    runtimeReadyLatched = true;
+    if (queueEmptyFrame(ContainerTopic::runtimeReady))
+    {
+      runtimeReadySentOnCurrentNeuron = true;
+    }
   }
 
   void signalRuntimeReadyToNeuron(void)
@@ -565,6 +587,8 @@ public:
 
     neuron.setUnixPairHalf(fd);
     neuronInstalled = false;
+    readySentOnCurrentNeuron = false;
+    runtimeReadySentOnCurrentNeuron = false;
     installNeuronIfReady();
   }
 

@@ -10117,22 +10117,28 @@ public:
     return true;
   }
 
-  bool recoverAcceptedOperatorCancellationTransition(void)
+  // An elected master can retain a fully materialized, non-serving stateless
+  // predecessor as NONE.  It has no scheduler owner to unwind, but its exact
+  // recovered container identities still have to be retired through the
+  // normal cancellation path after the operator record is durable.
+  bool operatorCancellationMaterializedNoneTransitionIsSafe(void) const
   {
     if (state != DeploymentState::none || plan.isStateful ||
         plan.config.type == ApplicationType::task || next == nullptr ||
         containers.empty() || waitingOnContainers.empty() == false ||
         waitingOnCompactions || canaryStack != nullptr ||
         currentlyExecutingWork != nullptr || toSchedule.empty() == false ||
-        schedulingStack.execution != nullptr ||
-        schedulingStack.waiters.empty() == false || nSuspended != 0)
+        schedulingStack.execution != nullptr || retiredSchedulingExecution != nullptr ||
+        schedulingStack.waiters.empty() == false || nSuspended != 0 ||
+        consumingSchedulingExecution)
     {
       return false;
     }
     for (ContainerView *container : containers)
     {
       if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
-          container->machine == nullptr || container->state == ContainerState::healthy ||
+          container->machine == nullptr || container->plannedWork != nullptr ||
+          container->state == ContainerState::healthy ||
           container->state == ContainerState::aboutToDestroy ||
           container->state == ContainerState::destroying ||
           container->state == ContainerState::destroyed)
@@ -10140,6 +10146,13 @@ public:
         return false;
       }
     }
+    return true;
+  }
+
+  bool recoverAcceptedOperatorCancellationTransition(void)
+  {
+    if (operatorCancellationMaterializedNoneTransitionIsSafe() == false)
+      return false;
     state = DeploymentState::deploying;
     stateChangedAtMs = Time::now<TimeResolution::ms>();
     operatorCancellationOwnsTransition = true;
