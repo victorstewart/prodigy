@@ -76,6 +76,24 @@ inline Plan parse(const char *file) {
   return p;
 }
 
+// Adoption intent can predate runtime UUID assignment. The persisted topology
+// supplies that UUID; registered adoption data remains the SSH authority.
+inline void resolveRegisteredMachine(const MothershipProdigyCluster& cluster, Machine& machine) {
+  const MothershipProdigyClusterMachine *registered=nullptr;
+  for(const auto& candidate:cluster.machines) if(str(candidate.ssh.address)==machine.address) {
+    require(registered==nullptr,"ambiguous registered migration SSH address"); registered=&candidate;
+  }
+  require(registered && registered->isBrain && (registered->uuid==0 || registered->uuid==machine.uuid),"migration adoption identity mismatch");
+  ClusterMachine adopted; mothershipFillAdoptedClusterMachine(*registered,adopted);
+  const ClusterMachine *runtime=nullptr;
+  for(const auto& candidate:cluster.topology.machines) if(candidate.uuid==machine.uuid) {
+    require(runtime==nullptr,"ambiguous migration runtime UUID"); runtime=&candidate;
+  }
+  require(runtime && runtime->isBrain && runtime->sameIdentityAs(adopted) && str(runtime->ssh.address)==machine.address,"migration runtime identity differs from registered topology");
+  require(registered->ssh.port && str(registered->ssh.user)=="root" && !registered->ssh.hostPublicKeyOpenSSH.empty(),"registered migration SSH authority incomplete");
+  machine.registered=*registered;
+}
+
 class Execution final : public MothershipTidesDBMigrationHooks {
 public:
   Plan plan; MothershipProdigyCluster cluster; MothershipTidesDBMigrationReceipt receipt;
@@ -223,9 +241,7 @@ public:
     require(cluster.clusterUUID==plan.clusterUUID && cluster.nBrains==3 && cluster.machines.size()==3 && cluster.deploymentMode!=MothershipClusterDeploymentMode::test,"migration target is not the registered three-machine production cluster");
     require(str(cluster.remoteProdigyPath)==plan.runtimeRoot,"migration runtime path differs from registered bootstrap owner");
     for(auto& m:plan.machines) {
-      bool found=false;
-      for(const auto& registered:cluster.machines) if(registered.uuid==m.uuid) { m.registered=registered; found=true; break; }
-      require(found && str(m.registered.ssh.address)==m.address && m.registered.ssh.port && str(m.registered.ssh.user)=="root" && !m.registered.ssh.hostPublicKeyOpenSSH.empty(),"migration machine differs from registered SSH authority");
+      resolveRegisteredMachine(cluster,m);
       machines.emplace(m.uuid,&m);
     }
   }

@@ -40,5 +40,20 @@ int main(int argc, char **argv)
   assert(str(stop).find("cgroup.kill")==std::string::npos && str(stop).find("pkill")==std::string::npos);
   assert(uuid("0x850fa69cddf33ccdb965f709303710c6")!=0);
   bool rejected=false; try { pathCheck("/var/lib/../prod"); } catch(const std::exception&) { rejected=true; } assert(rejected);
+  MothershipProdigyCluster registeredCluster;
+  MothershipProdigyClusterMachine adopted; adopted.isBrain=true;
+  adopted.ssh.address="fd72:6e61:6d65:1::10"_ctv; adopted.ssh.port=22;
+  adopted.ssh.user="root"_ctv; adopted.ssh.hostPublicKeyOpenSSH="fixture-host-key"_ctv;
+  registeredCluster.machines.push_back(adopted);
+  ClusterMachine topology; mothershipFillAdoptedClusterMachine(adopted,topology); topology.uuid=123;
+  registeredCluster.topology.machines.push_back(topology);
+  Machine planned; planned.uuid=123; planned.address="fd72:6e61:6d65:1::10";
+  resolveRegisteredMachine(registeredCluster,planned);
+  assert(planned.registered.ssh.hostPublicKeyOpenSSH==adopted.ssh.hostPublicKeyOpenSSH);
+  registeredCluster.topology.machines[0].uuid=124;
+  rejected=false; try { resolveRegisteredMachine(registeredCluster,planned); } catch(const std::exception&) { rejected=true; } assert(rejected);
+  registeredCluster.topology.machines[0].uuid=123;
+  registeredCluster.machines[0].uuid=124;
+  rejected=false; try { resolveRegisteredMachine(registeredCluster,planned); } catch(const std::exception&) { rejected=true; } assert(rejected);
   fs::remove_all(root);
 }
