@@ -50,6 +50,7 @@ struct Machine {
 };
 struct Plan {
   std::string identity, operationRoot, registryRoot, bundle, runtimeRoot, statePath, secretsPath, oldRuntimeSHA, oldBundleSHA, planSHA;
+  bool retainedRecovery = false;
   uint128_t operationID = 0, clusterUUID = 0;
   std::vector<Machine> machines;
 };
@@ -94,8 +95,8 @@ inline void resolveRegisteredMachine(const MothershipProdigyCluster& cluster, Ma
   machine.registered=*registered;
 }
 
-inline std::string quiesceServiceCommand() {
-  String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop);
+inline std::string quiesceServiceCommand(bool retainedRecoveryVerified = false) {
+  String stop; mothershipBuildTidesDBMigrationServiceQuiesceCommand(stop, retainedRecoveryVerified);
   return "if test \"$(systemctl show -p MainPID --value prodigy)\" != 0; then\n"+str(stop)+"\nfi; test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
 }
 
@@ -173,12 +174,13 @@ public:
   }
   void addDB(uint128_t machine,const std::string& label,const std::string& live,const std::string& root) {
     MothershipTidesDBMigrationDatabase db; db.machineUUID=machine; db.label=text(label); db.livePath=text(live);
-    db.retainedV9Path=text(live+".tidesdb9-"+plan.planSHA.substr(0,16)); db.copiedV9Path=text(root+"/"+label+".copy9");
-    db.streamPath=text(root+"/"+label+".kv"); db.preparedV10Path=text(root+"/"+label+".new10"); db.validationReceiptPath=text(root+"/"+label+".validation"); receipt.databases.push_back(std::move(db));
+    db.retainedV9Path=text(live+(plan.retainedRecovery ? ".retained10-" : ".tidesdb9-")+plan.planSHA.substr(0,16)); db.copiedV9Path=text(root+"/"+label+(plan.retainedRecovery ? ".copy10" : ".copy9"));
+    db.streamPath=text(root+"/"+label+".kv"); db.preparedV10Path=text(root+"/"+label+".new10"); db.validationReceiptPath=text(root+"/"+label+".validation"); if(plan.retainedRecovery && label=="secrets") { db.copiedV9Path=text(root+"/state.copy10.secrets"); db.preparedV10Path=text(root+"/state.new10.secrets"); }
+    receipt.databases.push_back(std::move(db));
   }
   void populateDatabases() {
     receipt.databases.clear();
-    addDB(0,"clusters",plan.registryRoot+"/clusters",plan.operationRoot); addDB(0,"provider_credentials",plan.registryRoot+"/provider_credentials",plan.operationRoot);
+    if (!plan.retainedRecovery) { addDB(0,"clusters",plan.registryRoot+"/clusters",plan.operationRoot); addDB(0,"provider_credentials",plan.registryRoot+"/provider_credentials",plan.operationRoot); }
     for(auto& m:plan.machines) { addDB(m.uuid,"state",plan.statePath,remoteRoot); addDB(m.uuid,"secrets",plan.secretsPath,remoteRoot); }
   }
   void prepareDB(MothershipTidesDBMigrationDatabase& db) {
@@ -216,9 +218,9 @@ public:
     const auto newRuntimeSHA=digest(localRuntime+"/prodigy"); require(newRuntimeSHA!=plan.oldRuntimeSHA,"migration requires a successor runtime");
     if(fs::exists(plan.operationRoot+"/receipt")) {
       String bytes=text(read(plan.operationRoot+"/receipt")); require(BitseryEngine::deserializeSafe(bytes,receipt),"migration receipt invalid");
-      require(receipt.operationID==plan.operationID && receipt.clusterUUID==plan.clusterUUID && str(receipt.approvedBundleSHA256)==str(bundleSHA) && str(receipt.newRuntimeSHA256)==newRuntimeSHA && str(receipt.oldRuntimeSHA256)==plan.oldRuntimeSHA && receipt.databases.size()==8,"migration receipt identity mismatch");
+      require(receipt.operationID==plan.operationID && receipt.clusterUUID==plan.clusterUUID && str(receipt.approvedBundleSHA256)==str(bundleSHA) && str(receipt.newRuntimeSHA256)==newRuntimeSHA && str(receipt.oldRuntimeSHA256)==plan.oldRuntimeSHA && receipt.databases.size()==(plan.retainedRecovery ? 6 : 8),"migration receipt identity mismatch");
       auto stored=receipt; populateDatabases();
-      for(size_t i=0;i<8;++i) { const auto& a=stored.databases[i]; const auto& b=receipt.databases[i];
+      for(size_t i=0;i<receipt.databases.size();++i) { const auto& a=stored.databases[i]; const auto& b=receipt.databases[i];
         require(a.machineUUID==b.machineUUID && a.label==b.label && a.livePath==b.livePath && a.retainedV9Path==b.retainedV9Path && a.copiedV9Path==b.copiedV9Path && a.streamPath==b.streamPath && a.preparedV10Path==b.preparedV10Path && a.validationReceiptPath==b.validationReceiptPath,"migration receipt paths differ from immutable plan"); }
       receipt=std::move(stored);
     } else {
@@ -332,12 +334,12 @@ public:
     for(auto& machine:plan.machines) {
       // A stopped unit remains stopped through process failure/reentry; no
       // application leaf belongs to this service's cgroup.
-      run(machine.uuid,quiesceServiceCommand()+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.stopped")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.stopped"));
+      run(machine.uuid,quiesceServiceCommand(plan.retainedRecovery)+observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.stopped")+"; cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.stopped"));
     }
     receipt.phase=MothershipTidesDBMigrationPhase::writersQuiesced; persist(receipt,nullptr);
   }
   void installRuntimes() {
-    const auto retained=plan.runtimeRoot+".tidesdb9-"+plan.planSHA.substr(0,16);
+    const auto retained=plan.runtimeRoot+(plan.retainedRecovery ? ".retained10-" : ".tidesdb9-")+plan.planSHA.substr(0,16);
     for(auto& machine:plan.machines) {
       // Both names are on the preflighted filesystem. Reentry examines exact
       // binary identities instead of treating path existence as installation.

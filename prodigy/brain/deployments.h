@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <services/debug.h>
 #include <prodigy/debug.h>
+#include <prodigy/container.services.h>
 #include <prodigy/brain/timing.knobs.h>
 #include <algorithm>
 #include <cstdio>
@@ -83,66 +84,6 @@ static inline void prodigyLogDeployHeapSnapshot(
 #define prodigyReadDeployHeapMetrics() ProdigyDeployHeapMetrics {}
 #define prodigyLogDeployHeapSnapshot(...) ((void)0)
 #endif
-
-static bool metricNameMatchesLiteral(const String& metricName, const char *literal)
-{
-  if (literal == nullptr)
-  {
-    return false;
-  }
-
-  size_t literalLength = std::strlen(literal);
-  if (metricName.size() != literalLength)
-  {
-    return false;
-  }
-
-  if (literalLength == 0)
-  {
-    return true;
-  }
-
-  return (std::memcmp(metricName.data(), literal, literalLength) == 0);
-}
-
-static bool isNeuronCollectableScalingDimension(ScalingDimension dimension)
-{
-  switch (dimension)
-  {
-    case ScalingDimension::cpu:
-    case ScalingDimension::memory:
-    case ScalingDimension::storage:
-      {
-        return true;
-      }
-    case ScalingDimension::runtimeIngressQueueWaitComposite:
-    case ScalingDimension::runtimeIngressHandlerComposite:
-    default:
-      {
-        return false;
-      }
-  }
-}
-
-static bool scalingDimensionForMetricName(const String& metricName, ScalingDimension& dimension)
-{
-  for (ScalingDimension candidate : {
-           ScalingDimension::cpu,
-           ScalingDimension::memory,
-           ScalingDimension::storage,
-           ScalingDimension::runtimeIngressQueueWaitComposite,
-           ScalingDimension::runtimeIngressHandlerComposite})
-  {
-    const char *builtinName = ProdigyMetrics::nameForScalingDimension(candidate);
-    if (metricNameMatchesLiteral(metricName, builtinName))
-    {
-      dimension = candidate;
-      return true;
-    }
-  }
-
-  return false;
-}
 
 static inline bool prodigyMachineReadyForScheduling(const Machine *machine)
 {
@@ -1091,35 +1032,7 @@ static void prodigyConsumeAssignedGPUsFromMachineAvailability(
 
 static NeuronContainerMetricPolicy deriveNeuronMetricPolicyForDeployment(const DeploymentPlan& plan)
 {
-  NeuronContainerMetricPolicy policy;
-
-  auto includeDimension = [&](ScalingDimension dimension) -> void {
-    if (isNeuronCollectableScalingDimension(dimension))
-    {
-      policy.scalingDimensionsMask |= ProdigyMetrics::maskForScalingDimension(dimension);
-    }
-  };
-
-  for (const HorizontalScaler& scaler : plan.horizontalScalers)
-  {
-    ScalingDimension dimension = ScalingDimension::cpu;
-    if (scalingDimensionForMetricName(scaler.name, dimension))
-    {
-      includeDimension(dimension);
-    }
-  }
-
-  for (const VerticalScaler& scaler : plan.verticalScalers)
-  {
-    includeDimension(scaler.resource);
-  }
-
-  if (policy.scalingDimensionsMask > 0)
-  {
-    policy.metricsCadenceMs = ProdigyMetrics::defaultNeuronCollectionCadenceMs;
-  }
-
-  return policy;
+  return prodigyNeuronMetricPolicyForDeployment(plan);
 }
 
 static const DistributableExternalSubnet *findWhiteholeRoutablePrefixForFamily(
@@ -1242,15 +1155,6 @@ public:
   }
 
   StatelessWork() = default; // needed so DeploymentWork has a default constructor
-};
-
-enum class DataStrategy : uint8_t {
-
-  none = 0,
-  genesis,
-  changelog,
-  seeding,
-  sharding
 };
 
 class StatefulWork : public WorkBase {
@@ -8777,91 +8681,51 @@ public:
           }
         };
 
-        for (const Subscription& subscription : plan.subscriptions)
+        ProdigyContainerServiceDefinitionContext definitionContext = {};
+        definitionContext.isStateful = std::is_same_v<T, StatefulWork>;
+        if constexpr (std::is_same_v<T, StatefulWork>)
         {
-          setupSubscription(subscription.service, subscription.startAt, subscription.stopAt, subscription.nature);
+          definitionContext.roles = container->effectiveStatefulMeshRoles(plan);
+          definitionContext.topology = container->effectiveStatefulTopology(plan);
+          definitionContext.advertiseClient = plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup);
+          definitionContext.seedingAlways = plan.stateful.seedingAlways;
+          definitionContext.dataStrategy = work.data;
+          definitionContext.nShardGroups = nShardGroups;
+          if (work.data == DataStrategy::sharding)
+          {
+            for (uint32_t shardGroup = 0; shardGroup < (nShardGroups - 1); ++shardGroup)
+            {
+              definitionContext.priorShardRoles.push_back(statefulMeshRolesForShardGroup(shardGroup));
+            }
+          }
+          if (definitionContext.advertiseClient && prodigyStatefulTopologyServesClients(definitionContext.topology) && !plan.stateful.allMasters)
+          {
+            masterForShardGroup.insert_or_assign(container->shardGroup, container);
+          }
         }
 
-        for (const Advertisement& advertisement : plan.advertisements)
+        ProdigyContainerServiceDefinitions definitions = {};
+        if (prodigyBuildContainerServiceDefinitions(plan, definitionContext, definitions) == false)
+        {
+          basics_log("schedule could not build container service definitions deploymentID=%llu appID=%u\n",
+                     (unsigned long long)plan.config.deploymentID(), unsigned(plan.config.applicationID));
+          return;
+        }
+        // Preserve the established mesh activation order: explicit services,
+        // then generated advertisements, then generated subscriptions.
+        for (uint32_t index = 0; index < plan.subscriptions.size(); ++index)
+        {
+          const Subscription& subscription = definitions.subscriptions[index];
+          setupSubscription(subscription.service, subscription.startAt, subscription.stopAt, subscription.nature);
+        }
+        for (const Advertisement& advertisement : definitions.advertisements)
         {
           setupAdvertisement(advertisement.service, advertisement.startAt, advertisement.stopAt, advertisement.port, advertisement.userCapacity);
         }
-
-        if constexpr (std::is_same_v<T, StatefulWork>)
+        for (uint32_t index = plan.subscriptions.size(); index < definitions.subscriptions.size(); ++index)
         {
-          StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(plan);
-          StatefulTopology topology = container->effectiveStatefulTopology(plan);
-
-          setupAdvertisement(roles.sibling, ContainerState::scheduled, ContainerState::destroying);
-          setupAdvertisement(roles.seeding, ContainerState::healthy, ContainerState::destroying);
-          if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldAdvertiseBridge(topology))
-          {
-            setupAdvertisement(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying);
-          }
-
-          if (prodigyStatefulTopologyServesClients(topology) && (plan.stateful.allMasters || !masterForShardGroup.contains(container->shardGroup)))
-          {
-            if (!plan.stateful.allMasters)
-            {
-              masterForShardGroup.insert_or_assign(container->shardGroup, container);
-            }
-
-            setupAdvertisement(roles.client, ContainerState::healthy, ContainerState::destroying);
-          }
-
-          if (plan.stateful.neverShard == false)
-          {
-            setupAdvertisement(roles.cousin, ContainerState::scheduled, ContainerState::destroying);
-            setupAdvertisement(roles.sharding, ContainerState::healthy, ContainerState::destroying);
-          }
-
-          setupSubscription(roles.sibling, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
-          if (roles.topologyBridge != 0 && prodigyStatefulTopologyShouldSubscribeBridge(topology))
-          {
-            setupSubscription(roles.topologyBridge, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
-          }
-
-          if (plan.stateful.seedingAlways)
-          {
-            setupSubscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
-          }
-
-          switch (work.data)
-          {
-            case DataStrategy::genesis:
-              {
-                break;
-              }
-            case DataStrategy::changelog: // still give them seeding just in case there is a problem they can start from scratch
-            case DataStrategy::seeding:
-              {
-                if (plan.stateful.seedingAlways == false)
-                {
-                  setupSubscription(roles.seeding, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all);
-                }
-
-                break;
-              }
-            case DataStrategy::sharding:
-              {
-                // feed on 1 instance from every other shard group
-                for (uint32_t shardGroup = 0; shardGroup < (nShardGroups - 1); ++shardGroup) // container->shardGroup will be (nShardGroups - 1) thus excluded
-                {
-                  StatefulMeshRoles shardRoles = statefulMeshRolesForShardGroup(shardGroup);
-
-                  // we'll cancel this subscription manually once all shards in the group are healthy and clients have connected
-
-                  // sharding won't begin until after all cousins have connected... otherwise we could miss writes
-                  setupSubscription(shardRoles.sharding, ContainerState::scheduled, ContainerState::none, SubscriptionNature::all);
-
-                  // these are so that the sharding-sender instances can send changes to the sharding-receiver instances
-                  setupSubscription(shardRoles.cousin, ContainerState::scheduled, ContainerState::none, SubscriptionNature::all);
-                }
-                break;
-              }
-            case DataStrategy::none:
-              break;
-          }
+          const Subscription& subscription = definitions.subscriptions[index];
+          setupSubscription(subscription.service, subscription.startAt, subscription.stopAt, subscription.nature);
         }
       };
 

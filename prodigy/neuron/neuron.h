@@ -1208,10 +1208,9 @@ protected:
   void appendInitialBrainControlFrames(String& outbound)
   {
     String installedDigest = {};
-    String installedPath = {};
-    String digestFailure = {};
-    prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, installedPath);
-    (void)prodigyComputeFileSHA256Hex(installedPath, installedDigest, &digestFailure);
+    String executable = {};
+    if (prodigyResolveCurrentExecutablePath(executable))
+      (void)prodigyResolveInstalledBundleDigestForExecutable(executable, installedDigest);
     // The master uses this attestation together with the following stateUpload
     // before it advances the next worker.
     Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments(), installedDigest);

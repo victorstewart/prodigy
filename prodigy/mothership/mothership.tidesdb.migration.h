@@ -86,7 +86,7 @@ static inline bool mothershipTidesDBMigrationMayRollback(const MothershipTidesDB
 
 static inline bool mothershipTidesDBMigrationAllDatabasesSwapped(const MothershipTidesDBMigrationReceipt& receipt)
 {
-  if (receipt.databases.size() != 8) return false;
+  if (receipt.databases.size() != 8 && receipt.databases.size() != 6) return false;
   for (const MothershipTidesDBMigrationDatabase& database : receipt.databases)
     if (database.swapped == false) return false;
   return true;
@@ -95,9 +95,16 @@ static inline bool mothershipTidesDBMigrationAllDatabasesSwapped(const Mothershi
 // This is intentionally distinct from mothershipBuildProdigyStopAndDrainCommand:
 // that remove-cluster owner kills /containers.slice leaves.  A database-only
 // runtime migration must leave those guests and their disks intact.
-static inline void mothershipBuildTidesDBMigrationServiceQuiesceCommand(String& command)
+static inline void mothershipBuildTidesDBMigrationServiceQuiesceCommand(String& command, bool retainedRecoveryVerified = false)
 {
   command.assign("set -eu; "_ctv);
+  if (!retainedRecoveryVerified) command.append(R"SH(
+for leaf in /sys/fs/cgroup/containers.slice/*.slice/leaf; do
+  [ -e "$leaf/cgroup.procs" ] || continue
+  processes=$(cat "$leaf/cgroup.procs") || exit 1
+  [ -z "$processes" ] || { echo 'retained containers require a recovery checkpoint' >&2; exit 1; }
+done
+)SH"_ctv);
   command.append(R"SH(
 load=$(systemctl show --property=LoadState --value prodigy) || exit 1
 [ "$load" != not-found ] || { echo 'prodigy unit is absent' >&2; exit 1; }
@@ -110,12 +117,7 @@ active=$(systemctl show --property=ActiveState --value prodigy) || exit 1
 pid=$(systemctl show --property=MainPID --value prodigy) || exit 1
 [ "$pid" = 0 ] || { echo 'prodigy remained active' >&2; exit 1; }
 case "$active" in inactive|failed) ;; *) echo 'prodigy service is still transitioning' >&2; exit 1;; esac
-# Runtime container leaves are deliberately only observed here.  Do not stop,
-# kill, remount, reset, or alter them as part of persistence migration.
-for leaf in /sys/fs/cgroup/containers.slice/*.slice/leaf; do
-  [ -e "$leaf/cgroup.procs" ] || continue
-  cat "$leaf/cgroup.procs" >/dev/null || { echo 'container cgroup is unreadable' >&2; exit 1; }
-done
+
 )SH"_ctv);
 }
 

@@ -616,6 +616,10 @@ add_executable(prodigy_remote_bootstrap_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/
 add_executable(prodigy_mothership_cluster_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_registry_unit.cpp)
 add_executable(prodigy_mothership_cluster_report_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_report_unit.cpp)
 add_executable(prodigy_mothership_restart_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_restart_persistence_unit.cpp)
+add_executable(prodigy_retained_container_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_retained_container_recovery_unit.cpp)
+target_compile_options(prodigy_retained_container_recovery_unit PRIVATE -UNDEBUG)
+add_executable(prodigy_mothership_retained_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_retained_recovery_unit.cpp)
+target_compile_options(prodigy_mothership_retained_recovery_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_mothership_tidesdb_migration_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_unit.cpp)
 add_executable(prodigy_mothership_tidesdb_migration_command_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_command_unit.cpp)
 target_compile_options(prodigy_mothership_tidesdb_migration_command_unit PRIVATE -UNDEBUG)
@@ -704,6 +708,8 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_registry_unit
    prodigy_mothership_cluster_report_unit
    prodigy_mothership_restart_persistence_unit
+   prodigy_retained_container_recovery_unit
+   prodigy_mothership_retained_recovery_unit
    prodigy_mothership_tidesdb_migration_unit
    prodigy_mothership_tidesdb_migration_command_unit
    prodigy_mothership_cluster_reconcile_unit
@@ -2057,6 +2063,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_command_unit
               $<TARGET_FILE:prodigy_tidesdb9_fixture> $<TARGET_FILE:prodigy_tidesdb9_export> $<TARGET_FILE:prodigy_tidesdb10_import>
    )
+   add_test(NAME prodigy_retained_container_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_container_recovery_unit)
+   add_test(NAME prodigy_mothership_retained_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_retained_recovery_unit)
    add_test(
       NAME prodigy_mothership_tidesdb_migration_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_unit

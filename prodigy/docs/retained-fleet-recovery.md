@@ -1,0 +1,60 @@
+# Retained-fleet recovery after the TidesDB format migration
+
+This explicit Mothership command repairs lost ownership for the frozen three-host
+fleet: 34 surviving processes, 23 canonical containers selected from the last
+verified healthy deployment, and 11 stateless extras. It is not a general reset.
+All lifecycle operations remain inside Mothership. Discombobulator supplies the
+approved runtime bundle. Never restore the v9 databases after v10 writers started.
+
+`mothership recoverRetainedFleet PRIVATE_PLAN recover`
+
+The private schema-v1 plan uses the migration plan fields and adds
+`retainedRecoveryMode: true`, `retainedManifestPath`, and
+`retainedManifestSHA256`. Its expected old runtime/bundle hashes identify the
+currently installed v10 runtime. Use a new operation ID and operation root.
+Run on the selected seed with the normal commissioned registry and outer
+Mothership client lock; no other Mothership process may own that registry.
+
+The private manifest binds cluster and successor bundle, and exactly three
+machine entries. Each machine has `machineUUID`, `machineFragment`, and `records`.
+Each process record has hexadecimal `uuid`, numeric `pid`, decimal-string `start`
+(from /proc start ticks), `exeSHA256`, `paramsSHA256`, `paramsPath`, `canonical`,
+and `createdAtMs` (recovery observation time, not the original scheduler time).
+Parameter files contain credentials and must remain private.
+
+Mothership verifies the exact process inventory, cgroups, executable hashes and
+live memfd parameter hashes. It stages the approved bundle, fences and stops only
+prodigy.service, and retains every container process. It copies the six v10
+state/secret databases and prepares witnesses on private paired copies using the
+existing StateStore. The seed's saved deployment plans are authoritative; existing
+replica plans must agree exactly, and only missing plans may be filled.
+
+The reconstruction supports ordinary base containers and stable shard-zero
+stateful replicas. It preserves resources, addresses, ports, credentials and
+launch pairings, restores omitted compact-wire CPU fields from deployment
+configuration, and rebuilds service definitions through the normal scheduler
+owner. Containers start as scheduled and unready. Normal readiness, mesh and
+bundle-attestation checks must establish their actual health.
+
+Private-copy readback must match before six atomic directory swaps. Original v10
+directories and the previous runtime are retained. The existing durable lifecycle
+receipt records each swap and crosses the activation boundary before any new
+writer starts. Repeat the same immutable command after interruption; do not
+replace its plan or silently roll back after activation.
+
+The internal `prepareRetainedRecoveryLocal REQUEST STATE prepare|verify` command
+is invoked by the staged Mothership against private copies. It is not a substitute
+for the fenced fleet operation.
+
+After normal reports prove the canonical 23 containers healthy, bind the inspected
+health evidence to the immutable plan and manifest by creating the private
+`OPERATION_ROOT/canonical-health-attestation` containing plan SHA, newline,
+manifest SHA, newline. Then explicitly invoke:
+
+`mothership recoverRetainedFleet PRIVATE_PLAN retire-extras`
+
+Only the 11 recorded stateless extras can be retired. Mothership rechecks each
+PID/start/executable/cgroup/parameter identity through a pidfd before signaling;
+no application directories are deleted. Reverify three Brains, 13 services,
+exactly 23 matching processes and three Hot replicas with 3 GiB limits and no
+observed crashes/OOMs. Neither command's success is an application-health claim.

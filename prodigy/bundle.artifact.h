@@ -751,6 +751,16 @@ static inline void prodigyResolveInstalledBundlePathForRoot(const String& instal
   bundlePath.append("prodigy.bundle.tar.zst"_ctv);
 }
 
+static inline bool prodigyResolveInstalledBundleDigestForExecutable(const String& executable, String& digest)
+{
+  digest.clear();
+  if (executable.empty()) return false;
+  String root, path, failure;
+  prodigyDirname(executable, root);
+  prodigyResolveInstalledBundlePathForRoot(root, path);
+  return prodigyComputeFileSHA256Hex(path, digest, &failure);
+}
+
 static inline void prodigyResolveBundlePathForExecutable(const String& localExecutablePath, MachineCpuArchitecture architecture, String& bundlePath)
 {
   String executableDirectory = {};

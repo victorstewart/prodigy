@@ -1,3 +1,4 @@
+#include <filesystem>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
 #include <services/debug.h>
@@ -379,6 +380,15 @@ int main(int argc, char *argv[])
   prodigyAppendShellSingleQuoted(prepareInstalledCommand, installedBundleSHA256Path);
   suite.expect(prodigyRunLocalShellCommand(prepareInstalledCommand, &failure), "prepare_installed_bundle_home");
   suite.expect(failure.size() == 0, "prepare_installed_bundle_home_clears_failure");
+
+  String colocatedBundle, fakeExecutable, registrationDigest;
+  prodigyResolveInstalledBundlePathForRoot(fakeBundleHome, colocatedBundle);
+  std::filesystem::copy_file(bundlePath.c_str(), colocatedBundle.c_str(), std::filesystem::copy_options::overwrite_existing);
+  fakeExecutable = fakeBundleHome; fakeExecutable.append("/prodigy"_ctv);
+  suite.expect(prodigyResolveInstalledBundleDigestForExecutable(fakeExecutable, registrationDigest) &&
+               registrationDigest == bundleDigest, "registration_digest_uses_actual_install_root");
+  suite.expect(!prodigyResolveInstalledBundleDigestForExecutable(""_ctv, registrationDigest) &&
+               registrationDigest.empty(), "registration_digest_empty_executable_clears_stale_digest");
 
   suite.expect(setenv("HOME", fakeHomeText.c_str(), 1) == 0, "set_fake_home");
   suite.expect(unsetenv("XDG_DATA_HOME") == 0, "unset_xdg_data_home");

@@ -1028,18 +1028,7 @@ static inline void prodigyResolveLocalBundleReportDigests(
   localInstalledBundleSHA256.clear();
   stagedBundleSHA256.clear();
 
-  if (localExecutablePath.size() > 0)
-  {
-    String localInstallRoot = {};
-    prodigyDirname(localExecutablePath, localInstallRoot);
-    String installedBundlePath = {};
-    prodigyResolveInstalledBundlePathForRoot(localInstallRoot, installedBundlePath);
-    if (prodigyFileReadable(installedBundlePath))
-    {
-      String digestFailure = {};
-      (void)prodigyComputeFileSHA256Hex(installedBundlePath, localInstalledBundleSHA256, &digestFailure);
-    }
-  }
+  (void)prodigyResolveInstalledBundleDigestForExecutable(localExecutablePath, localInstalledBundleSHA256);
 
   if (prodigyFileReadable(stagedBundlePath))
   {

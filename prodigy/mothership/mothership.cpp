@@ -60,6 +60,7 @@
 
 #include "mothership.virtual.datacenter.provider.inc"
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
+#include <prodigy/mothership/mothership.retained.recovery.command.h>
 
 // for now every time we create a new application or service we're going to have to recompile the mothership so that
 // it can read the enum values from enums.datacenter.h, but in the future we can do something else more flexible
@@ -10097,6 +10098,25 @@ private:
     basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
   }
 
+  void runRecoverRetainedFleet(int argc, char *argv[])
+  {
+    String failure;
+    if (argc != 2 || !MothershipRetainedRecovery::runFile(argv[0], argv[1], &failure)) {
+      basics_log("recoverRetainedFleet success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
+    }
+    basics_log("recoverRetainedFleet success=1 action=%s applicationHealthAttested=0\n", argv[1]);
+  }
+
+  void runPrepareRetainedRecoveryLocal(int argc, char *argv[])
+  {
+    String failure;
+    if (argc != 3 || (std::strcmp(argv[2], "prepare") != 0 && std::strcmp(argv[2], "verify") != 0) ||
+        !MothershipRetainedRecovery::prepareLocal(argv[0], argv[1], std::strcmp(argv[2], "verify") == 0, &failure)) {
+      basics_log("prepareRetainedRecoveryLocal success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
+    }
+    basics_log("prepareRetainedRecoveryLocal success=1\n");
+  }
+
   void runMigrateTidesDB9To10(int argc, char *argv[])
   {
     if (argc < 1 || argc > 2 || (argc == 2 && std::strcmp(argv[1], "rollback") != 0))
@@ -19013,6 +19033,7 @@ public:
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
+        {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
         {"printClusters",                   &Mothership::runPrintClusters                  },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
@@ -19022,6 +19043,7 @@ public:
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
+        {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
