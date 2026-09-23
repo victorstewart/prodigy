@@ -1357,6 +1357,220 @@ static void runStrandedFollowerReconnectFixture(TestSuite& suite)
   }
 }
 
+static bool queuedRegistrationAdvertisesMaster(String& buffer, uint128_t& advertisedMasterUUID)
+{
+  bool found = false;
+  forEachMessageInBuffer(buffer, [&](Message *message) {
+    if (found || BrainTopic(message->topic) != BrainTopic::registration)
+    {
+      return;
+    }
+
+    uint8_t *args = message->args;
+    uint128_t registeredUUID = 0;
+    int64_t registeredBoottimens = 0;
+    uint64_t registeredVersion = 0;
+    uint128_t existingMasterUUID = 0;
+    if (Message::extractArg<ArgumentNature::fixed>(args, registeredUUID) &&
+        Message::extractArg<ArgumentNature::fixed>(args, registeredBoottimens) &&
+        Message::extractArg<ArgumentNature::fixed>(args, registeredVersion) &&
+        Message::extractArg<ArgumentNature::fixed>(args, existingMasterUUID))
+    {
+      advertisedMasterUUID = existingMasterUUID;
+      found = true;
+    }
+  });
+  return found;
+}
+
+static void runGhostMasterRegistrationFixtures(TestSuite& suite)
+{
+  // A former master must immediately withdraw its self-claim on every live
+  // peer stream.  Otherwise a heartbeat-only peer can keep that claim fresh
+  // after the local Brain has become a follower.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    brain.boottimens = 10;
+    brain.version = 1;
+
+    BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 78;
+    brain.brains.insert(peer);
+
+    brain.forfeitMasterStatus();
+
+    uint128_t advertisedMasterUUID = uint128_t(1);
+    suite.expect(queuedRegistrationAdvertisesMaster(peer->wBuffer, advertisedMasterUUID),
+                 "ghost_master_forfeit_announces_registration_to_connected_peer");
+    suite.expect(advertisedMasterUUID == 0,
+                 "ghost_master_forfeit_announces_no_master_to_connected_peer");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  // Electing a peer master must immediately replace the prior zero/self claim
+  // on every connected stream, before heartbeat traffic can preserve stale
+  // follower observations.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.noMasterYet = true;
+    brain.boottimens = 10;
+    brain.version = 1;
+
+    BrainView *selected = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.13", false).v4);
+    selected->connected = true;
+    selected->isFixedFile = true;
+    selected->fslot = 79;
+    brain.brains.insert(selected);
+
+    BrainView *observer = makePeer(uint128_t(0x400), 40, IPAddress("10.0.0.14", false).v4);
+    observer->connected = true;
+    observer->isFixedFile = true;
+    observer->fslot = 80;
+    brain.brains.insert(observer);
+
+    brain.testElectBrainToMaster(selected);
+
+    uint128_t advertisedMasterUUID = 0;
+    suite.expect(queuedRegistrationAdvertisesMaster(observer->wBuffer, advertisedMasterUUID),
+                 "ghost_master_peer_election_announces_registration_to_connected_peer");
+    suite.expect(advertisedMasterUUID == selected->uuid,
+                 "ghost_master_peer_election_announces_selected_master_to_connected_peer");
+
+    brain.brains.erase(selected);
+    brain.brains.erase(observer);
+    delete selected;
+    delete observer;
+  }
+
+  // A forwarded claim cannot make an otherwise live peer master until that
+  // peer has made a fresh registration claiming itself.  A stale replay of a
+  // former master's UUID must leave the cluster eligible to derive a master.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+
+    BrainView *candidate = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.13", false).v4);
+    candidate->connected = true;
+    candidate->isFixedFile = true;
+    candidate->fslot = 53;
+    candidate->registrationFresh = false;
+    brain.brains.insert(candidate);
+
+    BrainView *forwarder = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
+    forwarder->connected = true;
+    forwarder->isFixedFile = true;
+    forwarder->fslot = 54;
+    brain.brains.insert(forwarder);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(
+        buffer,
+        BrainTopic::registration,
+        uint128_t(0x200),
+        int64_t(20),
+        uint64_t(14),
+        uint128_t(0x300));
+    brain.testBrainHandler(forwarder, message);
+
+    suite.expect(brain.noMasterYet, "registration_forwarded_unconfirmed_master_claim_keeps_election_open");
+    suite.expect(candidate->isMasterBrain == false, "registration_forwarded_unconfirmed_master_claim_does_not_elect_candidate");
+
+    brain.brains.erase(candidate);
+    brain.brains.erase(forwarder);
+    delete candidate;
+    delete forwarder;
+  }
+
+  // Once a peer was selected as master, its own fresh registration must be
+  // authoritative about whether it still owns that role.  Otherwise a prior
+  // forwarded claim can leave every Brain following a ghost master forever.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.noMasterYet = false;
+
+    BrainView *candidate = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.13", false).v4);
+    candidate->connected = true;
+    candidate->isFixedFile = true;
+    candidate->fslot = 55;
+    candidate->isMasterBrain = true;
+    candidate->registrationFresh = true;
+    candidate->existingMasterUUID = candidate->uuid;
+    brain.brains.insert(candidate);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(
+        buffer,
+        BrainTopic::registration,
+        candidate->uuid,
+        int64_t(31),
+        uint64_t(15),
+        uint128_t(0));
+    brain.testBrainHandler(candidate, message);
+
+    suite.expect(brain.noMasterYet, "registration_selected_master_disclaim_reopens_election");
+    suite.expect(candidate->isMasterBrain == false, "registration_selected_master_disclaim_revokes_ghost_master");
+
+    brain.brains.erase(candidate);
+    delete candidate;
+  }
+
+  // The same revocation is required when the selected peer reports another
+  // master.  That forwarded target also needs its own fresh self-claim before
+  // it can replace the selected peer.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.noMasterYet = false;
+
+    BrainView *candidate = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.13", false).v4);
+    candidate->connected = true;
+    candidate->isFixedFile = true;
+    candidate->fslot = 56;
+    candidate->isMasterBrain = true;
+    candidate->registrationFresh = true;
+    candidate->existingMasterUUID = candidate->uuid;
+    brain.brains.insert(candidate);
+
+    BrainView *forwardedTarget = makePeer(uint128_t(0x400), 40, IPAddress("10.0.0.14", false).v4);
+    forwardedTarget->connected = true;
+    forwardedTarget->isFixedFile = true;
+    forwardedTarget->fslot = 57;
+    forwardedTarget->registrationFresh = false;
+    brain.brains.insert(forwardedTarget);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(
+        buffer,
+        BrainTopic::registration,
+        candidate->uuid,
+        int64_t(31),
+        uint64_t(16),
+        forwardedTarget->uuid);
+    brain.testBrainHandler(candidate, message);
+
+    suite.expect(brain.noMasterYet, "registration_selected_master_other_claim_reopens_election");
+    suite.expect(candidate->isMasterBrain == false, "registration_selected_master_other_claim_revokes_ghost_master");
+    suite.expect(forwardedTarget->isMasterBrain == false, "registration_selected_master_other_claim_does_not_elect_unconfirmed_target");
+
+    brain.brains.erase(candidate);
+    brain.brains.erase(forwardedTarget);
+    delete candidate;
+    delete forwardedTarget;
+  }
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -1958,9 +2172,15 @@ int main(void)
       runPendingDesignatedMasterRecoveryFixtures(suite);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (std::strcmp(testOnly, "ghost-master-registration") == 0)
+    {
+      runGhostMasterRegistrationFixtures(suite);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
   }
 
   runStrandedFollowerReconnectFixture(suite);
+  runGhostMasterRegistrationFixtures(suite);
 
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_dev_master_stale_detection");

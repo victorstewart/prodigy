@@ -10972,6 +10972,17 @@ public:
     return existingMasterUUID;
   }
 
+  void publishLocalMasterIdentity(void)
+  {
+    for (BrainView *peer : brains)
+    {
+      if (peer != nullptr && peer->quarantined == false)
+      {
+        peer->sendRegistration(boottimens, version, getExistingMasterUUID());
+      }
+    }
+  }
+
   bool peerClaimsCurrentMasterIdentity(const BrainView *peer) const
   {
     if (peer == nullptr || weAreMaster)
@@ -11239,6 +11250,14 @@ public:
     }
 
     return true;
+  }
+
+  bool peerHasFreshMasterOwnershipClaim(BrainView *peer) const
+  {
+    // A forwarded identity is a vote, not proof that its target still owns
+    // master authority. Only that live peer's own registration can prove it.
+    return peerHasFreshExistingMasterClaim(peer) && peerSocketActive(peer) &&
+           peer->existingMasterUUID == peer->uuid;
   }
 
   uint128_t deriveRegisteredMasterUUID(void) const
@@ -19327,6 +19346,9 @@ public:
     {
       bv->forceConnectorOwnershipUntilMasterAck = false;
     }
+    // Keep live peers from retaining our previous self-claim while ordinary
+    // heartbeat acknowledgements continue after we relinquish authority.
+    publishLocalMasterIdentity();
   }
 
   bool selfElectAsMaster(const char *reason = "unspecified", bool replaceLiveMothershipListener = false)
@@ -19493,14 +19515,7 @@ public:
     }
 
     // Broadcast our selected-master identity immediately so peers converge on this master.
-    for (BrainView *bv : brains)
-    {
-      if (bv->quarantined)
-      {
-        continue;
-      }
-      bv->sendRegistration(boottimens, version, getExistingMasterUUID());
-    }
+    publishLocalMasterIdentity();
 
     // Existing peer links and canonical connector ownership are sufficient here.
 
@@ -19685,6 +19700,7 @@ public:
 
     refreshMasterAuthorityRuntimeStateFromLiveFields();
     persistLocalRuntimeState();
+    publishLocalMasterIdentity();
     refreshMasterPeerLivenessWaiter(brain, "elect-master");
   }
 
@@ -19769,6 +19785,8 @@ public:
         existingMasterUUID = resolveConsistentExistingMasterUUID();
       }
 
+      const bool existingPeerOwnsMaster = peerHasFreshMasterOwnershipClaim(
+          findBrainViewByUUID(existingMasterUUID));
       for (BrainView *brain : brains)
       {
         brain->existingMasterUUID = 0; // clear all of these
@@ -19788,8 +19806,8 @@ public:
         {
           if (BrainView *brain = findBrainViewByUUID(existingMasterUUID); brain != nullptr)
           {
-            // Never adopt a missing/stale master candidate.
-            if (brain->quarantined == false && brain->boottimens > 0)
+            // A live follower may still forward a former master's UUID.
+            if (existingPeerOwnsMaster)
             {
               electBrainToMaster(brain);
               adoptedExistingMaster = true;
@@ -26890,6 +26908,9 @@ public:
       case BrainTopic::registration:
         {
           uint8_t *args = message->args;
+          const bool peerWasSelectedMaster =
+              weAreMaster == false && noMasterYet == false &&
+              peerRepresentsCurrentMaster(bv);
 
           // uuid(16) boottimens(8) version(8) existingMasterUUID(16) kernel{4} osID{4} osVersionID{4}
           Message::extractArg<ArgumentNature::fixed>(args, bv->uuid);
@@ -26938,6 +26959,16 @@ public:
             armMachineUpdateTimerIfNeeded();
           }
           onUpdateSelfPeerRegistration(bv);
+
+          if (peerWasSelectedMaster && weAreMaster == false &&
+              pendingDesignatedMasterPeerKey == 0 && updateSelfState == UpdateSelfState::idle &&
+              bv->existingMasterUUID != bv->uuid)
+          {
+            // Heartbeats prove this process is alive, not that it remains
+            // master. Re-enter the existing election when it disclaims that
+            // role instead of indefinitely following a live follower.
+            resetMasterBrainAssignment();
+          }
 
           if (weAreMaster && bv->existingMasterUUID == selfBrainUUID())
           {
@@ -27093,7 +27124,8 @@ public:
             }
             else
             {
-              if (BrainView *peer = findBrainViewByUUID(bv->existingMasterUUID); peer != nullptr)
+              if (BrainView *peer = findBrainViewByUUID(bv->existingMasterUUID);
+                  peerHasFreshMasterOwnershipClaim(peer))
               {
                 electBrainToMaster(peer);
               }
