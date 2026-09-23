@@ -19354,6 +19354,18 @@ public:
   bool selfElectAsMaster(const char *reason = "unspecified", bool replaceLiveMothershipListener = false)
   {
     basics_log("selfElectAsMaster begin weAreMaster=%d reason=%s\n", int(weAreMaster), reason);
+    if (nBrains > 1 && brainConfig.clusterUUID == 0)
+    {
+      // The standalone seed must accept its first configure request. A new
+      // follower must first persist the configured master's state; topology
+      // and a live transport alone do not make it ready to own the cluster.
+      basics_log("selfElectAsMaster rejected reason=cluster-configuration-not-received request=%s\n", reason);
+      if (weAreMaster)
+      {
+        forfeitMasterStatus();
+      }
+      return false;
+    }
     if (localBrainEligibleForMasterElection() == false)
     {
       basics_log("selfElectAsMaster rejected reason=local-brain-not-in-authoritative-topology request=%s\n", reason);
@@ -19647,6 +19659,30 @@ public:
     recoverDeploymentsAfterNeuronState();
 
     return true;
+  }
+
+  void queueSelectedMasterStateReconciliation(BrainView *brain)
+  {
+    if (weAreMaster || noMasterYet || peerEligibleForClusterQuorum(brain) == false ||
+        brain->registrationFresh == false || peerSocketActive(brain) == false ||
+        peerRepresentsCurrentMaster(brain) == false)
+    {
+      return;
+    }
+
+    // Every peer-master adoption and fresh transport must request the same
+    // authoritative snapshot, including BrainConfig, through this owner.
+    BrainReconcileStateRequest request = {};
+    for (const auto& [deploymentID, plan] : deploymentPlans)
+    {
+      request.deploymentIDs.push_back(plan.config.deploymentID());
+    }
+    capturePresentSystemArtifactRef(request.systemArtifact);
+
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    Message::construct(brain->wBuffer, BrainTopic::reconcileState, serializedRequest);
+    Ring::queueSend(brain);
   }
 
   void electBrainToMaster(BrainView *brain)
@@ -26908,6 +26944,10 @@ public:
       case BrainTopic::registration:
         {
           uint8_t *args = message->args;
+          const uint128_t previousMasterUUID = getExistingMasterUUID();
+          const bool peerRegistrationWasFresh = bv->registrationFresh;
+          const bool peerPreviouslyClaimedMaster =
+              bv->uuid != 0 && bv->existingMasterUUID == bv->uuid;
           const bool peerWasSelectedMaster =
               weAreMaster == false && noMasterYet == false &&
               peerRepresentsCurrentMaster(bv);
@@ -27149,29 +27189,17 @@ public:
               basics_log("registration waiting designated master peerKey=%s from=%s claim=%s\n",
                          pendingPeerKeyText.c_str(), fromUUIDText.c_str(), claimUUIDText.c_str());
             }
+          }
 
-            if (!noMasterYet && !weAreMaster) // aka we just now have a master and it's not us
-            {
-              for (BrainView *bv : brains)
-              {
-                if (peerRepresentsCurrentMaster(bv))
-                {
-                  // send the deployments we have
-                  // the master will respond with any to cull and any we don't have yet
-
-                  BrainReconcileStateRequest request = {};
-                  for (const auto& [deploymentID, plan] : deploymentPlans)
-                  {
-                    request.deploymentIDs.push_back(plan.config.deploymentID());
-                  }
-                  capturePresentSystemArtifactRef(request.systemArtifact);
-
-                  String serializedRequest = {};
-                  BitseryEngine::serialize(serializedRequest, request);
-                  Message::construct(bv->wBuffer, BrainTopic::reconcileState, serializedRequest);
-                }
-              }
-            }
+          const uint128_t selectedMasterUUID = getExistingMasterUUID();
+          const bool selectedPeerRegistered = selectedMasterUUID != 0 && selectedMasterUUID == bv->uuid;
+          if (weAreMaster == false && noMasterYet == false &&
+              (selectedMasterUUID != previousMasterUUID ||
+               (selectedPeerRegistered &&
+                (peerRegistrationWasFresh == false ||
+                 (peerPreviouslyClaimedMaster == false && bv->existingMasterUUID == bv->uuid)))))
+          {
+            queueSelectedMasterStateReconciliation(findBrainViewByUUID(selectedMasterUUID));
           }
 
           // late-join reconciliation: if we are master and peer has an older bundle, push and transition it now

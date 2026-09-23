@@ -1073,6 +1073,7 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x123);
     brain.hasCompletedInitialMasterElection = true;
     brain.noMasterYet = true;
     brain.weAreMaster = false;
@@ -1569,6 +1570,183 @@ static void runGhostMasterRegistrationFixtures(TestSuite& suite)
     delete candidate;
     delete forwardedTarget;
   }
+}
+
+static void runDirectMasterClaimReconciliationFixtures(TestSuite& suite)
+{
+  // A configured multi-Brain cluster must not promote a follower that has
+  // received topology/heartbeats but not the combined configuration snapshot.
+  // This guard must run before either listener creation or master identity
+  // publication to peers.
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+
+    BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 83;
+    brain.brains.insert(peer);
+
+    suite.expect(brain.testSelfElectAsMaster("unconfigured-multi-brain") == false,
+                 "unconfigured_multi_brain_self_elect_rejects_promotion");
+    suite.expect(brain.weAreMaster == false && brain.noMasterYet &&
+                     brain.testMothershipUnixListenerActive() == false,
+                 "unconfigured_multi_brain_self_elect_does_not_publish_listener");
+    suite.expect(peer->wBuffer.empty(),
+                 "unconfigured_multi_brain_self_elect_does_not_publish_master_identity");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  // A direct fresh claim selects the peer before the old noMasterYet-only
+  // reconciliation branch.  The newly selected master must still receive a
+  // real reconcile request so it can return the combined BrainConfig and
+  // master-authority transition to this follower.
+  TestBrain brain = {};
+  brain.iaas = new NoopBrainIaaS();
+  brain.nBrains = 2;
+  brain.noMasterYet = true;
+
+  BrainView *claimedMaster = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.13", false).v4);
+  claimedMaster->connected = true;
+  claimedMaster->isFixedFile = true;
+  claimedMaster->fslot = 81;
+  brain.brains.insert(claimedMaster);
+
+  String registrationBuffer = {};
+  brain.testBrainHandler(
+      claimedMaster,
+      buildBrainMessage(
+          registrationBuffer,
+          BrainTopic::registration,
+          claimedMaster->uuid,
+          int64_t(31),
+          uint64_t(17),
+          claimedMaster->uuid));
+
+  uint32_t reconcileRequests = 0;
+  forEachMessageInBuffer(claimedMaster->wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::reconcileState)
+    {
+      reconcileRequests += 1;
+    }
+  });
+
+  suite.expect(claimedMaster->isMasterBrain && brain.noMasterYet == false && brain.weAreMaster == false,
+               "direct_master_claim_adoption_selects_claimed_peer_before_reconcile");
+  suite.expect(reconcileRequests == 1,
+               "direct_master_claim_adoption_queues_reconcile_for_combined_config_transition");
+
+  brain.brains.erase(claimedMaster);
+  delete claimedMaster;
+
+  // A master selected before its first registration on this transport also
+  // needs exactly one catch-up request. Repeated fresh registrations must not
+  // replay it and turn heartbeat traffic into a reconciliation loop.
+  TestBrain reconnectingFollower = {};
+  reconnectingFollower.iaas = new NoopBrainIaaS();
+  reconnectingFollower.nBrains = 2;
+  reconnectingFollower.noMasterYet = false;
+
+  BrainView *selectedMaster = makePeer(uint128_t(0x400), 40, IPAddress("10.0.0.14", false).v4);
+  selectedMaster->connected = true;
+  selectedMaster->isFixedFile = true;
+  selectedMaster->fslot = 82;
+  selectedMaster->isMasterBrain = true;
+  selectedMaster->registrationFresh = false;
+  selectedMaster->existingMasterUUID = selectedMaster->uuid;
+  reconnectingFollower.brains.insert(selectedMaster);
+
+  String reconnectRegistration = {};
+  reconnectingFollower.testBrainHandler(
+      selectedMaster,
+      buildBrainMessage(
+          reconnectRegistration,
+          BrainTopic::registration,
+          selectedMaster->uuid,
+          int64_t(41),
+          uint64_t(18),
+          selectedMaster->uuid));
+
+  uint32_t firstRegistrationReconciles = 0;
+  forEachMessageInBuffer(selectedMaster->wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::reconcileState)
+    {
+      firstRegistrationReconciles += 1;
+    }
+  });
+
+  reconnectRegistration.clear();
+  reconnectingFollower.testBrainHandler(
+      selectedMaster,
+      buildBrainMessage(
+          reconnectRegistration,
+          BrainTopic::registration,
+          selectedMaster->uuid,
+          int64_t(41),
+          uint64_t(18),
+          selectedMaster->uuid));
+
+  uint32_t repeatedRegistrationReconciles = 0;
+  forEachMessageInBuffer(selectedMaster->wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::reconcileState)
+    {
+      repeatedRegistrationReconciles += 1;
+    }
+  });
+
+  suite.expect(firstRegistrationReconciles == 1,
+               "selected_master_first_fresh_registration_queues_single_reconcile");
+  suite.expect(repeatedRegistrationReconciles == 1,
+               "selected_master_repeat_fresh_registration_does_not_duplicate_reconcile");
+
+  reconnectingFollower.brains.erase(selectedMaster);
+  delete selectedMaster;
+
+  // The common registration tail must also retain reconciliation when normal
+  // UUID ordering derives a peer master. deriveMasterBrain clears claims as it
+  // converges, so this path has no explicit existing-master UUID to key from.
+  TestBrain derivedFollower = {};
+  derivedFollower.iaas = new NoopBrainIaaS();
+  derivedFollower.nBrains = 2;
+  derivedFollower.boottimens = 10;
+
+  BrainView *derivedMaster = makePeer(uint128_t(0x050), 20, IPAddress("10.0.0.15", false).v4);
+  derivedMaster->connected = true;
+  derivedMaster->isFixedFile = true;
+  derivedMaster->fslot = 84;
+  derivedFollower.brains.insert(derivedMaster);
+
+  String derivedRegistration = {};
+  derivedFollower.testBrainHandler(
+      derivedMaster,
+      buildBrainMessage(
+          derivedRegistration,
+          BrainTopic::registration,
+          derivedMaster->uuid,
+          int64_t(20),
+          uint64_t(19),
+          uint128_t(0)));
+
+  uint32_t derivedReconcileRequests = 0;
+  forEachMessageInBuffer(derivedMaster->wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::reconcileState)
+    {
+      derivedReconcileRequests += 1;
+    }
+  });
+
+  suite.expect(derivedMaster->isMasterBrain && derivedFollower.noMasterYet == false &&
+                   derivedFollower.weAreMaster == false,
+               "derived_peer_master_selection_converges_before_reconcile");
+  suite.expect(derivedReconcileRequests == 1,
+               "derived_peer_master_selection_queues_reconcile_after_claim_clear");
+
+  derivedFollower.brains.erase(derivedMaster);
+  delete derivedMaster;
 }
 
 int main(void)
@@ -2177,10 +2355,20 @@ int main(void)
       runGhostMasterRegistrationFixtures(suite);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (std::strcmp(testOnly, "direct-master-claim-reconciliation") == 0)
+    {
+      withUniqueMothershipSocket(
+          "direct_master_claim_reconciliation_socket_dir_created",
+          [&] { runDirectMasterClaimReconciliationFixtures(suite); });
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
   }
 
   runStrandedFollowerReconnectFixture(suite);
   runGhostMasterRegistrationFixtures(suite);
+  withUniqueMothershipSocket("direct_master_claim_reconciliation_socket_dir_created", [&] {
+    runDirectMasterClaimReconciliationFixtures(suite);
+  });
 
   suite.expect(prodigyBrainPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_production_master_stale_detection");
   suite.expect(prodigyBrainDevPeerHeartbeatTimeoutMs <= 5000u, "timing_knobs_bound_dev_master_stale_detection");
