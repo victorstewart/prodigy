@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
+#include <prodigy/persistent.state.h>
 
 class MothershipClusterRemoveSummary {
 public:
@@ -29,11 +30,15 @@ public:
 // This is deliberately the only thing the emergency reader is allowed to
 // return.  In particular it is not a BrainConfig or a persistent snapshot:
 // those also contain the credential and SSH-key sidecars needed to run a
-// cluster.  The payload is shared by every adopted machine and is compared as
-// a serialized value before Mothership touches the DNS provider.
+// cluster.  The shared topology and lease payload is compared before
+// Mothership touches the DNS provider. Source identity is kept separately:
+// each queried machine necessarily reports a different local UUID.
 class MothershipOfflineDNSCleanupInventory {
 public:
   uint128_t clusterUUID = 0;
+  uint128_t sourceSnapshotClusterUUID = 0;
+  uint128_t sourceLocalMachineUUID = 0;
+  uint128_t sourceOwnerClusterUUID = 0;
   class Machine {
   public:
     uint128_t uuid = 0;
@@ -54,6 +59,9 @@ template <typename S>
 static void serialize(S&& serializer, MothershipOfflineDNSCleanupInventory& inventory)
 {
   serializer.value16b(inventory.clusterUUID);
+  serializer.value16b(inventory.sourceSnapshotClusterUUID);
+  serializer.value16b(inventory.sourceLocalMachineUUID);
+  serializer.value16b(inventory.sourceOwnerClusterUUID);
   serializer.object(inventory.machines);
   serializer.object(inventory.dnsRecordLeases);
 }
@@ -70,6 +78,103 @@ static inline bool mothershipOfflineDNSCleanupInventoryMatches(const MothershipO
   {
     if ((expected.dnsRecordLeases[i] == actual.dnsRecordLeases[i]) == false) return false;
   }
+  return true;
+}
+
+enum class MothershipOfflineDNSRecoveryMode : uint8_t {
+  strict = 0,
+  allowUnconfiguredSnapshot = 1,
+};
+
+// The emergency reader intentionally opens only the public TideDB records.
+// It never constructs ProdigyPersistentStateStore, which would consult the
+// private sidecar to reconstruct runnable TLS and bootstrap state.
+static inline bool mothershipBuildOfflineDNSCleanupInventory(const String& statePath, uint128_t expectedClusterUUID, bool allowUnconfiguredSnapshot, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
+{
+  inventory = {};
+  if (expectedClusterUUID == 0)
+  {
+    failure.assign("offline DNS recovery requires a nonzero cluster UUID"_ctv);
+    return false;
+  }
+  TidesDB db(statePath);
+  String serialized = {};
+  if (db.read("brain", "snapshot", serialized, &failure) == false) return false;
+  ProdigyPersistentStoredBrainSnapshot stored = {};
+  if (prodigyLoadPersistentStoredRecord(serialized, stored) == false)
+  {
+    failure.assign("offline DNS recovery snapshot decode failed"_ctv);
+    return false;
+  }
+  const uint128_t snapshotClusterUUID = stored.state.brainConfig.clusterUUID;
+  if (snapshotClusterUUID != expectedClusterUUID && (allowUnconfiguredSnapshot == false || snapshotClusterUUID != 0))
+  {
+    failure.assign("offline DNS recovery snapshot cluster UUID does not match requested cluster"_ctv);
+    return false;
+  }
+  inventory.clusterUUID = expectedClusterUUID;
+  inventory.sourceSnapshotClusterUUID = snapshotClusterUUID;
+  if (allowUnconfiguredSnapshot)
+  {
+    // This repair mode is only for the observed empty-cluster configuration
+    // defect. A live deployment plan or DNS lease needs the ordinary,
+    // fully configured snapshot recovery path.
+    if (stored.state.masterAuthority.deploymentPlans.empty() == false)
+    {
+      failure.assign("offline unconfigured DNS recovery requires no deployment plans"_ctv);
+      return false;
+    }
+    for (const RoutableResourceLease& lease : stored.state.masterAuthority.runtimeState.routableResourceLeases)
+    {
+      if (lease.kind == RoutableResourceLeaseKind::dnsRecord)
+      {
+        failure.assign("offline unconfigured DNS recovery requires no DNS leases"_ctv);
+        return false;
+      }
+    }
+    String localSerialized = {};
+    if (db.read("brain", "local_brain_state", localSerialized, &failure) == false) return false;
+    ProdigyPersistentStoredLocalBrainState local = {};
+    if (prodigyLoadPersistentStoredRecord(localSerialized, local) == false)
+    {
+      failure.assign("offline DNS recovery local public state decode failed"_ctv);
+      return false;
+    }
+    if (local.state.ownerClusterUUID != expectedClusterUUID || local.state.uuid == 0)
+    {
+      failure.assign("offline DNS recovery local public ownership does not match requested cluster"_ctv);
+      return false;
+    }
+    inventory.sourceOwnerClusterUUID = local.state.ownerClusterUUID;
+    inventory.sourceLocalMachineUUID = local.state.uuid;
+  }
+  for (const ClusterMachine& machine : stored.state.topology.machines)
+  {
+    if (machine.ssh.address.size() == 0)
+    {
+      failure.assign("offline DNS recovery snapshot topology has a machine without SSH address"_ctv);
+      return false;
+    }
+    if (machine.uuid == 0)
+    {
+      failure.assign("offline DNS recovery snapshot topology has a machine without UUID"_ctv);
+      return false;
+    }
+    inventory.machines.push_back({.uuid = machine.uuid, .sshAddress = machine.ssh.address});
+  }
+  for (const RoutableResourceLease& lease : stored.state.masterAuthority.runtimeState.routableResourceLeases)
+  {
+    if (lease.kind == RoutableResourceLeaseKind::dnsRecord) inventory.dnsRecordLeases.push_back(lease);
+  }
+  // A deterministic ordering makes inventories from different elected peers
+  // byte-comparable without retaining a second recovery journal.
+  std::sort(inventory.machines.begin(), inventory.machines.end(), [](const MothershipOfflineDNSCleanupInventory::Machine& a, const MothershipOfflineDNSCleanupInventory::Machine& b) { return a.uuid < b.uuid || (a.uuid == b.uuid && prodigyPersistentStringComesBefore(a.sshAddress, b.sshAddress)); });
+  std::sort(inventory.dnsRecordLeases.begin(), inventory.dnsRecordLeases.end(), [](const RoutableResourceLease& a, const RoutableResourceLease& b) {
+    RoutableResourceLease ac = a, bc = b; String as = {}, bs = {}; BitseryEngine::serialize(as, ac); BitseryEngine::serialize(bs, bc);
+    const size_t common = std::min(as.size(), bs.size()); const int compared = common ? std::memcmp(as.data(), bs.data(), common) : 0;
+    return compared != 0 ? compared < 0 : as.size() < bs.size();
+  });
+  failure.clear();
   return true;
 }
 
@@ -414,7 +519,7 @@ static inline void mothershipCollectAdoptedClusterRemoveMachines(const Mothershi
   }
 }
 
-static inline bool mothershipRunOfflineDNSRecovery(const MothershipProdigyCluster& cluster, MothershipOfflineDNSRecoveryHooks& hooks, MothershipClusterRemoveSummary& summary, String *failure = nullptr)
+static inline bool mothershipRunOfflineDNSRecovery(const MothershipProdigyCluster& cluster, MothershipOfflineDNSRecoveryHooks& hooks, MothershipClusterRemoveSummary& summary, String *failure = nullptr, MothershipOfflineDNSRecoveryMode mode = MothershipOfflineDNSRecoveryMode::strict)
 {
   summary = {};
   if (failure) failure->clear();
@@ -458,13 +563,42 @@ static inline bool mothershipRunOfflineDNSRecovery(const MothershipProdigyCluste
   for (const MothershipProdigyClusterMachine& machine : machines)
     if (hooks.quiesce(machine, failure) == false) return false;
   MothershipOfflineDNSCleanupInventory inventory = {};
+  bool sawAuthoritativeSnapshot = false;
   for (const MothershipProdigyClusterMachine& machine : machines)
   {
     MothershipOfflineDNSCleanupInventory observed = {};
     if (hooks.exportInventory(machine, observed, failure) == false) return false;
-    if (observed.clusterUUID != cluster.clusterUUID || (inventory.clusterUUID != 0 && mothershipOfflineDNSCleanupInventoryMatches(inventory, observed) == false))
+    if (observed.clusterUUID != cluster.clusterUUID ||
+        (mode == MothershipOfflineDNSRecoveryMode::strict && observed.sourceSnapshotClusterUUID != cluster.clusterUUID) ||
+        (mode == MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot &&
+         observed.sourceSnapshotClusterUUID != 0 && observed.sourceSnapshotClusterUUID != cluster.clusterUUID) ||
+        (inventory.clusterUUID != 0 && mothershipOfflineDNSCleanupInventoryMatches(inventory, observed) == false))
     { if (failure) failure->assign("offline DNS recovery inventories do not match"_ctv); return false; }
+
+    if (mode == MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot)
+    {
+      uint128_t expectedLocalUUID = 0;
+      for (const MothershipOfflineDNSCleanupInventory::Machine& expectedMachine : expected.machines)
+        if (expectedMachine.sshAddress == machine.ssh.address) { expectedLocalUUID = expectedMachine.uuid; break; }
+      if (observed.sourceOwnerClusterUUID != cluster.clusterUUID || observed.sourceLocalMachineUUID == 0 ||
+          observed.sourceLocalMachineUUID != expectedLocalUUID)
+      {
+        if (failure) failure->assign("offline DNS recovery local public ownership does not match registered machine"_ctv);
+        return false;
+      }
+    }
+    sawAuthoritativeSnapshot = sawAuthoritativeSnapshot || observed.sourceSnapshotClusterUUID == cluster.clusterUUID;
     inventory = std::move(observed);
+  }
+  if (mode == MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot && sawAuthoritativeSnapshot == false)
+  {
+    if (failure) failure->assign("offline DNS recovery requires an authoritative snapshot witness"_ctv);
+    return false;
+  }
+  if (mode == MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot && inventory.dnsRecordLeases.empty() == false)
+  {
+    if (failure) failure->assign("offline unconfigured DNS recovery requires no DNS leases"_ctv);
+    return false;
   }
   MothershipOfflineDNSCleanupInventory observed = {}; observed.clusterUUID = inventory.clusterUUID; observed.machines = inventory.machines;
   if (mothershipOfflineDNSCleanupInventoryMatches(expected, observed) == false) { if (failure) failure->assign("offline DNS recovery inventory source membership mismatch"_ctv); return false; }

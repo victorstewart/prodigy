@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <filesystem>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -181,12 +182,37 @@ public:
   uint32_t failWipeCall = 0;
   uint32_t wipeCalls = 0;
   MothershipOfflineDNSCleanupInventory inventory = {};
+  Vector<MothershipOfflineDNSCleanupInventory> inventories = {};
+  uint32_t exportCalls = 0;
   Vector<String> callOrder = {};
   bool quiesce(const MothershipProdigyClusterMachine&, String *failure) override { callOrder.push_back("quiesce"_ctv); if (failure) failure->clear(); return true; }
-  bool exportInventory(const MothershipProdigyClusterMachine&, MothershipOfflineDNSCleanupInventory& result, String *failure) override { callOrder.push_back("export"_ctv); if (failExport) { if (failure) failure->assign("export failed"_ctv); return false; } result = inventory; if (failure) failure->clear(); return true; }
+  bool exportInventory(const MothershipProdigyClusterMachine&, MothershipOfflineDNSCleanupInventory& result, String *failure) override { callOrder.push_back("export"_ctv); if (failExport) { if (failure) failure->assign("export failed"_ctv); return false; } result = inventories.empty() ? inventory : inventories[exportCalls < inventories.size() ? exportCalls : inventories.size() - 1]; exportCalls += 1; if (failure) failure->clear(); return true; }
   bool removeDNS(const MothershipOfflineDNSCleanupInventory&, uint32_t& removed, String *failure) override { callOrder.push_back("dns"_ctv); if (failDNS) { if (failure) failure->assign("dns failed"_ctv); return false; } removed = 1; if (failure) failure->clear(); return true; }
   bool wipe(const MothershipProdigyClusterMachine&, String *failure) override { callOrder.push_back("wipe"_ctv); if (++wipeCalls == failWipeCall) { if (failure) failure->assign("wipe failed"_ctv); return false; } if (failure) failure->clear(); return true; }
 };
+
+static bool writeOfflinePublicRecoveryState(const String& statePath, const ProdigyPersistentBrainSnapshot& snapshot, const ProdigyPersistentLocalBrainState *localState, String& failure)
+{
+  TidesDB db(statePath);
+  ProdigyPersistentStoredBrainSnapshot storedSnapshot = {};
+  storedSnapshot.state = snapshot;
+  String serialized = {};
+  BitseryEngine::serialize(serialized, storedSnapshot);
+  if (db.write("brain", "snapshot", serialized, &failure) == false) return false;
+  if (localState == nullptr) return true;
+  ProdigyPersistentStoredLocalBrainState storedLocal = {};
+  storedLocal.state = *localState;
+  serialized.clear();
+  BitseryEngine::serialize(serialized, storedLocal);
+  return db.write("brain", "local_brain_state", serialized, &failure);
+}
+
+static bool cleanupOfflinePublicRecoveryState(const String& statePath)
+{
+  std::error_code error = {};
+  std::filesystem::remove_all(std::string(reinterpret_cast<const char *>(statePath.data()), statePath.size()), error);
+  return !error;
+}
 
 static bool equalStrings(const Vector<String>& values, std::initializer_list<const char *> expected)
 {
@@ -446,6 +472,95 @@ int main(void)
   }
 
   {
+    char temporary[] = "/tmp/prodigy-offline-public-recovery-XXXXXX";
+    char *directory = ::mkdtemp(temporary);
+    suite.expect(directory != nullptr, "offline_public_recovery_creates_temporary_state");
+    if (directory != nullptr)
+    {
+      String statePath = {}; statePath.assign(directory); statePath.append("/state"_ctv);
+      const uint128_t clusterUUID = 77;
+      ProdigyPersistentBrainSnapshot snapshot = {};
+      snapshot.brainConfig.clusterUUID = clusterUUID;
+      ClusterMachine machine = makeTopologyMachine("10.0.3.1"_ctv, ClusterMachineSource::adopted, ClusterMachineBacking::owned);
+      machine.uuid = 101;
+      snapshot.topology.machines.push_back(machine);
+      ProdigyPersistentLocalBrainState local = {};
+      local.ownerClusterUUID = clusterUUID;
+      local.uuid = machine.uuid;
+      String failure = {};
+      MothershipOfflineDNSCleanupInventory inventory = {};
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, false, inventory, failure) &&
+                   inventory.sourceSnapshotClusterUUID == clusterUUID && inventory.sourceLocalMachineUUID == 0 &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) &&
+                   inventory.sourceOwnerClusterUUID == clusterUUID && inventory.sourceLocalMachineUUID == machine.uuid,
+                   "offline_public_recovery_strict_configured_and_selected_public_owner_pass");
+      String secretsPath = {}; resolveProdigyPersistentSecretsDBPath(statePath, secretsPath);
+      suite.expect(::access(secretsPath.c_str(), F_OK) != 0, "offline_public_recovery_never_creates_or_opens_secret_sidecar");
+
+      snapshot.brainConfig.clusterUUID = 0;
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, false, inventory, failure) == false &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure),
+                   "offline_public_recovery_zero_snapshot_strict_rejects_selected_accepts");
+      suite.expect(mothershipBuildOfflineDNSCleanupInventory(statePath, 0, false, inventory, failure) == false &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, 0, true, inventory, failure) == false,
+                   "offline_public_recovery_zero_requested_uuid_rejected");
+
+      local.ownerClusterUUID = 0;
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_zero_owner_rejected");
+      local.ownerClusterUUID = clusterUUID + 1;
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_wrong_owner_rejected");
+      local.ownerClusterUUID = clusterUUID;
+      local.uuid = 0;
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_zero_local_uuid_rejected");
+      local.uuid = machine.uuid;
+
+      String missingPath = {}; missingPath.assign(directory); missingPath.append("/missing-local"_ctv);
+      suite.expect(writeOfflinePublicRecoveryState(missingPath, snapshot, nullptr, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(missingPath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_missing_local_record_rejected");
+      String malformedPath = {}; malformedPath.assign(directory); malformedPath.append("/malformed-local"_ctv);
+      String malformedRecord = "not-a-persistent-local-state"_ctv;
+      bool wroteMalformedLocalRecord = false;
+      if (writeOfflinePublicRecoveryState(malformedPath, snapshot, nullptr, failure))
+      {
+        TidesDB malformedDB(malformedPath);
+        wroteMalformedLocalRecord = malformedDB.write("brain", "local_brain_state", malformedRecord, &failure);
+      }
+      suite.expect(wroteMalformedLocalRecord &&
+                   mothershipBuildOfflineDNSCleanupInventory(malformedPath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_malformed_local_record_rejected");
+
+      snapshot.brainConfig.clusterUUID = clusterUUID + 1;
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_foreign_snapshot_rejected");
+      snapshot.brainConfig.clusterUUID = 0;
+      snapshot.masterAuthority.deploymentPlans.insert_or_assign(1, DeploymentPlan{});
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_deployment_plan_rejected");
+      snapshot.masterAuthority.deploymentPlans.clear();
+      RoutableResourceLease dnsLease = {}; dnsLease.kind = RoutableResourceLeaseKind::dnsRecord;
+      snapshot.masterAuthority.runtimeState.routableResourceLeases.push_back(dnsLease);
+      suite.expect(writeOfflinePublicRecoveryState(statePath, snapshot, &local, failure) &&
+                   mothershipBuildOfflineDNSCleanupInventory(statePath, clusterUUID, true, inventory, failure) == false,
+                   "offline_public_recovery_dns_lease_rejected");
+      suite.expect(cleanupOfflinePublicRecoveryState(statePath) && cleanupOfflinePublicRecoveryState(missingPath) &&
+                   cleanupOfflinePublicRecoveryState(malformedPath),
+                   "offline_public_recovery_cleans_temporary_public_state");
+      std::error_code error = {}; std::filesystem::remove_all(directory, error);
+    }
+  }
+
+  {
     MothershipProdigyCluster cluster = {};
     cluster.clusterUUID = 77;
     cluster.includeLocalMachine = false;
@@ -456,19 +571,19 @@ int main(void)
     ClusterMachine topologyB = makeTopologyMachine("10.0.3.2"_ctv, ClusterMachineSource::adopted, ClusterMachineBacking::owned); topologyB.uuid = 102;
     cluster.topology.machines.push_back(topologyA); cluster.topology.machines.push_back(topologyB);
     FakeOfflineDNSRecoveryHooks hooks = {};
-    hooks.inventory.clusterUUID = cluster.clusterUUID;
+    hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.sourceSnapshotClusterUUID = cluster.clusterUUID;
     hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv});
     String failure = {};
     MothershipClusterRemoveSummary summary = {};
     suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure), "offline_recovery_happy_path");
     suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export", "dns", "wipe", "wipe"}), "offline_recovery_quiesces_all_before_export_dns_and_wipe");
-    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failExport = true;
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.sourceSnapshotClusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failExport = true;
     suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false, "offline_recovery_export_failure_rejected");
     suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export"}), "offline_recovery_export_failure_preserves_roots");
-    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failDNS = true;
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.sourceSnapshotClusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failDNS = true;
     suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false, "offline_recovery_dns_failure_rejected");
     suite.expect(equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export", "dns"}), "offline_recovery_dns_failure_preserves_roots");
-    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failWipeCall = 2;
+    hooks = {}; hooks.inventory.clusterUUID = cluster.clusterUUID; hooks.inventory.sourceSnapshotClusterUUID = cluster.clusterUUID; hooks.inventory.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv}); hooks.inventory.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv}); hooks.failWipeCall = 2;
     suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false && summary.dnsTeardownCompleted && summary.wipedAdoptedMachines == 1, "offline_recovery_partial_wipe_records_completed_dns_and_progress");
     for (uint32_t invalidCase = 0; invalidCase < 5; ++invalidCase)
     {
@@ -486,6 +601,61 @@ int main(void)
     suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure) == false &&
                  equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export"}) && summary.dnsTeardownCompleted == false,
                  "offline_recovery_foreign_snapshot_never_deletes_dns_or_roots");
+
+    // The explicit configuration-defect mode remains bounded by a public
+    // per-machine owner/local-UUID witness and a configured snapshot witness.
+    hooks = {};
+    MothershipOfflineDNSCleanupInventory configured = {};
+    configured.clusterUUID = cluster.clusterUUID;
+    configured.sourceSnapshotClusterUUID = cluster.clusterUUID;
+    configured.sourceOwnerClusterUUID = cluster.clusterUUID;
+    configured.sourceLocalMachineUUID = 101;
+    configured.machines.push_back({.uuid = 101, .sshAddress = "10.0.3.1"_ctv});
+    configured.machines.push_back({.uuid = 102, .sshAddress = "10.0.3.2"_ctv});
+    MothershipOfflineDNSCleanupInventory unconfigured = configured;
+    unconfigured.sourceSnapshotClusterUUID = 0;
+    unconfigured.sourceLocalMachineUUID = 102;
+    hooks.inventories.push_back(configured);
+    hooks.inventories.push_back(unconfigured);
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure,
+                                                 MothershipOfflineDNSRecoveryMode::strict) == false &&
+                 equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export"}) && summary.dnsTeardownCompleted == false,
+                 "offline_strict_rejects_unconfigured_snapshot_before_dns_or_wipe");
+
+    hooks = {}; hooks.inventories.push_back(configured); hooks.inventories.push_back(unconfigured);
+    suite.expect(mothershipRunOfflineDNSRecovery(cluster, hooks, summary, &failure,
+                                                 MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot) &&
+                 equalStrings(hooks.callOrder, {"quiesce", "quiesce", "export", "export", "dns", "wipe", "wipe"}),
+                 "offline_unconfigured_recovery_requires_public_owner_and_configured_witness");
+
+    auto rejectsUnconfigured = [&](MothershipOfflineDNSCleanupInventory first, MothershipOfflineDNSCleanupInventory second) {
+      FakeOfflineDNSRecoveryHooks rejected = {};
+      rejected.inventories.push_back(std::move(first)); rejected.inventories.push_back(std::move(second));
+      return mothershipRunOfflineDNSRecovery(cluster, rejected, summary, &failure,
+                                              MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot) == false &&
+             equalStrings(rejected.callOrder, {"quiesce", "quiesce", "export", "export"}) &&
+             summary.dnsTeardownCompleted == false;
+    };
+    MothershipOfflineDNSCleanupInventory zeroOwner = unconfigured; zeroOwner.sourceOwnerClusterUUID = 0;
+    suite.expect(rejectsUnconfigured(configured, zeroOwner), "offline_unconfigured_zero_owner_preserves_roots");
+    MothershipOfflineDNSCleanupInventory wrongOwner = unconfigured; wrongOwner.sourceOwnerClusterUUID = cluster.clusterUUID + 1;
+    suite.expect(rejectsUnconfigured(configured, wrongOwner), "offline_unconfigured_wrong_owner_preserves_roots");
+    MothershipOfflineDNSCleanupInventory foreignSnapshot = unconfigured; foreignSnapshot.sourceSnapshotClusterUUID = cluster.clusterUUID + 1;
+    suite.expect(rejectsUnconfigured(configured, foreignSnapshot), "offline_unconfigured_foreign_snapshot_preserves_roots");
+    MothershipOfflineDNSCleanupInventory missingLocal = unconfigured; missingLocal.sourceLocalMachineUUID = 0;
+    suite.expect(rejectsUnconfigured(configured, missingLocal), "offline_unconfigured_missing_local_uuid_preserves_roots");
+    MothershipOfflineDNSCleanupInventory wrongLocal = unconfigured; wrongLocal.sourceLocalMachineUUID = 101;
+    suite.expect(rejectsUnconfigured(configured, wrongLocal), "offline_unconfigured_wrong_local_uuid_preserves_roots");
+    MothershipOfflineDNSCleanupInventory allZero = configured; allZero.sourceSnapshotClusterUUID = 0;
+    suite.expect(rejectsUnconfigured(allZero, unconfigured), "offline_unconfigured_no_authoritative_witness_preserves_roots");
+    MothershipOfflineDNSCleanupInventory mismatchedTopology = unconfigured; mismatchedTopology.machines[1].sshAddress = "10.0.3.9"_ctv;
+    suite.expect(rejectsUnconfigured(configured, mismatchedTopology), "offline_unconfigured_inventory_mismatch_preserves_roots");
+    MothershipOfflineDNSCleanupInventory configuredDNS = configured;
+    MothershipOfflineDNSCleanupInventory unconfiguredDNS = unconfigured;
+    RoutableResourceLease fakeDNSLease = {}; fakeDNSLease.kind = RoutableResourceLeaseKind::dnsRecord;
+    configuredDNS.dnsRecordLeases.push_back(fakeDNSLease);
+    unconfiguredDNS.dnsRecordLeases.push_back(fakeDNSLease);
+    suite.expect(rejectsUnconfigured(configuredDNS, unconfiguredDNS), "offline_unconfigured_controller_rejects_dns_inventory_preserves_roots");
 
   }
 

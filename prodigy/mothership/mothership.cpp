@@ -7467,59 +7467,19 @@ private:
   // Read just the public TideDB record.  Do not use ProdigyPersistentStateStore
   // here: loadBrainSnapshot opens the private sidecar in order to reconstruct a
   // runnable BrainConfig, which is expressly outside this recovery operation.
-  static bool buildOfflineDNSCleanupInventory(const String& statePath, uint128_t expectedClusterUUID, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
-  {
-    inventory = {};
-    TidesDB db(statePath);
-    String serialized = {};
-    if (db.read("brain", "snapshot", serialized, &failure) == false) return false;
-    ProdigyPersistentStoredBrainSnapshot stored = {};
-    if (prodigyLoadPersistentStoredRecord(serialized, stored) == false)
-    {
-      failure.assign("offline DNS recovery snapshot decode failed"_ctv);
-      return false;
-    }
-    if (stored.state.brainConfig.clusterUUID == 0 || stored.state.brainConfig.clusterUUID != expectedClusterUUID)
-    {
-      failure.assign("offline DNS recovery snapshot cluster UUID does not match requested cluster"_ctv);
-      return false;
-    }
-    inventory.clusterUUID = expectedClusterUUID;
-    for (const ClusterMachine& machine : stored.state.topology.machines)
-    {
-      if (machine.ssh.address.size() == 0)
-      {
-        failure.assign("offline DNS recovery snapshot topology has a machine without SSH address"_ctv);
-        return false;
-      }
-      if (machine.uuid == 0)
-      {
-        failure.assign("offline DNS recovery snapshot topology has a machine without UUID"_ctv);
-        return false;
-      }
-      inventory.machines.push_back({.uuid = machine.uuid, .sshAddress = machine.ssh.address});
-    }
-    for (const RoutableResourceLease& lease : stored.state.masterAuthority.runtimeState.routableResourceLeases)
-    {
-      if (lease.kind == RoutableResourceLeaseKind::dnsRecord) inventory.dnsRecordLeases.push_back(lease);
-    }
-    // A deterministic ordering makes inventories from different elected peers
-    // byte-comparable without retaining a second recovery journal.
-    std::sort(inventory.machines.begin(), inventory.machines.end(), [](const MothershipOfflineDNSCleanupInventory::Machine& a, const MothershipOfflineDNSCleanupInventory::Machine& b) { return a.uuid < b.uuid || (a.uuid == b.uuid && prodigyPersistentStringComesBefore(a.sshAddress, b.sshAddress)); });
-    std::sort(inventory.dnsRecordLeases.begin(), inventory.dnsRecordLeases.end(), [](const RoutableResourceLease& a, const RoutableResourceLease& b) {
-      RoutableResourceLease ac = a, bc = b; String as = {}, bs = {}; BitseryEngine::serialize(as, ac); BitseryEngine::serialize(bs, bc);
-      const size_t common = std::min(as.size(), bs.size()); const int compared = common ? std::memcmp(as.data(), bs.data(), common) : 0;
-      return compared != 0 ? compared < 0 : as.size() < bs.size();
-    });
-    failure.clear();
-    return true;
-  }
+
 
   void runOfflineDNSCleanupInventory(int argc, char *argv[])
   {
-    if (argc != 1)
+    if (argc != 1 && argc != 2)
     {
-      basics_log("offlineDNSCleanupInventory requires exact cluster UUID\n");
+      basics_log("offlineDNSCleanupInventory requires exact cluster UUID [--allow-unconfigured-snapshot]\n");
+      exit(EXIT_FAILURE);
+    }
+    const bool allowUnconfiguredSnapshot = argc == 2 && std::strcmp(argv[1], "--allow-unconfigured-snapshot") == 0;
+    if (argc == 2 && allowUnconfiguredSnapshot == false)
+    {
+      basics_log("offlineDNSCleanupInventory unknown option\n");
       exit(EXIT_FAILURE);
     }
     String expectedText = {}; expectedText.assign(argv[0]);
@@ -7530,7 +7490,7 @@ private:
       exit(EXIT_FAILURE);
     }
     MothershipOfflineDNSCleanupInventory inventory = {}; String failure = {};
-    if (buildOfflineDNSCleanupInventory(defaultProdigyPersistentStateDBPath(), expected, inventory, failure) == false)
+    if (mothershipBuildOfflineDNSCleanupInventory(defaultProdigyPersistentStateDBPath(), expected, allowUnconfiguredSnapshot, inventory, failure) == false)
     {
       basics_log("offlineDNSCleanupInventory success=0 failure=%s\n", failure.c_str());
       exit(EXIT_FAILURE);
@@ -7606,7 +7566,7 @@ private:
     return ran && ok;
   }
 
-  bool offlineDNSRecoveryInventoryFromMachine(const MothershipProdigyCluster& cluster, const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
+  bool offlineDNSRecoveryInventoryFromMachine(const MothershipProdigyCluster& cluster, const MothershipProdigyClusterMachine& machine, bool allowUnconfiguredSnapshot, MothershipOfflineDNSCleanupInventory& inventory, String& failure)
   {
     inventory = {};
     LIBSSH2_SESSION *session = nullptr; int fd = -1;
@@ -7630,6 +7590,7 @@ private:
     if (ok)
     {
       String command = {}; command.assign("set -eu; "_ctv); prodigyAppendShellSingleQuoted(command, remoteBinary); command.append(" offlineDNSCleanupInventory "_ctv); prodigyAppendShellSingleQuoted(command, expectedUUID);
+      if (allowUnconfiguredSnapshot) command.append(" --allow-unconfigured-snapshot"_ctv);
       ok = prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, 120'000);
     }
     String cleanup = {}; cleanup.assign("rm -rf "_ctv); prodigyAppendShellSingleQuoted(cleanup, stage);
@@ -7717,17 +7678,18 @@ private:
 
   class OfflineDNSRecoveryHooks final : public MothershipOfflineDNSRecoveryHooks {
   public:
-    OfflineDNSRecoveryHooks(Mothership *owner, const MothershipProdigyCluster& cluster) : owner(owner), cluster(cluster) {}
+    OfflineDNSRecoveryHooks(Mothership *owner, const MothershipProdigyCluster& cluster, bool allowUnconfiguredSnapshot)
+      : owner(owner), cluster(cluster), allowUnconfiguredSnapshot(allowUnconfiguredSnapshot) {}
     bool quiesce(const MothershipProdigyClusterMachine& machine, String *failure) override {
       String command = {}; mothershipBuildProdigyStopAndDrainCommand(command);
       LIBSSH2_SESSION *session = nullptr; int fd = -1; String localFailure = {};
       bool ok = mothershipConnectSSHSession(machine, session, fd, &localFailure, &cluster.bootstrapSshKeyPackage, &cluster.bootstrapSshPrivateKeyPath) && prodigyRunBlockingSSHCommand(session, fd, command, &localFailure, 120'000);
       mothershipCloseSSHSession(session, fd); if (failure) *failure = localFailure; return ok;
     }
-    bool exportInventory(const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String *failure) override { String localFailure = {}; bool ok = owner->offlineDNSRecoveryInventoryFromMachine(cluster, machine, inventory, localFailure); if (failure) *failure = localFailure; return ok; }
+    bool exportInventory(const MothershipProdigyClusterMachine& machine, MothershipOfflineDNSCleanupInventory& inventory, String *failure) override { String localFailure = {}; bool ok = owner->offlineDNSRecoveryInventoryFromMachine(cluster, machine, allowUnconfiguredSnapshot, inventory, localFailure); if (failure) *failure = localFailure; return ok; }
     bool removeDNS(const MothershipOfflineDNSCleanupInventory& inventory, uint32_t& removed, String *failure) override { String localFailure = {}; bool ok = owner->removeClusterDNSBindingsOffline(cluster, inventory, removed, localFailure); if (failure) *failure = localFailure; return ok; }
     bool wipe(const MothershipProdigyClusterMachine& machine, String *failure) override { String localFailure = {}; bool ok = owner->stopAndWipeRemoteProdigyInstance(cluster, machine, localFailure); if (failure) *failure = localFailure; return ok; }
-  private: Mothership *owner; const MothershipProdigyCluster& cluster;
+  private: Mothership *owner; const MothershipProdigyCluster& cluster; bool allowUnconfiguredSnapshot = false;
   };
 
   bool providerCredentialReferencedByClusters(const String& name, String& failure, String *referencingClusterName = nullptr)
@@ -16651,13 +16613,14 @@ private:
   {
     if (argc != 1 && argc != 2)
     {
-      basics_log("usage: removeCluster [name|clusterUUID] [--resume-after-dns-teardown|--offline-dns-recovery]\n");
+      basics_log("usage: removeCluster [name|clusterUUID] [--resume-after-dns-teardown|--offline-dns-recovery|--offline-unconfigured-dns-recovery]\n");
       exit(EXIT_FAILURE);
     }
 
     const bool resumeAfterDNS = argc == 2 && std::strcmp(argv[1], "--resume-after-dns-teardown") == 0;
     const bool offlineDNSRecovery = argc == 2 && std::strcmp(argv[1], "--offline-dns-recovery") == 0;
-    if (argc == 2 && resumeAfterDNS == false && offlineDNSRecovery == false)
+    const bool offlineUnconfiguredDNSRecovery = argc == 2 && std::strcmp(argv[1], "--offline-unconfigured-dns-recovery") == 0;
+    if (argc == 2 && resumeAfterDNS == false && offlineDNSRecovery == false && offlineUnconfiguredDNSRecovery == false)
     {
       basics_log("removeCluster unknown option\n");
       exit(EXIT_FAILURE);
@@ -16682,7 +16645,7 @@ private:
       }
     }
 
-    if (offlineDNSRecovery)
+    if (offlineDNSRecovery || offlineUnconfiguredDNSRecovery)
     {
       uint128_t requestedUUID = 0;
       if (prodigyParseCanonicalHex128(name, requestedUUID) == false)
@@ -16739,8 +16702,11 @@ private:
       for (const MothershipProdigyClusterMachine& machine : adopted)
         if (machine.ssh.address.size() == 0 || machine.ssh.user.size() == 0) { basics_log("removeCluster offline DNS recovery requires complete adopted SSH registration\n"); exit(EXIT_FAILURE); }
       MothershipClusterRemoveSummary summary = {};
-      OfflineDNSRecoveryHooks offlineHooks(this, cluster);
-      if (mothershipRunOfflineDNSRecovery(cluster, offlineHooks, summary, &failure) == false)
+      const MothershipOfflineDNSRecoveryMode recoveryMode = offlineUnconfiguredDNSRecovery
+          ? MothershipOfflineDNSRecoveryMode::allowUnconfiguredSnapshot
+          : MothershipOfflineDNSRecoveryMode::strict;
+      OfflineDNSRecoveryHooks offlineHooks(this, cluster, offlineUnconfiguredDNSRecovery);
+      if (mothershipRunOfflineDNSRecovery(cluster, offlineHooks, summary, &failure, recoveryMode) == false)
       {
         basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 dnsTeardownCompleted=%u wipedAdoptedMachines=%u failure=%s\n", name.c_str(), unsigned(summary.dnsTeardownCompleted), unsigned(summary.wipedAdoptedMachines), failure.c_str());
         exit(EXIT_FAILURE);
