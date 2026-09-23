@@ -119,17 +119,19 @@ inline void Brain::sendRoutableSubnetUnregistrationResponse(const PendingElastic
   }
 }
 
-inline bool Brain::commitRoutableSubnetRegistryChange(void)
+inline void Brain::commitRoutableSubnetRegistryChangeAsync(PersistenceCompletion completion)
 {
-  if (commitMasterAuthorityStateChange() == false)
-  {
-    return false;
-  }
-  refreshAllDeploymentRegisteredRoutablePrefixWormholes();
-  sendNeuronSwitchboardRoutableSubnets();
-  sendNeuronSwitchboardHostedIngressPrefixes();
-  sendNeuronSwitchboardOverlayRoutes();
-  return true;
+  commitMasterAuthorityStateChangeAsync(
+      [this, completion = std::move(completion)](bool durable) mutable {
+        if (durable)
+        {
+          refreshAllDeploymentRegisteredRoutablePrefixWormholes();
+          sendNeuronSwitchboardRoutableSubnets();
+          sendNeuronSwitchboardHostedIngressPrefixes();
+          sendNeuronSwitchboardOverlayRoutes();
+        }
+        if (completion) completion(durable);
+      });
 }
 
 inline bool Brain::routableSubnetOperationPending(const String& name, uint128_t uuid) const
@@ -686,9 +688,10 @@ inline const ProdigyPendingElasticAddressRelease *Brain::findPendingElasticAddre
   return nullptr;
 }
 
-inline bool Brain::commitPendingElasticAddressStateChange(bool advanceGeneration)
+inline void Brain::commitPendingElasticAddressStateChangeAsync(
+    PersistenceCompletion completion, bool advanceGeneration)
 {
-  return commitMasterAuthorityStateChange(advanceGeneration);
+  commitMasterAuthorityStateChangeAsync(std::move(completion), advanceGeneration);
 }
 
 inline bool Brain::reserveElasticAddressControlOperationIDs(uint32_t count,
@@ -743,26 +746,42 @@ inline bool Brain::enqueueElasticAddressAssignment(
     const String& machineCloudID,
     const IPPrefix& deliveryPrefix)
 {
-  const bool acquiredFence = masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
-                             masterAuthorityRuntimeState.pendingElasticAddressReleases.empty();
+  struct Completion {
+    bool called = false;
+    bool durable = false;
+  };
+  std::shared_ptr<Completion> completion = std::make_shared<Completion>();
+  enqueueElasticAddressAssignmentAsync(stream, provider, request, machineUUID, machineCloudID,
+                                       deliveryPrefix, [completion](bool durable) {
+    completion->called = true;
+    completion->durable = durable;
+  });
+  return completion->called && completion->durable;
+}
+
+inline void Brain::enqueueElasticAddressAssignmentAsync(
+    Mothership *stream,
+    BrainIaaS& provider,
+    RoutableSubnetRegistration request,
+    uint128_t machineUUID,
+    String machineCloudID,
+    IPPrefix deliveryPrefix,
+    PersistenceCompletion completion)
+{
   if (provider.supportsTransactionalElasticAddresses() == false ||
       pendingElasticAddressLogicalOperationCount() >=
           ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations ||
-      masterAuthorityRuntimeState.generation >= UINT64_MAX - 3 ||
-      provider.setElasticAddressReleaseFenceActive(true) == false)
+      masterAuthorityRuntimeState.generation >= UINT64_MAX - 3)
   {
-    return false;
+    if (completion) completion(false);
+    return;
   }
 
   uint64_t operationID = 0;
-  if (nextElasticAddressControlOperationID(operationID) == false ||
-      commitPendingElasticAddressStateChange() == false)
+  if (nextElasticAddressControlOperationID(operationID) == false)
   {
-    if (acquiredFence)
-    {
-      (void)provider.setElasticAddressReleaseFenceActive(false);
-    }
-    return false;
+    if (completion) completion(false);
+    return;
   }
 
   uint128_t transactionNonce = Random::generateNumberWithNBits<128, uint128_t>();
@@ -770,41 +789,70 @@ inline bool Brain::enqueueElasticAddressAssignment(
   {
     transactionNonce = uint128_t(operationID) << 64 | operationID;
   }
+  const uint64_t authorityEpoch = masterAuthorityEpoch;
+  const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+  const uint64_t mothershipIncarnation = stream == nullptr ? 0 : stream->connectionIncarnation;
+  commitPendingElasticAddressStateChangeAsync(
+      [this, stream, &provider, request = std::move(request), machineUUID,
+       machineCloudID = std::move(machineCloudID), deliveryPrefix, operationID,
+       transactionNonce, authorityEpoch, operationGeneration, mothershipIncarnation,
+       completion = std::move(completion)](bool durable) mutable {
+        const bool current = durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                             masterAuthorityRuntimeState.generation == operationGeneration;
+        if (!current)
+        {
+          if (masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              masterAuthorityRuntimeState.nextPendingElasticAddressOperationID == operationID + 1)
+          {
+            masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = operationID;
+          }
+          if (completion) completion(false);
+          return;
+        }
 
-  PendingElasticAddressControlOperation pending;
-  pending.mothership = stream;
-  pending.provider = &provider;
-  pending.action = ProdigyBrainElasticAddressCoordinator::Action::prepareAssignment;
-  pending.operationID = operationID;
-  pending.sagaOperationID = operationID;
-  pending.transactionNonce = transactionNonce;
-  pending.mothershipIncarnation = stream->connectionIncarnation;
-  pending.authorityEpoch = masterAuthorityEpoch;
-  pending.machineUUID = machineUUID;
-  pending.machineCloudID.assign(machineCloudID);
-  pending.expectedDeliveryPrefix = deliveryPrefix;
-  prodigyOwnRoutableSubnetRegistration(request, pending.registration);
-  pendingElasticAddressControlOperations.emplace(operationID, std::move(pending));
+        if (provider.setElasticAddressReleaseFenceActive(true) == false)
+        {
+          if (completion) completion(false);
+          return;
+        }
 
-  ProviderElasticAddressRequest providerRequest;
-  providerRequest.cloudID.assign(machineCloudID);
-  providerRequest.family = request.family;
-  providerRequest.intent = request.elasticIntent;
-  providerRequest.requestedAddress.assign(request.requestedAddress);
-  providerRequest.providerPool.assign(request.subnet.providerPool);
-  providerRequest.deliveryPrefix = deliveryPrefix;
-  if (elasticAddressOperations.enqueue(provider, operationID, providerRequest, transactionNonce))
-  {
-    return true;
-  }
+        PendingElasticAddressControlOperation pending;
+        pending.mothership = stream;
+        pending.provider = &provider;
+        pending.action = ProdigyBrainElasticAddressCoordinator::Action::prepareAssignment;
+        pending.operationID = operationID;
+        pending.sagaOperationID = operationID;
+        pending.transactionNonce = transactionNonce;
+        pending.mothershipIncarnation = mothershipIncarnation;
+        pending.authorityEpoch = authorityEpoch;
+        pending.machineUUID = machineUUID;
+        pending.machineCloudID.assign(machineCloudID);
+        pending.expectedDeliveryPrefix = deliveryPrefix;
+        prodigyOwnRoutableSubnetRegistration(request, pending.registration);
+        pendingElasticAddressControlOperations.emplace(operationID, std::move(pending));
 
-  pendingElasticAddressControlOperations.erase(operationID);
-  if (masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
-      masterAuthorityRuntimeState.pendingElasticAddressReleases.empty())
-  {
-    (void)provider.setElasticAddressReleaseFenceActive(false);
-  }
-  return false;
+        ProviderElasticAddressRequest providerRequest;
+        providerRequest.cloudID.assign(machineCloudID);
+        providerRequest.family = request.family;
+        providerRequest.intent = request.elasticIntent;
+        providerRequest.requestedAddress.assign(request.requestedAddress);
+        providerRequest.providerPool.assign(request.subnet.providerPool);
+        providerRequest.deliveryPrefix = deliveryPrefix;
+        if (elasticAddressOperations.enqueue(provider, operationID, providerRequest, transactionNonce))
+        {
+          if (completion) completion(true);
+          return;
+        }
+
+        pendingElasticAddressControlOperations.erase(operationID);
+        if (masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
+            masterAuthorityRuntimeState.pendingElasticAddressReleases.empty())
+        {
+          (void)provider.setElasticAddressReleaseFenceActive(false);
+        }
+        if (completion) completion(false);
+      });
 }
 
 inline bool Brain::enqueueElasticAddressRelease(
@@ -813,36 +861,48 @@ inline bool Brain::enqueueElasticAddressRelease(
     const RoutableSubnetUnregistration& request,
     const DistributableExternalSubnet& prefix)
 {
+  struct Completion {
+    bool called = false;
+    bool durable = false;
+  };
+  std::shared_ptr<Completion> completion = std::make_shared<Completion>();
+  enqueueElasticAddressReleaseAsync(stream, provider, request, prefix, [completion](bool durable) {
+    completion->called = true;
+    completion->durable = durable;
+  });
+  return completion->called && completion->durable;
+}
+
+inline void Brain::enqueueElasticAddressReleaseAsync(
+    Mothership *stream,
+    BrainIaaS& provider,
+    RoutableSubnetUnregistration request,
+    DistributableExternalSubnet prefix,
+    PersistenceCompletion completion)
+{
   if (provider.supportsTransactionalElasticAddresses() == false ||
       pendingElasticAddressLogicalOperationCount() >=
           ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations ||
       masterAuthorityRuntimeState.generation >= UINT64_MAX - 2)
   {
-    return false;
-  }
-  const bool acquiredReleaseFence = masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() &&
-                                    masterAuthorityRuntimeState.pendingElasticAddressReleases.empty();
-  if (provider.setElasticAddressReleaseFenceActive(true) == false)
-  {
-    return false;
+    if (completion) completion(false);
+    return;
   }
 
   uint64_t operationID = 0;
   if (nextElasticAddressControlOperationID(operationID) == false)
   {
-    if (acquiredReleaseFence)
-    {
-      (void)provider.setElasticAddressReleaseFenceActive(false);
-    }
-    return false;
+    if (completion) completion(false);
+    return;
   }
 
   PendingElasticAddressControlOperation pending;
   pending.mothership = stream;
   pending.provider = &provider;
   pending.action = ProdigyBrainElasticAddressCoordinator::Action::release;
+  pending.operationID = operationID;
   pending.sagaOperationID = operationID;
-  pending.mothershipIncarnation = stream->connectionIncarnation;
+  pending.mothershipIncarnation = stream == nullptr ? 0 : stream->connectionIncarnation;
   pending.authorityEpoch = masterAuthorityEpoch;
   prodigyOwnRoutableSubnetUnregistration(request, pending.unregistration);
   prodigyOwnDistributableExternalSubnet(prefix, pending.releasedPrefix);
@@ -859,13 +919,26 @@ inline bool Brain::enqueueElasticAddressRelease(
   prodigyOwnDistributableExternalSubnet(prefix, release.prefix);
   masterAuthorityRuntimeState.pendingElasticAddressReleases.push_back(std::move(release));
   (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
-  if (commitPendingElasticAddressStateChange() == false)
-  {
-    return true;
-  }
-  reconcilePendingElasticAddressReleases();
-
-  return true;
+  const uint64_t authorityEpoch = masterAuthorityEpoch;
+  const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+  commitPendingElasticAddressStateChangeAsync(
+      [this, &provider, operationID, authorityEpoch, operationGeneration,
+       completion = std::move(completion)](bool durable) mutable {
+        const bool current = durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                             masterAuthorityRuntimeState.generation == operationGeneration;
+        if (!current)
+        {
+          if (completion) completion(false);
+          return;
+        }
+        if (provider.setElasticAddressReleaseFenceActive(true) == false)
+        {
+          if (completion) completion(false);
+          return;
+        }
+        reconcilePendingElasticAddressReleases();
+        if (completion) completion(true);
+      });
 }
 
 inline void Brain::completeElasticAddressAssignment(
@@ -941,9 +1014,18 @@ inline void Brain::completeElasticAddressAssignment(
     operation.providerOperationEnqueued = false;
     operation.action = ProdigyBrainElasticAddressCoordinator::Action::applyAssignment;
     const uint64_t sagaOperationID = operation.sagaOperationID;
+    const uint64_t authorityEpoch = operation.authorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
     pendingElasticAddressControlOperations.emplace(sagaOperationID, std::move(operation));
-    (void)commitPendingElasticAddressStateChange();
-    reconcilePendingElasticAddressAssignments();
+    commitPendingElasticAddressStateChangeAsync(
+        [this, sagaOperationID, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              findPendingElasticAddressAssignment(sagaOperationID) != nullptr)
+          {
+            reconcilePendingElasticAddressAssignments();
+          }
+        });
     return;
   }
 
@@ -967,8 +1049,18 @@ inline void Brain::completeElasticAddressAssignment(
     durable->lastFailure.assign(reason);
     durable->nextAttemptMs = Time::now<TimeResolution::ms>();
     retainReplyForRetry();
-    (void)commitPendingElasticAddressStateChange();
-    reconcilePendingElasticAddressAssignments();
+    const uint64_t sagaOperationID = durable->operationID;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, sagaOperationID, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              findPendingElasticAddressAssignment(sagaOperationID) != nullptr)
+          {
+            reconcilePendingElasticAddressAssignments();
+          }
+        });
   };
   if (response.failure.empty() == false)
   {
@@ -1056,22 +1148,49 @@ inline void Brain::completeElasticAddressAssignment(
       break;
     }
   }
-  if (commitPendingElasticAddressStateChange() == false)
-  {
-    brainConfig.distributableExternalSubnets.pop_back();
-    masterAuthorityRuntimeState.pendingElasticAddressAssignments.push_back(std::move(saved));
-    retainReplyForRetry();
-    return;
-  }
-  refreshAllDeploymentRegisteredRoutablePrefixWormholes();
-  sendNeuronSwitchboardRoutableSubnets();
-  sendNeuronSwitchboardHostedIngressPrefixes();
-  sendNeuronSwitchboardOverlayRoutes();
-  (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
-  response.success = true;
-  response.created = true;
-  response.failure.clear();
-  sendRoutableSubnetRegistrationResponse(operation, response);
+  const uint64_t sagaOperationID = saved.operationID;
+  const uint64_t authorityEpoch = operation.authorityEpoch;
+  const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+  const uint128_t storedUUID = response.subnet.uuid;
+  commitPendingElasticAddressStateChangeAsync(
+      [this, operation = std::move(operation), response = std::move(response),
+       saved = std::move(saved), sagaOperationID, authorityEpoch, operationGeneration,
+       storedUUID](bool durable) mutable {
+        if (!durable || weAreMaster == false || masterAuthorityEpoch != authorityEpoch ||
+            masterAuthorityRuntimeState.generation != operationGeneration)
+        {
+          if (masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            for (auto it = brainConfig.distributableExternalSubnets.begin();
+                 it != brainConfig.distributableExternalSubnets.end(); ++it)
+            {
+              if (it->uuid == storedUUID)
+              {
+                brainConfig.distributableExternalSubnets.erase(it);
+                break;
+              }
+            }
+            if (findPendingElasticAddressAssignment(sagaOperationID) == nullptr)
+            {
+              masterAuthorityRuntimeState.pendingElasticAddressAssignments.push_back(std::move(saved));
+            }
+            operation.operationID = 0;
+            operation.providerOperationEnqueued = false;
+            pendingElasticAddressControlOperations.insert_or_assign(sagaOperationID, std::move(operation));
+          }
+          return;
+        }
+        refreshAllDeploymentRegisteredRoutablePrefixWormholes();
+        sendNeuronSwitchboardRoutableSubnets();
+        sendNeuronSwitchboardHostedIngressPrefixes();
+        sendNeuronSwitchboardOverlayRoutes();
+        (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+        response.success = true;
+        response.created = true;
+        response.failure.clear();
+        sendRoutableSubnetRegistrationResponse(operation, response);
+      });
 }
 
 inline void Brain::completeElasticAddressCompensation(PendingElasticAddressControlOperation& operation,
@@ -1108,7 +1227,18 @@ inline void Brain::completeElasticAddressCompensation(PendingElasticAddressContr
     durable->nextAttemptMs = Time::now<TimeResolution::ms>() +
                              std::min<int64_t>(5'000LL << shift, 5 * 60 * 1000LL);
     retainReplyForRetry();
-    (void)commitPendingElasticAddressStateChange();
+    const uint64_t sagaOperationID = durable->operationID;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, sagaOperationID, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              findPendingElasticAddressAssignment(sagaOperationID) != nullptr)
+          {
+            reconcilePendingElasticAddressAssignments();
+          }
+        });
     return;
   }
 
@@ -1132,14 +1262,29 @@ inline void Brain::completeElasticAddressCompensation(PendingElasticAddressContr
       break;
     }
   }
-  if (commitPendingElasticAddressStateChange() == false)
-  {
-    masterAuthorityRuntimeState.pendingElasticAddressAssignments.push_back(std::move(saved));
-    retainReplyForRetry();
-    return;
-  }
-  (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
-  sendRoutableSubnetRegistrationResponse(operation, response);
+  const uint64_t sagaOperationID = saved.operationID;
+  const uint64_t authorityEpoch = operation.authorityEpoch;
+  const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+  commitPendingElasticAddressStateChangeAsync(
+      [this, operation = std::move(operation), response = std::move(response),
+       saved = std::move(saved), sagaOperationID, authorityEpoch, operationGeneration](bool durable) mutable {
+        if (!durable || weAreMaster == false || masterAuthorityEpoch != authorityEpoch ||
+            masterAuthorityRuntimeState.generation != operationGeneration)
+        {
+          if (masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              findPendingElasticAddressAssignment(sagaOperationID) == nullptr)
+          {
+            masterAuthorityRuntimeState.pendingElasticAddressAssignments.push_back(std::move(saved));
+            operation.operationID = 0;
+            operation.providerOperationEnqueued = false;
+            pendingElasticAddressControlOperations.insert_or_assign(sagaOperationID, std::move(operation));
+          }
+          return;
+        }
+        (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+        sendRoutableSubnetRegistrationResponse(operation, response);
+      });
 }
 
 inline void Brain::reconcilePendingElasticAddressAssignments(void)
@@ -1153,10 +1298,17 @@ inline void Brain::reconcilePendingElasticAddressAssignments(void)
   }
   if (masterAuthorityRuntimeStateDurable == false)
   {
-    if (commitPendingElasticAddressStateChange(false) == false)
-    {
-      return;
-    }
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            reconcilePendingElasticAddressAssignments();
+          }
+        }, false);
+    return;
   }
 
   const int64_t nowMs = Time::now<TimeResolution::ms>();
@@ -1199,7 +1351,18 @@ inline void Brain::reconcilePendingElasticAddressAssignments(void)
         assignment->compensating = true;
         assignment->lastFailure.assign("elastic assignment target identity changed before apply"_ctv);
         assignment->nextAttemptMs = nowMs;
-        (void)commitPendingElasticAddressStateChange();
+        const uint64_t authorityEpoch = masterAuthorityEpoch;
+        const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+        commitPendingElasticAddressStateChangeAsync(
+            [this, sagaID, authorityEpoch, operationGeneration](bool durable) {
+              if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                  masterAuthorityRuntimeState.generation == operationGeneration &&
+                  findPendingElasticAddressAssignment(sagaID) != nullptr)
+              {
+                reconcilePendingElasticAddressAssignments();
+              }
+            });
+        return;
       }
       continue;
     }
@@ -1224,58 +1387,64 @@ inline void Brain::reconcilePendingElasticAddressAssignments(void)
       return;
     }
     assignment->attempts = std::min<uint32_t>(assignment->attempts + 1, 1'000'000);
-    if (commitPendingElasticAddressStateChange() == false)
-    {
-      return;
-    }
-    assignment = findPendingElasticAddressAssignment(sagaID);
-    if (assignment == nullptr)
-    {
-      continue;
-    }
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, sagaID, attemptID, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            ProdigyPendingElasticAddressAssignment *current =
+                findPendingElasticAddressAssignment(sagaID);
+            if (current == nullptr) return;
+            ProviderElasticAddressPlan currentPlan;
+            currentPlan.opaque.assign(current->providerPlan);
+            ProviderElasticAddressRequest currentRequest;
+            prodigyElasticAddressRequestFromPendingAssignment(*current, currentRequest);
+            PendingElasticAddressControlOperation control;
+            auto waiting = pendingElasticAddressControlOperations.find(sagaID);
+            if (waiting != pendingElasticAddressControlOperations.end())
+            {
+              control = std::move(waiting->second);
+              pendingElasticAddressControlOperations.erase(waiting);
+            }
+            else
+            {
+              control.sagaOperationID = sagaID;
+              control.machineUUID = current->machineUUID;
+              control.machineCloudID.assign(current->machineCloudID);
+              control.expectedDeliveryPrefix = current->expectedDeliveryPrefix;
+              prodigyOwnRoutableSubnetRegistration(current->registration, control.registration);
+            }
+            control.operationID = attemptID;
+            control.provider = iaas;
+            control.authorityEpoch = authorityEpoch;
+            control.providerOperationEnqueued = true;
+            control.action = current->compensating
+                                 ? ProdigyBrainElasticAddressCoordinator::Action::compensateAssignment
+                                 : ProdigyBrainElasticAddressCoordinator::Action::applyAssignment;
+            pendingElasticAddressControlOperations.emplace(attemptID, std::move(control));
+            if (elasticAddressOperations.enqueue(*iaas, attemptID,
+                                                current->compensating
+                                                    ? ProdigyBrainElasticAddressCoordinator::Action::compensateAssignment
+                                                    : ProdigyBrainElasticAddressCoordinator::Action::applyAssignment,
+                                                currentPlan, currentRequest,
+                                                current->transactionNonce) == false)
+            {
+              auto rejected = pendingElasticAddressControlOperations.find(attemptID);
+              if (rejected != pendingElasticAddressControlOperations.end())
+              {
+                PendingElasticAddressControlOperation retry = std::move(rejected->second);
+                pendingElasticAddressControlOperations.erase(rejected);
+                retry.operationID = 0;
+                retry.providerOperationEnqueued = false;
+                pendingElasticAddressControlOperations.emplace(sagaID, std::move(retry));
+              }
+            }
+          }
+        });
+    return;
 
-    PendingElasticAddressControlOperation control;
-    auto waiting = pendingElasticAddressControlOperations.find(sagaID);
-    if (waiting != pendingElasticAddressControlOperations.end())
-    {
-      control = std::move(waiting->second);
-      pendingElasticAddressControlOperations.erase(waiting);
-    }
-    else
-    {
-      control.sagaOperationID = sagaID;
-      control.machineUUID = assignment->machineUUID;
-      control.machineCloudID.assign(assignment->machineCloudID);
-      control.expectedDeliveryPrefix = assignment->expectedDeliveryPrefix;
-      prodigyOwnRoutableSubnetRegistration(assignment->registration, control.registration);
-    }
-    control.operationID = attemptID;
-    control.provider = iaas;
-    control.authorityEpoch = masterAuthorityEpoch;
-    control.providerOperationEnqueued = true;
-    control.action = assignment->compensating
-                         ? ProdigyBrainElasticAddressCoordinator::Action::compensateAssignment
-                         : ProdigyBrainElasticAddressCoordinator::Action::applyAssignment;
-    pendingElasticAddressControlOperations.emplace(attemptID, std::move(control));
-    if (elasticAddressOperations.enqueue(*iaas,
-                                         attemptID,
-                                         assignment->compensating
-                                             ? ProdigyBrainElasticAddressCoordinator::Action::compensateAssignment
-                                             : ProdigyBrainElasticAddressCoordinator::Action::applyAssignment,
-                                         plan,
-                                         providerRequest,
-                                         assignment->transactionNonce) == false)
-    {
-      auto rejected = pendingElasticAddressControlOperations.find(attemptID);
-      if (rejected != pendingElasticAddressControlOperations.end())
-      {
-        PendingElasticAddressControlOperation retry = std::move(rejected->second);
-        pendingElasticAddressControlOperations.erase(rejected);
-        retry.operationID = 0;
-        retry.providerOperationEnqueued = false;
-        pendingElasticAddressControlOperations.emplace(sagaID, std::move(retry));
-      }
-    }
   }
 }
 
@@ -1288,9 +1457,18 @@ inline void Brain::reconcilePendingElasticAddressReleases(void)
   {
     return;
   }
-  if (masterAuthorityRuntimeStateDurable == false &&
-      commitPendingElasticAddressStateChange(false) == false)
+  if (masterAuthorityRuntimeStateDurable == false)
   {
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            reconcilePendingElasticAddressReleases();
+          }
+        }, false);
     return;
   }
 
@@ -1342,8 +1520,18 @@ inline void Brain::reconcilePendingElasticAddressReleases(void)
     {
       release->lastFailure.assign("routable prefix quarantine was not preserved"_ctv);
       release->nextAttemptMs = nowMs + 5'000;
-      (void)commitPendingElasticAddressStateChange();
-      continue;
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+      commitPendingElasticAddressStateChangeAsync(
+          [this, sagaOperationID, authorityEpoch, operationGeneration](bool durable) {
+            if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                masterAuthorityRuntimeState.generation == operationGeneration &&
+                findPendingElasticAddressRelease(sagaOperationID) != nullptr)
+            {
+              reconcilePendingElasticAddressReleases();
+            }
+          });
+      return;
     }
 
     if (routablePrefixHasOwnedResourceLease(release->prefix.uuid))
@@ -1360,8 +1548,18 @@ inline void Brain::reconcilePendingElasticAddressReleases(void)
         sendRoutableSubnetUnregistrationResponse(pendingIt->second, response);
         pendingElasticAddressControlOperations.erase(pendingIt);
       }
-      (void)commitPendingElasticAddressStateChange();
-      continue;
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+      commitPendingElasticAddressStateChangeAsync(
+          [this, sagaOperationID, authorityEpoch, operationGeneration](bool durable) {
+            if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                masterAuthorityRuntimeState.generation == operationGeneration &&
+                findPendingElasticAddressRelease(sagaOperationID) != nullptr)
+            {
+              reconcilePendingElasticAddressReleases();
+            }
+          });
+      return;
     }
 
     uint64_t attemptOperationID = 0;
@@ -1369,55 +1567,62 @@ inline void Brain::reconcilePendingElasticAddressReleases(void)
     {
       return;
     }
-    if (commitPendingElasticAddressStateChange() == false)
-    {
-      return;
-    }
-    release = findPendingElasticAddressRelease(sagaOperationID);
-    if (release == nullptr)
-    {
-      continue;
-    }
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    commitPendingElasticAddressStateChangeAsync(
+        [this, sagaOperationID, attemptOperationID, authorityEpoch, operationGeneration](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            ProdigyPendingElasticAddressRelease *current =
+                findPendingElasticAddressRelease(sagaOperationID);
+            if (current == nullptr) return;
+            PendingElasticAddressControlOperation pending;
+            for (auto it = pendingElasticAddressControlOperations.begin();
+                 it != pendingElasticAddressControlOperations.end(); ++it)
+            {
+              if (it->second.action == ProdigyBrainElasticAddressCoordinator::Action::release &&
+                  it->second.sagaOperationID == sagaOperationID)
+              {
+                pending = std::move(it->second);
+                pendingElasticAddressControlOperations.erase(it);
+                break;
+              }
+            }
+            if (pending.sagaOperationID == 0)
+            {
+              pending.action = ProdigyBrainElasticAddressCoordinator::Action::release;
+              pending.sagaOperationID = sagaOperationID;
+              pending.unregistration.name.assign(current->prefix.name);
+              prodigyOwnDistributableExternalSubnet(current->prefix, pending.releasedPrefix);
+            }
+            pending.operationID = attemptOperationID;
+            pending.authorityEpoch = authorityEpoch;
+            pending.provider = iaas;
+            pending.providerOperationEnqueued = true;
+            pendingElasticAddressControlOperations.emplace(attemptOperationID, std::move(pending));
+            ProviderElasticAddressRelease providerRelease;
+            providerRelease.assignedPrefix = current->prefix.subnet;
+            providerRelease.transactionNonce = current->transactionNonce;
+            providerRelease.allocationID.assign(current->prefix.providerAllocationID);
+            providerRelease.associationID.assign(current->prefix.providerAssociationID);
+            providerRelease.releaseOnRemove = current->prefix.releaseOnRemove;
+            if (elasticAddressOperations.enqueue(*iaas, attemptOperationID, providerRelease) == false)
+            {
+              auto rejected = pendingElasticAddressControlOperations.find(attemptOperationID);
+              if (rejected != pendingElasticAddressControlOperations.end())
+              {
+                PendingElasticAddressControlOperation retry = std::move(rejected->second);
+                pendingElasticAddressControlOperations.erase(rejected);
+                retry.operationID = 0;
+                retry.providerOperationEnqueued = false;
+                pendingElasticAddressControlOperations.emplace(sagaOperationID, std::move(retry));
+              }
+            }
+          }
+        });
+    return;
 
-    PendingElasticAddressControlOperation pending;
-    if (pendingIt != pendingElasticAddressControlOperations.end())
-    {
-      pending = std::move(pendingIt->second);
-      pendingElasticAddressControlOperations.erase(pendingIt);
-    }
-    else
-    {
-      pending.action = ProdigyBrainElasticAddressCoordinator::Action::release;
-      pending.sagaOperationID = sagaOperationID;
-      pending.authorityEpoch = masterAuthorityEpoch;
-      pending.provider = iaas;
-      pending.unregistration.name.assign(release->prefix.name);
-      prodigyOwnDistributableExternalSubnet(release->prefix, pending.releasedPrefix);
-    }
-    pending.operationID = attemptOperationID;
-    pending.authorityEpoch = masterAuthorityEpoch;
-    pending.provider = iaas;
-    pending.providerOperationEnqueued = true;
-    pendingElasticAddressControlOperations.emplace(attemptOperationID, std::move(pending));
-
-    ProviderElasticAddressRelease providerRelease;
-    providerRelease.assignedPrefix = release->prefix.subnet;
-    providerRelease.transactionNonce = release->transactionNonce;
-    providerRelease.allocationID.assign(release->prefix.providerAllocationID);
-    providerRelease.associationID.assign(release->prefix.providerAssociationID);
-    providerRelease.releaseOnRemove = release->prefix.releaseOnRemove;
-    if (elasticAddressOperations.enqueue(*iaas, attemptOperationID, providerRelease) == false)
-    {
-      auto attemptIt = pendingElasticAddressControlOperations.find(attemptOperationID);
-      if (attemptIt != pendingElasticAddressControlOperations.end())
-      {
-        PendingElasticAddressControlOperation waiting = std::move(attemptIt->second);
-        pendingElasticAddressControlOperations.erase(attemptIt);
-        waiting.operationID = 0;
-        waiting.providerOperationEnqueued = false;
-        pendingElasticAddressControlOperations.emplace(sagaOperationID, std::move(waiting));
-      }
-    }
   }
 }
 
@@ -1458,9 +1663,19 @@ inline void Brain::completeElasticAddressRelease(PendingElasticAddressControlOpe
       release->nextAttemptMs = Time::now<TimeResolution::ms>() +
                                std::min<int64_t>(5'000LL << shift, 5 * 60 * 1000LL);
       release->lastFailure = response.failure;
-      (void)commitPendingElasticAddressStateChange();
+      const uint64_t authorityEpoch = operation.authorityEpoch;
+      const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+      commitPendingElasticAddressStateChangeAsync(
+          [this, operation = std::move(operation), response = std::move(response),
+           authorityEpoch, operationGeneration](bool durable) mutable {
+            if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                masterAuthorityRuntimeState.generation == operationGeneration)
+            {
+              sendRoutableSubnetUnregistrationResponse(operation, response);
+            }
+          });
+      return;
     }
-    sendRoutableSubnetUnregistrationResponse(operation, response);
     return;
   }
   if (masterAuthorityRuntimeState.generation == UINT64_MAX)
@@ -1481,20 +1696,31 @@ inline void Brain::completeElasticAddressRelease(PendingElasticAddressControlOpe
       break;
     }
   }
-  if (commitPendingElasticAddressStateChange() == false)
-  {
-    masterAuthorityRuntimeState.pendingElasticAddressReleases.push_back(std::move(saved));
-    const uint64_t sagaOperationID = operation.sagaOperationID;
-    operation.operationID = 0;
-    operation.providerOperationEnqueued = false;
-    pendingElasticAddressControlOperations.insert_or_assign(sagaOperationID,
-                                                            std::move(operation));
-    return;
-  }
-  (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
-  response.success = true;
-  response.removed = true;
-  sendRoutableSubnetUnregistrationResponse(operation, response);
+  const uint64_t sagaOperationID = saved.operationID;
+  const uint64_t authorityEpoch = operation.authorityEpoch;
+  const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+  commitPendingElasticAddressStateChangeAsync(
+      [this, operation = std::move(operation), response = std::move(response),
+       saved = std::move(saved), sagaOperationID, authorityEpoch, operationGeneration](bool durable) mutable {
+        if (!durable || weAreMaster == false || masterAuthorityEpoch != authorityEpoch ||
+            masterAuthorityRuntimeState.generation != operationGeneration)
+        {
+          if (masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration &&
+              findPendingElasticAddressRelease(sagaOperationID) == nullptr)
+          {
+            masterAuthorityRuntimeState.pendingElasticAddressReleases.push_back(std::move(saved));
+            operation.operationID = 0;
+            operation.providerOperationEnqueued = false;
+            pendingElasticAddressControlOperations.insert_or_assign(sagaOperationID, std::move(operation));
+          }
+          return;
+        }
+        (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+        response.success = true;
+        response.removed = true;
+        sendRoutableSubnetUnregistrationResponse(operation, response);
+      });
 }
 
 inline void Brain::elasticAddressOperationCompleted(
@@ -1694,18 +1920,26 @@ inline void Brain::handleRegisterRoutableSubnet(Mothership *stream, uint8_t *arg
         {
           response.failure.assign("target machine delivery prefix is unavailable"_ctv);
         }
-        else if (enqueueElasticAddressAssignment(stream,
-                                            *iaas,
-                                            request,
-                                            owner->uuid,
-                                            owner->cloudID,
-                                            deliveryPrefix))
-        {
-          return;
-        }
         else
         {
-          response.failure.assign("elastic routable prefix operation queue is full"_ctv);
+          const uint64_t mothershipIncarnation = stream->connectionIncarnation;
+          const uint64_t authorityEpoch = masterAuthorityEpoch;
+          RoutableSubnetRegistration replyRequest;
+          prodigyOwnRoutableSubnetRegistration(request, replyRequest);
+          enqueueElasticAddressAssignmentAsync(
+              stream, *iaas, std::move(request), owner->uuid, owner->cloudID, deliveryPrefix,
+              [this, stream, mothershipIncarnation, authorityEpoch,
+               request = std::move(replyRequest)](bool durable) mutable {
+                if (durable || weAreMaster == false || masterAuthorityEpoch != authorityEpoch) return;
+                RoutableSubnetRegistration response;
+                prodigyOwnRoutableSubnetRegistration(request, response);
+                response.failure.assign("failed to persist elastic routable prefix operation"_ctv);
+                PendingElasticAddressControlOperation operation;
+                operation.mothership = stream;
+                operation.mothershipIncarnation = mothershipIncarnation;
+                sendRoutableSubnetRegistrationResponse(operation, response);
+              });
+          return;
         }
       }
     }
@@ -1763,19 +1997,40 @@ inline void Brain::handleRegisterRoutableSubnet(Mothership *stream, uint8_t *arg
           prodigyOwnDistributableExternalSubnet(request.subnet, stored);
           brainConfig.distributableExternalSubnets.push_back(std::move(stored));
         }
-        if (commitRoutableSubnetRegistryChange())
-        {
-          response.success = true;
-          response.created = !replaced;
-        }
-        else
-        {
-          brainConfig = std::move(previousConfig);
-          masterAuthorityRuntimeState = std::move(previousRuntimeState);
-          masterAuthorityRuntimeStateDurable = previousDurable;
-          durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-          response.failure.assign("failed to persist routable prefix registry transition"_ctv);
-        }
+        const uint64_t authorityEpoch = masterAuthorityEpoch;
+        const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+        const uint64_t mothershipIncarnation = stream->connectionIncarnation;
+        RoutableSubnetRegistration deferredResponse;
+        prodigyOwnRoutableSubnetRegistration(request, deferredResponse);
+        commitRoutableSubnetRegistryChangeAsync(
+            [this, stream, mothershipIncarnation, authorityEpoch, operationGeneration,
+             response = std::move(deferredResponse), previousConfig = std::move(previousConfig),
+             previousRuntimeState = std::move(previousRuntimeState), previousDurable,
+             previousDurableGeneration, replaced](bool durable) mutable {
+              PendingElasticAddressControlOperation reply;
+              reply.mothership = stream;
+              reply.mothershipIncarnation = mothershipIncarnation;
+              if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                  masterAuthorityRuntimeState.generation == operationGeneration)
+              {
+                response.success = true;
+                response.created = !replaced;
+              }
+              else
+              {
+                if (masterAuthorityEpoch == authorityEpoch &&
+                    masterAuthorityRuntimeState.generation == operationGeneration)
+                {
+                  brainConfig = std::move(previousConfig);
+                  masterAuthorityRuntimeState = std::move(previousRuntimeState);
+                  masterAuthorityRuntimeStateDurable = previousDurable;
+                  durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                }
+                response.failure.assign("failed to persist routable prefix registry transition"_ctv);
+              }
+              sendRoutableSubnetRegistrationResponse(reply, response);
+            });
+        return;
       }
     }
   }
@@ -1838,13 +2093,27 @@ inline void Brain::handleUnregisterRoutableSubnet(Mothership *stream, uint8_t *a
       {
         response.failure.assign("active iaas runtime does not support transactional elastic addresses"_ctv);
       }
-      else if (enqueueElasticAddressRelease(stream, *iaas, request, *match))
-      {
-        return;
-      }
       else
       {
-        response.failure.assign("elastic routable prefix operation queue is full"_ctv);
+        const uint64_t mothershipIncarnation = stream->connectionIncarnation;
+        const uint64_t authorityEpoch = masterAuthorityEpoch;
+        RoutableSubnetUnregistration replyRequest;
+        prodigyOwnRoutableSubnetUnregistration(request, replyRequest);
+        enqueueElasticAddressReleaseAsync(
+            stream, *iaas, std::move(request), *match,
+            [this, stream, mothershipIncarnation, authorityEpoch,
+             request = std::move(replyRequest)](bool durable) mutable {
+              if (durable || weAreMaster == false || masterAuthorityEpoch != authorityEpoch ||
+                  routableSubnetOperationPending(request.name)) return;
+              RoutableSubnetUnregistration response;
+              prodigyOwnRoutableSubnetUnregistration(request, response);
+              response.failure.assign("failed to persist elastic routable prefix operation"_ctv);
+              PendingElasticAddressControlOperation operation;
+              operation.mothership = stream;
+              operation.mothershipIncarnation = mothershipIncarnation;
+              sendRoutableSubnetUnregistrationResponse(operation, response);
+            });
+        return;
       }
     }
     else
@@ -1855,19 +2124,40 @@ inline void Brain::handleUnregisterRoutableSubnet(Mothership *stream, uint8_t *a
       const bool previousDurable = masterAuthorityRuntimeStateDurable;
       const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
       brainConfig.distributableExternalSubnets.erase(match);
-      if (commitRoutableSubnetRegistryChange())
-      {
-        response.success = true;
-        response.removed = true;
-      }
-      else
-      {
-        masterAuthorityRuntimeState = std::move(previousRuntimeState);
-        masterAuthorityRuntimeStateDurable = previousDurable;
-        durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-        brainConfig = std::move(previousConfig);
-        response.failure.assign("failed to persist routable prefix registry transition"_ctv);
-      }
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+      const uint64_t mothershipIncarnation = stream->connectionIncarnation;
+      RoutableSubnetUnregistration deferredResponse;
+      prodigyOwnRoutableSubnetUnregistration(request, deferredResponse);
+      commitRoutableSubnetRegistryChangeAsync(
+          [this, stream, mothershipIncarnation, authorityEpoch, operationGeneration,
+           response = std::move(deferredResponse), previousConfig = std::move(previousConfig),
+           previousRuntimeState = std::move(previousRuntimeState), previousDurable,
+           previousDurableGeneration](bool durable) mutable {
+            PendingElasticAddressControlOperation reply;
+            reply.mothership = stream;
+            reply.mothershipIncarnation = mothershipIncarnation;
+            if (durable && weAreMaster && masterAuthorityEpoch == authorityEpoch &&
+                masterAuthorityRuntimeState.generation == operationGeneration)
+            {
+              response.success = true;
+              response.removed = true;
+            }
+            else
+            {
+              if (masterAuthorityEpoch == authorityEpoch &&
+                  masterAuthorityRuntimeState.generation == operationGeneration)
+              {
+                masterAuthorityRuntimeState = std::move(previousRuntimeState);
+                masterAuthorityRuntimeStateDurable = previousDurable;
+                durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                brainConfig = std::move(previousConfig);
+              }
+              response.failure.assign("failed to persist routable prefix registry transition"_ctv);
+            }
+            sendRoutableSubnetUnregistrationResponse(reply, response);
+          });
+      return;
     }
   }
 

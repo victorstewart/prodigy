@@ -8,7 +8,7 @@
 #include <networking/ring.h>
 #include <networking/ssh.h>
 #include <networking/reconnector.h>
-#include <prodigy/transport.tls.h>
+#include <prodigy/transport.artifact.h>
 #include <prodigy/machine.hardware.types.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/types.h>
@@ -35,19 +35,21 @@ enum class MachineState : uint8_t {
   decommissioning
 };
 
-class NeuronView : public RingInterface, public ProdigyTransportTLSStream, public CoroutineStack, public Reconnector {
+class NeuronView : public RingInterface, public ProdigyArtifactStream, public CoroutineStack, public Reconnector {
 public:
 
   Machine *machine = nullptr;
   bool connected = false;
   bool hadSuccessfulConnection = false;
+  bool artifactCapabilityPending = false;
 
   void reset(void) override
   {
-    ProdigyTransportTLSStream::reset();
+    ProdigyArtifactStream::reset();
     Reconnector::reset();
     connected = false;
     hadSuccessfulConnection = false;
+    artifactCapabilityPending = false;
   }
 };
 

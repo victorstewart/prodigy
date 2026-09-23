@@ -470,6 +470,139 @@ int main(int argc, char *argv[])
   suite.expect(failure.size() == 0, "normal_stage_bundle_sidecar_clears_failure");
   suite.expect(stagedExpectedDigest == bundleDigest, "normal_stage_bundle_sidecar_matches_verified_digest");
 
+  String preparedBundlePath = {};
+  preparedBundlePath.assign(tempDirectory);
+  preparedBundlePath.append("/prepared-stage.bundle.tar.zst"_ctv);
+  ProdigyPreparedBundleArtifact preparedBundle = {};
+  suite.expect(prodigyPrepareBundleArtifact(preparedBundle, preparedBundlePath, bundleBytes, bundleDigest, &failure),
+               "prepared_bundle_stage_is_verified");
+  suite.expect(preparedBundle.prepared && preparedBundle.published == false &&
+                   preparedBundle.stageBundlePath != preparedBundle.bundlePath &&
+                   fileExists(preparedBundle.stageBundlePath) && fileExists(preparedBundle.stageSHA256Path),
+               "prepared_bundle_uses_private_bundle_and_sidecar_stages");
+  suite.expect(prodigyPublishPreparedBundleArtifact(preparedBundle, &failure),
+               "prepared_bundle_publishes_verified_stages");
+  suite.expect(prodigyFsyncPublishedBundleArtifact(preparedBundle, &failure),
+               "prepared_bundle_publication_parent_is_durable");
+  suite.expect(preparedBundle.published && fileExists(preparedBundle.bundlePath) && fileExists(preparedBundle.sha256Path),
+               "prepared_bundle_publish_exposes_bundle_and_sidecar");
+  String publishedPreparedDigest = {};
+  suite.expect(prodigyLoadBundleExpectedSHA256Hex(preparedBundle.bundlePath, publishedPreparedDigest, &failure) &&
+                   publishedPreparedDigest == bundleDigest,
+               "prepared_bundle_published_sidecar_matches_digest");
+  suite.expect(::unlink(preparedBundle.bundlePath.c_str()) == 0 &&
+                   Filesystem::openWriteAtClose(-1, preparedBundle.bundlePath, bundleBytes) == int(bundleBytes.size()),
+               "prepared_bundle_published_target_is_replaced_before_stale_cleanup");
+  prodigyDiscardPreparedBundleArtifact(preparedBundle);
+  suite.expect(fileExists(preparedBundlePath), "prepared_bundle_cleanup_does_not_delete_replacement");
+
+  // The two renames are deliberately not a pair-atomic operation. Make the
+  // second target a directory so the first rename succeeds and the sidecar
+  // rename fails, then ensure cleanup owns and removes that first final inode.
+  String partialPublicationBundlePath = {};
+  partialPublicationBundlePath.assign(tempDirectory);
+  partialPublicationBundlePath.append("/partial-publication.bundle.tar.zst"_ctv);
+  ProdigyPreparedBundleArtifact partialPublication = {};
+  failure.clear();
+  suite.expect(prodigyPrepareBundleArtifact(
+                   partialPublication, partialPublicationBundlePath, bundleBytes, bundleDigest, &failure),
+               "partial_publication_stage_is_verified");
+  String partialPublicationFinalBundlePath = {};
+  String partialPublicationFinalSHA256Path = {};
+  String partialPublicationStageSHA256Path = {};
+  partialPublicationFinalBundlePath.assign(partialPublication.bundlePath);
+  partialPublicationFinalSHA256Path.assign(partialPublication.sha256Path);
+  partialPublicationStageSHA256Path.assign(partialPublication.stageSHA256Path);
+  std::error_code partialPublicationDirectoryError = {};
+  suite.expect(std::filesystem::create_directory(
+                   std::filesystem::path(partialPublicationFinalSHA256Path.c_str()), partialPublicationDirectoryError) &&
+                   partialPublicationDirectoryError.value() == 0,
+               "partial_publication_sidecar_target_is_directory");
+  failure.clear();
+  suite.expect(prodigyPublishPreparedBundleArtifact(partialPublication, &failure) == false &&
+                   partialPublication.bundlePublished && partialPublication.sha256Published == false &&
+                   partialPublication.published == false,
+               "partial_publication_records_first_final_inode_before_sidecar_failure");
+  prodigyDiscardPreparedBundleArtifact(partialPublication);
+  suite.expect(fileExists(partialPublicationFinalBundlePath) == false &&
+                   fileExists(partialPublicationStageSHA256Path) == false,
+               "partial_publication_cleanup_removes_only_first_published_inode_and_stage");
+  struct stat partialPublicationSidecarDirectory = {};
+  suite.expect(::stat(partialPublicationFinalSHA256Path.c_str(), &partialPublicationSidecarDirectory) == 0 &&
+                   S_ISDIR(partialPublicationSidecarDirectory.st_mode),
+               "partial_publication_cleanup_preserves_unowned_sidecar_target");
+  suite.expect(::rmdir(partialPublicationFinalSHA256Path.c_str()) == 0,
+               "partial_publication_sidecar_target_cleanup");
+
+  // A concurrent owner may replace the first final path before stale cleanup.
+  // The recorded inode must prevent this request from unlinking that replacement.
+  String replacedPartialPublicationBundlePath = {};
+  replacedPartialPublicationBundlePath.assign(tempDirectory);
+  replacedPartialPublicationBundlePath.append("/partial-publication-replaced.bundle.tar.zst"_ctv);
+  ProdigyPreparedBundleArtifact replacedPartialPublication = {};
+  failure.clear();
+  suite.expect(prodigyPrepareBundleArtifact(
+                   replacedPartialPublication, replacedPartialPublicationBundlePath, bundleBytes, bundleDigest, &failure),
+               "partial_publication_replacement_stage_is_verified");
+  String replacedFinalBundlePath = {};
+  String replacedFinalSHA256Path = {};
+  String replacedStageSHA256Path = {};
+  replacedFinalBundlePath.assign(replacedPartialPublication.bundlePath);
+  replacedFinalSHA256Path.assign(replacedPartialPublication.sha256Path);
+  replacedStageSHA256Path.assign(replacedPartialPublication.stageSHA256Path);
+  std::error_code replacedSidecarDirectoryError = {};
+  suite.expect(std::filesystem::create_directory(
+                   std::filesystem::path(replacedFinalSHA256Path.c_str()), replacedSidecarDirectoryError) &&
+                   replacedSidecarDirectoryError.value() == 0,
+               "partial_publication_replacement_sidecar_target_is_directory");
+  failure.clear();
+  suite.expect(prodigyPublishPreparedBundleArtifact(replacedPartialPublication, &failure) == false &&
+                   replacedPartialPublication.bundlePublished && replacedPartialPublication.sha256Published == false,
+               "partial_publication_replacement_records_first_final_inode");
+  String independentReplacementPath = {};
+  independentReplacementPath.assign(tempDirectory);
+  independentReplacementPath.append("/independent-bundle-replacement"_ctv);
+  std::error_code independentReplacementCopyError = {};
+  suite.expect(std::filesystem::copy_file(
+                   std::filesystem::path(replacedFinalBundlePath.c_str()),
+                   std::filesystem::path(independentReplacementPath.c_str()),
+                   std::filesystem::copy_options::none,
+                   independentReplacementCopyError) && independentReplacementCopyError.value() == 0,
+               "partial_publication_independent_replacement_is_created");
+  struct stat independentReplacementMetadata = {};
+  suite.expect(::stat(independentReplacementPath.c_str(), &independentReplacementMetadata) == 0 &&
+                   (independentReplacementMetadata.st_dev != replacedPartialPublication.publishedBundleDevice ||
+                    independentReplacementMetadata.st_ino != replacedPartialPublication.publishedBundleInode),
+               "partial_publication_independent_replacement_has_distinct_inode");
+  suite.expect(::rename(independentReplacementPath.c_str(), replacedFinalBundlePath.c_str()) == 0,
+               "partial_publication_independent_replacement_is_published");
+  prodigyDiscardPreparedBundleArtifact(replacedPartialPublication);
+  struct stat survivingReplacementMetadata = {};
+  suite.expect(::stat(replacedFinalBundlePath.c_str(), &survivingReplacementMetadata) == 0 &&
+                   survivingReplacementMetadata.st_dev == independentReplacementMetadata.st_dev &&
+                   survivingReplacementMetadata.st_ino == independentReplacementMetadata.st_ino &&
+                   fileExists(replacedStageSHA256Path) == false,
+               "partial_publication_cleanup_preserves_independently_replaced_final_inode");
+  suite.expect(::rmdir(replacedFinalSHA256Path.c_str()) == 0,
+               "partial_publication_replacement_sidecar_target_cleanup");
+
+  String competingBundlePath = {};
+  competingBundlePath.assign(tempDirectory);
+  competingBundlePath.append("/competing-stage.bundle.tar.zst"_ctv);
+  ProdigyPreparedBundleArtifact competingBundle = {};
+  suite.expect(prodigyPrepareBundleArtifact(competingBundle, competingBundlePath, bundleBytes, bundleDigest, &failure),
+               "prepared_bundle_competing_stage_is_verified");
+  suite.expect(::unlink(competingBundle.stageBundlePath.c_str()) == 0 &&
+                   Filesystem::openWriteAtClose(-1, competingBundle.stageBundlePath, bundleBytes) == int(bundleBytes.size()),
+               "prepared_bundle_competing_stage_replaces_inode");
+  suite.expect(prodigyPublishPreparedBundleArtifact(competingBundle, &failure) == false,
+               "prepared_bundle_rejects_replaced_stage_inode");
+  String competingStagePath = {};
+  competingStagePath.assign(competingBundle.stageBundlePath);
+  prodigyDiscardPreparedBundleArtifact(competingBundle);
+  suite.expect(fileExists(competingStagePath),
+               "prepared_bundle_cleanup_preserves_competing_replacement");
+
   String stagedInstallRoot = {};
   stagedInstallRoot.assign(tempDirectory);
   stagedInstallRoot.append("/normal-stage-installed-root"_ctv);

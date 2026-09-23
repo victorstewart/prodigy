@@ -1,16 +1,23 @@
 #include <includes.h>
+#include <prodigy/transport.artifact.h>
 #include <prodigy/transport.tls.h>
+#include <prodigy/bundle.artifact.h>
 #include <services/debug.h>
+#include <services/crypto.h>
 #include <services/bitsery.h>
 #include <services/filesystem.h>
 #include <networking/message.h>
 #include <networking/multiplexer.h>
 #include <networking/ring.h>
 
+#include <algorithm>
+#include <chrono>
+
 #include <arpa/inet.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -30,7 +37,7 @@ public:
     }
     else
     {
-      basics_log("FAIL: %s\n", name);
+      std::fprintf(stderr, "FAIL: %s\n", name);
       failed += 1;
     }
   }
@@ -245,6 +252,35 @@ static bool pumpTransportBytes(ProdigyTransportTLSStream& from, ProdigyTransport
     return false;
   }
 
+  if (to.rBuffer.remainingCapacity() < bytes)
+  {
+    to.rBuffer.reserve(to.rBuffer.size() + bytes);
+  }
+
+  from.noteSendQueued();
+  std::memcpy(to.rBuffer.pTail(), from.pBytesToSend(), bytes);
+  if (to.decryptTransportTLS(bytes) == false)
+  {
+    from.noteSendCompleted();
+    return false;
+  }
+
+  from.consumeSentBytes(bytes, false);
+  from.noteSendCompleted();
+  return true;
+}
+
+constexpr static uint32_t boundedPlaintextSendBudget = (64u * 1024u);
+
+static bool pumpTransportBytesLimited(ProdigyTransportTLSStream& from, ProdigyTransportTLSStream& to, uint32_t maximumBytes)
+{
+  const uint32_t available = from.nBytesToSend();
+  if (available == 0 || maximumBytes == 0)
+  {
+    return false;
+  }
+
+  const uint32_t bytes = std::min(available, maximumBytes);
   if (to.rBuffer.remainingCapacity() < bytes)
   {
     to.rBuffer.reserve(to.rBuffer.size() + bytes);
@@ -718,6 +754,252 @@ static int runAcceptedFixedFileSenderServer(const char *bindIP, uint16_t port, u
   return EXIT_SUCCESS;
 }
 
+static void runBoundedPlaintextSendCase(
+    TestSuite& suite,
+    uint128_t clientUUID,
+    uint128_t serverUUID,
+    const String& rootCertPem,
+    const String& rootKeyPem,
+    const String& clientCertPem,
+    const String& clientKeyPem,
+    const String& serverCertPem,
+    const String& serverKeyPem,
+    String& failure)
+{
+  // A multi-MiB queued payload must encrypt one bounded plaintext chunk per
+  // send kick.  An unrelated TLS stream must still make progress while the
+  // first stream has ciphertext partially in flight.
+  suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "reconfigure_transport_runtime_client_bounded_plaintext");
+  ProdigyTransportTLSStream bulkClient = {};
+  reserveTransportStream(bulkClient);
+  suite.expect(bulkClient.beginTransportTLS(false), "begin_transport_tls_client_bounded_plaintext");
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure), "reconfigure_transport_runtime_server_bounded_plaintext");
+  ProdigyTransportTLSStream bulkServer = {};
+  reserveTransportStream(bulkServer);
+  suite.expect(bulkServer.beginTransportTLS(true), "begin_transport_tls_server_bounded_plaintext");
+  suite.expect(completeTransportHandshake(bulkClient, bulkServer), "complete_transport_tls_handshake_bounded_plaintext");
+  bulkServer.rBuffer.clear();
+
+  suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "reconfigure_transport_runtime_client_interleaved_stream");
+  ProdigyTransportTLSStream controlClient = {};
+  reserveTransportStream(controlClient);
+  suite.expect(controlClient.beginTransportTLS(false), "begin_transport_tls_client_interleaved_stream");
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure), "reconfigure_transport_runtime_server_interleaved_stream");
+  ProdigyTransportTLSStream controlServer = {};
+  reserveTransportStream(controlServer);
+  suite.expect(controlServer.beginTransportTLS(true), "begin_transport_tls_server_interleaved_stream");
+  suite.expect(completeTransportHandshake(controlClient, controlServer), "complete_transport_tls_handshake_interleaved_stream");
+  controlServer.rBuffer.clear();
+
+  String bulkPayload = {};
+  bulkPayload.reserve((3u * 1024u * 1024u));
+  for (uint32_t index = 0; index < (3u * 1024u * 1024u); ++index)
+  {
+    bulkPayload.append(uint8_t(index));
+  }
+  bulkClient.wBuffer.append(bulkPayload);
+  uint32_t firstBulkCiphertext = bulkClient.nBytesToSend();
+  suite.expect(firstBulkCiphertext > 0, "bounded_plaintext_first_ciphertext_ready");
+  suite.expect(
+      bulkClient.wBuffer.outstandingBytes() == bulkPayload.size() - boundedPlaintextSendBudget,
+      "bounded_plaintext_first_kick_consumes_exact_budget");
+
+  uint32_t partialBulkCompletion = firstBulkCiphertext / 2;
+  if (partialBulkCompletion == 0)
+  {
+    partialBulkCompletion = 1;
+  }
+  suite.expect(pumpTransportBytesLimited(bulkClient, bulkServer, partialBulkCompletion), "bounded_plaintext_partial_ciphertext_completion_decrypts");
+  suite.expect(
+      bulkClient.wBuffer.outstandingBytes() == bulkPayload.size() - boundedPlaintextSendBudget,
+      "bounded_plaintext_partial_ciphertext_does_not_consume_next_chunk");
+
+  String controlPayload = "independent control stream progresses while bulk ciphertext is in flight"_ctv;
+  controlClient.wBuffer.append(controlPayload);
+  suite.expect(pumpTransportUntilPlaintext(controlClient, controlServer, controlServer.rBuffer, controlPayload), "bounded_plaintext_interleaved_stream_delivers_control");
+  suite.expect(streamBufferEquals(controlServer.rBuffer, controlPayload), "bounded_plaintext_interleaved_stream_preserves_control_bytes");
+
+  bool bulkDelivered = false;
+  for (uint32_t round = 0; round < 2048; ++round)
+  {
+    bool progressed = pumpTransportBytesLimited(bulkClient, bulkServer, 4096);
+    if (streamBufferEquals(bulkServer.rBuffer, bulkPayload))
+    {
+      bulkDelivered = true;
+      break;
+    }
+    if (progressed == false)
+    {
+      break;
+    }
+  }
+  suite.expect(bulkDelivered, "bounded_plaintext_multimegabyte_payload_delivers");
+  suite.expect(streamBufferEquals(bulkServer.rBuffer, bulkPayload), "bounded_plaintext_multimegabyte_payload_bytes_and_order_match");
+
+}
+
+static bool consumeArtifactInterleaveMessages(
+    ProdigyArtifactStream& stream,
+    uint32_t& controlCount,
+    Vector<String>& completed,
+    String& failure)
+{
+  bool parseFailed = false;
+  stream.extractMessages<Message>([&](Message *message) -> void {
+    if (message->topic == ProdigyBulkTransfer::fragmentTopic)
+    {
+      auto result = stream.artifacts.consume(message, [&](String&& frame) { completed.push_back(std::move(frame)); }, &failure);
+      if (result == ProdigyBulkTransfer::ConsumeResult::invalid) parseFailed = true;
+      return;
+    }
+    if (message->topic == 0x3101u) ++controlCount;
+    else { failure.assign("unexpected same-stream artifact interleave topic"_ctv); parseFailed = true; }
+  }, true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
+  return parseFailed == false && failure.size() == 0;
+}
+
+static void runArtifactInterleaveCase(
+    TestSuite& suite,
+    uint128_t clientUUID,
+    uint128_t serverUUID,
+    const String& rootCertPem,
+    const String& rootKeyPem,
+    const String& clientCertPem,
+    const String& clientKeyPem,
+    const String& serverCertPem,
+    const String& serverKeyPem,
+    String& failure)
+{
+  suite.expect(configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure), "artifact_interleave_configure_client");
+  ProdigyArtifactStream client = {};
+  reserveTransportStream(client);
+  client.artifactChunksEnabled = true;
+  suite.expect(client.beginTransportTLS(false), "artifact_interleave_begin_client_tls");
+  suite.expect(configureTransportRuntimeForNode(serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure), "artifact_interleave_configure_server");
+  ProdigyArtifactStream server = {};
+  reserveTransportStream(server);
+  server.artifactChunksEnabled = true;
+  suite.expect(server.beginTransportTLS(true), "artifact_interleave_begin_server_tls");
+  suite.expect(completeTransportHandshake(client, server), "artifact_interleave_complete_tls_handshake");
+  server.rBuffer.clear();
+
+  String opaque = {};
+  opaque.reserve(64u * 1024u * 1024u);
+  for (uint32_t index = 0; index < 64u * 1024u * 1024u; ++index) opaque.append(uint8_t(index));
+  String artifactFrame = {};
+  Message::construct(artifactFrame, uint16_t(0x3100u), opaque);
+  const uint64_t expectedArtifactFrameBytes = artifactFrame.size();
+  String expectedArtifactFrameDigest = {};
+  suite.expect(prodigyComputeSHA256Hex(artifactFrame, expectedArtifactFrameDigest, &failure), "artifact_interleave_hashes_opaque_frame");
+  String queueFailure = {};
+  suite.expect(client.queueArtifactMessage(std::move(artifactFrame), &queueFailure), "artifact_interleave_queues_64mib_opaque_frame");
+
+  uint32_t controls = 0;
+  uint32_t probesIssued = 0;
+  Vector<String> completed = {};
+  String receiveFailure = {};
+  std::vector<uint64_t> probeDurationsUs = {};
+  std::vector<std::chrono::steady_clock::time_point> probeStarts = {};
+  bool parseProgress = true;
+  bool senderBounded = true;
+  for (uint32_t round = 0; round < 200000 && completed.empty(); ++round)
+  {
+    const bool issueProbe = probesIssued < 30 && client.hasBufferedTransportCiphertext() == false && client.wBuffer.outstandingBytes() == 0;
+    std::chrono::steady_clock::time_point probeStart = {};
+    if (issueProbe)
+    {
+      // nBytesToSend appends exactly one opaque fragment. The control frame is
+      // then queued behind a deliberately partial ciphertext send on the same
+      // TLS stream, so it must be parsed before the next artifact fragment.
+      (void)client.nBytesToSend();
+      String probe = {};
+      probe.snprintf<"probe-{itoa}"_ctv>(uint64_t(probesIssued));
+      Message::construct(client.wBuffer, uint16_t(0x3101u), probe);
+      probeStart = std::chrono::steady_clock::now();
+      probeStarts.push_back(probeStart);
+      ++probesIssued;
+    }
+
+    const uint32_t controlsBefore = controls;
+    bool progressed = pumpTransportBytesLimited(client, server, 4096);
+    progressed = pumpTransportBytesLimited(server, client, 4096) || progressed;
+    parseProgress = consumeArtifactInterleaveMessages(server, controls, completed, receiveFailure) && parseProgress;
+    for (uint32_t completedProbe = controlsBefore; completedProbe < controls; ++completedProbe)
+    {
+      probeDurationsUs.push_back(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - probeStarts[completedProbe]).count()));
+    }
+    senderBounded = client.wBuffer.reservedBytes() <= (ProdigyBulkTransfer::maximumFragmentBytes * 2u) && senderBounded;
+    if (receiveFailure.size() > 0 || progressed == false) break;
+  }
+
+  suite.expect(parseProgress, "artifact_interleave_parse_progress");
+  suite.expect(senderBounded, "artifact_interleave_sender_buffer_stays_fragment_bounded");
+  suite.expect(probesIssued == 30 && controls == 30, "artifact_interleave_all_30_same_stream_controls_processed_before_artifact_completion");
+  suite.expect(completed.size() == 1, "artifact_interleave_reconstructs_exactly_one_opaque_frame");
+  if (completed.size() == 1)
+  {
+    const Message *message = reinterpret_cast<const Message *>(completed[0].data());
+    String completedDigest = {};
+    suite.expect(prodigyComputeSHA256Hex(completed[0], completedDigest, &failure) &&
+                     message->topic == 0x3100u && completed[0].size() == expectedArtifactFrameBytes && completedDigest.equals(expectedArtifactFrameDigest),
+                 "artifact_interleave_reconstructed_frame_bytes_and_topic_match");
+  }
+  std::vector<uint64_t> sorted = probeDurationsUs;
+  std::sort(sorted.begin(), sorted.end());
+  const uint64_t p95Us = sorted.empty() ? UINT64_MAX : sorted[(sorted.size() * 95 + 99) / 100 - 1];
+  std::fprintf(stderr, "artifact_interleave_probe_us=");
+  for (uint64_t duration : probeDurationsUs) std::fprintf(stderr, "%llu,", static_cast<unsigned long long>(duration));
+  std::fprintf(stderr, " p95_us=%llu samples=%llu\n", static_cast<unsigned long long>(p95Us), static_cast<unsigned long long>(probeDurationsUs.size()));
+  suite.expect(probeDurationsUs.size() == 30 && p95Us < 100'000, "artifact_interleave_30_probe_p95_under_100ms");
+
+  // On the same TLS stream, reset a partially received transfer. Its remaining
+  // old-ID fragment is rejected, while the following transfer gets a newer ID
+  // and reconstructs normally.
+  String stalePayload = {};
+  stalePayload.reserve(128u * 1024u);
+  for (uint32_t index = 0; index < 128u * 1024u; ++index) stalePayload.append(uint8_t(0xa0u + index));
+  String staleFrame = {};
+  Message::construct(staleFrame, uint16_t(0x3100u), stalePayload);
+  suite.expect(client.queueArtifactMessage(std::move(staleFrame), &queueFailure), "artifact_interleave_queues_partial_reset_transfer");
+  Vector<String> resetCompleted = {};
+  String resetFailure = {};
+  for (uint32_t round = 0; round < 1000 && server.artifacts.pendingIncomingReservedBytes() == 0; ++round)
+  {
+    (void)pumpTransportBytesLimited(client, server, 4096);
+    (void)consumeArtifactInterleaveMessages(server, controls, resetCompleted, resetFailure);
+  }
+  suite.expect(server.artifacts.pendingIncomingReservedBytes() > 0, "artifact_interleave_receives_partial_transfer_before_reset");
+  server.artifacts.reset();
+  suite.expect(server.artifacts.pendingIncomingReservedBytes() == 0, "artifact_interleave_reset_drops_stale_fragment_reservation");
+  bool staleRejected = false;
+  for (uint32_t round = 0; round < 1000 && staleRejected == false; ++round)
+  {
+    (void)pumpTransportBytesLimited(client, server, 4096);
+    String oldFailure = {};
+    staleRejected = consumeArtifactInterleaveMessages(server, controls, resetCompleted, oldFailure) == false;
+  }
+  suite.expect(staleRejected, "artifact_interleave_reset_rejects_stale_old_transfer_fragment");
+  for (uint32_t round = 0; round < 1000 && (client.artifacts.hasOutbound() || client.hasBufferedTransportCiphertext() || client.wBuffer.outstandingBytes() > 0); ++round)
+  {
+    (void)pumpTransportBytesLimited(client, server, 4096);
+    String ignoredOldFailure = {};
+    (void)consumeArtifactInterleaveMessages(server, controls, resetCompleted, ignoredOldFailure);
+  }
+  suite.expect(client.artifacts.hasOutbound() == false && client.hasBufferedTransportCiphertext() == false && client.wBuffer.outstandingBytes() == 0,
+               "artifact_interleave_drains_rejected_old_transfer_before_new_id");
+
+  String freshFrame = {};
+  Message::construct(freshFrame, uint16_t(0x3100u), "fresh-transfer-after-reset"_ctv);
+  suite.expect(client.queueArtifactMessage(std::move(freshFrame), &queueFailure), "artifact_interleave_queues_newer_transfer_after_reset");
+  resetFailure.clear();
+  for (uint32_t round = 0; round < 1000 && resetCompleted.empty(); ++round)
+  {
+    (void)pumpTransportBytesLimited(client, server, 4096);
+    (void)consumeArtifactInterleaveMessages(server, controls, resetCompleted, resetFailure);
+  }
+  suite.expect(resetFailure.size() == 0 && resetCompleted.size() == 1, "artifact_interleave_new_transfer_id_completes_after_stale_reset");
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 1 && std::strcmp(argv[1], "--accepted-send-server") == 0)
@@ -745,6 +1027,9 @@ int main(int argc, char **argv)
         uint32_t(payloadValue),
         uint32_t(maxSegmentValue));
   }
+
+  const bool boundedSendOnly = argc > 1 && std::strcmp(argv[1], "--bounded-send") == 0;
+  const bool artifactInterleaveOnly = argc > 1 && std::strcmp(argv[1], "--artifact-interleave") == 0;
 
   TestSuite suite;
   String failure = {};
@@ -809,6 +1094,30 @@ int main(int argc, char **argv)
   if (serverCert)
   {
     X509_free(serverCert);
+  }
+
+  if (boundedSendOnly)
+  {
+    runBoundedPlaintextSendCase(
+        suite,
+        clientUUID,
+        serverUUID,
+        rootCertPem,
+        rootKeyPem,
+        clientCertPem,
+        clientKeyPem,
+        serverCertPem,
+        serverKeyPem,
+        failure);
+    ProdigyTransportTLSRuntime::clear();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
+  if (artifactInterleaveOnly)
+  {
+    runArtifactInterleaveCase(suite, clientUUID, serverUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, serverCertPem, serverKeyPem, failure);
+    ProdigyTransportTLSRuntime::clear();
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   TlsResumptionSnapshot resumptionSnapshot = makeTransportTlsResumptionSnapshot();
@@ -1092,6 +1401,30 @@ int main(int argc, char **argv)
     suite.expect(pendingTopics[1] == 0x2002u, "pending_plaintext_second_topic_matches");
     suite.expect(pendingPayloads[1].equals(pendingPayloadB), "pending_plaintext_second_payload_matches");
   }
+
+  runBoundedPlaintextSendCase(
+      suite,
+      clientUUID,
+      serverUUID,
+      rootCertPem,
+      rootKeyPem,
+      clientCertPem,
+      clientKeyPem,
+      serverCertPem,
+      serverKeyPem,
+      failure);
+
+  runArtifactInterleaveCase(
+      suite,
+      clientUUID,
+      serverUUID,
+      rootCertPem,
+      rootKeyPem,
+      clientCertPem,
+      clientKeyPem,
+      serverCertPem,
+      serverKeyPem,
+      failure);
 
   ProdigyTransportTLSRuntime::clear();
   runFixedSlotRingTransportTLSPayload(

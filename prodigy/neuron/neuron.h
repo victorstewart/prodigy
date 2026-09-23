@@ -41,26 +41,29 @@
 #include <prodigy/neuron/bgp.runtime.h>
 #include <prodigy/neuron/containers.h>
 #include <prodigy/bundle.artifact.h>
+#include <prodigy/artifact.io.h>
 #include <prodigy/machine.hardware.h>
 #include <prodigy/netdev.detect.h>
-#include <prodigy/transport.tls.h>
+#include <prodigy/transport.artifact.h>
 #include <switchboard/overlay.route.h>
 #include <switchboard/switchboard.h>
 #include <switchboard/whitehole.route.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/wire.h>
 
-class NeuronBrainControlStream : public RingInterface, public ProdigyTransportTLSStream {
+class NeuronBrainControlStream : public RingInterface, public ProdigyArtifactStream {
 public:
 
   bool connected = false;
   bool initialMachineHardwareProfileQueued = false;
+  bool transitionAfterBundleAck = false;
 
   void reset(void) override
   {
-    ProdigyTransportTLSStream::reset();
+    ProdigyArtifactStream::reset();
     connected = false;
     initialMachineHardwareProfileQueued = false;
+    transitionAfterBundleAck = false;
   }
 };
 
@@ -93,6 +96,18 @@ protected:
     }
   };
 
+  struct PendingReceivedBundleArtifact {
+    NeuronBrainControlStream *stream = nullptr;
+    uint64_t streamGeneration = 0;
+    uint128_t peerUUID = 0;
+    String bundle = {};
+    String expectedDigest = {};
+    String actualDigest = {};
+    String failure = {};
+    ProdigyPreparedBundleArtifact prepared = {};
+    bool durable = false;
+  };
+
   NeuronIaaS *iaas;
   std::unique_ptr<NeuronBGPRuntime> bgp;
   std::unique_ptr<Switchboard> switchboard;
@@ -121,6 +136,15 @@ protected:
   ProdigyOverlayValueMirror<portal_definition, switchboard_whitehole_binding> installedEgressWhiteholeBindingKeys;
   bytell_hash_subvector<uint32_t, LocalWhiteholeBindingEntry> whiteholeBindingsByContainer;
   bytell_hash_subvector<uint64_t, CoroutineStack *> pendingContainerDownloads;
+  std::unique_ptr<ProdigyArtifactIO> artifactIO;
+  // Receipt-driven operations may complete after their control stream was
+  // replaced.  The callback must not touch a destroyed Neuron.
+  std::shared_ptr<uint8_t> asyncOperationLifetime = std::make_shared<uint8_t>(0);
+  std::shared_ptr<PendingReceivedBundleArtifact> pendingBundleArtifact;
+  bool deferredBundleTransition = false;
+  String installedBundleDigest = {};
+  bool installedBundleDigestReady = false;
+  bool installedBundleDigestInFlight = false;
   bytell_hash_map<uint128_t, Vector<String>> pendingAdvertisementPairings;
   bytell_hash_map<uint128_t, Vector<String>> pendingSubscriptionPairings;
   bytell_hash_map<uint128_t, Vector<String>> pendingCredentialRefreshes;
@@ -911,6 +935,12 @@ protected:
       return;
     }
 
+    if (pendingBundleArtifact != nullptr && pendingBundleArtifact->stream == stream)
+    {
+      pendingBundleArtifact.reset();
+      deferredBundleTransition = false;
+    }
+
     if (stream == brain)
     {
       brain = nullptr;
@@ -1207,13 +1237,97 @@ protected:
 
   void appendInitialBrainControlFrames(String& outbound)
   {
-    String installedDigest = {};
-    String executable = {};
-    if (prodigyResolveCurrentExecutablePath(executable))
-      (void)prodigyResolveInstalledBundleDigestForExecutable(executable, installedDigest);
     // The master uses this attestation together with the following stateUpload
     // before it advances the next worker.
-    Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments(), installedDigest);
+    Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments(), installedBundleDigest);
+  }
+
+  void queueAttestedInitialBrainControlFrames(NeuronBrainControlStream *stream)
+  {
+    if (installedBundleDigestReady == false || stream != brain || streamIsActive(stream) == false)
+    {
+      return;
+    }
+    stream->initialMachineHardwareProfileQueued = false;
+    appendInitialBrainControlFrames(stream->wBuffer);
+    for (const auto& [deploymentID, coros] : pendingContainerDownloads)
+    {
+      (void)coros;
+      Message::construct(stream->wBuffer, NeuronTopic::requestContainerBlob, deploymentID);
+    }
+    (void)queueMachineHardwareProfileToBrainIfReady("brain-control-accept");
+    (void)appendHealthyContainerFrames(stream->wBuffer);
+    if (stream->pendingSend == false)
+    {
+      Ring::queueSend(stream);
+    }
+    Ring::submitPending();
+  }
+
+  void queueInstalledBundleDigestAttestation(NeuronBrainControlStream *stream)
+  {
+    if (installedBundleDigestReady)
+    {
+      queueAttestedInitialBrainControlFrames(stream);
+      return;
+    }
+    if (installedBundleDigestInFlight || artifactIO == nullptr)
+    {
+      if (artifactIO == nullptr && stream == brain) queueCloseIfActive(stream);
+      return;
+    }
+    String executable = {};
+    if (prodigyResolveCurrentExecutablePath(executable) == false)
+    {
+      if (stream == brain) queueCloseIfActive(stream);
+      return;
+    }
+    installedBundleDigestInFlight = true;
+    auto digest = std::make_shared<String>();
+    const uint64_t streamGeneration = stream->ioGeneration;
+    if (artifactIO->submit(
+            0,
+            [executable, digest] { (void)prodigyResolveInstalledBundleDigestForExecutable(executable, *digest); },
+            [this, stream, streamGeneration, digest] {
+              installedBundleDigestInFlight = false;
+              if (digest->empty())
+              {
+                if (brain == stream && stream->ioGeneration == streamGeneration)
+                {
+                  queueCloseIfActive(stream);
+                }
+                else if (brain != nullptr)
+                {
+                  queueInstalledBundleDigestAttestation(brain);
+                }
+                return;
+              }
+              installedBundleDigest = std::move(*digest);
+              installedBundleDigestReady = true;
+              if (brain == stream && stream->ioGeneration == streamGeneration)
+              {
+                queueAttestedInitialBrainControlFrames(stream);
+              }
+              else if (brain != nullptr)
+              {
+                queueInstalledBundleDigestAttestation(brain);
+              }
+            },
+            [this, stream, streamGeneration](std::exception_ptr) {
+              installedBundleDigestInFlight = false;
+              if (brain == stream && stream->ioGeneration == streamGeneration)
+              {
+                queueCloseIfActive(stream);
+              }
+              else if (brain != nullptr)
+              {
+                queueInstalledBundleDigestAttestation(brain);
+              }
+            }) == false)
+    {
+      installedBundleDigestInFlight = false;
+      if (stream == brain) queueCloseIfActive(stream);
+    }
   }
 
   uint32_t appendHealthyContainerFrames(String& outbound)
@@ -2661,6 +2775,8 @@ public:
 
   ~Neuron()
   {
+    asyncOperationLifetime.reset();
+    artifactIO.reset();
     if (wormholeFlowGC)
     {
       WormholeFlowGC *gc = wormholeFlowGC;
@@ -2781,6 +2897,15 @@ public:
     osUpdateProcess.pollQueued = false;
     osUpdateProcess.targetOSID.clear();
     osUpdateProcess.targetOSVersionID.clear();
+  }
+
+  virtual void startOperatingSystemUpdateAsync(String targetOSID, String targetOSVersionID,
+                                               String updateCommand,
+                                               std::function<void(bool, String)> completion)
+  {
+    String failure;
+    const bool started = startOperatingSystemUpdate(targetOSID, targetOSVersionID, updateCommand, &failure);
+    completion(started, std::move(failure));
   }
 
   virtual bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr)
@@ -2976,6 +3101,11 @@ public:
 
     RingDispatcher::installMultiplexee(&brainListener, this);
     RingDispatcher::installMultiplexee(this, this);
+    artifactIO = ProdigyArtifactIO::startOwned();
+    if (artifactIO == nullptr)
+    {
+      std::fprintf(stderr, "neuron artifact I/O worker unavailable\n");
+    }
     Ring::installFDIntoFixedFileSlot(&brainListener);
     deferredHardwareInventoryWake.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (deferredHardwareInventoryWake.fd < 0)
@@ -3701,12 +3831,195 @@ public:
     continuation.resume();
   }
 
+  void resumeStoredContainerDownload(uint64_t deploymentID)
+  {
+    auto pendingIt = pendingContainerDownloads.find(deploymentID);
+    if (pendingIt == pendingContainerDownloads.end())
+    {
+      return;
+    }
+
+    Vector<CoroutineStack *> toResume = std::move(pendingIt->second);
+    pendingContainerDownloads.erase(pendingIt);
+    bytell_hash_set<CoroutineStack *> resumed;
+    for (CoroutineStack *coro : toResume)
+    {
+      if (coro != nullptr && resumed.contains(coro) == false)
+      {
+        resumed.emplace(coro);
+        resumeContainerDownloadWaiter(coro);
+      }
+    }
+  }
+
+  struct PendingReceivedContainerArtifact {
+    NeuronBrainControlStream *stream = nullptr;
+    uint64_t streamGeneration = 0;
+    uint128_t peerUUID = 0;
+    uint64_t deploymentID = 0;
+    String blob = {};
+    String storeRoot = {};
+    String stagePath = {};
+    String failure = {};
+    ContainerStore::PreparedAppArtifact prepared = {};
+  };
+
+  bool receivedArtifactSourceIsCurrent(const PendingReceivedContainerArtifact& operation) const
+  {
+    NeuronBrainControlStream *stream = operation.stream;
+    if (brain != stream || stream == nullptr || stream->ioGeneration != operation.streamGeneration ||
+        streamIsActive(stream) == false || stream->tlsPeerUUID != operation.peerUUID)
+    {
+      return false;
+    }
+    return stream->transportTLSEnabled() == false ||
+           (stream->isTLSNegotiated() && stream->tlsPeerVerified);
+  }
+
+  // The default deliberately has no policy effect.  The focused artifact unit
+  // uses this terminal Ring callback to distinguish a completed stale worker
+  // from a merely queued one while keeping its store outside /containers.
+  virtual void receivedContainerArtifactFinished(uint64_t, bool, bool) {}
+
+  void finishReceivedContainerArtifact(const PendingReceivedContainerArtifact& operation, bool adopted)
+  {
+    receivedContainerArtifactFinished(operation.deploymentID, adopted, receivedArtifactSourceIsCurrent(operation));
+  }
+
+  void replayPendingContainerDownloadAfterArtifactFailure(const PendingReceivedContainerArtifact& operation)
+  {
+    if (receivedArtifactSourceIsCurrent(operation))
+    {
+      std::fprintf(stderr, "neuron requestContainerBlob replaying after artifact failure deploymentID=%llu\n",
+                 (unsigned long long)operation.deploymentID);
+      queueCloseIfActive(operation.stream);
+    }
+  }
+
+  bool queueReceivedContainerArtifact(NeuronBrainControlStream *stream, uint64_t deploymentID, String&& blob)
+  {
+    if (artifactIO == nullptr || stream == nullptr || streamIsActive(stream) == false ||
+        blob.size() == 0 || blob.size() > ProdigyArtifactIO::maximumBytes)
+    {
+      return false;
+    }
+
+    auto operation = std::make_shared<PendingReceivedContainerArtifact>();
+    operation->stream = stream;
+    operation->streamGeneration = stream->ioGeneration;
+    operation->peerUUID = stream->tlsPeerUUID;
+    operation->deploymentID = deploymentID;
+    operation->blob = std::move(blob);
+    operation->storeRoot = containerArtifactStoreRoot();
+
+    const uint64_t bytes = operation->blob.size();
+    return artifactIO->submit(
+        bytes,
+        [operation] {
+          operation->stagePath = ContainerStore::pathForContainerImage(operation->deploymentID, &operation->storeRoot);
+          operation->stagePath.append(".neuron-incoming.XXXXXX"_ctv);
+          operation->stagePath.addNullTerminator();
+          const int stageFD = ::mkstemp(reinterpret_cast<char *>(operation->stagePath.data()));
+          if (stageFD < 0)
+          {
+            operation->failure.assign("container artifact stage creation failed"_ctv);
+            return;
+          }
+          (void)::close(stageFD);
+          String digest = {};
+          if (prodigyComputeSHA256Hex(operation->blob, digest, &operation->failure) == false ||
+              ContainerStore::prepareAppArtifactAtPath(operation->prepared,
+                                                       operation->deploymentID,
+                                                       operation->stagePath,
+                                                       operation->blob,
+                                                       digest,
+                                                       operation->blob.size(),
+                                                       &operation->failure,
+                                                       &operation->storeRoot) == false)
+          {
+            (void)::unlink(operation->stagePath.c_str());
+            return;
+          }
+          operation->blob.reset();
+        },
+        [this, operation] {
+          if (operation->prepared.prepared == false || receivedArtifactSourceIsCurrent(*operation) == false)
+          {
+            finishReceivedContainerArtifact(*operation, false);
+            replayPendingContainerDownloadAfterArtifactFailure(*operation);
+            (void)artifactIO->continueWith(
+                [operation] { ContainerStore::discardPreparedAppArtifact(operation->prepared); },
+                [] {},
+                [operation](std::exception_ptr) {});
+            return;
+          }
+
+          // The first worker has only written a verified stage. Publication
+          // receives a second, current-stream authorization on the Ring.
+          const bool queued = artifactIO->continueWith(
+              [operation] {
+                if (ContainerStore::publishPreparedAppArtifact(operation->prepared, &operation->failure) == false)
+                {
+                  ContainerStore::discardPreparedAppArtifact(operation->prepared);
+                  return;
+                }
+              },
+              [this, operation] {
+                if (operation->prepared.published == false || receivedArtifactSourceIsCurrent(*operation) == false ||
+                    ContainerStore::adoptPreparedAppArtifact(operation->prepared) == false)
+                {
+                  std::fprintf(stderr, "neuron requestContainerBlob publish not adopted deploymentID=%llu\n",
+                             (unsigned long long)operation->deploymentID);
+                  if (operation->prepared.published)
+                  {
+                    (void)artifactIO->continueWith(
+                        [operation] { ContainerStore::discardPreparedAppArtifact(operation->prepared); },
+                        [] {},
+                        [operation](std::exception_ptr) {});
+                  }
+                  finishReceivedContainerArtifact(*operation, false);
+                  replayPendingContainerDownloadAfterArtifactFailure(*operation);
+                  return;
+                }
+                resumeStoredContainerDownload(operation->deploymentID);
+                finishReceivedContainerArtifact(*operation, true);
+              },
+              [this, operation](std::exception_ptr) {
+                std::fprintf(stderr, "neuron requestContainerBlob publish worker failed deploymentID=%llu\n",
+                           (unsigned long long)operation->deploymentID);
+                finishReceivedContainerArtifact(*operation, false);
+                replayPendingContainerDownloadAfterArtifactFailure(*operation);
+              });
+          if (queued == false)
+          {
+            std::fprintf(stderr, "neuron requestContainerBlob publish continuation rejected deploymentID=%llu\n",
+                       (unsigned long long)operation->deploymentID);
+            replayPendingContainerDownloadAfterArtifactFailure(*operation);
+          }
+        },
+        [this, operation](std::exception_ptr) {
+          std::fprintf(stderr, "neuron requestContainerBlob worker failed deploymentID=%llu\n",
+                     (unsigned long long)operation->deploymentID);
+          finishReceivedContainerArtifact(*operation, false);
+          replayPendingContainerDownloadAfterArtifactFailure(*operation);
+          (void)artifactIO->continueWith(
+              [operation] { ContainerStore::discardPreparedAppArtifact(operation->prepared); },
+              [] {},
+              [operation](std::exception_ptr) {});
+        });
+  }
+
   // Keep live container processes and their mounts intact.  The replacement
   // Neuron re-registers and stateUpload re-adopts them before scheduling any
   // new work; this is deliberately an exec, not a Neuron restart/teardown.
   virtual bool quiesceProcessForBundleExec(void)
   {
     return true;
+  }
+
+  bool quiesceArtifactIOForBundleExec(void) override
+  {
+    return !artifactIO || artifactIO->quiesceForExec();
   }
 
   bool quiesceContainerControlSocketsForBundleExec(void) override
@@ -3754,12 +4067,13 @@ public:
 
   virtual void transitionToNewBundle(void)
   {
-    // Host-control HTTP and DNS own raw-fd polls. Their asynchronous shutdown
+    // Host-control HTTP, DNS and artifact I/O own raw-fd polls. Their asynchronous shutdown
     // callbacks are the lifetime barrier required by Ring::shutdownForExec().
     // Retry from this Neuron-owned timer after cancellation CQEs are dispatched.
     const bool containerControlsQuiesced = quiesceContainerControlSocketsForBundleExec();
     const bool processQuiesced = quiesceProcessForBundleExec();
-    if (containerControlsQuiesced == false || processQuiesced == false)
+    const bool artifactIOQuiesced = quiesceArtifactIOForBundleExec();
+    if (containerControlsQuiesced == false || processQuiesced == false || artifactIOQuiesced == false)
     {
       queueBundleExecRetry();
       return;
@@ -3800,11 +4114,38 @@ public:
     _exit(EXIT_FAILURE);
   }
 
-  // Bundle payloads are release-sized and their digest/install temporaries have
-  // non-trivial lifetimes. Keep this path off neuronHandler's bounded dispatch
-  // stack: the integrated live rollout reproduced a guard-page SIGSEGV while
-  // processing updateBundle inline, while this isolated frame transitioned the
-  // same worker cleanly.
+  bool receivedBundleSourceIsCurrent(const PendingReceivedBundleArtifact& operation) const
+  {
+    NeuronBrainControlStream *stream = operation.stream;
+    return brain == stream && stream != nullptr && stream->ioGeneration == operation.streamGeneration &&
+           streamIsActive(stream) && stream->tlsPeerUUID == operation.peerUUID &&
+           (stream->transportTLSEnabled() == false || (stream->isTLSNegotiated() && stream->tlsPeerVerified));
+  }
+
+  void clearPendingBundleArtifact(const std::shared_ptr<PendingReceivedBundleArtifact>& operation)
+  {
+    if (pendingBundleArtifact == operation)
+    {
+      pendingBundleArtifact.reset();
+    }
+  }
+
+  void queueBundleArtifactResponse(const std::shared_ptr<PendingReceivedBundleArtifact>& operation, bool success)
+  {
+    if (receivedBundleSourceIsCurrent(*operation) == false)
+    {
+      return;
+    }
+    Message::construct(operation->stream->wBuffer,
+                       NeuronTopic::updateBundle,
+                       success,
+                       operation->actualDigest,
+                       operation->failure);
+    Ring::queueSend(operation->stream);
+  }
+
+  // Bundle payloads are release-sized. The worker writes only a private,
+  // verified stage; publication follows a Ring-owned source/epoch check.
   [[gnu::noinline]] void handleBundleUpdateMessage(Message *message)
   {
     uint8_t *args = message->args;
@@ -3812,28 +4153,114 @@ public:
     String expectedDigest = {};
     Message::extractToStringView(args, bundle);
     Message::extractToStringView(args, expectedDigest);
-    String actualDigest = {};
-    String failure = {};
-    if (prodigyStageBundleWithExpectedSHA256(prodigyStagedBundlePath(), bundle, expectedDigest, actualDigest, &failure) == false)
+    if (artifactIO == nullptr || brain == nullptr || streamIsActive(brain) == false ||
+        pendingBundleArtifact != nullptr || bundle.size() == 0 || bundle.size() > ProdigyArtifactIO::maximumBytes)
     {
-      basics_log("neuron updateBundle rejected bytes=%llu reason=%s\n", (unsigned long long)bundle.size(), failure.c_str());
-      if (brain != nullptr)
-      {
-        Message::construct(brain->wBuffer, NeuronTopic::updateBundle, false, actualDigest, failure);
-        if (streamIsActive(brain))
-        {
-          Ring::queueSend(brain);
-        }
-      }
+      std::fprintf(stderr, "neuron updateBundle artifact queue rejected bytes=%llu\n", (unsigned long long)bundle.size());
+      if (brain != nullptr) queueCloseIfActive(brain);
       return;
     }
-    if (brain != nullptr)
+
+    auto operation = std::make_shared<PendingReceivedBundleArtifact>();
+    operation->stream = brain;
+    operation->streamGeneration = brain->ioGeneration;
+    operation->peerUUID = brain->tlsPeerUUID;
+    operation->bundle.assign(bundle);
+    operation->expectedDigest.assign(expectedDigest);
+    pendingBundleArtifact = operation;
+    const uint64_t bytes = operation->bundle.size();
+    if (artifactIO->submit(
+            bytes,
+            [operation] {
+              if (prodigyPrepareBundleArtifact(operation->prepared,
+                                                prodigyStagedBundlePath(),
+                                                operation->bundle,
+                                                operation->expectedDigest,
+                                                &operation->failure))
+              {
+                operation->actualDigest.assign(operation->prepared.sha256);
+                operation->bundle.reset();
+              }
+            },
+            [this, operation] {
+              if (operation->prepared.prepared == false || receivedBundleSourceIsCurrent(*operation) == false)
+              {
+                queueBundleArtifactResponse(operation, false);
+                clearPendingBundleArtifact(operation);
+                deferredBundleTransition = false;
+                (void)artifactIO->continueWith(
+                    [operation] { prodigyDiscardPreparedBundleArtifact(operation->prepared); },
+                    [] {},
+                    [operation](std::exception_ptr) {});
+                return;
+              }
+              if (prodigyPublishPreparedBundleArtifact(operation->prepared, &operation->failure) == false)
+              {
+                queueBundleArtifactResponse(operation, false);
+                clearPendingBundleArtifact(operation);
+                deferredBundleTransition = false;
+                (void)artifactIO->continueWith(
+                    [operation] { prodigyDiscardPreparedBundleArtifact(operation->prepared); },
+                    [] {},
+                    [operation](std::exception_ptr) {});
+                return;
+              }
+              if (artifactIO->continueWith(
+                      [operation] {
+                        operation->durable = prodigyFsyncPublishedBundleArtifact(operation->prepared, &operation->failure);
+                      },
+                      [this, operation] {
+                        if (operation->prepared.published == false || operation->durable == false || receivedBundleSourceIsCurrent(*operation) == false)
+                        {
+                          queueBundleArtifactResponse(operation, false);
+                          clearPendingBundleArtifact(operation);
+                          deferredBundleTransition = false;
+                          if (operation->prepared.published)
+                          {
+                            (void)artifactIO->continueWith(
+                                [operation] { prodigyDiscardPreparedBundleArtifact(operation->prepared); },
+                                [] {},
+                                [operation](std::exception_ptr) {});
+                          }
+                          return;
+                        }
+                        const bool transitionAfterAck = deferredBundleTransition;
+                        deferredBundleTransition = false;
+                        queueBundleArtifactResponse(operation, true);
+                        clearPendingBundleArtifact(operation);
+                        if (transitionAfterAck)
+                        {
+                          operation->stream->transitionAfterBundleAck = true;
+                        }
+                      },
+                      [this, operation](std::exception_ptr) {
+                        operation->failure.assign("bundle artifact worker failed"_ctv);
+                        queueBundleArtifactResponse(operation, false);
+                        clearPendingBundleArtifact(operation);
+                        deferredBundleTransition = false;
+                      }) == false)
+              {
+                operation->failure.assign("bundle artifact publication continuation unavailable"_ctv);
+                queueBundleArtifactResponse(operation, false);
+                clearPendingBundleArtifact(operation);
+                deferredBundleTransition = false;
+              }
+            },
+            [this, operation](std::exception_ptr) {
+              operation->failure.assign("bundle artifact worker failed"_ctv);
+              queueBundleArtifactResponse(operation, false);
+              clearPendingBundleArtifact(operation);
+              deferredBundleTransition = false;
+              (void)artifactIO->continueWith(
+                  [operation] { prodigyDiscardPreparedBundleArtifact(operation->prepared); },
+                  [] {},
+                  [operation](std::exception_ptr) {});
+            }) == false)
     {
-      Message::construct(brain->wBuffer, NeuronTopic::updateBundle, true, actualDigest, String());
-      if (streamIsActive(brain))
-      {
-        Ring::queueSend(brain);
-      }
+      pendingBundleArtifact.reset();
+      deferredBundleTransition = false;
+      std::fprintf(stderr, "neuron updateBundle artifact worker queue full bytes=%llu\n", (unsigned long long)bytes);
+      queueCloseIfActive(brain);
     }
   }
 
@@ -3849,6 +4276,13 @@ public:
                  container->name.equal(String(name.c_str())) &&
                  containers.contains(container->plan.uuid);
         }, failure);
+  }
+
+  // Production keeps received application artifacts in the canonical store.
+  // Tests override only the root to exercise the identical prepared lifecycle.
+  virtual String containerArtifactStoreRoot(void) const
+  {
+    return "/containers/store"_ctv;
   }
 
   void neuronHandler(Message *message)
@@ -4227,7 +4661,14 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, marker);
           if (marker == 1)
           {
-            transitionToNewBundle();
+            if (pendingBundleArtifact != nullptr)
+            {
+              deferredBundleTransition = true;
+            }
+            else
+            {
+              transitionToNewBundle();
+            }
           }
           break;
         }
@@ -4247,28 +4688,27 @@ public:
           targetOSVersionIDText.assign(targetOSVersionID);
           updateCommandText.assign(updateCommand);
 
-          String failure = {};
-          if (startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, &failure) == false)
-          {
-            PRODIGY_DEBUG_LOG(
-                         "neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
-                         targetOSIDText.c_str(),
-                         targetOSVersionIDText.c_str(),
-                         failure.c_str());
-            PRODIGY_DEBUG_FLUSH();
-            basics_log("neuron updateOS failed targetOSID=%s targetOSVersionID=%s reason=%s\n",
-                       targetOSIDText.c_str(),
-                       targetOSVersionIDText.c_str(),
-                       failure.c_str());
-            if (brain != nullptr)
-            {
-              Message::construct(brain->wBuffer, NeuronTopic::hardwareFailure, failure);
-              if (streamIsActive(brain))
-              {
-                Ring::queueSend(brain);
-              }
-            }
-          }
+          NeuronBrainControlStream *requestStream = brain;
+          const uint64_t requestGeneration = requestStream ? requestStream->ioGeneration : 0;
+          const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+          startOperatingSystemUpdateAsync(std::move(targetOSIDText), std::move(targetOSVersionIDText),
+                                          std::move(updateCommandText),
+              [this, requestStream, requestGeneration, lifetime](bool started, String failure) mutable {
+                if (lifetime.expired() || started) return;
+                if (failure.empty()) failure.assign("OS update persistence failed"_ctv);
+                PRODIGY_DEBUG_LOG("neuron updateOS receipt failed reason=%s\n", failure.c_str());
+                PRODIGY_DEBUG_FLUSH();
+                basics_log("neuron updateOS receipt failed reason=%s\n", failure.c_str());
+                // A failure belongs to the request's authenticated control
+                // stream. Do not report it on a replacement generation.
+                if (brain != requestStream || requestStream == nullptr ||
+                    requestStream->ioGeneration != requestGeneration || streamIsActive(requestStream) == false)
+                {
+                  return;
+                }
+                Message::construct(requestStream->wBuffer, NeuronTopic::hardwareFailure, failure);
+                Ring::queueSend(requestStream);
+              });
 
           break;
         }
@@ -4368,36 +4808,14 @@ public:
                        (unsigned long long)(pendingContainerDownloads.contains(deploymentID) ? pendingContainerDownloads.countEntriesFor(deploymentID) : 0));
           PRODIGY_DEBUG_FLUSH();
 
-          if (containerBlob.size() > 0)
+          String ownedBlob = containerBlob.substr(0, containerBlob.size(), Copy::yes);
+          if (queueReceivedContainerArtifact(brain, deploymentID, std::move(ownedBlob)) == false)
           {
-            String containerStoreFailure = {};
-            if (ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &containerStoreFailure) == false)
+            std::fprintf(stderr, "neuron requestContainerBlob artifact queue rejected deploymentID=%llu\n",
+                       (unsigned long long)deploymentID);
+            if (brain != nullptr)
             {
-              PRODIGY_DEBUG_LOG(
-                           "neuron requestContainerBlob store failed deploymentID=%llu reason=%s\n",
-                           (unsigned long long)deploymentID,
-                           (containerStoreFailure.size() > 0 ? containerStoreFailure.c_str() : "unknown"));
-              PRODIGY_DEBUG_FLUSH();
-            }
-          }
-
-          if (auto pendingIt = pendingContainerDownloads.find(deploymentID); pendingIt != pendingContainerDownloads.end())
-          {
-            Vector<CoroutineStack *> toResume;
-            toResume = std::move(pendingIt->second);
-            pendingContainerDownloads.erase(pendingIt);
-
-            // Defensive dedupe: a coroutine may already be tracked for this deployment.
-            bytell_hash_set<CoroutineStack *> resumed;
-            for (CoroutineStack *coro : toResume)
-            {
-              if (coro == nullptr || resumed.contains(coro))
-              {
-                continue;
-              }
-
-              resumed.emplace(coro);
-              resumeContainerDownloadWaiter(coro);
+              queueCloseIfActive(brain);
             }
           }
 
@@ -5104,11 +5522,47 @@ public:
       }
 
       bool parseFailed = false;
-      stream->template extractMessages<Message>([&](Message *message) -> void {
+      bool artifactFailed = false;
+      stream->template extractMessages<Message>([&](Message *message, bool& stop) -> void {
+        if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+        {
+          String artifactFailure = {};
+          const ProdigyBulkTransfer::ConsumeResult artifactResult = stream->artifacts.consume(
+              message,
+              [&](String&& completeFrame) -> void {
+                Message *completeMessage = reinterpret_cast<Message *>(completeFrame.data());
+                const NeuronTopic completeTopic = NeuronTopic(completeMessage->topic);
+                if (completeTopic != NeuronTopic::requestContainerBlob && completeTopic != NeuronTopic::updateBundle)
+                {
+                  artifactFailed = true;
+                  artifactFailure.assign("bulk artifact completed with a disallowed control topic"_ctv);
+                  return;
+                }
+                // neuronHandler remains the single owner of ordinary Neuron
+                // payload validation and topic semantics after transport has
+                // reassembled this owned complete Message.
+                dispatch(completeMessage);
+              },
+              &artifactFailure);
+          if (artifactResult == ProdigyBulkTransfer::ConsumeResult::invalid || artifactFailed)
+          {
+            std::fprintf(stderr, "neuron artifact recv invalid reason=%s fd=%d fslot=%d\n",
+                       (artifactFailure.size() > 0 ? artifactFailure.c_str() : "unknown"),
+                       stream->fd,
+                       stream->fslot);
+            artifactFailed = true;
+            stop = true;
+            return;
+          }
+          if (artifactResult != ProdigyBulkTransfer::ConsumeResult::notFragment)
+          {
+            return;
+          }
+        }
         dispatch(message);
       },
                                                 true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
-      if (parseFailed)
+      if (parseFailed || artifactFailed)
       {
         if constexpr (std::is_same_v<T, Container>)
         {
@@ -5298,6 +5752,10 @@ public:
 
       stream->consumeSentBytes(uint32_t(result), false);
       stream->noteSendCompleted();
+      if constexpr (requires (T *s) { s->prepareNextArtifactChunk(); })
+      {
+        stream->prepareNextArtifactChunk();
+      }
 
       bool queueAnotherSend = (stream->wBuffer.outstandingBytes() > 0);
       if constexpr (requires (T *s) { s->transportTLSEnabled(); })
@@ -5311,6 +5769,17 @@ public:
       if (queueAnotherSend && streamIsActive(stream))
       {
         Ring::queueSend(stream);
+      }
+
+      if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+      {
+        if (stream->transitionAfterBundleAck && queueAnotherSend == false && stream->wBuffer.outstandingBytes() == 0 &&
+            stream == brain && streamIsActive(stream))
+        {
+          stream->transitionAfterBundleAck = false;
+          transitionToNewBundle();
+          return;
+        }
       }
 
       int tlsNegotiated = 0;
@@ -5489,53 +5958,7 @@ public:
                  unsigned(brain->ioGeneration),
                  (unsigned long long)brain->rBuffer.remainingCapacity());
 
-      brain->initialMachineHardwareProfileQueued = false;
-      appendInitialBrainControlFrames(brain->wBuffer);
-
-      for (const auto& [deploymentID, coros] : pendingContainerDownloads)
-      {
-        (void)coros;
-        Message::construct(brain->wBuffer, NeuronTopic::requestContainerBlob, deploymentID);
-      }
-
-      bool queuedHardwareProfile = queueMachineHardwareProfileToBrainIfReady("brain-control-accept");
-      PRODIGY_DEBUG_LOG(
-                   "neuron brain control queue-hardware reason=accept stream=%p fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d queuedHardware=%d wbytes=%u queued=%llu serializedHardware=%llu\n",
-                   static_cast<void *>(brain),
-                   brain->fd,
-                   brain->fslot,
-                   int(brain->pendingSend),
-                   int(brain->pendingRecv),
-                   int(brain->isTLSNegotiated()),
-                   int(brain->tlsPeerVerified),
-                   int(queuedHardwareProfile),
-                   unsigned(brain->wBuffer.size()),
-                   (unsigned long long)brain->queuedSendOutstandingBytes(),
-                   (unsigned long long)serializedHardwareProfile.size());
-      PRODIGY_DEBUG_FLUSH();
-      (void)appendHealthyContainerFrames(brain->wBuffer);
-
-      if (streamIsActive(brain))
-      {
-        if (brain->pendingSend == false)
-        {
-          Ring::queueSend(brain);
-        }
-        verboseNeuronSocketLog("neuron accepted brain control send-arm fd=%d fslot=%d pendingSend=%d pendingRecv=%d tlsNegotiated=%d needsSendKick=%d wbytes=%u queued=%llu\n",
-                               brain->fd,
-                               brain->fslot,
-                               int(brain->pendingSend),
-                               int(brain->pendingRecv),
-                               int(brain->isTLSNegotiated()),
-                               int(brain->needsTransportTLSSendKick()),
-                               unsigned(brain->wBuffer.size()),
-                               (unsigned long long)brain->queuedSendOutstandingBytes());
-
-        // The initial TLS/registration exchange is queued from inside the accept
-        // completion handler. Submit those SQEs immediately so the master brain
-        // can make progress without waiting for a later loop iteration.
-        Ring::submitPending();
-      }
+      queueInstalledBundleDigestAttestation(brain);
     }
     else
     {

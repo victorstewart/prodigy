@@ -20,7 +20,9 @@
 #include <prodigy/brain/timing.knobs.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/brain/metrics.h>
-#include <prodigy/transport.tls.h>
+#include <prodigy/transport.artifact.h>
+#include <prodigy/artifact.io.h>
+#include <memory>
 #include <networking/reconnector.h>
 
 class ContainerView;
@@ -48,7 +50,7 @@ public:
   }
 };
 
-class BrainView : public RingInterface, public ProdigyTransportTLSStream, public CoroutineStack, public Reconnector {
+class BrainView : public RingInterface, public ProdigyArtifactStream, public CoroutineStack, public Reconnector {
 public:
 
   Machine *machine = nullptr;
@@ -64,6 +66,9 @@ public:
   bool connected = false;
   bool currentStreamAccepted = false;
   bool registrationFresh = false;
+  bool transitionAfterBundleEcho = false;
+  bool transitionAfterBundleAckSend = false;
+  bool installedBundleReadPending = false;
   int64_t lastReceiveMs = 0;
   int64_t lastMasterRegistrationAdvertiseMs = 0;
   int64_t lastHeartbeatSendMs = 0;
@@ -113,11 +118,14 @@ public:
 
   void reset() override
   {
-    ProdigyTransportTLSStream::reset();
+    ProdigyArtifactStream::reset();
     Reconnector::reset();
     connected = false;
     currentStreamAccepted = false;
     registrationFresh = false;
+    transitionAfterBundleEcho = false;
+    transitionAfterBundleAckSend = false;
+    installedBundleReadPending = false;
     kernel.clear();
     osID.clear();
     osVersionID.clear();
@@ -287,6 +295,20 @@ public:
 class BrainBase : public RingMultiplexer {
 public:
 
+  std::unique_ptr<ProdigyArtifactIO> artifactIO;
+
+  bool ensureArtifactIO(void)
+  {
+    if (artifactIO == nullptr) artifactIO = ProdigyArtifactIO::startOwned();
+    return artifactIO != nullptr;
+  }
+
+  bool quiesceArtifactIOForBundleExec(void)
+  {
+    return !artifactIO || artifactIO->quiesceForExec();
+  }
+
+
   static inline Vector<String> launchArguments = {};
 
   static void captureLaunchArguments(int argc, char *argv[])
@@ -335,6 +357,15 @@ public:
     failure.clear();
     return true;
   }
+
+  virtual void prepareForBundleExecAsync(std::function<void(bool, String)> completion)
+  {
+    String failure;
+    const bool ready = prepareForBundleExec(failure);
+    completion(ready, std::move(failure));
+  }
+
+  virtual bool quiescePersistenceForBundleExec() { return true; }
 
   static MachineState machineBootstrapLifecycleState(int64_t creationTimeMs)
   {
@@ -499,7 +530,7 @@ public:
     if (lastMetricPersistMs == 0 || (nowMs - lastMetricPersistMs) >= metricPersistMinIntervalMs)
     {
       lastMetricPersistMs = nowMs;
-      persistLocalRuntimeState();
+      persistLocalRuntimeStateAsync();
     }
   }
 
@@ -532,6 +563,16 @@ public:
   virtual bool persistLocalRuntimeState(void)
   {
     return true;
+  }
+  using PersistenceCompletion = std::function<void(bool)>;
+  // A completion is a durable receipt, never queue admission. The inline
+  // adapter keeps startup-only and synchronous test stores on the same API.
+  // Live runtimes override this with the single ordered persistent writer.
+  std::shared_ptr<uint8_t> persistenceLifetime = std::make_shared<uint8_t>(0);
+  virtual void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {})
+  {
+    const bool durable = persistLocalRuntimeState();
+    if (completion) completion(durable);
   }
   virtual bool routablePrefixReleasePending(uint128_t uuid) const
   {
@@ -794,9 +835,10 @@ public:
     {
       releaseRoutableResourceLeasesForDeployment(deploymentID);
     }
-    persistLocalRuntimeState();
-
-    armFailedDeploymentCleaner();
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    persistLocalRuntimeStateAsync([this, lifetime](bool durable) {
+      if (!lifetime.expired() && durable) armFailedDeploymentCleaner();
+    });
 
     // The deployment plan and terminal failure are both persisted above so a
     // restarted brain can reconcile the deployment. Keep the matching image
@@ -1058,7 +1100,7 @@ public:
       return 0;
     }
 
-    const uint64_t plaintextBytes = brain->wBuffer.outstandingBytes();
+    const uint64_t plaintextBytes = brain->wBuffer.outstandingBytes() + brain->artifacts.pendingOutboundBytes();
     if (brain->transportTLSEnabled())
     {
       return (plaintextBytes + brain->queuedSendOutstandingBytes());
@@ -1144,11 +1186,16 @@ public:
       queueBrainPeerLargePayloadKeepalive(brain);
     }
 
-    Message::construct(
-        brain->wBuffer,
-        BrainTopic::replicateDeployment,
-        std::forward<decltype(serializedPlan)>(serializedPlan),
-        std::forward<decltype(containerBlob)>(containerBlob));
+    String frame;
+    Message::construct(frame, BrainTopic::replicateDeployment,
+                       std::forward<decltype(serializedPlan)>(serializedPlan),
+                       std::forward<decltype(containerBlob)>(containerBlob));
+    String failure;
+    if (brain->queueArtifactMessage(std::move(frame), &failure) == false)
+    {
+      std::fprintf(stderr, "brain artifact queue rejected: %s\n", failure.c_str());
+      return false;
+    }
     Ring::queueSend(brain);
     return true;
   }
@@ -1168,12 +1215,42 @@ public:
       queueBrainPeerLargePayloadKeepalive(brain);
     }
 
-    uint32_t headerOffset = Message::appendHeader(brain->wBuffer, BrainTopic::replicateDeployment);
-    Message::appendValue(brain->wBuffer, serializedPlan);
-    Message::appendFile(brain->wBuffer, ContainerStore::pathForContainerImage(deploymentID));
-    Message::finish(brain->wBuffer, headerOffset);
-    Ring::queueSend(brain);
-    return true;
+    if (ensureArtifactIO() == false) return false;
+    struct ReadResult { String frame; bool success = false; };
+    auto result = std::make_shared<ReadResult>();
+    const uint64_t generation = brain->ioGeneration;
+    const uint128_t peerUUID = brain->uuid;
+    const String path = ContainerStore::pathForContainerImage(deploymentID);
+    const String plan = serializedPlan.substr(0, serializedPlan.size(), Copy::yes);
+    return artifactIO->submit(appendBytes + containerBlobBytes,
+        [result, path, plan, containerBlobBytes] {
+          String blob;
+          Filesystem::openReadAtClose(-1, path, blob);
+          if (blob.size() != containerBlobBytes) return;
+          Message::construct(result->frame, BrainTopic::replicateDeployment, plan, blob);
+          result->success = true;
+        },
+        [this, brain, generation, peerUUID, result] {
+          if (brains.contains(brain) == false || brain->ioGeneration != generation ||
+              brain->uuid != peerUUID || brain->canQueueSend() == false) return;
+          String failure;
+          if (result->success == false || brain->queueArtifactMessage(std::move(result->frame), &failure) == false)
+          {
+            std::fprintf(stderr, "brain stored artifact read/queue failed: %s\n", failure.c_str());
+            brain->noteCloseQueuedForCurrentTransport();
+            Ring::queueClose(brain);
+            return;
+          }
+          Ring::queueSend(brain);
+        },
+        [this, brain, generation](std::exception_ptr) {
+          std::fprintf(stderr, "brain stored artifact worker failed\n");
+          if (brains.contains(brain) && brain->ioGeneration == generation && brain->canQueueSend())
+          {
+            brain->noteCloseQueuedForCurrentTransport();
+            Ring::queueClose(brain);
+          }
+        });
   }
 
   void queueBrainDeploymentReplication(StringType auto&& serializedPlan, StringType auto&& containerBlob)
@@ -1205,7 +1282,14 @@ public:
       queueBrainPeerLargePayloadKeepalive(brain);
     }
 
-    Message::construct(brain->wBuffer, BrainTopic::replicateSystemContainerArtifact, sha256, bytes, blob);
+    String frame;
+    Message::construct(frame, BrainTopic::replicateSystemContainerArtifact, sha256, bytes, blob);
+    String failure;
+    if (brain->queueArtifactMessage(std::move(frame), &failure) == false)
+    {
+      std::fprintf(stderr, "brain system artifact queue rejected: %s\n", failure.c_str());
+      return false;
+    }
     Ring::queueSend(brain);
     return true;
   }

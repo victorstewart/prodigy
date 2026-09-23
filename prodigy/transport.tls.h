@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include <prodigy/server.state.h>
 #include <services/vault.h>
 #include <services/bitsery.h>
@@ -495,34 +497,40 @@ private:
     return harvestEncryptedOutput();
   }
 
+  constexpr static uint32_t maxPlaintextEncryptionBytesPerSendKick = (64u * 1024u);
+
   bool flushPlaintextQueue(void)
   {
-    while (wBuffer.outstandingBytes() > 0)
+    // A Ring send kick encrypts one bounded plaintext chunk. On a retry, the
+    // unconsumed wBuffer head and its exact byte count remain unchanged.
+    const uint32_t plaintextBytes = uint32_t(std::min<uint64_t>(
+        wBuffer.outstandingBytes(), maxPlaintextEncryptionBytesPerSendKick));
+    if (plaintextBytes == 0)
     {
-      int consumed = SSL_write(ssl, wBuffer.pHead(), wBuffer.outstandingBytes());
-      if (consumed > 0)
-      {
-        wBuffer.consume(consumed, false);
-        continue;
-      }
-
-      switch (SSL_get_error(ssl, consumed))
-      {
-        case SSL_ERROR_WANT_READ:
-        case SSL_ERROR_WANT_WRITE:
-          {
-            return harvestEncryptedOutput();
-          }
-        default:
-          {
-            encryptedWBuffer.reset();
-            wBuffer.clear();
-            return false;
-          }
-      }
+      return harvestEncryptedOutput();
     }
 
-    return harvestEncryptedOutput();
+    int consumed = SSL_write(ssl, wBuffer.pHead(), plaintextBytes);
+    if (consumed > 0)
+    {
+      wBuffer.consume(uint32_t(consumed), false);
+      return harvestEncryptedOutput();
+    }
+
+    switch (SSL_get_error(ssl, consumed))
+    {
+      case SSL_ERROR_WANT_READ:
+      case SSL_ERROR_WANT_WRITE:
+        {
+          return harvestEncryptedOutput();
+        }
+      default:
+        {
+          encryptedWBuffer.reset();
+          wBuffer.clear();
+          return false;
+        }
+    }
   }
 
 public:

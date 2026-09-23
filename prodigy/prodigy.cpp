@@ -6,6 +6,7 @@
 #include <prodigy/host.control.network.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/persistent.state.h>
+#include <prodigy/persistent.writer.h>
 #include <prodigy/iaas/runtime/runtime.h>
 #include <prodigy/mothership/mothership.tunnel.gateway.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
@@ -34,6 +35,22 @@ static ProdigyPersistentBrainSnapshot persistedBrainSnapshot;
 static ProdigyPersistentLocalBrainState persistentLocalBrainState;
 static bool havePersistedBrainSnapshot = false;
 static ProdigyBootstrapConfig effectiveBootstrapConfig;
+static std::weak_ptr<ProdigyPersistentStateWriter> livePersistentWriter;
+static RuntimeAwareNeuronIaaS *liveRuntimeAwareNeuronIaaS = nullptr;
+
+static bool prodigySubmitLiveBootState(ProdigyPersistentBootState bootState, uint64_t retainedBytes,
+                                       std::function<void(bool)> completion)
+{
+  auto writer = livePersistentWriter.lock();
+  if (!writer)
+  {
+    return false;
+  }
+  auto callback = std::make_shared<std::function<void(bool)>>(std::move(completion));
+  const bool admitted = writer->submitBootState(std::move(bootState), retainedBytes,
+      [callback](auto&& result) mutable { if (*callback) (*callback)(result.bootStateDurable); });
+  return admitted;
+}
 
 static bool prodigyRuntimeTraceEnabled(void)
 {
@@ -788,6 +805,61 @@ static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, S
 
 class ProdigyBrain : public Brain {
   ProdigyHostControlNetwork& hostControlNetwork;
+  std::shared_ptr<ProdigyPersistentStateWriter> persistentWriter;
+  RuntimeAwareBrainIaaS *runtimeAwareIaaS = nullptr;
+  bool runtimePersistenceStarted = false;
+  struct ExecPersistenceState { bool prepared = false, durable = false, closed = false; String failure; };
+  std::shared_ptr<ExecPersistenceState> execPersistence = std::make_shared<ExecPersistenceState>();
+
+  static uint64_t retainedBytesForSnapshot(ProdigyPersistentBrainSnapshot& snapshot,
+                                           ProdigyPersistentBootState& bootState)
+  {
+    const uint64_t snapshotBytes = ProdigyPersistentStateWriter::retainedBytesFor(snapshot);
+    const uint64_t bootStateBytes = ProdigyPersistentStateWriter::retainedBytesFor(bootState);
+    if (!snapshotBytes || !bootStateBytes || snapshotBytes > ProdigyPersistentStateWriter::maximumRetainedBytes - bootStateBytes)
+      return 0;
+    return snapshotBytes + bootStateBytes;
+  }
+
+  static uint64_t retainedBytesForLocal(ProdigyPersistentLocalBrainState& state)
+  {
+    return ProdigyPersistentStateWriter::retainedBytesFor(state);
+  }
+
+  bool ensurePersistentWriter()
+  {
+    if (persistentWriter) return true;
+    if (auto shared = livePersistentWriter.lock())
+    {
+      persistentWriter = std::move(shared);
+      return true;
+    }
+    if (!ensureArtifactIO()) return false;
+    persistentWriter = std::make_shared<ProdigyPersistentStateWriter>(persistentStateStore, *artifactIO);
+    livePersistentWriter = persistentWriter;
+    if (runtimeAwareIaaS)
+    {
+      runtimeAwareIaaS->setAsyncBootStatePersistence(prodigySubmitLiveBootState);
+    }
+    if (liveRuntimeAwareNeuronIaaS)
+      liveRuntimeAwareNeuronIaaS->setAsyncBootStatePersistence(prodigySubmitLiveBootState);
+    return true;
+  }
+
+  ProdigyPersistentBootState buildPersistentBootState(const ProdigyPersistentBrainSnapshot& snapshot) const
+  {
+    ProdigyPersistentBootState bootState = persistentBootState;
+    bootState.bootstrapConfig = effectiveBootstrapConfig;
+    bootState.bootstrapSshUser = snapshot.brainConfig.bootstrapSshUser;
+    bootState.bootstrapSshKeyPackage = snapshot.brainConfig.bootstrapSshKeyPackage;
+    bootState.bootstrapSshHostKeyPackage = snapshot.brainConfig.bootstrapSshHostKeyPackage;
+    bootState.bootstrapSshPrivateKeyPath = snapshot.brainConfig.bootstrapSshPrivateKeyPath;
+    if (!snapshot.brainPeers.empty()) bootState.bootstrapConfig.bootstrapPeers = snapshot.brainPeers;
+    bootState.runtimeEnvironment = snapshot.brainConfig.runtimeEnvironment.configured() ?
+        snapshot.brainConfig.runtimeEnvironment : persistentBootState.runtimeEnvironment;
+    bootState.initialTopology = {};
+    return bootState;
+  }
 
 public:
 
@@ -795,6 +867,13 @@ public:
 
   bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr) override
   {
+    // Live callers must use the asynchronous hook below. This compatibility
+    // path remains only for startup before the writer is enabled.
+    if (persistentWriter)
+    {
+      if (failure) failure->assign("live cluster ownership requires async persistence"_ctv);
+      return false;
+    }
     String localFailure = {};
     bool claimed = prodigyClaimPersistentLocalClusterOwnership(clusterUUID, localFailure);
     if (failure)
@@ -805,8 +884,43 @@ public:
     return claimed;
   }
 
+  bool usesAsyncMasterAuthorityPersistence() const override { return true; }
+
+  bool claimLocalClusterOwnershipAsync(uint128_t clusterUUID, PersistenceCompletion completion) override
+  {
+    ProdigyPersistentLocalBrainState candidate = persistentLocalBrainState;
+    String failure = {};
+    bool changed = false;
+    if (!prodigyEnsureLocalBrainOwnedByCluster(candidate, clusterUUID, &changed, &failure))
+    {
+      return false;
+    }
+    if (!changed)
+    {
+      completion(true);
+      return true;
+    }
+    const uint64_t retainedBytes = retainedBytesForLocal(candidate);
+    if (!retainedBytes || !ensurePersistentWriter())
+    {
+      return false;
+    }
+    auto cached = std::make_shared<ProdigyPersistentLocalBrainState>(std::move(candidate));
+    if (!ProdigyPersistentStateWriter::detach(*cached)) return false;
+    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const bool admitted = persistentWriter->submitLocalBrainState(*cached, retainedBytes,
+        [cached, callback, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (result.durable) persistentLocalBrainState = std::move(*cached);
+          if (*callback) (*callback)(result.durable);
+        });
+    return admitted;
+  }
+
   bool applyPersistedTransportTLSAuthority(void)
   {
+    if (persistentWriter) return false;
     const ProdigyTransportTLSAuthority& authority = masterAuthorityRuntimeState.transportTLSAuthority;
     if (authority.canMintForCluster() == false)
     {
@@ -846,6 +960,44 @@ public:
 
     persistentLocalBrainState = updatedLocalState;
     return true;
+  }
+
+  void applyPersistedTransportTLSAuthorityAsync(PersistenceCompletion completion)
+  {
+    const ProdigyTransportTLSAuthority authority = masterAuthorityRuntimeState.transportTLSAuthority;
+    if (!authority.canMintForCluster()) { if (completion) completion(true); return; }
+    ProdigyTransportTLSAuthority current = {};
+    prodigyBuildTransportTLSAuthority(persistentLocalBrainState, current);
+    if (current == authority && persistentLocalBrainState.transportTLS.localCertPem.size() &&
+        persistentLocalBrainState.transportTLS.localKeyPem.size()) { if (completion) completion(true); return; }
+    auto updated = std::make_shared<ProdigyPersistentLocalBrainState>(persistentLocalBrainState);
+    String failure = {};
+    if (!prodigyApplyTransportTLSAuthorityToLocalState(*updated, authority, &failure))
+    {
+      basics_log("ProdigyBrain transport tls authority prepare failed: %s\n", failure.c_str());
+      if (completion) completion(false); return;
+    }
+    const uint64_t retainedBytes = retainedBytesForLocal(*updated);
+    if (!retainedBytes || !ensurePersistentWriter()) { if (completion) completion(false); return; }
+    if (!ProdigyPersistentStateWriter::detach(*updated)) { if (completion) completion(false); return; }
+    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const bool admitted = persistentWriter->submitLocalBrainState(*updated, retainedBytes,
+        [updated, callback, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (!result.durable) { if (*callback) (*callback)(false); return; }
+          String failure = {};
+          ProdigyTransportTLSBootstrap bootstrap = {};
+          prodigyBuildTransportTLSBootstrap(*updated, bootstrap);
+          if (!ProdigyTransportTLSRuntime::configure(bootstrap, &failure))
+          {
+            basics_log("ProdigyBrain transport tls runtime configure failed after durable state: %s\n", failure.c_str());
+            if (*callback) (*callback)(false); return;
+          }
+          persistentLocalBrainState = std::move(*updated);
+          if (*callback) (*callback)(true);
+        });
+    if (!admitted && *callback) (*callback)(false);
   }
 
   ProdigyPersistentBrainSnapshot buildPersistentBrainSnapshot(const ClusterTopology *topologyOverride = nullptr)
@@ -973,6 +1125,9 @@ public:
 
   bool persistBrainSnapshot(ProdigyPersistentBrainSnapshot snapshot)
   {
+    // A live Ring caller cannot synchronously wait for ArtifactIO. Retain
+    // startup-only use until all legacy bool contracts have been removed.
+    if (persistentWriter) return false;
     prodigyRuntimeTrace(
         "prodigy persist brain-snapshot-begin topologyMachines=%zu brainPeers=%zu\n",
         size_t(snapshot.topology.machines.size()),
@@ -1017,6 +1172,41 @@ public:
         size_t(persistedBrainSnapshot.brainPeers.size()),
         size_t(persistentBootState.bootstrapConfig.bootstrapPeers.size()));
     return true;
+  }
+
+  bool persistMasterAuthorityTransitionCandidate(
+      const ProdigyMasterAuthorityStateTransition& candidate, PersistenceCompletion completion) override
+  {
+    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
+    snapshot.brainConfig = candidate.brainConfig;
+    snapshot.masterAuthority.runtimeState = candidate.runtimeState;
+    prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
+    ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
+    const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
+    if (!retainedBytes || !ensurePersistentWriter())
+    {
+      return false;
+    }
+    auto cachedSnapshot = std::make_shared<ProdigyPersistentBrainSnapshot>(std::move(snapshot));
+    auto cachedBootState = std::make_shared<ProdigyPersistentBootState>(std::move(bootState));
+    if (!ProdigyPersistentStateWriter::detach(*cachedSnapshot) ||
+        !ProdigyPersistentStateWriter::detach(*cachedBootState)) { return false; }
+    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
+        [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (result.snapshotDurable)
+          {
+            prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(*cachedSnapshot));
+            havePersistedBrainSnapshot = true;
+          }
+          if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
+          if (result.snapshotDurable && !result.bootStateDurable)
+            basics_log("ProdigyBrain authority snapshot committed but boot-state follow-up failed: %s\n", result.failure.c_str());
+          if (*callback) (*callback)(result.snapshotDurable && result.bootStateDurable);
+        });
+    return admitted;
   }
 
   static void noteMothershipTunnelGatewayFailure(void *, uint64_t failures, String& failure)
@@ -1162,21 +1352,55 @@ public:
 
   void onMasterAuthorityRuntimeStateApplied(void) override
   {
-    (void)applyPersistedTransportTLSAuthority();
+    applyPersistedTransportTLSAuthorityAsync({});
   }
 
   bool persistLocalRuntimeState(void) override
   {
-    prodigyRuntimeTrace("prodigy persist local-runtime-begin\n");
+    // Bootstrap supersession commits during construction, before the live
+    // writer exists. After activation every Ring caller must use the receipt
+    // API below so no synchronous store access can reappear in production.
+    if (runtimePersistenceStarted) return false;
+    return persistBrainSnapshot(buildPersistentBrainSnapshot());
+  }
+
+  void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+  {
     ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
-    const bool persisted = persistBrainSnapshot(std::move(snapshot));
-    prodigyRuntimeTrace("prodigy persist local-runtime-end\n");
-    return persisted;
+    prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
+    ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
+    const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
+    if (!retainedBytes || !ensurePersistentWriter()) { if (completion) completion(false); return; }
+    auto cachedSnapshot = std::make_shared<ProdigyPersistentBrainSnapshot>(std::move(snapshot));
+    auto cachedBootState = std::make_shared<ProdigyPersistentBootState>(std::move(bootState));
+    if (!ProdigyPersistentStateWriter::detach(*cachedSnapshot) ||
+        !ProdigyPersistentStateWriter::detach(*cachedBootState)) { if (completion) completion(false); return; }
+    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
+        [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (result.snapshotDurable)
+          {
+            prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(*cachedSnapshot));
+            havePersistedBrainSnapshot = true;
+          }
+          if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
+          if (result.snapshotDurable && !result.bootStateDurable)
+            basics_log("ProdigyBrain snapshot committed but boot-state follow-up failed: %s\n", result.failure.c_str());
+          if (*callback) (*callback)(result.snapshotDurable && result.bootStateDurable);
+        });
+    if (!admitted && *callback) (*callback)(false);
   }
 
   bool prepareForBundleExec(String& failure) override
   {
     stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
+    if (persistentWriter)
+    {
+      failure.assign("bundle exec requires receipt-driven persistence drain"_ctv);
+      return false;
+    }
     if (persistentStateStore.saveLocalBrainState(persistentLocalBrainState, &failure) == false)
     {
       return false;
@@ -1187,19 +1411,80 @@ public:
     return true;
   }
 
+  void prepareForBundleExecAsync(std::function<void(bool, String)> completion) override
+  {
+    stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
+    if (execPersistence->prepared)
+    {
+      completion(execPersistence->durable, execPersistence->failure);
+      return;
+    }
+    execPersistence->prepared = true;
+    if (!ensurePersistentWriter())
+    {
+      execPersistence->failure.assign("persistent writer unavailable for bundle exec"_ctv);
+      completion(false, execPersistence->failure);
+      return;
+    }
+    auto state = execPersistence;
+    ProdigyPersistentLocalBrainState local = persistentLocalBrainState;
+    if (!ProdigyPersistentStateWriter::detach(local))
+    {
+      execPersistence->failure.assign("final local state ownership capture failed"_ctv);
+      completion(false, execPersistence->failure);
+      return;
+    }
+    const uint64_t retainedBytes = retainedBytesForLocal(local);
+    if (!retainedBytes)
+    {
+      state->failure.assign("final local state exceeds persistence capacity"_ctv);
+      completion(false, state->failure);
+      return;
+    }
+    auto callback = std::make_shared<std::function<void(bool, String)>>(std::move(completion));
+    const bool admitted = persistentWriter->submitLocalBrainState(std::move(local), retainedBytes,
+        [state, callback](auto&& result) mutable {
+          state->durable = result.durable;
+          state->failure = result.failure;
+          if (*callback) (*callback)(state->durable, state->failure);
+        });
+    if (!admitted)
+    {
+      state->failure.assign("final local state persistence admission rejected"_ctv);
+      if (*callback) (*callback)(false, state->failure);
+    }
+  }
+
+  bool quiescePersistenceForBundleExec() override
+  {
+    if (!execPersistence->prepared || !execPersistence->durable) return false;
+    if (execPersistence->closed) return true;
+    if (!persistentWriter || !persistentWriter->drainForExec()) return false;
+    persistentStateStore.close();
+    execPersistence->closed = true;
+    return true;
+  }
+
   bool quiesceProcessForBundleExec(void) override
   {
     const bool containerControlsQuiesced = thisNeuron == nullptr ||
                                          thisNeuron->quiesceContainerControlSocketsForBundleExec();
+    const bool neuronArtifactsQuiesced = thisNeuron == nullptr || thisNeuron->quiesceArtifactIOForBundleExec();
     const bool retainedPidfdsQuiesced = ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec();
     const bool hostControlQuiesced = hostControlNetwork.shutdown();
-    return containerControlsQuiesced && retainedPidfdsQuiesced && hostControlQuiesced;
+    return containerControlsQuiesced && neuronArtifactsQuiesced && retainedPidfdsQuiesced && hostControlQuiesced;
   }
 
   bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override
   {
     return havePersistedBrainSnapshot && haveData == false && machine != nullptr && machine->isThisMachine;
   }
+
+#ifdef PRODIGY_RUNTIME_PERSISTENCE_UNIT
+  ProdigyBrain(ProdigyHostControlNetwork& network, std::shared_ptr<ProdigyPersistentStateWriter> writer)
+      : hostControlNetwork(network), persistentWriter(std::move(writer)), runtimePersistenceStarted(true)
+  {}
+#endif
 
   explicit ProdigyBrain(ProdigyHostControlNetwork& hostControlNetwork)
       : hostControlNetwork(hostControlNetwork)
@@ -1230,10 +1515,11 @@ public:
       prodigyOwnRuntimeEnvironmentConfig(persistentBootState.runtimeEnvironment, brainConfig.runtimeEnvironment);
     }
 
-    iaas = new RuntimeAwareBrainIaaS(&persistentStateStore,
+    runtimeAwareIaaS = new RuntimeAwareBrainIaaS(&persistentStateStore,
                                      effectiveBootstrapConfig,
                                      persistentBootState,
                                      {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
+    iaas = runtimeAwareIaaS;
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
     dnsProvider = new ProdigyDefaultDNSProvider();
@@ -1287,10 +1573,17 @@ public:
       std::fprintf(stderr, "prodigy startup could not persist consumed bootstrap receipt: %s\n", bootstrapSupersessionFailure.c_str());
       _exit(EXIT_FAILURE);
     }
+    runtimePersistenceStarted = true;
+    runtimeAwareIaaS->setAsyncBootStatePersistence(
+        [this](ProdigyPersistentBootState state, uint64_t retainedBytes, std::function<void(bool)> completion) {
+          if (!ensurePersistentWriter()) return false;
+          return prodigySubmitLiveBootState(std::move(state), retainedBytes, std::move(completion));
+        });
   }
 
   ~ProdigyBrain()
   {
+    persistenceLifetime.reset();
     stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
   }
 
@@ -1307,70 +1600,199 @@ public:
 
   bool persistAuthoritativeClusterTopology(const ClusterTopology& topology) override
   {
-    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot(&topology);
-    bool persisted = persistBrainSnapshot(std::move(snapshot));
-    if (persisted)
-    {
-      sendNeuronSwitchboardOverlayRoutes();
-    }
+    return false;
+  }
 
-    return persisted;
+  void persistAuthoritativeClusterTopologyAsync(ClusterTopology topology,
+                                                 PersistenceCompletion completion = {}) override
+  {
+    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot(&topology);
+    prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
+    ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
+    const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
+    if (!retainedBytes || !ensurePersistentWriter()) { if (completion) completion(false); return; }
+    auto cachedSnapshot = std::make_shared<ProdigyPersistentBrainSnapshot>(std::move(snapshot));
+    auto cachedBootState = std::make_shared<ProdigyPersistentBootState>(std::move(bootState));
+    if (!ProdigyPersistentStateWriter::detach(*cachedSnapshot) ||
+        !ProdigyPersistentStateWriter::detach(*cachedBootState)) { if (completion) completion(false); return; }
+    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
+        [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (result.snapshotDurable)
+          {
+            prodigyReplaceCachedBrainSnapshot(persistedBrainSnapshot, std::move(*cachedSnapshot));
+            havePersistedBrainSnapshot = true;
+          }
+          if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
+          const bool durable = result.snapshotDurable && result.bootStateDurable;
+          if (durable && !lifetime.expired() && thisBrain) thisBrain->sendNeuronSwitchboardOverlayRoutes();
+          if (*callback) (*callback)(durable);
+        });
+    if (!admitted && *callback) (*callback)(false);
   }
 };
 
 class ProdigyNeuron : public Neuron {
   ProdigyHostControlNetwork& hostControlNetwork;
+  RuntimeAwareNeuronIaaS *runtimeAwareIaaS = nullptr;
+  std::shared_ptr<ProdigyPersistentStateWriter> persistentWriter;
+  TimeoutPacket osUpdatePersistenceRetry = {};
+  bool osUpdatePersistencePending = false;
+  bool osUpdatePersistenceReceipt = false;
+  bool osUpdatePersistenceStoreClosed = false;
+  String osUpdateTargetOSID, osUpdateTargetOSVersionID, osUpdateCommand;
+  std::function<void(bool, String)> osUpdateCompletion = {};
+  std::shared_ptr<uint8_t> osUpdatePersistenceLifetime = std::make_shared<uint8_t>(0);
+
+  void queueOSUpdatePersistenceRetry()
+  {
+    osUpdatePersistenceRetry.clear();
+    osUpdatePersistenceRetry.originator = this;
+    osUpdatePersistenceRetry.setTimeoutMs(5);
+    Ring::queueTimeout(&osUpdatePersistenceRetry);
+  }
+
+  void finishOSUpdatePersistence(bool success, String failure = {})
+  {
+    auto completion = std::move(osUpdateCompletion);
+    osUpdatePersistencePending = false;
+    osUpdatePersistenceReceipt = false;
+    if (completion) completion(success, std::move(failure));
+  }
+
+  bool ensurePersistentWriter()
+  {
+    if (persistentWriter) return true;
+    if (auto shared = livePersistentWriter.lock())
+    {
+      persistentWriter = std::move(shared);
+      return true;
+    }
+    if (!artifactIO) return false;
+    persistentWriter = std::make_shared<ProdigyPersistentStateWriter>(persistentStateStore, *artifactIO);
+    livePersistentWriter = persistentWriter;
+    return true;
+  }
 
 public:
 
   explicit ProdigyNeuron(ProdigyHostControlNetwork& hostControlNetwork)
       : hostControlNetwork(hostControlNetwork)
   {
-    iaas = new RuntimeAwareNeuronIaaS(&persistentStateStore,
+    runtimeAwareIaaS = new RuntimeAwareNeuronIaaS(&persistentStateStore,
                                       effectiveBootstrapConfig,
                                       persistentBootState,
                                       {.http = hostControlNetwork.http(), .delay = ProdigyHostDelayOperation::submission()});
+    liveRuntimeAwareNeuronIaaS = runtimeAwareIaaS;
+    iaas = runtimeAwareIaaS;
+    runtimeAwareIaaS->setAsyncBootStatePersistence(
+        [this](ProdigyPersistentBootState state, uint64_t retainedBytes, std::function<void(bool)> completion) {
+          if (!ensurePersistentWriter()) return false;
+          return prodigySubmitLiveBootState(std::move(state), retainedBytes, std::move(completion));
+        });
   }
 
   bool quiesceProcessForBundleExec(void) override
   {
+    const bool brainArtifactsQuiesced = thisBrain == nullptr || thisBrain->quiesceArtifactIOForBundleExec();
     const bool retainedPidfdsQuiesced = ContainerManager::quiesceRetainedNonChildPidfdPollsForBundleExec();
     const bool hostControlQuiesced = hostControlNetwork.shutdown();
-    return retainedPidfdsQuiesced && hostControlQuiesced;
+    return brainArtifactsQuiesced && retainedPidfdsQuiesced && hostControlQuiesced;
   }
 
   bool startOperatingSystemUpdate(const String& targetOSID, const String& targetOSVersionID, const String& updateCommand, String *failure = nullptr) override
   {
-    String targetOSIDText = {};
-    String targetOSVersionIDText = {};
-    String updateCommandText = {};
-    targetOSIDText.assign(targetOSID);
-    targetOSVersionIDText.assign(targetOSVersionID);
-    updateCommandText.assign(updateCommand);
+    (void)targetOSID;
+    (void)targetOSVersionID;
+    (void)updateCommand;
+    if (failure) failure->assign("os update requires receipt-driven persistence"_ctv);
+    return false;
+  }
 
-    if (targetOSIDText.size() == 0 || targetOSVersionIDText.size() == 0 || updateCommandText.size() == 0)
+  void startOperatingSystemUpdateAsync(String targetOSID, String targetOSVersionID, String updateCommand,
+                                       std::function<void(bool, String)> completion) override
+  {
+    if (osUpdatePersistencePending)
     {
-      return Neuron::startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, failure);
+      String failure = "os update persistence already pending"_ctv;
+      completion(false, std::move(failure));
+      return;
     }
-
-    String localFailure = {};
-    if (persistentStateStore.saveLocalBrainState(persistentLocalBrainState, &localFailure) == false)
+    if (targetOSID.empty() || targetOSVersionID.empty() || updateCommand.empty())
     {
-      if (failure)
+      String failure = "os update target is incomplete"_ctv;
+      completion(false, std::move(failure));
+      return;
+    }
+    if (!ensurePersistentWriter())
+    {
+      String failure = "persistent writer unavailable for os update"_ctv;
+      completion(false, std::move(failure));
+      return;
+    }
+    auto writer = persistentWriter;
+    osUpdatePersistencePending = true;
+    osUpdatePersistenceReceipt = false;
+    osUpdatePersistenceStoreClosed = false;
+    // Control-stream arguments may be non-owning views. This timer crosses
+    // the call boundary, so retain owned bytes before queuing it.
+    osUpdateTargetOSID.assign(targetOSID);
+    osUpdateTargetOSVersionID.assign(targetOSVersionID);
+    osUpdateCommand.assign(updateCommand);
+    osUpdateCompletion = std::move(completion);
+    const std::weak_ptr<uint8_t> lifetime = osUpdatePersistenceLifetime;
+    const uint64_t retainedBytes = ProdigyPersistentStateWriter::retainedBytesFor(persistentLocalBrainState);
+    if (!retainedBytes)
+    {
+      String failure = "local state exceeds persistence capacity"_ctv;
+      finishOSUpdatePersistence(false, std::move(failure));
+      return;
+    }
+    const bool admitted = writer->submitLocalBrainState(persistentLocalBrainState, retainedBytes,
+        [this, lifetime](auto&& result) mutable {
+          if (lifetime.expired()) return;
+          if (!result.durable) { finishOSUpdatePersistence(false, result.failure); return; }
+          osUpdatePersistenceReceipt = true;
+          queueOSUpdatePersistenceRetry();
+        });
+    if (!admitted) finishOSUpdatePersistence(false, "os update persistence admission rejected"_ctv);
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet == &osUpdatePersistenceRetry)
+    {
+      if (result == -ECANCELED)
       {
-        *failure = localFailure;
+        // A live cancellation is a terminal rejection for this request. The
+        // destructor resets the lifetime first, making its own late CQE inert.
+        if (osUpdatePersistenceLifetime && osUpdatePersistencePending)
+          finishOSUpdatePersistence(false, "os update persistence retry cancelled"_ctv);
+        return;
       }
-      return false;
+      if (!osUpdatePersistencePending || !osUpdatePersistenceReceipt) return;
+      auto writer = persistentWriter ? persistentWriter : livePersistentWriter.lock();
+      if (writer && !writer->drainForExec()) { queueOSUpdatePersistenceRetry(); return; }
+      if (!osUpdatePersistenceStoreClosed) { persistentStateStore.close(); osUpdatePersistenceStoreClosed = true; }
+      String failure = {};
+      const bool started = Neuron::startOperatingSystemUpdate(osUpdateTargetOSID, osUpdateTargetOSVersionID, osUpdateCommand, &failure);
+      finishOSUpdatePersistence(started, std::move(failure));
+      return;
     }
+    Neuron::timeoutHandler(packet, result);
+  }
 
-    persistentStateStore.close();
-    basics_log("os update persistent state sealed targetOSID=%s targetOSVersionID=%s\n",
-               targetOSIDText.c_str(),
-               targetOSVersionIDText.c_str());
-    return Neuron::startOperatingSystemUpdate(targetOSIDText, targetOSVersionIDText, updateCommandText, failure);
+  ~ProdigyNeuron()
+  {
+    osUpdatePersistenceLifetime.reset();
+    osUpdatePersistenceRetry.clear();
+    if (liveRuntimeAwareNeuronIaaS == runtimeAwareIaaS) liveRuntimeAwareNeuronIaaS = nullptr;
   }
 };
 
+#ifndef PRODIGY_RUNTIME_PERSISTENCE_UNIT
 int main(int argc, char *argv[])
 {
   String bootJSON;
@@ -1510,3 +1932,4 @@ int main(int argc, char *argv[])
   prodigy.start();
   return EXIT_SUCCESS;
 }
+#endif

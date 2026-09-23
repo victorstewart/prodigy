@@ -10846,7 +10846,7 @@ inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
 
   if (expiredDeploymentIDs.empty() == false)
   {
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
   }
   return uint32_t(expiredDeploymentIDs.size());
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <functional>
 #include <services/debug.h>
 
 #include <prodigy/bootstrap.config.h>
@@ -11,6 +12,8 @@
 #include <prodigy/iaas/gcp/gcp.h>
 #include <prodigy/iaas/vultr/vultr.h>
 #include <prodigy/persistent.state.h>
+#include <prodigy/artifact.io.h>
+#include <prodigy/persistent.writer.h>
 
 static inline std::unique_ptr<BrainIaaS> prodigyCreateProviderBrainIaaS(
     const ProdigyRuntimeEnvironmentConfig& config,
@@ -112,6 +115,8 @@ private:
   ProdigyRuntimeEnvironmentConfig pendingRuntimeEnvironment;
   ProdigyPersistentBootState persistentBootState = {};
   ProdigyPersistentStateStore *stateStore = nullptr;
+  using AsyncBootStatePersistence = std::function<bool(ProdigyPersistentBootState, uint64_t, std::function<void(bool)>)>;
+  AsyncBootStatePersistence asyncBootStatePersistence = {};
   BootstrapBrainIaaS bootstrapDelegate;
   std::unique_ptr<BrainIaaS> providerDelegate;
   bool providerReconfigurationPending = false;
@@ -151,13 +156,19 @@ private:
 
   void persistBootState(void)
   {
-    if (stateStore == nullptr)
+    persistentBootState.bootstrapConfig = bootstrapConfig;
+    prodigyOwnRuntimeEnvironmentConfig(runtimeEnvironment, persistentBootState.runtimeEnvironment);
+
+    if (asyncBootStatePersistence)
     {
+      const uint64_t retainedBytes = ProdigyPersistentStateWriter::retainedBytesFor(persistentBootState);
+      if (!retainedBytes || !asyncBootStatePersistence(persistentBootState, retainedBytes, [](bool durable) {
+            if (!durable) basics_log("RuntimeAwareBrainIaaS async boot-state persist failed\n");
+          })) basics_log("RuntimeAwareBrainIaaS async boot-state admission failed\n");
       return;
     }
 
-    persistentBootState.bootstrapConfig = bootstrapConfig;
-    prodigyOwnRuntimeEnvironmentConfig(runtimeEnvironment, persistentBootState.runtimeEnvironment);
+    if (stateStore == nullptr) return;
 
     String failure;
     if (stateStore->saveBootState(persistentBootState, &failure) == false)
@@ -167,6 +178,11 @@ private:
   }
 
 public:
+
+  void setAsyncBootStatePersistence(AsyncBootStatePersistence persistence)
+  {
+    asyncBootStatePersistence = std::move(persistence);
+  }
 
   RuntimeAwareBrainIaaS(ProdigyPersistentStateStore *store,
                         const ProdigyBootstrapConfig& bootstrap,
@@ -562,6 +578,9 @@ private:
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
   ProdigyPersistentBootState persistentBootState = {};
   ProdigyPersistentStateStore *stateStore = nullptr;
+  using AsyncBootStatePersistence = std::function<bool(ProdigyPersistentBootState, uint64_t, std::function<void(bool)>)>;
+  AsyncBootStatePersistence asyncBootStatePersistence = {};
+  uint128_t persistentLocalNodeUUID = 0;
   BootstrapNeuronIaaS bootstrapDelegate;
   std::unique_ptr<NeuronIaaS> providerDelegate;
 
@@ -572,6 +591,7 @@ private:
 
   uint128_t resolvePersistentLocalNodeUUID(void)
   {
+    if (asyncBootStatePersistence) return persistentLocalNodeUUID;
     if (stateStore == nullptr)
     {
       return 0;
@@ -583,7 +603,8 @@ private:
     {
       if (localState.uuid != 0)
       {
-        return localState.uuid;
+        persistentLocalNodeUUID = localState.uuid;
+        return persistentLocalNodeUUID;
       }
     }
     else if (loadFailure.size() > 0 && loadFailure != "record not found"_ctv)
@@ -604,18 +625,25 @@ private:
       return 0;
     }
 
-    return uuid;
+    persistentLocalNodeUUID = uuid;
+    return persistentLocalNodeUUID;
   }
 
   void persistBootState(void)
   {
-    if (stateStore == nullptr)
+    persistentBootState.bootstrapConfig = bootstrapConfig;
+    prodigyOwnRuntimeEnvironmentConfig(runtimeEnvironment, persistentBootState.runtimeEnvironment);
+
+    if (asyncBootStatePersistence)
     {
+      const uint64_t retainedBytes = ProdigyPersistentStateWriter::retainedBytesFor(persistentBootState);
+      if (!retainedBytes || !asyncBootStatePersistence(persistentBootState, retainedBytes, [](bool durable) {
+            if (!durable) basics_log("RuntimeAwareNeuronIaaS async boot-state persist failed\n");
+          })) basics_log("RuntimeAwareNeuronIaaS async boot-state admission failed\n");
       return;
     }
 
-    persistentBootState.bootstrapConfig = bootstrapConfig;
-    prodigyOwnRuntimeEnvironmentConfig(runtimeEnvironment, persistentBootState.runtimeEnvironment);
+    if (stateStore == nullptr) return;
 
     String failure;
     if (stateStore->saveBootState(persistentBootState, &failure) == false)
@@ -625,6 +653,11 @@ private:
   }
 
 public:
+
+  void setAsyncBootStatePersistence(AsyncBootStatePersistence persistence)
+  {
+    asyncBootStatePersistence = std::move(persistence);
+  }
 
   RuntimeAwareNeuronIaaS(ProdigyPersistentStateStore *store,
                          const ProdigyBootstrapConfig& bootstrap,
@@ -644,6 +677,9 @@ public:
     {
       providerDelegate->configureRuntimeEnvironment(runtimeEnvironment);
     }
+    // This is the last startup-only read/create before live persistence is
+    // injected. Later gatherSelfData uses the cached identity exclusively.
+    persistentLocalNodeUUID = resolvePersistentLocalNodeUUID();
     persistBootState();
   }
 

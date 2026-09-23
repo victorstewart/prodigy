@@ -4,6 +4,48 @@
 #include <cstdlib>
 #include <optional>
 #include <utility>
+#include <functional>
+#include <memory>
+
+// Adapt one Ring-owned completion to the coroutines already used by host
+// operations. Inline completion does not resume an un-suspended coroutine;
+// cancellation destroys the awaiter and makes a late callback inert.
+template <typename Value>
+class ProdigyHostCompletion final
+{
+  struct State
+  {
+    std::optional<Value> value;
+    std::coroutine_handle<> continuation;
+    bool suspended = false;
+    bool alive = true;
+  };
+  std::shared_ptr<State> state = std::make_shared<State>();
+  std::function<void(std::function<void(Value)>)> start;
+public:
+  explicit ProdigyHostCompletion(std::function<void(std::function<void(Value)>)> start)
+      : start(std::move(start)) {}
+  ProdigyHostCompletion(const ProdigyHostCompletion&) = delete;
+  ~ProdigyHostCompletion() { state->alive = false; }
+  bool await_ready() const noexcept { return false; }
+  bool await_suspend(std::coroutine_handle<> continuation)
+  {
+    state->continuation = continuation;
+    start([state = state](Value value) mutable {
+      if (!state->alive || state->value) return;
+      state->value.emplace(std::move(value));
+      if (state->suspended)
+      {
+        state->suspended = false;
+        state->continuation.resume();
+      }
+    });
+    if (state->value) return false;
+    state->suspended = true;
+    return true;
+  }
+  Value await_resume() { return std::move(*state->value); }
+};
 
 #include <networking/includes.h>
 #include <types/types.containers.h>

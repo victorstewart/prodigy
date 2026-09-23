@@ -523,6 +523,224 @@ static inline bool prodigyStageBundleWithExpectedSHA256(
   return true;
 }
 
+struct ProdigyPreparedBundleArtifact {
+  String stageBundlePath = {};
+  String stageSHA256Path = {};
+  String bundlePath = {};
+  String sha256Path = {};
+  String sha256 = {};
+  uint64_t bytes = 0;
+  dev_t stageBundleDevice = 0;
+  ino_t stageBundleInode = 0;
+  dev_t stageSHA256Device = 0;
+  ino_t stageSHA256Inode = 0;
+  dev_t publishedBundleDevice = 0;
+  ino_t publishedBundleInode = 0;
+  dev_t publishedSHA256Device = 0;
+  ino_t publishedSHA256Inode = 0;
+  bool prepared = false;
+  // Each rename is independently atomic. Keep ownership of either final inode
+  // as soon as its rename and identity check succeed so partial publication can
+  // discard only that exact inode.
+  bool bundlePublished = false;
+  bool sha256Published = false;
+  bool published = false;
+};
+
+static inline bool prodigyFsyncBundleArtifactPath(const String& path, String *failure = nullptr)
+{
+  String pathText = {};
+  pathText.assign(path);
+  int fd = ::open(pathText.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0 || ::fsync(fd) != 0)
+  {
+    const int error = errno;
+    if (fd >= 0) (void)::close(fd);
+    if (failure) failure->snprintf<"failed to fsync bundle artifact {} errno={itoa}"_ctv>(path, uint64_t(error));
+    return false;
+  }
+  (void)::close(fd);
+  return true;
+}
+
+static inline bool prodigyFsyncBundleArtifactParent(const String& path, String *failure = nullptr)
+{
+  String parent = {};
+  prodigyDirname(path, parent);
+  String parentText = {};
+  parentText.assign(parent);
+  int fd = ::open(parentText.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0 || ::fsync(fd) != 0)
+  {
+    const int error = errno;
+    if (fd >= 0) (void)::close(fd);
+    if (failure) failure->snprintf<"failed to fsync bundle artifact parent {} errno={itoa}"_ctv>(parent, uint64_t(error));
+    return false;
+  }
+  (void)::close(fd);
+  return true;
+}
+
+// Worker-thread only. The created staging names live beside the canonical
+// targets, so the later individual renames stay on one filesystem. They are
+// deliberately not presented as a pair-atomic publication.
+static inline bool prodigyPrepareBundleArtifact(
+    ProdigyPreparedBundleArtifact& prepared,
+    const String& bundlePath,
+    const String& bundle,
+    const String& expectedDigest,
+    String *failure = nullptr)
+{
+  prepared = {};
+  if (failure) failure->clear();
+  prepared.bundlePath = bundlePath;
+  prodigyResolveBundleSHA256Path(bundlePath, prepared.sha256Path);
+  prepared.stageBundlePath = bundlePath;
+  prepared.stageBundlePath.append(".incoming.XXXXXX"_ctv);
+  prepared.stageBundlePath.addNullTerminator();
+  int bundleFD = ::mkstemp(reinterpret_cast<char *>(prepared.stageBundlePath.data()));
+  if (bundleFD < 0)
+  {
+    if (failure) failure->assign("bundle artifact stage creation failed"_ctv);
+    return false;
+  }
+  (void)::close(bundleFD);
+  const uint64_t createdStageBytes = std::strlen(reinterpret_cast<const char *>(prepared.stageBundlePath.data()));
+  prepared.stageBundlePath = prepared.stageBundlePath.substr(0, createdStageBytes, Copy::yes);
+  prodigyResolveBundleSHA256Path(prepared.stageBundlePath, prepared.stageSHA256Path);
+
+  String actual = {};
+  if (prodigyStageBundleWithExpectedSHA256(prepared.stageBundlePath, bundle, expectedDigest, actual, failure) == false ||
+      prodigyFsyncBundleArtifactPath(prepared.stageBundlePath, failure) == false ||
+      prodigyFsyncBundleArtifactPath(prepared.stageSHA256Path, failure) == false)
+  {
+    (void)::unlink(prepared.stageBundlePath.c_str());
+    (void)::unlink(prepared.stageSHA256Path.c_str());
+    return false;
+  }
+
+  struct stat bundleMetadata = {};
+  struct stat shaMetadata = {};
+  if (::stat(prepared.stageBundlePath.c_str(), &bundleMetadata) != 0 ||
+      ::stat(prepared.stageSHA256Path.c_str(), &shaMetadata) != 0)
+  {
+    if (failure) failure->assign("bundle artifact staging metadata unavailable"_ctv);
+    (void)::unlink(prepared.stageBundlePath.c_str());
+    (void)::unlink(prepared.stageSHA256Path.c_str());
+    return false;
+  }
+  prepared.sha256 = actual;
+  prepared.bytes = bundle.size();
+  prepared.stageBundleDevice = bundleMetadata.st_dev;
+  prepared.stageBundleInode = bundleMetadata.st_ino;
+  prepared.stageSHA256Device = shaMetadata.st_dev;
+  prepared.stageSHA256Inode = shaMetadata.st_ino;
+  prepared.prepared = true;
+  return true;
+}
+
+// Ring-thread only, after the owner has revalidated the exact source. This is
+// metadata-only publication: all hashing and file fsync work happened while
+// the files were isolated under their unique staging names. Bundle and sidecar
+// renames are individually atomic, not pair-atomic.
+static inline bool prodigyPublishPreparedBundleArtifact(ProdigyPreparedBundleArtifact& prepared, String *failure = nullptr)
+{
+  if (prepared.prepared == false || prepared.published)
+  {
+    return false;
+  }
+  struct stat bundleMetadata = {};
+  struct stat shaMetadata = {};
+  if (::stat(prepared.stageBundlePath.c_str(), &bundleMetadata) != 0 ||
+      ::stat(prepared.stageSHA256Path.c_str(), &shaMetadata) != 0 ||
+      bundleMetadata.st_dev != prepared.stageBundleDevice || bundleMetadata.st_ino != prepared.stageBundleInode ||
+      shaMetadata.st_dev != prepared.stageSHA256Device || shaMetadata.st_ino != prepared.stageSHA256Inode ||
+      uint64_t(bundleMetadata.st_size) != prepared.bytes)
+  {
+    if (failure && failure->empty()) failure->assign("bundle artifact stage identity or digest changed"_ctv);
+    return false;
+  }
+  if (::rename(prepared.stageBundlePath.c_str(), prepared.bundlePath.c_str()) != 0)
+  {
+    if (failure && failure->empty()) failure->assign("bundle artifact publication failed"_ctv);
+    return false;
+  }
+  if (::stat(prepared.bundlePath.c_str(), &bundleMetadata) != 0 ||
+      bundleMetadata.st_dev != prepared.stageBundleDevice || bundleMetadata.st_ino != prepared.stageBundleInode)
+  {
+    if (failure) failure->assign("bundle artifact published identity changed"_ctv);
+    return false;
+  }
+  prepared.publishedBundleDevice = bundleMetadata.st_dev;
+  prepared.publishedBundleInode = bundleMetadata.st_ino;
+  prepared.bundlePublished = true;
+
+  if (::rename(prepared.stageSHA256Path.c_str(), prepared.sha256Path.c_str()) != 0)
+  {
+    if (failure && failure->empty()) failure->assign("bundle artifact publication failed"_ctv);
+    return false;
+  }
+  if (::stat(prepared.sha256Path.c_str(), &shaMetadata) != 0 ||
+      shaMetadata.st_dev != prepared.stageSHA256Device || shaMetadata.st_ino != prepared.stageSHA256Inode)
+  {
+    if (failure) failure->assign("bundle artifact published identity changed"_ctv);
+    return false;
+  }
+  prepared.publishedSHA256Device = shaMetadata.st_dev;
+  prepared.publishedSHA256Inode = shaMetadata.st_ino;
+  prepared.sha256Published = true;
+  prepared.published = true;
+  return true;
+}
+
+// Worker-thread only, after Ring publication. It refuses to acknowledge a
+// replacement which displaced either member of the staged pair.
+static inline bool prodigyFsyncPublishedBundleArtifact(const ProdigyPreparedBundleArtifact& prepared, String *failure = nullptr)
+{
+  struct stat bundleMetadata = {};
+  struct stat shaMetadata = {};
+  String bundlePath = {};
+  String sha256Path = {};
+  bundlePath.assign(prepared.bundlePath);
+  sha256Path.assign(prepared.sha256Path);
+  if (prepared.published == false || ::stat(bundlePath.c_str(), &bundleMetadata) != 0 ||
+      ::stat(sha256Path.c_str(), &shaMetadata) != 0 ||
+      bundleMetadata.st_dev != prepared.publishedBundleDevice || bundleMetadata.st_ino != prepared.publishedBundleInode ||
+      shaMetadata.st_dev != prepared.publishedSHA256Device || shaMetadata.st_ino != prepared.publishedSHA256Inode)
+  {
+    if (failure) failure->assign("bundle artifact published identity changed before durability sync"_ctv);
+    return false;
+  }
+  return prodigyFsyncBundleArtifactParent(prepared.bundlePath, failure);
+}
+
+// Worker-thread only. It removes only verified staging inodes and final inodes
+// this request individually published. A renamed or replaced path is left
+// untouched.
+static inline void prodigyDiscardPreparedBundleArtifact(ProdigyPreparedBundleArtifact& prepared)
+{
+  auto discardExact = [](const String& path, dev_t device, ino_t inode) {
+    String pathText = {};
+    pathText.assign(path);
+    struct stat metadata = {};
+    if (path.size() && ::stat(pathText.c_str(), &metadata) == 0 && metadata.st_dev == device && metadata.st_ino == inode)
+    {
+      (void)::unlink(pathText.c_str());
+    }
+  };
+  discardExact(prepared.stageBundlePath, prepared.stageBundleDevice, prepared.stageBundleInode);
+  discardExact(prepared.stageSHA256Path, prepared.stageSHA256Device, prepared.stageSHA256Inode);
+  if (prepared.bundlePublished)
+  {
+    discardExact(prepared.bundlePath, prepared.publishedBundleDevice, prepared.publishedBundleInode);
+  }
+  if (prepared.sha256Published)
+  {
+    discardExact(prepared.sha256Path, prepared.publishedSHA256Device, prepared.publishedSHA256Inode);
+  }
+  prepared = {};
+}
+
 static inline bool prodigyComputeFileSHA256Hex(const String& path, String& digest, String *failure = nullptr)
 {
   return prodigyComputeFileSHA256Hex(path, digest, nullptr, failure);

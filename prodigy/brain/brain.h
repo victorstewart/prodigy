@@ -1304,12 +1304,28 @@ public:
   constexpr static uint64_t machineRetirementJournalMinimumPeerVersion = 5;
   TimeoutPacket machineRetirementRecheck;
   bool machineRetirementRecheckArmed = false;
+  // A retirement transition must not let the recheck advance to provider
+  // destruction while its journal or topology receipt is still outstanding.
+  bool machineRetirementPersistencePending = false;
 
   // just create a new ssh instance each time we need it... simplies everything for now.. unless we intended to use it regularly
   bytell_hash_set<MachineSSH *> sshs;
 
   Mothership *mothership = nullptr;
   bytell_hash_set<Mothership *> activeMotherships;
+  bytell_hash_set<String> pendingReservedApplicationNames;
+  bytell_hash_set<uint16_t> pendingReservedApplicationIDs;
+  bytell_hash_set<uint16_t> pendingServiceReservationApplications;
+  bytell_hash_set<uint16_t> pendingApiCredentialApplications;
+  struct PendingConfigureOwnershipReceipt
+  {
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    uint64_t authorityEpoch = 0;
+    bool ownershipDurable = false;
+    String serializedConfig;
+  };
+  std::shared_ptr<PendingConfigureOwnershipReceipt> pendingConfigureOwnershipReceipt;
   bytell_hash_set<Mothership *> closingMotherships;
   UnixSocket mothershipUnixSocket;
   bool mothershipUnixAcceptArmed = false;
@@ -1318,6 +1334,52 @@ public:
   dev_t mothershipUnixSocketPathDevice = 0;
   ino_t mothershipUnixSocketPathInode = 0;
   bytell_hash_map<uint64_t, Mothership *> spinApplicationMotherships;
+
+  class PendingMothershipSpinArtifact
+  {
+  public:
+
+    enum class Phase : uint8_t {
+      preparing,
+      prepared,
+      publishing,
+      published
+    };
+
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    uint64_t authorityEpoch = 0;
+    uint64_t deploymentID = 0;
+    String requestFrame = {};
+    String storeRoot = {};
+    String expectedDigest = {};
+    uint64_t expectedBytes = 0;
+    String failure = {};
+    ContainerStore::PreparedAppArtifact prepared = {};
+    Phase phase = Phase::preparing;
+    bool taskAdmissionDurable = false;
+  };
+
+  bytell_hash_map<uint64_t, std::shared_ptr<PendingMothershipSpinArtifact>> pendingMothershipSpinArtifacts;
+
+  class PendingMothershipUpdateArtifact
+  {
+  public:
+    enum class Phase : uint8_t { preparing, prepared, fsyncing, published };
+
+    Mothership *stream = nullptr;
+    uint64_t streamIncarnation = 0;
+    uint64_t authorityEpoch = 0;
+    String requestFrame = {};
+    String stagedBundlePath = {};
+    String digest = {};
+    String failure = {};
+    ProdigyPreparedBundleArtifact prepared = {};
+    bool fsyncSucceeded = false;
+    Phase phase = Phase::preparing;
+  };
+
+  std::shared_ptr<PendingMothershipUpdateArtifact> pendingMothershipUpdateArtifact = nullptr;
   bytell_hash_map<uint128_t, Machine *> machinesByUUID;
   ProdigyDNSProvider *dnsProvider = nullptr;
 
@@ -4153,7 +4215,8 @@ public:
     return uint32_t(std::min<uint64_t>(std::max<uint64_t>(ttlMs, 5000), 60'000));
   }
 
-  bool importACMELineage(const AcmeLineageImportRequest& request, AcmeLineageImportResponse& response)
+  bool importACMELineage(const AcmeLineageImportRequest& request, AcmeLineageImportResponse& response,
+                         PersistenceCompletion completion = {})
   {
     response = {};
     response.certName = request.certName;
@@ -4293,8 +4356,8 @@ public:
     identity.tags.push_back(std::move(wormholeTag));
 
     certificate->identity = std::move(identity);
-    certificate->certbotCertName = request.certName;
-    certificate->lineagePath = request.lineagePath;
+    certificate->certbotCertName.assign(request.certName);
+    certificate->lineagePath.assign(request.lineagePath);
     certificate->generation = generation;
     certificate->nextRenewAtMs = certificateLifecycleJitteredRenewAtMs(prodigyCertificateRenewAtMs(notBeforeMs, notAfterMs, certificate->spec.renewAfterLifetimePermille), publicTlsCertificateJitterSeed(*certificate));
     certificate->lastSuccessMs = certificate->lastAttemptMs;
@@ -4305,8 +4368,21 @@ public:
     response.generation = generation;
     response.nextRenewAtMs = certificate->nextRenewAtMs;
 
-    noteMasterAuthorityRuntimeStateChanged();
-    (void)pushPublicTlsIdentityDeltaToLiveContainers(*certificate, "acme-lineage-import"_ctv);
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t certificateGeneration = certificate->generation;
+    const String certificateKey = publicTlsCertificateRuntimeKey(*certificate);
+    commitMasterAuthorityStateChangeAsync(
+        [this, authorityEpoch, certificateGeneration, certificateKey, completion = std::move(completion)](bool durable) mutable {
+          if (masterAuthorityEpoch != authorityEpoch) return;
+          bool currentGeneration = false;
+          for (PublicTlsCertificateState& current : masterAuthorityRuntimeState.publicTlsCertificates)
+            if (publicTlsCertificateRuntimeKey(current).equals(certificateKey) && current.generation == certificateGeneration)
+            {
+              currentGeneration = true;
+              if (durable) (void)pushPublicTlsIdentityDeltaToLiveContainers(current, "acme-lineage-import"_ctv);
+            }
+          if (completion) completion(durable && currentGeneration);
+        });
     return true;
   }
 
@@ -5235,19 +5311,19 @@ public:
     return nullptr;
   }
 
-  bool journalAutonomousProvisioningOperation(
+  void journalAutonomousProvisioningOperationAsync(
       uint64_t deploymentID,
       ApplicationLifetime lifetime,
       const String& machineSchema,
       uint32_t count,
-      uint64_t& operationID)
+      std::function<void(bool, uint64_t)> completion)
   {
-    operationID = 0;
     if (deploymentID == 0 || machineSchema.empty() || count == 0 ||
         masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == 0 ||
         masterAuthorityRuntimeState.nextPendingAddMachinesOperationID == UINT64_MAX)
     {
-      return false;
+      completion(false, 0);
+      return;
     }
 
     const uint64_t previousGeneration = masterAuthorityRuntimeState.generation;
@@ -5267,22 +5343,25 @@ public:
     masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.push_back(
         std::move(operation));
 
-    if (commitMasterAuthorityStateChange() == false)
-    {
-      masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.pop_back();
-      masterAuthorityRuntimeState.nextPendingAddMachinesOperationID =
-          previousNextOperationID;
-      masterAuthorityRuntimeState.generation = previousGeneration;
-      masterAuthorityRuntimeStateDurable = previousDurable;
-      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-      return false;
-    }
-
-    operationID = previousNextOperationID;
-    return true;
+    const uint64_t epoch = masterAuthorityEpoch;
+    commitMasterAuthorityStateChangeAsync([this, epoch, previousGeneration, previousNextOperationID,
+        previousDurable, previousDurableGeneration, completion = std::move(completion)](bool durable) mutable {
+      if (!durable && masterAuthorityEpoch == epoch &&
+          masterAuthorityRuntimeState.generation == previousGeneration + 1)
+      {
+        auto& operations = masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations;
+        for (auto it = operations.begin(); it != operations.end(); ++it)
+          if (it->operationID == previousNextOperationID) { operations.erase(it); break; }
+        masterAuthorityRuntimeState.nextPendingAddMachinesOperationID = previousNextOperationID;
+        masterAuthorityRuntimeState.generation = previousGeneration;
+        masterAuthorityRuntimeStateDurable = previousDurable;
+        durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      }
+      completion(durable, durable ? previousNextOperationID : 0);
+    });
   }
 
-  bool settleAutonomousProvisioningOperation(uint64_t operationID)
+  void settleAutonomousProvisioningOperationAsync(uint64_t operationID, PersistenceCompletion completion)
   {
     auto& operations =
         masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations;
@@ -5300,18 +5379,24 @@ public:
       ProdigyPendingAutonomousProvisioningOperation operation = std::move(*it);
       const uint32_t index = uint32_t(it - operations.begin());
       operations.erase(it);
-      if (commitMasterAuthorityStateChange())
-      {
-        return true;
-      }
-
-      operations.insert(operations.begin() + index, std::move(operation));
-      masterAuthorityRuntimeState.generation = previousGeneration;
-      masterAuthorityRuntimeStateDurable = previousDurable;
-      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-      return false;
+      const uint64_t epoch = masterAuthorityEpoch;
+      commitMasterAuthorityStateChangeAsync([this, epoch, previousGeneration, previousDurable,
+          previousDurableGeneration, operation = std::move(operation), index,
+          completion = std::move(completion)](bool durable) mutable {
+        if (!durable && masterAuthorityEpoch == epoch &&
+            masterAuthorityRuntimeState.generation == previousGeneration + 1)
+        {
+          auto& current = masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations;
+          current.insert(current.begin() + std::min<size_t>(index, current.size()), std::move(operation));
+          masterAuthorityRuntimeState.generation = previousGeneration;
+          masterAuthorityRuntimeStateDurable = previousDurable;
+          durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+        }
+        completion(durable);
+      });
+      return;
     }
-    return true;
+    completion(true);
   }
 
   ProdigyPendingAddMachinesOperation *findPendingAddMachinesOperation(uint64_t operationID)
@@ -5374,7 +5459,9 @@ public:
     }
   }
 
-  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap)
+  bytell_hash_set<uint64_t> activeAddMachinesOperations;
+
+  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap, bool persist = true)
   {
     assignAdoptedBootstrapMachineUUIDs(plannedTopology, machinesToBootstrap);
     refreshMasterAuthorityRuntimeStateFromLiveFields();
@@ -5392,7 +5479,7 @@ public:
     operation.machinesToBootstrap = machinesToBootstrap;
     operation.updatedAtMs = Time::now<TimeResolution::ms>();
     masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(operation));
-    noteMasterAuthorityRuntimeStateChanged();
+    if (persist) noteMasterAuthorityRuntimeStateChanged();
     return operationID;
   }
 
@@ -5450,6 +5537,24 @@ public:
     return true;
   }
 
+  void erasePendingAddMachinesOperationAsync(uint64_t operationID, PersistenceCompletion completion)
+  {
+    auto *operation = findPendingAddMachinesOperation(operationID);
+    if (!operation) { if (completion) completion(true); return; }
+    auto previous = *operation;
+    const uint64_t epoch = masterAuthorityEpoch;
+    erasePendingAddMachinesOperation(operationID, false, false);
+    const uint64_t generation = masterAuthorityRuntimeState.generation;
+    commitMasterAuthorityStateChangeAsync(
+        [this, epoch, generation, previous = std::move(previous), completion = std::move(completion)](bool durable) mutable {
+          if (!durable && masterAuthorityEpoch == epoch &&
+              masterAuthorityRuntimeState.generation == generation &&
+              !findPendingAddMachinesOperation(previous.operationID))
+            masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(previous));
+          if (completion) completion(durable);
+        }, false);
+  }
+
   void updatePendingAddMachinesOperationFailure(uint64_t operationID, const String& failure, bool replicate = true, bool persist = true)
   {
     if (ProdigyPendingAddMachinesOperation *operation = findPendingAddMachinesOperation(operationID); operation != nullptr)
@@ -5474,7 +5579,8 @@ public:
     return false;
   }
 
-  bool refreshPendingAddMachinesOperationCreatedMachines(ProdigyPendingAddMachinesOperation& operation, String& failure)
+  bool refreshPendingAddMachinesOperationCreatedMachines(ProdigyPendingAddMachinesOperation& operation, String& failure,
+                                                       bool persist = true)
   {
     failure.clear();
     if (pendingAddMachinesOperationHasUnreadyCreatedMachines(operation) == false)
@@ -5551,7 +5657,7 @@ public:
     {
       prodigyNormalizeClusterTopologyPeerAddresses(operation.plannedTopology);
       operation.updatedAtMs = Time::now<TimeResolution::ms>();
-      noteMasterAuthorityRuntimeStateChanged();
+      noteMasterAuthorityRuntimeStateChanged(true, persist);
     }
 
     if (pendingAddMachinesOperationHasUnreadyCreatedMachines(operation))
@@ -5823,40 +5929,93 @@ public:
     ::close(fd);
   }
 
-  bool resumePendingAddMachinesOperation(uint64_t operationID)
+  void resumePendingAddMachinesOperationAsync(uint64_t operationID,
+                                              PersistenceCompletion completion = {})
   {
     if (operationID == 0)
     {
-      return true;
+      if (completion) completion(true);
+      co_return;
+    }
+    if (activeAddMachinesOperations.contains(operationID))
+    {
+      if (completion) completion(false);
+      co_return;
+    }
+    if (findPendingAddMachinesOperation(operationID) == nullptr)
+    {
+      if (completion) completion(true);
+      co_return;
     }
 
+    const uint64_t epoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto activeOperation = std::shared_ptr<uint64_t>(new uint64_t(operationID),
+        [this, lifetime](uint64_t *id) {
+          if (!lifetime.expired()) activeAddMachinesOperations.erase(*id);
+          delete id;
+        });
+    activeAddMachinesOperations.insert(operationID);
+    auto finish = [this, lifetime, operationID, completion = std::move(completion)](bool success) mutable {
+      if (lifetime.expired()) return;
+      activeAddMachinesOperations.erase(operationID);
+      if (completion) completion(success);
+    };
+    auto persistFailure = [this, lifetime, epoch, operationID](const String& failure) -> ProdigyHostTask<bool> {
+      if (lifetime.expired() || masterAuthorityEpoch != epoch ||
+          findPendingAddMachinesOperation(operationID) == nullptr) co_return false;
+      updatePendingAddMachinesOperationFailure(operationID, failure, false, false);
+      const bool durable = co_await ProdigyHostCompletion<bool>([this](auto receipt) {
+        commitMasterAuthorityStateChangeAsync(std::move(receipt));
+      });
+      co_return durable && !lifetime.expired() && masterAuthorityEpoch == epoch;
+    };
+
+    String failure = {};
     ProdigyPendingAddMachinesOperation *persistedOperation = findPendingAddMachinesOperation(operationID);
     if (persistedOperation == nullptr)
     {
-      return true;
+      finish(true);
+      co_return;
     }
-
-    String failure = {};
-    Vector<ClusterMachine> startedMachines = {};
-
-    if (refreshPendingAddMachinesOperationCreatedMachines(*persistedOperation, failure) == false)
+    if (refreshPendingAddMachinesOperationCreatedMachines(*persistedOperation, failure, false) == false)
     {
-      updatePendingAddMachinesOperationFailure(operationID, failure);
-      return false;
+      (void)co_await persistFailure(failure);
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      finish(false);
+      co_return;
     }
 
-    if (persistedOperation->machinesToBootstrap.empty() == false)
+    const bool refreshDurable = co_await ProdigyHostCompletion<bool>([this](auto receipt) {
+      commitMasterAuthorityStateChangeAsync(std::move(receipt));
+    });
+    if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+    if (!refreshDurable || findPendingAddMachinesOperation(operationID) == nullptr)
+    {
+      if (findPendingAddMachinesOperation(operationID) != nullptr)
+      {
+        failure.assign("failed to persist refreshed pending addMachines operation"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      }
+      finish(false);
+      co_return;
+    }
+
+    // The persistence awaiter can let replicated state replace the operation's
+    // storage.  Take an owned copy before bootstrap; do not retain a vector pointer.
+    ProdigyPendingAddMachinesOperation operation = *findPendingAddMachinesOperation(operationID);
+    Vector<ClusterMachine> startedMachines = {};
+    if (operation.machinesToBootstrap.empty() == false)
     {
       ProdigyRemoteBootstrapBundleApprovalCache bootstrapBundleApprovalCache = {};
       if (prodigyBootstrapItemsConcurrently<ClusterMachine>(
-              persistedOperation->machinesToBootstrap,
-              [this, &persistedOperation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine, String& bootstrapFailure) -> bool {
-                return bootstrapClusterMachineBlocking(
-                    clusterMachine,
-                    persistedOperation->request,
-                    persistedOperation->plannedTopology,
-                    bootstrapFailure,
-                    &bootstrapBundleApprovalCache);
+              operation.machinesToBootstrap,
+              [this, &operation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine,
+                                                                 String& bootstrapFailure) -> bool {
+                return bootstrapClusterMachineBlocking(clusterMachine, operation.request,
+                                                        operation.plannedTopology, bootstrapFailure,
+                                                        &bootstrapBundleApprovalCache);
               },
               [this](const ClusterMachine& clusterMachine) -> void {
                 stopClusterMachineBootstrap(clusterMachine);
@@ -5868,39 +6027,74 @@ public:
         {
           stopClusterMachineBootstrap(clusterMachine);
         }
-
-        updatePendingAddMachinesOperationFailure(operationID, failure);
-        return false;
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
       }
     }
 
-    ClusterTopology mergedTopology = {};
-    if (mergePendingAddMachinesTopology(*persistedOperation, mergedTopology, failure) == false)
+    if (findPendingAddMachinesOperation(operationID) == nullptr)
     {
-      updatePendingAddMachinesOperationFailure(operationID, failure);
-      return false;
+      finish(false);
+      co_return;
+    }
+    operation = *findPendingAddMachinesOperation(operationID);
+    ClusterTopology mergedTopology = {};
+    if (mergePendingAddMachinesTopology(operation, mergedTopology, failure) == false)
+    {
+      (void)co_await persistFailure(failure);
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      finish(false);
+      co_return;
+    }
+
+    const bool topologyDurable = co_await ProdigyHostCompletion<bool>(
+        [this, mergedTopology](auto receipt) mutable {
+          persistAuthoritativeClusterTopologyAsync(std::move(mergedTopology), std::move(receipt));
+        });
+    if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+    if (!topologyDurable || findPendingAddMachinesOperation(operationID) == nullptr)
+    {
+      if (findPendingAddMachinesOperation(operationID) != nullptr)
+      {
+        failure.assign("failed to persist authoritative cluster topology during addMachines resume"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      }
+      finish(false);
+      co_return;
     }
 
     restoreBrainsFromClusterTopology(mergedTopology);
     restoreMachinesFromClusterTopology(mergedTopology);
     nBrains = clusterTopologyBrainCount(mergedTopology);
     initializeAllBrainPeersIfNeeded();
-
-    if (persistAuthoritativeClusterTopology(mergedTopology) == false)
-    {
-      updatePendingAddMachinesOperationFailure(persistedOperation->operationID, "failed to persist authoritative cluster topology during addMachines resume"_ctv);
-      return false;
-    }
-
     if (nBrains > 1)
     {
-      String serializedTopology = {};
+      String serializedTopology;
       BitseryEngine::serialize(serializedTopology, mergedTopology);
       queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
     }
 
-    erasePendingAddMachinesOperation(operationID);
-    return true;
+    const bool erased = co_await ProdigyHostCompletion<bool>([this, operationID](auto receipt) {
+      erasePendingAddMachinesOperationAsync(operationID, std::move(receipt));
+    });
+    if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+    finish(erased);
+    co_return;
+  }
+
+  // Compatibility for inline fixtures whose persistence hooks reply inline.
+  // Live recovery starts the owning asynchronous operation below.
+  bool resumePendingAddMachinesOperation(uint64_t operationID)
+  {
+    auto receipt = std::make_shared<std::pair<bool, bool>>(false, false);
+    resumePendingAddMachinesOperationAsync(operationID, [receipt](bool durable) {
+      receipt->first = true;
+      receipt->second = durable;
+    });
+    return receipt->first && receipt->second;
   }
 
   void resumePendingAddMachinesOperations(void)
@@ -5923,8 +6117,7 @@ public:
       {
         continue;
       }
-
-      (void)resumePendingAddMachinesOperation(operationID);
+      resumePendingAddMachinesOperationAsync(operationID);
     }
   }
 
@@ -6005,14 +6198,18 @@ public:
     if (persist)
     {
       masterAuthorityRuntimeStateDurable = false;
-      if (persistLocalRuntimeState() == false)
-      {
-        return;
-      }
-      masterAuthorityRuntimeStateDurable = true;
-      durableMasterAuthorityRuntimeStateGeneration =
-          masterAuthorityRuntimeState.generation;
-      captureDurableElasticAddressOperations();
+      const uint64_t epoch = masterAuthorityEpoch;
+      const uint64_t generation = masterAuthorityRuntimeState.generation;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      persistLocalRuntimeStateAsync([this, lifetime, epoch, generation, replicate](bool durable) {
+        if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch ||
+            masterAuthorityRuntimeState.generation != generation) return;
+        masterAuthorityRuntimeStateDurable = true;
+        durableMasterAuthorityRuntimeStateGeneration = generation;
+        captureDurableElasticAddressOperations();
+        if (replicate) queueMasterAuthorityRuntimeStateReplication();
+      });
+      return;
     }
 
     if (replicate)
@@ -6042,6 +6239,38 @@ public:
     captureDurableElasticAddressOperations();
     queueMasterAuthorityRuntimeStateReplication();
     return true;
+  }
+
+  void commitMasterAuthorityStateChangeAsync(PersistenceCompletion completion,
+                                             bool advanceGeneration = true)
+  {
+    refreshMasterAuthorityRuntimeStateFromLiveFields();
+    if (advanceGeneration)
+    {
+      if (masterAuthorityRuntimeState.generation == UINT64_MAX)
+      {
+        if (completion) completion(false);
+        return;
+      }
+      ++masterAuthorityRuntimeState.generation;
+    }
+    masterAuthorityRuntimeStateDurable = false;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    persistLocalRuntimeStateAsync([this, lifetime, epoch, generation,
+                                  completion = std::move(completion)](bool durable) mutable {
+      if (lifetime.expired()) return;
+      const bool currentAuthority = masterAuthorityEpoch == epoch;
+      if (durable && currentAuthority && masterAuthorityRuntimeState.generation == generation)
+      {
+        masterAuthorityRuntimeStateDurable = true;
+        durableMasterAuthorityRuntimeStateGeneration = generation;
+        captureDurableElasticAddressOperations();
+        queueMasterAuthorityRuntimeStateReplication();
+      }
+      if (completion) completion(durable && currentAuthority);
+    });
   }
 
   static int64_t apiCredentialEffectiveDeadlineMs(const ApiCredential& credential)
@@ -6296,16 +6525,26 @@ public:
     {
       return 0;
     }
-    if (commitMasterAuthorityStateChange() == false)
-    {
-      masterAuthorityRuntimeState = std::move(previous);
-      masterAuthorityRuntimeStateDurable = previousDurable;
-      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-      return 0;
-    }
-
-    broadcastApiCredentialExpiryNotices(newlyCreated);
-    return uint32_t(newlyCreated.size());
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+    auto count = std::make_shared<uint32_t>(0);
+    commitMasterAuthorityStateChangeAsync([this, epoch, generation, previous = std::move(previous),
+        previousDurable, previousDurableGeneration, newlyCreated = std::move(newlyCreated), count](bool durable) mutable {
+      if (masterAuthorityEpoch != epoch) return;
+      if (!durable)
+      {
+        if (masterAuthorityRuntimeState.generation == generation)
+        {
+          masterAuthorityRuntimeState = std::move(previous);
+          masterAuthorityRuntimeStateDurable = previousDurable;
+          durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+        }
+        return;
+      }
+      broadcastApiCredentialExpiryNotices(newlyCreated);
+      *count = uint32_t(newlyCreated.size());
+    });
+    return *count;
   }
 
   bool pruneExpiredTaskExecutionRecords(int64_t nowMs)
@@ -6455,7 +6694,19 @@ public:
     return true;
   }
 
-  bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
+  struct PreparedMasterAuthorityRuntimeState
+  {
+    ProdigyMasterAuthorityRuntimeState runtimeState;
+    bool shouldApply = false;
+    bool sameState = false;
+  };
+
+  // Validation and witness preparation have no provider or live-state effects.
+  // Both synchronous restoration and asynchronous replication use this owner.
+  bool prepareReplicatedMasterAuthorityRuntimeState(
+      const ProdigyMasterAuthorityRuntimeState& incoming,
+      PreparedMasterAuthorityRuntimeState& prepared,
+      const BrainConfig *validationConfig = nullptr)
   {
     const ProdigyPersistentUpdateSelfState incomingRecoveryWitness =
         projectUpdateSelfRecoveryWitness(incoming.updateSelf);
@@ -6523,7 +6774,7 @@ public:
       sanitizedIncoming.nextPendingAddMachinesOperationID = 1;
     }
     if (sanitizedIncoming.nextPendingElasticAddressOperationID == 0 ||
-        validatePendingElasticAddressOperations(sanitizedIncoming) == false)
+        validatePendingElasticAddressOperations(sanitizedIncoming, validationConfig) == false)
     {
       return false;
     }
@@ -6540,8 +6791,6 @@ public:
     comparableIncoming.updateSelf = {};
     ProdigyMasterAuthorityRuntimeState comparableCurrent = masterAuthorityRuntimeState;
     comparableCurrent.updateSelf = {};
-    const ProdigyPersistentUpdateSelfState previousLiveUpdateCoordinator =
-        capturePersistentUpdateSelfState();
 
     const bool shouldApply = sanitizedIncoming.generation > masterAuthorityRuntimeState.generation;
 
@@ -6551,6 +6800,20 @@ public:
     {
       return false;
     }
+    if (sanitizedIncoming.generation < masterAuthorityRuntimeState.generation) return false;
+    prepared.shouldApply = shouldApply;
+    prepared.sameState = comparableIncoming == comparableCurrent;
+    prepared.runtimeState = std::move(sanitizedIncoming);
+    return true;
+  }
+
+  bool applyPreparedMasterAuthorityRuntimeState(
+      PreparedMasterAuthorityRuntimeState prepared, bool persist, bool alreadyDurable = false)
+  {
+    ProdigyMasterAuthorityRuntimeState sanitizedIncoming = std::move(prepared.runtimeState);
+    const ProdigyPersistentUpdateSelfState localUpdateCoordinator = sanitizedIncoming.updateSelf;
+    const ProdigyPersistentUpdateSelfState previousLiveUpdateCoordinator = capturePersistentUpdateSelfState();
+    const bool shouldApply = prepared.shouldApply;
     const bool currentHasPendingElasticOperations =
         masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
         masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false;
@@ -6566,7 +6829,7 @@ public:
       return false;
     }
 
-    if (shouldApply == false && comparableIncoming == comparableCurrent && persist &&
+    if (shouldApply == false && prepared.sameState && persist &&
         (masterAuthorityRuntimeStateDurable == false ||
          durableMasterAuthorityRuntimeStateGeneration != sanitizedIncoming.generation))
     {
@@ -6583,13 +6846,19 @@ public:
       }
       return masterAuthorityRuntimeStateDurable;
     }
-    if (shouldApply == false && comparableIncoming == comparableCurrent)
+    if (shouldApply == false && prepared.sameState)
     {
       if (persist == false ||
           (masterAuthorityRuntimeStateDurable &&
            durableMasterAuthorityRuntimeStateGeneration == sanitizedIncoming.generation))
       {
         restorePersistentUpdateSelfState(localUpdateCoordinator);
+        if (alreadyDurable)
+        {
+          masterAuthorityRuntimeStateDurable = true;
+          durableMasterAuthorityRuntimeStateGeneration = sanitizedIncoming.generation;
+          captureDurableElasticAddressOperations();
+        }
         return true;
       }
       return false;
@@ -6661,7 +6930,7 @@ public:
     (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
     reconcileAuthoritativeDNSState();
 
-    if (persist)
+    if (persist || alreadyDurable)
     {
       masterAuthorityRuntimeStateDurable = true;
       durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
@@ -6686,9 +6955,23 @@ public:
     return persist == false || masterAuthorityRuntimeStateDurable;
   }
 
-  bool applyReplicatedMasterAuthorityTransition(
+  bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
+  {
+    PreparedMasterAuthorityRuntimeState prepared;
+    return prepareReplicatedMasterAuthorityRuntimeState(incoming, prepared) &&
+           applyPreparedMasterAuthorityRuntimeState(std::move(prepared), persist);
+  }
+
+  struct PreparedMasterAuthorityTransition
+  {
+    BrainConfig config;
+    PreparedMasterAuthorityRuntimeState runtime;
+    bool configChanged = false;
+  };
+
+  bool prepareReplicatedMasterAuthorityTransition(
       const ProdigyMasterAuthorityStateTransition& incoming,
-      bool persist = true)
+      PreparedMasterAuthorityTransition& prepared)
   {
     const bool incomingHasPendingElasticOperations =
         incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
@@ -6727,24 +7010,32 @@ public:
     {
       return false;
     }
-    String ownershipFailure;
-    if (claimLocalClusterOwnership(ownedIncoming.clusterUUID, &ownershipFailure) == false)
-    {
-      basics_log("replicateMasterAuthorityState reject clusterUUID=%llu reason=%s\n",
-                 (unsigned long long)ownedIncoming.clusterUUID,
-                 ownershipFailure.c_str());
-      return false;
-    }
-    if (incoming.runtimeState.generation == masterAuthorityRuntimeState.generation)
-    {
-      return applyReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, persist);
-    }
+    if (!prepareReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, prepared.runtime, &ownedIncoming)) return false;
+    prepared.config = std::move(ownedIncoming);
+    prepared.configChanged = configChanged;
+    return true;
+  }
 
-    BrainConfig previousConfig = std::move(brainConfig);
-    brainConfig = std::move(ownedIncoming);
-    if (applyReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, persist))
+  bool applyPreparedMasterAuthorityTransition(
+      PreparedMasterAuthorityTransition prepared, bool persist, bool alreadyDurable = false)
+  {
+    // Asynchronous ownership persistence belongs to the candidate commit.
+    // This legacy claim remains solely on the synchronous compatibility path.
+    if (!alreadyDurable)
     {
-      if (configChanged)
+      String ownershipFailure;
+      if (!claimLocalClusterOwnership(prepared.config.clusterUUID, &ownershipFailure))
+      {
+        basics_log("replicateMasterAuthorityState reject clusterUUID=%llu reason=%s\n",
+                   (unsigned long long)prepared.config.clusterUUID, ownershipFailure.c_str());
+        return false;
+      }
+    }
+    BrainConfig previousConfig = std::move(brainConfig);
+    brainConfig = std::move(prepared.config);
+    if (applyPreparedMasterAuthorityRuntimeState(std::move(prepared.runtime), persist, alreadyDurable))
+    {
+      if (prepared.configChanged)
       {
         refreshMachineFragmentAssignmentsIfPossible();
         loadBrainConfigIf();
@@ -6754,6 +7045,215 @@ public:
     brainConfig = std::move(previousConfig);
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     return false;
+  }
+
+  bool applyReplicatedMasterAuthorityTransition(
+      const ProdigyMasterAuthorityStateTransition& incoming, bool persist = true)
+  {
+    PreparedMasterAuthorityTransition prepared;
+    return prepareReplicatedMasterAuthorityTransition(incoming, prepared) &&
+           applyPreparedMasterAuthorityTransition(std::move(prepared), persist);
+  }
+
+  // The runtime opts in only after it owns every access to its state store.
+  // Until then the established synchronous path remains the compatibility owner.
+  virtual bool usesAsyncMasterAuthorityPersistence() const { return false; }
+
+  // An async authority transition must hold this ownership receipt before its
+  // candidate reaches persistent storage. A true result accepts exactly one
+  // Ring completion; false admits nothing and never calls completion.
+  virtual bool claimLocalClusterOwnershipAsync(
+      uint128_t clusterUUID, std::function<void(bool)> completion)
+  {
+    (void)clusterUUID;
+    (void)completion;
+    return false;
+  }
+
+  // The candidate must be detached before the worker reads it. A true result
+  // accepts exactly one Ring completion; false admits nothing and never calls
+  // completion. Success includes the cluster ownership prerequisite and every
+  // record needed to recover this transition, not merely queue acceptance.
+  virtual bool persistMasterAuthorityTransitionCandidate(
+      const ProdigyMasterAuthorityStateTransition& candidate,
+      std::function<void(bool)> completion)
+  {
+    (void)candidate;
+    (void)completion;
+    return false;
+  }
+
+  struct PendingReplicatedMasterAuthorityTransition
+  {
+    PreparedMasterAuthorityTransition prepared;
+    ProdigyMasterAuthorityRuntimeState previousRuntime;
+    ProdigyPersistentUpdateSelfState previousCoordinator;
+    String previousConfig;
+    String serializedRequest;
+    uint64_t authorityEpoch = 0;
+    uint128_t masterUUID = 0;
+    uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    uint64_t peerGeneration = 0;
+    int peerFileSlot = -1;
+  };
+  std::shared_ptr<PendingReplicatedMasterAuthorityTransition> pendingReplicatedMasterAuthorityTransition;
+
+  struct QueuedReplicatedMasterAuthorityTransition
+  {
+    uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    uint64_t peerGeneration = 0;
+    uint64_t authorityEpoch = 0;
+    String serialized;
+  };
+  std::deque<QueuedReplicatedMasterAuthorityTransition> queuedReplicatedMasterAuthorityTransitions;
+  uint64_t queuedReplicatedMasterAuthorityBytes = 0;
+
+  bool pendingReplicatedMasterAuthorityTransitionIsCurrent(
+      const std::shared_ptr<PendingReplicatedMasterAuthorityTransition>& pending,
+      BrainView *&currentPeer)
+  {
+    if (!pending || pendingReplicatedMasterAuthorityTransition != pending) return false;
+    currentPeer = findBrainViewByUUID(pending->peerUUID);
+    String currentConfig;
+    BitseryEngine::serialize(currentConfig, brainConfig);
+    return !weAreMaster && masterAuthorityEpoch == pending->authorityEpoch &&
+           getExistingMasterUUID() == pending->masterUUID &&
+           masterAuthorityRuntimeState == pending->previousRuntime &&
+           capturePersistentUpdateSelfState() == pending->previousCoordinator &&
+           currentConfig.equals(pending->previousConfig) && currentPeer != nullptr &&
+           currentPeer->boottimens == pending->peerBootTime &&
+           currentPeer->ioGeneration == pending->peerGeneration &&
+           currentPeer->fslot == pending->peerFileSlot &&
+           peerCanReplicateMasterAuthorityState(currentPeer);
+  }
+
+  void resumeQueuedReplicatedMasterAuthorityTransitions()
+  {
+    while (!pendingReplicatedMasterAuthorityTransition && !queuedReplicatedMasterAuthorityTransitions.empty())
+    {
+      auto queued = std::move(queuedReplicatedMasterAuthorityTransitions.front());
+      queuedReplicatedMasterAuthorityTransitions.pop_front();
+      queuedReplicatedMasterAuthorityBytes -= queued.serialized.size();
+      BrainView *peer = findBrainViewByUUID(queued.peerUUID);
+      if (weAreMaster || masterAuthorityEpoch != queued.authorityEpoch || peer == nullptr ||
+          peer->boottimens != queued.peerBootTime || peer->ioGeneration != queued.peerGeneration ||
+          !peerCanReplicateMasterAuthorityState(peer)) continue;
+      ProdigyMasterAuthorityStateTransition incoming;
+      if (BitseryEngine::deserializeSafe(queued.serialized, incoming))
+        (void)beginReplicatedMasterAuthorityTransition(peer, incoming, queued.serialized);
+    }
+  }
+
+  void acknowledgeAppliedMasterAuthorityTransition(
+      BrainView *peer, const ProdigyMasterAuthorityRuntimeState& incoming, const String& serialized)
+  {
+    String transitionDigest;
+    if ((incoming.pendingElasticAddressAssignments.empty() == false ||
+         incoming.pendingElasticAddressReleases.empty() == false ||
+         machineRetirementJournalPresent(incoming) ||
+         hasUpdateSelfRecoveryWitness(incoming.updateSelf)) &&
+        applyReplicatedMachineRetirementTopology(incoming) &&
+        replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming) &&
+        prodigyComputeSHA256Hex(serialized, transitionDigest))
+    {
+      sendMasterAuthorityTransitionAcknowledgement(peer, incoming.generation, transitionDigest);
+    }
+  }
+
+  bool beginReplicatedMasterAuthorityTransition(
+      BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
+  {
+    if (!usesAsyncMasterAuthorityPersistence()) return false;
+    // Serialize conflicting authority snapshots, while the handler continues
+    // to accept heartbeats and other independent traffic. Full admission stays
+    // unacknowledged so the sender's existing transition retry can recover it.
+    if (pendingReplicatedMasterAuthorityTransition)
+    {
+      if (queuedReplicatedMasterAuthorityTransitions.size() >= ProdigyArtifactIO::maximumJobs ||
+          serialized.size() > ProdigyArtifactIO::maximumBytes ||
+          queuedReplicatedMasterAuthorityBytes > ProdigyArtifactIO::maximumBytes - serialized.size()) return true;
+      QueuedReplicatedMasterAuthorityTransition queued;
+      queued.peerUUID = peer->uuid;
+      queued.peerBootTime = peer->boottimens;
+      queued.peerGeneration = peer->ioGeneration;
+      queued.authorityEpoch = masterAuthorityEpoch;
+      queued.serialized.assign(serialized);
+      queuedReplicatedMasterAuthorityBytes += queued.serialized.size();
+      queuedReplicatedMasterAuthorityTransitions.push_back(std::move(queued));
+      return true;
+    }
+    auto pending = std::make_shared<PendingReplicatedMasterAuthorityTransition>();
+    if (!prepareReplicatedMasterAuthorityTransition(incoming, pending->prepared)) return true;
+    pending->previousRuntime = masterAuthorityRuntimeState;
+    pending->previousCoordinator = capturePersistentUpdateSelfState();
+    BitseryEngine::serialize(pending->previousConfig, brainConfig);
+    pending->serializedRequest.assign(serialized);
+    pending->authorityEpoch = masterAuthorityEpoch;
+    pending->masterUUID = getExistingMasterUUID();
+    pending->peerUUID = peer->uuid;
+    pending->peerBootTime = peer->boottimens;
+    pending->peerGeneration = peer->ioGeneration;
+    pending->peerFileSlot = peer->fslot;
+    pendingReplicatedMasterAuthorityTransition = pending;
+
+    ProdigyMasterAuthorityStateTransition candidate;
+    candidate.brainConfig = pending->prepared.config;
+    candidate.runtimeState = pending->prepared.runtime.runtimeState;
+    const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
+    const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
+        [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
+          // A destroyed Brain releases its pending owner. Do not dereference
+          // this until that lifetime token has been recovered successfully.
+          auto pending = weakPending.lock();
+          if (!pending || pendingReplicatedMasterAuthorityTransition != pending) return;
+          BrainView *currentPeer = nullptr;
+          if (!owned || !pendingReplicatedMasterAuthorityTransitionIsCurrent(pending, currentPeer))
+          {
+            pendingReplicatedMasterAuthorityTransition.reset();
+            resumeQueuedReplicatedMasterAuthorityTransitions();
+            return;
+          }
+          const bool admitted = persistMasterAuthorityTransitionCandidate(candidate,
+              [this, weakPending](bool durable) {
+                // A destroyed Brain releases its pending owner. Do not dereference
+                // this until that lifetime token has been recovered successfully.
+                auto pending = weakPending.lock();
+                if (!pending || pendingReplicatedMasterAuthorityTransition != pending) return;
+                BrainView *currentPeer = nullptr;
+                if (!durable || !pendingReplicatedMasterAuthorityTransitionIsCurrent(pending, currentPeer))
+                {
+                  pendingReplicatedMasterAuthorityTransition.reset();
+                  resumeQueuedReplicatedMasterAuthorityTransitions();
+                  return;
+                }
+                // Every live projection and recovery hook executes only after the
+                // worker receipt, through the same owner as synchronous restoration.
+                const ProdigyMasterAuthorityRuntimeState appliedState = pending->prepared.runtime.runtimeState;
+                if (applyPreparedMasterAuthorityTransition(std::move(pending->prepared), false, true))
+                {
+                  acknowledgeAppliedMasterAuthorityTransition(currentPeer, appliedState, pending->serializedRequest);
+                }
+                pendingReplicatedMasterAuthorityTransition.reset();
+                resumeQueuedReplicatedMasterAuthorityTransitions();
+              });
+          if (!admitted && pendingReplicatedMasterAuthorityTransition == pending)
+          {
+            pendingReplicatedMasterAuthorityTransition.reset();
+            // Admission failure leaves the candidate unapplied and unacknowledged.
+            // Retrying from the peer's normal replication owner also revalidates it.
+            resumeQueuedReplicatedMasterAuthorityTransitions();
+          }
+        });
+    if (!ownershipAdmitted && pendingReplicatedMasterAuthorityTransition == pending)
+    {
+      pendingReplicatedMasterAuthorityTransition.reset();
+      // Ownership admission failure leaves the candidate unapplied and unacknowledged.
+      // Retrying from the peer's normal replication owner also revalidates it.
+      resumeQueuedReplicatedMasterAuthorityTransitions();
+    }
+    return true;
   }
 
   bool peerCanReplicateMasterAuthorityState(BrainView *peer)
@@ -7235,7 +7735,7 @@ public:
     ReplicatedContainerRuntimeStateApplyResult result = applyReplicatedContainerRuntimeStateNow(state);
     if (result == ReplicatedContainerRuntimeStateApplyResult::applied)
     {
-      persistLocalRuntimeState();
+      persistLocalRuntimeStateAsync();
       return;
     }
     if (result == ReplicatedContainerRuntimeStateApplyResult::deferred)
@@ -7340,7 +7840,7 @@ public:
       queueBrainDeploymentReplication(serializedPlan, ""_ctv);
     }
 
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
     return true;
   }
 
@@ -8613,6 +9113,10 @@ public:
 
   uint32_t pushTlsResumptionUpdateToLiveContainers(const DeploymentPlan& deploymentPlan, const TlsResumptionSnapshot *snapshot, const String *removedWormholeName, uint64_t generation, const String& reason)
   {
+    // A retry can observe the staged key ring while its write is outstanding.
+    // It must obey the same durable-generation gate as the initial publication.
+    if (!masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation) return 0;
     CredentialDelta delta = {};
     delta.bundleGeneration = generation;
     if (snapshot != nullptr)
@@ -8724,10 +9228,6 @@ public:
     for (uint32_t index = 0; index < wormholesToRemove.size(); index += 1)
     {
       const String& wormholeName = wormholesToRemove[index];
-      if (pushDelta)
-      {
-        pushTlsResumptionUpdateToLiveContainers(deploymentPlan, nullptr, &wormholeName, generationsToRemove[index], "tls-resumption-policy-disabled-or-removed"_ctv);
-      }
       if (removeTlsResumptionStateForWormhole(deploymentID, wormholeName, false))
       {
         removed += 1;
@@ -8736,7 +9236,16 @@ public:
 
     if (removed > 0)
     {
-      noteMasterAuthorityRuntimeStateChanged();
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      DeploymentPlan durablePlan = deploymentPlan;
+      commitMasterAuthorityStateChangeAsync([this, authorityEpoch, durablePlan = std::move(durablePlan),
+                                             wormholes = std::move(wormholesToRemove),
+                                             generations = std::move(generationsToRemove), pushDelta](bool durable) mutable {
+        if (!durable || masterAuthorityEpoch != authorityEpoch || !pushDelta) return;
+        for (uint32_t index = 0; index < wormholes.size(); ++index)
+          pushTlsResumptionUpdateToLiveContainers(durablePlan, nullptr, &wormholes[index], generations[index],
+                                                   "tls-resumption-policy-disabled-or-removed"_ctv);
+      });
     }
     return removed;
   }
@@ -8775,7 +9284,20 @@ public:
       {
         if (pushDelta)
         {
-          pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-accept-only-rollout"_ctv);
+          if (masterAuthorityRuntimeStateDurable)
+            pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-accept-only-rollout"_ctv);
+          else
+          {
+            const uint64_t generation = snapshot->generation;
+            DeploymentPlan ownedPlan = deploymentPlan;
+            const String name(wormhole.name.data(), wormhole.name.size(), Copy::yes, wormhole.name.size());
+            commitMasterAuthorityStateChangeAsync([this, ownedPlan = std::move(ownedPlan), name, generation](bool durable) {
+              if (!durable) return;
+              auto current = mutableTlsResumptionSnapshotForWormhole(ownedPlan.config.deploymentID(), name);
+              if (current && current->generation == generation)
+                pushTlsResumptionUpdateToLiveContainers(ownedPlan, current, nullptr, generation, "tls-resumption-accept-only-rollout"_ctv);
+            }, false);
+          }
         }
         return snapshot;
       }
@@ -8790,11 +9312,19 @@ public:
 
     clearTlsResumptionAcksForWormhole(deploymentID, wormhole.name);
 
-    noteMasterAuthorityRuntimeStateChanged();
-    if (pushDelta)
-    {
-      pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-accept-only-rollout"_ctv);
-    }
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t snapshotGeneration = snapshot->generation;
+    DeploymentPlan durablePlan = deploymentPlan;
+    const String wormholeName(wormhole.name.data(), wormhole.name.size(), Copy::yes, wormhole.name.size());
+    commitMasterAuthorityStateChangeAsync([this, authorityEpoch, snapshotGeneration,
+                                           durablePlan = std::move(durablePlan), wormholeName, pushDelta](bool durable) mutable {
+      if (!durable || masterAuthorityEpoch != authorityEpoch || !pushDelta) return;
+      TlsResumptionSnapshot *current = mutableTlsResumptionSnapshotForWormhole(
+          durablePlan.config.deploymentID(), wormholeName);
+      if (current != nullptr && current->generation == snapshotGeneration)
+        pushTlsResumptionUpdateToLiveContainers(durablePlan, current, nullptr, snapshotGeneration,
+                                                 "tls-resumption-accept-only-rollout"_ctv);
+    });
     return snapshot;
   }
 
@@ -8850,11 +9380,19 @@ public:
       return false;
     }
 
-    noteMasterAuthorityRuntimeStateChanged();
-    if (pushDelta)
-    {
-      pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-issue-promotion"_ctv);
-    }
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t snapshotGeneration = snapshot->generation;
+    DeploymentPlan durablePlan = deploymentPlan;
+    const String wormholeName(wormhole.name.data(), wormhole.name.size(), Copy::yes, wormhole.name.size());
+    commitMasterAuthorityStateChangeAsync([this, authorityEpoch, snapshotGeneration,
+                                           durablePlan = std::move(durablePlan), wormholeName, pushDelta](bool durable) mutable {
+      if (!durable || masterAuthorityEpoch != authorityEpoch || !pushDelta) return;
+      TlsResumptionSnapshot *current = mutableTlsResumptionSnapshotForWormhole(
+          durablePlan.config.deploymentID(), wormholeName);
+      if (current != nullptr && current->generation == snapshotGeneration)
+        pushTlsResumptionUpdateToLiveContainers(durablePlan, current, nullptr, snapshotGeneration,
+                                                 "tls-resumption-issue-promotion"_ctv);
+    });
     return true;
   }
 
@@ -8924,11 +9462,19 @@ public:
         clearTlsResumptionAcksForWormhole(deploymentID, wormhole.name);
       }
 
-      noteMasterAuthorityRuntimeStateChanged();
-      if (pushDelta)
-      {
-        pushTlsResumptionUpdateToLiveContainers(deploymentPlan, snapshot, nullptr, snapshot->generation, "tls-resumption-expired-epoch-retire"_ctv);
-      }
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const uint64_t snapshotGeneration = snapshot->generation;
+      DeploymentPlan durablePlan = deploymentPlan;
+      const String wormholeName(wormhole.name.data(), wormhole.name.size(), Copy::yes, wormhole.name.size());
+      commitMasterAuthorityStateChangeAsync([this, authorityEpoch, snapshotGeneration,
+                                             durablePlan = std::move(durablePlan), wormholeName, pushDelta](bool durable) mutable {
+        if (!durable || masterAuthorityEpoch != authorityEpoch || !pushDelta) return;
+        TlsResumptionSnapshot *current = mutableTlsResumptionSnapshotForWormhole(
+            durablePlan.config.deploymentID(), wormholeName);
+        if (current != nullptr && current->generation == snapshotGeneration)
+          pushTlsResumptionUpdateToLiveContainers(durablePlan, current, nullptr, snapshotGeneration,
+                                                   "tls-resumption-expired-epoch-retire"_ctv);
+      });
     }
 
     return retired;
@@ -9746,19 +10292,27 @@ public:
     }
 
     retirement->destroySucceeded = true;
-    if (commitMachineRetirementJournal() == false)
-    {
-      retirement->destroySucceeded = false;
-      basics_log("provider machine destroy completion persist failed uuid=%llu cloudID=%.*s\n",
-                 (unsigned long long)uuid,
-                 int(cloudID.size()),
-                 reinterpret_cast<const char *>(cloudID.data()));
-      deferRetiredMachineDestroy(*retirement);
-      return;
-    }
-    retirement->destroyFailureCount = 0;
-    retirement->nextDestroyAttemptMs = 0;
-    armMachineRetirementRecheck();
+    const uint64_t operationEpoch = authorityEpoch;
+    String completedCloudID;
+    completedCloudID.assign(cloudID);
+    commitMachineRetirementJournalAsync(
+        [this, uuid, cloudID = std::move(completedCloudID), operationEpoch](bool durable) {
+          RetiredMachineIdentity *current = retiredMachineIdentityForProvider(uuid, cloudID);
+          if (current == nullptr || isActiveMaster() == false ||
+              masterAuthorityEpoch != operationEpoch) return;
+          if (durable == false)
+          {
+            current->destroySucceeded = false;
+            basics_log("provider machine destroy completion persist failed uuid=%llu cloudID=%.*s\n",
+                       (unsigned long long)uuid,
+                       int(cloudID.size()), reinterpret_cast<const char *>(cloudID.data()));
+            deferRetiredMachineDestroy(*current);
+            return;
+          }
+          current->destroyFailureCount = 0;
+          current->nextDestroyAttemptMs = 0;
+          armMachineRetirementRecheck();
+        });
   }
 
   bool driveRetiredMachineDestroy(RetiredMachineIdentity& retirement)
@@ -9859,7 +10413,7 @@ public:
                                                const RoutableSubnetRegistration& response);
   void sendRoutableSubnetUnregistrationResponse(const PendingElasticAddressControlOperation& operation,
                                                  const RoutableSubnetUnregistration& response);
-  bool commitRoutableSubnetRegistryChange(void);
+  void commitRoutableSubnetRegistryChangeAsync(PersistenceCompletion completion);
   bool routableSubnetOperationPending(const String& name, uint128_t uuid = 0) const;
   bool routablePrefixReleasePending(uint128_t uuid) const override;
   bool validatePendingElasticAddressOperations(
@@ -9883,7 +10437,8 @@ public:
   const ProdigyPendingElasticAddressAssignment *findPendingElasticAddressAssignment(uint64_t operationID) const;
   ProdigyPendingElasticAddressRelease *findPendingElasticAddressRelease(uint64_t operationID);
   const ProdigyPendingElasticAddressRelease *findPendingElasticAddressRelease(uint64_t operationID) const;
-  bool commitPendingElasticAddressStateChange(bool advanceGeneration = true);
+  void commitPendingElasticAddressStateChangeAsync(PersistenceCompletion completion,
+                                                    bool advanceGeneration = true);
   void reconcilePendingElasticAddressAssignments(void);
   void reconcilePendingElasticAddressReleases(void);
   bool reserveElasticAddressControlOperationIDs(uint32_t count, uint64_t& firstOperationID);
@@ -9896,10 +10451,17 @@ public:
                                        uint128_t machineUUID,
                                        const String& machineCloudID,
                                        const IPPrefix& deliveryPrefix);
+  void enqueueElasticAddressAssignmentAsync(Mothership *stream, BrainIaaS& provider,
+                                            RoutableSubnetRegistration request, uint128_t machineUUID,
+                                            String machineCloudID, IPPrefix deliveryPrefix,
+                                            PersistenceCompletion completion);
   bool enqueueElasticAddressRelease(Mothership *stream,
                                     BrainIaaS& provider,
-                                    const RoutableSubnetUnregistration& request,
-                                    const DistributableExternalSubnet& prefix);
+                                     const RoutableSubnetUnregistration& request,
+                                     const DistributableExternalSubnet& prefix);
+  void enqueueElasticAddressReleaseAsync(Mothership *stream, BrainIaaS& provider,
+                                         RoutableSubnetUnregistration request, DistributableExternalSubnet prefix,
+                                         PersistenceCompletion completion);
   void completeElasticAddressAssignment(PendingElasticAddressControlOperation& operation,
                                         ProviderElasticAddressPlan&& plan,
                                         ProviderElasticAddressAssignment&& assignment,
@@ -11189,15 +11751,15 @@ public:
 
     prodigyNormalizeClusterTopologyPeerAddresses(topology);
     topology.version += 1;
-    if (persistAuthoritativeClusterTopology(topology) == false)
-    {
-      return false;
-    }
-
-    String serializedTopology = {};
-    BitseryEngine::serialize(serializedTopology, topology);
-    queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
-    sendNeuronSwitchboardOverlayRoutes();
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const uint64_t epoch = masterAuthorityEpoch;
+    persistAuthoritativeClusterTopologyAsync(topology, [this, lifetime, epoch, topology](bool durable) {
+      if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch) return;
+      String serializedTopology;
+      BitseryEngine::serialize(serializedTopology, topology);
+      queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+      sendNeuronSwitchboardOverlayRoutes();
+    });
     return true;
   }
 
@@ -11542,8 +12104,20 @@ public:
     return true;
   }
 
+  // Recovery already has one retry owner. Hold that owner at a durable
+  // boundary and re-enter it from the receipt instead of retaining iterators.
+  bool recoveryPersistencePending = false;
+  bytell_hash_set<String> pendingMaterializedRecoveryPersistence;
+  struct PersistenceDispatchResult
+  {
+    bool returned = false;
+    bool completed = false;
+    bool durable = false;
+  };
+
   bool pruneRecoveredInventoryOrphanWhiteholeLeases(void)
   {
+    if (recoveryPersistencePending) return false;
     if (recoveredInventoryWhiteholeLeasePruneIsSafe() == false)
     {
       return true;
@@ -11602,15 +12176,27 @@ public:
     const bool previousDurable = masterAuthorityRuntimeStateDurable;
     const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
     routableResourceLeaseRuntimeState = std::move(retained);
-    if (commitMasterAuthorityStateChange() == false)
-    {
-      routableResourceLeaseRuntimeState = previousLeases;
-      masterAuthorityRuntimeState = previousRuntimeState;
-      masterAuthorityRuntimeStateDurable = previousDurable;
-      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-      return false;
-    }
-    return true;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t expectedGeneration = masterAuthorityRuntimeState.generation + 1;
+    auto receipt = std::make_shared<PersistenceDispatchResult>();
+    recoveryPersistencePending = true;
+    commitMasterAuthorityStateChangeAsync([this, receipt, epoch, expectedGeneration,
+        previousLeases, previousRuntimeState, previousDurable, previousDurableGeneration](bool durable) {
+      recoveryPersistencePending = false;
+      receipt->completed = true;
+      receipt->durable = durable && masterAuthorityEpoch == epoch;
+      if (!receipt->durable && masterAuthorityEpoch == epoch &&
+          masterAuthorityRuntimeState.generation == expectedGeneration)
+      {
+        routableResourceLeaseRuntimeState = previousLeases;
+        masterAuthorityRuntimeState = previousRuntimeState;
+        masterAuthorityRuntimeStateDurable = previousDurable;
+        durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+      }
+      if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
+    });
+    receipt->returned = true;
+    return receipt->completed && receipt->durable;
   }
 
   bool finalizePersistedNeuronInventoryRecovery(void)
@@ -11752,6 +12338,7 @@ public:
   bool promoteRetainedStorageRecoverySuccessor(ProdigyMaterializedStatefulRecoveryRetry& retry,
                                                ApplicationDeployment *head)
   {
+    if (recoveryPersistencePending) return false;
     auto activeIt = deployments.find(retry.activeDeploymentID);
     auto failedIt = deployments.find(retry.failedSuccessorDeploymentID);
     if (retry.phase != ProdigyMaterializedStatefulRecoveryRetryPhase::authorized || !head ||
@@ -11776,27 +12363,49 @@ public:
     head->state = DeploymentState::waitingToDeploy;
     retry.phase = ProdigyMaterializedStatefulRecoveryRetryPhase::successorAdmitted;
     retry.updatedAtMs = Time::now<TimeResolution::ms>();
-    if (!commitMasterAuthorityStateChange())
-    {
-      head->previous = failed;
-      active->next = failed;
-      failed->previous = active;
-      failed->next = head;
-      head->state = priorState;
-      masterAuthorityRuntimeState = before;
-      masterAuthorityRuntimeStateDurable = wasDurable;
-      durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
-      return false;
-    }
-    if (!failed->containers.empty())
-      (void)failed->discardUnlaunchedMaterializedRecoveryViews();
-    active->rebuildRecoveredContainerCounts();
-    return true;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t expectedGeneration = before.generation + 1;
+    const uint64_t headID = head->plan.config.deploymentID();
+    const uint64_t activeID = active->plan.config.deploymentID();
+    const uint64_t failedID = failed->plan.config.deploymentID();
+    auto receipt = std::make_shared<PersistenceDispatchResult>();
+    recoveryPersistencePending = true;
+    commitMasterAuthorityStateChangeAsync([this, receipt, epoch, expectedGeneration, headID, activeID,
+        failedID, before, wasDurable, durableGeneration, priorState](bool durable) {
+      recoveryPersistencePending = false;
+      receipt->completed = true;
+      if (masterAuthorityEpoch != epoch) return;
+      auto h = deployments.find(headID), a = deployments.find(activeID), f = deployments.find(failedID);
+      if (h == deployments.end() || a == deployments.end() || f == deployments.end() ||
+          !h->second || !a->second || !f->second) return;
+      auto *head = h->second;
+      auto *active = a->second;
+      auto *failed = f->second;
+      if (head->previous != active || active->next != head || failed->previous || failed->next) return;
+      if (!durable)
+      {
+        if (masterAuthorityRuntimeState.generation == expectedGeneration)
+        {
+          head->previous = failed; active->next = failed;
+          failed->previous = active; failed->next = head; head->state = priorState;
+          masterAuthorityRuntimeState = before;
+          masterAuthorityRuntimeStateDurable = wasDurable;
+          durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+        }
+        return;
+      }
+      if (!failed->containers.empty()) (void)failed->discardUnlaunchedMaterializedRecoveryViews();
+      active->rebuildRecoveredContainerCounts();
+      receipt->durable = true;
+      if (receipt->returned) recoverDeploymentsAfterNeuronState();
+    });
+    receipt->returned = true;
+    return receipt->completed && receipt->durable;
   }
 
   void recoverDeploymentsAfterNeuronState(void)
   {
-    if (weAreMaster == false || ignited == false ||
+    if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() || weAreMaster == false || ignited == false ||
         finalizePersistedNeuronInventoryRecovery() == false)
     {
       return;
@@ -11831,11 +12440,24 @@ public:
       const uint64_t durableGeneration = durableMasterAuthorityRuntimeStateGeneration;
       auto persistTransition = [&]() {
         retry.updatedAtMs = Time::now<TimeResolution::ms>();
-        if (commitMasterAuthorityStateChange()) return true;
-        masterAuthorityRuntimeState = before;
-        masterAuthorityRuntimeStateDurable = wasDurable;
-        durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
-        return false;
+        const uint64_t epoch = masterAuthorityEpoch;
+        auto receipt = std::make_shared<PersistenceDispatchResult>();
+        recoveryPersistencePending = true;
+        commitMasterAuthorityStateChangeAsync([this, receipt, epoch, before, wasDurable, durableGeneration](bool durable) {
+          recoveryPersistencePending = false;
+          receipt->completed = true;
+          receipt->durable = durable && masterAuthorityEpoch == epoch;
+          if (!receipt->durable && masterAuthorityEpoch == epoch &&
+              masterAuthorityRuntimeState.generation == before.generation + 1)
+          {
+            masterAuthorityRuntimeState = before;
+            masterAuthorityRuntimeStateDurable = wasDurable;
+            durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+          }
+          if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
+        });
+        receipt->returned = true;
+        return receipt->completed && receipt->durable;
       };
       // The predecessor may have been culled by the ordinary scheduler. Check
       // completion before requiring that old owner to remain in the index.
@@ -11874,6 +12496,9 @@ public:
       head->materializedStatefulRecoveryOwnsTransition = true;
       if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchHealthy)
       {
+        head->hasRetainedStorageRecoverySource = false;
+        head->retainedStorageRecoveryContainerUUID = 0;
+        head->retainedStorageRecoverySource = {};
         head->resumeMaterializedStatefulRecovery();
         continue;
       }
@@ -11968,18 +12593,25 @@ public:
       head->resumeMaterializedStatefulRecovery();
     }
 
-    if (completedRecoveryOperations.empty() == false && commitMasterAuthorityStateChange() == false)
+    if (!completedRecoveryOperations.empty())
     {
-      for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
-      {
-        for (const String& operationID : completedRecoveryOperations)
-        {
-          if (operation.operationID.equals(operationID))
-          {
-            operation.completed = false;
-          }
-        }
-      }
+      const uint64_t epoch = masterAuthorityEpoch;
+      const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+      auto receipt = std::make_shared<PersistenceDispatchResult>();
+      recoveryPersistencePending = true;
+      commitMasterAuthorityStateChangeAsync([this, epoch, generation, receipt,
+          operationIDs = std::move(completedRecoveryOperations)](bool durable) {
+        recoveryPersistencePending = false;
+        receipt->completed = true;
+        receipt->durable = durable && masterAuthorityEpoch == epoch;
+        if (!receipt->durable && masterAuthorityEpoch == epoch && masterAuthorityRuntimeState.generation == generation)
+          for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
+            for (const String& id : operationIDs)
+              if (operation.operationID.equals(id)) operation.completed = false;
+        if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
+      });
+      receipt->returned = true;
+      if (!receipt->completed || !receipt->durable) return;
     }
 
     for (const auto& [applicationID, indexedHead] : deploymentsByApp)
@@ -12035,13 +12667,34 @@ public:
         const int64_t stateChangedAtMs = head->stateChangedAtMs;
         head->state = DeploymentState::waitingToDeploy;
         head->stateChangedAtMs = Time::now<TimeResolution::ms>();
-        if (persistLocalRuntimeState() == false)
-        {
-          head->state = DeploymentState::none;
-          head->stateChangedAtMs = stateChangedAtMs;
-          continue;
-        }
-        deploymentsWaitingForDNS.erase(head->plan.config.deploymentID());
+        const uint64_t deploymentID = head->plan.config.deploymentID();
+        const int64_t candidateTime = head->stateChangedAtMs;
+        const uint64_t epoch = masterAuthorityEpoch;
+        const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+        auto receipt = std::make_shared<PersistenceDispatchResult>();
+        recoveryPersistencePending = true;
+        persistLocalRuntimeStateAsync([this, lifetime, receipt, epoch, deploymentID,
+            candidateTime, stateChangedAtMs](bool durable) {
+          if (lifetime.expired()) return;
+          recoveryPersistencePending = false;
+          receipt->completed = true;
+          if (masterAuthorityEpoch != epoch) return;
+          auto current = deployments.find(deploymentID);
+          if (current == deployments.end() || !current->second ||
+              current->second->state != DeploymentState::waitingToDeploy ||
+              current->second->stateChangedAtMs != candidateTime) return;
+          if (!durable)
+          {
+            current->second->state = DeploymentState::none;
+            current->second->stateChangedAtMs = stateChangedAtMs;
+            return;
+          }
+          receipt->durable = true;
+          deploymentsWaitingForDNS.erase(deploymentID);
+          if (receipt->returned) recoverDeploymentsAfterNeuronState();
+        });
+        receipt->returned = true;
+        if (!receipt->completed || !receipt->durable) return;
       }
 
       // A queued successor becomes the application index head before the
@@ -12156,11 +12809,11 @@ public:
 
     const uint64_t priorGeneration = brain->ioGeneration;
 
-    // Accepted reconnects must not inherit buffered plaintext/ciphertext
-    // or stale peer-verification state from the prior stream generation.
+    // Accepted reconnects must not inherit buffered plaintext/ciphertext,
+    // artifact fragments, or peer-verification state from the prior generation.
     // Keep the broader BrainView identity/runtime intact and scrub only
     // the transport buffers that can block fresh registration parsing.
-    brain->ProdigyTransportTLSStream::reset();
+    brain->ProdigyArtifactStream::reset();
     brain->fslot = fslot;
     brain->isFixedFile = true;
     brain->isNonBlocking = true;
@@ -12464,7 +13117,7 @@ public:
         // A successful reconnect is a fresh transport generation. Keep the
         // BrainView identity/reconnect policy but discard prior TLS/BIO and
         // buffered stream state before starting the new handshake.
-        brain->ProdigyTransportTLSStream::reset();
+        brain->ProdigyArtifactStream::reset();
         if (ProdigyTransportTLSRuntime::configured() && brain->beginTransportTLS(false) == false)
         {
           if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
@@ -13300,7 +13953,7 @@ public:
       return;
     }
 
-    neuron->ProdigyTransportTLSStream::reset();
+    neuron->ProdigyArtifactStream::reset();
     neuron->recreateSocket();
     if (installNeuronControlSocket(neuron))
     {
@@ -13970,7 +14623,7 @@ public:
       brain->registrationFresh = false;
       // The next accepted/outbound peer stream must not inherit TLS/BIO or
       // buffered send/receive state from the closed socket generation.
-      brain->ProdigyTransportTLSStream::reset();
+      brain->ProdigyArtifactStream::reset();
       bool expectedOSUpdateFollowerReboot = (brain->machine != nullptr && brain->machine->state == MachineState::updatingOS && brain->machine->osUpdateCommandIssued);
       bool expectedUpdateFollowerReboot = ((updateSelfState == UpdateSelfState::waitingForFollowerReboots && updateSelfFollowerBootNsByPeerKey.contains(updateSelfPeerTrackingKey(brain))) || expectedOSUpdateFollowerReboot);
 
@@ -14167,7 +14820,7 @@ public:
         }
         else
         {
-          neuron->ProdigyTransportTLSStream::reset();
+          neuron->ProdigyArtifactStream::reset();
         }
         armNeuronReconnectWaiterIfAbsent(neuron, neuronControlReconnectDelayMs(neuron), "close-neuron-reconnect", true, true);
       }
@@ -15168,6 +15821,13 @@ public:
     return true;
   }
 
+  virtual void persistAuthoritativeClusterTopologyAsync(ClusterTopology topology,
+                                                        PersistenceCompletion completion)
+  {
+    const bool durable = persistAuthoritativeClusterTopology(topology);
+    if (completion) completion(durable);
+  }
+
   bool loadOrPersistAuthoritativeClusterTopology(ClusterTopology& topology)
   {
     if (loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false)
@@ -15175,8 +15835,9 @@ public:
       return true;
     }
 
-    persistLocalRuntimeState();
-    return loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false;
+    // Topology is published by its async persistence owner. A read cannot
+    // manufacture a durable topology while an earlier write is in flight.
+    return false;
   }
 
   void applyMachineHardwareProfile(Machine *machine, const MachineHardwareProfile& hardware)
@@ -15206,7 +15867,7 @@ public:
       return;
     }
 
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
 
     if (isActiveMaster())
     {
@@ -15241,14 +15902,14 @@ public:
 
         prodigyStripMachineHardwareCapturesFromClusterTopology(topology);
         topology.version += 1;
-        if (persistAuthoritativeClusterTopology(topology) == false)
-        {
-          return;
-        }
-
-        String serializedTopology = {};
-        BitseryEngine::serialize(serializedTopology, topology);
-        queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+        const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+        const uint64_t epoch = masterAuthorityEpoch;
+        persistAuthoritativeClusterTopologyAsync(topology, [this, lifetime, epoch, topology](bool durable) {
+          if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch) return;
+          String serializedTopology;
+          BitseryEngine::serialize(serializedTopology, topology);
+          queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+        });
       }
     }
   }
@@ -16220,14 +16881,20 @@ public:
     return decodeMachineRetirementJournal(masterAuthorityRuntimeState, validated);
   }
 
-  bool commitMachineRetirementJournal(void)
+  void commitMachineRetirementJournalAsync(PersistenceCompletion completion)
   {
+    if (machineRetirementPersistencePending)
+    {
+      if (completion) completion(false);
+      return;
+    }
     auto previousCarrier = masterAuthorityRuntimeState.taskExecutions.find(machineRetirementJournalExecutionID);
     const bool hadPreviousCarrier = previousCarrier != masterAuthorityRuntimeState.taskExecutions.end();
     if (isActiveMaster() == false ||
         (hadPreviousCarrier == false && machineRetirementPeersSupportJournal() == false))
     {
-      return false;
+      if (completion) completion(false);
+      return;
     }
     TaskExecutionRecord previousRecord = hadPreviousCarrier ? previousCarrier->second : TaskExecutionRecord {};
     const uint64_t previousGeneration = masterAuthorityRuntimeState.generation;
@@ -16236,29 +16903,46 @@ public:
 
     const bool wroteCarrier = writeMachineRetirementJournalCarrier();
     const bool carrierPresent = machineRetirementJournalPresent(masterAuthorityRuntimeState);
-    if (wroteCarrier &&
-        (carrierPresent == false || configureMachineRetirementProviderFence(masterAuthorityRuntimeState)) &&
-        commitMasterAuthorityStateChange())
+    if (wroteCarrier == false || carrierPresent == false)
     {
-      (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
-      return true;
+      if (hadPreviousCarrier)
+      {
+        masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
+            machineRetirementJournalExecutionID, std::move(previousRecord));
+      }
+      else masterAuthorityRuntimeState.taskExecutions.erase(machineRetirementJournalExecutionID);
+      if (completion) completion(false);
+      return;
     }
-
-    if (hadPreviousCarrier)
-    {
-      masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
-          machineRetirementJournalExecutionID,
-          std::move(previousRecord));
-    }
-    else
-    {
-      masterAuthorityRuntimeState.taskExecutions.erase(machineRetirementJournalExecutionID);
-    }
-    masterAuthorityRuntimeState.generation = previousGeneration;
-    masterAuthorityRuntimeStateDurable = previousDurable;
-    durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-    (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
-    return false;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    machineRetirementPersistencePending = true;
+    commitMasterAuthorityStateChangeAsync(
+        [this, completion = std::move(completion), hadPreviousCarrier,
+         previousRecord = std::move(previousRecord), previousGeneration, previousDurable,
+         previousDurableGeneration, authorityEpoch, operationGeneration](bool durable) mutable {
+          machineRetirementPersistencePending = false;
+          const bool current = durable && isActiveMaster() && masterAuthorityEpoch == authorityEpoch &&
+                               masterAuthorityRuntimeState.generation == operationGeneration;
+          if (current)
+          {
+            (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
+            if (completion) completion(true);
+            return;
+          }
+          if (masterAuthorityEpoch == authorityEpoch &&
+              masterAuthorityRuntimeState.generation == operationGeneration)
+          {
+            if (hadPreviousCarrier)
+              masterAuthorityRuntimeState.taskExecutions.insert_or_assign(
+                  machineRetirementJournalExecutionID, std::move(previousRecord));
+            else masterAuthorityRuntimeState.taskExecutions.erase(machineRetirementJournalExecutionID);
+            masterAuthorityRuntimeState.generation = previousGeneration;
+            masterAuthorityRuntimeStateDurable = previousDurable;
+            durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+          }
+          if (completion) completion(false);
+        });
   }
 
   bool restoreRetiredMachineIdentitiesFromRuntimeState(void)
@@ -16399,8 +17083,13 @@ public:
   bool journalMachineRetirement(
       const Vector<Machine *>& aliases,
       bool destroyRequired,
-      uint64_t& identityID)
+      uint64_t& identityID,
+      PersistenceCompletion completion = {})
   {
+    if (machineRetirementPersistencePending)
+    {
+      return false;
+    }
     identityID = 0;
     if (isActiveMaster() == false || aliases.empty())
     {
@@ -16515,15 +17204,28 @@ public:
     merged.destroySucceeded = hadRequiredDestroy && requiredDestroysSucceeded;
     merged.providerAbsent = merged.machine.cloud.cloudID.empty();
     retiredMachineIdentities.insert_or_assign(identityID, std::move(merged));
-    if (commitMachineRetirementJournal())
-    {
-      return true;
-    }
-
-    retiredMachineIdentities = std::move(previousRetirements);
-    nextRetiredMachineIdentityID = previousNextIdentityID;
-    identityID = 0;
-    return false;
+    const uint64_t committedIdentityID = identityID;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t candidateGeneration = masterAuthorityRuntimeState.generation + 1;
+    std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    commitMachineRetirementJournalAsync(
+        [this, lifetime, completion = std::move(completion), previousRetirements = std::move(previousRetirements),
+         previousNextIdentityID, committedIdentityID, authorityEpoch, candidateGeneration](bool durable) mutable {
+          if (lifetime.expired()) return;
+          // The journal commit restores its carrier and generation before it
+          // reports a failed receipt, so failure rollback must fence on the
+          // surviving retirement candidate rather than the former generation.
+          const bool current = masterAuthorityEpoch == authorityEpoch &&
+                               retiredMachineIdentities.contains(committedIdentityID) &&
+                               (durable == false || masterAuthorityRuntimeState.generation == candidateGeneration);
+          if (!durable && current)
+          {
+            retiredMachineIdentities = std::move(previousRetirements);
+            nextRetiredMachineIdentityID = previousNextIdentityID;
+          }
+          if (completion) completion(durable && current);
+        });
+    return true;
   }
 
   bool machineIdentityIsRetiring(const Machine& candidate) const
@@ -16607,15 +17309,99 @@ public:
         topology.machines.end());
     const bool changed = before != topology.machines.size() || topology.version < requiredVersion;
     topology.version = std::max(topology.version, requiredVersion);
-    if (changed && persistAuthoritativeClusterTopology(topology) == false)
+    if (changed)
     {
-      return false;
+      if (machineRetirementPersistencePending)
+      {
+        return false;
+      }
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      machineRetirementPersistencePending = true;
+      persistAuthoritativeClusterTopologyAsync(topology,
+          [this, lifetime, topology, authorityEpoch](bool durable) {
+            if (lifetime.expired()) return;
+            machineRetirementPersistencePending = false;
+            if (durable && masterAuthorityEpoch == authorityEpoch)
+            {
+              (void)applyPostRetirementBrainMembership(topology);
+            }
+            armMachineRetirementRecheck();
+          });
+      return true;
     }
     return applyPostRetirementBrainMembership(topology);
   }
 
+  void finishRetiredMachineAuthoritativeTopology(
+      const ClusterTopology& topology,
+      uint64_t authorityEpoch)
+  {
+    if (masterAuthorityEpoch != authorityEpoch ||
+        applyPostRetirementBrainMembership(topology) == false || isActiveMaster() == false)
+    {
+      return;
+    }
+
+    Vector<uint64_t> phased;
+    for (auto& [identityID, retirement] : retiredMachineIdentities)
+    {
+      if (retirement.authoritySettled)
+      {
+        continue;
+      }
+      retirement.topologyAbsent = true;
+      retirement.topologyObservationEpoch = authorityEpoch;
+      if (retirement.topologyVersion == 0)
+      {
+        retirement.topologyVersion = topology.version;
+        phased.push_back(identityID);
+      }
+    }
+    if (phased.empty())
+    {
+      return;
+    }
+
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    commitMachineRetirementJournalAsync(
+        [this, lifetime, authorityEpoch, topology, phased = std::move(phased)](bool durable) mutable {
+          if (lifetime.expired()) return;
+          const bool current = masterAuthorityEpoch == authorityEpoch && isActiveMaster();
+          if (!durable || !current)
+          {
+            if (current)
+            {
+              for (uint64_t identityID : phased)
+              {
+                auto retirement = retiredMachineIdentities.find(identityID);
+                if (retirement != retiredMachineIdentities.end() &&
+                    retirement->second.topologyVersion == topology.version)
+                {
+                  retirement->second.topologyVersion = 0;
+                }
+              }
+            }
+            armMachineRetirementRecheck();
+            return;
+          }
+          if (nBrains > 1)
+          {
+            String serializedTopology = {};
+            BitseryEngine::serialize(serializedTopology, topology);
+            queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+          }
+          reapRetiringMachines();
+          armMachineRetirementRecheck();
+        });
+  }
+
   void reconcileRetiredMachineAuthoritativeTopology(void)
   {
+    if (machineRetirementPersistencePending)
+    {
+      return;
+    }
     if (std::none_of(retiredMachineIdentities.begin(),
                      retiredMachineIdentities.end(),
                      [](const auto& retirement) -> bool {
@@ -16691,56 +17477,42 @@ public:
         return;
       }
       topology.version += 1;
-      if (persistAuthoritativeClusterTopology(topology) == false)
-      {
-        return;
-      }
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      machineRetirementPersistencePending = true;
+      persistAuthoritativeClusterTopologyAsync(topology,
+          [this, lifetime, topology, authorityEpoch](bool durable) {
+            if (lifetime.expired()) return;
+            machineRetirementPersistencePending = false;
+            if (!durable || masterAuthorityEpoch != authorityEpoch)
+            {
+              armMachineRetirementRecheck();
+              return;
+            }
+            finishRetiredMachineAuthoritativeTopology(topology, authorityEpoch);
+          });
+      return;
     }
     else if (topology.version == 0)
     {
       topology.version = 1;
-      if (persistAuthoritativeClusterTopology(topology) == false)
-      {
-        return;
-      }
-    }
-    if (applyPostRetirementBrainMembership(topology) == false || isActiveMaster() == false)
-    {
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      machineRetirementPersistencePending = true;
+      persistAuthoritativeClusterTopologyAsync(topology,
+          [this, lifetime, topology, authorityEpoch](bool durable) {
+            if (lifetime.expired()) return;
+            machineRetirementPersistencePending = false;
+            if (!durable || masterAuthorityEpoch != authorityEpoch)
+            {
+              armMachineRetirementRecheck();
+              return;
+            }
+            finishRetiredMachineAuthoritativeTopology(topology, authorityEpoch);
+          });
       return;
     }
-
-    Vector<uint64_t> phased;
-    for (auto& [identityID, retirement] : retiredMachineIdentities)
-    {
-      if (retirement.authoritySettled)
-      {
-        continue;
-      }
-      retirement.topologyAbsent = true;
-      retirement.topologyObservationEpoch = masterAuthorityEpoch;
-      if (retirement.topologyVersion == 0)
-      {
-        retirement.topologyVersion = topology.version;
-        phased.push_back(identityID);
-      }
-    }
-    if (phased.empty())
-    {
-      return;
-    }
-    if (nBrains > 1)
-    {
-      String serializedTopology = {};
-      BitseryEngine::serialize(serializedTopology, topology);
-      queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
-    }
-    if (commitMachineRetirementJournal() == false)
-    {
-      for (uint64_t identityID : phased)
-      {
-        retiredMachineIdentities[identityID].topologyVersion = 0;
-      }
-    }
+    finishRetiredMachineAuthoritativeTopology(topology, masterAuthorityEpoch);
   }
 
   bool machineRetirementIdentityHasMachineObject(uint64_t identityID) const
@@ -16792,7 +17564,8 @@ public:
 
   void settleRetiredMachineIdentities(void)
   {
-    if (isActiveMaster() == false || machineRetirementJournalHasAllSurvivorDurability() == false)
+    if (machineRetirementPersistencePending || isActiveMaster() == false ||
+        machineRetirementJournalHasAllSurvivorDurability() == false)
     {
       return;
     }
@@ -16821,9 +17594,19 @@ public:
         ++retirement;
       }
     }
-    if (changed && commitMachineRetirementJournal() == false)
+    if (changed)
     {
-      retiredMachineIdentities = std::move(previousRetirements);
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      commitMachineRetirementJournalAsync(
+          [this, lifetime, authorityEpoch, previousRetirements = std::move(previousRetirements)](bool durable) mutable {
+            if (lifetime.expired()) return;
+            if (!durable && masterAuthorityEpoch == authorityEpoch)
+            {
+              retiredMachineIdentities = std::move(previousRetirements);
+            }
+            armMachineRetirementRecheck();
+          });
     }
   }
 
@@ -17412,7 +18195,7 @@ public:
     }
   }
 
-  bool normalizeAdoptedClusterMachine(const ClusterMachine& requested, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, ClusterMachine& normalized, String& failure) const
+  virtual bool normalizeAdoptedClusterMachine(const ClusterMachine& requested, const String& defaultSSHUser, const String& defaultSSHPrivateKeyPath, ClusterMachine& normalized, String& failure) const
   {
     normalized = requested;
     normalized.source = ClusterMachineSource::adopted;
@@ -18559,7 +19342,7 @@ public:
       selfElectAsMaster("getBrains:single-brain-bootstrap"); // we are it
     }
 
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
   }
 
   void resetMasterBrainAssignment(void)
@@ -18720,6 +19503,68 @@ public:
     return true;
   }
 
+  struct PeerSystemArtifactStore {
+    BrainView *peer = nullptr;
+    uint64_t transportGeneration = 0;
+    uint128_t peerUUID = 0;
+    uint128_t selectedMasterUUID = 0;
+    String sha256;
+    uint64_t bytes = 0;
+    String blob;
+    String failure;
+    bool success = false;
+  };
+
+  bool peerSystemArtifactStillCurrent(const PeerSystemArtifactStore& operation)
+  {
+    return operation.peer != nullptr && brains.contains(operation.peer) &&
+           operation.peer->ioGeneration == operation.transportGeneration &&
+           operation.peer->uuid == operation.peerUUID && operation.peer->canQueueSend() &&
+           getExistingMasterUUID() == operation.selectedMasterUUID;
+  }
+
+  bool queueSystemContainerArtifactApplyForPeer(BrainView *peer, const String& sha256, uint64_t bytes, const String& blob)
+  {
+    if (peer == nullptr || ensureArtifactIO() == false) return false;
+    auto operation = std::make_shared<PeerSystemArtifactStore>();
+    operation->peer = peer;
+    operation->transportGeneration = peer->ioGeneration;
+    operation->peerUUID = peer->uuid;
+    operation->selectedMasterUUID = getExistingMasterUUID();
+    operation->sha256.assign(sha256);
+    operation->bytes = bytes;
+    operation->blob.append(blob.data(), blob.size());
+    return artifactIO->submit(operation->blob.size(),
+        [operation] {
+          String verificationFailure = {};
+          operation->success = ContainerStore::systemVerify(operation->sha256, operation->bytes, nullptr, nullptr, &verificationFailure);
+          if (operation->success == false)
+          {
+            operation->success = ContainerStore::systemStore(operation->sha256, operation->bytes, operation->blob, &operation->failure);
+          }
+          operation->blob.reset();
+        },
+        [this, operation] {
+          if (peerSystemArtifactStillCurrent(*operation) == false) return;
+          if (operation->success == false)
+          {
+            std::fprintf(stderr, "replicateSystemContainerArtifact store failed sha256=%s bytes=%llu reason=%s\n",
+                       operation->sha256.c_str(), (unsigned long long)operation->bytes,
+                       operation->failure.size() > 0 ? operation->failure.c_str() : "unknown");
+            queueBrainCloseIfActive(operation->peer, "system-artifact-store-failed", -EIO);
+            return;
+          }
+          reconcileMothershipTunnelProviderRuntimeState();
+        },
+        [this, operation](std::exception_ptr) {
+          if (peerSystemArtifactStillCurrent(*operation))
+          {
+            std::fprintf(stderr, "replicateSystemContainerArtifact worker failed\n");
+            queueBrainCloseIfActive(operation->peer, "system-artifact-store-failed", -EIO);
+          }
+        });
+  }
+
   void capturePresentSystemArtifactRef(SystemContainerArtifactRef& ref)
   {
     ref = {};
@@ -18755,12 +19600,24 @@ public:
       return;
     }
 
-    String blob = {};
-    String failure = {};
-    if (loadSystemContainerArtifact(spec.artifactSha256, spec.artifactBytes, blob, &failure))
-    {
-      (void)queueBrainSystemContainerArtifactReplicationToPeer(peer, spec.artifactSha256, spec.artifactBytes, blob);
-    }
+    if (ensureArtifactIO() == false) return;
+    auto operation = std::make_shared<PeerSystemArtifactStore>();
+    operation->peer = peer;
+    operation->transportGeneration = peer->ioGeneration;
+    operation->peerUUID = peer->uuid;
+    operation->selectedMasterUUID = getExistingMasterUUID();
+    operation->sha256.assign(spec.artifactSha256);
+    operation->bytes = spec.artifactBytes;
+    (void)artifactIO->submit(spec.artifactBytes,
+        [operation] { operation->success = ContainerStore::systemLoadVerified(operation->sha256, operation->bytes, operation->blob, &operation->failure); },
+        [this, operation] {
+          if (peerSystemArtifactStillCurrent(*operation) == false || operation->success == false) return;
+          const MothershipConnectivity& current = masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState.connectivity;
+          if (current.kind != MothershipConnectivityKind::tunnelProvider ||
+              current.tunnelProvider.artifactBytes != operation->bytes || current.tunnelProvider.artifactSha256.equal(operation->sha256) == false) return;
+          (void)queueBrainSystemContainerArtifactReplicationToPeer(operation->peer, operation->sha256, operation->bytes, operation->blob);
+        },
+        [](std::exception_ptr) { std::fprintf(stderr, "system artifact load worker failed\n"); });
   }
 
   void reconcileMothershipTunnelProviderRuntimeState(void)
@@ -19248,9 +20105,16 @@ protected:
     }
   }
 
-  virtual bool reconcileManagedMachineSchemasOnSelfElection(String *failure)
+  virtual void reconcileManagedMachineSchemasOnSelfElectionAsync(PersistenceCompletion completion)
   {
-    return reconcileManagedMachineSchemas(failure);
+    const uint64_t epoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    reconcileManagedMachineSchemasAsync([this, lifetime, epoch, completion = std::move(completion)]
+        (bool durable, String failure, ClusterTopology) {
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+      if (!durable) basics_log("selfElectAsMaster managed machine schema reconcile failed reason=%s\n", failure.c_str());
+      if (completion) completion(durable);
+    });
   }
 
 public:
@@ -19650,13 +20514,9 @@ public:
     {
       refreshMachineFragmentAssignmentsIfPossible();
     }
-    String managedSchemaReconcileFailure = {};
-    if (reconcileManagedMachineSchemasOnSelfElection(&managedSchemaReconcileFailure) == false)
-    {
-      basics_log("selfElectAsMaster managed machine schema reconcile failed reason=%s\n",
-                 managedSchemaReconcileFailure.c_str());
-    }
-    recoverDeploymentsAfterNeuronState();
+    reconcileManagedMachineSchemasOnSelfElectionAsync([this](bool durable) {
+      if (durable) recoverDeploymentsAfterNeuronState();
+    });
 
     return true;
   }
@@ -19735,9 +20595,16 @@ public:
     basics_log("electBrainToMaster uuid=%s\n", masterUUIDText.c_str());
 
     refreshMasterAuthorityRuntimeStateFromLiveFields();
-    persistLocalRuntimeState();
-    publishLocalMasterIdentity();
-    refreshMasterPeerLivenessWaiter(brain, "elect-master");
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t incarnation = brain->ioGeneration;
+    persistLocalRuntimeStateAsync([this, lifetime, epoch, brain, incarnation](bool durable) {
+      if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch ||
+          std::find(brains.begin(), brains.end(), brain) == brains.end() ||
+          brain->ioGeneration != incarnation || !brain->isMasterBrain) return;
+      publishLocalMasterIdentity();
+      refreshMasterPeerLivenessWaiter(brain, "elect-master");
+    });
   }
 
   void deriveMasterBrain(bool allowExistingMasterClaims = true)
@@ -19902,7 +20769,7 @@ public:
       }
     }
 
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
   }
 
   void deriveMasterBrainIf(void)
@@ -20107,7 +20974,9 @@ public:
   {
     ticket->deployment = deployment;
     ticket->lifetime = lifetime;
-    const ApplicationConfig& config = deployment->plan.config;
+    const ApplicationConfig config = deployment->plan.config;
+    const uint64_t requestEpoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetimeToken = persistenceLifetime;
 
   retry: // there will be new MachineState::deploying machines now
 
@@ -20227,9 +21096,18 @@ public:
         uint32_t nByMemory = divideAndRoundUp(uint64_t(nMore) * config.totalMemoryMB(), machineConfig->nMemoryMB);
         uint32_t nByStorage = divideAndRoundUp(uint64_t(nMore) * config.totalStorageMB(), machineConfig->nStorageMB);
         nMoreMachines = std::max(nByCores, std::max(nByMemory, nByStorage));
-        if (journalAutonomousProvisioningOperation(config.deploymentID(), lifetime,
-                                                   slug, nMoreMachines,
-                                                   provisioningOperationID) == false)
+        provisioningOperationID = co_await ProdigyHostCompletion<uint64_t>(
+            [this, &config, lifetime, &slug, nMoreMachines](auto completion) {
+              journalAutonomousProvisioningOperationAsync(config.deploymentID(), lifetime, slug, nMoreMachines,
+                  [completion = std::move(completion)](bool durable, uint64_t operationID) mutable {
+                    completion(durable ? operationID : 0);
+                  });
+            });
+        if (lifetimeToken.expired()) co_return;
+        auto currentDeployment = deployments.find(config.deploymentID());
+        if (masterAuthorityEpoch != requestEpoch || currentDeployment == deployments.end() ||
+            currentDeployment->second != deployment) co_return;
+        if (provisioningOperationID == 0)
         {
           basics_log("requestMachines failure reason=provisioning-operation-persist-failed applicationID=%u deploymentID=%llu lifetime=%u requested=%u\n",
                      unsigned(config.applicationID),
@@ -20237,6 +21115,9 @@ public:
                      unsigned(lifetime), unsigned(nMoreMachines));
           co_return;
         }
+        auto currentConfig = brainConfig.configBySlug.find(slug);
+        if (currentConfig == brainConfig.configBySlug.end()) co_return;
+        machineConfig = &currentConfig->second;
       }
 
       CoroutineStack *coro = new CoroutineStack();
@@ -20261,7 +21142,14 @@ public:
       {
         co_return;
       }
-      if (settleAutonomousProvisioningOperation(provisioningOperationID) == false)
+      const bool settled = co_await ProdigyHostCompletion<bool>([this, provisioningOperationID](auto completion) {
+        settleAutonomousProvisioningOperationAsync(provisioningOperationID, std::move(completion));
+      });
+      if (lifetimeToken.expired()) co_return;
+      auto currentDeployment = deployments.find(config.deploymentID());
+      if (masterAuthorityEpoch != requestEpoch || currentDeployment == deployments.end() ||
+          currentDeployment->second != deployment) co_return;
+      if (!settled)
       {
         basics_log("requestMachines failure reason=provisioning-operation-settlement-persist-failed applicationID=%u deploymentID=%llu lifetime=%u operationID=%llu\n",
                    unsigned(config.applicationID),
@@ -20793,7 +21681,8 @@ public:
   void authorizeCompletedMachineRetirements(
       const Vector<ApplicationDeployment *>& graph)
   {
-    if (isActiveMaster() == false || machineRetirementJournalHasDurableQuorum() == false)
+    if (machineRetirementPersistencePending || isActiveMaster() == false ||
+        machineRetirementJournalHasDurableQuorum() == false)
     {
       return;
     }
@@ -20808,16 +21697,27 @@ public:
         authorized.push_back(identityID);
       }
     }
-    if (authorized.empty() == false && commitMachineRetirementJournal() == false)
+    if (authorized.empty() == false)
     {
-      for (uint64_t identityID : authorized)
-      {
-        if (auto retirement = retiredMachineIdentities.find(identityID);
-            retirement != retiredMachineIdentities.end())
-        {
-          retirement->second.evacuationComplete = false;
-        }
-      }
+      const uint64_t authorityEpoch = masterAuthorityEpoch;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      commitMachineRetirementJournalAsync(
+          [this, lifetime, authorityEpoch, authorized = std::move(authorized)](bool durable) mutable {
+            if (lifetime.expired()) return;
+            if (!durable && masterAuthorityEpoch == authorityEpoch)
+            {
+              for (uint64_t identityID : authorized)
+              {
+                if (auto retirement = retiredMachineIdentities.find(identityID);
+                    retirement != retiredMachineIdentities.end())
+                {
+                  retirement->second.evacuationComplete = false;
+                }
+              }
+            }
+            reapRetiringMachines();
+            armMachineRetirementRecheck();
+          });
     }
   }
 
@@ -20879,7 +21779,17 @@ public:
 
   void reapRetiringMachines(void)
   {
+    if (machineRetirementPersistencePending)
+    {
+      armMachineRetirementRecheck();
+      return;
+    }
     reconcileRetiredMachineAuthoritativeTopology();
+    if (machineRetirementPersistencePending)
+    {
+      armMachineRetirementRecheck();
+      return;
+    }
     const bool authoritative = isActiveMaster() &&
                                machineRetirementJournalHasDurableQuorum();
     if (isActiveMaster() == false || authoritative)
@@ -21278,8 +22188,13 @@ public:
     {
       destroyRequired = destroyRequired || alias->cloudID.empty() == false;
     }
-    uint64_t identityID = 0;
-    if (journalMachineRetirement(aliases, destroyRequired, identityID) == false)
+    std::shared_ptr<uint64_t> identityID = std::make_shared<uint64_t>(0);
+    if (journalMachineRetirement(aliases, destroyRequired, *identityID,
+                                 [this, identityID](bool durable) {
+                                   if (!durable || retiredMachineIdentities.contains(*identityID) == false) return;
+                                   reapRetiringMachines();
+                                   armMachineRetirementRecheck();
+                                 }) == false)
     {
       basics_log("decommissionMachine rejected uuid=%llu cloudID=%s reason=retirement-journal\n",
                  (unsigned long long)machine->uuid,
@@ -21295,8 +22210,6 @@ public:
                  machine->cloudID.c_str(),
                  (unsigned long long)aliases.size());
     PRODIGY_DEBUG_FLUSH();
-    reapRetiringMachines();
-    armMachineRetirementRecheck();
   }
 
   void checkForSpotTerminations(void)
@@ -21727,29 +22640,29 @@ public:
       return;
     }
 
-    Message::construct(
-        machine->neuron.wBuffer,
-        NeuronTopic::updateOS,
-        policy->osID,
-        policy->targetVersionID,
-        policy->command);
+    const MachineState previousState = machine->state;
+    const uint128_t uuid = machine->uuid;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t streamGeneration = machine->neuron.ioGeneration;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    String osID, version, command;
+    osID.assign(policy->osID); version.assign(policy->targetVersionID); command.assign(policy->command);
     machine->state = MachineState::updatingOS;
     machine->osUpdateCommandIssued = true;
-    persistLocalRuntimeState();
-    armOSUpdateCommandWatchdog(machine);
-    PRODIGY_DEBUG_LOG(
-                 "os update command queued uuid=%llu private4=%u osID=%s targetVersionID=%s\n",
-                 (unsigned long long)machine->uuid,
-                 unsigned(machine->private4),
-                 policy->osID.c_str(),
-                 policy->targetVersionID.c_str());
-    PRODIGY_DEBUG_FLUSH();
-    basics_log("os update command queued uuid=%llu private4=%u osID=%s targetVersionID=%s\n",
-               (unsigned long long)machine->uuid,
-               unsigned(machine->private4),
-               policy->osID.c_str(),
-               policy->targetVersionID.c_str());
-    Ring::queueSend(&machine->neuron);
+    persistLocalRuntimeStateAsync([this, lifetime, epoch, uuid, streamGeneration, previousState,
+        osID = std::move(osID), version = std::move(version), command = std::move(command)](bool durable) {
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+      Machine *current = nullptr;
+      for (Machine *candidate : machines)
+        if (candidate && candidate->uuid == uuid) { current = candidate; break; }
+      if (!current || !current->osUpdateCommandIssued || current->state != MachineState::updatingOS ||
+          current->neuron.ioGeneration != streamGeneration) return;
+      if (!durable) { current->osUpdateCommandIssued = false; current->state = previousState; return; }
+      if (!neuronControlStreamActive(current)) return;
+      Message::construct(current->neuron.wBuffer, NeuronTopic::updateOS, osID, version, command);
+      armOSUpdateCommandWatchdog(current);
+      Ring::queueSend(&current->neuron);
+    });
   }
 
   bool beginMachineOSUpdate(Machine *machine)
@@ -23681,8 +24594,30 @@ public:
         brain->notePeerMessageReceived();
 
         bool parseFailed = false;
-        brain->extractMessages<Message>([&](Message *message) -> void {
-          brainHandler(brain, message);
+        brain->extractMessages<Message>([&](Message *message, bool& stop) -> void {
+          String failure;
+          auto result = brain->artifacts.consume(message, [&](String&& frame) {
+            Message *artifact = reinterpret_cast<Message *>(frame.data());
+            const BrainTopic topic = BrainTopic(artifact->topic);
+            if (topic != BrainTopic::replicateDeployment &&
+                topic != BrainTopic::replicateSystemContainerArtifact &&
+                topic != BrainTopic::updateBundle)
+            {
+              failure.assign("peer bulk transfer wrapped a non-artifact topic"_ctv);
+              return;
+            }
+            brainHandler(brain, artifact);
+          }, &failure);
+          if (result == ProdigyBulkTransfer::ConsumeResult::invalid || failure.size() > 0)
+          {
+            std::fprintf(stderr, "brain artifact receive rejected: %s\n", failure.c_str());
+            stop = true;
+            queueBrainCloseIfActive(brain, "invalid-artifact-fragment", -EPROTO);
+          }
+          else if (result == ProdigyBulkTransfer::ConsumeResult::notFragment)
+          {
+            brainHandler(brain, message);
+          }
         },
                                         true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
         if (parseFailed)
@@ -24113,6 +25048,10 @@ public:
 
       stream->consumeSentBytes(uint32_t(result), false);
       stream->noteSendCompleted();
+      if constexpr (requires (T *s) { s->prepareNextArtifactChunk(); })
+      {
+        stream->prepareNextArtifactChunk();
+      }
 
       bool queueAnotherSend = (stream->wBuffer.outstandingBytes() > 0);
       if constexpr (requires (T *s) { s->transportTLSEnabled(); })
@@ -24180,6 +25119,14 @@ public:
                    static_cast<void *>(brain), brain->private4, result, int(brain->isFixedFile), brain->fslot, brain->fd, uint32_t(updateSelfState));
       }
       sendHandler(brain, result);
+      if (result > 0 && brain->transitionAfterBundleAckSend &&
+          !brain->pendingSend && brain->wBuffer.outstandingBytes() == 0 &&
+          !brain->hasBufferedTransportCiphertext() && !weAreMaster)
+      {
+        brain->transitionAfterBundleAckSend = false;
+        transitionToNewBundle();
+        return;
+      }
       if (result > 0)
       {
         queueUpdateSelfBundleToPeer(brain);
@@ -24865,9 +25812,37 @@ public:
     bundleExecRetryTickQueued = true;
   }
 
+  bool bundlePersistencePreparing = false;
+  bool bundlePersistenceReady = false;
+
   virtual void transitionToNewBundle(void)
   {
-    if (quiesceProcessForBundleExec() == false)
+    if (!bundlePersistenceReady)
+    {
+      if (bundlePersistencePreparing) return;
+      bundlePersistencePreparing = true;
+      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      prepareForBundleExecAsync([this, lifetime](bool ready, String failure) {
+        if (lifetime.expired()) return;
+        bundlePersistencePreparing = false;
+        if (!ready)
+        {
+          basics_log("transitionToNewBundle prepare failed: %s\n", failure.c_str());
+          return;
+        }
+        bundlePersistenceReady = true;
+        queueBundleExecRetry();
+      });
+      return;
+    }
+    if (!quiescePersistenceForBundleExec())
+    {
+      queueBundleExecRetry();
+      return;
+    }
+    const bool artifactIOQuiesced = quiesceArtifactIOForBundleExec();
+    const bool processQuiesced = quiesceProcessForBundleExec();
+    if (artifactIOQuiesced == false || processQuiesced == false)
     {
       queueBundleExecRetry();
       return;
@@ -24887,12 +25862,6 @@ public:
     String libraryDirectoryText = {};
     libraryDirectoryText.assign(installPaths.libraryDirectory);
     (void)setenv("LD_LIBRARY_PATH", libraryDirectoryText.c_str(), 1);
-    String prepareFailure = {};
-    if (prepareForBundleExec(prepareFailure) == false)
-    {
-      basics_log("transitionToNewBundle prepare failed: %s\n", prepareFailure.c_str());
-      _exit(EXIT_FAILURE);
-    }
     Ring::shutdownForExec();
 
     long maxFD = sysconf(_SC_OPEN_MAX);
@@ -25337,8 +26306,134 @@ public:
     }
   }
 
+  struct PendingPeerBundleArtifact {
+    BrainView *peer = nullptr;
+    uint64_t generation = 0;
+    uint128_t peerUUID = 0;
+    uint128_t masterUUID = 0;
+    String blob, failure;
+    ProdigyPreparedBundleArtifact prepared;
+    bool success = false;
+    bool transitionRequested = false;
+  };
+  std::shared_ptr<PendingPeerBundleArtifact> pendingPeerBundleArtifact;
+
+  bool peerBundleArtifactIsCurrent(const std::shared_ptr<PendingPeerBundleArtifact>& operation)
+  {
+    return pendingPeerBundleArtifact == operation && brains.contains(operation->peer) &&
+           operation->peer->ioGeneration == operation->generation &&
+           operation->peer->uuid == operation->peerUUID && peerSocketActive(operation->peer) &&
+           getExistingMasterUUID() == operation->masterUUID;
+  }
+
+  bool queuePeerBundleArtifact(BrainView *peer, const String& bundle)
+  {
+    if (!ensureArtifactIO() || bundle.empty()) return false;
+    if (pendingPeerBundleArtifact && peerBundleArtifactIsCurrent(pendingPeerBundleArtifact)) return false;
+    auto operation = std::make_shared<PendingPeerBundleArtifact>();
+    operation->peer = peer;
+    operation->generation = peer->ioGeneration;
+    operation->peerUUID = peer->uuid;
+    operation->masterUUID = getExistingMasterUUID();
+    operation->blob = bundle.substr(0, bundle.size(), Copy::yes);
+    pendingPeerBundleArtifact = operation;
+    auto discard = [this, operation] {
+      if (pendingPeerBundleArtifact == operation) pendingPeerBundleArtifact.reset();
+      (void)artifactIO->continueWith(
+          [operation] { prodigyDiscardPreparedBundleArtifact(operation->prepared); },
+          [] {}, [](std::exception_ptr) { std::fprintf(stderr, "peer bundle cleanup worker failed\n"); });
+    };
+    auto failed = [this, operation, discard](std::exception_ptr) {
+      std::fprintf(stderr, "peer bundle staging failed: %s\n", operation->failure.c_str());
+      if (peerBundleArtifactIsCurrent(operation))
+        queueBrainCloseIfActive(operation->peer, "peer-bundle-stage-failed", -EIO);
+      discard();
+    };
+    bool queued = artifactIO->submit(operation->blob.size(),
+        [operation] {
+          String digest;
+          operation->success = prodigyComputeSHA256Hex(operation->blob, digest, &operation->failure) &&
+              prodigyPrepareBundleArtifact(operation->prepared, prodigyStagedBundlePath(),
+                                           operation->blob, digest, &operation->failure);
+          operation->blob.reset();
+        },
+        [this, operation, failed, discard] {
+          if (!peerBundleArtifactIsCurrent(operation)) { discard(); return; }
+          if (!operation->success || !prodigyPublishPreparedBundleArtifact(operation->prepared, &operation->failure))
+          { failed({}); return; }
+          if (!artifactIO->continueWith(
+              [operation] { operation->success = prodigyFsyncPublishedBundleArtifact(operation->prepared, &operation->failure); },
+              [this, operation, failed, discard] {
+                if (!peerBundleArtifactIsCurrent(operation)) { discard(); return; }
+                if (!operation->success) { failed({}); return; }
+                Message::construct(operation->peer->wBuffer, BrainTopic::updateBundle);
+                Ring::queueSend(operation->peer);
+                pendingPeerBundleArtifact.reset();
+                operation->peer->transitionAfterBundleAckSend = operation->transitionRequested && !weAreMaster;
+              }, failed)) failed({});
+        }, failed);
+    if (!queued && pendingPeerBundleArtifact == operation) pendingPeerBundleArtifact.reset();
+    return queued;
+  }
+
+  void queueInstalledBundleToPeer(BrainView *peer)
+  {
+    if (!peer || !peerSocketActive(peer) || peer->installedBundleReadPending ||
+        peer->transitionAfterBundleEcho || !ensureArtifactIO()) return;
+    struct Result { String frame; bool success = false; };
+    auto result = std::make_shared<Result>();
+    const uint64_t generation = peer->ioGeneration;
+    const uint64_t authority = masterAuthorityEpoch;
+    auto current = [this, peer, generation, authority] {
+      return brains.contains(peer) && peer->ioGeneration == generation &&
+             masterAuthorityEpoch == authority && isActiveMaster() && peerSocketActive(peer);
+    };
+    peer->installedBundleReadPending = true;
+    // The frame limit bounds the retained installed bundle even before its
+    // file length is known. Reading happens only in the bounded disk worker.
+    if (!artifactIO->submit(ProdigyWire::maxControlFrameBytes * 2ULL,
+        [result] {
+          String path, bundle;
+          prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, path);
+          struct stat metadata = {};
+          if (::stat(path.c_str(), &metadata) || metadata.st_size <= 0 ||
+              uint64_t(metadata.st_size) >= ProdigyWire::maxControlFrameBytes - 64) return;
+          Filesystem::openReadAtClose(-1, path, bundle);
+          if (bundle.size() != uint64_t(metadata.st_size)) return;
+          Message::construct(result->frame, BrainTopic::updateBundle, bundle);
+          result->success = true;
+        },
+        [this, peer, current, result] {
+          if (!current()) return;
+          peer->installedBundleReadPending = false;
+          String failure;
+          if (!result->success || !peer->queueArtifactMessage(std::move(result->frame), &failure))
+          {
+            std::fprintf(stderr, "installed bundle read/queue failed: %s\n", failure.c_str());
+            queueBrainCloseIfActive(peer, "installed-bundle-read-failed", -EIO);
+            return;
+          }
+          // A control frame can now pass a bulk transfer. Never enqueue the
+          // transition until the peer acknowledges its verified durable stage.
+          peer->transitionAfterBundleEcho = true;
+          Ring::queueSend(peer);
+        },
+        [this, peer, current](std::exception_ptr) {
+          if (current())
+          {
+            peer->installedBundleReadPending = false;
+            queueBrainCloseIfActive(peer, "installed-bundle-worker-failed", -EIO);
+          }
+        }))
+    {
+      peer->installedBundleReadPending = false;
+      queueBrainCloseIfActive(peer, "installed-bundle-worker-full", -ENOBUFS);
+    }
+  }
+
   void queueUpdateSelfBundleToPeer(BrainView *bv)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForBundleEchos)
     {
       return;
@@ -25387,11 +26482,15 @@ public:
     }
     else
     {
-      const uint64_t bundleSendHeadroom = 256_KB;
-      // Large updateProdigy payloads can exceed the normal peer keepalive/user-timeout window.
       queueBrainPeerLargePayloadKeepalive(bv);
-      bv->wBuffer.reserve(bv->wBuffer.size() + updateSelfBundleBlob.size() + bundleSendHeadroom);
-      Message::construct(bv->wBuffer, BrainTopic::updateBundle, updateSelfBundleBlob);
+      String frame, failure;
+      Message::construct(frame, BrainTopic::updateBundle, updateSelfBundleBlob);
+      if (!bv->queueArtifactMessage(std::move(frame), &failure))
+      {
+        std::fprintf(stderr, "peer bundle queue rejected: %s\n", failure.c_str());
+        queueBrainCloseIfActive(bv, "bundle-queue-backpressure", -ENOBUFS);
+        return;
+      }
       PRODIGY_DEBUG_LOG( "prodigy updateProdigy bundle-send private4=%u bytes=%u\n", bv->private4, uint32_t(updateSelfBundleBlob.size()));
       PRODIGY_DEBUG_FLUSH();
     }
@@ -25430,6 +26529,7 @@ public:
 
   void queueUpdateSelfTransitionToPeer(BrainView *bv)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForFollowerReboots)
     {
       return;
@@ -25494,6 +26594,7 @@ public:
 
   void queueUpdateSelfRelinquishToPeer(BrainView *bv)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForRelinquishEchos)
     {
       return;
@@ -25530,6 +26631,33 @@ public:
     Ring::queueSend(bv);
   }
 
+  // All bundle progress in one receipt batch must be durable before a peer
+  // command or local exec can consume it. A failed batch remains fenced until
+  // recovery restores the durable coordinator state.
+  size_t updateSelfPersistencePending = 0;
+  bool updateSelfPersistenceFailed = false;
+  Vector<std::function<void()>> updateSelfDurableContinuations;
+
+  void persistUpdateSelfProgress(std::function<void()> continuation = {})
+  {
+    if (continuation) updateSelfDurableContinuations.push_back(std::move(continuation));
+    ++updateSelfPersistencePending;
+    commitMasterAuthorityStateChangeAsync([this](bool durable) {
+      updateSelfPersistenceFailed |= !durable;
+      if (--updateSelfPersistencePending != 0) return;
+      auto continuations = std::move(updateSelfDurableContinuations);
+      updateSelfDurableContinuations.clear();
+      if (updateSelfPersistenceFailed) return;
+      for (auto& resume : continuations) resume();
+      queueWorkerBundleTransitionIfReady();
+      if (updateSelfExpectedEchos > 0)
+      {
+        maybeTransitionFollowersForUpdateSelf();
+        maybeRelinquishMasterForUpdateSelf();
+      }
+    });
+  }
+
   void beginUpdateSelfBundle(uint32_t expectedPeerEchos)
   {
     bool useStagedBundleOnly = updateSelfUseStagedBundleOnly;
@@ -25546,19 +26674,16 @@ public:
                  size_t(updateSelfBundleBlob.size()),
                  (long long)Time::now<TimeResolution::ms>());
     PRODIGY_DEBUG_FLUSH();
-    noteMasterAuthorityRuntimeStateChanged();
-
-    if (expectedPeerEchos == 0)
-    {
-      if (updateSelfTransitionAfterMothershipAck)
+    persistUpdateSelfProgress([this, expectedPeerEchos] {
+      if (updateSelfState != UpdateSelfState::waitingForBundleEchos ||
+          updateSelfExpectedEchos != expectedPeerEchos) return;
+      if (expectedPeerEchos == 0)
       {
+        if (!updateSelfTransitionAfterMothershipAck) transitionLocalUpdateToNewBundle();
         return;
       }
-      transitionLocalUpdateToNewBundle();
-      return;
-    }
-
-    queueUpdateSelfBundleToPendingPeers();
+      queueUpdateSelfBundleToPendingPeers();
+    });
   }
 
   bool masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers()
@@ -25622,6 +26747,7 @@ public:
 
   void maybeRelinquishMasterForUpdateSelf(void)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForFollowerReboots)
     {
       return;
@@ -25671,16 +26797,14 @@ public:
                  nextMasterPeerKeyText.c_str(),
                  (long long)Time::now<TimeResolution::ms>());
     PRODIGY_DEBUG_FLUSH();
-    noteMasterAuthorityRuntimeStateChanged();
-
-    for (BrainView *bv : brains)
-    {
-      queueUpdateSelfRelinquishToPeer(bv);
-    }
+    persistUpdateSelfProgress([this] {
+      for (BrainView *bv : brains) queueUpdateSelfRelinquishToPeer(bv);
+    });
   }
 
   void maybeTransitionFollowersForUpdateSelf(void)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForBundleEchos)
     {
       return;
@@ -25699,29 +26823,13 @@ public:
     updateSelfFollowerRebootedPeerKeys.clear();
     updateSelfTransitionIssuedPeerKeys.clear();
     updateSelfBundleBlob.clear();
-    noteMasterAuthorityRuntimeStateChanged();
-
-    // Followers should transition first so master handoff/restart happens last.
-    PRODIGY_DEBUG_LOG(
-                 "prodigy updateProdigy follower-transition-begin peers=%u nowMs=%lld\n",
-                 updateSelfExpectedEchos,
-                 (long long)Time::now<TimeResolution::ms>());
-    PRODIGY_DEBUG_FLUSH();
-    for (BrainView *bv : brains)
-    {
-      if (peerSocketActive(bv) == false)
-      {
-        continue;
-      }
-
-      uint128_t peerKey = updateSelfPeerTrackingKey(bv);
-      if (peerKey != 0)
-      {
-        updateSelfFollowerBootNsByPeerKey.insert_or_assign(peerKey, bv->boottimens);
-      }
-
-      queueUpdateSelfTransitionToPeer(bv);
-    }
+    for (BrainView *peer : brains)
+      if (peerSocketActive(peer) && updateSelfPeerTrackingKey(peer))
+        updateSelfFollowerBootNsByPeerKey.insert_or_assign(updateSelfPeerTrackingKey(peer), peer->boottimens);
+    persistUpdateSelfProgress([this] {
+      for (BrainView *peer : brains) queueUpdateSelfTransitionToPeer(peer);
+    });
+    // Followers transition first; the master handoff and restart remain last.
   }
 
   void noteUpdateSelfFollowerReboot(BrainView *bv, const char *source, int64_t previousBootNs = 0)
@@ -25765,9 +26873,7 @@ public:
                  (long)bv->boottimens,
                  (long long)Time::now<TimeResolution::ms>());
     PRODIGY_DEBUG_FLUSH();
-    noteMasterAuthorityRuntimeStateChanged();
-
-    maybeRelinquishMasterForUpdateSelf();
+    persistUpdateSelfProgress();
   }
 
   void onUpdateSelfPeerRegistration(BrainView *bv)
@@ -25818,7 +26924,7 @@ public:
     {
       updateSelfBundleEchoPeerKeys.insert(peerKey);
       updateSelfBundleEchos += 1;
-      noteMasterAuthorityRuntimeStateChanged();
+      persistUpdateSelfProgress();
     }
 
     PRODIGY_DEBUG_LOG(
@@ -25832,6 +26938,7 @@ public:
 
   void queueWorkerBundleTransitionIfReady(void)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfWorkerMachineUUIDs.empty() ||
         updateSelfWorkerStagedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size())
     {
@@ -25855,9 +26962,16 @@ public:
         // failure. Keep the Brain's exact container/storage/network ownership
         // indexed until the replacement Neuron uploads its live inventory.
         machine->inBinaryUpdate = true;
-        noteMasterAuthorityRuntimeStateChanged();
-        Message::construct(machine->neuron.wBuffer, NeuronTopic::transitionToNewBundle, uint8_t(1));
-        if (neuronControlStreamActive(machine)) Ring::queueSend(&machine->neuron);
+        const uint128_t machineUUID = machine->uuid;
+        const uint64_t streamGeneration = machine->neuron.ioGeneration;
+        persistUpdateSelfProgress([this, machineUUID, streamGeneration] {
+          Machine *current = findMachineByUUID(machineUUID);
+          if (!current || current->neuron.ioGeneration != streamGeneration ||
+              !updateSelfWorkerTransitionIssuedMachineUUIDs.contains(machineUUID) ||
+              updateSelfWorkerStateUploadedMachineUUIDs.contains(machineUUID)) return;
+          Message::construct(current->neuron.wBuffer, NeuronTopic::transitionToNewBundle, uint8_t(1));
+          if (neuronControlStreamActive(current)) Ring::queueSend(&current->neuron);
+        });
       }
       return;
     }
@@ -25936,7 +27050,7 @@ public:
     return true;
   }
 
-  bool prepareLocalBundleExecRecovery(void)
+  void prepareLocalBundleExecRecoveryAsync(PersistenceCompletion completion)
   {
     if (updateSelfMachineRecoveryWitnesses.empty() == false &&
         masterAuthorityRuntimeStateDurable &&
@@ -25944,17 +27058,17 @@ public:
     {
       // A same-digest retry resumes a durably committed all-machine checkpoint.
       // Do not replace it with a post-handoff local view.
-      return true;
+      completion(true); return;
     }
     if (recoveringPersistedNeuronInventory)
     {
       updateSelfWorkerFailure.assign("persisted machine inventory is incomplete for bundle exec"_ctv);
-      return false;
+      completion(false); return;
     }
     if (masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false)
     {
       updateSelfWorkerFailure.assign("current master authority is not durably acknowledged by every registered peer"_ctv);
-      return false;
+      completion(false); return;
     }
     // A master can be replaced while its peers exec the same bundle.  Capture
     // every machine through the established Neuron plan collector before the
@@ -25972,7 +27086,7 @@ public:
       if (machine->uuid == 0 || seen.insert(machine->uuid).second == false)
       {
         updateSelfWorkerFailure.assign("machine identity unavailable while preparing bundle exec"_ctv);
-        return false;
+        completion(false); return;
       }
       ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
       witness.machineUUID = machine->uuid;
@@ -25984,14 +27098,14 @@ public:
         // attempt this operation again after the reply.
         queueNeuronStateUploadForMachine(machine);
         updateSelfWorkerFailure.assign("machine container ownership needs a fresh authenticated stateUpload for bundle exec"_ctv);
-        return false;
+        completion(false); return;
       }
       witnesses.push_back(std::move(witness));
     }
     if (witnesses.empty())
     {
       updateSelfWorkerFailure.assign("no machine inventory available while preparing bundle exec"_ctv);
-      return false;
+      completion(false); return;
     }
     std::sort(witnesses.begin(), witnesses.end(), [](const auto& lhs, const auto& rhs) {
       return lhs.machineUUID < rhs.machineUUID;
@@ -26011,26 +27125,40 @@ public:
     updateSelfLocalBundleRegistered = false;
     updateSelfLocalContainerBootstraps.clear();
     updateSelfWorkerFailure.clear();
-    if (commitMasterAuthorityStateChange() == false)
-    {
-      updateSelfMachineRecoveryWitnesses = previousWitnesses;
-      updateSelfLocalMachineUUID = previousLocalMachineUUID;
-      updateSelfLocalMachineFragment = previousLocalMachineFragment;
-      updateSelfLocalBundleRegistered = previousLocalBundleRegistered;
-      updateSelfLocalContainerBootstraps = previousLocalBootstraps;
-      updateSelfWorkerFailure.assign("bundle-exec recovery state could not be persisted"_ctv);
-      return false;
-    }
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+    commitMasterAuthorityStateChangeAsync([this, epoch, generation, previousWitnesses,
+        previousLocalMachineUUID, previousLocalMachineFragment, previousLocalBundleRegistered,
+        previousLocalBootstraps, completion = std::move(completion)](bool durable) mutable {
+      if (masterAuthorityEpoch != epoch) { completion(false); return; }
+      if (!durable)
+      {
+        if (masterAuthorityRuntimeState.generation == generation)
+        {
+          updateSelfMachineRecoveryWitnesses = previousWitnesses;
+          updateSelfLocalMachineUUID = previousLocalMachineUUID;
+          updateSelfLocalMachineFragment = previousLocalMachineFragment;
+          updateSelfLocalBundleRegistered = previousLocalBundleRegistered;
+          updateSelfLocalContainerBootstraps = previousLocalBootstraps;
+          updateSelfWorkerFailure.assign("bundle-exec recovery state could not be persisted"_ctv);
+        }
+        completion(false); return;
+      }
+      // Begin the exact inventory barrier only after all-machine evidence is durable.
+      recoveringPersistedNeuronInventory = true;
+      persistedMachineInventoryUploaded.clear();
+      persistedMachineStateUploadPlansByMachine.clear();
+      recoveredNeuronPairingsUnified = false;
+      completion(true);
+    });
+  }
 
-    // The current master remains authoritative while followers exec.  Start
-    // the existing exact-inventory barrier before either follower can report
-    // a transiently unready runtime; otherwise its report may close a target
-    // deficit and create a replacement alongside the retained process.
-    recoveringPersistedNeuronInventory = true;
-    persistedMachineInventoryUploaded.clear();
-    persistedMachineStateUploadPlansByMachine.clear();
-    recoveredNeuronPairingsUnified = false;
-    return true;
+  // Synchronous fixture adapter. Live callers use the completion above.
+  bool prepareLocalBundleExecRecovery(void)
+  {
+    auto receipt = std::make_shared<bool>(false);
+    prepareLocalBundleExecRecoveryAsync([receipt](bool durable) { *receipt = durable; });
+    return *receipt;
   }
 
   bool noteLocalBundleRegistration(
@@ -26122,6 +27250,7 @@ public:
 
   void completeWorkerBundleUpgradeIfReady(void)
   {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfWorkerMachineUUIDs.empty() ||
         updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() ||
         updateSelfWorkerMothership == nullptr || streamIsActive(updateSelfWorkerMothership) == false)
@@ -26129,21 +27258,23 @@ public:
       return;
     }
 
-    if (prepareLocalBundleExecRecovery() == false)
-    {
-      noteMasterAuthorityRuntimeStateChanged();
-      return;
-    }
-
-    MothershipResponse response = {};
-    response.success = true;
-    String serializedResponse = {};
-    BitseryEngine::serialize(serializedResponse, response);
-    Message::construct(updateSelfWorkerMothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
-    updateSelfTransitionAfterMothershipAck = true;
-    Ring::queueSend(updateSelfWorkerMothership);
-    updateSelfWorkerMothership = nullptr;
-    beginUpdateSelfBundle(0);
+    Mothership *stream = updateSelfWorkerMothership;
+    const uint64_t incarnation = stream->connectionIncarnation;
+    const uint64_t epoch = masterAuthorityEpoch;
+    prepareLocalBundleExecRecoveryAsync([this, stream, incarnation, epoch](bool durable) {
+      if (!durable || masterAuthorityEpoch != epoch || updateSelfWorkerMothership != stream ||
+          !activeMotherships.contains(stream) || stream->connectionIncarnation != incarnation ||
+          !streamIsActive(stream)) return;
+      MothershipResponse response = {};
+      response.success = true;
+      String serializedResponse;
+      BitseryEngine::serialize(serializedResponse, response);
+      Message::construct(stream->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
+      updateSelfTransitionAfterMothershipAck = true;
+      Ring::queueSend(stream);
+      updateSelfWorkerMothership = nullptr;
+      beginUpdateSelfBundle(0);
+    });
   }
 
   void noteWorkerBundleStaged(NeuronView *neuron, bool success, const String& digest, const String& failure)
@@ -26157,15 +27288,30 @@ public:
     {
       updateSelfWorkerFailure = failure;
       if (updateSelfWorkerFailure.empty()) updateSelfWorkerFailure.assign("worker staging acknowledgement digest mismatch"_ctv);
-      noteMasterAuthorityRuntimeStateChanged();
+      persistUpdateSelfProgress();
       return;
     }
     if (updateSelfWorkerStagedMachineUUIDs.insert(neuron->machine->uuid).second)
     {
       updateSelfWorkerFailure.clear();
-      noteMasterAuthorityRuntimeStateChanged();
+      persistUpdateSelfProgress();
     }
     queueWorkerBundleTransitionIfReady();
+  }
+
+  bool queueBundleToNeuron(NeuronView *neuron, const String& expectedDigest)
+  {
+    if (!neuron || !streamIsActive(neuron) || neuron->artifactCapabilityPending) return false;
+    String frame, failure;
+    Message::construct(frame, NeuronTopic::updateBundle, updateSelfBundleBlob, expectedDigest);
+    if (!neuron->queueArtifactMessage(std::move(frame), &failure))
+    {
+      std::fprintf(stderr, "neuron bundle queue rejected: %s\n", failure.c_str());
+      queueCloseIfActive(neuron);
+      return false;
+    }
+    Ring::queueSend(neuron);
+    return true;
   }
 
   void noteWorkerRegistration(NeuronView *neuron, const String& installedDigest)
@@ -26181,8 +27327,7 @@ public:
       // received. Replaying the byte-identical durable payload is idempotent.
       if (updateSelfBundleBlob.size() > 0)
       {
-        Message::construct(neuron->wBuffer, NeuronTopic::updateBundle, updateSelfBundleBlob, updateSelfWorkerExpectedBundleSHA256);
-        if (streamIsActive(neuron)) Ring::queueSend(neuron);
+        queueBundleToNeuron(neuron, updateSelfWorkerExpectedBundleSHA256);
       }
       return;
     }
@@ -26190,14 +27335,14 @@ public:
     {
       if (updateSelfWorkerTransitionIssuedMachineUUIDs.erase(neuron->machine->uuid))
       {
-        noteMasterAuthorityRuntimeStateChanged();
+        persistUpdateSelfProgress();
         queueWorkerBundleTransitionIfReady();
       }
       return;
     }
     if (updateSelfWorkerRebootedMachineUUIDs.insert(neuron->machine->uuid).second)
     {
-      noteMasterAuthorityRuntimeStateChanged();
+      persistUpdateSelfProgress();
     }
   }
 
@@ -26235,18 +27380,21 @@ public:
     {
       return;
     }
-    updateSelfWorkerStateUploadedMachineUUIDs.insert(neuron->machine->uuid);
+    if (!updateSelfWorkerStateUploadedMachineUUIDs.insert(neuron->machine->uuid).second) return;
+    const uint128_t uploadedMachineUUID = neuron->machine->uuid;
+    persistUpdateSelfProgress([this, uploadedMachineUUID] {
+    Machine *uploadedMachine = findMachineByUUID(uploadedMachineUUID);
+    if (!uploadedMachine || !updateSelfWorkerStateUploadedMachineUUIDs.contains(uploadedMachineUUID)) return;
     // Registration proved the exact successor digest and this upload has now
     // restored its authoritative inventory, so the per-machine exec fence is
     // complete even while the durable cohort waits for its other members.
-    neuron->machine->inBinaryUpdate = false;
+    uploadedMachine->inBinaryUpdate = false;
     // A non-empty target set is the durable completion criterion.  Do not
     // clear it early: recovery replays outstanding staged workers after a
     // master restart and reports remain visibly incomplete until all upload.
     const bool allWorkersRestored =
         updateSelfWorkerMachineUUIDs.empty() == false &&
         updateSelfWorkerStateUploadedMachineUUIDs.size() == updateSelfWorkerMachineUUIDs.size();
-    noteMasterAuthorityRuntimeStateChanged();
     if (allWorkersRestored)
     {
       // Forced recovery can restore the local Neuron before the outstanding
@@ -26275,6 +27423,7 @@ public:
       completeWorkerBundleUpgradeIfReady();
     }
     else queueWorkerBundleTransitionIfReady();
+    });
   }
 
   void onUpdateSelfRelinquishEcho(BrainView *bv)
@@ -26293,30 +27442,34 @@ public:
     {
       updateSelfRelinquishEchoPeerKeys.insert(peerKey);
       updateSelfRelinquishEchos += 1;
-      noteMasterAuthorityRuntimeStateChanged();
+
     }
 
-    PRODIGY_DEBUG_LOG(
-                 "prodigy updateProdigy relinquish-echo %u/%u nowMs=%lld\n",
-                 updateSelfRelinquishEchos,
-                 updateSelfExpectedEchos,
-                 (long long)Time::now<TimeResolution::ms>());
-    PRODIGY_DEBUG_FLUSH();
-    if (updateSelfRelinquishEchos < updateSelfExpectedEchos)
-    {
-      return;
-    }
+    persistUpdateSelfProgress([this] {
+      if (updateSelfState != UpdateSelfState::waitingForRelinquishEchos ||
+          updateSelfRelinquishEchos < updateSelfExpectedEchos) return;
+      if (updateSelfPlannedMasterPeerKey > 0)
+        pendingDesignatedMasterPeerKey = updateSelfPlannedMasterPeerKey;
+      boottimens = Time::now<TimeResolution::ns>();
+      forfeitMasterStatus();
+      resetUpdateSelfState();
+      persistUpdateSelfProgress([this] { transitionToNewBundle(); });
+    });
+  }
 
-    // Once every peer has acknowledged relinquish, we can safely restart ourselves.
-    if (updateSelfPlannedMasterPeerKey > 0)
-    {
-      pendingDesignatedMasterPeerKey = updateSelfPlannedMasterPeerKey;
-    }
-    boottimens = Time::now<TimeResolution::ns>();
-    forfeitMasterStatus();
-    resetUpdateSelfState();
-    noteMasterAuthorityRuntimeStateChanged();
-    transitionToNewBundle();
+  void acknowledgeDurableRelinquish(BrainView *peer)
+  {
+    if (!peer) return;
+    const uint64_t ioGeneration = peer->ioGeneration;
+    const uint128_t uuid = peer->uuid;
+    const uint64_t epoch = masterAuthorityEpoch;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    persistLocalRuntimeStateAsync([this, peer, ioGeneration, uuid, epoch, lifetime](bool durable) {
+      if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch || !brains.contains(peer) ||
+          peer->uuid != uuid || peer->ioGeneration != ioGeneration || !peerSocketActive(peer)) return;
+      Message::construct(peer->wBuffer, BrainTopic::relinquishMasterStatus);
+      Ring::queueSend(peer);
+    });
   }
 
   bool relinquishMasterStatusAlreadyApplied(BrainView *commandPeer,
@@ -26407,9 +27560,106 @@ public:
     Ring::queueSend(masterPeer);
   }
 
+  struct PeerArtifactStore {
+    BrainView *peer = nullptr;
+    uint64_t transportGeneration = 0;
+    uint128_t peerUUID = 0;
+    uint128_t masterUUID = 0;
+    DeploymentPlan plan;
+    String blob;
+    String failure;
+    ContainerStore::PreparedAppArtifact prepared;
+    bool success = false;
+  };
+
+  bool peerArtifactStoreStillCurrent(const PeerArtifactStore& operation)
+  {
+    auto failed = failedDeployments.find(operation.plan.config.deploymentID());
+    return brains.contains(operation.peer) &&
+           operation.peer->ioGeneration == operation.transportGeneration &&
+           operation.peer->uuid == operation.peerUUID &&
+           operation.peer->canQueueSend() &&
+           getExistingMasterUUID() == operation.masterUUID &&
+           (failed == failedDeployments.end() || failed->second.hasOperatorCancellation == false);
+  }
+
+  void discardPeerArtifactStore(const std::shared_ptr<PeerArtifactStore>& operation)
+  {
+    if (artifactIO && !artifactIO->continueWith(
+        [operation] { ContainerStore::discardPreparedAppArtifact(operation->prepared); },
+        [] {}, [](std::exception_ptr) { std::fprintf(stderr, "peer artifact cleanup worker failed\n"); }))
+    {
+      std::fprintf(stderr, "peer artifact cleanup deferred: I/O queue is full\n");
+    }
+  }
+
+  bool queuePeerArtifactStore(BrainView *peer, const DeploymentPlan& plan, const String& blob)
+  {
+    if (!ensureArtifactIO()) return false;
+    auto operation = std::make_shared<PeerArtifactStore>();
+    operation->peer = peer;
+    operation->transportGeneration = peer->ioGeneration;
+    operation->peerUUID = peer->uuid;
+    operation->masterUUID = getExistingMasterUUID();
+    operation->plan = plan;
+    operation->blob.append(blob.data(), blob.size());
+    auto failure = [this, operation](std::exception_ptr) {
+      std::fprintf(stderr, "peer artifact preparation/publication failed: %s\n", operation->failure.c_str());
+      discardPeerArtifactStore(operation);
+      if (peerArtifactStoreStillCurrent(*operation))
+        queueBrainCloseIfActive(operation->peer, "artifact-store-failed", -EIO);
+    };
+    return artifactIO->submit(operation->blob.size(),
+        [operation] {
+          String path = ContainerStore::pathForContainerImage(operation->plan.config.deploymentID());
+          path.append(".incoming.XXXXXX"_ctv);
+          path.addNullTerminator();
+          int fd = ::mkstemp(reinterpret_cast<char *>(path.data()));
+          if (fd < 0) { operation->failure.assign("cannot create peer artifact stage"_ctv); return; }
+          ::close(fd);
+          operation->success = ContainerStore::prepareAppArtifactAtPath(
+              operation->prepared, operation->plan.config.deploymentID(), path, operation->blob,
+              operation->plan.config.containerBlobSHA256, operation->plan.config.containerBlobBytes,
+              &operation->failure);
+          if (!operation->success) (void)::unlink(path.c_str());
+          operation->blob.reset();
+        },
+        [this, operation, failure] {
+          if (!operation->success) { failure({}); return; }
+          if (!peerArtifactStoreStillCurrent(*operation)) { discardPeerArtifactStore(operation); return; }
+          if (!artifactIO->continueWith(
+              [operation] { operation->success = ContainerStore::publishPreparedAppArtifact(operation->prepared, &operation->failure); },
+              [this, operation, failure] {
+                if (!operation->success) { failure({}); return; }
+                if (!peerArtifactStoreStillCurrent(*operation)) { discardPeerArtifactStore(operation); return; }
+                if (!ContainerStore::adoptPreparedAppArtifact(operation->prepared)) { failure({}); return; }
+                const uint64_t deploymentID = operation->plan.config.deploymentID();
+                deploymentPlans.insert_or_assign(deploymentID, operation->plan);
+                applyReplicatedDeploymentPlanLiveState(operation->plan);
+                applyPendingReplicatedContainerRuntimeStates(deploymentID);
+                std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                persistLocalRuntimeStateAsync([this, lifetime, operation, deploymentID](bool durable) {
+                  if (!durable || lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
+                  Message::construct(operation->peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
+                  Ring::queueSend(operation->peer);
+                });
+              }, failure)) failure({});
+        }, failure);
+  }
+
   void brainHandler(BrainView *bv, Message *message)
   {
     uint8_t *args = message->args;
+    const BrainTopic incomingTopic = BrainTopic(message->topic);
+    if ((incomingTopic == BrainTopic::replicateDeployment ||
+         incomingTopic == BrainTopic::replicateSystemContainerArtifact ||
+         incomingTopic == BrainTopic::updateBundle) &&
+        !ProdigyIngressValidation::validateBrainPayload(message->topic, args, message->terminal()))
+    {
+      std::fprintf(stderr, "brain artifact payload rejected topic=%u\n", unsigned(message->topic));
+      queueBrainCloseIfActive(bv, "invalid-artifact-payload", -EPROTO);
+      return;
+    }
     if (bv != nullptr)
     {
       bv->notePeerMessageReceived();
@@ -26644,7 +27894,7 @@ public:
           if (BitseryEngine::deserializeSafe(serialized, samples))
           {
             metrics.importSamples(samples);
-            persistLocalRuntimeState();
+            persistLocalRuntimeStateAsync();
           }
           break;
         }
@@ -26740,39 +27990,34 @@ public:
               break;
             }
 
+            String containerBlob;
+            Message::extractToStringView(args, containerBlob);
+            if (containerBlob.size() > 0)
+            {
+              if (!queuePeerArtifactStore(bv, plan, containerBlob))
+              {
+                std::fprintf(stderr, "peer artifact I/O queue rejected deploymentID=%llu\n", (unsigned long long)deploymentID);
+                queueBrainCloseIfActive(bv, "artifact-io-backpressure", -ENOBUFS);
+              }
+              break;
+            }
+            // Metadata-only reconciliation retains its existing durable ACK.
             deploymentPlans.insert_or_assign(deploymentID, plan);
             applyReplicatedDeploymentPlanLiveState(plan);
             applyPendingReplicatedContainerRuntimeStates(deploymentID);
-
-            String containerBlob;
-            Message::extractToStringView(args, containerBlob);
-
-            bool stored = true;
-            if (containerBlob.size() > 0)
-            {
-              String storeFailure = {};
-              stored = ContainerStore::store(
-                  deploymentID,
-                  containerBlob,
-                  nullptr,
-                  nullptr,
-                  &plan.config.containerBlobSHA256,
-                  &plan.config.containerBlobBytes,
-                  &storeFailure);
-              if (stored == false)
-              {
-                basics_log(
-                    "replicateDeployment blob store failed deploymentID=%llu reason=%s\n",
-                    (unsigned long long)plan.config.deploymentID(),
-                    (storeFailure.size() > 0 ? storeFailure.c_str() : "unknown"));
-              }
-            }
-            // else this replication carried only metadata (e.g. no-op image reuse path)
-
-            if (stored && persistLocalRuntimeState())
-            {
-              Message::construct(bv->wBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID());
-            }
+            const uint128_t peerUUID = bv->uuid;
+            const int64_t peerBootTime = bv->boottimens;
+            const uint64_t peerGeneration = bv->ioGeneration;
+            const int peerSlot = bv->fslot;
+            std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+            persistLocalRuntimeStateAsync([this, lifetime, peerUUID, peerBootTime, peerGeneration, peerSlot, deploymentID](bool durable) {
+              if (!durable || lifetime.expired()) return;
+              BrainView *peer = findBrainViewByUUID(peerUUID);
+              if (peer == nullptr || !brains.contains(peer) || !peer->connected || peer->boottimens != peerBootTime ||
+                  peer->ioGeneration != peerGeneration || peer->fslot != peerSlot) return;
+              Message::construct(peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
+              Ring::queueSend(peer);
+            });
           }
 
           break;
@@ -26786,14 +28031,11 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, bytes);
           Message::extractToStringView(args, blob);
 
-          String storeFailure = {};
-          if (applySystemContainerArtifact(sha256, bytes, blob, false, &storeFailure) == false)
+          if (queueSystemContainerArtifactApplyForPeer(bv, sha256, bytes, blob) == false)
           {
-            basics_log(
-                "replicateSystemContainerArtifact store failed sha256=%s bytes=%llu reason=%s\n",
-                sha256.c_str(),
-                (unsigned long long)bytes,
-                (storeFailure.size() > 0 ? storeFailure.c_str() : "unknown"));
+            std::fprintf(stderr, "replicateSystemContainerArtifact I/O queue rejected sha256=%s bytes=%llu\n",
+                       sha256.c_str(), (unsigned long long)bytes);
+            queueBrainCloseIfActive(bv, "system-artifact-io-backpressure", -ENOBUFS);
           }
 
           break;
@@ -26812,7 +28054,7 @@ public:
             refreshMasterAuthorityRuntimeStateFromLiveFields();
           }
           ContainerStore::destroy(deploymentID);
-          persistLocalRuntimeState();
+          persistLocalRuntimeStateAsync();
 
           break;
         }
@@ -26956,6 +28198,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, bv->uuid);
           Message::extractArg<ArgumentNature::fixed>(args, bv->boottimens);
           Message::extractArg<ArgumentNature::fixed>(args, bv->version);
+          bv->artifactChunksEnabled = bv->version >= 7;
           Message::extractArg<ArgumentNature::fixed>(args, bv->existingMasterUUID);
           Message::extractToString(args, bv->kernel);
           Message::extractToString(args, bv->osID);
@@ -27207,14 +28450,7 @@ public:
           {
             if (peerSocketActive(bv))
             {
-              bv->wBuffer.reserve(bv->wBuffer.size() + 512_KB);
-              String prodigyBundlePath = {};
-              prodigyResolveInstalledBundlePathForRoot("/root/prodigy"_ctv, prodigyBundlePath);
-              uint32_t headerOffset = Message::appendHeader(bv->wBuffer, BrainTopic::updateBundle);
-              Message::appendFile(bv->wBuffer, prodigyBundlePath);
-              Message::finish(bv->wBuffer, headerOffset);
-              Message::construct(bv->wBuffer, BrainTopic::transitionToNewBundle);
-              Ring::queueSend(bv);
+              queueInstalledBundleToPeer(bv);
             }
           }
 
@@ -27286,7 +28522,16 @@ public:
         {
           if (message->isEcho())
           {
-            onUpdateSelfBundleEcho(bv);
+            if (bv->transitionAfterBundleEcho)
+            {
+              bv->transitionAfterBundleEcho = false;
+              if (isActiveMaster() && peerSocketActive(bv))
+              {
+                Message::construct(bv->wBuffer, BrainTopic::transitionToNewBundle);
+                Ring::queueSend(bv);
+              }
+            }
+            else onUpdateSelfBundleEcho(bv);
           }
           else
           {
@@ -27304,16 +28549,9 @@ public:
             {
               PRODIGY_DEBUG_LOG( "prodigy updateProdigy bundle-recv from=%u bytes=%u\n", bv->private4, uint32_t(newBundle.size()));
               PRODIGY_DEBUG_FLUSH();
-              String expectedDigest = {};
-              String actualDigest = {};
-              String stagingFailure = {};
-              if (prodigyComputeSHA256Hex(newBundle, expectedDigest, &stagingFailure) == false ||
-                  prodigyStageBundleWithExpectedSHA256(
-                      prodigyStagedBundlePath(), newBundle, expectedDigest, actualDigest, &stagingFailure) == false)
-              {
-                basics_log("prodigy updateProdigy peer bundle stage failed: %s\n", stagingFailure.c_str());
-                break;
-              }
+              if (!queuePeerBundleArtifact(bv, newBundle))
+                queueBrainCloseIfActive(bv, "peer-bundle-worker-full", -ENOBUFS);
+              break;
             }
 
             if (peerSocketActive(bv))
@@ -27332,9 +28570,12 @@ public:
                        thisNeuron->private4.v4,
                        int(weAreMaster));
           PRODIGY_DEBUG_FLUSH();
-          if (weAreMaster == false)
+          if (weAreMaster == false && peerSocketActive(bv))
           {
-            transitionToNewBundle();
+            if (pendingPeerBundleArtifact && pendingPeerBundleArtifact->peer == bv &&
+                peerBundleArtifactIsCurrent(pendingPeerBundleArtifact))
+              pendingPeerBundleArtifact->transitionRequested = true;
+            else transitionToNewBundle();
           }
 
           break;
@@ -27369,11 +28610,7 @@ public:
             if (relinquishMasterStatusAlreadyApplied(
                     bv, designatedMasterPeerKey, peer))
             {
-              if (peerSocketActive(bv))
-              {
-                Message::construct(bv->wBuffer, BrainTopic::relinquishMasterStatus);
-                Ring::queueSend(bv);
-              }
+              acknowledgeDurableRelinquish(bv);
               break;
             }
 
@@ -27427,13 +28664,7 @@ public:
               }
             }
 
-            if (peerSocketActive(bv))
-            {
-              Message::construct(bv->wBuffer, BrainTopic::relinquishMasterStatus);
-              Ring::queueSend(bv);
-            }
-
-            noteMasterAuthorityRuntimeStateChanged(false, true);
+            acknowledgeDurableRelinquish(bv);
           }
 
           break;
@@ -27464,11 +28695,16 @@ public:
             break;
           }
 
-          restoreBrainsFromClusterTopology(incomingTopology);
-          restoreMachinesFromClusterTopology(incomingTopology);
-          nBrains = clusterTopologyBrainCount(incomingTopology);
-          initializeAllBrainPeersIfNeeded();
-          persistAuthoritativeClusterTopology(incomingTopology);
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          const uint64_t epoch = masterAuthorityEpoch;
+          persistAuthoritativeClusterTopologyAsync(incomingTopology,
+              [this, lifetime, epoch, incomingTopology](bool durable) {
+                if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch) return;
+                restoreBrainsFromClusterTopology(incomingTopology);
+                restoreMachinesFromClusterTopology(incomingTopology);
+                nBrains = clusterTopologyBrainCount(incomingTopology);
+                initializeAllBrainPeersIfNeeded();
+              });
           break;
         }
       case BrainTopic::replicateApplicationIDReservation:
@@ -27490,7 +28726,7 @@ public:
           }
           else
           {
-            persistLocalRuntimeState();
+            persistLocalRuntimeStateAsync();
           }
 
           break;
@@ -27517,7 +28753,7 @@ public:
           }
           else
           {
-            persistLocalRuntimeState();
+            persistLocalRuntimeStateAsync();
           }
 
           break;
@@ -27546,7 +28782,7 @@ public:
             if (validateApplicationTlsVaultFactoryMaterial(incoming, &validationFailure))
             {
               tlsVaultFactoriesByApp.insert_or_assign(incoming.applicationID, incoming);
-              persistLocalRuntimeState();
+              persistLocalRuntimeStateAsync();
             }
             else
             {
@@ -27579,7 +28815,7 @@ public:
           if (shouldAcceptApiCredentialSetReplication(incoming, existing))
           {
             apiCredentialSetsByApp.insert_or_assign(incoming.applicationID, incoming);
-            persistLocalRuntimeState();
+            persistLocalRuntimeStateAsync();
           }
 
           break;
@@ -27610,21 +28846,10 @@ public:
               validatePendingElasticAddressOperations(incoming.runtimeState,
                                                       &incoming.brainConfig))
           {
-            String transitionDigest;
-            const bool applied = applyReplicatedMasterAuthorityTransition(incoming, true);
-            if (applied &&
-                (incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
-                 incoming.runtimeState.pendingElasticAddressReleases.empty() == false ||
-                 machineRetirementJournalPresent(incoming.runtimeState) ||
-                 hasUpdateSelfRecoveryWitness(incoming.runtimeState.updateSelf)) &&
-                applyReplicatedMachineRetirementTopology(incoming.runtimeState) &&
-                replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming.runtimeState) &&
-                prodigyComputeSHA256Hex(serialized, transitionDigest))
+            if (!beginReplicatedMasterAuthorityTransition(bv, incoming, serialized) &&
+                applyReplicatedMasterAuthorityTransition(incoming, true))
             {
-              sendMasterAuthorityTransitionAcknowledgement(
-                  bv,
-                  incoming.runtimeState.generation,
-                  transitionDigest);
+              acknowledgeAppliedMasterAuthorityTransition(bv, incoming.runtimeState, serialized);
             }
           }
 
@@ -27692,30 +28917,50 @@ public:
             previous = existingIt->second;
           }
           failedDeployments.insert_or_assign(incoming.deploymentID, incoming);
-          if (persistLocalRuntimeState() == false)
-          {
-            if (hadExisting)
-            {
-              failedDeployments.insert_or_assign(incoming.deploymentID, std::move(previous));
-            }
-            else
-            {
-              failedDeployments.erase(incoming.deploymentID);
-            }
-            break;
-          }
-          armFailedDeploymentCleaner();
-
-          DeploymentCancellationAcknowledgement acknowledgement = {};
-          acknowledgement.operationID = incoming.operationID;
-          acknowledgement.durableGeneration = incoming.cancellationGeneration;
-          acknowledgement.peerUUID = thisNeuron ? thisNeuron->uuid : uint128_t(0);
-          acknowledgement.peerBootNs = boottimens;
-          String serializedAcknowledgement = {};
-          BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
-          Message::construct(bv->wBuffer, BrainTopic::acknowledgeDeploymentCancellation,
-                             serializedAcknowledgement);
-          Ring::queueSend(bv);
+          const uint64_t authorityEpoch = masterAuthorityEpoch;
+          const uint128_t peerUUID = bv->uuid;
+          const int64_t peerBootTime = bv->boottimens;
+          const uint64_t peerGeneration = bv->ioGeneration;
+          const int peerFileSlot = bv->fslot;
+          const uint64_t deploymentID = incoming.deploymentID;
+          const uint64_t cancellationGeneration = incoming.cancellationGeneration;
+          String operationID(incoming.operationID.data(), incoming.operationID.size(), Copy::yes, incoming.operationID.size());
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          persistLocalRuntimeStateAsync(
+              [this, lifetime, authorityEpoch, peerUUID, peerBootTime, peerGeneration, peerFileSlot,
+               deploymentID, cancellationGeneration, operationID = std::move(operationID), hadExisting,
+               previous = std::move(previous)](bool durable) mutable {
+                if (lifetime.expired() || masterAuthorityEpoch != authorityEpoch || weAreMaster) return;
+                auto current = failedDeployments.find(deploymentID);
+                const bool candidateCurrent = current != failedDeployments.end() &&
+                                              current->second.hasOperatorCancellation &&
+                                              current->second.cancellationGeneration == cancellationGeneration &&
+                                              current->second.operationID.equals(operationID);
+                if (durable == false)
+                {
+                  if (candidateCurrent)
+                  {
+                    if (hadExisting) failedDeployments.insert_or_assign(deploymentID, std::move(previous));
+                    else failedDeployments.erase(deploymentID);
+                  }
+                  return;
+                }
+                if (candidateCurrent == false) return;
+                BrainView *peer = findBrainViewByUUID(peerUUID);
+                if (peer == nullptr || peer->boottimens != peerBootTime || peer->ioGeneration != peerGeneration ||
+                    peer->fslot != peerFileSlot || peerCanReplicateMasterAuthorityState(peer) == false) return;
+                armFailedDeploymentCleaner();
+                DeploymentCancellationAcknowledgement acknowledgement = {};
+                acknowledgement.operationID = operationID;
+                acknowledgement.durableGeneration = cancellationGeneration;
+                acknowledgement.peerUUID = thisNeuron ? thisNeuron->uuid : uint128_t(0);
+                acknowledgement.peerBootNs = boottimens;
+                String serializedAcknowledgement = {};
+                BitseryEngine::serialize(serializedAcknowledgement, acknowledgement);
+                Message::construct(peer->wBuffer, BrainTopic::acknowledgeDeploymentCancellation,
+                                   serializedAcknowledgement);
+                Ring::queueSend(peer);
+              });
           break;
         }
       case BrainTopic::acknowledgeDeploymentCancellation:
@@ -27773,7 +29018,7 @@ public:
     {
       deployments.insert_or_assign(deployment->plan.config.deploymentID(), deployment);
       deployment->deploy();
-      persistLocalRuntimeState();
+      persistLocalRuntimeStateAsync();
       return;
     }
 
@@ -27814,8 +29059,12 @@ public:
         deployment->previous = previous;
         deployment->state = DeploymentState::waitingToDeploy;
         (void)promoteRetainedStorageRecoverySuccessor(*retry, deployment);
-        (void)persistLocalRuntimeState();
-        recoverDeploymentsAfterNeuronState();
+        const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+        const uint64_t epoch = masterAuthorityEpoch;
+        persistLocalRuntimeStateAsync([this, lifetime, epoch](bool durable) {
+          if (!lifetime.expired() && durable && masterAuthorityEpoch == epoch)
+            recoverDeploymentsAfterNeuronState();
+        });
         return;
       }
       switch (previous->state)
@@ -27916,7 +29165,7 @@ public:
       }
     }
 
-    persistLocalRuntimeState();
+    persistLocalRuntimeStateAsync();
 
     if (deployment != nullptr && prodigyDebugDeployHeapEnabled())
     {
@@ -28036,6 +29285,15 @@ public:
       return;
     }
 
+    const ProdigyMasterAuthorityRuntimeState previousRuntimeState = masterAuthorityRuntimeState;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint64_t deploymentID = deployment->plan.config.deploymentID();
+    const uint32_t attemptNumber = container->taskAttemptNumber;
+    const uint128_t containerUUID = container->uuid;
+    const uint128_t machineUUID = container->machine ? container->machine->uuid : 0;
+    const uint64_t streamGeneration = container->machine ? container->machine->neuron.ioGeneration : 0;
     const int64_t nowMs = Time::now<TimeResolution::ms>();
     TaskAttemptRecord attempt = {};
     attempt.attemptNumber = container->taskAttemptNumber;
@@ -28059,30 +29317,70 @@ public:
       return;
     }
 
-    if (container->machine)
-    {
-      container->machine->queueSend(NeuronTopic::taskAttemptTerminalAck, deployment->plan.config.deploymentID(), container->taskAttemptNumber);
-    }
-    deployment->taskAttemptContainerDone(container);
-    noteMasterAuthorityRuntimeStateChanged();
+    const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    commitMasterAuthorityStateChangeAsync(
+        [this, lifetime, previousRuntimeState, previousDurable, previousDurableGeneration,
+         authorityEpoch, operationGeneration, deploymentID, attemptNumber, containerUUID,
+         machineUUID, streamGeneration](bool durable) mutable {
+          if (lifetime.expired()) return;
+          auto record = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+          const bool matchingAttempt = record != masterAuthorityRuntimeState.taskExecutions.end() &&
+              record->second.currentAttemptNumber == attemptNumber &&
+              ((record->second.hasFinalAttempt &&
+                record->second.finalAttempt.containerUUID == containerUUID) ||
+               (record->second.hasLatestNonSuccessAttempt &&
+                record->second.latestNonSuccessAttempt.containerUUID == containerUUID));
+          const bool current = masterAuthorityEpoch == authorityEpoch &&
+                               masterAuthorityRuntimeState.generation == operationGeneration &&
+                               matchingAttempt;
+          if (!durable || !current)
+          {
+            if (current)
+            {
+              masterAuthorityRuntimeState = std::move(previousRuntimeState);
+              masterAuthorityRuntimeStateDurable = previousDurable;
+              durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+            }
+            return;
+          }
 
-    if (recordIt->second.state == TaskExecutionState::retrying)
-    {
-      pushSpinApplicationProgressToMothership(deployment, "task attempt failed; retrying"_ctv);
-      // Re-enter the deployment's canonical target/placement/scheduling
-      // lifecycle after the completed attempt releases its placement counts.
-      deployment->deploy();
-      return;
-    }
+          auto deploymentIt = deployments.find(deploymentID);
+          auto containerIt = containers.find(containerUUID);
+          if (deploymentIt == deployments.end() || deploymentIt->second == nullptr ||
+              containerIt == containers.end() || containerIt->second == nullptr ||
+              containerIt->second->taskAttemptNumber != attemptNumber)
+          {
+            return;
+          }
+          ApplicationDeployment *currentDeployment = deploymentIt->second;
+          ContainerView *currentContainer = containerIt->second;
+          Machine *machine = machineUUID == 0 ? nullptr : findMachineByUUID(machineUUID);
+          if (machineUUID != 0 && (machine == nullptr || machine->neuron.ioGeneration != streamGeneration))
+          {
+            return;
+          }
+          if (machine != nullptr && neuronControlStreamActive(machine))
+          {
+            machine->queueSend(NeuronTopic::taskAttemptTerminalAck, deploymentID, attemptNumber);
+          }
+          const bool retrying = record->second.state == TaskExecutionState::retrying;
+          currentDeployment->taskAttemptContainerDone(currentContainer);
 
-    spinApplicationFin(deployment);
-    const uint64_t deploymentID = deployment->plan.config.deploymentID();
-    releaseRoutableResourceLeasesForDeployment(deploymentID);
-    ContainerStore::destroy(deploymentID);
-    deploymentPlans.erase(deploymentID);
-    deployments.erase(deploymentID);
-    delete deployment;
-    persistLocalRuntimeState();
+          if (retrying)
+          {
+            pushSpinApplicationProgressToMothership(currentDeployment, "task attempt failed; retrying"_ctv);
+            currentDeployment->deploy();
+            return;
+          }
+
+          spinApplicationFin(currentDeployment);
+          releaseRoutableResourceLeasesForDeployment(deploymentID);
+          ContainerStore::destroy(deploymentID);
+          deploymentPlans.erase(deploymentID);
+          deployments.erase(deploymentID);
+          delete currentDeployment;
+        });
   }
 
   void spinApplicationFin(ApplicationDeployment *deployment) override
@@ -28375,139 +29673,75 @@ public:
     return true;
   }
 
+  void reconcileManagedMachineSchemasAsync(std::function<void(bool, String, ClusterTopology)> completion)
+  {
+    String failure = {};
+    ClusterTopology currentTopology = {};
+    if (!weAreMaster || masterAuthorityRuntimeState.machineSchemas.empty())
+    {
+      if (!loadOrPersistAuthoritativeClusterTopology(currentTopology))
+        failure.assign("authoritative cluster topology unavailable after machine schema reconcile"_ctv);
+      completion(failure.empty(), std::move(failure), std::move(currentTopology));
+      return;
+    }
+    if (!loadOrPersistAuthoritativeClusterTopology(currentTopology))
+    {
+      completion(false, "authoritative cluster topology unavailable"_ctv, {});
+      return;
+    }
+    AddMachines request = {};
+    ManagedAddMachinesWork work = {};
+    if (!buildManagedMachineSchemaRequest(currentTopology, request, work, &failure))
+    {
+      completion(false, std::move(failure), {});
+      return;
+    }
+    if (work.createdMachines.empty() && request.removedMachines.empty())
+    {
+      completion(true, {}, std::move(currentTopology));
+      return;
+    }
+    addMachines(nullptr, std::move(request), std::move(work), nullptr,
+        [completion = std::move(completion), currentTopology = std::move(currentTopology)](AddMachines response) mutable {
+          completion(response.success, std::move(response.failure),
+                     response.hasTopology ? std::move(response.topology) : std::move(currentTopology));
+        });
+  }
+
   bool reconcileManagedMachineSchemas(
       String *failure = nullptr,
       ProdigyTimingAttribution *timingAttribution = nullptr,
       ClusterTopology *reconciledTopology = nullptr)
   {
-    if (failure)
-    {
-      failure->clear();
-    }
+    // Compatibility is for synchronous tests only. Live callers use the
+    // owning completion API above and never lend a stack response object.
+    auto receipt = std::make_shared<std::tuple<bool, String, ClusterTopology>>();
+    reconcileManagedMachineSchemasAsync([receipt](bool success, String asyncFailure, ClusterTopology topology) {
+      std::get<0>(*receipt) = success;
+      std::get<1>(*receipt) = std::move(asyncFailure);
+      std::get<2>(*receipt) = std::move(topology);
+    });
+    if (failure) *failure = std::get<1>(*receipt);
+    if (reconciledTopology) *reconciledTopology = std::get<2>(*receipt);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-    if (timingAttribution != nullptr)
-    {
-      *timingAttribution = {};
-    }
+    if (timingAttribution) *timingAttribution = {};
 #else
     (void)timingAttribution;
 #endif
-    auto loadReconciledTopologyOutput = [&](const String& topologyFailure) -> bool {
-      if (reconciledTopology == nullptr)
-      {
-        return true;
-      }
-
-      *reconciledTopology = {};
-      if (loadOrPersistAuthoritativeClusterTopology(*reconciledTopology))
-      {
-        return true;
-      }
-
-      if (failure)
-      {
-        failure->assign(topologyFailure);
-      }
-
-      return false;
-    };
-
-    PRODIGY_DEBUG_LOG( "prodigy managedSchemas-reconcile-begin master=%d schemas=%u\n",
-                 int(weAreMaster),
-                 uint32_t(masterAuthorityRuntimeState.machineSchemas.size()));
-    PRODIGY_DEBUG_FLUSH();
-    if (weAreMaster == false)
-    {
-      return loadReconciledTopologyOutput("authoritative cluster topology unavailable after machine schema reconcile"_ctv);
-    }
-
-    if (masterAuthorityRuntimeState.machineSchemas.empty())
-    {
-      return loadReconciledTopologyOutput("authoritative cluster topology unavailable after machine schema reconcile"_ctv);
-    }
-
-    ClusterTopology currentTopology = {};
-    if (loadOrPersistAuthoritativeClusterTopology(currentTopology) == false)
-    {
-      if (failure)
-      {
-        failure->assign("authoritative cluster topology unavailable"_ctv);
-      }
-      return false;
-    }
-
-    AddMachines request = {};
-    ManagedAddMachinesWork work = ManagedAddMachinesWork();
-    if (buildManagedMachineSchemaRequest(currentTopology, request, work, failure) == false)
-    {
-      return false;
-    }
-
-    PRODIGY_DEBUG_LOG( "prodigy managedSchemas-reconcile-built adopted=%u ready=%u removed=%u created=%u requiredBrains=%u topologyMachines=%u\n",
-                 uint32_t(request.adoptedMachines.size()),
-                 uint32_t(request.readyMachines.size()),
-                 uint32_t(request.removedMachines.size()),
-                 uint32_t(work.createdMachines.size()),
-                 unsigned(work.requiredBrainCount),
-                 uint32_t(currentTopology.machines.size()));
-    PRODIGY_DEBUG_FLUSH();
-
-    if (work.createdMachines.empty() && request.removedMachines.empty())
-    {
-      PRODIGY_DEBUG_LOG( "prodigy managedSchemas-reconcile-noop topologyMachines=%u\n",
-                   uint32_t(currentTopology.machines.size()));
-      PRODIGY_DEBUG_FLUSH();
-      if (reconciledTopology != nullptr)
-      {
-        *reconciledTopology = currentTopology;
-      }
-      return true;
-    }
-
-    AddMachines response = {};
-    PRODIGY_DEBUG_LOG( "prodigy managedSchemas-reconcile-dispatch created=%u removed=%u\n",
-                 uint32_t(work.createdMachines.size()),
-                 uint32_t(request.removedMachines.size()));
-    PRODIGY_DEBUG_FLUSH();
-    addMachines(nullptr, std::move(request), std::move(work), &response);
-    PRODIGY_DEBUG_LOG( "prodigy managedSchemas-reconcile-result success=%d failureBytes=%zu hasTopology=%d topologyMachines=%u\n",
-                 int(response.success),
-                 size_t(response.failure.size()),
-                 int(response.hasTopology),
-                 (response.hasTopology ? uint32_t(response.topology.machines.size()) : 0u));
-    PRODIGY_DEBUG_FLUSH();
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-    if (timingAttribution != nullptr && response.hasTimingAttribution)
-    {
-      *timingAttribution = response.timingAttribution;
-    }
-#endif
-    if (response.success == false)
-    {
-      if (failure)
-      {
-        *failure = response.failure;
-      }
-      return false;
-    }
-
-    if (reconciledTopology != nullptr)
-    {
-      if (response.hasTopology)
-      {
-        *reconciledTopology = std::move(response.topology);
-      }
-      else
-      {
-        *reconciledTopology = std::move(currentTopology);
-      }
-    }
-
-    return true;
+    return std::get<0>(*receipt);
   }
 
-  void addMachines(Mothership *mothership, AddMachines request, ManagedAddMachinesWork managedWork = ManagedAddMachinesWork(), AddMachines *capturedResponse = nullptr)
+  void addMachines(Mothership *mothership, AddMachines request, ManagedAddMachinesWork managedWork = ManagedAddMachinesWork(),
+                   AddMachines *capturedResponse = nullptr, std::function<void(AddMachines)> onCompleted = {})
   {
+    const std::weak_ptr<uint8_t> operationLifetime = persistenceLifetime;
+    const uint64_t operationEpoch = masterAuthorityEpoch;
+    const uint64_t responseStreamIncarnation = mothership ? mothership->connectionIncarnation : 0;
+    auto activeOperation = std::shared_ptr<uint64_t>(new uint64_t(0),
+        [this, operationLifetime](uint64_t *id) {
+          if (!operationLifetime.expired()) activeAddMachinesOperations.erase(*id);
+          delete id;
+        });
     AddMachines response = {};
     response.success = false;
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
@@ -28608,6 +29842,176 @@ public:
         String *failure = nullptr;
         bool incrementalCreatedBootstrapBlocking = false;
         bool incrementalCreatedBootstrapCoordinator = false;
+        uint32_t pendingReceipts = 0;
+        bool persistenceFailed = false;
+        std::function<void(bool)> persistenceCompletion = {};
+
+        void finishPersistenceReceipt(bool durable)
+        {
+          persistenceFailed |= !durable;
+          if (pendingReceipts > 0)
+          {
+            --pendingReceipts;
+          }
+          if (pendingReceipts == 0 && persistenceCompletion)
+          {
+            std::function<void(bool)> completion = std::move(persistenceCompletion);
+            persistenceCompletion = {};
+            completion(!persistenceFailed);
+          }
+        }
+
+        void bootstrapAfterDurableReceipt(ClusterMachine createdMachine)
+        {
+          if (owner == nullptr || request == nullptr || targetTopology == nullptr ||
+              machinesToBootstrap == nullptr || startedMachines == nullptr ||
+              pendingOperationID == nullptr || *pendingOperationID == 0 || failure == nullptr ||
+              failure->size() > 0)
+          {
+            finishPersistenceReceipt(false);
+            return;
+          }
+
+          if (prodigyFindClusterMachineByIdentity(*startedMachines, createdMachine) != nullptr)
+          {
+            (void)owner->erasePendingAddMachinesOperationBootstrapMachine(*pendingOperationID, createdMachine);
+            prodigyEraseClusterMachineByIdentity(*machinesToBootstrap, createdMachine);
+            finishPersistenceReceipt(true);
+            return;
+          }
+
+          if (prodigyFindClusterMachineByIdentity(*machinesToBootstrap, createdMachine) == nullptr)
+          {
+            machinesToBootstrap->push_back(createdMachine);
+          }
+
+          if (incrementalCreatedBootstrapCoordinator)
+          {
+            if (streamedBootstrapQueuedMachines != nullptr &&
+                prodigyFindClusterMachineByIdentity(*streamedBootstrapQueuedMachines, createdMachine) != nullptr)
+            {
+              finishPersistenceReceipt(true);
+              return;
+            }
+
+            String bootstrapFailure = {};
+            if (bootstrapCoordinator != nullptr && bootstrapBundleApprovalCache != nullptr &&
+                owner->queueClusterMachineBootstrapAsync(*bootstrapCoordinator, *bootstrapBundleApprovalCache,
+                                                         createdMachine, *request, *targetTopology, bootstrapFailure))
+            {
+#if PRODIGY_DEBUG
+              basics_log("addMachines incremental bootstrap-queued cloudID=%s op=%llu ssh=%s:%u mode=coordinator pendingTasks=%u openSockets=%u streamed=%u queued=%u started=%u\n",
+                         createdMachine.cloud.cloudID.c_str(),
+                         (unsigned long long)*pendingOperationID,
+                         createdMachine.ssh.address.c_str(),
+                         unsigned(createdMachine.ssh.port),
+                         unsigned(bootstrapCoordinator->pendingTasks),
+                         unsigned(bootstrapCoordinator->openSockets),
+                         uint32_t(streamedBootstrapQueuedMachines != nullptr ? streamedBootstrapQueuedMachines->size() : 0u),
+                         uint32_t(machinesToBootstrap->size()),
+                         uint32_t(startedMachines->size()));
+#endif
+              if (streamedBootstrapQueuedMachines != nullptr)
+              {
+                streamedBootstrapQueuedMachines->push_back(createdMachine);
+              }
+              finishPersistenceReceipt(true);
+              return;
+            }
+
+            failure->assign(bootstrapFailure.size() > 0 ? bootstrapFailure : "failed to queue streamed cluster bootstrap"_ctv);
+            finishPersistenceReceipt(false);
+            return;
+          }
+
+          String bootstrapFailure = {};
+#if PRODIGY_DEBUG
+          basics_log("addMachines incremental bootstrap-start cloudID=%s op=%llu ssh=%s:%u mode=blocking targetMachines=%u queued=%u started=%u\n",
+                     createdMachine.cloud.cloudID.c_str(),
+                     (unsigned long long)*pendingOperationID,
+                     createdMachine.ssh.address.c_str(),
+                     unsigned(createdMachine.ssh.port),
+                     uint32_t(targetTopology->machines.size()),
+                     uint32_t(machinesToBootstrap->size()),
+                     uint32_t(startedMachines->size()));
+#endif
+          if (owner->bootstrapClusterMachineBlocking(createdMachine, *request, *targetTopology,
+                                                     bootstrapFailure, bootstrapBundleApprovalCache))
+          {
+#if PRODIGY_DEBUG
+            basics_log("addMachines incremental bootstrap-ok cloudID=%s op=%llu ssh=%s:%u mode=blocking queued=%u started=%u\n",
+                       createdMachine.cloud.cloudID.c_str(),
+                       (unsigned long long)*pendingOperationID,
+                       createdMachine.ssh.address.c_str(),
+                       unsigned(createdMachine.ssh.port),
+                       uint32_t(machinesToBootstrap->size()),
+                       uint32_t(startedMachines->size() + 1));
+#endif
+            startedMachines->push_back(createdMachine);
+            prodigyEraseClusterMachineByIdentity(*machinesToBootstrap, createdMachine);
+            (void)owner->erasePendingAddMachinesOperationBootstrapMachine(*pendingOperationID, createdMachine);
+            finishPersistenceReceipt(true);
+            return;
+          }
+
+#if PRODIGY_DEBUG
+          basics_log("addMachines incremental bootstrap-failed cloudID=%s op=%llu ssh=%s:%u mode=blocking failure=%s\n",
+                     createdMachine.cloud.cloudID.c_str(),
+                     (unsigned long long)*pendingOperationID,
+                     createdMachine.ssh.address.c_str(),
+                     unsigned(createdMachine.ssh.port),
+                     bootstrapFailure.c_str());
+#endif
+          owner->stopClusterMachineBootstrap(createdMachine);
+          failure->assign(bootstrapFailure);
+          finishPersistenceReceipt(false);
+        }
+
+        void journalCreatedMachine(ClusterMachine createdMachine, bool queueForBootstrap,
+                                   bool bootstrapAfterReceipt)
+        {
+          if (owner == nullptr || pendingOperationID == nullptr || *pendingOperationID == 0 ||
+              owner->findPendingAddMachinesOperation(*pendingOperationID) == nullptr)
+          {
+            if (failure != nullptr && failure->size() == 0)
+            {
+              failure->assign("missing addMachines persistence operation"_ctv);
+            }
+            persistenceFailed = true;
+            return;
+          }
+
+          (void)owner->upsertPendingAddMachinesOperationMachine(
+              *pendingOperationID, createdMachine, queueForBootstrap, false, false);
+          const uint64_t authorityEpoch = owner->masterAuthorityEpoch;
+          const std::weak_ptr<uint8_t> lifetime = owner->persistenceLifetime;
+          ++pendingReceipts;
+          owner->commitMasterAuthorityStateChangeAsync(
+              [this, lifetime, authorityEpoch, createdMachine = std::move(createdMachine),
+               bootstrapAfterReceipt](bool durable) mutable {
+                if (lifetime.expired()) return;
+                if (!durable)
+                {
+                  if (failure != nullptr && failure->size() == 0)
+                  {
+                    failure->assign("failed to persist incremental created machine"_ctv);
+                  }
+                  finishPersistenceReceipt(false);
+                  return;
+                }
+                if (owner == nullptr || owner->masterAuthorityEpoch != authorityEpoch)
+                {
+                  finishPersistenceReceipt(false);
+                  return;
+                }
+                if (bootstrapAfterReceipt)
+                {
+                  bootstrapAfterDurableReceipt(std::move(createdMachine));
+                  return;
+                }
+                finishPersistenceReceipt(true);
+              });
+        }
 
       public:
 
@@ -28666,6 +30070,17 @@ public:
           incrementalCreatedBootstrapCoordinator = false;
         }
 
+        void awaitPersistence(std::function<void(bool)> completion)
+        {
+          if (!completion) return;
+          if (pendingReceipts == 0)
+          {
+            completion(!persistenceFailed);
+            return;
+          }
+          persistenceCompletion = std::move(completion);
+        }
+
         void reportMachineProvisioningAccepted(const String& cloudID) override
         {
           if ((incrementalCreatedBootstrapBlocking == false && incrementalCreatedBootstrapCoordinator == false) || owner == nullptr || request == nullptr || instruction == nullptr || machineConfig == nullptr || targetTopology == nullptr || pendingOperationID == nullptr || *pendingOperationID == 0 || failure == nullptr || failure->size() > 0 || cloudID.size() == 0)
@@ -28715,7 +30130,7 @@ public:
             }
           }
 
-          (void)owner->upsertPendingAddMachinesOperationMachine(*pendingOperationID, createdMachine, false);
+          journalCreatedMachine(std::move(createdMachine), false, false);
         }
 
         void reportMachineProvisioned(const Machine& machine) override
@@ -28788,91 +30203,7 @@ public:
                      createdMachine.ownedStorageMB);
 #endif
 
-          (void)owner->upsertPendingAddMachinesOperationMachine(*pendingOperationID, createdMachine, true);
-          if (prodigyFindClusterMachineByIdentity(*startedMachines, createdMachine) != nullptr)
-          {
-            (void)owner->erasePendingAddMachinesOperationBootstrapMachine(*pendingOperationID, createdMachine);
-            prodigyEraseClusterMachineByIdentity(*machinesToBootstrap, createdMachine);
-            return;
-          }
-
-          if (prodigyFindClusterMachineByIdentity(*machinesToBootstrap, createdMachine) == nullptr)
-          {
-            machinesToBootstrap->push_back(createdMachine);
-          }
-
-          if (incrementalCreatedBootstrapCoordinator)
-          {
-            if (streamedBootstrapQueuedMachines != nullptr && prodigyFindClusterMachineByIdentity(*streamedBootstrapQueuedMachines, createdMachine) != nullptr)
-            {
-              return;
-            }
-
-            String bootstrapFailure = {};
-            if (bootstrapCoordinator != nullptr && bootstrapBundleApprovalCache != nullptr && owner->queueClusterMachineBootstrapAsync(*bootstrapCoordinator, *bootstrapBundleApprovalCache, createdMachine, *request, *targetTopology, bootstrapFailure))
-            {
-#if PRODIGY_DEBUG
-              basics_log("addMachines incremental bootstrap-queued cloudID=%s op=%llu ssh=%s:%u mode=coordinator pendingTasks=%u openSockets=%u streamed=%u queued=%u started=%u\n",
-                         createdMachine.cloud.cloudID.c_str(),
-                         (unsigned long long)*pendingOperationID,
-                         createdMachine.ssh.address.c_str(),
-                         unsigned(createdMachine.ssh.port),
-                         unsigned(bootstrapCoordinator != nullptr ? bootstrapCoordinator->pendingTasks : 0u),
-                         unsigned(bootstrapCoordinator != nullptr ? bootstrapCoordinator->openSockets : 0u),
-                         uint32_t(streamedBootstrapQueuedMachines != nullptr ? streamedBootstrapQueuedMachines->size() : 0u),
-                         uint32_t(machinesToBootstrap->size()),
-                         uint32_t(startedMachines->size()));
-#endif
-              if (streamedBootstrapQueuedMachines != nullptr)
-              {
-                streamedBootstrapQueuedMachines->push_back(createdMachine);
-              }
-
-              return;
-            }
-
-            failure->assign(bootstrapFailure.size() > 0 ? bootstrapFailure : "failed to queue streamed cluster bootstrap"_ctv);
-            return;
-          }
-
-          String bootstrapFailure = {};
-#if PRODIGY_DEBUG
-          basics_log("addMachines incremental bootstrap-start cloudID=%s op=%llu ssh=%s:%u mode=blocking targetMachines=%u queued=%u started=%u\n",
-                     createdMachine.cloud.cloudID.c_str(),
-                     (unsigned long long)*pendingOperationID,
-                     createdMachine.ssh.address.c_str(),
-                     unsigned(createdMachine.ssh.port),
-                     uint32_t(targetTopology->machines.size()),
-                     uint32_t(machinesToBootstrap->size()),
-                     uint32_t(startedMachines->size()));
-#endif
-          if (owner->bootstrapClusterMachineBlocking(createdMachine, *request, *targetTopology, bootstrapFailure, bootstrapBundleApprovalCache))
-          {
-#if PRODIGY_DEBUG
-            basics_log("addMachines incremental bootstrap-ok cloudID=%s op=%llu ssh=%s:%u mode=blocking queued=%u started=%u\n",
-                       createdMachine.cloud.cloudID.c_str(),
-                       (unsigned long long)*pendingOperationID,
-                       createdMachine.ssh.address.c_str(),
-                       unsigned(createdMachine.ssh.port),
-                       uint32_t(machinesToBootstrap->size()),
-                       uint32_t(startedMachines->size() + 1));
-#endif
-            startedMachines->push_back(createdMachine);
-            prodigyEraseClusterMachineByIdentity(*machinesToBootstrap, createdMachine);
-            (void)owner->erasePendingAddMachinesOperationBootstrapMachine(*pendingOperationID, createdMachine);
-            return;
-          }
-
-#if PRODIGY_DEBUG
-          basics_log("addMachines incremental bootstrap-failed cloudID=%s op=%llu ssh=%s:%u mode=blocking failure=%s\n",
-                     createdMachine.cloud.cloudID.c_str(),
-                     (unsigned long long)*pendingOperationID,
-                     createdMachine.ssh.address.c_str(),
-                     unsigned(createdMachine.ssh.port),
-                     bootstrapFailure.c_str());
-#endif
-          owner->stopClusterMachineBootstrap(createdMachine);
-          failure->assign(bootstrapFailure);
+          journalCreatedMachine(std::move(createdMachine), true, true);
         }
 
         void reportMachineProvisioningProgress(const Vector<MachineProvisioningProgress>& progress) override
@@ -29112,9 +30443,22 @@ public:
             break;
           }
 
-          if (incrementalCreatedBootstrapSupported && pendingAddMachinesOperationID == 0)
+          if (pendingAddMachinesOperationID == 0)
           {
-            pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap);
+            pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap, false);
+            *activeOperation = pendingAddMachinesOperationID;
+            activeAddMachinesOperations.insert(pendingAddMachinesOperationID);
+            const bool admitted = co_await ProdigyHostCompletion<bool>([this](auto completion) {
+              commitMasterAuthorityStateChangeAsync(std::move(completion));
+            });
+            if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
+            if (!admitted)
+            {
+              erasePendingAddMachinesOperation(pendingAddMachinesOperationID, false, false);
+              pendingAddMachinesOperationID = 0;
+              response.failure.assign("failed to persist machine provisioning intent"_ctv);
+              break;
+            }
           }
 
           iaas->configureBootstrapSSHAccess(request.bootstrapSshUser, request.bootstrapSshKeyPackage, request.bootstrapSshHostKeyPackage, request.bootstrapSshPrivateKeyPath);
@@ -29162,6 +30506,17 @@ public:
           addMachinesProviderWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
 #endif
           iaas->configureProvisioningProgressSink(nullptr);
+          const bool progressDurable = co_await ProdigyHostCompletion<bool>([&provisioningProgressSink](auto completion) {
+            provisioningProgressSink.awaitPersistence(std::move(completion));
+          });
+          if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch)
+          {
+            for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
+            delete coro;
+            co_return;
+          }
+          if (!progressDurable && response.failure.empty())
+            response.failure.assign("failed to persist provisioned machine identity"_ctv);
           provisioningProgressSink.clearIncrementalCreatedBootstrap();
           delete coro;
 
@@ -29257,7 +30612,7 @@ public:
                 (void)upsertPendingAddMachinesOperationMachine(
                     pendingAddMachinesOperationID,
                     *normalizedMachine,
-                    bootstrapQueueContainsMachine(*normalizedMachine));
+                    bootstrapQueueContainsMachine(*normalizedMachine), false, false);
               }
             }
           }
@@ -29312,9 +30667,29 @@ public:
 
       if (readOnlyTopologyRequest == false)
       {
+        const bool journalWasNew = pendingAddMachinesOperationID == 0;
         if (response.failure.size() == 0 && pendingAddMachinesOperationID == 0)
         {
-          pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap);
+          pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap, false);
+          *activeOperation = pendingAddMachinesOperationID;
+          activeAddMachinesOperations.insert(pendingAddMachinesOperationID);
+        }
+
+        if (response.failure.empty() && pendingAddMachinesOperationID != 0)
+        {
+          const bool journalDurable = co_await ProdigyHostCompletion<bool>([this](auto completion) {
+            commitMasterAuthorityStateChangeAsync(std::move(completion));
+          });
+          if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
+          if (!journalDurable)
+          {
+            if (journalWasNew)
+            {
+              erasePendingAddMachinesOperation(pendingAddMachinesOperationID, false, false);
+              pendingAddMachinesOperationID = 0;
+            }
+            response.failure.assign("failed to persist machine bootstrap intent"_ctv);
+          }
         }
 
         auto rollbackBootstrapped = [this](const ClusterMachine& clusterMachine) -> void {
@@ -29424,6 +30799,23 @@ public:
         PRODIGY_DEBUG_FLUSH();
         targetTopology.version = currentTopology.version + 1;
 
+        PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-persist-topology version=%u machines=%u\n",
+                     uint32_t(targetTopology.version),
+                     uint32_t(targetTopology.machines.size()));
+        PRODIGY_DEBUG_FLUSH();
+        const std::weak_ptr<uint8_t> persistenceGuard = persistenceLifetime;
+        const uint64_t persistenceEpoch = masterAuthorityEpoch;
+        const bool topologyDurable = co_await ProdigyHostCompletion<bool>(
+            [this, topology = targetTopology](auto completion) mutable {
+              persistAuthoritativeClusterTopologyAsync(std::move(topology), std::move(completion));
+            });
+        if (persistenceGuard.expired() || masterAuthorityEpoch != persistenceEpoch) co_return;
+        if (topologyDurable == false)
+        {
+          response.failure.assign("failed to persist authoritative cluster topology"_ctv);
+        }
+        else
+        {
         PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-restore-brains version=%u brains=%u\n",
                      uint32_t(targetTopology.version),
                      uint32_t(clusterTopologyBrainCount(targetTopology)));
@@ -29439,16 +30831,6 @@ public:
         PRODIGY_DEBUG_FLUSH();
         initializeAllBrainPeersIfNeeded();
 
-        PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-persist-topology version=%u machines=%u\n",
-                     uint32_t(targetTopology.version),
-                     uint32_t(targetTopology.machines.size()));
-        PRODIGY_DEBUG_FLUSH();
-        if (persistAuthoritativeClusterTopology(targetTopology) == false)
-        {
-          response.failure.assign("failed to persist authoritative cluster topology"_ctv);
-        }
-        else
-        {
           PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-replicate-topology version=%u machines=%u\n",
                        uint32_t(targetTopology.version),
                        uint32_t(targetTopology.machines.size()));
@@ -29465,8 +30847,20 @@ public:
             PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-clear-pending operationID=%llu\n",
                          (unsigned long long)pendingAddMachinesOperationID);
             PRODIGY_DEBUG_FLUSH();
-            (void)erasePendingAddMachinesOperation(pendingAddMachinesOperationID);
-            pendingAddMachinesOperationID = 0;
+            const bool settled = co_await ProdigyHostCompletion<bool>([this, pendingAddMachinesOperationID](auto completion) {
+              erasePendingAddMachinesOperationAsync(pendingAddMachinesOperationID, std::move(completion));
+            });
+            if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
+            if (settled) pendingAddMachinesOperationID = 0;
+            else
+            {
+              // Topology already committed: retain the recovery journal and the
+              // live machines, and report the incomplete settlement truthfully.
+              response.success = false;
+              response.failure.assign("machine topology committed but journal settlement failed"_ctv);
+              cleanupProvisionedSnapshots(false);
+              goto addmachines_reply;
+            }
           }
         }
       }
@@ -29487,7 +30881,10 @@ public:
         cleanupProvisionedSnapshots(true);
         if (pendingAddMachinesOperationID > 0)
         {
-          (void)erasePendingAddMachinesOperation(pendingAddMachinesOperationID);
+          (void)co_await ProdigyHostCompletion<bool>([this, pendingAddMachinesOperationID](auto completion) {
+            erasePendingAddMachinesOperationAsync(pendingAddMachinesOperationID, std::move(completion));
+          });
+          if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
         }
       }
       else
@@ -29530,19 +30927,24 @@ public:
 
     if (response.success && managedWork.empty() && readOnlyTopologyRequest == false && weAreMaster)
     {
-      String managedFailure = {};
-      ClusterTopology managedTopology = {};
-      if (reconcileManagedMachineSchemas(&managedFailure, nullptr, &managedTopology) == false)
+      auto managedResult = co_await ProdigyHostCompletion<std::tuple<bool, String, ClusterTopology>>(
+          [this](auto completion) {
+            reconcileManagedMachineSchemasAsync([completion = std::move(completion)](bool success, String failure, ClusterTopology topology) mutable {
+              completion(std::make_tuple(success, std::move(failure), std::move(topology)));
+            });
+          });
+      if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
+      if (std::get<0>(managedResult) == false)
       {
         response.success = false;
         response.hasTopology = false;
         response.topology = {};
-        response.failure = managedFailure;
+        response.failure = std::move(std::get<1>(managedResult));
       }
       else
       {
         response.hasTopology = true;
-        response.topology = std::move(managedTopology);
+        response.topology = std::move(std::get<2>(managedResult));
       }
     }
     if (response.success && readOnlyTopologyRequest == false)
@@ -29550,11 +30952,13 @@ public:
       armMachineUpdateTimerIfNeeded();
     }
 
+  addmachines_reply:
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
     response.hasTimingAttribution = true;
     prodigyFinalizeTimingAttribution(Time::now<TimeResolution::ns>() - addMachinesStartNs, addMachinesProviderWaitNs, response.timingAttribution);
 #endif
-    bool streamActive = streamIsActive(mothership);
+    bool streamActive = mothership && activeMotherships.contains(mothership) &&
+        mothership->connectionIncarnation == responseStreamIncarnation && streamIsActive(mothership);
     if (streamActive)
     {
       String serializedResponse;
@@ -29593,28 +30997,51 @@ public:
         *capturedResponse = std::move(response);
       }
     }
+    if (onCompleted)
+    {
+      onCompleted(std::move(response));
+    }
   }
 
-  bool persistAndReplicateOperatorCancellation(FailedDeploymentRecord& record)
+  bytell_hash_set<uint64_t> pendingCancellationPersistence;
+
+  void persistAndReplicateOperatorCancellationAsync(FailedDeploymentRecord& record,
+                                                     PersistenceCompletion completion)
   {
-    if (masterAuthorityRuntimeState.generation == UINT64_MAX)
+    const uint64_t id = record.deploymentID;
+    if (masterAuthorityRuntimeState.generation == UINT64_MAX || pendingCancellationPersistence.contains(id))
     {
-      return false;
+      if (completion) completion(false);
+      return;
     }
     const uint64_t previousGeneration = record.cancellationGeneration;
     const uint64_t previousAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    const uint64_t epoch = masterAuthorityEpoch;
     record.cancellationGeneration = previousAuthorityGeneration + 1;
-    if (commitMasterAuthorityStateChange() == false)
-    {
-      record.cancellationGeneration = previousGeneration;
-      masterAuthorityRuntimeState.generation = previousAuthorityGeneration;
-      return false;
-    }
-
-    String serialized = {};
-    BitseryEngine::serialize(serialized, record);
-    queueBrainReplication(BrainTopic::replicateDeploymentCancellation, serialized);
-    return true;
+    const FailedDeploymentRecord candidate = record;
+    pendingCancellationPersistence.insert(id);
+    commitMasterAuthorityStateChangeAsync([this, id, epoch, previousGeneration, previousAuthorityGeneration,
+        candidate, completion = std::move(completion)](bool durable) mutable {
+      pendingCancellationPersistence.erase(id);
+      if (masterAuthorityEpoch != epoch) return;
+      auto current = failedDeployments.find(id);
+      if (current == failedDeployments.end() ||
+          !current->second.operationID.equals(candidate.operationID) ||
+          current->second.cancellationGeneration != candidate.cancellationGeneration) return;
+      if (!durable)
+      {
+        current->second.cancellationGeneration = previousGeneration;
+        if (masterAuthorityRuntimeState.generation == previousAuthorityGeneration + 1)
+          masterAuthorityRuntimeState.generation = previousAuthorityGeneration;
+      }
+      else
+      {
+        String serialized;
+        BitseryEngine::serialize(serialized, candidate);
+        queueBrainReplication(BrainTopic::replicateDeploymentCancellation, serialized);
+      }
+      if (completion) completion(durable);
+    });
   }
 
   bool deploymentHasRoutableResourceLease(uint64_t deploymentID) const
@@ -30021,6 +31448,7 @@ public:
 
   void finishOperatorCancellationAfterContainers(uint64_t deploymentID)
   {
+    if (pendingCancellationPersistence.contains(deploymentID)) return;
     auto failedIt = failedDeployments.find(deploymentID);
     if (failedIt == failedDeployments.end() || failedIt->second.hasOperatorCancellation == false)
     {
@@ -30112,29 +31540,27 @@ public:
     {
       const CancelDeploymentPhase previousPhase = record.cancellationPhase;
       record.cancellationPhase = CancelDeploymentPhase::containersTerminated;
-      if (persistAndReplicateOperatorCancellation(record) == false)
-      {
-        record.cancellationPhase = previousPhase;
-        return;
-      }
-      if (operatorCancellationDevCrashBarrier(record))
-      {
-        return;
-      }
+      persistAndReplicateOperatorCancellationAsync(record, [this, deploymentID, previousPhase](bool durable) {
+        auto current = failedDeployments.find(deploymentID);
+        if (current == failedDeployments.end()) return;
+        if (!durable) { current->second.cancellationPhase = previousPhase; return; }
+        if (!operatorCancellationDevCrashBarrier(current->second))
+          finishOperatorCancellationAfterContainers(deploymentID);
+      });
+      return;
     }
     if (uint8_t(record.cancellationPhase) < uint8_t(CancelDeploymentPhase::successorStarted))
     {
       const CancelDeploymentPhase previousPhase = record.cancellationPhase;
       record.cancellationPhase = CancelDeploymentPhase::successorStarted;
-      if (persistAndReplicateOperatorCancellation(record) == false)
-      {
-        record.cancellationPhase = previousPhase;
-        return;
-      }
-      if (operatorCancellationDevCrashBarrier(record))
-      {
-        return;
-      }
+      persistAndReplicateOperatorCancellationAsync(record, [this, deploymentID, previousPhase](bool durable) {
+        auto current = failedDeployments.find(deploymentID);
+        if (current == failedDeployments.end()) return;
+        if (!durable) { current->second.cancellationPhase = previousPhase; return; }
+        if (!operatorCancellationDevCrashBarrier(current->second))
+          finishOperatorCancellationAfterContainers(deploymentID);
+      });
+      return;
     }
 
     // The accepted record can outlive DNS/certbot work.  Validate again only
@@ -30171,12 +31597,20 @@ public:
       // launch, so an old resource owner can never be cleaned up underneath a
       // new public endpoint.
       releaseRoutableResourceLeasesForDeployment(deploymentID);
-      if (deploymentHasRoutableResourceLease(deploymentID) ||
-          commitMasterAuthorityStateChange() == false)
-      {
-        return;
-      }
-      successor->deploy();
+      if (deploymentHasRoutableResourceLease(deploymentID)) return;
+      const uint64_t successorID = record.successorDeploymentID;
+      const uint64_t epoch = masterAuthorityEpoch;
+      pendingCancellationPersistence.insert(deploymentID);
+      commitMasterAuthorityStateChangeAsync([this, epoch, deploymentID, successorID](bool durable) {
+        pendingCancellationPersistence.erase(deploymentID);
+        if (!durable || masterAuthorityEpoch != epoch) return;
+        auto current = deployments.find(successorID);
+        if (current == deployments.end() || !current->second || deploymentHasRoutableResourceLease(deploymentID)) return;
+        if (current->second->state == DeploymentState::waitingToDeploy || current->second->state == DeploymentState::none)
+          current->second->deploy();
+        finishOperatorCancellationAfterContainers(deploymentID);
+      });
+      return;
     }
     if (alreadyCompleted)
     {
@@ -30185,14 +31619,18 @@ public:
     const CancelDeploymentPhase previousPhase = record.cancellationPhase;
     record.cancellationPhase = CancelDeploymentPhase::completed;
     record.cancellationCompletedAtMs = Time::now<TimeResolution::ms>();
-    if (persistAndReplicateOperatorCancellation(record) == false)
-    {
-      record.cancellationPhase = previousPhase;
-      record.cancellationCompletedAtMs = 0;
-      return;
-    }
-    injectOperatorCancellationDevReplicationReorder(record);
-    (void)operatorCancellationDevCrashBarrier(record);
+    persistAndReplicateOperatorCancellationAsync(record, [this, deploymentID, previousPhase](bool durable) {
+      auto current = failedDeployments.find(deploymentID);
+      if (current == failedDeployments.end()) return;
+      if (!durable)
+      {
+        current->second.cancellationPhase = previousPhase;
+        current->second.cancellationCompletedAtMs = 0;
+        return;
+      }
+      injectOperatorCancellationDevReplicationReorder(current->second);
+      (void)operatorCancellationDevCrashBarrier(current->second);
+    });
   }
 
   void armOperatorCancellationContinuation(void)
@@ -30261,6 +31699,7 @@ public:
     }
     for (uint64_t deploymentID : deploymentIDs)
     {
+      if (pendingCancellationPersistence.contains(deploymentID)) continue;
       auto failedIt = failedDeployments.find(deploymentID);
       if (failedIt == failedDeployments.end() || failedIt->second.hasOperatorCancellation == false)
       {
@@ -30287,6 +31726,190 @@ public:
         deployment->reissueOperatorCancellationDestruction();
       }
     }
+  }
+
+protected:
+
+  // Production uses the immutable global container store.  Tests override
+  // this narrow path selector so a real Discombobulator blob never writes to
+  // /containers while exercising the same prepare/publish receipt path.
+  virtual const String *containerArtifactStoreRoot() const
+  {
+    return nullptr;
+  }
+
+  // Mothership update staging is normally the installed runtime path.  Tests
+  // use an isolated path while exercising the identical prepare/publish/fsync
+  // continuation, so they never alter the host bundle.
+  virtual String mothershipStagedBundlePath() const
+  {
+    return prodigyStagedBundlePath();
+  }
+
+public:
+
+  bool pendingMothershipSpinArtifactIsCurrent(const std::shared_ptr<PendingMothershipSpinArtifact>& pending)
+  {
+    return pending != nullptr && weAreMaster && pending->authorityEpoch == masterAuthorityEpoch &&
+           pending->stream != nullptr && activeMotherships.contains(pending->stream) &&
+           pending->stream->connectionIncarnation == pending->streamIncarnation &&
+           streamIsActive(pending->stream) && Ring::socketIsClosing(pending->stream) == false;
+  }
+
+  bool pendingMothershipSpinArtifactMatches(
+      const std::shared_ptr<PendingMothershipSpinArtifact>& pending,
+      Mothership *stream,
+      Message *message)
+  {
+    return pending != nullptr && stream != nullptr && message != nullptr && pending->stream == stream &&
+           pending->streamIncarnation == stream->connectionIncarnation &&
+           pending->authorityEpoch == masterAuthorityEpoch &&
+           pending->requestFrame.size() == message->size &&
+           memcmp(pending->requestFrame.data(), message, message->size) == 0;
+  }
+
+  // This is always dispatched through the same bounded artifact worker that
+  // created the stage.  Before publication it removes only this request's
+  // stage inode; a published immutable artifact remains available for an exact
+  // later replay and is never rolled back by a stale control stream.
+  void discardPendingMothershipSpinArtifact(const std::shared_ptr<PendingMothershipSpinArtifact>& pending)
+  {
+    if (pending == nullptr || pending->prepared.prepared == false || ensureArtifactIO() == false ||
+        artifactIO->continueWith(
+            [pending] { ContainerStore::discardPreparedAppArtifact(pending->prepared); },
+            [] {},
+            [](std::exception_ptr) {}) == false)
+    {
+      std::fprintf(stderr, "mothership spin artifact cleanup could not be queued deploymentID=%llu\n",
+                 (unsigned long long)(pending ? pending->deploymentID : 0));
+    }
+  }
+
+  void rejectPendingMothershipSpinArtifact(
+      const std::shared_ptr<PendingMothershipSpinArtifact>& pending,
+      const String& reason)
+  {
+    if (pending == nullptr) return;
+    const uint64_t deploymentID = pending->deploymentID;
+    if (pendingMothershipSpinArtifactIsCurrent(pending))
+    {
+      Message::construct(
+          pending->stream->wBuffer,
+          MothershipTopic::spinApplication,
+          uint8_t(SpinApplicationResponseCode::invalidPlan),
+          reason);
+      (void)flushActiveMothershipSendBuffer(pending->stream, "spin-artifact-reject");
+    }
+    discardPendingMothershipSpinArtifact(pending);
+    auto it = pendingMothershipSpinArtifacts.find(deploymentID);
+    if (it != pendingMothershipSpinArtifacts.end() && it->second == pending)
+    {
+      pendingMothershipSpinArtifacts.erase(it);
+    }
+  }
+
+  bool pendingMothershipUpdateArtifactIsCurrent(const std::shared_ptr<PendingMothershipUpdateArtifact>& pending)
+  {
+    return pending != nullptr && weAreMaster && pending->authorityEpoch == masterAuthorityEpoch &&
+           pending->stream != nullptr && activeMotherships.contains(pending->stream) &&
+           pending->stream->connectionIncarnation == pending->streamIncarnation &&
+           streamIsActive(pending->stream) && Ring::socketIsClosing(pending->stream) == false;
+  }
+
+  bool pendingMothershipUpdateArtifactMatches(
+      const std::shared_ptr<PendingMothershipUpdateArtifact>& pending,
+      Mothership *stream,
+      Message *message)
+  {
+    return pending != nullptr && stream != nullptr && message != nullptr && pending->stream == stream &&
+           pending->streamIncarnation == stream->connectionIncarnation && pending->authorityEpoch == masterAuthorityEpoch &&
+           pending->requestFrame.size() == message->size &&
+           memcmp(pending->requestFrame.data(), message, message->size) == 0;
+  }
+
+  void discardPendingMothershipUpdateArtifact(const std::shared_ptr<PendingMothershipUpdateArtifact>& pending)
+  {
+    if (pending == nullptr || pending->prepared.prepared == false || ensureArtifactIO() == false ||
+        artifactIO->continueWith(
+            [pending] { prodigyDiscardPreparedBundleArtifact(pending->prepared); },
+            [] {},
+            [](std::exception_ptr) {}) == false)
+    {
+      std::fprintf(stderr, "mothership update artifact cleanup could not be queued\n");
+    }
+  }
+
+  void rejectPendingMothershipUpdateArtifact(
+      const std::shared_ptr<PendingMothershipUpdateArtifact>& pending,
+      const String& reason)
+  {
+    if (pending == nullptr) return;
+    if (pendingMothershipUpdateArtifactIsCurrent(pending))
+    {
+      MothershipResponse response = {};
+      response.failure.assign(reason);
+      String serialized = {};
+      BitseryEngine::serialize(serialized, response);
+      Message::construct(pending->stream->wBuffer, MothershipTopic::updateProdigy, serialized);
+      (void)flushActiveMothershipSendBuffer(pending->stream, "update-artifact-reject");
+    }
+    discardPendingMothershipUpdateArtifact(pending);
+    if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+  }
+
+  template <typename Response>
+  void completeMachineSchemaMutation(Mothership *stream, MothershipTopic topic, Response response,
+                                      Vector<ProdigyManagedMachineSchema> previousSchemas)
+  {
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+    const uint64_t incarnation = stream->connectionIncarnation;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto reply = [this, lifetime, epoch, stream, incarnation, topic, response = std::move(response)]
+        (bool success, String failure, ClusterTopology topology) mutable {
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+      response.success = success;
+      response.failure = std::move(failure);
+      response.hasTopology = success;
+      response.topology = std::move(topology);
+      if (success) armMachineUpdateTimerIfNeeded();
+      if (!activeMotherships.contains(stream) || stream->connectionIncarnation != incarnation || !streamIsActive(stream)) return;
+      String payload;
+      BitseryEngine::serialize(payload, response);
+      Message::construct(stream->wBuffer, topic, payload);
+      (void)flushActiveMothershipSendBuffer(stream, "machine-schema-durable");
+    };
+    commitMasterAuthorityStateChangeAsync([this, epoch, generation, previousSchemas = std::move(previousSchemas),
+        reply = std::move(reply)](bool durable) mutable {
+      if (masterAuthorityEpoch != epoch) return;
+      if (!durable)
+      {
+        if (masterAuthorityRuntimeState.generation == generation)
+        {
+          syncManagedMachineSchemaConfigs(masterAuthorityRuntimeState.machineSchemas, previousSchemas);
+          masterAuthorityRuntimeState.machineSchemas = std::move(previousSchemas);
+        }
+        reply(false, "failed to persist machine schema mutation"_ctv, {});
+        return;
+      }
+      reconcileManagedMachineSchemasAsync(std::move(reply));
+    });
+  }
+
+  void resumeOwnedBrainConfiguration(const std::shared_ptr<PendingConfigureOwnershipReceipt>& pending)
+  {
+    if (pendingConfigureOwnershipReceipt != pending || pending == nullptr ||
+        masterAuthorityEpoch != pending->authorityEpoch ||
+        activeMotherships.contains(pending->stream) == false ||
+        pending->stream->connectionIncarnation != pending->streamIncarnation ||
+        streamIsActive(pending->stream) == false || Ring::socketIsClosing(pending->stream))
+    {
+      if (pendingConfigureOwnershipReceipt == pending) pendingConfigureOwnershipReceipt.reset();
+      return;
+    }
+    String frame = {};
+    Message::construct(frame, MothershipTopic::configure, pending->serializedConfig);
+    mothershipHandler(pending->stream, reinterpret_cast<Message *>(frame.data()));
   }
 
   void mothershipHandler(Mothership *mothership, Message *message)
@@ -30344,16 +31967,50 @@ public:
                        int(incomingConfig.vmImageURI.size() > 0));
           PRODIGY_DEBUG_FLUSH();
 
-          String ownershipFailure = {};
-          if (claimLocalClusterOwnership(incomingConfig.clusterUUID, &ownershipFailure) == false)
+          const uint64_t configureStreamIncarnation = mothership->connectionIncarnation;
+          const uint64_t configureAuthorityEpoch = masterAuthorityEpoch;
+          const bool ownershipAlreadyDurable = pendingConfigureOwnershipReceipt != nullptr &&
+              pendingConfigureOwnershipReceipt->ownershipDurable &&
+              pendingConfigureOwnershipReceipt->stream == mothership &&
+              pendingConfigureOwnershipReceipt->streamIncarnation == configureStreamIncarnation &&
+              pendingConfigureOwnershipReceipt->authorityEpoch == configureAuthorityEpoch;
+          if (ownershipAlreadyDurable == false)
           {
-            PRODIGY_DEBUG_LOG( "prodigy mothership configure-reject clusterUUID=%llu reason=%s\n",
-                         (unsigned long long)incomingConfig.clusterUUID,
-                         ownershipFailure.c_str());
-            PRODIGY_DEBUG_FLUSH();
-            queueCloseIfActive(mothership, "configure-owner-mismatch");
+            if (pendingConfigureOwnershipReceipt != nullptr)
+            {
+              queueCloseIfActive(mothership, "configure-ownership-pending");
+              break;
+            }
+            auto pending = std::make_shared<PendingConfigureOwnershipReceipt>();
+            pending->stream = mothership;
+            pending->streamIncarnation = configureStreamIncarnation;
+            pending->authorityEpoch = configureAuthorityEpoch;
+            BitseryEngine::serialize(pending->serializedConfig, incomingConfig);
+            pendingConfigureOwnershipReceipt = pending;
+            const std::weak_ptr<uint8_t> ownershipLifetime = persistenceLifetime;
+            const bool admitted = claimLocalClusterOwnershipAsync(
+                incomingConfig.clusterUUID, [this, pending, ownershipLifetime](bool owned) {
+                  if (ownershipLifetime.expired() || pendingConfigureOwnershipReceipt != pending) return;
+                  if (owned == false)
+                  {
+                    if (masterAuthorityEpoch == pending->authorityEpoch &&
+                        activeMotherships.contains(pending->stream) &&
+                        pending->stream->connectionIncarnation == pending->streamIncarnation)
+                      queueCloseIfActive(pending->stream, "configure-owner-mismatch");
+                    pendingConfigureOwnershipReceipt.reset();
+                    return;
+                  }
+                  pending->ownershipDurable = true;
+                  resumeOwnedBrainConfiguration(pending);
+                });
+            if (admitted == false && pendingConfigureOwnershipReceipt == pending)
+            {
+              pendingConfigureOwnershipReceipt.reset();
+              queueCloseIfActive(mothership, "configure-owner-unavailable");
+            }
             break;
           }
+          pendingConfigureOwnershipReceipt.reset();
 
           if (incomingConfig.runtimeEnvironment.configured() &&
               elasticAddressSagaFencesRuntimeEnvironment(incomingConfig.runtimeEnvironment))
@@ -30492,48 +32149,41 @@ public:
           }
 
           (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
-          if (commitMasterAuthorityStateChange() == false)
-          {
-            brainConfig = std::move(previousConfig);
-            masterAuthorityRuntimeState = std::move(previousMasterAuthorityState);
-            masterAuthorityRuntimeStateDurable = previousMasterAuthorityDurable;
-            durableMasterAuthorityRuntimeStateGeneration =
-                previousDurableMasterAuthorityGeneration;
-            (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
-            queueCloseIfActive(mothership, "configure-master-authority-persist-failed");
-            break;
-          }
-
-          loadBrainConfigIf();
-          refreshMachineFragmentAssignmentsIfPossible();
-          armMachineUpdateTimerIfNeeded();
-
-          if (noMasterYet)
-          {
-            deriveMasterBrain();
-          }
-
           String serializedBrainConfig;
           BitseryEngine::serialize(serializedBrainConfig, brainConfig);
-
-          PRODIGY_DEBUG_LOG( "prodigy mothership configure-response clusterUUID=%llu datacenter=%u autoscale=%u nMachineConfigs=%u nSubnets=%u bytes=%zu noMasterYet=%d master=%d osUpdatesEnabled=%d osUpdatePolicies=%u maxOSDrains=%u cadenceMins=%u\n",
-                       (unsigned long long)brainConfig.clusterUUID,
-                       unsigned(brainConfig.datacenterFragment),
-                       unsigned(brainConfig.autoscaleIntervalSeconds),
-                       uint32_t(brainConfig.configBySlug.size()),
-                       uint32_t(brainConfig.distributableExternalSubnets.size()),
-                       size_t(serializedBrainConfig.size()),
-                       int(noMasterYet),
-                       int(weAreMaster),
-                       int(brainConfig.osUpdatesEnabled),
-                       unsigned(brainConfig.osUpdatePolicies.size()),
-                       unsigned(brainConfig.maxOSDrains),
-                       unsigned(brainConfig.machineUpdateCadenceMins));
-          PRODIGY_DEBUG_FLUSH();
-          basics_log("configure sharedCPUOvercommitPermille=%u previous=%u\n",
-                     unsigned(brainConfig.sharedCPUOvercommitPermille),
-                     unsigned(previousSharedCPUOvercommitPermille));
-          Message::construct(mothership->wBuffer, MothershipTopic::configure, serializedBrainConfig);
+          const uint64_t configureEpoch = masterAuthorityEpoch;
+          const uint64_t streamIncarnation = mothership->connectionIncarnation;
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          commitMasterAuthorityStateChangeAsync(
+              [this, lifetime, mothership, streamIncarnation, configureEpoch,
+               candidateConfig = std::move(serializedBrainConfig), previousConfig = std::move(previousConfig),
+               previousMasterAuthorityState = std::move(previousMasterAuthorityState),
+               previousMasterAuthorityDurable, previousDurableMasterAuthorityGeneration,
+               previousSharedCPUOvercommitPermille](bool durable) mutable {
+                if (lifetime.expired() || masterAuthorityEpoch != configureEpoch) return;
+                String currentConfig;
+                BitseryEngine::serialize(currentConfig, brainConfig);
+                if (currentConfig.equals(candidateConfig) == false) return;
+                if (durable == false)
+                {
+                  brainConfig = std::move(previousConfig);
+                  masterAuthorityRuntimeState = std::move(previousMasterAuthorityState);
+                  masterAuthorityRuntimeStateDurable = previousMasterAuthorityDurable;
+                  durableMasterAuthorityRuntimeStateGeneration = previousDurableMasterAuthorityGeneration;
+                  (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+                  if (activeMotherships.contains(mothership) && mothership->connectionIncarnation == streamIncarnation)
+                    queueCloseIfActive(mothership, "configure-master-authority-persist-failed");
+                  return;
+                }
+                loadBrainConfigIf(); refreshMachineFragmentAssignmentsIfPossible(); armMachineUpdateTimerIfNeeded();
+                if (noMasterYet) deriveMasterBrain();
+                if (activeMotherships.contains(mothership) == false || mothership->connectionIncarnation != streamIncarnation ||
+                    streamIsActive(mothership) == false || Ring::socketIsClosing(mothership)) return;
+                basics_log("configure sharedCPUOvercommitPermille=%u previous=%u\n",
+                           unsigned(brainConfig.sharedCPUOvercommitPermille), unsigned(previousSharedCPUOvercommitPermille));
+                Message::construct(mothership->wBuffer, MothershipTopic::configure, candidateConfig);
+                (void)flushActiveMothershipSendBuffer(mothership, "configure-durable");
+              });
 
           break;
         }
@@ -30594,39 +32244,9 @@ public:
             if (response.failure.size() == 0)
             {
               syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
-              noteMasterAuthorityRuntimeStateChanged();
-
-              String reconcileFailure = {};
-              ClusterTopology reconciledTopology = {};
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-              ProdigyTimingAttribution reconcileTiming = {};
-              if (reconcileManagedMachineSchemas(&reconcileFailure, &reconcileTiming, &reconciledTopology) == false)
-#else
-              if (reconcileManagedMachineSchemas(&reconcileFailure, nullptr, &reconciledTopology) == false)
-#endif
-              {
-                PRODIGY_DEBUG_LOG( "prodigy mothership upsertMachineSchemas-reconcile-failure bytes=%zu text=%.*s\n",
-                             size_t(reconcileFailure.size()),
-                             int(reconcileFailure.size()),
-                             reconcileFailure.c_str());
-                PRODIGY_DEBUG_FLUSH();
-                response.failure = reconcileFailure;
-              }
-              else
-              {
-                response.hasTopology = true;
-                response.topology = std::move(reconciledTopology);
-              }
-
-              response.success = (response.failure.size() == 0);
-              if (response.success)
-              {
-                armMachineUpdateTimerIfNeeded();
-              }
-#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-              response.hasTimingAttribution = true;
-              response.timingAttribution = reconcileTiming;
-#endif
+              completeMachineSchemaMutation(mothership, MothershipTopic::upsertMachineSchemas,
+                                            std::move(response), std::move(previousSchemas));
+              break;
             }
           }
 
@@ -30648,28 +32268,17 @@ public:
           }
           else
           {
-            response.schema = request.schema;
+            response.schema.assign(request.schema);
+            auto previousSchemas = masterAuthorityRuntimeState.machineSchemas;
             if (prodigyDeltaManagedMachineBudget(masterAuthorityRuntimeState.machineSchemas, request.schema, request.delta, &response.budget, &response.failure) == false)
             {
               response.success = false;
             }
             else
             {
-              noteMasterAuthorityRuntimeStateChanged();
-
-              String reconcileFailure = {};
-              ClusterTopology reconciledTopology = {};
-              if (reconcileManagedMachineSchemas(&reconcileFailure, nullptr, &reconciledTopology) == false)
-              {
-                response.failure = reconcileFailure;
-              }
-              else
-              {
-                response.hasTopology = true;
-                response.topology = std::move(reconciledTopology);
-              }
-
-              response.success = (response.failure.size() == 0);
+              completeMachineSchemaMutation(mothership, MothershipTopic::deltaMachineBudget,
+                                            std::move(response), std::move(previousSchemas));
+              break;
             }
           }
 
@@ -30691,7 +32300,7 @@ public:
           }
           else
           {
-            response.schema = request.schema;
+            response.schema.assign(request.schema);
             Vector<ProdigyManagedMachineSchema> previousSchemas = masterAuthorityRuntimeState.machineSchemas;
             if (prodigyDeleteManagedMachineSchema(masterAuthorityRuntimeState.machineSchemas, request.schema, &response.removed, &response.failure) == false)
             {
@@ -30702,19 +32311,9 @@ public:
               if (response.removed)
               {
                 syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
-                noteMasterAuthorityRuntimeStateChanged();
-
-                String reconcileFailure = {};
-                ClusterTopology reconciledTopology = {};
-                if (reconcileManagedMachineSchemas(&reconcileFailure, nullptr, &reconciledTopology) == false)
-                {
-                  response.failure = reconcileFailure;
-                }
-                else
-                {
-                  response.hasTopology = true;
-                  response.topology = std::move(reconciledTopology);
-                }
+                completeMachineSchemaMutation(mothership, MothershipTopic::deleteMachineSchema,
+                                              std::move(response), std::move(previousSchemas));
+                break;
               }
               else if (loadOrPersistAuthoritativeClusterTopology(response.topology))
               {
@@ -30862,7 +32461,20 @@ public:
           }
           else
           {
-            (void)importACMELineage(request, response);
+            auto reply = std::make_shared<AcmeLineageImportResponse>();
+            const uint64_t epoch = masterAuthorityEpoch;
+            const uint64_t incarnation = mothership->connectionIncarnation;
+            if (importACMELineage(request, *reply, [this, mothership, epoch, incarnation, reply](bool durable) {
+              if (masterAuthorityEpoch != epoch || !activeMotherships.contains(mothership) ||
+                  mothership->connectionIncarnation != incarnation || !streamIsActive(mothership)) return;
+              reply->success = durable;
+              if (!durable) reply->failure.assign("failed to persist ACME lineage"_ctv);
+              String serialized;
+              BitseryEngine::serialize(serialized, *reply);
+              Message::construct(mothership->wBuffer, MothershipTopic::importACMELineage, serialized);
+              (void)flushActiveMothershipSendBuffer(mothership, "acme-lineage-durable");
+            })) break;
+            response = std::move(*reply);
           }
 
           String serializedResponse;
@@ -31511,44 +33123,179 @@ public:
       case MothershipTopic::updateProdigy:
         {
           // bundleBlob{4}
-
           String newBundle;
           Message::extractToStringView(args, newBundle);
+          auto sendFailure = [&](const String& failure) {
+            MothershipResponse response = {};
+            response.failure.assign(failure);
+            String serializedResponse = {};
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
+          };
+
+          std::shared_ptr<PendingMothershipUpdateArtifact> pending = pendingMothershipUpdateArtifact;
+          if (pending == nullptr)
+          {
+            pending = std::make_shared<PendingMothershipUpdateArtifact>();
+            pending->stream = mothership;
+            pending->streamIncarnation = mothership->connectionIncarnation;
+            pending->authorityEpoch = masterAuthorityEpoch;
+            pending->requestFrame = String(
+                reinterpret_cast<uint8_t *>(message), message->size, Copy::yes, message->size);
+            pending->stagedBundlePath = mothershipStagedBundlePath();
+            String ownedBundle(newBundle.data(), newBundle.size(), Copy::yes, newBundle.size());
+            pendingMothershipUpdateArtifact = pending;
+            if (pending->requestFrame.size() > UINT64_MAX - ownedBundle.size() || ensureArtifactIO() == false ||
+                artifactIO->submit(
+                    pending->requestFrame.size() + ownedBundle.size(),
+                    [pending, ownedBundle = std::move(ownedBundle)]() mutable {
+                      String digestFailure = {};
+                      if (prodigyComputeSHA256Hex(ownedBundle, pending->digest, &digestFailure) == false)
+                      {
+                        pending->failure.assign(digestFailure);
+                        return;
+                      }
+                      if (prodigyPrepareBundleArtifact(
+                              pending->prepared,
+                              pending->stagedBundlePath,
+                              ownedBundle,
+                              pending->digest,
+                              &pending->failure) == false && pending->failure.size() == 0)
+                      {
+                        pending->failure.assign("bundle artifact preparation failed"_ctv);
+                      }
+                    },
+                    [this, pending] {
+                      if (pendingMothershipUpdateArtifact != pending ||
+                          pendingMothershipUpdateArtifactIsCurrent(pending) == false)
+                      {
+                        discardPendingMothershipUpdateArtifact(pending);
+                        if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+                        return;
+                      }
+                      if (pending->prepared.prepared == false)
+                      {
+                        String failure = {};
+                        failure.snprintf<"bundle artifact preparation failed: {}"_ctv>(
+                            pending->failure.size() ? pending->failure : String("unknown"_ctv));
+                        rejectPendingMothershipUpdateArtifact(pending, failure);
+                        return;
+                      }
+                      pending->phase = PendingMothershipUpdateArtifact::Phase::prepared;
+                      mothershipHandler(pending->stream, reinterpret_cast<Message *>(pending->requestFrame.data()));
+                      (void)flushActiveMothershipSendBuffer(pending->stream, "update-artifact-prepared");
+                    },
+                    [this, pending](std::exception_ptr) {
+                      rejectPendingMothershipUpdateArtifact(
+                          pending, "bundle artifact preparation failed"_ctv);
+                    }) == false)
+            {
+              if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+              sendFailure("bundle artifact worker is unavailable or busy"_ctv);
+            }
+            break;
+          }
+
+          if (pendingMothershipUpdateArtifactMatches(pending, mothership, message) == false)
+          {
+            sendFailure("another bundle update is already staging"_ctv);
+            break;
+          }
+          if (pendingMothershipUpdateArtifactIsCurrent(pending) == false)
+          {
+            sendFailure("bundle update continuation is no longer authoritative"_ctv);
+            break;
+          }
+          if (pending->phase == PendingMothershipUpdateArtifact::Phase::preparing ||
+              pending->phase == PendingMothershipUpdateArtifact::Phase::fsyncing)
+          {
+            sendFailure("bundle update staging is still in progress"_ctv);
+            break;
+          }
+          if (pending->phase != PendingMothershipUpdateArtifact::Phase::prepared &&
+              pending->phase != PendingMothershipUpdateArtifact::Phase::published)
+          {
+            rejectPendingMothershipUpdateArtifact(pending, "bundle update continuation phase is invalid"_ctv);
+            break;
+          }
 
           MothershipResponse response = {};
-          String expectedWorkerDigest = {};
-          String digestFailure = {};
-          if (prodigyComputeSHA256Hex(newBundle, expectedWorkerDigest, &digestFailure) == false)
-          {
-            response.failure = digestFailure;
-          }
-
+          const String& expectedWorkerDigest = pending->digest;
           bytell_hash_set<uint128_t> requestedWorkers = {};
-          if (response.failure.empty())
+          for (Machine *machine : machines)
           {
-            for (Machine *machine : machines)
+            if (machine != nullptr && machine->isBrain == false && machine->uuid != 0)
             {
-              if (machine != nullptr && machine->isBrain == false && machine->uuid != 0)
-              {
-                requestedWorkers.insert(machine->uuid);
-              }
-            }
-            // A different digest must be rejected before staging or touching the
-            // durable incomplete operation. Otherwise a failed request can
-            // overwrite the resumable bundle and still be sent to workers.
-            if (requestedWorkers.empty() == false &&
-                updateSelfWorkerMachineUUIDs.empty() == false &&
-                updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() &&
-                updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
-            {
-              response.failure.assign("another worker bundle upgrade is incomplete"_ctv);
+              requestedWorkers.insert(machine->uuid);
             }
           }
-          if (response.failure.empty())
+          // Every incomplete coordinator is checked before the Ring publishes
+          // the new canonical bundle.  A rejected contender never overwrites
+          // a resumable worker or local bundle operation.
+          if (requestedWorkers.empty() == false &&
+              updateSelfWorkerMachineUUIDs.empty() == false &&
+              updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size() &&
+              updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
           {
-            String actualWorkerDigest = {};
-            (void)prodigyStageBundleWithExpectedSHA256(
-                prodigyStagedBundlePath(), newBundle, expectedWorkerDigest, actualWorkerDigest, &response.failure);
+            response.failure.assign("another worker bundle upgrade is incomplete"_ctv);
+          }
+          if (response.failure.empty() &&
+              (updateSelfMachineRecoveryWitnesses.empty() == false || updateSelfLocalMachineUUID != 0) &&
+              updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
+          {
+            response.failure.assign("another local bundle upgrade is incomplete"_ctv);
+          }
+          if (response.failure.empty() && pending->phase == PendingMothershipUpdateArtifact::Phase::prepared)
+          {
+            if (prodigyPublishPreparedBundleArtifact(pending->prepared, &pending->failure) == false)
+            {
+              String failure = {};
+              failure.snprintf<"bundle artifact publication failed: {}"_ctv>(
+                  pending->failure.size() ? pending->failure : String("unknown"_ctv));
+              rejectPendingMothershipUpdateArtifact(pending, failure);
+              break;
+            }
+            pending->phase = PendingMothershipUpdateArtifact::Phase::fsyncing;
+            if (artifactIO->continueWith(
+                    [pending] {
+                      pending->fsyncSucceeded = prodigyFsyncPublishedBundleArtifact(pending->prepared, &pending->failure);
+                    },
+                    [this, pending] {
+                      if (pendingMothershipUpdateArtifact != pending ||
+                          pendingMothershipUpdateArtifactIsCurrent(pending) == false)
+                      {
+                        discardPendingMothershipUpdateArtifact(pending);
+                        if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+                        return;
+                      }
+                      if (pending->fsyncSucceeded == false)
+                      {
+                        String failure = {};
+                        failure.snprintf<"bundle artifact durability sync failed: {}"_ctv>(
+                            pending->failure.size() ? pending->failure : String("unknown"_ctv));
+                        rejectPendingMothershipUpdateArtifact(pending, failure);
+                        return;
+                      }
+                      pending->phase = PendingMothershipUpdateArtifact::Phase::published;
+                      mothershipHandler(pending->stream, reinterpret_cast<Message *>(pending->requestFrame.data()));
+                      (void)flushActiveMothershipSendBuffer(pending->stream, "update-artifact-durable");
+                    },
+                    [this, pending](std::exception_ptr) {
+                      rejectPendingMothershipUpdateArtifact(
+                          pending, "bundle artifact durability sync failed"_ctv);
+                    }) == false)
+            {
+              pending->phase = PendingMothershipUpdateArtifact::Phase::prepared;
+              rejectPendingMothershipUpdateArtifact(
+                  pending, "bundle artifact durability sync could not be queued"_ctv);
+            }
+            break;
+          }
+          if (response.failure.empty() &&
+              (pending->phase != PendingMothershipUpdateArtifact::Phase::published || pending->fsyncSucceeded == false))
+          {
+            rejectPendingMothershipUpdateArtifact(pending, "bundle artifact durability receipt is missing"_ctv);
+            break;
           }
 
           uint32_t expectedPeerEchos = 0;
@@ -31577,55 +33324,60 @@ public:
                 expectedPeerEchos += 1;
               }
             }
-            if (response.success)
+            waitingForWorkers = requestedWorkers.empty() == false;
+            if (waitingForWorkers)
             {
-              waitingForWorkers = requestedWorkers.empty() == false;
-              if (waitingForWorkers)
+              // A same-digest command is a durable resume, not a second
+              // rollout. A different digest cannot overwrite a partial one.
+              if (updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false ||
+                  updateSelfWorkerMachineUUIDs.empty())
               {
-                // A same-digest command is a durable resume, not a second
-                // rollout. A different digest cannot overwrite a partial one.
-                if (updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false ||
-                         updateSelfWorkerMachineUUIDs.empty())
-                {
-                  updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
-                  updateSelfWorkerFailure.clear();
-                  updateSelfWorkerMachineUUIDs = std::move(requestedWorkers);
-                  updateSelfWorkerStagedMachineUUIDs.clear();
-                  updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
-                  updateSelfWorkerRebootedMachineUUIDs.clear();
-                  updateSelfWorkerStateUploadedMachineUUIDs.clear();
-                }
-                updateSelfBundleBlob.assign(newBundle);
-                updateSelfWorkerMothership = mothership;
+                updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
+                updateSelfWorkerFailure.clear();
+                updateSelfWorkerMachineUUIDs = std::move(requestedWorkers);
+                updateSelfWorkerStagedMachineUUIDs.clear();
+                updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
+                updateSelfWorkerRebootedMachineUUIDs.clear();
+                updateSelfWorkerStateUploadedMachineUUIDs.clear();
+              }
+              updateSelfBundleBlob.assign(newBundle);
+              updateSelfWorkerMothership = mothership;
+              persistUpdateSelfProgress([this] {
                 for (Machine *machine : machines)
                 {
-                  if (machine == nullptr || updateSelfWorkerMachineUUIDs.contains(machine->uuid) == false ||
+                  if (machine == nullptr || !updateSelfWorkerMachineUUIDs.contains(machine->uuid) ||
                       updateSelfWorkerStagedMachineUUIDs.contains(machine->uuid)) continue;
-                  Message::construct(machine->neuron.wBuffer, NeuronTopic::updateBundle, updateSelfBundleBlob, expectedWorkerDigest);
-                  if (neuronControlStreamActive(machine)) Ring::queueSend(&machine->neuron);
+                  (void)queueBundleToNeuron(&machine->neuron, updateSelfWorkerExpectedBundleSHA256);
                 }
-                noteMasterAuthorityRuntimeStateChanged();
                 completeWorkerBundleUpgradeIfReady();
-              }
-              else
+              });
+            }
+            else
+            {
+              updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
+              if (updateSelfMachineRecoveryWitnesses.empty() && updateSelfLocalMachineUUID == 0)
               {
-                if ((updateSelfMachineRecoveryWitnesses.empty() == false ||
-                     updateSelfLocalMachineUUID != 0) &&
-                    updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest) == false)
-                {
-                  response.success = false;
-                  response.failure.assign("another local bundle upgrade is incomplete"_ctv);
-                }
-                else
-                {
-                  updateSelfWorkerExpectedBundleSHA256 = expectedWorkerDigest;
-                  if (updateSelfMachineRecoveryWitnesses.empty() &&
-                      updateSelfLocalMachineUUID == 0 && prepareLocalBundleExecRecovery() == false)
+                const uint64_t epoch = masterAuthorityEpoch;
+                const uint64_t incarnation = mothership->connectionIncarnation;
+                prepareLocalBundleExecRecoveryAsync([this, epoch, incarnation, mothership, pending,
+                    expectedPeerEchos](bool durable) {
+                  if (masterAuthorityEpoch != epoch || !activeMotherships.contains(mothership) ||
+                      mothership->connectionIncarnation != incarnation || !streamIsActive(mothership)) return;
+                  MothershipResponse reply = {};
+                  reply.success = durable;
+                  if (!durable) reply.failure = updateSelfWorkerFailure;
+                  String payload;
+                  BitseryEngine::serialize(payload, reply);
+                  Message::construct(mothership->wBuffer, MothershipTopic::updateProdigy, payload);
+                  if (durable)
                   {
-                    response.success = false;
-                    response.failure = updateSelfWorkerFailure;
+                    updateSelfTransitionAfterMothershipAck = expectedPeerEchos == 0;
+                    beginUpdateSelfBundle(expectedPeerEchos);
                   }
-                }
+                  if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+                  (void)flushActiveMothershipSendBuffer(mothership, "bundle-recovery-durable");
+                });
+                break;
               }
             }
           }
@@ -31634,6 +33386,7 @@ public:
           {
             // Deliberately defer the response: success means every worker has
             // registered the requested installed digest and uploaded live state.
+            if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
             break;
           }
           String serializedResponse = {};
@@ -31641,6 +33394,7 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::updateProdigy, serializedResponse);
           if (response.success == false)
           {
+            if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
             break;
           }
 
@@ -31648,7 +33402,7 @@ public:
 
           // now wait for the echos
           beginUpdateSelfBundle(expectedPeerEchos);
-
+          if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
           break;
         }
       case MothershipTopic::reserveApplicationID:
@@ -31671,9 +33425,14 @@ public:
           }
           else
           {
-            response.applicationName = request.applicationName;
+            response.applicationName.assign(request.applicationName.data(), request.applicationName.size());
 
-            if (auto byName = reservedApplicationIDsByName.find(request.applicationName); byName != reservedApplicationIDsByName.end())
+            if (pendingReservedApplicationNames.contains(request.applicationName) ||
+                (request.requestedApplicationID != 0 && pendingReservedApplicationIDs.contains(request.requestedApplicationID)))
+            {
+              response.failure.assign("application reservation durability pending; retry"_ctv);
+            }
+            else if (auto byName = reservedApplicationIDsByName.find(request.applicationName); byName != reservedApplicationIDsByName.end())
             {
               response.applicationID = byName->second;
               if (request.requestedApplicationID != 0 && request.requestedApplicationID != response.applicationID)
@@ -31694,6 +33453,7 @@ public:
               }
               else
               {
+                const uint16_t previousNextApplicationID = nextReservableApplicationID;
                 uint16_t assignedApplicationID = 0;
                 if (request.requestedApplicationID != 0)
                 {
@@ -31717,15 +33477,57 @@ public:
                   }
                   else
                   {
-                    if (nBrains > 1)
-                    {
-                      queueBrainReplication(BrainTopic::replicateApplicationIDReservation, assignedApplicationID, request.applicationName);
-                    }
-
+                    pendingReservedApplicationNames.insert(String(request.applicationName.data(), request.applicationName.size(), Copy::yes, request.applicationName.size()));
+                    pendingReservedApplicationIDs.insert(assignedApplicationID);
                     response.applicationID = assignedApplicationID;
                     response.success = true;
                     response.created = true;
-                    persistLocalRuntimeState();
+                    const String candidateName(request.applicationName.data(), request.applicationName.size(), Copy::yes, request.applicationName.size());
+                    const uint64_t authorityEpoch = masterAuthorityEpoch;
+                    const uint64_t streamIncarnation = mothership->connectionIncarnation;
+                    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                    persistLocalRuntimeStateAsync(
+                        [this, lifetime, mothership, streamIncarnation, authorityEpoch, candidateName,
+                         assignedApplicationID, previousNextApplicationID,
+                         response = std::move(response)](bool durable) mutable {
+                          if (lifetime.expired()) return;
+                          pendingReservedApplicationNames.erase(candidateName);
+                          pendingReservedApplicationIDs.erase(assignedApplicationID);
+                          if (masterAuthorityEpoch != authorityEpoch) return;
+                          const auto candidate = reservedApplicationIDsByName.find(candidateName);
+                          const auto candidateID = reservedApplicationNamesByID.find(assignedApplicationID);
+                          const bool candidateCurrent = candidate != reservedApplicationIDsByName.end() &&
+                                                        candidate->second == assignedApplicationID &&
+                                                        candidateID != reservedApplicationNamesByID.end() &&
+                                                        candidateID->second.equals(candidateName);
+                          if (durable == false)
+                          {
+                            if (candidateCurrent)
+                            {
+                              reservedApplicationIDsByName.erase(candidateName);
+                              reservedApplicationNamesByID.erase(assignedApplicationID);
+                              nextReservableApplicationID = previousNextApplicationID;
+                            }
+                            response.success = false;
+                            response.created = false;
+                            response.failure.assign("failed to persist application reservation"_ctv);
+                          }
+                          else if (candidateCurrent && nBrains > 1)
+                          {
+                            queueBrainReplication(BrainTopic::replicateApplicationIDReservation,
+                                                  assignedApplicationID, candidateName);
+                          }
+
+                          if (activeMotherships.contains(mothership) == false ||
+                              mothership->connectionIncarnation != streamIncarnation ||
+                              streamIsActive(mothership) == false || Ring::socketIsClosing(mothership)) return;
+                          String serializedResponse = {};
+                          BitseryEngine::serialize(serializedResponse, response);
+                          Message::construct(mothership->wBuffer, MothershipTopic::reserveApplicationID,
+                                             serializedResponse);
+                      (void)flushActiveMothershipSendBuffer(mothership, "request-durable");
+                        });
+                    break;
                   }
                 }
               }
@@ -31772,6 +33574,11 @@ public:
               {
                 response.failure.assign("applicationID required"_ctv);
               }
+              else if (pendingReservedApplicationIDs.contains(applicationID) ||
+                       pendingServiceReservationApplications.contains(applicationID))
+              {
+                response.failure.assign("service reservation durability pending; retry"_ctv);
+              }
               else if (isApplicationIDReserved(applicationID) == false)
               {
                 response.failure.assign("applicationID not reserved"_ctv);
@@ -31785,9 +33592,9 @@ public:
                 }
                 else
                 {
-                  response.applicationName = request.applicationName;
+                  response.applicationName.assign(request.applicationName.data(), request.applicationName.size());
                 }
-                response.serviceName = request.serviceName;
+                response.serviceName.assign(request.serviceName.data(), request.serviceName.size());
 
                 ApplicationServiceIdentity existing;
                 if (resolveReservedApplicationService(applicationID, request.serviceName, existing))
@@ -31819,6 +33626,9 @@ public:
                   identity.applicationID = applicationID;
                   identity.serviceName = request.serviceName;
                   identity.kind = request.kind;
+                  const auto priorNextServiceSlot = nextReservableServiceSlotByApplication.find(applicationID);
+                  const bool hadPreviousNextServiceSlot = priorNextServiceSlot != nextReservableServiceSlotByApplication.end();
+                  const uint8_t previousNextServiceSlot = hadPreviousNextServiceSlot ? priorNextServiceSlot->second : 0;
 
                   if (request.kind == ApplicationServiceIdentity::Kind::unspecified)
                   {
@@ -31846,19 +33656,76 @@ public:
                     }
                     else
                     {
-                      if (nBrains > 1)
-                      {
-                        String serializedIdentity;
-                        BitseryEngine::serialize(serializedIdentity, identity);
-                        queueBrainReplication(BrainTopic::replicateApplicationServiceReservation, serializedIdentity);
-                      }
-
                       response.service = materializeReservedService(identity);
                       response.serviceSlot = identity.serviceSlot;
                       response.kind = identity.kind;
                       response.success = true;
                       response.created = true;
-                      persistLocalRuntimeState();
+                      ApplicationServiceIdentity candidate = identity;
+                      candidate.serviceName.assign(identity.serviceName.data(), identity.serviceName.size());
+                      const String candidateNameKey = makeReservedServiceNameKey(candidate.applicationID, candidate.serviceName);
+                      const uint64_t candidateService = materializeReservedService(candidate);
+                      const uint32_t candidateSlotKey = makeReservedServiceSlotKey(candidate.applicationID, candidate.serviceSlot);
+                      const uint64_t authorityEpoch = masterAuthorityEpoch;
+                      const uint64_t streamIncarnation = mothership->connectionIncarnation;
+                      const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                      pendingServiceReservationApplications.insert(applicationID);
+                      persistLocalRuntimeStateAsync(
+                          [this, lifetime, mothership, streamIncarnation, authorityEpoch, candidate = std::move(candidate),
+                           candidateNameKey, candidateService, candidateSlotKey, previousNextServiceSlot,
+                           hadPreviousNextServiceSlot, response = std::move(response)](bool durable) mutable {
+                            if (lifetime.expired()) return;
+                            pendingServiceReservationApplications.erase(candidate.applicationID);
+                            if (masterAuthorityEpoch != authorityEpoch) return;
+                            auto current = reservedApplicationServicesByNameKey.find(candidateNameKey);
+                            auto currentService = reservedApplicationServicesByID.find(candidateService);
+                            auto currentSlot = reservedApplicationServiceNamesBySlotKey.find(candidateSlotKey);
+                            const bool candidateCurrent = current != reservedApplicationServicesByNameKey.end() &&
+                                                          current->second.applicationID == candidate.applicationID &&
+                                                          current->second.serviceSlot == candidate.serviceSlot &&
+                                                          current->second.kind == candidate.kind &&
+                                                          current->second.serviceName.equals(candidate.serviceName) &&
+                                                          currentService != reservedApplicationServicesByID.end() &&
+                                                          currentService->second.serviceName.equals(candidate.serviceName) &&
+                                                          currentSlot != reservedApplicationServiceNamesBySlotKey.end() &&
+                                                          currentSlot->second.equals(candidate.serviceName);
+                            if (durable == false)
+                            {
+                              if (candidateCurrent)
+                              {
+                                reservedApplicationServicesByNameKey.erase(candidateNameKey);
+                                reservedApplicationServicesByID.erase(candidateService);
+                                reservedApplicationServiceNamesBySlotKey.erase(candidateSlotKey);
+                                if (hadPreviousNextServiceSlot)
+                                {
+                                  nextReservableServiceSlotByApplication.insert_or_assign(candidate.applicationID, previousNextServiceSlot);
+                                }
+                                else
+                                {
+                                  nextReservableServiceSlotByApplication.erase(candidate.applicationID);
+                                }
+                              }
+                              response.success = false;
+                              response.created = false;
+                              response.failure.assign("failed to persist service reservation"_ctv);
+                            }
+                            else if (candidateCurrent && nBrains > 1)
+                            {
+                              String serializedIdentity;
+                              BitseryEngine::serialize(serializedIdentity, candidate);
+                              queueBrainReplication(BrainTopic::replicateApplicationServiceReservation, serializedIdentity);
+                            }
+
+                            if (activeMotherships.contains(mothership) == false ||
+                                mothership->connectionIncarnation != streamIncarnation ||
+                                streamIsActive(mothership) == false || Ring::socketIsClosing(mothership)) return;
+                            String serializedResponse = {};
+                            BitseryEngine::serialize(serializedResponse, response);
+                            Message::construct(mothership->wBuffer, MothershipTopic::reserveServiceID,
+                                               serializedResponse);
+                      (void)flushActiveMothershipSendBuffer(mothership, "request-durable");
+                          });
+                      break;
                     }
                   }
                 }
@@ -31979,10 +33846,10 @@ public:
               }
               else
               {
-                factory.rootCertPem = request.importRootCertPem;
-                factory.rootKeyPem = request.importRootKeyPem;
-                factory.intermediateCertPem = request.importIntermediateCertPem;
-                factory.intermediateKeyPem = request.importIntermediateKeyPem;
+                factory.rootCertPem.assign(request.importRootCertPem);
+                factory.rootKeyPem.assign(request.importRootKeyPem);
+                factory.intermediateCertPem.assign(request.importIntermediateCertPem);
+                factory.intermediateKeyPem.assign(request.importIntermediateKeyPem);
               }
             }
 
@@ -32013,16 +33880,29 @@ public:
               response.mode = factory.keySourceMode;
               response.factoryGeneration = factory.factoryGeneration;
               response.effectiveLeafValidityDays = factory.defaultLeafValidityDays;
-
-              if (nBrains > 1)
-              {
-                String serializedFactory;
-                BitseryEngine::serialize(serializedFactory, factory);
-                queueBrainReplication(BrainTopic::replicateTlsVaultFactory, serializedFactory);
-              }
-
-              noteMasterAuthorityRuntimeStateChanged();
-              (void)pushPrivateTlsIdentityDeltaToLiveContainers(request.applicationID, "tls-vault-factory-upsert"_ctv);
+              const uint64_t epoch = masterAuthorityEpoch;
+              const uint64_t incarnation = mothership->connectionIncarnation;
+              const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+              commitMasterAuthorityStateChangeAsync(
+                  [this, lifetime, mothership, epoch, incarnation, created, factory,
+                   response = std::move(response)](bool durable) mutable {
+                    if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+                    auto current = tlsVaultFactoriesByApp.find(factory.applicationID);
+                    const bool candidateCurrent = current != tlsVaultFactoriesByApp.end() &&
+                                                  current->second.factoryGeneration == factory.factoryGeneration;
+                    if (durable && candidateCurrent)
+                    {
+                      if (nBrains > 1) { String serialized; BitseryEngine::serialize(serialized, factory); queueBrainReplication(BrainTopic::replicateTlsVaultFactory, serialized); }
+                      (void)pushPrivateTlsIdentityDeltaToLiveContainers(factory.applicationID, "tls-vault-factory-upsert"_ctv);
+                    }
+                    response.success = durable && candidateCurrent;
+                    if (!response.success) response.failure.assign("failed to persist tls vault factory"_ctv);
+                    if (activeMotherships.contains(mothership) == false || mothership->connectionIncarnation != incarnation || streamIsActive(mothership) == false) return;
+                    String serialized; BitseryEngine::serialize(serialized, response);
+                    Message::construct(mothership->wBuffer, MothershipTopic::upsertTlsVaultFactory, serialized);
+                    (void)flushActiveMothershipSendBuffer(mothership, "tls-factory-durable");
+                  });
+              break;
             }
           }
 
@@ -32049,6 +33929,10 @@ public:
           else if (request.applicationID == 0)
           {
             response.failure.assign("applicationID required"_ctv);
+          }
+          else if (pendingApiCredentialApplications.contains(request.applicationID))
+          {
+            response.failure.assign("api credential durability pending; retry"_ctv);
           }
           else
           {
@@ -32118,6 +34002,31 @@ public:
                 set.credentials.push_back(credential);
               }
 
+              // Deserialization may leave these Strings viewing the request
+              // frame. The persistence receipt outlives that frame.
+              for (ApiCredential& credential : set.credentials)
+              {
+                credential.name.assign(credential.name.data(), credential.name.size());
+                credential.provider.assign(credential.provider.data(), credential.provider.size());
+                credential.material.assign(credential.material.data(), credential.material.size());
+                bytell_hash_map<String, String> metadata;
+                for (const auto& [key, value] : credential.metadata)
+                {
+                  String ownedKey(key.data(), key.size(), Copy::yes, key.size());
+                  String ownedValue(value.data(), value.size(), Copy::yes, value.size());
+                  metadata.insert_or_assign(std::move(ownedKey), std::move(ownedValue));
+                }
+                credential.metadata = std::move(metadata);
+              }
+              for (String& name : response.updatedNames)
+              {
+                name.assign(name.data(), name.size());
+              }
+              for (String& name : response.removedNames)
+              {
+                name.assign(name.data(), name.size());
+              }
+
               set.setGeneration = nextSetGeneration;
               set.updatedAtMs = Time::now<TimeResolution::ms>();
               String dependencyFailure = {};
@@ -32131,35 +34040,65 @@ public:
               {
                 const ApplicationApiCredentialSet previousSet = created ? ApplicationApiCredentialSet {} : apiCredentialSetsByApp.find(request.applicationID)->second;
                 apiCredentialSetsByApp.insert_or_assign(request.applicationID, set);
+                response.setGeneration = set.setGeneration;
+                response.success = true;
+                const uint64_t authorityEpoch = masterAuthorityEpoch;
+                const uint64_t streamIncarnation = mothership->connectionIncarnation;
+                const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                String reason(request.reason.data(), request.reason.size(), Copy::yes, request.reason.size());
+                pendingApiCredentialApplications.insert(request.applicationID);
+                persistLocalRuntimeStateAsync(
+                    [this, lifetime, mothership, streamIncarnation, authorityEpoch, created,
+                     previousSet, candidate = set, reason = std::move(reason),
+                     response = std::move(response)](bool durable) mutable {
+                      if (lifetime.expired()) return;
+                      pendingApiCredentialApplications.erase(candidate.applicationID);
+                      if (masterAuthorityEpoch != authorityEpoch) return;
+                      auto current = apiCredentialSetsByApp.find(candidate.applicationID);
+                      const bool candidateCurrent = current != apiCredentialSetsByApp.end() &&
+                                                    current->second.setGeneration == candidate.setGeneration;
+                      if (durable == false)
+                      {
+                        if (candidateCurrent)
+                        {
+                          if (created)
+                          {
+                            apiCredentialSetsByApp.erase(candidate.applicationID);
+                          }
+                          else
+                          {
+                            apiCredentialSetsByApp.insert_or_assign(candidate.applicationID, previousSet);
+                          }
+                        }
+                        response.success = false;
+                        response.setGeneration = 0;
+                        response.failure.assign("failed to persist api credential set"_ctv);
+                        response.updatedNames.clear();
+                        response.removedNames.clear();
+                      }
+                      else if (candidateCurrent)
+                      {
+                        if (nBrains > 1)
+                        {
+                          String serializedSet;
+                          BitseryEngine::serialize(serializedSet, candidate);
+                          queueBrainReplication(BrainTopic::replicateApiCredentialSet, serializedSet);
+                        }
+                        (void)advanceApiCredentialExpiryNotices(Time::now<TimeResolution::ms>());
+                        pushApiCredentialDeltaToLiveContainers(candidate.applicationID, candidate,
+                                                               response.updatedNames, response.removedNames, reason);
+                      }
 
-                if (persistLocalRuntimeState() == false)
-                {
-                  if (created)
-                  {
-                    apiCredentialSetsByApp.erase(request.applicationID);
-                  }
-                  else
-                  {
-                    apiCredentialSetsByApp.insert_or_assign(request.applicationID, std::move(previousSet));
-                  }
-                  response.failure.assign("failed to persist api credential set"_ctv);
-                  response.updatedNames.clear();
-                  response.removedNames.clear();
-                }
-                else
-                {
-                  response.setGeneration = set.setGeneration;
-                  response.success = true;
-                  if (nBrains > 1)
-                  {
-                    String serializedSet;
-                    BitseryEngine::serialize(serializedSet, set);
-                    queueBrainReplication(BrainTopic::replicateApiCredentialSet, serializedSet);
-                  }
-
-                  (void)advanceApiCredentialExpiryNotices(Time::now<TimeResolution::ms>());
-                  pushApiCredentialDeltaToLiveContainers(request.applicationID, set, response.updatedNames, response.removedNames, request.reason);
-                }
+                      if (activeMotherships.contains(mothership) == false ||
+                          mothership->connectionIncarnation != streamIncarnation ||
+                          streamIsActive(mothership) == false || Ring::socketIsClosing(mothership)) return;
+                      String serializedResponse = {};
+                      BitseryEngine::serialize(serializedResponse, response);
+                      Message::construct(mothership->wBuffer, MothershipTopic::upsertApiCredentialSet,
+                                         serializedResponse);
+                      (void)flushActiveMothershipSendBuffer(mothership, "request-durable");
+                    });
+                break;
               }
             }
           }
@@ -32179,6 +34118,7 @@ public:
           ClientTlsMintResponse response;
           response.success = false;
           response.applicationID = 0;
+          bool deferredResponse = false;
 
           if (BitseryEngine::deserializeSafe(serializedRequest, request) == false)
           {
@@ -32195,7 +34135,7 @@ public:
           else
           {
             response.applicationID = request.applicationID;
-            response.name = request.name;
+            response.name.assign(request.name);
 
             auto factoryIt = tlsVaultFactoriesByApp.find(request.applicationID);
             if (factoryIt == tlsVaultFactoriesByApp.end())
@@ -32256,7 +34196,24 @@ public:
                     response.notBeforeMs = Time::now<TimeResolution::ms>();
                     response.notAfterMs = response.notBeforeMs + int64_t(validityDays) * 24 * 60 * 60 * 1000;
                     response.success = true;
-                    noteMasterAuthorityRuntimeStateChanged();
+                    const uint64_t previousGeneration = response.generation;
+                    const uint64_t epoch = masterAuthorityEpoch;
+                    const uint64_t incarnation = mothership->connectionIncarnation;
+                    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                    commitMasterAuthorityStateChangeAsync(
+                        [this, lifetime, mothership, epoch, incarnation, previousGeneration,
+                         response = std::move(response)](bool durable) mutable {
+                          if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+                          if (durable == false && nextMintedClientTlsGeneration == previousGeneration + 1)
+                            nextMintedClientTlsGeneration = previousGeneration;
+                          if (activeMotherships.contains(mothership) == false || mothership->connectionIncarnation != incarnation || streamIsActive(mothership) == false) return;
+                          response.success = durable;
+                          if (durable == false) response.failure.assign("failed to persist client tls identity"_ctv);
+                          String serialized; BitseryEngine::serialize(serialized, response);
+                          Message::construct(mothership->wBuffer, MothershipTopic::mintClientTlsIdentity, serialized);
+                          (void)flushActiveMothershipSendBuffer(mothership, "tls-mint-durable");
+                        });
+                    deferredResponse = true;
                   }
                   else
                   {
@@ -32284,6 +34241,7 @@ public:
             }
           }
 
+          if (deferredResponse) break;
           String serializedResponse;
           BitseryEngine::serialize(serializedResponse, response);
           Message::construct(mothership->wBuffer, MothershipTopic::mintClientTlsIdentity, serializedResponse);
@@ -32390,13 +34348,23 @@ public:
 
           BitseryEngine::deserialize(serializedPlan, deployment->plan);
           auto rejectInvalidPlan = [&](const String& reason) {
-            String message = reason.size() ? reason : String("invalid plan: unspecified admission failure"_ctv);
-            basics_log("spinApplication invalidPlan: %s\n", message.c_str());
+            String reasonText = reason.size() ? reason : String("invalid plan: unspecified admission failure"_ctv);
+            std::fprintf(stderr, "spinApplication invalidPlan: %s\n", reasonText.c_str());
+            auto pendingIt = pendingMothershipSpinArtifacts.find(deployment->plan.config.deploymentID());
+            if (pendingIt != pendingMothershipSpinArtifacts.end() &&
+                pendingMothershipSpinArtifactMatches(pendingIt->second, mothership, message) &&
+                (pendingIt->second->phase == PendingMothershipSpinArtifact::Phase::prepared ||
+                 pendingIt->second->phase == PendingMothershipSpinArtifact::Phase::published))
+            {
+              rejectPendingMothershipSpinArtifact(pendingIt->second, reasonText);
+              delete deployment;
+              return;
+            }
             Message::construct(
                 mothership->wBuffer,
                 MothershipTopic::spinApplication,
                 uint8_t(SpinApplicationResponseCode::invalidPlan),
-                message);
+                reasonText);
             delete deployment;
           };
           auto rejectInvalidPlanFailure = [&](const String& failure, const String& fallback) {
@@ -32663,23 +34631,138 @@ public:
             }
           }
 
-          // they might just reisuse the application with the same deployment ID again if it fails
-          if (auto it = failedDeployments.find(deployment->plan.config.deploymentID()); it != failedDeployments.end())
-          {
-            failedDeployments.erase(it);
-          }
-
           String containerBlob;
           Message::extractToStringView(args, containerBlob);
 
-          String trustedContainerBlobSHA256 = {};
-          uint64_t trustedContainerBlobBytes = containerBlob.size();
-          String digestFailure = {};
-          if (prodigyComputeSHA256Hex(containerBlob, trustedContainerBlobSHA256, &digestFailure) == false)
+          const uint64_t deploymentID = deployment->plan.config.deploymentID();
+          auto pendingIt = pendingMothershipSpinArtifacts.find(deploymentID);
+          std::shared_ptr<PendingMothershipSpinArtifact> pending =
+              (pendingIt == pendingMothershipSpinArtifacts.end()) ? nullptr : pendingIt->second;
+          if (pending == nullptr)
           {
-            rejectInvalidPlanFailure(digestFailure, "container blob sha256 computation failed without detail"_ctv);
+            // Hashing and staging a large Discombobulator artifact must never
+            // monopolize the Ring.  Keep the complete wire frame and copied
+            // artifact bytes owned by the worker; the continuation returns to
+            // this handler for all mutable Brain admission work.
+            pending = std::make_shared<PendingMothershipSpinArtifact>();
+            pending->stream = mothership;
+            pending->streamIncarnation = mothership->connectionIncarnation;
+            pending->authorityEpoch = masterAuthorityEpoch;
+            pending->deploymentID = deploymentID;
+            pending->requestFrame = String(
+                reinterpret_cast<uint8_t *>(message), message->size, Copy::yes, message->size);
+            if (const String *storeRoot = containerArtifactStoreRoot(); storeRoot != nullptr)
+            {
+              pending->storeRoot.assign(*storeRoot);
+            }
+            String ownedBlob(containerBlob.data(), containerBlob.size(), Copy::yes, containerBlob.size());
+            pendingMothershipSpinArtifacts.insert_or_assign(deploymentID, pending);
+
+            if (pending->requestFrame.size() > UINT64_MAX - ownedBlob.size() || ensureArtifactIO() == false || artifactIO->submit(
+                    pending->requestFrame.size() + ownedBlob.size(),
+                    [pending, ownedBlob = std::move(ownedBlob)]() mutable {
+                      String digestFailure = {};
+                      if (prodigyComputeSHA256Hex(ownedBlob, pending->expectedDigest, &digestFailure) == false)
+                      {
+                        pending->failure.assign(digestFailure);
+                        return;
+                      }
+                      pending->expectedBytes = ownedBlob.size();
+                      const String *storeRoot = pending->storeRoot.size() ? &pending->storeRoot : nullptr;
+                      String stagePath = ContainerStore::pathForContainerImage(pending->deploymentID, storeRoot);
+                      stagePath.append(".mothership-spin.XXXXXX"_ctv);
+                      stagePath.addNullTerminator();
+                      int stageFD = ::mkstemp(reinterpret_cast<char *>(stagePath.data()));
+                      if (stageFD < 0)
+                      {
+                        pending->failure.assign("container artifact stage creation failed"_ctv);
+                        return;
+                      }
+                      ::close(stageFD);
+                      const bool prepared = ContainerStore::prepareAppArtifactAtPath(
+                          pending->prepared,
+                          pending->deploymentID,
+                          stagePath,
+                          ownedBlob,
+                          pending->expectedDigest,
+                          pending->expectedBytes,
+                          &pending->failure,
+                          storeRoot);
+                      if (prepared == false)
+                      {
+                        (void)::unlink(stagePath.c_str());
+                        if (pending->failure.size() == 0)
+                        {
+                          pending->failure.assign("container artifact preparation failed"_ctv);
+                        }
+                      }
+                    },
+                    [this, pending] {
+                      auto current = pendingMothershipSpinArtifacts.find(pending->deploymentID);
+                      if (current == pendingMothershipSpinArtifacts.end() || current->second != pending ||
+                          pendingMothershipSpinArtifactIsCurrent(pending) == false)
+                      {
+                        discardPendingMothershipSpinArtifact(pending);
+                        if (current != pendingMothershipSpinArtifacts.end() && current->second == pending)
+                        {
+                          pendingMothershipSpinArtifacts.erase(current);
+                        }
+                        return;
+                      }
+                      if (pending->prepared.prepared == false)
+                      {
+                        String reason = {};
+                        reason.snprintf<"invalid container blob: {}"_ctv>(
+                            pending->failure.size() ? pending->failure : String("artifact preparation failed"_ctv));
+                        rejectPendingMothershipSpinArtifact(pending, reason);
+                        return;
+                      }
+                      pending->phase = PendingMothershipSpinArtifact::Phase::prepared;
+                      mothershipHandler(
+                          pending->stream,
+                          reinterpret_cast<Message *>(pending->requestFrame.data()));
+                      (void)flushActiveMothershipSendBuffer(pending->stream, "spin-artifact-prepared");
+                    },
+                    [this, pending](std::exception_ptr) {
+                      rejectPendingMothershipSpinArtifact(
+                          pending,
+                          "invalid container blob: artifact preparation failed"_ctv);
+                    }) == false)
+            {
+              auto current = pendingMothershipSpinArtifacts.find(deploymentID);
+              if (current != pendingMothershipSpinArtifacts.end() && current->second == pending)
+              {
+                pendingMothershipSpinArtifacts.erase(current);
+              }
+              rejectInvalidPlan("invalid container blob: artifact worker is unavailable or busy"_ctv);
+              return;
+            }
+            delete deployment;
             return;
           }
+
+          if (pendingMothershipSpinArtifactMatches(pending, mothership, message) == false ||
+              pendingMothershipSpinArtifactIsCurrent(pending) == false)
+          {
+            rejectInvalidPlan("invalid plan: container artifact continuation no longer owns this request"_ctv);
+            return;
+          }
+          if (pending->phase == PendingMothershipSpinArtifact::Phase::preparing ||
+              pending->phase == PendingMothershipSpinArtifact::Phase::publishing)
+          {
+            delete deployment;
+            return;
+          }
+          if (pending->phase != PendingMothershipSpinArtifact::Phase::prepared &&
+              pending->phase != PendingMothershipSpinArtifact::Phase::published)
+          {
+            rejectInvalidPlan("invalid plan: container artifact continuation phase is invalid"_ctv);
+            return;
+          }
+
+          String trustedContainerBlobSHA256 = {};
+          trustedContainerBlobSHA256.assign(pending->expectedDigest);
+          uint64_t trustedContainerBlobBytes = pending->expectedBytes;
 
           String taskFingerprint = {};
           if (deployment->plan.config.type == ApplicationType::task)
@@ -32708,7 +34791,8 @@ public:
               noteMasterAuthorityRuntimeStateChanged();
               existingTaskIt = masterAuthorityRuntimeState.taskExecutions.end();
             }
-            if (existingTaskIt != masterAuthorityRuntimeState.taskExecutions.end())
+            if (existingTaskIt != masterAuthorityRuntimeState.taskExecutions.end() &&
+                pending->taskAdmissionDurable == false)
             {
               TaskExecutionRecord& existing = existingTaskIt->second;
               if (existing.fingerprint != taskFingerprint)
@@ -32738,6 +34822,16 @@ public:
                 progress.snprintf<"attached to existing task execution state={} attempt={}"_ctv>(String(prodigyTaskExecutionStateName(existing.state)), existing.currentAttemptNumber);
                 Message::construct(stream->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::progress), progress);
               }
+              // This is an idempotent task attachment, not admission of the
+              // newly staged blob.  Its private stage must not survive the
+              // replayed request; an already published immutable final stays
+              // available for an exact later replay.
+              discardPendingMothershipSpinArtifact(pending);
+              auto pendingTask = pendingMothershipSpinArtifacts.find(deploymentID);
+              if (pendingTask != pendingMothershipSpinArtifacts.end() && pendingTask->second == pending)
+              {
+                pendingMothershipSpinArtifacts.erase(pendingTask);
+              }
               delete deployment;
               return;
             }
@@ -32747,28 +34841,75 @@ public:
 
           String expectedContainerBlobSHA256 = trustedContainerBlobSHA256;
           uint64_t expectedContainerBlobBytes = trustedContainerBlobBytes;
-          String containerStoreFailure = {};
-          if (ContainerStore::store(
-                  deployment->plan.config.deploymentID(),
-                  containerBlob,
-                  &trustedContainerBlobSHA256,
-                  &trustedContainerBlobBytes,
-                  &expectedContainerBlobSHA256,
-                  &expectedContainerBlobBytes,
-                  &containerStoreFailure) == false)
+          if (pending->phase == PendingMothershipSpinArtifact::Phase::prepared)
           {
-            String reason = {};
-            reason.assign("invalid container blob: "_ctv);
-            if (containerStoreFailure.size() > 0)
+            // Every domain preflight above has completed on the Ring.  Grant
+            // publication only now, then re-enter after the worker's
+            // no-replace link/fsync receipt is available.
+            pending->phase = PendingMothershipSpinArtifact::Phase::publishing;
+            delete deployment;
+            if (artifactIO->continueWith(
+                    [pending] {
+                      if (ContainerStore::publishPreparedAppArtifact(pending->prepared, &pending->failure) == false &&
+                          pending->failure.size() == 0)
+                      {
+                        pending->failure.assign("container artifact publish failed"_ctv);
+                      }
+                    },
+                    [this, pending] {
+                      auto current = pendingMothershipSpinArtifacts.find(pending->deploymentID);
+                      if (current == pendingMothershipSpinArtifacts.end() || current->second != pending ||
+                          pendingMothershipSpinArtifactIsCurrent(pending) == false)
+                      {
+                        discardPendingMothershipSpinArtifact(pending);
+                        if (current != pendingMothershipSpinArtifacts.end() && current->second == pending)
+                        {
+                          pendingMothershipSpinArtifacts.erase(current);
+                        }
+                        return;
+                      }
+                      if (pending->prepared.published == false)
+                      {
+                        String reason = {};
+                        reason.snprintf<"invalid container blob: {}"_ctv>(
+                            pending->failure.size() ? pending->failure : String("artifact publication failed"_ctv));
+                        rejectPendingMothershipSpinArtifact(pending, reason);
+                        return;
+                      }
+                      pending->phase = PendingMothershipSpinArtifact::Phase::published;
+                      mothershipHandler(
+                          pending->stream,
+                          reinterpret_cast<Message *>(pending->requestFrame.data()));
+                      (void)flushActiveMothershipSendBuffer(pending->stream, "spin-artifact-published");
+                    },
+                    [this, pending](std::exception_ptr) {
+                      rejectPendingMothershipSpinArtifact(
+                          pending,
+                          "invalid container blob: artifact publication failed"_ctv);
+                    }) == false)
             {
-              reason.append(containerStoreFailure);
+              pending->phase = PendingMothershipSpinArtifact::Phase::prepared;
+              rejectPendingMothershipSpinArtifact(
+                  pending,
+                  "invalid container blob: artifact publication could not be queued"_ctv);
             }
-            else
-            {
-              reason.append("blob store rejected the payload"_ctv);
-            }
-            rejectInvalidPlan(reason);
             return;
+          }
+
+          if (pending->phase != PendingMothershipSpinArtifact::Phase::published ||
+              ContainerStore::adoptPreparedAppArtifact(pending->prepared) == false)
+          {
+            rejectPendingMothershipSpinArtifact(
+                pending,
+                "invalid container blob: artifact publication identity changed before admission"_ctv);
+            delete deployment;
+            return;
+          }
+          // A failed record is removed only after the exact artifact has been
+          // published and adopted by this authoritative Ring owner.
+          if (auto it = failedDeployments.find(deployment->plan.config.deploymentID()); it != failedDeployments.end())
+          {
+            failedDeployments.erase(it);
           }
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
@@ -32783,8 +34924,11 @@ public:
             rejectInvalidPlan("invalid plan: materialized stateful recovery retry target does not match its durable authorization"_ctv);
             return;
           }
-          if (deployment->plan.config.type == ApplicationType::task)
+          if (deployment->plan.config.type == ApplicationType::task && !pending->taskAdmissionDurable)
           {
+            const ProdigyMasterAuthorityRuntimeState previousRuntimeState = masterAuthorityRuntimeState;
+            const bool previousDurable = masterAuthorityRuntimeStateDurable;
+            const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
             TaskExecutionRecord record = {};
             record.executionID = deployment->plan.config.deploymentID();
             record.applicationID = deployment->plan.config.applicationID;
@@ -32795,7 +34939,47 @@ public:
             record.acceptedAtMs = Time::now<TimeResolution::ms>();
             record.updatedAtMs = record.acceptedAtMs;
             masterAuthorityRuntimeState.taskExecutions.insert_or_assign(record.executionID, record);
-            noteMasterAuthorityRuntimeStateChanged();
+            const uint64_t authorityEpoch = masterAuthorityEpoch;
+            const uint64_t operationGeneration = masterAuthorityRuntimeState.generation + 1;
+            const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+            commitMasterAuthorityStateChangeAsync(
+                [this, lifetime, pending, previousRuntimeState, previousDurable,
+                 previousDurableGeneration, authorityEpoch, operationGeneration,
+                 deploymentID](bool durable) mutable {
+                  if (lifetime.expired()) return;
+                  auto currentPending = pendingMothershipSpinArtifacts.find(deploymentID);
+                  auto record = masterAuthorityRuntimeState.taskExecutions.find(deploymentID);
+                  const bool current = masterAuthorityEpoch == authorityEpoch &&
+                                       masterAuthorityRuntimeState.generation == operationGeneration &&
+                                       currentPending != pendingMothershipSpinArtifacts.end() &&
+                                       currentPending->second == pending &&
+                                       record != masterAuthorityRuntimeState.taskExecutions.end() &&
+                                       record->second.state == TaskExecutionState::accepted;
+                  if (!durable || !current)
+                  {
+                    if (current)
+                    {
+                      masterAuthorityRuntimeState = std::move(previousRuntimeState);
+                      masterAuthorityRuntimeStateDurable = previousDurable;
+                      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                    }
+                    rejectPendingMothershipSpinArtifact(
+                        pending, "invalid plan: task execution acceptance was not durably recorded"_ctv);
+                    return;
+                  }
+                  if (pendingMothershipSpinArtifactIsCurrent(pending) == false)
+                  {
+                    discardPendingMothershipSpinArtifact(pending);
+                    pendingMothershipSpinArtifacts.erase(deploymentID);
+                    return;
+                  }
+                  pending->taskAdmissionDurable = true;
+                  mothershipHandler(pending->stream,
+                      reinterpret_cast<Message *>(pending->requestFrame.data()));
+                  (void)flushActiveMothershipSendBuffer(pending->stream, "task-admission-durable");
+                });
+            delete deployment;
+            return;
           }
           if (reserveDeploymentWormholeAddressLeases(deployment->plan, wormholeLeaseFailure, true) == false)
           {
@@ -32829,6 +35013,12 @@ public:
           // The deploy CLI waits for the initial okay/invalidPlan frame before it starts
           // consuming streamed progress on the same topic.
           (void)startDeploymentAfterAuthoritativeReplication(deployment);
+
+          auto admittedPending = pendingMothershipSpinArtifacts.find(deploymentID);
+          if (admittedPending != pendingMothershipSpinArtifacts.end() && admittedPending->second == pending)
+          {
+            pendingMothershipSpinArtifacts.erase(admittedPending);
+          }
 
           break;
         }
@@ -32880,14 +35070,35 @@ public:
                 ProdigyMasterAuthorityRuntimeState previous = masterAuthorityRuntimeState;
                 const bool previousDurable = masterAuthorityRuntimeStateDurable;
                 const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+                const uint64_t candidateGeneration = masterAuthorityRuntimeState.generation + 1;
                 existing.acknowledged = true;
-                if (commitMasterAuthorityStateChange() == false)
-                {
-                  masterAuthorityRuntimeState = std::move(previous);
-                  masterAuthorityRuntimeStateDurable = previousDurable;
-                  durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
-                  break;
-                }
+                const uint64_t epoch = masterAuthorityEpoch;
+                const uint64_t incarnation = mothership->connectionIncarnation;
+                const uint64_t stableID = payload.notice.stableID;
+                const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+                commitMasterAuthorityStateChangeAsync(
+                    [this, lifetime, mothership, epoch, incarnation, stableID, candidateGeneration,
+                     previous = std::move(previous), previousDurable, previousDurableGeneration](bool durable) mutable {
+                      if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
+                      auto current = std::find_if(masterAuthorityRuntimeState.apiCredentialExpiryNotices.begin(),
+                                                  masterAuthorityRuntimeState.apiCredentialExpiryNotices.end(),
+                                                  [stableID](const ApiCredentialExpiryNotice& notice) { return notice.stableID == stableID; });
+                      if (durable == false)
+                      {
+                        if (current != masterAuthorityRuntimeState.apiCredentialExpiryNotices.end() && current->acknowledged &&
+                            masterAuthorityRuntimeState.generation == candidateGeneration)
+                        {
+                          masterAuthorityRuntimeState = std::move(previous);
+                          masterAuthorityRuntimeStateDurable = previousDurable;
+                          durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                        }
+                        return;
+                      }
+                      if (current != masterAuthorityRuntimeState.apiCredentialExpiryNotices.end() && current->acknowledged &&
+                          activeMotherships.contains(mothership) && mothership->connectionIncarnation == incarnation)
+                        mothership->queuedApiCredentialExpiryNoticeIDs.erase(stableID);
+                    });
+                break;
               }
               acknowledged = true;
               break;
@@ -32927,6 +35138,7 @@ public:
             reject("invalid materialized stateful recovery request");
             break;
           }
+          if (pendingMaterializedRecoveryPersistence.contains(request.operationID)) break;
           response = request;
           response.success = false;
           response.failure.clear();
@@ -33075,17 +35287,49 @@ public:
             retry.source.captureSHA256 = request.captureSHA256;
             retry.updatedAtMs = Time::now<TimeResolution::ms>();
             masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.push_back(std::move(retry));
-            if (commitMasterAuthorityStateChange() == false)
-            {
-              masterAuthorityRuntimeState = before;
-              masterAuthorityRuntimeStateDurable = wasDurable;
-              durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
-              reject("materialized stateful recovery retry durable acceptance failed");
-              break;
-            }
-            response.success = true;
-            response.durableGeneration = masterAuthorityRuntimeState.generation;
-            reply();
+            const uint64_t epoch = masterAuthorityEpoch;
+            const uint64_t incarnation = mothership->connectionIncarnation;
+            String operationID(request.operationID.data(), request.operationID.size(), Copy::yes, request.operationID.size());
+            const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+            const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+            String replyIdentity;
+            BitseryEngine::serialize(replyIdentity, response);
+            pendingMaterializedRecoveryPersistence.insert(operationID);
+            commitMasterAuthorityStateChangeAsync(
+                [this, lifetime, mothership, epoch, incarnation, operationID = std::move(operationID),
+                 before = std::move(before), wasDurable, durableGeneration, generation,
+                 replyIdentity = std::move(replyIdentity)](bool durable) mutable {
+                  if (lifetime.expired()) return;
+                  pendingMaterializedRecoveryPersistence.erase(operationID);
+                  if (masterAuthorityEpoch != epoch) return;
+                  auto current = std::find_if(masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.begin(),
+                                              masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.end(),
+                                              [&operationID](const ProdigyMaterializedStatefulRecoveryRetry& retry) {
+                                                return retry.operationID.equals(operationID);
+                                              });
+                  const bool candidateCurrent = current != masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.end();
+                  if (!durable && candidateCurrent)
+                  {
+                    if (masterAuthorityRuntimeState.generation == generation)
+                    {
+                      masterAuthorityRuntimeState = std::move(before);
+                      masterAuthorityRuntimeStateDurable = wasDurable;
+                      durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+                    }
+                    else masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.erase(current);
+                  }
+                  if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation ||
+                      !streamIsActive(mothership) || Ring::socketIsClosing(mothership)) return;
+                  RecoverMaterializedStatefulDeployment response = {};
+                  BitseryEngine::deserializeSafe(replyIdentity, response);
+                  response.success = durable && candidateCurrent;
+                  if (response.success) response.durableGeneration = generation;
+                  else response.failure.assign("materialized stateful recovery retry durable acceptance failed"_ctv);
+                  String payload = {};
+                  BitseryEngine::serialize(payload, response);
+                  Message::construct(mothership->wBuffer, MothershipTopic::recoverMaterializedStatefulDeployment, payload);
+                  (void)flushActiveMothershipSendBuffer(mothership, "recovery-retry-durable");
+                });
             break;
           }
 
@@ -33156,25 +35400,52 @@ public:
           operation.started = true;
           operation.updatedAtMs = Time::now<TimeResolution::ms>();
           masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(std::move(operation));
-          if (commitMasterAuthorityStateChange() == false)
-          {
-            masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.pop_back();
-            reject("materialized stateful recovery durable acceptance failed");
-            break;
-          }
-          // The initial-health-wait predicate is fully synchronous. Its only
-          // mutation is deliberately after durable acceptance, so a rejected
-          // request never alters the active deployment or its callbacks.
-          if (initialHealthWaitParkable)
-          {
-            active->second->parkMaterializedStatefulInitialHealthWait();
-          }
-          assert(active->second->recoveredMaterializedStatefulRollForwardIsSafe());
-          successor->second->materializedStatefulRecoveryOwnsTransition = true;
-          successor->second->resumeMaterializedStatefulRecovery();
-          response.success = true;
-          response.durableGeneration = masterAuthorityRuntimeState.generation;
-          reply();
+          const uint64_t epoch = masterAuthorityEpoch;
+          const uint64_t incarnation = mothership->connectionIncarnation;
+          String operationID(request.operationID.data(), request.operationID.size(), Copy::yes, request.operationID.size());
+          const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+          String replyIdentity;
+          BitseryEngine::serialize(replyIdentity, response);
+          pendingMaterializedRecoveryPersistence.insert(operationID);
+          commitMasterAuthorityStateChangeAsync(
+              [this, lifetime, mothership, epoch, incarnation, operationID = std::move(operationID), activeID,
+               successorID, initialHealthWaitParkable, replyIdentity = std::move(replyIdentity)](bool durable) mutable {
+                if (lifetime.expired()) return;
+                pendingMaterializedRecoveryPersistence.erase(operationID);
+                if (masterAuthorityEpoch != epoch) return;
+                auto current = std::find_if(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                                            masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                                            [&operationID](const ProdigyMaterializedStatefulRecoveryOperation& operation) {
+                                              return operation.operationID.equals(operationID);
+                                            });
+                const bool candidateCurrent = current != masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end();
+                RecoverMaterializedStatefulDeployment response = {};
+                BitseryEngine::deserializeSafe(replyIdentity, response);
+                response.success = durable && candidateCurrent;
+                if (!durable)
+                {
+                  if (candidateCurrent) masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.erase(current);
+                  response.failure.assign("materialized stateful recovery durable acceptance failed"_ctv);
+                }
+                else if (candidateCurrent)
+                {
+                  auto active = deployments.find(activeID);
+                  auto successor = deployments.find(successorID);
+                  if (active == deployments.end() || successor == deployments.end() || !active->second || !successor->second ||
+                      active->second->next != successor->second || successor->second->previous != active->second) return;
+                  if (initialHealthWaitParkable) active->second->parkMaterializedStatefulInitialHealthWait();
+                  if (!active->second->recoveredMaterializedStatefulRollForwardIsSafe()) return;
+                  successor->second->materializedStatefulRecoveryOwnsTransition = true;
+                  successor->second->resumeMaterializedStatefulRecovery();
+                  response.durableGeneration = masterAuthorityRuntimeState.generation;
+                }
+                if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation ||
+                    !streamIsActive(mothership) || Ring::socketIsClosing(mothership)) return;
+                String payload = {};
+                BitseryEngine::serialize(payload, response);
+                Message::construct(mothership->wBuffer, MothershipTopic::recoverMaterializedStatefulDeployment, payload);
+                (void)flushActiveMothershipSendBuffer(mothership, "recovery-acceptance-durable");
+              });
           break;
         }
       case MothershipTopic::cancelDeployment:
@@ -33236,6 +35507,7 @@ public:
 
           if (auto failedIt = failedDeployments.find(cancelledID); failedIt != failedDeployments.end())
           {
+            if (pendingCancellationPersistence.contains(cancelledID)) break;
             FailedDeploymentRecord& failed = failedIt->second;
             if (failed.hasOperatorCancellation == false || failed.operationID.equals(request.operationID) == false ||
                 failed.successorDeploymentID != successorID)
@@ -33354,36 +35626,49 @@ public:
           failed.cancellationPhase = CancelDeploymentPhase::accepted;
           auto [failedIt, inserted] = failedDeployments.insert_or_assign(cancelledID, std::move(failed));
           (void)inserted;
-          if (persistAndReplicateOperatorCancellation(failedIt->second) == false)
-          {
-            failedDeployments.erase(cancelledID);
-            reject("cancelDeployment durable acceptance failed");
-            break;
-          }
-          const bool cancellationDevPaused =
-              operatorCancellationDevCrashBarrier(failedIt->second);
-          armFailedDeploymentCleaner();
-          if (cancellationDevPaused == false)
-          {
-            // The NONE shape is intentionally changed only after accepted has
-            // committed.  Restart recovery re-enters the same helper.
-            (void)deployment->recoverAcceptedOperatorCancellationTransition();
-            spinApplicationFailed(deployment, "operator cancellation accepted"_ctv);
-            deployment->cancelUnhealthyStatelessForSuccessor();
-          }
-
-          response.success = true;
-          response.result = CancelDeploymentResult::accepted;
-          response.phase = failedIt->second.cancellationPhase;
-          response.durableGeneration = failedIt->second.cancellationGeneration;
-          if (consumeOperatorCancellationDevControl(failedIt->second, "drop-response"))
-          {
-            queueCloseIfActive(mothership, "cancel-deployment-dev-drop-response");
-            break;
-          }
-          String serializedResponse = {};
-          BitseryEngine::serialize(serializedResponse, response);
-          Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
+          const uint64_t epoch = masterAuthorityEpoch;
+          const uint64_t incarnation = mothership->connectionIncarnation;
+          persistAndReplicateOperatorCancellationAsync(failedIt->second,
+              [this, mothership, epoch, incarnation, cancelledID, response = std::move(response)](bool durable) mutable {
+                if (masterAuthorityEpoch != epoch) return;
+                auto failed = failedDeployments.find(cancelledID);
+                if (failed == failedDeployments.end()) return;
+                if (!durable)
+                {
+                  failedDeployments.erase(failed);
+                  response.success = false;
+                  response.result = CancelDeploymentResult::rejected;
+                  response.failure.assign("cancelDeployment durable acceptance failed"_ctv);
+                }
+                else
+                {
+                  const bool paused = operatorCancellationDevCrashBarrier(failed->second);
+                  armFailedDeploymentCleaner();
+                  auto current = deployments.find(cancelledID);
+                  if (!paused && current != deployments.end() && current->second)
+                  {
+                    (void)current->second->recoverAcceptedOperatorCancellationTransition();
+                    spinApplicationFailed(current->second, "operator cancellation accepted"_ctv);
+                    current->second->cancelUnhealthyStatelessForSuccessor();
+                  }
+                  response.success = true;
+                  response.result = CancelDeploymentResult::accepted;
+                  response.phase = failed->second.cancellationPhase;
+                  response.durableGeneration = failed->second.cancellationGeneration;
+                  if (consumeOperatorCancellationDevControl(failed->second, "drop-response"))
+                  {
+                    if (activeMotherships.contains(mothership) && mothership->connectionIncarnation == incarnation)
+                      queueCloseIfActive(mothership, "cancel-deployment-dev-drop-response");
+                    return;
+                  }
+                }
+                if (!activeMotherships.contains(mothership) || mothership->connectionIncarnation != incarnation ||
+                    !streamIsActive(mothership)) return;
+                String serializedResponse;
+                BitseryEngine::serialize(serializedResponse, response);
+                Message::construct(mothership->wBuffer, MothershipTopic::cancelDeployment, serializedResponse);
+                (void)flushActiveMothershipSendBuffer(mothership, "cancel-deployment-durable");
+              });
           break;
         }
       // this is very dangerous so we might not even want this code to be active
@@ -33414,6 +35699,82 @@ public:
       default:
         break;
     }
+  }
+
+  void establishNeuronArtifactCapability(NeuronView *neuron, const String& installedDigest)
+  {
+    neuron->artifactChunksEnabled = false;
+    neuron->artifactCapabilityPending = false;
+    if (installedDigest.empty() || !ensureArtifactIO()) return;
+    auto localDigest = std::make_shared<String>();
+    const String peerDigest = installedDigest.substr(0, installedDigest.size(), Copy::yes);
+    const uint64_t generation = neuron->ioGeneration;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    neuron->artifactCapabilityPending = true;
+    if (!artifactIO->submit(0,
+        [localDigest] {
+          String executable;
+          if (prodigyResolveCurrentExecutablePath(executable))
+            (void)prodigyResolveInstalledBundleDigestForExecutable(executable, *localDigest);
+        },
+        [this, neuron, generation, authorityEpoch, localDigest, peerDigest] {
+          if (neurons.contains(neuron) && neuron->ioGeneration == generation &&
+              masterAuthorityEpoch == authorityEpoch && streamIsActive(neuron))
+          {
+            neuron->artifactCapabilityPending = false;
+            neuron->artifactChunksEnabled = !localDigest->empty() && localDigest->equals(peerDigest);
+            if (neuron->machine && updateSelfWorkerMachineUUIDs.contains(neuron->machine->uuid) &&
+                !updateSelfWorkerStagedMachineUUIDs.contains(neuron->machine->uuid))
+              noteWorkerRegistration(neuron, peerDigest);
+          }
+        }, [this, neuron, generation](std::exception_ptr) {
+          std::fprintf(stderr, "neuron artifact capability digest worker failed\n");
+          if (neurons.contains(neuron) && neuron->ioGeneration == generation) queueCloseIfActive(neuron);
+        }))
+    {
+      neuron->artifactCapabilityPending = false;
+      queueCloseIfActive(neuron);
+    }
+  }
+
+  bool queueNeuronStoredArtifact(NeuronView *neuron, uint64_t deploymentID)
+  {
+    auto plan = deploymentPlans.find(deploymentID);
+    auto live = deployments.find(deploymentID);
+    if (!ensureArtifactIO()) return false;
+    const uint64_t expectedBytes = live != deployments.end() && live->second ?
+        live->second->plan.config.containerBlobBytes :
+        (plan != deploymentPlans.end() ? plan->second.config.containerBlobBytes : 0);
+    if (expectedBytes == 0) return false;
+    if (expectedBytes > ProdigyWire::maxControlFrameBytes) return false;
+    const uint64_t generation = neuron->ioGeneration;
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    struct Result { String frame; bool success = false; };
+    auto result = std::make_shared<Result>();
+    return artifactIO->submit(expectedBytes * 2,
+        [result, deploymentID, expectedBytes] {
+          String blob;
+          ContainerStore::get(deploymentID, blob);
+          if (blob.size() != expectedBytes || blob.empty()) return;
+          Message::construct(result->frame, NeuronTopic::requestContainerBlob, deploymentID, blob);
+          result->success = true;
+        },
+        [this, neuron, generation, authorityEpoch, result] {
+          if (!neurons.contains(neuron) || neuron->ioGeneration != generation ||
+              masterAuthorityEpoch != authorityEpoch || !streamIsActive(neuron)) return;
+          String failure;
+          if (!result->success || !neuron->queueArtifactMessage(std::move(result->frame), &failure))
+          {
+            std::fprintf(stderr, "neuron stored artifact read/queue failed: %s\n", failure.c_str());
+            queueCloseIfActive(neuron);
+            return;
+          }
+          Ring::queueSend(neuron);
+        },
+        [this, neuron, generation](std::exception_ptr) {
+          std::fprintf(stderr, "neuron stored artifact worker failed\n");
+          if (neurons.contains(neuron) && neuron->ioGeneration == generation) queueCloseIfActive(neuron);
+        });
   }
 
   void neuronHandler(NeuronView *neuron, Message *message)
@@ -33467,6 +35828,7 @@ public:
           {
             Message::extractToStringView(args, installedBundleDigest);
           }
+          establishNeuronArtifactCapability(neuron, installedBundleDigest);
           noteWorkerRegistration(neuron, installedBundleDigest);
           // A digest-matching post-exec registration proves the intended
           // bundle is running, but the fresh Neuron still needs the brain's
@@ -34625,20 +36987,11 @@ public:
           uint64_t deploymentID;
           Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
 
-          String containerBlobPath = ContainerStore::pathForContainerImage(deploymentID);
-          PRODIGY_DEBUG_LOG( "brain requestContainerBlob deploymentID=%llu machinePrivate4=%u path=%s readable=%d\n",
-                       (unsigned long long)deploymentID,
-                       (neuron->machine ? unsigned(neuron->machine->private4) : 0u),
-                       containerBlobPath.c_str(),
-                       int(prodigyFileReadable(containerBlobPath)));
-          PRODIGY_DEBUG_FLUSH();
-
-          uint32_t headerOffset = Message::appendHeader(neuron->wBuffer, NeuronTopic::requestContainerBlob);
-          Message::append(neuron->wBuffer, deploymentID);
-          Message::appendFile(neuron->wBuffer, containerBlobPath);
-          Message::finish(neuron->wBuffer, headerOffset);
-
-          Ring::queueSend(neuron);
+          if (!queueNeuronStoredArtifact(neuron, deploymentID))
+          {
+            std::fprintf(stderr, "neuron artifact I/O queue rejected deploymentID=%llu\n", (unsigned long long)deploymentID);
+            queueCloseIfActive(neuron);
+          }
 
           break;
         }

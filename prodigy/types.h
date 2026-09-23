@@ -6919,7 +6919,11 @@ static void serialize(S&& serializer, ProdigyPersistentUpdateSelfFollowerBoot& s
 }
 
 template <typename T>
-struct ProdigyPersistentSerializerIsWriter : std::false_type {
+struct ProdigyPersistentSerializerIsWriter
+    : std::bool_constant<[] constexpr {
+        if constexpr (requires { T::isProdigyPersistentWriter; }) return T::isProdigyPersistentWriter;
+        return false;
+      }()> {
 };
 
 template <typename OutputAdapter, typename Context>
@@ -8759,6 +8763,23 @@ static void serialize(S&& serializer, FailedDeploymentRecord& record)
   constexpr static uint64_t cancellationPrefixBytes = sizeof(cancellationPrefix) - 1;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
 
+  // The owning persistence visitors do not produce the legacy encoded record
+  // below.  Detach the source fields directly before that temporary encoding
+  // is discarded, including the structured terminal report payload.
+  if constexpr (requires { serializer.detachPersistentValue(record.reason); })
+  {
+    serializer.detachPersistentValue(record.reason);
+    if (record.hasTerminalReport || record.hasOperatorCancellation)
+    {
+      serializer.detachPersistentValue(record.terminalReport);
+    }
+    if (record.hasOperatorCancellation)
+    {
+      serializer.detachPersistentValue(record.operationID);
+    }
+    return;
+  }
+
   String encoded = {};
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -8908,6 +8929,15 @@ static void prodigyWritePersistentMapAsEntries(
     SerializeValue&& serializeValue,
     Compare&& compare)
 {
+  if constexpr (requires { serializer.detachPersistentMap(map); })
+  {
+    // The ownership visitor must rebuild the map before it visits keys. Hash
+    // table keys are const after insertion; assigning a detached String via
+    // the normal writer's const_cast path would leave that invariant broken.
+    serializer.detachPersistentMap(map);
+    return;
+  }
+
   Vector<ProdigyPersistentMapEntryRef<Key, Value>> entries = {};
   entries.reserve(map.size());
   for (const auto& [key, value] : map)

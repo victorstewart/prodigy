@@ -10,6 +10,7 @@
 #include <ctime>
 #include <filesystem>
 #include <algorithm>
+#include <chrono>
 
 class TestSuite {
 public:
@@ -873,9 +874,91 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                "master_authority_runtime_state_rejects_unknown_version_marker");
 }
 
+static int runPersistentUpdateBundleSnapshotMeasurement(TestSuite& suite, const char *bundlePath)
+{
+  if (bundlePath == nullptr || bundlePath[0] == '\0')
+  {
+    suite.expect(false, "persistent_update_bundle_measurement_requires_runtime_bundle");
+    return EXIT_FAILURE;
+  }
+
+  String bundle = {};
+  Filesystem::openReadAtClose(-1, String(bundlePath), bundle);
+  suite.expect(bundle.empty() == false, "persistent_update_bundle_measurement_reads_runtime_bundle");
+  if (bundle.empty()) return EXIT_FAILURE;
+
+  String expectedDigest = {};
+  String failure = {};
+  suite.expect(prodigyComputeSHA256Hex(bundle, expectedDigest, &failure),
+               "persistent_update_bundle_measurement_hashes_runtime_bundle");
+  if (expectedDigest.empty()) return EXIT_FAILURE;
+
+  std::filesystem::create_directories(".run");
+  char scratch[] = ".run/prodigy-persistent-update-bundle-XXXXXX";
+  char *created = ::mkdtemp(scratch);
+  suite.expect(created != nullptr, "persistent_update_bundle_measurement_private_store_created");
+  if (created == nullptr) return EXIT_FAILURE;
+  String dbPath = {};
+  dbPath.assign(created);
+  (void)cleanupPersistentStateRoots(dbPath);
+
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  snapshot.brainConfig.clusterUUID = uint128_t(0x5017);
+  snapshot.brainConfig.datacenterFragment = 1;
+  snapshot.masterAuthority.runtimeState.generation = 1;
+  snapshot.masterAuthority.runtimeState.updateSelf.state =
+      uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+  snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob = bundle;
+  snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = expectedDigest;
+
+  String serializedSnapshot = {};
+  BitseryEngine::serialize(serializedSnapshot, snapshot);
+  const uint64_t serializedBytes = serializedSnapshot.size();
+  Vector<uint64_t> samplesUs = {};
+  samplesUs.reserve(10);
+  ProdigyPersistentStateStore store(dbPath);
+  for (uint32_t index = 0; index < 10; ++index)
+  {
+    snapshot.masterAuthority.runtimeState.generation = uint64_t(index + 1);
+    failure.clear();
+    const auto started = std::chrono::steady_clock::now();
+    const bool saved = store.saveBrainSnapshot(snapshot, &failure);
+    const auto finished = std::chrono::steady_clock::now();
+    suite.expect(saved, "persistent_update_bundle_measurement_saves_snapshot");
+    if (saved == false) break;
+    samplesUs.push_back(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(finished - started).count()));
+  }
+
+  uint64_t maximumUs = 0;
+  for (uint64_t sample : samplesUs) maximumUs = std::max(maximumUs, sample);
+  std::fprintf(stderr, "persistent_update_bundle_snapshot serialized_bytes=%llu bundle_bytes=%llu save_samples_us=",
+               (unsigned long long)serializedBytes, (unsigned long long)bundle.size());
+  for (uint64_t sample : samplesUs) std::fprintf(stderr, "%llu,", (unsigned long long)sample);
+  std::fprintf(stderr, " max_us=%llu samples=%llu\n", (unsigned long long)maximumUs,
+               (unsigned long long)samplesUs.size());
+  std::fflush(stderr);
+  suite.expect(samplesUs.size() == 10, "persistent_update_bundle_measurement_records_ten_saves");
+
+  ProdigyPersistentBrainSnapshot loaded = {};
+  failure.clear();
+  const bool loadedSnapshot = store.loadBrainSnapshot(loaded, &failure);
+  String loadedDigest = {};
+  const bool matches = loadedSnapshot &&
+                       prodigyComputeSHA256Hex(loaded.masterAuthority.runtimeState.updateSelf.bundleBlob, loadedDigest, &failure) &&
+                       loadedDigest.equals(expectedDigest);
+  suite.expect(matches, "persistent_update_bundle_measurement_readback_matches_digest");
+  store.close();
+  suite.expect(cleanupPersistentStateRoots(dbPath), "persistent_update_bundle_measurement_private_store_cleaned");
+  return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_PERSISTENT_UPDATE_BUNDLE_MEASUREMENT") != nullptr)
+  {
+    return runPersistentUpdateBundleSnapshotMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
+  }
   testMasterAuthorityRuntimeStateRecoveryCodec(suite);
   testPersistentMapDirectionalSerialization(suite);
   testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);
@@ -1074,6 +1157,10 @@ int main(void)
     suite.expect(masterBrain.reserveApplicationIDMapping("TopicServiceApp"_ctv, 52'000, &reserveFailure), "persistent_master_service_topic_seed_application");
 
     Mothership mothership = {};
+    mothership.isFixedFile = true;
+    mothership.fslot = 1;
+    suite.expect(masterBrain.activateMothershipConnection(&mothership),
+                 "persistent_master_service_topic_activates_mothership");
     String requestBuffer = {};
     ApplicationServiceReserveRequest request = {};
     request.applicationID = 52'000;
@@ -1100,6 +1187,7 @@ int main(void)
 
     suite.expect(response.success, "persistent_master_service_topic_creates_service");
     suite.expect(masterBrain.persistCalls == 1, "persistent_master_service_topic_persists_created_service");
+    masterBrain.activeMotherships.erase(&mothership);
   }
 
   {

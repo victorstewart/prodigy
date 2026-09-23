@@ -208,6 +208,11 @@ public:
   {
   }
 
+  virtual bool quiesceArtifactIOForBundleExec(void)
+  {
+    return true;
+  }
+
   // A base-only Neuron implementation cannot prove that its live containers
   // have no control operations.  Block bundle exec until it has none.
   virtual bool quiesceContainerControlSocketsForBundleExec(void)

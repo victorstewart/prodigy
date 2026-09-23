@@ -664,19 +664,15 @@ protected:
     Brain::awaitSelfElectionMachineInventoryIfNeeded(coro, suspendIndex);
   }
 
-  bool reconcileManagedMachineSchemasOnSelfElection(String *failure) override
+  void reconcileManagedMachineSchemasOnSelfElectionAsync(PersistenceCompletion completion) override
   {
     selfElectionManagedSchemaReconcileCalls += 1;
     if (overrideSelfElectionManagedSchemaReconcile)
     {
-      if (failure != nullptr)
-      {
-        failure->assign(forcedSelfElectionManagedSchemaReconcileFailure);
-      }
-      return forcedSelfElectionManagedSchemaReconcile;
+      if (completion) completion(forcedSelfElectionManagedSchemaReconcile);
+      return;
     }
-
-    return Brain::reconcileManagedMachineSchemasOnSelfElection(failure);
+    Brain::reconcileManagedMachineSchemasOnSelfElectionAsync(std::move(completion));
   }
 };
 
@@ -3145,7 +3141,9 @@ int main(void)
                  "machine_retirement_rolling_upgrade_excludes_v4_peer_with_carrier");
 
     brain.retiredMachineIdentities[identityID].topologyVersion = 1;
-    suite.expect(brain.commitMachineRetirementJournal(),
+    bool retirementDurable = false;
+    brain.commitMachineRetirementJournalAsync([&](bool durable) { retirementDurable = durable; });
+    suite.expect(retirementDurable,
                  "machine_retirement_rolling_upgrade_existing_carrier_advances_with_peer_unavailable");
     makePeerDurablyActive(
         brain,

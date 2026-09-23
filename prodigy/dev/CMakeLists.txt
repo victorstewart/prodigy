@@ -562,10 +562,17 @@ add_executable(prodigy_brain_spot_async_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/p
 add_executable(prodigy_pairing_parser_adversarial_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pairing_parser_adversarial_unit.cpp)
 add_executable(prodigy_bootstrap_config_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bootstrap_config_unit.cpp)
 add_executable(prodigy_persistent_state_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_persistent_state_unit.cpp)
+add_executable(prodigy_async_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_async_persistence_unit.cpp)
+add_executable(prodigy_brain_async_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_async_authority_unit.cpp)
+add_executable(prodigy_runtime_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_persistence_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(prodigy_runtime_environment_bgp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_environment_bgp_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_tls_unit.cpp)
+add_executable(prodigy_transport_bulk_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_bulk_unit.cpp)
+add_executable(prodigy_artifact_io_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_artifact_io_unit.cpp)
+add_executable(prodigy_mothership_artifact_responsiveness_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_artifact_responsiveness_unit.cpp)
 add_executable(prodigy_cluster_topology_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_topology_unit.cpp)
 add_executable(prodigy_neuron_hub_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_hub_unit.cpp)
+add_executable(prodigy_neuron_artifact_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_neuron_artifact_unit.cpp)
 add_executable(prodigy_ring_recvmsg_multishot_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_ring_recvmsg_multishot_unit.cpp)
 add_executable(prodigy_machine_pinger_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_pinger_unit.cpp)
 add_executable(prodigy_switchboard_routable_prefix_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_routable_prefix_unit.cpp)
@@ -656,10 +663,17 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_pairing_parser_adversarial_unit
    prodigy_bootstrap_config_unit
    prodigy_persistent_state_unit
+   prodigy_async_persistence_unit
+   prodigy_brain_async_authority_unit
    prodigy_runtime_environment_bgp_unit
+   prodigy_runtime_persistence_unit
    prodigy_transport_tls_unit
+   prodigy_transport_bulk_unit
+   prodigy_artifact_io_unit
+   prodigy_mothership_artifact_responsiveness_unit
    prodigy_cluster_topology_unit
    prodigy_neuron_hub_unit
+   prodigy_neuron_artifact_unit
    prodigy_ring_recvmsg_multishot_unit
    prodigy_machine_pinger_unit
    prodigy_switchboard_routable_prefix_unit
@@ -905,10 +919,17 @@ target_compile_options(prodigy_brain_spot_async_unit PUBLIC -O2)
 target_compile_options(prodigy_pairing_parser_adversarial_unit PUBLIC -O2)
 target_compile_options(prodigy_bootstrap_config_unit PUBLIC -O2)
 target_compile_options(prodigy_persistent_state_unit PUBLIC -O2)
+target_compile_options(prodigy_async_persistence_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_async_authority_unit PUBLIC -O2)
 target_compile_options(prodigy_runtime_environment_bgp_unit PUBLIC -O2)
+target_compile_options(prodigy_runtime_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
+target_compile_options(prodigy_transport_bulk_unit PUBLIC -O2)
+target_compile_options(prodigy_artifact_io_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_artifact_responsiveness_unit PUBLIC -O2)
 target_compile_options(prodigy_cluster_topology_unit PUBLIC -O2)
 target_compile_options(prodigy_neuron_hub_unit PUBLIC -O2)
+target_compile_options(prodigy_neuron_artifact_unit PUBLIC -O2)
 target_compile_options(prodigy_ring_recvmsg_multishot_unit PUBLIC -O2)
 target_compile_options(prodigy_machine_pinger_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_routable_prefix_unit PUBLIC -O2)
@@ -1072,6 +1093,8 @@ add_dependencies(prodigy_switchboard_whitehole_unit
    host_ingress_router
    host_ingress_router_dev
    host_egress_router)
+
+add_dependencies(prodigy_mothership_artifact_responsiveness_unit host_ingress_router host_egress_router)
 
 add_dependencies(prodigy_brain_replication_credentials_unit
    host_ingress_router
@@ -1714,6 +1737,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_transport_tls_unit
    )
 
+   add_test(NAME prodigy_transport_bulk_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_transport_bulk_unit)
+   add_test(NAME prodigy_artifact_io_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_artifact_io_unit)
+   add_test(NAME prodigy_mothership_artifact_responsiveness_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_artifact_responsiveness_unit)
+
    add_test(
       NAME prodigy_cluster_topology_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_cluster_topology_unit
@@ -1723,6 +1750,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_neuron_hub_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
    )
+   add_test(NAME prodigy_neuron_artifact_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_artifact_unit)
 
    add_test(
       NAME prodigy_ring_recvmsg_multishot_unit
@@ -1834,6 +1862,17 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_brain_spot_async_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_spot_async_unit
+   )
+   add_test(NAME prodigy_runtime_persistence_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_runtime_persistence_unit)
+   add_test(NAME prodigy_async_persistence_callers
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-persistence-callers ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(
+      NAME prodigy_async_persistence_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit
+   )
+   add_test(
+      NAME prodigy_brain_async_authority_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_async_authority_unit
    )
    add_test(
       NAME prodigy_gcp_neuron_startup_async_contract

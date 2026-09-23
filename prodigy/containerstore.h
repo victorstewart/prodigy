@@ -467,6 +467,161 @@ private:
 
 public:
 
+  struct PreparedAppArtifact {
+    uint64_t deploymentID = 0;
+    String stagePath = {};
+    String finalPath = {};
+    String sha256 = {};
+    uint64_t bytes = 0;
+    dev_t device = 0;
+    ino_t inode = 0;
+    dev_t publishedDevice = 0;
+    ino_t publishedInode = 0;
+    bool prepared = false;
+    bool published = false;
+    bool reusedExisting = false;
+  };
+
+  // Worker-thread only: validates, writes, fsyncs, and verifies an isolated
+  // stage. It deliberately never updates `contents` or the live final path.
+  static bool prepareAppArtifactAtPath(
+      PreparedAppArtifact& prepared,
+      uint64_t deploymentID,
+      const String& stagePath,
+      const String& containerBlob,
+      const String& expectedDigest,
+      uint64_t expectedBytes,
+      String *failureReport = nullptr,
+      const String *storeRoot = nullptr)
+  {
+    prepared = {};
+    String mutableStagePath = {};
+    mutableStagePath.assign(stagePath);
+    String stageParent = {};
+    String finalParent = {};
+    String finalPath = storeRoot ? pathForContainerImageWithinRoot(*storeRoot, deploymentID) : pathForContainerImage(deploymentID);
+    prodigyDirname(mutableStagePath, stageParent);
+    prodigyDirname(finalPath, finalParent);
+    if (mutableStagePath.size() == 0 || expectedDigest.size() == 0 || stageParent != finalParent ||
+        storeAppContainerBlobAtPath(mutableStagePath, containerBlob, nullptr, nullptr, &expectedDigest, &expectedBytes, failureReport) == false)
+    {
+      if (stageParent != finalParent && failureReport) failureReport->assign("prepared container artifact must stage in final store directory"_ctv);
+      return false;
+    }
+    struct stat metadata = {};
+    if (::stat(mutableStagePath.c_str(), &metadata) != 0)
+    {
+      if (failureReport) failureReport->assign("prepared container artifact disappeared after verification"_ctv);
+      return false;
+    }
+    prepared.deploymentID = deploymentID;
+    prepared.stagePath = mutableStagePath;
+    prepared.finalPath = finalPath;
+    prepared.sha256 = expectedDigest;
+    prepared.bytes = expectedBytes;
+    prepared.device = metadata.st_dev;
+    prepared.inode = metadata.st_ino;
+    prepared.prepared = true;
+    return true;
+  }
+
+  // Worker-thread only, after the Ring owner has granted publication. Never
+  // replaces an existing final path; this prevents a late job overwriting a
+  // replacement artifact. Parent fsync remains off the Ring.
+  static bool publishPreparedAppArtifact(PreparedAppArtifact& prepared, String *failureReport = nullptr)
+  {
+    if (prepared.prepared == false || prepared.published ||
+        verifyStoredBlobAtPath(prepared.stagePath, prepared.sha256, prepared.bytes, nullptr, nullptr, failureReport) == false)
+    {
+      return false;
+    }
+    struct stat stage = {};
+    if (::stat(prepared.stagePath.c_str(), &stage) != 0 || stage.st_dev != prepared.device || stage.st_ino != prepared.inode)
+    {
+      if (failureReport) failureReport->assign("prepared container artifact identity changed before publish"_ctv);
+      return false;
+    }
+    // link(2) is an atomic no-replace publish because stage and final share the
+    // store directory. The unlink only removes our verified staging name.
+    if (::link(prepared.stagePath.c_str(), prepared.finalPath.c_str()) != 0)
+    {
+      // Duplicate stores are idempotent only when the existing immutable
+      // artifact independently verifies as the exact expected bytes. It is
+      // never ours to delete during late completion cleanup.
+      if (errno == EEXIST && verifyStoredBlobAtPath(prepared.finalPath, prepared.sha256, prepared.bytes, nullptr, nullptr, failureReport))
+      {
+        struct stat existing = {};
+        if (::stat(prepared.finalPath.c_str(), &existing) == 0)
+        {
+          prepared.published = true;
+          prepared.reusedExisting = true;
+          prepared.publishedDevice = existing.st_dev;
+          prepared.publishedInode = existing.st_ino;
+          if (::unlink(prepared.stagePath.c_str()) == 0)
+          {
+            return fsyncParentDirectory(prepared.finalPath, failureReport);
+          }
+        }
+      }
+      if (failureReport && failureReport->size() == 0)
+      {
+        int err = errno;
+        failureReport->snprintf<"container artifact publish refused errno={itoa}({})"_ctv>(uint64_t(err), errnoString(err));
+      }
+      return false;
+    }
+    // From this point finalPath is a store-owned immutable inode, even if
+    // staging cleanup below reports an error. It is never rolled back by a
+    // stale asynchronous request.
+    prepared.published = true;
+    prepared.publishedDevice = prepared.device;
+    prepared.publishedInode = prepared.inode;
+    if (::unlink(prepared.stagePath.c_str()) != 0 || fsyncParentDirectory(prepared.finalPath, failureReport) == false)
+    {
+      return false;
+    }
+    struct stat finalMetadata = {};
+    if (::stat(prepared.finalPath.c_str(), &finalMetadata) != 0 || finalMetadata.st_dev != prepared.device || finalMetadata.st_ino != prepared.inode)
+    {
+      if (failureReport) failureReport->assign("published container artifact identity changed"_ctv);
+      return false;
+    }
+    prepared.publishedDevice = finalMetadata.st_dev;
+    prepared.publishedInode = finalMetadata.st_ino;
+    return true;
+  }
+
+  // Ring-thread only, after a second caller authority/epoch check. This is the
+  // sole point where an asynchronously published artifact enters the cache.
+  static bool adoptPreparedAppArtifact(const PreparedAppArtifact& prepared)
+  {
+    if (prepared.prepared == false || prepared.published == false) return false;
+    String finalPath = {};
+    finalPath.assign(prepared.finalPath);
+    struct stat metadata = {};
+    if (::stat(finalPath.c_str(), &metadata) != 0 || metadata.st_dev != prepared.publishedDevice || metadata.st_ino != prepared.publishedInode) return false;
+    contents.insert(prepared.deploymentID);
+    return true;
+  }
+
+  // Worker-thread only. Before publication, removes only this operation's
+  // staging inode. A published immutable final path can be shared by another
+  // accepted request, so normal ContainerStore lifecycle owns its removal.
+  // Parent fsync stays off the Ring.
+  static void discardPreparedAppArtifact(PreparedAppArtifact& prepared)
+  {
+    String path = {};
+    path.assign(prepared.stagePath);
+    struct stat metadata = {};
+    if (path.size() && ::stat(path.c_str(), &metadata) == 0 &&
+        metadata.st_dev == prepared.device && metadata.st_ino == prepared.inode)
+    {
+      (void)::unlink(path.c_str());
+      (void)fsyncParentDirectory(path);
+    }
+    prepared = {};
+  }
+
   static inline bool autoDestroy; // false if brain, else true
 
   static bool atomicWriteRuntimeFile(const String& finalPath, const String& payload, String *failureReport = nullptr)
@@ -474,9 +629,9 @@ public:
     return atomicWriteFile(finalPath, payload, failureReport);
   }
 
-  static String pathForContainerImage(uint64_t deploymentID)
+  static String pathForContainerImage(uint64_t deploymentID, const String *storeRoot = nullptr)
   {
-    return pathForContainerImageWithinRoot("/containers/store"_ctv, deploymentID);
+    return pathForContainerImageWithinRoot(storeRoot ? *storeRoot : String("/containers/store"_ctv), deploymentID);
   }
 
 #if PRODIGY_DEBUG
