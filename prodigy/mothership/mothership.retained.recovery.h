@@ -46,6 +46,19 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
 {
   const auto& update = snapshot.masterAuthority.runtimeState.updateSelf;
   if (!update.active()) return true;
+  // Admission may reject after retaining the candidate payload, before the
+  // coordinator issues any work. Fenced recovery may consume that exact
+  // candidate only when every progress, handoff and recovery field is empty.
+  ProdigyPersistentUpdateSelfState unstarted;
+  unstarted.bundleBlob = update.bundleBlob;
+  unstarted.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
+  unstarted.workerFailure = update.workerFailure;
+  if (update == unstarted && !update.bundleBlob.empty() && !update.workerFailure.empty() &&
+      update.workerExpectedBundleSHA256 == expectedBundleSHA256)
+  {
+    String digest;
+    return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == expectedBundleSHA256;
+  }
   // Followers can still hold the previous recovery envelope when the master's
   // next update is contained. Only the sealed installed predecessor is allowed.
   const bool previousEnvelope = mothershipRetainedRecoveryEnvelopeMatches(update, previousBundleSHA256);

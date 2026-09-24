@@ -271,6 +271,66 @@ int main()
   auto transitionSnapshot=laggingEchoSnapshot;
   transitionSnapshot.masterAuthority.runtimeState.updateSelf.workerTransitionIssuedMachineUUIDs.push_back(1);
   assert(!mothershipRetainedRecoveryCanReplaceUpdate(transitionSnapshot,request.bundleSHA,{}));
+
+  // A rejected update can have already retained its payload and intended
+  // worker digest while the authority-ack admission barrier rejects it.  It
+  // has not issued work, handoff, or recovery state, so a fenced retained
+  // recovery may replace this one exact pre-admission record.
+  auto rejectedBeforeAdmissionSnapshot=snapshot;
+  auto& rejectedBeforeAdmission=rejectedBeforeAdmissionSnapshot.masterAuthority.runtimeState.updateSelf;
+  rejectedBeforeAdmission.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::idle);
+  rejectedBeforeAdmission.bundleBlob=interruptedBundle;
+  rejectedBeforeAdmission.workerExpectedBundleSHA256=request.bundleSHA;
+  rejectedBeforeAdmission.workerFailure.assign("current master authority is not durably acknowledged by every registered peer"_ctv);
+  assert(mothershipRetainedRecoveryCanReplaceUpdate(rejectedBeforeAdmissionSnapshot,request.bundleSHA,{}));
+
+  auto wrongRejectedDigest=rejectedBeforeAdmissionSnapshot;
+  wrongRejectedDigest.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256.assign(std::string(64,'e').c_str());
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(wrongRejectedDigest,request.bundleSHA,{}));
+  auto wrongRejectedBlob=rejectedBeforeAdmissionSnapshot;
+  wrongRejectedBlob.masterAuthority.runtimeState.updateSelf.bundleBlob.assign("wrong-rejected-before-admission-bundle"_ctv);
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(wrongRejectedBlob,request.bundleSHA,{}));
+
+  struct RejectedBeforeAdmissionMutation {
+    const char *name;
+    void (*apply)(ProdigyPersistentUpdateSelfState&);
+  };
+  const RejectedBeforeAdmissionMutation unsafeRejectedBeforeAdmission[] = {
+    {"no-rejection", [](ProdigyPersistentUpdateSelfState& update) { update.workerFailure.clear(); }},
+    {"phase", [](ProdigyPersistentUpdateSelfState& update) { update.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos); }},
+    {"echo", [](ProdigyPersistentUpdateSelfState& update) { update.expectedEchos=1; }},
+    {"handoff", [](ProdigyPersistentUpdateSelfState& update) { update.plannedMasterPeerKey=1; }},
+    {"reboot", [](ProdigyPersistentUpdateSelfState& update) { update.followerRebootedPeerKeys.push_back(1); }},
+    {"worker", [](ProdigyPersistentUpdateSelfState& update) { update.workerMachineUUIDs.push_back(1); }},
+    {"local", [](ProdigyPersistentUpdateSelfState& update) { update.localMachineUUID=1; }},
+    {"witness", [](ProdigyPersistentUpdateSelfState& update) { ProdigyPersistentUpdateSelfMachineRecoveryWitness witness={};witness.machineUUID=1;update.machineRecoveryWitnesses.push_back(std::move(witness)); }},
+  };
+  for (const RejectedBeforeAdmissionMutation& mutation : unsafeRejectedBeforeAdmission)
+  {
+    auto unsafe=rejectedBeforeAdmissionSnapshot;
+    mutation.apply(unsafe.masterAuthority.runtimeState.updateSelf);
+    assert(!mothershipRetainedRecoveryCanReplaceUpdate(unsafe,request.bundleSHA,{}));
+  }
+
+  auto rejectedBeforeAdmissionPrepared=rejectedBeforeAdmissionSnapshot;
+  assert(mothershipPrepareRetainedRecoverySnapshot(rejectedBeforeAdmissionPrepared,request.plans,request.machines,request.bundleSHA,&failure));
+  const auto rejectedRecoveryRoot=root/"rejected-before-admission";
+  std::filesystem::create_directories(rejectedRecoveryRoot);
+  const auto rejectedStatePath=(rejectedRecoveryRoot/"state.new10").string();
+  const auto rejectedRequestPath=(rejectedRecoveryRoot/"request").string();
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(rejectedStatePath)); assert(store.saveBrainSnapshot(rejectedBeforeAdmissionSnapshot,&failure)); }
+  std::filesystem::create_directories(rejectedStatePath+".secrets");
+  BitseryEngine::serialize(bytes,request);MothershipTidesMigration::durable(rejectedRequestPath,bytes);
+  WitnessSet rejectedSealed = {};
+  rejectedSealed.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(rejectedRequestPath));
+  rejectedSealed.witnesses=rejectedBeforeAdmissionPrepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  BitseryEngine::serialize(bytes,rejectedSealed);MothershipTidesMigration::durable(rejectedRequestPath+".witnesses",bytes);
+  assert(prepareLocal(rejectedRequestPath.c_str(),rejectedStatePath.c_str(),false,&failure));
+  ProdigyPersistentBrainSnapshot rejectedAfter = {};
+  loadSnapshot(rejectedStatePath,rejectedAfter);
+  assert(prodigyPersistentBrainSnapshotsEqual(rejectedAfter,rejectedBeforeAdmissionPrepared));
+  assert(prepareLocal(rejectedRequestPath.c_str(),rejectedStatePath.c_str(),true,&failure));
+
   auto exhaustedSnapshot=laggingEchoSnapshot;
   exhaustedSnapshot.masterAuthority.runtimeState.generation=std::numeric_limits<uint64_t>::max();
   assert(!mothershipPrepareRetainedRecoverySnapshot(exhaustedSnapshot,request.plans,request.machines,request.bundleSHA,&failure));
