@@ -200,6 +200,40 @@ static void testPersistentWriterOwnsVersionedAuthorityState(TestSuite& suite)
   reopened.close();
 }
 
+static void testPersistentWriterRetainsOwnedStorage(TestSuite& suite)
+{
+  for (MemoryType memory : {MemoryType::heap, MemoryType::mmap})
+  {
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    String bundle(4096, memory);
+    bundle.assign("already-owned-runtime-bundle"_ctv);
+    const uint8_t *ownedAddress = bundle.data();
+    snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob = std::move(bundle);
+    const uint64_t before = ProdigyPersistentStateWriter::retainedBytesFor(snapshot);
+    suite.expect(ProdigyPersistentStateWriter::detach(snapshot) &&
+                     snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob.data() == ownedAddress &&
+                     snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob.equals("already-owned-runtime-bundle"_ctv) &&
+                     ProdigyPersistentStateWriter::retainedBytesFor(snapshot) == before,
+                 memory == MemoryType::heap ? "async_persistence_detach_keeps_owned_heap_bundle_without_recopy" :
+                                             "async_persistence_detach_keeps_owned_mmap_bundle_without_recopy");
+  }
+  for (bool readOnly : {false, true})
+  {
+    char backing[] = "borrowed-runtime-bundle";
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    auto& bundle = snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob;
+    if (readOnly) bundle.setInvariant(static_cast<const char *>(backing), sizeof(backing) - 1);
+    else bundle.setInvariant(backing, sizeof(backing) - 1);
+    const uint8_t *borrowedAddress = bundle.data();
+    const bool detached = ProdigyPersistentStateWriter::detach(snapshot);
+    std::memset(backing, '!', sizeof(backing) - 1);
+    suite.expect(detached && bundle.data() != borrowedAddress && bundle.ownsMemory() &&
+                     bundle.equals("borrowed-runtime-bundle"_ctv),
+                 readOnly ? "async_persistence_detach_copies_readonly_bundle_before_backing_changes" :
+                            "async_persistence_detach_copies_view_bundle_before_backing_changes");
+  }
+}
+
 static uint64_t p95(const std::vector<uint64_t>& samples)
 {
   if (samples.empty()) return 0;
@@ -284,8 +318,9 @@ static void runUpdateBundleWriterMeasurement(TestSuite& suite, const char *bundl
   const bool readback = store.loadBrainSnapshot(loaded, &failure) &&
       prodigyComputeSHA256Hex(loaded.masterAuthority.runtimeState.updateSelf.bundleBlob, loadedDigest, &failure) &&
       loadedDigest.equals(expectedDigest);
-  suite.expect(!ring.timedOut && completed == 10 && durable && completionUs.size() == 10 && timerUs.size() >= 30 &&
-                   p95(timerUs) <= 10'000 && maxTimerUs < 50'000 && maxSubmissionUs < 10'000 && readback,
+  suite.expect(!ring.timedOut && completed == 10 && durable && completionUs.size() == 10 && readback,
+               "async_persistence_bundle_measurement_ten_durable_receipts_and_exact_digest_readback");
+  suite.expect(timerUs.size() >= 30 && p95(timerUs) <= 10'000 && maxTimerUs < 50'000 && maxSubmissionUs < 10'000,
                "async_persistence_bundle_measurement_durable_writer_latency_contract");
   suite.expect(writer.drainForExec(), "async_persistence_bundle_measurement_drains_writer");
   io->stop();
@@ -297,6 +332,7 @@ int main()
   TestSuite suite;
 
   testPersistentWriterOwnsVersionedAuthorityState(suite);
+  testPersistentWriterRetainsOwnedStorage(suite);
   runUpdateBundleWriterMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
 
   // The actual TidesDB owner remains private to the state store.  This proves

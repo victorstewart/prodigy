@@ -32,8 +32,9 @@ public:
   using Completion = std::function<void(Result&&)>;
 
   // Replays the persistent Bitsery schema without producing I/O.  Unlike a
-  // normal String copy, text fields become heap-owned before a Request can
-  // outlive the Ring callback that supplied it.  This deliberately follows
+  // normal String copy, borrowed text fields become heap-owned before a Request
+  // can outlive the Ring callback that supplied it. Already-owned storage moves
+  // with the Request and needs no second copy. This deliberately follows
   // the serialization schema rather than maintaining a second field list.
   class OwningSchemaVisitor {
     bool valid = true;
@@ -45,7 +46,7 @@ public:
 
     void own(String& value)
     {
-      if (!valid || value.size() == 0) return;
+      if (!valid || value.size() == 0 || value.ownsMemory()) return;
       String copied(const_cast<uint8_t *>(value.data()), value.size(), Copy::yes, value.size());
       if (copied.size() != value.size()) { valid = false; return; }
       value = std::move(copied);
