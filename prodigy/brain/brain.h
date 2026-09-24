@@ -14672,7 +14672,10 @@ public:
               brain->nDefaultAttemptsBudget * brain->connectTimeoutMs + prodigyBrainPeerInboundMissingSlackMs,
               "close-connector-master");
         }
-        if (inertDuplicateConnectorClose)
+        // An initial connect failure has no transport epoch yet and can look
+        // inert on its first close. Suppress a duplicate only when a retry is
+        // already owned; otherwise the canonical peer link can stay stranded.
+        if (inertDuplicateConnectorClose && brainReconnectWaiters.contains(brain))
         {
           basics_log("brain close ignored inert duplicate connector private4=%u weConnectToIt=%d reconnectAfterClose=%d\n",
                      brain->private4,

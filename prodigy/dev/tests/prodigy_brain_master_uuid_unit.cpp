@@ -1564,6 +1564,103 @@ static void runStrandedFollowerReconnectFixture(TestSuite& suite)
   }
 }
 
+// A failed first outbound connect has transportEpoch == 0.  Drive its real
+// close CQE rather than calling closeHandler on a pre-activated transport: the
+// latter cannot cover the epoch-zero duplicate-close guard.
+static void runInitialConnectFailureRetryFixture(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  TestBrain brain = {};
+  brain.iaas = new NoopBrainIaaS();
+  brain.nBrains = 3;
+  brain.weAreMaster = false;
+  brain.noMasterYet = false;
+
+  BrainView *peer = makePeer(uint128_t(0x31f1), 101, IPAddress("127.0.0.18", false).v4, "127.0.0.18");
+  peer->registrationFresh = false;
+  peer->weConnectToIt = true;
+  peer->reconnectAfterClose = true;
+  peer->connectTimeoutMs = 250;
+  peer->nDefaultAttemptsBudget = 7;
+  peer->nAttemptsBudget = 7;
+  brain.brains.insert(peer);
+
+  int pair[2] = {-1, -1};
+  const bool madePair = (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+  suite.expect(madePair, "initial_connect_failure_retry_creates_transport_fixture");
+  if (madePair)
+  {
+    peer->fd = pair[0];
+    Ring::installFDIntoFixedFileSlot(peer);
+    suite.expect(peer->isFixedFile && peer->fslot >= 0,
+                 "initial_connect_failure_retry_installs_initial_fixed_transport");
+    suite.expect(peer->uuid != 0 && peer->transportEpoch == 0,
+                 "initial_connect_failure_retry_starts_known_follower_at_epoch_zero");
+
+    RingInterface *previousInterfacer = Ring::interfacer;
+    auto previousLifecycler = Ring::lifecycler;
+    Ring::interfacer = &brain;
+    Ring::lifecycler = nullptr;
+    brain.testConnectHandler(peer, -ECONNREFUSED);
+    suite.expect(Ring::socketIsClosing(peer),
+                 "initial_connect_failure_retry_failed_connect_queues_production_close");
+
+    RingExitDeadline completionDeadline(40);
+    Ring::exit = false;
+    completionDeadline.arm();
+    Ring::start();
+    Ring::exit = false;
+    Ring::interfacer = previousInterfacer;
+    Ring::lifecycler = previousLifecycler;
+
+    TimeoutPacket *reconnectWaiter = brain.testGetBrainReconnectWaiter(peer);
+    suite.expect(peer->transportEpoch == 0 && peer->queuedCloseTransportEpoch == 0,
+                 "initial_connect_failure_retry_close_completion_retains_epoch_zero_identity");
+    suite.expect(reconnectWaiter != nullptr,
+                 "initial_connect_failure_retry_close_completion_arms_reconnect_waiter");
+    suite.expect(peer->isFixedFile == false && peer->fslot < 0 && peer->connectAttemptPending() == false,
+                 "initial_connect_failure_retry_defers_redial_until_waiter");
+
+    const uint32_t attemptsBeforeDuplicateClose = peer->nConnectionAttempts;
+    const uint32_t budgetBeforeDuplicateClose = peer->nAttemptsBudget;
+    const int64_t deadlineBeforeDuplicateClose = peer->attemptDeadlineMs;
+    brain.testCloseHandler(peer);
+    suite.expect(brain.testGetBrainReconnectWaiter(peer) == reconnectWaiter,
+                 "initial_connect_failure_retry_duplicate_close_preserves_reconnect_waiter");
+    suite.expect(peer->nConnectionAttempts == attemptsBeforeDuplicateClose &&
+                     peer->nAttemptsBudget == budgetBeforeDuplicateClose &&
+                     peer->attemptDeadlineMs == deadlineBeforeDuplicateClose,
+                 "initial_connect_failure_retry_duplicate_close_preserves_retry_budget");
+    suite.expect(peer->isFixedFile == false && peer->fslot < 0 && peer->connectAttemptPending() == false,
+                 "initial_connect_failure_retry_duplicate_close_does_not_redial");
+
+    if (reconnectWaiter != nullptr)
+    {
+      brain.testDispatchTimeout(reconnectWaiter);
+    }
+    suite.expect(brain.testHasBrainReconnectWaiter(peer) == false,
+                 "initial_connect_failure_retry_waiter_dispatch_consumes_waiter");
+    suite.expect(peer->isFixedFile && peer->fslot >= 0 && peer->connectAttemptPending(),
+                 "initial_connect_failure_retry_waiter_dispatch_arms_new_connect");
+  }
+
+  if (peer->isFixedFile)
+  {
+    Ring::uninstallFromFixedFileSlot(peer);
+  }
+  else if (peer->fd >= 0)
+  {
+    ::close(peer->fd);
+  }
+  if (pair[1] >= 0)
+  {
+    ::close(pair[1]);
+  }
+  brain.brains.erase(peer);
+  delete peer;
+}
+
 static bool queuedRegistrationAdvertisesMaster(String& buffer, uint128_t& advertisedMasterUUID)
 {
   bool found = false;
@@ -2785,6 +2882,11 @@ int main(void)
       runStrandedFollowerReconnectFixture(suite);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (std::strcmp(testOnly, "initial-connect-failure-retry") == 0)
+    {
+      runInitialConnectFailureRetryFixture(suite);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "restored-deployment-chain") == 0)
     {
       runRestoredDeploymentChainFixtures();
@@ -2836,6 +2938,7 @@ int main(void)
   }
 
   runStrandedFollowerReconnectFixture(suite);
+  runInitialConnectFailureRetryFixture(suite);
   runGhostMasterRegistrationFixtures(suite);
   withUniqueMothershipSocket("direct_master_claim_reconciliation_socket_dir_created", [&] {
     runDirectMasterClaimReconciliationFixtures(suite);
