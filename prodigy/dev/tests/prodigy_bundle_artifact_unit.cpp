@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <string_view>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
 #include <services/debug.h>
@@ -495,6 +496,66 @@ int main(int argc, char *argv[])
                "prepared_bundle_published_target_is_replaced_before_stale_cleanup");
   prodigyDiscardPreparedBundleArtifact(preparedBundle);
   suite.expect(fileExists(preparedBundlePath), "prepared_bundle_cleanup_does_not_delete_replacement");
+
+  // Production's default staged path is a `_ctv` read-only String. Exercise
+  // both literal-equivalent capacity and a view with no spare terminator byte.
+  // Each uses a task-owned target and must materialize the borrowed paths.
+  for (const bool terminatedView : {false, true})
+  {
+    String readOnlyPreparedBundleBacking = {};
+    readOnlyPreparedBundleBacking.assign(tempDirectory);
+    if (terminatedView)
+      readOnlyPreparedBundleBacking.append("/literal-prepared-stage.bundle.tar.zst"_ctv);
+    else
+      readOnlyPreparedBundleBacking.append("/view-prepared-stage.bundle.tar.zst"_ctv);
+    String readOnlyPreparedBundlePath = {};
+    if (terminatedView)
+      readOnlyPreparedBundlePath.setInvariant(readOnlyPreparedBundleBacking.c_str(),
+                                             readOnlyPreparedBundleBacking.size() + 1,
+                                             readOnlyPreparedBundleBacking.size());
+    else
+      readOnlyPreparedBundlePath = String(
+          std::string_view(readOnlyPreparedBundleBacking.c_str(),
+                           readOnlyPreparedBundleBacking.size()), Copy::no);
+    String readOnlyPreparedBundleSourceSnapshot = {};
+    readOnlyPreparedBundleSourceSnapshot.assign(readOnlyPreparedBundlePath);
+    ProdigyPreparedBundleArtifact readOnlyPreparedBundle = {};
+    failure.clear();
+    suite.expect(prodigyPrepareBundleArtifact(
+                     readOnlyPreparedBundle, readOnlyPreparedBundlePath, bundleBytes, bundleDigest, &failure),
+                 "readonly_prepared_bundle_stage_is_verified");
+    suite.expect(readOnlyPreparedBundlePath == readOnlyPreparedBundleSourceSnapshot,
+                 "readonly_prepared_bundle_preserves_source_path");
+    suite.expect(readOnlyPreparedBundle.prepared &&
+                     readOnlyPreparedBundle.stageBundlePath != readOnlyPreparedBundlePath &&
+                     stringContains(readOnlyPreparedBundle.stageBundlePath, ".incoming.") &&
+                     fileExists(readOnlyPreparedBundle.stageBundlePath) &&
+                     fileExists(readOnlyPreparedBundle.stageSHA256Path),
+                 "readonly_prepared_bundle_materializes_unique_owned_stage");
+    suite.expect(prodigyPublishPreparedBundleArtifact(readOnlyPreparedBundle, &failure),
+                 "readonly_prepared_bundle_publishes_verified_stage");
+    suite.expect(prodigyFsyncPublishedBundleArtifact(readOnlyPreparedBundle, &failure),
+                 "readonly_prepared_bundle_publication_is_durable");
+    String readOnlyPublishedDigest = {};
+    suite.expect(prodigyLoadBundleExpectedSHA256Hex(
+                     readOnlyPreparedBundle.bundlePath, readOnlyPublishedDigest, &failure) &&
+                     readOnlyPublishedDigest == bundleDigest,
+                 "readonly_prepared_bundle_published_sidecar_matches_digest");
+    String readOnlyPublishedBundlePath = {};
+    String readOnlyPublishedSHA256Path = {};
+    String readOnlyStageBundlePath = {};
+    String readOnlyStageSHA256Path = {};
+    readOnlyPublishedBundlePath.assign(readOnlyPreparedBundle.bundlePath);
+    readOnlyPublishedSHA256Path.assign(readOnlyPreparedBundle.sha256Path);
+    readOnlyStageBundlePath.assign(readOnlyPreparedBundle.stageBundlePath);
+    readOnlyStageSHA256Path.assign(readOnlyPreparedBundle.stageSHA256Path);
+    prodigyDiscardPreparedBundleArtifact(readOnlyPreparedBundle);
+    suite.expect(fileExists(readOnlyPublishedBundlePath) == false &&
+                     fileExists(readOnlyPublishedSHA256Path) == false &&
+                     fileExists(readOnlyStageBundlePath) == false &&
+                     fileExists(readOnlyStageSHA256Path) == false,
+                 "readonly_prepared_bundle_cleanup_removes_owned_publication_and_stage");
+  }
 
   // The two renames are deliberately not a pair-atomic operation. Make the
   // second target a directory so the first rename succeeds and the sidecar

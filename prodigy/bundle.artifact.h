@@ -593,9 +593,11 @@ static inline bool prodigyPrepareBundleArtifact(
 {
   prepared = {};
   if (failure) failure->clear();
-  prepared.bundlePath = bundlePath;
+  // Preparation outlives the caller's views and publication needs C strings.
+  prepared.bundlePath.assign(bundlePath);
   prodigyResolveBundleSHA256Path(bundlePath, prepared.sha256Path);
-  prepared.stageBundlePath = bundlePath;
+  // Default paths are read-only views; mkstemp needs an owned mutable template.
+  prepared.stageBundlePath.assign(bundlePath);
   prepared.stageBundlePath.append(".incoming.XXXXXX"_ctv);
   prepared.stageBundlePath.addNullTerminator();
   int bundleFD = ::mkstemp(reinterpret_cast<char *>(prepared.stageBundlePath.data()));
