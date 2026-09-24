@@ -6,6 +6,7 @@
 #include <prodigy/dev/tests/prodigy_test_ssh_keys.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cerrno>
 #include <cstdio>
@@ -4324,6 +4325,188 @@ static void testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(Test
   suite.expect(master.wBuffer.empty() == false,
                "replicated_deployment_acks_after_persistence_succeeds");
   follower.deploymentPlans.erase(plan.config.deploymentID());
+}
+
+static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuite& suite)
+{
+  ScopedAsyncMothershipRing scopedRing = {};
+  auto pumpUntil = [&](auto&& ready, const char *name) {
+    for (uint32_t attempt = 0; attempt < 200 && !ready(); ++attempt) scopedRing.runFor(10);
+    suite.expect(ready(), name);
+  };
+  TestBrain follower = {};
+  NoopBrainIaaS iaas = {};
+  follower.iaas = &iaas;
+  BrainView master = {};
+  authorizeMasterPeerForTest(follower, master, 23, uint128_t(0x62'022'01), 62'022);
+  // Keep frames in the fixture outbox. A fake fixed slot is valid for state
+  // fencing but is not a registered io_uring fixed-file entry.
+  master.pendingSend = true;
+  follower.brains.insert(&master);
+  suite.require(follower.ensureArtifactIO(), "replicated_artifact_capacity_starts_worker");
+
+  std::atomic<bool> release = false;
+  std::atomic<uint32_t> releasedCompletions = 0;
+  bool filled = true;
+  for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs; ++index)
+  {
+    filled = filled && follower.artifactIO->submit(1, [&release] {
+      while (!release.load()) std::this_thread::yield();
+    }, [&releasedCompletions] { releasedCompletions += 1; }, [](std::exception_ptr) {});
+  }
+  suite.require(filled, "replicated_artifact_capacity_holds_eight_worker_slots");
+
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 62'022);
+  String blob = prodigyDiscombobulatorBlobHeaderText();
+  blob.append("replicated-capacity-artifact"_ctv);
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers"_ctv, 0755) >= 0 || errno == EEXIST,
+                "replicated_artifact_capacity_creates_container_root");
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers/store"_ctv, 0755) >= 0 || errno == EEXIST,
+                "replicated_artifact_capacity_creates_artifact_store");
+  suite.require(prodigyComputeSHA256Hex(blob, plan.config.containerBlobSHA256),
+                "replicated_artifact_capacity_hashes_fixture");
+  plan.config.containerBlobBytes = blob.size();
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, plan);
+  String frame = {};
+  // Metadata can precede its artifact during normal reconciliation. The
+  // rejected artifact must still be reported missing on the next request.
+  follower.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  suite.expect(follower.deploymentPlans.contains(plan.config.deploymentID()) && master.wBuffer.empty(),
+               "replicated_artifact_capacity_does_not_ack_rejected_artifact_with_existing_metadata");
+  const bool peerCloseQueued = Ring::socketIsClosing(&master);
+  suite.expect(peerCloseQueued == false,
+               "replicated_artifact_capacity_keeps_selected_master_connected");
+  // The baseline intentionally queues a close for this stack fixture. Keep
+  // the peer alive while the existing ArtifactIO exec barrier drains its raw
+  // poll CQE; shutdownForExec correctly rejects an undrained poll tracker.
+  if (peerCloseQueued)
+  {
+    release = true;
+    suite.expect(quiesceArtifactIOForTest(follower.artifactIO.get()),
+                 "replicated_artifact_capacity_baseline_quiesces_worker_raw_poll");
+    follower.artifactIO.reset();
+    follower.brains.erase(&master);
+    return;
+  }
+
+  release = true;
+  pumpUntil([&] { return releasedCompletions == ProdigyArtifactIO::maximumJobs; },
+            "replicated_artifact_capacity_releases_all_initial_worker_slots");
+  follower.runBrainPeerHeartbeatTick();
+  uint32_t reconcileFrames = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    reconcileFrames += (BrainTopic(message->topic) == BrainTopic::reconcileState);
+  });
+  String serializedReconcile = {};
+  BrainReconcileStateRequest reconcile = {};
+  const bool haveReconcile = extractSerializedBrainPayload(master.wBuffer, BrainTopic::reconcileState, serializedReconcile) &&
+      BitseryEngine::deserializeSafe(serializedReconcile, reconcile);
+  bool omittedArtifactID = true;
+  for (uint64_t id : reconcile.deploymentIDs) omittedArtifactID &= (id != plan.config.deploymentID());
+  suite.expect(reconcileFrames == 1 && haveReconcile && omittedArtifactID && follower.deploymentPlans.contains(plan.config.deploymentID()),
+               "replicated_artifact_capacity_reconciliation_omits_existing_metadata_for_missing_artifact");
+
+  master.wBuffer.clear();
+  std::atomic<bool> resaturationRelease = false;
+  std::atomic<uint32_t> resaturationCompletions = 0;
+  bool resaturated = true;
+  for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs; ++index)
+  {
+    resaturated = resaturated && follower.artifactIO->submit(1, [&resaturationRelease] {
+      while (!resaturationRelease.load()) std::this_thread::yield();
+    }, [&resaturationCompletions] { resaturationCompletions += 1; }, [](std::exception_ptr) {});
+  }
+  suite.require(resaturated, "replicated_artifact_capacity_resaturates_after_first_reconciliation_request");
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  resaturationRelease = true;
+  pumpUntil([&] { return resaturationCompletions == ProdigyArtifactIO::maximumJobs; },
+            "replicated_artifact_capacity_releases_all_resaturated_worker_slots");
+  follower.runBrainPeerHeartbeatTick();
+  uint32_t resaturatedReconcileFrames = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    resaturatedReconcileFrames += (BrainTopic(message->topic) == BrainTopic::reconcileState);
+  });
+  suite.expect(resaturatedReconcileFrames == 1,
+               "replicated_artifact_capacity_rearms_reconciliation_after_duplicate_resaturation");
+
+  master.wBuffer.clear();
+  follower.holdRuntimePersistence = true;
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  pumpUntil([&] { return follower.pendingRuntimePersistence.empty() == false; },
+            "replicated_artifact_capacity_waits_for_held_durable_receipt");
+  suite.expect(master.wBuffer.empty() && follower.deploymentPlans.contains(plan.config.deploymentID()),
+               "replicated_artifact_capacity_holds_ack_until_durable_snapshot_receipt");
+  follower.finishRuntimePersistence(true);
+  uint32_t durableAcks = 0;
+  uint64_t durableAckID = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    if (BrainTopic(message->topic) == BrainTopic::replicateDeployment && message->payloadSize() == sizeof(uint64_t))
+    {
+      uint8_t *args = message->args;
+      Message::extractArg<ArgumentNature::fixed>(args, durableAckID);
+      durableAcks += 1;
+    }
+  });
+  suite.expect(durableAcks == 1 && durableAckID == plan.config.deploymentID(),
+               "replicated_artifact_capacity_acks_exact_replayed_id_after_durable_snapshot_receipt");
+  follower.deploymentPlans.erase(plan.config.deploymentID());
+
+  master.wBuffer.clear();
+  std::atomic<bool> staleRelease = false;
+  std::atomic<uint32_t> staleCompletions = 0;
+  bool staleFilled = true;
+  for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs; ++index)
+  {
+    staleFilled = staleFilled && follower.artifactIO->submit(1, [&staleRelease] {
+      while (!staleRelease.load()) std::this_thread::yield();
+    }, [&staleCompletions] { staleCompletions += 1; }, [](std::exception_ptr) {});
+  }
+  suite.require(staleFilled, "replicated_artifact_capacity_refills_held_worker_slots_for_stale_peer");
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  master.ioGeneration += 1;
+  staleRelease = true;
+  pumpUntil([&] { return staleCompletions == ProdigyArtifactIO::maximumJobs; },
+            "replicated_artifact_capacity_releases_all_stale_worker_slots");
+  follower.runBrainPeerHeartbeatTick();
+  uint32_t staleReconcileFrames = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    staleReconcileFrames += (BrainTopic(message->topic) == BrainTopic::reconcileState);
+  });
+  suite.expect(staleReconcileFrames == 0,
+               "replicated_artifact_capacity_stale_generation_without_replay_suppresses_reconciliation");
+
+  master.wBuffer.clear();
+  std::atomic<bool> replacementRelease = false;
+  std::atomic<uint32_t> replacementCompletions = 0;
+  bool replacementFilled = true;
+  for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs; ++index)
+  {
+    replacementFilled = replacementFilled && follower.artifactIO->submit(1, [&replacementRelease] {
+      while (!replacementRelease.load()) std::this_thread::yield();
+    }, [&replacementCompletions] { replacementCompletions += 1; }, [](std::exception_ptr) {});
+  }
+  suite.require(replacementFilled, "replicated_artifact_capacity_refills_held_worker_slots_for_replacement_peer");
+  // The same UUID can represent a newly activated transport. Its rejected
+  // artifact must replace, rather than inherit and later discard, old fencing.
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  replacementRelease = true;
+  pumpUntil([&] { return replacementCompletions == ProdigyArtifactIO::maximumJobs; },
+            "replicated_artifact_capacity_releases_all_replacement_worker_slots");
+  follower.runBrainPeerHeartbeatTick();
+  uint32_t replacementReconcileFrames = 0;
+  uint32_t replacementArtifactAcks = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    replacementReconcileFrames += (BrainTopic(message->topic) == BrainTopic::reconcileState);
+    replacementArtifactAcks += (BrainTopic(message->topic) == BrainTopic::replicateDeployment);
+  });
+  suite.expect(replacementReconcileFrames == 1 && replacementArtifactAcks == 0,
+               "replicated_artifact_capacity_replaces_stale_generation_before_reconciliation");
+  ContainerStore::destroy(plan.config.deploymentID());
+  if (follower.artifactIO) { (void)quiesceArtifactIOForTest(follower.artifactIO.get()); follower.artifactIO.reset(); }
 }
 
 static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(TestSuite& suite)
@@ -26717,6 +26900,12 @@ int main(void)
     testCertificateLifecycleSchedulers(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "artifact-capacity-reconciliation") == 0)
+  {
+    testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
+    std::printf("ARTIFACT_CAPACITY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-kill-pending-restart") == 0)
   {
@@ -27032,6 +27221,7 @@ int main(void)
   testRecoveredIndexedSuccessorWaitsForDurableReplication(suite);
   testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
   testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
+  testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);

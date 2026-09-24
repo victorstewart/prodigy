@@ -32,6 +32,8 @@ public:
   static constexpr uint32_t maximumJobs = 8;
   static constexpr uint64_t maximumBytes = 512ULL * 1024ULL * 1024ULL;
 
+  enum class Admission : uint8_t { admitted, oversize, stopping, jobCapacity, byteCapacity, submissionRejected };
+
 private:
   struct Job {
     uint64_t generation = 0;
@@ -42,7 +44,7 @@ private:
     std::exception_ptr exception = {};
   };
 
-  std::mutex mutex;
+  mutable std::mutex mutex;
   std::condition_variable condition;
   std::deque<Job> queued;
   std::deque<Job> completed;
@@ -60,6 +62,15 @@ private:
   bool workerExited = true;
   Job *callbackJob = nullptr;
   bool callbackContinuation = false;
+
+  Admission admissionLocked(uint64_t bytes) const
+  {
+    if (bytes > maximumBytes) return Admission::oversize;
+    if (stopping) return Admission::stopping;
+    if (retainedJobs == maximumJobs) return Admission::jobCapacity;
+    if (retainedBytes > maximumBytes - bytes) return Admission::byteCapacity;
+    return Admission::admitted;
+  }
 
   void releaseJobLocked(const Job& job)
   {
@@ -173,14 +184,23 @@ public:
 
   bool submit(uint64_t bytes, Work work, Completion completion, Failure failure)
   {
-    if (work == nullptr || completion == nullptr || failure == nullptr || bytes > maximumBytes) return false;
+    if (work == nullptr || completion == nullptr || failure == nullptr) return false;
     std::lock_guard lock(mutex);
-    if (stopping || retainedJobs == maximumJobs || retainedBytes > maximumBytes - bytes) return false;
+    if (admissionLocked(bytes) != Admission::admitted) return false;
     queued.push_back({.generation = generation, .bytes = bytes, .work = std::move(work), .completion = std::move(completion), .failure = std::move(failure)});
     retainedBytes += bytes;
     ++retainedJobs;
     condition.notify_one();
     return true;
+  }
+
+  // Ring owners use this to distinguish a replayable capacity miss from an
+  // impossible request or exec shutdown. The caller still submits immediately
+  // after an admitted result; submissions are Ring-thread serialized.
+  Admission admission(uint64_t bytes) const
+  {
+    std::lock_guard lock(mutex);
+    return admissionLocked(bytes);
   }
 
   // Ring-callback only. Replaces the current job in-place and preserves its

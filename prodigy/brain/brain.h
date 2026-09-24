@@ -1259,6 +1259,21 @@ public:
   bytell_hash_map<BrainView *, TimeoutPacket *> brainLivenessWaiters;
   bytell_hash_map<BrainView *, TimeoutPacket *> brainHandshakeWaiters;
   bytell_hash_map<BrainView *, int> pendingAcceptedBrainSlots;
+  // A rejected artifact is deliberately not entered in deploymentPlans: the
+  // selected-master reconciliation request must continue to describe it as
+  // missing until its artifact and snapshot receipt are durable.
+  class DeferredPeerArtifactReconciliation
+  {
+  public:
+    uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    uint64_t peerGeneration = 0;
+    int peerSlot = -1;
+    uint64_t requiredBytes = 0;
+    Vector<uint64_t> missingDeploymentIDs = {};
+    bool requestPending = false;
+  };
+  bytell_hash_map<uint128_t, DeferredPeerArtifactReconciliation> deferredPeerArtifactReconciliations;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronReconnectWaiters;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronHandshakeWaiters;
   Vector<Machine *> operatingSystemUpdateOrder;
@@ -14176,6 +14191,99 @@ public:
     }
   }
 
+  bool deferPeerArtifactReconciliation(BrainView *peer, uint64_t deploymentID, uint64_t requiredBytes)
+  {
+    if (peer == nullptr || peer->uuid == 0 || peerRepresentsCurrentMaster(peer) == false || peerSocketActive(peer) == false ||
+        requiredBytes > ProdigyArtifactIO::maximumBytes ||
+        deferredPeerArtifactReconciliations.size() >= ProdigyArtifactIO::maximumJobs &&
+            deferredPeerArtifactReconciliations.contains(peer->uuid) == false)
+    {
+      return false;
+    }
+    auto existing = deferredPeerArtifactReconciliations.find(peer->uuid);
+    if (existing != deferredPeerArtifactReconciliations.end())
+    {
+      if (existing->second.peerBootTime != peer->boottimens || existing->second.peerGeneration != peer->ioGeneration ||
+          existing->second.peerSlot != peer->fslot)
+      {
+        deferredPeerArtifactReconciliations.erase(existing);
+        existing = deferredPeerArtifactReconciliations.end();
+      }
+    }
+    if (existing != deferredPeerArtifactReconciliations.end())
+    {
+      existing->second.requiredBytes = std::max(existing->second.requiredBytes, requiredBytes);
+      bool found = false;
+      for (uint64_t id : existing->second.missingDeploymentIDs) found |= (id == deploymentID);
+      // A fresh inbound replay may have arrived after the prior reconciliation
+      // request while the worker filled again. Re-arm exactly one request.
+      existing->second.requestPending = false;
+      if (found) return true;
+      if (existing->second.missingDeploymentIDs.size() >= ProdigyArtifactIO::maximumJobs) return false;
+      existing->second.missingDeploymentIDs.push_back(deploymentID);
+      return true;
+    }
+    DeferredPeerArtifactReconciliation deferred = {
+        .peerUUID = peer->uuid,
+        .peerBootTime = peer->boottimens,
+        .peerGeneration = peer->ioGeneration,
+        .peerSlot = peer->fslot,
+        .requiredBytes = requiredBytes};
+    deferred.missingDeploymentIDs.push_back(deploymentID);
+    deferredPeerArtifactReconciliations.insert_or_assign(peer->uuid, std::move(deferred));
+    return true;
+  }
+
+  bool peerArtifactReconciliationDefers(BrainView *peer, uint64_t deploymentID) const
+  {
+    if (peer == nullptr) return false;
+    auto deferred = deferredPeerArtifactReconciliations.find(peer->uuid);
+    if (deferred == deferredPeerArtifactReconciliations.end() || deferred->second.peerBootTime != peer->boottimens ||
+        deferred->second.peerGeneration != peer->ioGeneration || deferred->second.peerSlot != peer->fslot)
+    {
+      return false;
+    }
+    for (uint64_t id : deferred->second.missingDeploymentIDs)
+      if (id == deploymentID) return true;
+    return false;
+  }
+
+  // ArtifactIO releases a slot only after the current Ring completion returns.
+  // The heartbeat is therefore the existing next-turn owner for a coalesced
+  // selected-master reconciliation request; it never retains an artifact blob.
+  void retryDeferredPeerArtifactReconciliations(void)
+  {
+    if (deferredPeerArtifactReconciliations.empty()) return;
+    Vector<uint128_t> peers = {};
+    peers.reserve(deferredPeerArtifactReconciliations.size());
+    for (const auto& [peerUUID, deferred] : deferredPeerArtifactReconciliations)
+    {
+      (void)deferred;
+      peers.push_back(peerUUID);
+    }
+    for (uint128_t peerUUID : peers)
+    {
+      auto deferred = deferredPeerArtifactReconciliations.find(peerUUID);
+      if (deferred == deferredPeerArtifactReconciliations.end()) continue;
+      BrainView *peer = findBrainViewByUUID(peerUUID);
+      if (peer == nullptr || brains.contains(peer) == false || peer->boottimens != deferred->second.peerBootTime ||
+          peer->ioGeneration != deferred->second.peerGeneration || peer->fslot != deferred->second.peerSlot ||
+          peerRepresentsCurrentMaster(peer) == false || peerSocketActive(peer) == false)
+      {
+        deferredPeerArtifactReconciliations.erase(deferred);
+        continue;
+      }
+      if (artifactIO == nullptr || artifactIO->admission(deferred->second.requiredBytes) != ProdigyArtifactIO::Admission::admitted)
+      {
+        continue;
+      }
+      if (deferred->second.requestPending == false)
+      {
+        deferred->second.requestPending = queueSelectedMasterStateReconciliation(peer);
+      }
+    }
+  }
+
   void runBrainPeerHeartbeatTick(void)
   {
     if (brainPeerHeartbeatIntervalMs == 0 || brainPeerHeartbeatTimeoutMs == 0)
@@ -14343,6 +14451,7 @@ public:
         peer->sendPeerHeartbeat(nowMs);
       }
     }
+    retryDeferredPeerArtifactReconciliations();
   }
 
   void brainMissing(BrainView *brain)
@@ -20525,13 +20634,13 @@ public:
     return true;
   }
 
-  void queueSelectedMasterStateReconciliation(BrainView *brain)
+  bool queueSelectedMasterStateReconciliation(BrainView *brain)
   {
     if (weAreMaster || noMasterYet || peerEligibleForClusterQuorum(brain) == false ||
         brain->registrationFresh == false || peerSocketActive(brain) == false ||
         peerRepresentsCurrentMaster(brain) == false)
     {
-      return;
+      return false;
     }
 
     // Every peer-master adoption and fresh transport must request the same
@@ -20539,7 +20648,8 @@ public:
     BrainReconcileStateRequest request = {};
     for (const auto& [deploymentID, plan] : deploymentPlans)
     {
-      request.deploymentIDs.push_back(plan.config.deploymentID());
+      bool missingArtifact = peerArtifactReconciliationDefers(brain, plan.config.deploymentID());
+      if (missingArtifact == false) request.deploymentIDs.push_back(plan.config.deploymentID());
     }
     capturePresentSystemArtifactRef(request.systemArtifact);
 
@@ -20547,6 +20657,7 @@ public:
     BitseryEngine::serialize(serializedRequest, request);
     Message::construct(brain->wBuffer, BrainTopic::reconcileState, serializedRequest);
     Ring::queueSend(brain);
+    return true;
   }
 
   void electBrainToMaster(BrainView *brain)
@@ -27576,6 +27687,26 @@ public:
     bool success = false;
   };
 
+  void completeDeferredPeerArtifactReconciliation(const PeerArtifactStore& operation)
+  {
+    auto deferred = deferredPeerArtifactReconciliations.find(operation.peerUUID);
+    if (deferred == deferredPeerArtifactReconciliations.end() || operation.peer == nullptr ||
+        deferred->second.peerBootTime != operation.peer->boottimens ||
+        deferred->second.peerGeneration != operation.transportGeneration || deferred->second.peerSlot != operation.peer->fslot)
+    {
+      return;
+    }
+    for (size_t index = 0; index < deferred->second.missingDeploymentIDs.size(); ++index)
+    {
+      if (deferred->second.missingDeploymentIDs[index] == operation.plan.config.deploymentID())
+      {
+        deferred->second.missingDeploymentIDs.erase(deferred->second.missingDeploymentIDs.begin() + index);
+        break;
+      }
+    }
+    if (deferred->second.missingDeploymentIDs.empty()) deferredPeerArtifactReconciliations.erase(deferred);
+  }
+
   bool peerArtifactStoreStillCurrent(const PeerArtifactStore& operation)
   {
     auto failed = failedDeployments.find(operation.plan.config.deploymentID());
@@ -27597,9 +27728,11 @@ public:
     }
   }
 
-  bool queuePeerArtifactStore(BrainView *peer, const DeploymentPlan& plan, const String& blob)
+  ProdigyArtifactIO::Admission queuePeerArtifactStore(BrainView *peer, const DeploymentPlan& plan, const String& blob)
   {
-    if (!ensureArtifactIO()) return false;
+    if (!ensureArtifactIO()) return ProdigyArtifactIO::Admission::stopping;
+    const ProdigyArtifactIO::Admission admission = artifactIO->admission(blob.size());
+    if (admission != ProdigyArtifactIO::Admission::admitted) return admission;
     auto operation = std::make_shared<PeerArtifactStore>();
     operation->peer = peer;
     operation->transportGeneration = peer->ioGeneration;
@@ -27613,7 +27746,7 @@ public:
       if (peerArtifactStoreStillCurrent(*operation))
         queueBrainCloseIfActive(operation->peer, "artifact-store-failed", -EIO);
     };
-    return artifactIO->submit(operation->blob.size(),
+    if (artifactIO->submit(operation->blob.size(),
         [operation] {
           String path = ContainerStore::pathForContainerImage(operation->plan.config.deploymentID());
           path.append(".incoming.XXXXXX"_ctv);
@@ -27644,11 +27777,16 @@ public:
                 std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
                 persistLocalRuntimeStateAsync([this, lifetime, operation, deploymentID](bool durable) {
                   if (!durable || lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
+                  completeDeferredPeerArtifactReconciliation(*operation);
                   Message::construct(operation->peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
                   Ring::queueSend(operation->peer);
                 });
               }, failure)) failure({});
-        }, failure);
+        }, failure) == false)
+    {
+      return ProdigyArtifactIO::Admission::submissionRejected;
+    }
+    return ProdigyArtifactIO::Admission::admitted;
   }
 
   void brainHandler(BrainView *bv, Message *message)
@@ -27998,10 +28136,23 @@ public:
             Message::extractToStringView(args, containerBlob);
             if (containerBlob.size() > 0)
             {
-              if (!queuePeerArtifactStore(bv, plan, containerBlob))
+              const ProdigyArtifactIO::Admission admission = queuePeerArtifactStore(bv, plan, containerBlob);
+              if (admission == ProdigyArtifactIO::Admission::jobCapacity ||
+                  admission == ProdigyArtifactIO::Admission::byteCapacity)
               {
-                std::fprintf(stderr, "peer artifact I/O queue rejected deploymentID=%llu\n", (unsigned long long)deploymentID);
-                queueBrainCloseIfActive(bv, "artifact-io-backpressure", -ENOBUFS);
+                if (!deferPeerArtifactReconciliation(bv, deploymentID, containerBlob.size()))
+                {
+                  std::fprintf(stderr, "peer artifact reconciliation queue rejected deploymentID=%llu\n", (unsigned long long)deploymentID);
+                  queueBrainCloseIfActive(bv, "artifact-io-backpressure", -ENOBUFS);
+                }
+              }
+              else if (admission != ProdigyArtifactIO::Admission::admitted)
+              {
+                std::fprintf(stderr, "peer artifact I/O admission rejected deploymentID=%llu admission=%u\n",
+                             (unsigned long long)deploymentID, unsigned(admission));
+                queueBrainCloseIfActive(bv,
+                    admission == ProdigyArtifactIO::Admission::oversize ? "artifact-io-oversize" : "artifact-io-unavailable",
+                    -ENOBUFS);
               }
               break;
             }
