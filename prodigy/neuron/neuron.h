@@ -2398,6 +2398,47 @@ protected:
     return nullptr;
   }
 
+  std::function<void(bool)> wormholeOperationReply(SwitchboardWormholeOperation operation)
+  {
+    NeuronBrainControlStream *requestStream = brain;
+    const uint64_t requestGeneration = requestStream ? requestStream->ioGeneration : 0;
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    operation.desired.clear();
+    return [this, lifetime, requestStream, requestGeneration, operation = std::move(operation)](bool ready) mutable {
+      if (lifetime.expired() || brain != requestStream || requestStream == nullptr ||
+          requestStream->ioGeneration != requestGeneration || !streamIsActive(requestStream)) return;
+      if (!ready && operation.status == SwitchboardWormholeOperationStatus::applied)
+        operation.status = SwitchboardWormholeOperationStatus::rollbackFailed;
+      String response = {};
+      BitseryEngine::serialize(response, operation);
+      Message::construct(requestStream->wBuffer, NeuronTopic::openSwitchboardWormholes, response);
+      Ring::queueSend(requestStream);
+    };
+  }
+
+  std::function<void(bool)> wormholeContainerRefresh(Container *container)
+  {
+    const uint128_t containerUUID = container->plan.uuid;
+    const uint64_t containerGeneration = container->ioGeneration;
+    NeuronBrainControlStream *requestStream = brain;
+    const uint64_t requestGeneration = requestStream ? requestStream->ioGeneration : 0;
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    return [this, lifetime, container, containerUUID, containerGeneration, requestStream, requestGeneration](bool ready) {
+      if (lifetime.expired() || !ready || brain != requestStream || requestStream == nullptr ||
+          requestStream->ioGeneration != requestGeneration || !streamIsActive(requestStream)) return;
+      const auto current = containers.find(containerUUID);
+      if (current == containers.end() || current->second != container || container->pendingDestroy ||
+          container->ioGeneration != containerGeneration || !streamIsActive(container)) return;
+      // The waiter coalesces newer refreshes for this container. Serialize the
+      // current owned plan only after its routing is ready, never retain a
+      // view into the original receive buffer across worker completion.
+      String serialized = {};
+      BitseryEngine::serialize(serialized, container->plan.wormholes);
+      Message::construct(container->wBuffer, ContainerTopic::wormholesRefresh, serialized);
+      Ring::queueSend(container);
+    };
+  }
+
   void refreshContainerSwitchboardWormholes(Container *container) override
   {
     if (container == nullptr)
@@ -4019,7 +4060,9 @@ public:
 
   bool quiesceArtifactIOForBundleExec(void) override
   {
-    return !artifactIO || artifactIO->quiesceForExec();
+    const bool artifactsReady = !artifactIO || artifactIO->quiesceForExec();
+    const bool ringsReady = !switchboard || switchboard->quiesceRingPreparationForExec();
+    return artifactsReady && ringsReady;
   }
 
   bool quiesceContainerControlSocketsForBundleExec(void) override
@@ -5116,14 +5159,13 @@ public:
           {
             operation.status = SwitchboardWormholeOperationStatus::rejected;
           }
-          if (streamIsActive(brain))
-          {
-            operation.desired.clear();
-            String response = {};
-            BitseryEngine::serialize(response, operation);
-            Message::construct(brain->wBuffer, NeuronTopic::openSwitchboardWormholes, response);
-            Ring::queueSend(brain);
-          }
+          const uint32_t requestContainerID = operation.containerID;
+          const bool admitted = valid && operation.status == SwitchboardWormholeOperationStatus::applied;
+          auto respond = wormholeOperationReply(std::move(operation));
+          if (admitted)
+            ensureSwitchboard()->whenRingsReady(requestContainerID, std::move(respond));
+          else
+            respond(false);
           break;
         }
       case NeuronTopic::refreshContainerWormholes:
@@ -5151,11 +5193,9 @@ public:
 
             container->plan.wormholes = wormholes;
             refreshContainerSwitchboardWormholes(container);
-            if (streamIsActive(container))
-            {
-              Message::construct(container->wBuffer, ContainerTopic::wormholesRefresh, serialized);
-              Ring::queueSend(container);
-            }
+            ensureSwitchboard()->whenRingsReady(
+                generateLocalContainerID(container->plan.fragment), wormholeContainerRefresh(container),
+                Switchboard::RingConsumer::containerRefresh);
           }
 
           break;

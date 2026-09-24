@@ -19,7 +19,8 @@
 #include <thread>
 #include <unistd.h>
 
-// A single-worker bridge for disk and digest work. The worker owns only the
+// A bounded worker bridge for blocking preparation (disk, digests, private BPF
+// maps). The worker owns only the
 // closures supplied at submit time; it never reads mutable Ring-owner state.
 // start(), stop(), submission, and destruction run on the Ring thread.
 class ProdigyArtifactIO final : public RingInterface {

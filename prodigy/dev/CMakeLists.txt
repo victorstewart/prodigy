@@ -577,6 +577,8 @@ add_executable(prodigy_ring_recvmsg_multishot_unit ${CMAKE_CURRENT_SOURCE_DIR}/t
 add_executable(prodigy_machine_pinger_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_machine_pinger_unit.cpp)
 add_executable(prodigy_switchboard_routable_prefix_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_routable_prefix_unit.cpp)
 add_executable(prodigy_switchboard_balancer_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_balancer_unit.cpp)
+add_executable(prodigy_switchboard_maglev_async_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_maglev_async_unit.cpp)
+add_executable(prodigy_switchboard_ring_publication_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_ring_publication_unit.cpp)
 add_executable(prodigy_container_storage_layout_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_storage_layout_unit.cpp)
 add_executable(prodigy_switchboard_overlay_route_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_overlay_route_unit.cpp)
 add_executable(prodigy_container_overlay_sync_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_overlay_sync_unit.cpp)
@@ -678,6 +680,8 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_machine_pinger_unit
    prodigy_switchboard_routable_prefix_unit
    prodigy_switchboard_balancer_unit
+   prodigy_switchboard_maglev_async_unit
+   prodigy_switchboard_ring_publication_unit
    prodigy_container_storage_layout_unit
    prodigy_switchboard_overlay_route_unit
    prodigy_container_overlay_sync_unit
@@ -934,6 +938,9 @@ target_compile_options(prodigy_ring_recvmsg_multishot_unit PUBLIC -O2)
 target_compile_options(prodigy_machine_pinger_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_routable_prefix_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_balancer_unit PUBLIC -O2)
+target_compile_options(prodigy_switchboard_maglev_async_unit PUBLIC -O2)
+target_compile_options(prodigy_switchboard_ring_publication_unit PUBLIC -O2)
+target_link_options(prodigy_switchboard_ring_publication_unit PRIVATE "-Wl,--wrap=bpf_map_create" "-Wl,--wrap=bpf_map_update_elem" "-Wl,--wrap=bpf_object__find_map_by_name" "-Wl,--wrap=bpf_map__fd")
 target_compile_options(prodigy_container_storage_layout_unit PUBLIC -O2)
 target_compile_options(prodigy_switchboard_overlay_route_unit PUBLIC -O2)
 target_compile_options(prodigy_container_overlay_sync_unit PUBLIC -O2)
@@ -1771,6 +1778,16 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_balancer_unit
    )
    set_tests_properties(prodigy_switchboard_balancer_unit PROPERTIES TIMEOUT 10)
+   add_test(
+      NAME prodigy_switchboard_maglev_async_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_maglev_async_unit
+   )
+   set_tests_properties(prodigy_switchboard_maglev_async_unit PROPERTIES TIMEOUT 10)
+   add_test(
+      NAME prodigy_switchboard_ring_publication_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_ring_publication_unit
+   )
+   set_tests_properties(prodigy_switchboard_ring_publication_unit PROPERTIES TIMEOUT 15)
 
    add_test(
       NAME prodigy_container_storage_layout_unit

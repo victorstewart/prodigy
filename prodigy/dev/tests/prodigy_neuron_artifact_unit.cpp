@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <vector>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -82,6 +83,7 @@ class TestNeuron final : public Neuron {
 public:
   String root = {};
   NeuronBrainControlStream *retained = nullptr;
+  std::vector<NeuronBrainControlStream *> retired = {};
   uint32_t artifactFinishes = 0;
   bool lastArtifactAdopted = false;
   bool lastArtifactSourceCurrent = false;
@@ -120,6 +122,7 @@ public:
 
   void replaceBrainWithoutClosing(void)
   {
+    if (retained != nullptr) retired.push_back(retained);
     retained = brain;
     brain = new NeuronBrainControlStream();
     brain->connected = true;
@@ -184,6 +187,75 @@ public:
     return offset == brain->wBuffer.size() && requested;
   }
 
+  std::function<void(bool)> prepareWormholeOperationReply(SwitchboardWormholeOperation operation)
+  {
+    return wormholeOperationReply(std::move(operation));
+  }
+
+  std::function<void(bool)> prepareWormholeContainerRefresh(Container *container)
+  {
+    return wormholeContainerRefresh(container);
+  }
+
+  void trackContainerForReplyTest(Container *container)
+  {
+    containers.insert_or_assign(container->plan.uuid, container);
+  }
+
+  void untrackContainerForReplyTest(uint128_t uuid)
+  {
+    containers.erase(uuid);
+  }
+
+  void prepareContainerReplyBuffer(Container *container)
+  {
+    container->wBuffer.clear();
+    container->pendingSend = true; // Inspect the queued container reply without I/O.
+  }
+
+  bool readContainerWormholeRefresh(Container *container, String& serialized) const
+  {
+    if (container == nullptr || container->wBuffer.size() < Message::headerBytes) return false;
+    Message *message = reinterpret_cast<Message *>(container->wBuffer.data());
+    if (message->size != container->wBuffer.size() || ContainerTopic(message->topic) != ContainerTopic::wormholesRefresh)
+      return false;
+    uint8_t *args = message->args;
+    Message::extractToStringView(args, serialized);
+    return true;
+  }
+
+  void prepareBrainReplyBuffer(void)
+  {
+    brain->wBuffer.clear();
+    brain->pendingSend = true; // Keep the reply in the accepted-stream buffer for inspection.
+  }
+
+  bool readWormholeOperationReply(SwitchboardWormholeOperation& operation) const
+  {
+    if (brain == nullptr || brain->wBuffer.size() < Message::headerBytes) return false;
+    Message *message = reinterpret_cast<Message *>(brain->wBuffer.data());
+    if (message->size != brain->wBuffer.size() || NeuronTopic(message->topic) != NeuronTopic::openSwitchboardWormholes)
+      return false;
+    uint8_t *args = message->args;
+    String serialized = {};
+    Message::extractToStringView(args, serialized);
+    return BitseryEngine::deserializeSafe(serialized, operation);
+  }
+
+  bool replyBufferEmpty(void) const { return brain == nullptr || brain->wBuffer.size() == 0; }
+
+  void advanceBrainGenerationForReplyTest(void) { ++brain->ioGeneration; }
+  void deactivateBrainForReplyTest(void) { brain->connected = false; }
+  void reactivateBrainForReplyTest(void) { brain->connected = true; }
+  void expireReplyLifetimeForTest(void) { asyncOperationLifetime.reset(); }
+  void restoreReplyLifetimeForTest(void) { asyncOperationLifetime = std::make_shared<uint8_t>(0); }
+  void prepareBrainForArtifactTest(void)
+  {
+    brain->wBuffer.clear();
+    brain->pendingSend = false;
+    brain->connected = true;
+  }
+
   ~TestNeuron()
   {
     // main() keeps this owner alive until quiesceForExec observes the terminal
@@ -191,6 +263,11 @@ public:
     if (artifactIO != nullptr) std::abort();
     if (brain && brain->fd >= 0) ::close(brain->fd);
     if (retained && retained->fd >= 0) ::close(retained->fd);
+    for (NeuronBrainControlStream *stream : retired)
+    {
+      if (stream && stream->fd >= 0) ::close(stream->fd);
+      delete stream;
+    }
     delete brain;
     delete retained;
     brain = nullptr;
@@ -240,10 +317,10 @@ int main()
 {
   TestSuite suite = {};
   String fixture = {};
-  if (!loadFixture(fixture))
+  const bool hasArtifactFixture = loadFixture(fixture);
+  if (!hasArtifactFixture)
   {
-    dprintf(STDERR_FILENO, "SKIP: neuron artifact fixture requires PRODIGY_TEST_APP_ARTIFACT\n");
-    return EXIT_SUCCESS;
+    dprintf(STDERR_FILENO, "SKIP: neuron artifact fixture requires PRODIGY_TEST_APP_ARTIFACT; callback receipt cases remain active\n");
   }
 
   ScopedArtifactStore store = {};
@@ -256,30 +333,158 @@ int main()
   suite.expect(started, "neuron_artifact_starts_worker_and_control_stream");
   if (started)
   {
-    constexpr uint64_t currentDeploymentID = 0xE71F01ULL;
-    suite.expect(neuron.submit(currentDeploymentID, fixture.substr(0, fixture.size(), Copy::yes)),
-                 "neuron_artifact_queues_current_stream_fixture");
-    runRingUntil(ring, [&] { return neuron.artifactFinished(); });
-    suite.expect(ring.timedOut == false && neuron.stored(currentDeploymentID, fixture),
-                 "neuron_artifact_current_stream_prepares_publishes_and_adopts_fixture");
-    suite.expect(neuron.artifactFinished() && neuron.lastArtifactAdopted && neuron.lastArtifactSourceCurrent,
-                 "neuron_artifact_current_stream_completes_on_ring_after_durable_adoption");
+    auto operation = [] {
+      SwitchboardWormholeOperation value = {};
+      value.containerID = 0x00a1b2c3;
+      value.status = SwitchboardWormholeOperationStatus::applied;
+      value.revision.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+      value.desired.assign("requested-wormhole-state"_ctv);
+      return value;
+    };
+    auto isExactReply = [&](SwitchboardWormholeOperationStatus expectedStatus) {
+      SwitchboardWormholeOperation reply = {};
+      return neuron.readWormholeOperationReply(reply) && reply.containerID == 0x00a1b2c3 &&
+             reply.status == expectedStatus &&
+             reply.revision.equal("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv) &&
+             reply.desired.size() == 0;
+    };
 
-    constexpr uint64_t staleDeploymentID = 0xE71F02ULL;
-    ring.timedOut = false;
-    neuron.artifactFinishes = 0;
-    neuron.retainPendingDownload(staleDeploymentID);
-    suite.expect(neuron.submit(staleDeploymentID, fixture.substr(0, fixture.size(), Copy::yes)),
-                 "neuron_artifact_queues_stale_stream_fixture");
+    neuron.prepareBrainReplyBuffer();
+    auto heldSuccess = neuron.prepareWormholeOperationReply(operation());
+    suite.expect(neuron.replyBufferEmpty(), "neuron_wormhole_reply_pending_callback_appends_no_reply_before_receipt");
+    heldSuccess(true);
+    suite.expect(isExactReply(SwitchboardWormholeOperationStatus::applied),
+                 "neuron_wormhole_reply_success_sends_one_applied_exact_id_revision_empty_desired");
+
+    neuron.prepareBrainReplyBuffer();
+    auto heldFailure = neuron.prepareWormholeOperationReply(operation());
+    heldFailure(false);
+    suite.expect(isExactReply(SwitchboardWormholeOperationStatus::rollbackFailed),
+                 "neuron_wormhole_reply_failure_sends_rollback_failed_not_applied");
+
+    neuron.prepareBrainReplyBuffer();
+    auto replaced = neuron.prepareWormholeOperationReply(operation());
     neuron.replaceBrainWithoutClosing();
-    runRingUntil(ring, [&] { return neuron.artifactFinished(); });
-    suite.expect(ring.timedOut == false && neuron.stored(staleDeploymentID, fixture) == false &&
-                     neuron.lastArtifactAdopted == false && neuron.lastArtifactSourceCurrent == false,
-                 "neuron_artifact_stale_incarnation_suppresses_publish_and_adoption");
-    suite.expect(neuron.hasPendingDownload(staleDeploymentID),
-                 "neuron_artifact_replacement_retains_download_for_existing_reconnect_replay");
-    suite.expect(neuron.replacementQueuesPendingDownload(staleDeploymentID),
-                 "neuron_artifact_replacement_requeues_retained_download_on_accepted_control_stream");
+    neuron.prepareBrainReplyBuffer();
+    replaced(true);
+    suite.expect(neuron.replyBufferEmpty(), "neuron_wormhole_reply_replaced_brain_suppresses_late_append");
+
+    neuron.prepareBrainReplyBuffer();
+    auto changedGeneration = neuron.prepareWormholeOperationReply(operation());
+    neuron.advanceBrainGenerationForReplyTest();
+    changedGeneration(true);
+    suite.expect(neuron.replyBufferEmpty(), "neuron_wormhole_reply_generation_change_suppresses_late_append");
+
+    neuron.prepareBrainReplyBuffer();
+    auto inactive = neuron.prepareWormholeOperationReply(operation());
+    neuron.deactivateBrainForReplyTest();
+    inactive(true);
+    suite.expect(neuron.replyBufferEmpty(), "neuron_wormhole_reply_inactive_stream_suppresses_late_append");
+    neuron.reactivateBrainForReplyTest();
+
+    neuron.prepareBrainReplyBuffer();
+    auto expiredLifetime = neuron.prepareWormholeOperationReply(operation());
+    neuron.expireReplyLifetimeForTest();
+    expiredLifetime(true);
+    suite.expect(neuron.replyBufferEmpty(), "neuron_wormhole_reply_expired_lifetime_suppresses_late_append");
+
+    // The late callback retains the old weak lifetime. Restore a fresh owner
+    // and a neutral stream before optional artifact cases use this fixture.
+    neuron.restoreReplyLifetimeForTest();
+    neuron.prepareBrainForArtifactTest();
+
+    auto localContainer = std::make_unique<Container>();
+    localContainer->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    localContainer->plan.uuid = uint128_t(0x00c0ffee);
+    localContainer->plan.wormholes.emplace_back();
+    localContainer->plan.wormholes.back().name.assign("current-wormhole"_ctv);
+    localContainer->plan.wormholes.back().containerPort = 8443;
+    localContainer->plan.wormholes.back().externalPort = 443;
+    neuron.trackContainerForReplyTest(localContainer.get());
+    String expectedWormholes = {};
+    BitseryEngine::serialize(expectedWormholes, localContainer->plan.wormholes);
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto pendingRefresh = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_pending_callback_appends_no_container_frame_before_receipt");
+    pendingRefresh(true);
+    String receivedWormholes = {};
+    suite.expect(neuron.readContainerWormholeRefresh(localContainer.get(), receivedWormholes) &&
+                     receivedWormholes == expectedWormholes,
+                 "neuron_wormhole_refresh_success_sends_exact_current_plan_serialization");
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto failedRefresh = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    failedRefresh(false);
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_failed_receipt_suppresses_container_frame");
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto obsoleteContainer = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    neuron.untrackContainerForReplyTest(localContainer->plan.uuid);
+    obsoleteContainer(true);
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_obsolete_container_entry_suppresses_late_frame");
+    neuron.trackContainerForReplyTest(localContainer.get());
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto changedContainerGeneration = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    ++localContainer->ioGeneration;
+    changedContainerGeneration(true);
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_container_generation_change_suppresses_late_frame");
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto pendingDestroy = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    localContainer->pendingDestroy = true;
+    pendingDestroy(true);
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_pending_destroy_suppresses_late_frame");
+    localContainer->pendingDestroy = false;
+
+    neuron.prepareContainerReplyBuffer(localContainer.get());
+    auto replacedSourceBrain = neuron.prepareWormholeContainerRefresh(localContainer.get());
+    neuron.replaceBrainWithoutClosing();
+    replacedSourceBrain(true);
+    suite.expect(localContainer->wBuffer.size() == 0,
+                 "neuron_wormhole_refresh_replaced_source_brain_suppresses_late_frame");
+
+    neuron.untrackContainerForReplyTest(localContainer->plan.uuid);
+    if (localContainer->fd >= 0)
+    {
+      ::close(localContainer->fd);
+      localContainer->fd = -1;
+    }
+    localContainer.reset();
+    neuron.prepareBrainForArtifactTest();
+    if (hasArtifactFixture)
+    {
+      constexpr uint64_t currentDeploymentID = 0xE71F01ULL;
+      suite.expect(neuron.submit(currentDeploymentID, fixture.substr(0, fixture.size(), Copy::yes)),
+                   "neuron_artifact_queues_current_stream_fixture");
+      runRingUntil(ring, [&] { return neuron.artifactFinished(); });
+      suite.expect(ring.timedOut == false && neuron.stored(currentDeploymentID, fixture),
+                   "neuron_artifact_current_stream_prepares_publishes_and_adopts_fixture");
+      suite.expect(neuron.artifactFinished() && neuron.lastArtifactAdopted && neuron.lastArtifactSourceCurrent,
+                   "neuron_artifact_current_stream_completes_on_ring_after_durable_adoption");
+
+      constexpr uint64_t staleDeploymentID = 0xE71F02ULL;
+      ring.timedOut = false;
+      neuron.artifactFinishes = 0;
+      neuron.retainPendingDownload(staleDeploymentID);
+      suite.expect(neuron.submit(staleDeploymentID, fixture.substr(0, fixture.size(), Copy::yes)),
+                   "neuron_artifact_queues_stale_stream_fixture");
+      neuron.replaceBrainWithoutClosing();
+      runRingUntil(ring, [&] { return neuron.artifactFinished(); });
+      suite.expect(ring.timedOut == false && neuron.stored(staleDeploymentID, fixture) == false &&
+                       neuron.lastArtifactAdopted == false && neuron.lastArtifactSourceCurrent == false,
+                   "neuron_artifact_stale_incarnation_suppresses_publish_and_adoption");
+      suite.expect(neuron.hasPendingDownload(staleDeploymentID),
+                   "neuron_artifact_replacement_retains_download_for_existing_reconnect_replay");
+      suite.expect(neuron.replacementQueuesPendingDownload(staleDeploymentID),
+                   "neuron_artifact_replacement_requeues_retained_download_on_accepted_control_stream");
+    }
   }
 
   ring.timedOut = false;

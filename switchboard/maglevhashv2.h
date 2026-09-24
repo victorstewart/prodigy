@@ -5,12 +5,16 @@ private:
 
   constexpr static uint32_t kDefaultChRingSize = 65'537;
 
+public:
+
   struct Endpoint {
 
     uint32_t num;
     uint32_t weight;
     uint64_t hash;
   };
+
+private:
 
   static uint64_t rotl64(uint64_t x, int8_t r)
   {
@@ -94,6 +98,8 @@ private:
     permutation[2 * pos + 1] = skip;
   }
 
+public:
+
   static std::array<uint32_t, RING_SIZE> generateHashRingForEndpoints(const std::vector<Endpoint>& endpoints)
   {
     std::array<uint32_t, RING_SIZE> ring;
@@ -158,7 +164,8 @@ private:
 
 public:
 
-  static std::array<uint32_t, RING_SIZE> generateHashRingForPortal(Portal *portal)
+  template <typename PortalType>
+  static std::array<uint32_t, RING_SIZE> generateHashRingForPortal(PortalType *portal)
   {
     std::vector<Endpoint> endpoints;
 

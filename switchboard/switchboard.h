@@ -468,8 +468,13 @@ public:
 } // namespace switchboard_runtime
 
 #include <switchboard/maglevhashv2.h>
+#include <switchboard/maglev.ring.prepare.h>
+#include <unordered_map>
 
 class Switchboard {
+  friend class SwitchboardRingTestAccess;
+public:
+  enum class RingConsumer : uint32_t { brainReceipt, containerRefresh };
 private:
 
   EthDevice& eth;
@@ -490,6 +495,129 @@ private:
   bytell_hash_map<uint32_t, String> wormholeRevisionByContainer;
   bytell_hash_subset<uint32_t, switchboard_runtime::Whitehole *> whiteholesByContainer;
   Vector<uint32_t> portalSlots;
+
+  // Desired routing remains Ring-owned. The worker sees only copied endpoints
+  // and creates private inner maps; the current owner alone publishes them.
+  struct PortalRingState {
+    uint64_t generation = 0;
+    uint8_t datacenterPrefix = 0;
+    std::vector<MaglevHashV2::Endpoint> endpoints;
+    std::shared_ptr<SwitchboardMaglevRingPrepareResult> prepared;
+    bool failed = false;
+  };
+  std::unordered_map<SwitchboardPortal *, PortalRingState> portalRings;
+  std::unique_ptr<ProdigyArtifactIO> ringPreparation;
+  std::shared_ptr<uint8_t> ringPreparationLifetime = std::make_shared<uint8_t>(0);
+  std::unordered_map<uint64_t, std::function<void(bool)>> ringWaiters;
+  uint64_t nextRingGeneration = 1;
+  bool ringPreparationInFlight = false;
+  bool resettingRings = false;
+  bool ringPreparationQuiescing = false;
+
+  static bool sameRingEndpoints(const std::vector<MaglevHashV2::Endpoint>& a,
+                                const std::vector<MaglevHashV2::Endpoint>& b)
+  {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (a[i].num != b[i].num || a[i].weight != b[i].weight || a[i].hash != b[i].hash) return false;
+    return true;
+  }
+
+  bool publishPreparedRing(BPFProgram *program, SwitchboardPortal *portal,
+                           const SwitchboardMaglevRingPrepareResult& prepared)
+  {
+    if (program == nullptr || !prepared.prepared()) return false;
+    bool ok = false;
+    program->openMap("cid_rings"_ctv, [&](int mapFD) {
+      if (mapFD >= 0 && bpf_map_update_elem(mapFD, &portal->slot, &prepared.innerMapFD, BPF_ANY) == 0)
+        ok = true;
+      else
+        basics_log("Switchboard outer ring publication failed ifidx=%u slot=%u errno=%d\n",
+                   eth.ifidx, unsigned(portal->slot), errno);
+    });
+    return ok;
+  }
+
+  void settleRingWaiters()
+  {
+    if (ringPreparationInFlight) return;
+    bool ok = true;
+    for (const auto& [portal, state] : portalRings)
+    {
+      (void)portal;
+      if (!state.failed && (!state.prepared || state.prepared->generation != state.generation)) return;
+      ok = ok && !state.failed;
+    }
+    // A failed asynchronous publication can have reached some programs. It is
+    // not a successful transaction or a proven rollback; force a fresh retry.
+    if (!ok) wormholeRevisionByContainer.clear();
+    auto ready = std::move(ringWaiters);
+    ringWaiters.clear();
+    for (auto& [id, completion] : ready) { (void)id; completion(ok); }
+  }
+
+  void preparePendingRings()
+  {
+    if (ringPreparationInFlight || resettingRings || ringPreparationQuiescing) return;
+    std::vector<SwitchboardMaglevRingPrepareRequest> requests;
+    for (const auto& [portal, state] : portalRings)
+    {
+      (void)portal;
+      if (!state.failed && (!state.prepared || state.prepared->generation != state.generation))
+      {
+        requests.push_back({state.generation, state.datacenterPrefix, state.endpoints});
+        if (requests.size() == 8) break; // bound one worker/completion batch
+      }
+    }
+    if (requests.empty()) { settleRingWaiters(); return; }
+    if (!ringPreparation) ringPreparation = ProdigyArtifactIO::startOwned();
+    auto failed = [this]() {
+      ringPreparationInFlight = false;
+      for (auto& [portal, state] : portalRings)
+      {
+        (void)portal;
+        if (!state.prepared || state.prepared->generation != state.generation) state.failed = true;
+      }
+      basics_log("Switchboard ring preparation failed ifidx=%u\n", eth.ifidx);
+      settleRingWaiters();
+    };
+    if (!ringPreparation) { failed(); return; }
+    const std::weak_ptr<uint8_t> lifetime = ringPreparationLifetime;
+    ringPreparationInFlight = true;
+    if (!switchboardPrepareMaglevRingsAsync(*ringPreparation, std::move(requests),
+        switchboardDefaultMaglevMapBackend(),
+        [this, lifetime](std::vector<SwitchboardMaglevRingPrepareResult>&& results) {
+          if (lifetime.expired()) return;
+          ringPreparationInFlight = false;
+          for (auto& result : results)
+          {
+            for (auto& [portal, state] : portalRings)
+            {
+              if (state.generation != result.generation) continue;
+              if (!result.prepared())
+              {
+                state.failed = true;
+                basics_log("Switchboard inner ring preparation failed ifidx=%u slot=%u error=%u errno=%d\n",
+                           eth.ifidx, unsigned(portal->slot), unsigned(result.error), result.errorNumber);
+                break;
+              }
+              auto prepared = std::make_shared<SwitchboardMaglevRingPrepareResult>(std::move(result));
+              state.prepared = prepared;
+              bool ok = syncPortalDefinitionForProgram(bpf_router, portal);
+              if (host_ingress) ok = syncPortalDefinitionForProgram(host_ingress, portal) && ok;
+              forEachActivePeerProgram([&](BPFProgram *program) {
+                ok = syncPortalDefinitionForProgram(program, portal) && ok;
+              });
+              state.failed = !ok;
+              if (ok) portal->hashRing = prepared->ring;
+              break;
+            }
+          }
+          preparePendingRings();
+        },
+        [lifetime, failed](std::exception_ptr) { if (!lifetime.expired()) failed(); })) failed();
+  }
+
 
   // Portal slots cross the machine boundary in overlay packets.  They must
   // therefore depend on the portal set, not on each node's replay order.
@@ -1842,12 +1970,20 @@ private:
     installedWhiteholeBindingKeys.clear();
   }
 
-  bool syncPortalDefinitionForProgram(BPFProgram *program, const SwitchboardPortal *portal) const
+  bool syncPortalDefinitionForProgram(BPFProgram *program, SwitchboardPortal *portal)
   {
     if (program == nullptr || portal == nullptr)
     {
       return false;
     }
+
+    auto ring = portalRings.find(portal);
+    if (ring == portalRings.end() || !ring->second.prepared ||
+        ring->second.prepared->generation != ring->second.generation)
+      return true; // desired definition is published by the prepared-map completion
+    if (ring->second.failed) return false;
+    if (!publishPreparedRing(program, portal, *ring->second.prepared))
+    { ring->second.failed = true; return false; }
 
     portal_definition portalDef = portal->generatePortalDefinition();
     portal_meta meta = {};
@@ -1881,6 +2017,7 @@ private:
       updated = true;
     });
 
+    if (!updated) ring->second.failed = true;
     return updated;
   }
 
@@ -1912,73 +2049,30 @@ private:
 
   bool generateRingForPortalOnProgram(BPFProgram *program, SwitchboardPortal *portal)
   {
-    if (portal == nullptr || program == nullptr)
+    if (portal == nullptr || program == nullptr || resettingRings || ringPreparationQuiescing) return false;
+    std::vector<MaglevHashV2::Endpoint> endpoints;
+    endpoints.reserve(portal->wormholes.size());
+    for (const auto *wormhole : portal->wormholes)
+      endpoints.push_back({wormhole->containerID, wormhole->weight ? wormhole->weight : 1, wormhole->hash()});
+    auto& state = portalRings[portal];
+    if (state.generation == 0 || state.datacenterPrefix != subnet.dpfx ||
+        !sameRingEndpoints(state.endpoints, endpoints) || state.failed)
     {
-      return false;
+      state.generation = nextRingGeneration++;
+      state.datacenterPrefix = subnet.dpfx;
+      state.endpoints = std::move(endpoints);
+      state.failed = false;
     }
-
-    std::array<uint32_t, RING_SIZE> newRing = MaglevHashV2::generateHashRingForPortal(portal);
-
-    int hashring_fd = bpf_map_create(BPF_MAP_TYPE_ARRAY, nullptr, sizeof(__u32), sizeof(container_id), RING_SIZE, nullptr);
-    if (hashring_fd < 0)
+    if (state.prepared && state.prepared->generation == state.generation)
     {
-      basics_log("Switchboard inner ring map create failed (%d)\n", errno);
-      return false;
+      const bool ok = publishPreparedRing(program, portal, *state.prepared);
+      state.failed = !ok;
+      return ok;
     }
-
-    bool ok = true;
-    for (uint32_t index = 0; index < RING_SIZE; ++index)
-    {
-      container_id entry = {};
-      uint32_t containerKey = newRing[index];
-
-      if (containerKey != 0)
-      {
-        uint8_t containerFragment = static_cast<uint8_t>((containerKey >> 24) & 0xFF);
-        uint8_t machineByte0 = static_cast<uint8_t>((containerKey >> 16) & 0xFF);
-        uint8_t machineByte1 = static_cast<uint8_t>((containerKey >> 8) & 0xFF);
-        uint8_t machineByte2 = static_cast<uint8_t>(containerKey & 0xFF);
-
-        entry.hasID = true;
-        entry.value[0] = subnet.dpfx;
-        entry.value[1] = machineByte0;
-        entry.value[2] = machineByte1;
-        entry.value[3] = machineByte2;
-        entry.value[4] = containerFragment;
-      }
-
-      if (bpf_map_update_elem(hashring_fd, &index, &entry, BPF_ANY) != 0)
-      {
-        basics_log("Switchboard inner ring update failed (%d)\n", errno);
-        ok = false;
-        break;
-      }
-    }
-
-    if (ok)
-    {
-      program->openMap("cid_rings"_ctv, [&](int map_fd) -> void {
-        if (map_fd < 0)
-        {
-          basics_log("Switchboard missing cid_rings map ifidx=%u\n", eth.ifidx);
-          ok = false;
-          return;
-        }
-
-        if (bpf_map_update_elem(map_fd, &portal->slot, &hashring_fd, BPF_ANY) != 0)
-        {
-          basics_log("Switchboard outer ring update failed (%d)\n", errno);
-          ok = false;
-        }
-      });
-    }
-
-    close(hashring_fd);
-    if (ok)
-    {
-      portal->hashRing = newRing;
-    }
-    return ok;
+    preparePendingRings();
+    // This is admission only. Neuron waits for whenRingsReady before sending
+    // an applied receipt; no incomplete inner map is ever published.
+    return !state.failed;
   }
 
   bool generateRingForPortal(SwitchboardPortal *portal)
@@ -2198,6 +2292,7 @@ private:
         removePortalDefinitionForProgram(program, portal);
         clearPortalQuicCidDecryptStateForProgram(program, portal->slot);
       });
+      portalRings.erase(portal);
       delete portal;
       if (assignDeterministicPortalSlots())
       {
@@ -2244,6 +2339,26 @@ private:
 
 public:
 
+  void whenRingsReady(uint32_t containerID, std::function<void(bool)> completion,
+                      RingConsumer consumer = RingConsumer::brainReceipt)
+  {
+    const uint64_t key = uint64_t(containerID) | (uint64_t(consumer) << 32);
+    if (ringPreparationQuiescing || resettingRings ||
+        (ringWaiters.size() >= 2 * MAX_CONTAINERS_PER_PORTAL && !ringWaiters.contains(key)))
+    { completion(false); return; }
+    // Each consumer retains only its latest request. Application refreshes
+    // must not replace the Brain's independent routing acknowledgment.
+    ringWaiters.insert_or_assign(key, std::move(completion));
+    settleRingWaiters();
+  }
+
+  bool quiesceRingPreparationForExec()
+  {
+    ringPreparationQuiescing = true;
+    ringWaiters.clear();
+    return !ringPreparation || ringPreparation->quiesceForExec();
+  }
+
   explicit Switchboard(EthDevice& thisEth)
       : eth(thisEth)
   {
@@ -2256,6 +2371,10 @@ public:
 
   ~Switchboard()
   {
+    ringPreparationLifetime.reset();
+    ringPreparationQuiescing = true;
+    ringWaiters.clear();
+    ringPreparation.reset();
     resetState();
   }
 
@@ -2325,6 +2444,11 @@ public:
 
   void resetState(void)
   {
+    resettingRings = true;
+    portalRings.clear();
+    auto canceled = std::move(ringWaiters);
+    ringWaiters.clear();
+    for (auto& [id, completion] : canceled) { (void)id; completion(false); }
     while (wormholesByContainer.size() > 0)
     {
       auto it = wormholesByContainer.begin();
@@ -2341,6 +2465,7 @@ public:
     hostedIngressPrefixes.clear();
     replaceTrackedRoutableSubnets(noSubnets);
     maybeDetachBoundaryRouter();
+    resettingRings = false;
   }
 
   void setRoutableSubnets(const Vector<DistributableExternalSubnet>& desiredSubnets)
@@ -2368,6 +2493,16 @@ public:
 
   void closeWormholesToContainer(uint32_t containerID)
   {
+    for (RingConsumer consumer : {RingConsumer::brainReceipt, RingConsumer::containerRefresh})
+    {
+      const uint64_t key = uint64_t(containerID) | (uint64_t(consumer) << 32);
+      if (auto waiting = ringWaiters.find(key); waiting != ringWaiters.end())
+      {
+        auto completion = std::move(waiting->second);
+        ringWaiters.erase(waiting);
+        completion(false);
+      }
+    }
     wormholeRevisionByContainer.erase(containerID);
     if (auto it = wormholesByContainer.find(containerID); it != wormholesByContainer.end())
     {
@@ -2517,6 +2652,7 @@ public:
                          unsigned(portal->port),
                          unsigned(portal->proto));
         portals.erase(portal);
+        portalRings.erase(portal);
         delete portal;
         (void)assignDeterministicPortalSlots();
         syncPeerProgramRuntimeRouting(bpf_router);
@@ -2560,6 +2696,7 @@ public:
       {
         removePortalDefinitionForProgram(bpf_router, portal);
         portals.erase(portal);
+        portalRings.erase(portal);
         delete portal;
         (void)assignDeterministicPortalSlots();
         syncPeerProgramRuntimeRouting(bpf_router);
