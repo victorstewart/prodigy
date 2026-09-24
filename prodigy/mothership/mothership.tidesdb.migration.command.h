@@ -20,6 +20,14 @@ inline String text(const std::string& value) { String result; result.assign(valu
 inline std::string str(const String& value) { return std::string(reinterpret_cast<const char *>(value.data()), value.size()); }
 inline std::string quote(const std::string& value) { String result; prodigyAppendShellSingleQuoted(result, text(value)); return str(result); }
 inline void require(bool value, const char *message) { if (!value) throw std::runtime_error(message); }
+// `grep -q` intentionally stops after its first match.  Under pipefail that
+// can leave printf with SIGPIPE when /proc contains many descriptors, turning
+// a valid retained preflight into a false rejection.  Redirect ordinary grep
+// output instead, so it consumes the complete descriptor listing while its
+// exact-match exit status remains the check result.
+inline std::string descriptorLockCheckCommand(const std::string& lockPath) {
+  return "printf '%s\\n' \"$fds\" | grep -Fx "+quote(lockPath)+" > /dev/null; ";
+}
 inline std::string read(const fs::path& path) {
   std::ifstream input(path, std::ios::binary); require(bool(input), "migration input unreadable");
   return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -307,7 +315,7 @@ public:
         cmd+="test \"$(systemctl show -p KillMode --value prodigy)\" = control-group; test \"$(systemctl show -p Restart --value prodigy)\" = always; ";
         cmd+="pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; test \"$(readlink -f /proc/$pid/exe)\" = "+quote(binary)+"; test \"$(cat /proc/$pid/cgroup)\" = '0::/system.slice/prodigy.service'; ";
         cmd+="fds=$(for f in /proc/$pid/fd/*; do readlink \"$f\" || true; done); ";
-        for(const auto& dbPath:{plan.statePath,plan.secretsPath}) cmd+="test -d "+quote(dbPath)+"; test ! -L "+quote(dbPath)+"; test \"$(stat -c %d "+quote(dbPath)+")\" = \"$(stat -c %d "+quote(remoteRoot)+")\"; printf '%s\\n' \"$fds\" | grep -Fxq "+quote(dbPath+"/LOCK")+"; ";
+        for(const auto& dbPath:{plan.statePath,plan.secretsPath}) cmd+="test -d "+quote(dbPath)+"; test ! -L "+quote(dbPath)+"; test \"$(stat -c %d "+quote(dbPath)+")\" = \"$(stat -c %d "+quote(remoteRoot)+")\"; "+descriptorLockCheckCommand(dbPath+"/LOCK");
         cmd+=observeContainers()+"snapshot_containers > "+quote(remoteRoot+"/containers.check")+"; ";
         cmd+="if test -f "+quote(remoteRoot+"/containers.before")+"; then cmp "+quote(remoteRoot+"/containers.before")+" "+quote(remoteRoot+"/containers.check")+"; else mv "+quote(remoteRoot+"/containers.check")+" "+quote(remoteRoot+"/containers.before")+"; sync -f "+quote(remoteRoot)+"; fi";
         run(id,cmd);

@@ -5,6 +5,36 @@
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
 #include <prodigy/mothership/mothership.tidesdb.migration.h>
 
+static bool retainedDescriptorLockChecksDrainProducer(void)
+{
+  using namespace MothershipTidesMigration;
+  const std::string stateLock = "/var/lib/prodigy/state/LOCK";
+  const std::string secretsLock = "/var/lib/prodigy/secrets/LOCK";
+  const std::string checkState = descriptorLockCheckCommand(stateLock);
+  const std::string checkSecrets = descriptorLockCheckCommand(secretsLock);
+
+  std::filesystem::create_directories(".run");
+  const std::string descriptorPath = ".run/retained-descriptors-" + std::to_string(::getpid());
+  auto run = [&](const std::string& descriptors, const std::string& check) {
+    { std::ofstream output(descriptorPath, std::ios::binary); if (!output) return false; output << descriptors; }
+    String failure;
+    const std::string command = "set -o pipefail; fds=$(cat " + quote(descriptorPath) + "); " + check;
+    return prodigyRunLocalShellCommand(text(command), &failure);
+  };
+
+  // Keep a matching lock before a payload far larger than a pipe buffer.  The
+  // fixed command must drain it; the historical grep -q command makes printf
+  // fail with SIGPIPE under pipefail after accepting the first line.
+  std::string descriptors = stateLock + "\n" + secretsLock + "\n";
+  descriptors.append(8 * 1024 * 1024, 'x');
+  bool passed = run(descriptors, checkState) && run(descriptors, checkSecrets);
+
+  passed = passed && !run(secretsLock + "\n" + stateLock + ".stale", checkState);
+  passed = passed && !run(stateLock + "\n" + secretsLock + ".stale", checkSecrets);
+  std::filesystem::remove(descriptorPath);
+  return passed;
+}
+
 static void assertRetainedBootstrapUnorderedMapRoundTrip(void)
 {
   NeuronContainerBootstrap bootstrap = {};
@@ -60,6 +90,7 @@ int main()
   assert(strstr(quiesce.c_str(), "retained containers require a recovery checkpoint") != nullptr);
 
   using namespace MothershipRetainedRecovery;
+  if (!retainedDescriptorLockChecksDrainProducer()) return 1;
   assertRetainedBootstrapUnorderedMapRoundTrip();
   // Maintenance and resumption cannot manufacture authority from an incomplete
   // migration receipt or run without the explicitly supplied tool artifact.
