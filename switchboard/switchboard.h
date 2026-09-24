@@ -5,6 +5,7 @@
 #include <cstring>
 #include <services/debug.h>
 #include <memory>
+#include <utility>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -514,6 +515,79 @@ private:
   bool resettingRings = false;
   bool ringPreparationQuiescing = false;
 
+  // QUIC CID state belongs to the same desired/published owner as portal
+  // rings.  A program identity is the kernel map ID, never a reused C++
+  // pointer.  The initial scan is deliberately bounded: a preattached ARRAY
+  // can contain stale decrypt keys that must be removed before an applied
+  // routing receipt is emitted.
+  static constexpr uint32_t quicCidMapEntries = MAX_PORTALS * 2;
+  // Bounds map-ID metadata, BPF map lookup, and BPF map update syscalls per
+  // Ring turn.
+  static constexpr uint32_t quicCidReconcileOperationsPerTurn = 32;
+  struct QuicCidProgramState {
+    // Store only observed non-zero slots.  The initial scan proves every
+    // omitted slot is zero, avoiding a 2,048-entry resident copy per peer.
+    bytell_hash_map<uint32_t, quic_cid_aes_decrypt_state> published = {};
+    uint32_t scanCursor = 0;
+    Vector<uint32_t> dirtyIndices = {};
+    uint32_t dirtyCursor = 0;
+    uint64_t desiredGeneration = 0;
+    bool scanned = false;
+    bool failed = false;
+  };
+  std::unordered_map<uint32_t, QuicCidProgramState> quicCidPrograms;
+  bool quicCidDiscoveryFailed = false;
+  bool quicCidReconciliationDirty = false;
+  // Rebuilt once when a coalesced request reaches the Ring, never for every
+  // bounded continuation.  Only non-zero desired slots are retained.
+  bytell_hash_map<uint32_t, quic_cid_aes_decrypt_state> quicCidDesired = {};
+  bool quicCidDesiredRefreshPending = false;
+  uint64_t quicCidDesiredGeneration = 1;
+  // The cursor is an index into a fresh, per-callback program list.  It never
+  // retains a BPFProgram pointer past that callback; kernel map identities are
+  // retained only until the entire sweep can safely prune removed maps.
+  uint32_t quicCidProgramSweepCursor = 0;
+  uint32_t quicCidProgramSweepCount = 0;
+  bool quicCidProgramSweepComplete = false;
+  bytell_hash_set<uint32_t> quicCidSweepActiveMapIDs = {};
+
+  struct QuicCidReconcileWakeLifetime {
+    uint32_t pending = 0;
+  };
+  std::shared_ptr<QuicCidReconcileWakeLifetime> quicCidReconcileWakeLifetime =
+      std::make_shared<QuicCidReconcileWakeLifetime>();
+
+  class QuicCidReconcileWake final : public TimeoutDispatcher {
+  public:
+    Switchboard *owner = nullptr;
+    std::shared_ptr<QuicCidReconcileWakeLifetime> lifetime;
+    TimeoutPacket packet = {};
+    QuicCidReconcileWake(Switchboard *requestedOwner,
+                          std::shared_ptr<QuicCidReconcileWakeLifetime> requestedLifetime)
+        : owner(requestedOwner), lifetime(std::move(requestedLifetime))
+    {
+      lifetime->pending += 1;
+      packet.dispatcher = this;
+    }
+
+    void cancel(void)
+    {
+      owner = nullptr;
+      Ring::queueCancelTimeout(&packet);
+    }
+
+    void dispatchTimeout(TimeoutPacket *completedPacket) override
+    {
+      if (completedPacket != &packet) return;
+      Switchboard *completedOwner = owner;
+      if (completedOwner) completedOwner->quicCidReconcileWake = nullptr;
+      if (lifetime && lifetime->pending > 0) lifetime->pending -= 1;
+      delete this;
+      if (completedOwner) completedOwner->continueQuicCidReconciliation();
+    }
+  };
+  QuicCidReconcileWake *quicCidReconcileWake = nullptr;
+
   static bool sameRingEndpoints(const std::vector<MaglevHashV2::Endpoint>& a,
                                 const std::vector<MaglevHashV2::Endpoint>& b)
   {
@@ -541,6 +615,16 @@ private:
   void settleRingWaiters()
   {
     if (ringPreparationInFlight) return;
+    if (quicCidReconciliationReady() == false)
+    {
+      if (quicCidReconciliationFailed())
+      {
+        auto failed = std::move(ringWaiters);
+        ringWaiters.clear();
+        for (auto& [id, completion] : failed) { (void)id; completion(false); }
+      }
+      return;
+    }
     bool ok = true;
     for (const auto& [portal, state] : portalRings)
     {
@@ -948,71 +1032,276 @@ private:
     }
   }
 
-  void clearPortalQuicCidDecryptStateForProgram(BPFProgram *program, uint32_t portalSlot) const
+  bool refreshQuicCidDesired(void)
   {
-    if (program == nullptr)
+    bytell_hash_map<uint32_t, quic_cid_aes_decrypt_state> desired = {};
+    for (const SwitchboardPortal *portal : portals)
     {
-      return;
-    }
-
-    quic_cid_aes_decrypt_state emptyState = {};
-    program->openMap("quic_cid_dec"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
+      if (portal == nullptr || portal->isQuic == false || portal->hasQuicCidKeyState == false)
       {
-        basics_log("Switchboard missing quic_cid_dec\n");
-        return;
+        continue;
       }
-
       for (uint8_t keyIndex = 0; keyIndex < 2; ++keyIndex)
       {
-        uint32_t mapIndex = quicCidPortalDecryptMapIndex(portalSlot, keyIndex);
-        if (bpf_map_update_elem(map_fd, &mapIndex, &emptyState, BPF_ANY) != 0)
-        {
-          basics_log("Switchboard decrypt-state clear failed (%d)\n", errno);
-        }
+        const uint128_t keyMaterial = portal->quicCidKeyMaterialByIndex[keyIndex];
+        const uint32_t mapIndex = quicCidPortalDecryptMapIndex(
+            portal->slot, wormholeQuicCidKeyMaterialPhase(keyMaterial));
+        if (mapIndex >= quicCidMapEntries) continue;
+        quic_cid_aes_decrypt_state state = {};
+        buildQuicCidDecryptState(keyMaterial, state);
+        desired.insert_or_assign(mapIndex, state);
       }
-    });
-  }
-
-  void clearPortalQuicCidDecryptState(uint32_t portalSlot)
-  {
-    clearPortalQuicCidDecryptStateForProgram(bpf_router, portalSlot);
-  }
-
-  void installPortalQuicCidDecryptStateForProgram(BPFProgram *program, const SwitchboardPortal *portal) const
-  {
-    if (program == nullptr || portal == nullptr || portal->isQuic == false || portal->hasQuicCidKeyState == false)
-    {
-      return;
     }
 
-    program->openMap("quic_cid_dec"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
+    if (desired.size() == quicCidDesired.size())
+    {
+      bool unchanged = true;
+      for (const auto& [index, state] : desired)
       {
-        basics_log("Switchboard missing quic_cid_dec\n");
-        return;
-      }
-
-      for (uint8_t keyIndex = 0; keyIndex < 2; ++keyIndex)
-      {
-        quic_cid_aes_decrypt_state aesState = {};
-        // This BPF map holds only QUIC CID routing decrypt state, never TLS
-        // session-resumption ticket material.
-        uint128_t keyMaterial = portal->quicCidKeyMaterialByIndex[keyIndex];
-        buildQuicCidDecryptState(keyMaterial, aesState);
-
-        uint32_t mapIndex = quicCidPortalDecryptMapIndex(portal->slot, wormholeQuicCidKeyMaterialPhase(keyMaterial));
-        if (bpf_map_update_elem(map_fd, &mapIndex, &aesState, BPF_ANY) != 0)
+        const auto current = quicCidDesired.find(index);
+        if (current == quicCidDesired.end() ||
+            std::memcmp(&current->second, &state, sizeof(state)) != 0)
         {
-          basics_log("Switchboard decrypt-state update failed (%d)\n", errno);
+          unchanged = false;
+          break;
         }
       }
-    });
+      if (unchanged) return false;
+    }
+
+    quicCidDesired = std::move(desired);
+    if (quicCidDesiredGeneration < UINT64_MAX) quicCidDesiredGeneration += 1;
+    return true;
   }
 
-  void installPortalQuicCidDecryptState(const SwitchboardPortal *portal)
+  void collectActiveQuicCidPrograms(Vector<BPFProgram *>& programs) const
   {
-    installPortalQuicCidDecryptStateForProgram(bpf_router, portal);
+    auto add = [&programs](BPFProgram *program) {
+      if (program != nullptr && std::find(programs.begin(), programs.end(), program) == programs.end())
+      {
+        programs.push_back(program);
+      }
+    };
+    add(bpf_router);
+    add(host_ingress);
+    forEachActivePeerProgram([&add](BPFProgram *program) { add(program); });
+  }
+
+  bool quicCidProgramConverged(const QuicCidProgramState& state) const
+  {
+    return state.scanned && !state.failed &&
+           state.desiredGeneration == quicCidDesiredGeneration &&
+           state.dirtyCursor == state.dirtyIndices.size();
+  }
+
+  void refreshQuicCidProgramDirtyIndices(QuicCidProgramState& state)
+  {
+    if (!state.scanned || state.desiredGeneration == quicCidDesiredGeneration) return;
+    state.dirtyIndices.clear();
+    for (const auto& [index, desired] : quicCidDesired)
+    {
+      const auto observed = state.published.find(index);
+      if (observed == state.published.end() ||
+          std::memcmp(&observed->second, &desired, sizeof(desired)) != 0)
+      {
+        state.dirtyIndices.push_back(index);
+      }
+    }
+    for (const auto& [index, observed] : state.published)
+    {
+      (void)observed;
+      if (quicCidDesired.contains(index) == false) state.dirtyIndices.push_back(index);
+    }
+    state.dirtyCursor = 0;
+    state.desiredGeneration = quicCidDesiredGeneration;
+  }
+
+  bool reconcileQuicCidProgram(BPFProgram *program,
+                               uint32_t& remaining,
+                               bytell_hash_set<uint32_t>& activeMapIDs)
+  {
+    if (program == nullptr) return true;
+    bool complete = false;
+    uint32_t resolvedMapID = 0;
+    program->openMap("quic_cid_dec"_ctv, [this, &complete, &resolvedMapID, &remaining, &activeMapIDs](int mapFD) {
+      if (mapFD < 0)
+      {
+        basics_log("Switchboard missing quic_cid_dec during reconciliation ifidx=%u\n", eth.ifidx);
+        quicCidDiscoveryFailed = true;
+        complete = true;
+        return;
+      }
+      if (remaining == 0) return;
+      remaining -= 1; // map-ID metadata lookup
+      const uint32_t mapID = kernelMapIDForFD(mapFD);
+      if (mapID == 0)
+      {
+        basics_log("Switchboard quic_cid_dec identity lookup failed ifidx=%u fd=%d\n", eth.ifidx, mapFD);
+        quicCidDiscoveryFailed = true;
+        complete = true;
+        return;
+      }
+      resolvedMapID = mapID;
+      QuicCidProgramState& state = quicCidPrograms[mapID];
+      while (remaining > 0 && state.scanned == false)
+      {
+        quic_cid_aes_decrypt_state observed = {};
+        errno = 0;
+        remaining -= 1;
+        if (bpf_map_lookup_elem(mapFD, &state.scanCursor, &observed) != 0)
+        {
+          basics_log("Switchboard quic_cid_dec read failed ifidx=%u map=%u index=%u errno=%d\n",
+                     eth.ifidx, mapID, state.scanCursor, errno);
+          state.failed = true;
+          return;
+        }
+        const quic_cid_aes_decrypt_state empty = {};
+        if (std::memcmp(&observed, &empty, sizeof(empty)) != 0)
+        {
+          state.published.insert_or_assign(state.scanCursor, observed);
+        }
+        state.scanCursor += 1;
+        if (state.scanCursor == quicCidMapEntries)
+        {
+          state.scanned = true;
+          refreshQuicCidProgramDirtyIndices(state);
+        }
+      }
+      refreshQuicCidProgramDirtyIndices(state);
+      while (remaining > 0 && state.dirtyCursor < state.dirtyIndices.size())
+      {
+        const uint32_t index = state.dirtyIndices[state.dirtyCursor];
+        const auto desired = quicCidDesired.find(index);
+        const quic_cid_aes_decrypt_state empty = {};
+        const quic_cid_aes_decrypt_state& expected =
+            desired == quicCidDesired.end() ? empty : desired->second;
+        errno = 0;
+        remaining -= 1;
+        if (bpf_map_update_elem(mapFD, &index, &expected, BPF_ANY) != 0)
+        {
+          basics_log("Switchboard quic_cid_dec reconcile update failed ifidx=%u map=%u index=%u errno=%d\n",
+                     eth.ifidx, mapID, index, errno);
+          state.failed = true;
+          return;
+        }
+        if (desired == quicCidDesired.end()) state.published.erase(index);
+        else state.published.insert_or_assign(index, expected);
+        state.dirtyCursor += 1;
+      }
+    });
+    if (resolvedMapID == 0) return complete;
+    const auto state = quicCidPrograms.find(resolvedMapID);
+    complete = state != quicCidPrograms.end() && quicCidProgramConverged(state->second);
+    // A map replaced during its initial scan never joined this completed
+    // sweep. Retaining its partial mirror would keep readiness false forever.
+    if (complete) activeMapIDs.insert(resolvedMapID);
+    return complete;
+  }
+
+  bool quicCidProgramStatesConverged(void) const
+  {
+    if (quicCidDiscoveryFailed || quicCidProgramSweepComplete == false) return false;
+    for (const auto& [mapID, state] : quicCidPrograms)
+    {
+      (void)mapID;
+      if (!quicCidProgramConverged(state)) return false;
+    }
+    return true;
+  }
+
+  bool quicCidReconciliationReady(void) const
+  {
+    return quicCidReconciliationDirty == false && quicCidProgramStatesConverged();
+  }
+
+  bool quicCidReconciliationFailed(void) const
+  {
+    if (quicCidDiscoveryFailed) return true;
+    for (const auto& [mapID, state] : quicCidPrograms)
+    {
+      (void)mapID;
+      if (state.failed) return true;
+    }
+    return false;
+  }
+
+  void continueQuicCidReconciliation(void)
+  {
+    if (resettingRings || ringPreparationQuiescing) return;
+    quicCidDiscoveryFailed = false;
+    if (quicCidDesiredRefreshPending)
+    {
+      quicCidDesiredRefreshPending = false;
+      (void)refreshQuicCidDesired();
+    }
+    Vector<BPFProgram *> programs = {};
+    collectActiveQuicCidPrograms(programs);
+    if (quicCidProgramSweepCount != programs.size())
+    {
+      quicCidProgramSweepCursor = 0;
+      quicCidProgramSweepComplete = false;
+      quicCidSweepActiveMapIDs.clear();
+    }
+    quicCidProgramSweepCount = programs.size();
+    uint32_t remaining = quicCidReconcileOperationsPerTurn;
+    while (quicCidProgramSweepCursor < programs.size() && remaining > 0)
+    {
+      if (reconcileQuicCidProgram(programs[quicCidProgramSweepCursor], remaining,
+                                  quicCidSweepActiveMapIDs) == false)
+      {
+        break;
+      }
+      quicCidProgramSweepCursor += 1;
+      if (quicCidReconciliationFailed()) break;
+    }
+    if (quicCidProgramSweepCursor == programs.size())
+    {
+      for (auto it = quicCidPrograms.begin(); it != quicCidPrograms.end();)
+      {
+        if (quicCidSweepActiveMapIDs.contains(it->first) == false) it = quicCidPrograms.erase(it);
+        else ++it;
+      }
+      quicCidProgramSweepComplete = true;
+    }
+    quicCidReconciliationDirty = quicCidProgramStatesConverged() == false;
+    if (quicCidReconciliationReady() == false && quicCidReconciliationFailed() == false)
+    {
+      if (quicCidReconcileWake == nullptr)
+      {
+        quicCidReconcileWake = new QuicCidReconcileWake(this, quicCidReconcileWakeLifetime);
+        quicCidReconcileWake->packet.setTimeoutUs(1);
+        Ring::queueTimeout(&quicCidReconcileWake->packet);
+      }
+    }
+    settleRingWaiters();
+  }
+
+  void requestQuicCidReconciliation(void)
+  {
+    // A fresh runtime-routing request is the explicit retry boundary for a
+    // prior map failure.  Timer-driven continuation deliberately leaves a
+    // failure sticky, so a bad map cannot busy-loop BPF syscalls.  Re-scan on
+    // a new request because the active map may have been replaced meanwhile.
+    if (quicCidReconciliationFailed())
+    {
+      quicCidDiscoveryFailed = false;
+      for (auto& [mapID, state] : quicCidPrograms)
+      {
+        (void)mapID;
+        if (state.failed == false) continue;
+        state = {};
+      }
+    }
+    quicCidDesiredRefreshPending = true;
+    quicCidReconciliationDirty = true;
+    quicCidProgramSweepCursor = 0;
+    quicCidProgramSweepCount = 0;
+    quicCidProgramSweepComplete = false;
+    quicCidSweepActiveMapIDs.clear();
+    if (resettingRings || ringPreparationQuiescing || quicCidReconcileWake != nullptr) return;
+    quicCidReconcileWake = new QuicCidReconcileWake(this, quicCidReconcileWakeLifetime);
+    quicCidReconcileWake->packet.setTimeoutUs(1);
+    Ring::queueTimeout(&quicCidReconcileWake->packet);
   }
 
   template <typename Callback>
@@ -1038,27 +1327,7 @@ private:
 
   void syncAllPortalQuicCidDecryptStates(void)
   {
-    if (bpf_router == nullptr)
-    {
-      return;
-    }
-
-    for (SwitchboardPortal *portal : portals)
-    {
-      if (portal == nullptr || portal->isQuic == false)
-      {
-        continue;
-      }
-
-      if (portal->hasQuicCidKeyState)
-      {
-        installPortalQuicCidDecryptState(portal);
-      }
-      else
-      {
-        clearPortalQuicCidDecryptState(portal->slot);
-      }
-    }
+    requestQuicCidReconciliation();
   }
 
   bool buildContainerIDStruct(uint32_t containerKey, container_id& id) const
@@ -2147,25 +2416,6 @@ private:
       clearHashMapFD<switchboard_wormhole_target_key>(map_fd, "wh_targets");
     });
 
-    program->openMap("quic_cid_dec"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        return;
-      }
-
-      quic_cid_aes_decrypt_state emptyState = {};
-      for (uint32_t mapIndex = 0; mapIndex < (MAX_PORTALS * 2); ++mapIndex)
-      {
-        if (bpf_map_update_elem(map_fd, &mapIndex, &emptyState, BPF_ANY) != 0)
-        {
-          basics_log("Switchboard quic_cid_dec clear failed scope=peer-runtime-sync ifidx=%u errno=%d index=%u\n",
-                     eth.ifidx,
-                     errno,
-                     mapIndex);
-        }
-      }
-    });
-
     for (SwitchboardPortal *portal : portals)
     {
       syncPortalDefinitionForProgram(program, portal);
@@ -2173,8 +2423,9 @@ private:
       {
         basics_log("Switchboard peer-runtime-sync cid_rings install failed ifidx=%u slot=%u\n", eth.ifidx, unsigned(portal->slot));
       }
-      installPortalQuicCidDecryptStateForProgram(program, portal);
     }
+
+    requestQuicCidReconciliation();
 
     (void)syncPortalTargetBindingsForProgram(program, "peer-runtime-sync");
 
@@ -2203,25 +2454,6 @@ private:
       clearHashMapFD<switchboard_wormhole_target_key>(map_fd, "wh_targets");
     });
 
-    host_ingress->openMap("quic_cid_dec"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        return;
-      }
-
-      quic_cid_aes_decrypt_state emptyState = {};
-      for (uint32_t mapIndex = 0; mapIndex < (MAX_PORTALS * 2); ++mapIndex)
-      {
-        if (bpf_map_update_elem(map_fd, &mapIndex, &emptyState, BPF_ANY) != 0)
-        {
-          basics_log("Switchboard quic_cid_dec clear failed scope=host-ingress-sync ifidx=%u errno=%d index=%u\n",
-                     eth.ifidx,
-                     errno,
-                     mapIndex);
-        }
-      }
-    });
-
     for (SwitchboardPortal *portal : portals)
     {
       syncPortalDefinitionForProgram(host_ingress, portal);
@@ -2229,8 +2461,9 @@ private:
       {
         basics_log("Switchboard host-ingress-sync cid_rings install failed ifidx=%u slot=%u\n", eth.ifidx, unsigned(portal->slot));
       }
-      installPortalQuicCidDecryptStateForProgram(host_ingress, portal);
     }
+
+    requestQuicCidReconciliation();
 
     (void)syncPortalTargetBindingsForProgram(host_ingress, "host-ingress-sync");
 
@@ -2286,14 +2519,13 @@ private:
         removePortalDefinitionForProgram(bpf_router, portal);
       }
 
-      clearPortalQuicCidDecryptState(portal->slot);
       portals.erase(portal);
       forEachActivePeerProgram([&](BPFProgram *program) -> void {
         removePortalDefinitionForProgram(program, portal);
-        clearPortalQuicCidDecryptStateForProgram(program, portal->slot);
       });
       portalRings.erase(portal);
       delete portal;
+      requestQuicCidReconciliation();
       if (assignDeterministicPortalSlots())
       {
         syncPeerProgramRuntimeRouting(bpf_router);
@@ -2349,6 +2581,7 @@ public:
     // Each consumer retains only its latest request. Application refreshes
     // must not replace the Brain's independent routing acknowledgment.
     ringWaiters.insert_or_assign(key, std::move(completion));
+    requestQuicCidReconciliation();
     settleRingWaiters();
   }
 
@@ -2356,7 +2589,9 @@ public:
   {
     ringPreparationQuiescing = true;
     ringWaiters.clear();
-    return !ringPreparation || ringPreparation->quiesceForExec();
+    if (QuicCidReconcileWake *wake = std::exchange(quicCidReconcileWake, nullptr)) wake->cancel();
+    const bool preparationQuiesced = !ringPreparation || ringPreparation->quiesceForExec();
+    return preparationQuiesced && quicCidReconcileWakeLifetime->pending == 0;
   }
 
   explicit Switchboard(EthDevice& thisEth)
@@ -2374,6 +2609,7 @@ public:
     ringPreparationLifetime.reset();
     ringPreparationQuiescing = true;
     ringWaiters.clear();
+    if (QuicCidReconcileWake *wake = std::exchange(quicCidReconcileWake, nullptr)) wake->cancel();
     ringPreparation.reset();
     resetState();
   }
@@ -2445,6 +2681,16 @@ public:
   void resetState(void)
   {
     resettingRings = true;
+    if (QuicCidReconcileWake *wake = std::exchange(quicCidReconcileWake, nullptr)) wake->cancel();
+    quicCidPrograms.clear();
+    quicCidDiscoveryFailed = false;
+    quicCidReconciliationDirty = false;
+    quicCidDesired.clear();
+    quicCidDesiredRefreshPending = false;
+    quicCidProgramSweepCursor = 0;
+    quicCidProgramSweepCount = 0;
+    quicCidProgramSweepComplete = false;
+    quicCidSweepActiveMapIDs.clear();
     portalRings.clear();
     auto canceled = std::move(ringWaiters);
     ringWaiters.clear();
@@ -2662,10 +2908,7 @@ public:
 
     }
 
-    if (portal->isQuic && portal->hasQuicCidKeyState)
-    {
-      installPortalQuicCidDecryptState(portal);
-    }
+    requestQuicCidReconciliation();
 
     switchboard_runtime::Wormhole *wormhole = new switchboard_runtime::Wormhole();
     wormhole->containerID = containerID;
