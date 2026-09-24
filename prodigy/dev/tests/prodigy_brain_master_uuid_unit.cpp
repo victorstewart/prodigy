@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <csignal>
+#include <sched.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -1792,6 +1793,45 @@ int main(void)
     ::rmdir(socketDirectory);
   };
 
+  auto runFollowerBootstrapHeartbeatTickerFixture = [&]() -> void {
+    // getBrains() binds the production Brain port. This selected fixture must
+    // enter a private network namespace before it can create that listener.
+    if (::unshare(CLONE_NEWNET) != 0)
+    {
+      suite.expect(false, "follower_bootstrap_heartbeat_ticker_requires_private_network_namespace");
+      return;
+    }
+
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+
+    // Noop bootstrap reports this process as a non-master. getBrains() is the
+    // only bootstrap path available to followers before a master election.
+    const int64_t startedAtMs = Time::now<TimeResolution::ms>();
+    brain.getBrains();
+    suite.expect(brain.weAreMaster == false && brain.noMasterYet,
+                 "follower_bootstrap_heartbeat_ticker_keeps_follower_role");
+    suite.expect(brain.brainPeerHeartbeatTicker.flags == uint64_t(BrainTimeoutFlags::brainPeerHeartbeat) &&
+                     brain.brainPeerHeartbeatTicker.dispatcher != nullptr,
+                 "follower_bootstrap_heartbeat_ticker_installs_timeout_dispatcher");
+
+    RingExitDeadline deadline(int64_t(brain.brainPeerHeartbeatTimeoutMs) * 2 +
+                              int64_t(brain.brainPeerHeartbeatIntervalMs) * 2);
+    deadline.arm();
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+
+    suite.expect(deadline.fired,
+                 "follower_bootstrap_heartbeat_ticker_runs_real_ring_two_timeout_windows");
+    suite.expect(brain.lastBrainPeerHeartbeatTickMs >=
+                     startedAtMs + int64_t(brain.brainPeerHeartbeatTimeoutMs) * 2 -
+                         int64_t(brain.brainPeerHeartbeatIntervalMs),
+                 "follower_bootstrap_heartbeat_ticker_rearms_after_each_real_ring_receipt");
+  };
+
   auto runRestoredDeploymentChainFixtures = [&]() -> void {
     withUniqueMothershipSocket("self_elect_as_master_promotes_newer_pending_deployment_socket_dir_created", [&] {
     TestBrain brain = {};
@@ -2356,6 +2396,11 @@ int main(void)
       withUniqueMothershipSocket(
           "direct_master_claim_reconciliation_socket_dir_created",
           [&] { runDirectMasterClaimReconciliationFixtures(suite); });
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "follower-bootstrap-heartbeat-ticker") == 0)
+    {
+      runFollowerBootstrapHeartbeatTickerFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }

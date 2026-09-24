@@ -19163,13 +19163,6 @@ public:
     RingDispatcher::installMultiplexee(&ignitionSwitch, this);
     Ring::queueTimeout(&ignitionSwitch);
 
-    brainPeerHeartbeatTicker.flags = uint64_t(BrainTimeoutFlags::brainPeerHeartbeat);
-    brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
-    brainPeerHeartbeatTicker.dispatcher = this;
-    RingDispatcher::installMultiplexee(&brainPeerHeartbeatTicker, this);
-    // Keep peer liveness ticking even when the mesh goes otherwise quiet.
-    Ring::queueTimeout(&brainPeerHeartbeatTicker);
-
     // we could turn this on and off whether we have spot machines or not.... but just simpler to let it run always
     spotDecomissionChecker.flags = uint64_t(BrainTimeoutFlags::spotDecomissionChecker);
     spotDecomissionChecker.setTimeoutMs(prodigyBrainSpotDecommissionCheckIntervalMs); // every 90 seconds, gives us 30 seconds to get a new machine up if need be
@@ -19263,6 +19256,14 @@ public:
     Ring::installFDIntoFixedFileSlot(&brainSocket);
     brain_saddrlen = sizeof(brain_saddr);
     Ring::queueAccept(&brainSocket, reinterpret_cast<struct sockaddr *>(&brain_saddr), &brain_saddrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+    // Every Brain role enters here after Ring is live. Followers do not necessarily
+    // enumerate machines, so peer liveness must not be owned by getMachines().
+    brainPeerHeartbeatTicker.flags = uint64_t(BrainTimeoutFlags::brainPeerHeartbeat);
+    brainPeerHeartbeatTicker.setTimeoutMs(brainPeerHeartbeatIntervalMs);
+    brainPeerHeartbeatTicker.dispatcher = this;
+    RingDispatcher::installMultiplexee(&brainPeerHeartbeatTicker, this);
+    Ring::queueTimeout(&brainPeerHeartbeatTicker);
 
     CoroutineStack *coro = &brainInventoryCoroutine;
 
