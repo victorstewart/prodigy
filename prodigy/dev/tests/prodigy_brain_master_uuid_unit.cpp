@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <csignal>
+#include <fcntl.h>
 #include <sched.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -974,6 +975,214 @@ public:
   }
 };
 
+// Drive the production Brain send/receive callbacks through Ring while the
+// other end deliberately drains only a small amount per tick.  This keeps a
+// fragmented artifact in flight long enough for many actual heartbeat request
+// and response frames without opening a listener or leaving the process netns.
+class PacedArtifactHeartbeatPeer final : public TimeoutDispatcher {
+public:
+  TestSuite& suite;
+  TestBrain& brain;
+  BrainView& peer;
+  int remoteFD = -1;
+  ProdigyArtifactStream remote = {};
+  TimeoutPacket tick = {};
+  TimeoutPacket deadline = {};
+  uint32_t completedArtifacts = 0;
+  uint32_t ticks = 0;
+  uint32_t heartbeatRequests = 0;
+  uint32_t heartbeatResponsesSent = 0;
+  uint32_t controlFramesQueued = 0;
+  uint32_t controlFramesReceived = 0;
+  uint32_t controlsQueuedWithCiphertext = 0;
+  uint32_t targetHeartbeats = 30;
+  uint32_t targetControls = 0;
+  bool useTransportTLS = false;
+  bool parseFailed = false;
+  bool deadlineFired = false;
+
+  PacedArtifactHeartbeatPeer(TestSuite& testSuite, TestBrain& testBrain,
+                             BrainView& testPeer, int fd, bool tls = false,
+                             uint32_t heartbeats = 30, uint32_t controls = 0)
+      : suite(testSuite), brain(testBrain), peer(testPeer), remoteFD(fd),
+        targetHeartbeats(heartbeats), targetControls(controls), useTransportTLS(tls)
+  {
+    remote.rBuffer.reserve(8192);
+    remote.wBuffer.reserve(8192);
+    tick.dispatcher = this;
+    deadline.dispatcher = this;
+    tick.setTimeoutMs(1);
+    deadline.setTimeoutMs(2000);
+  }
+
+  void arm(void)
+  {
+    Ring::queueTimeout(&tick);
+    Ring::queueTimeout(&deadline);
+  }
+
+  void drainRemote(void)
+  {
+    uint8_t bytes[4096] = {};
+    const ssize_t received = ::recv(remoteFD, bytes, sizeof(bytes), MSG_DONTWAIT);
+    if (received > 0)
+    {
+      if (useTransportTLS)
+      {
+        if (remote.rBuffer.remainingCapacity() < uint32_t(received))
+        {
+          remote.rBuffer.reserve(remote.rBuffer.size() + uint32_t(received));
+        }
+        std::memcpy(remote.rBuffer.pTail(), bytes, uint32_t(received));
+        parseFailed = parseFailed || remote.decryptTransportTLS(uint32_t(received)) == false;
+      }
+      else
+      {
+        remote.rBuffer.append(bytes, uint32_t(received));
+      }
+      bool framingFailed = false;
+      String failure = {};
+      remote.extractMessages<Message>([&](Message *message) {
+        if (message->topic == ProdigyBulkTransfer::fragmentTopic)
+        {
+          const auto result = remote.artifacts.consume(
+              message,
+              [&](String&&) { completedArtifacts += 1; },
+              &failure);
+          framingFailed = framingFailed || result == ProdigyBulkTransfer::ConsumeResult::invalid;
+          return;
+        }
+        if (BrainTopic(message->topic) == BrainTopic::replicateMasterAuthorityState)
+        {
+          uint8_t *args = message->args;
+          String payload = {};
+          Message::extractToString(args, payload);
+          if (payload.size() < 64_KB ||
+              uint8_t(payload[0]) != uint8_t(controlFramesReceived))
+          {
+            framingFailed = true;
+            return;
+          }
+          controlFramesReceived += 1;
+          return;
+        }
+        if (BrainTopic(message->topic) != BrainTopic::peerHeartbeat || message->isEcho())
+        {
+          framingFailed = true;
+          return;
+        }
+        uint8_t *args = message->args;
+        bool response = true;
+        uint64_t nonce = 0;
+        if (!Message::extractArg<ArgumentNature::fixed>(args, response) ||
+            !Message::extractArg<ArgumentNature::fixed>(args, nonce) || response)
+        {
+          framingFailed = true;
+          return;
+        }
+        heartbeatRequests += 1;
+        Message::construct(remote.wBuffer, uint16_t(BrainTopic::peerHeartbeat), true, nonce);
+      }, true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, framingFailed);
+      parseFailed = parseFailed || framingFailed || failure.empty() == false;
+    }
+
+    const uint32_t available = remote.nBytesToSend();
+    if (available > 0)
+    {
+      const ssize_t sent = ::send(remoteFD, remote.pBytesToSend(), available, MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (sent > 0)
+      {
+        if (remote.transportTLSEnabled() == false || remote.wBuffer.outstandingBytes() > 0)
+        {
+          heartbeatResponsesSent += 1;
+        }
+        remote.consumeSentBytes(uint32_t(sent), false);
+      }
+      else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+        parseFailed = true;
+      }
+    }
+  }
+
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    if (packet == &deadline)
+    {
+      deadlineFired = true;
+      Ring::exit = true;
+      return;
+    }
+    if (packet != &tick)
+    {
+      parseFailed = true;
+      Ring::exit = true;
+      return;
+    }
+
+    drainRemote();
+    // Once the transfer has completed and the workload has observed its
+    // requested replies, do not create a new probe merely because the Ring timer
+    // fired before the last queued echo was received.  Keep pumping the real
+    // peer until that already-issued nonce is acknowledged.
+    if (completedArtifacts == 1 && controlFramesReceived == targetControls && peer.lastHeartbeatAckNonce >= targetHeartbeats)
+    {
+      if (peer.lastHeartbeatAckNonce == peer.lastHeartbeatSentNonce)
+      {
+        Ring::exit = true;
+        return;
+      }
+      tick.setTimeoutMs(1);
+      Ring::queueTimeout(&tick);
+      return;
+    }
+    ticks += 1;
+    brain.testRunBrainPeerHeartbeatTick();
+    if (controlFramesQueued < targetControls &&
+        (peer.hasBufferedTransportCiphertext() || peer.pendingSend || (ticks % 5) == 0))
+    {
+      String payload = {};
+      payload.reserve(96_KB);
+      payload.append(uint8_t(controlFramesQueued));
+      while (payload.size() < 96_KB)
+      {
+        payload.append(uint8_t(payload.size()));
+      }
+      if (peer.hasBufferedTransportCiphertext() || peer.pendingSend)
+      {
+        controlsQueuedWithCiphertext += 1;
+      }
+      brain.queueBrainReplication(BrainTopic::replicateMasterAuthorityState, payload);
+      controlFramesQueued += 1;
+    }
+    drainRemote();
+
+    if (peer.lastHeartbeatAckNonce >= targetHeartbeats && completedArtifacts == 1 &&
+        controlFramesReceived == targetControls &&
+        peer.lastHeartbeatAckNonce == peer.lastHeartbeatSentNonce)
+    {
+      Ring::exit = true;
+      return;
+    }
+    tick.setTimeoutMs(1);
+    Ring::queueTimeout(&tick);
+  }
+};
+
+static bool configurePacedTransportTLSRuntime(
+    uint128_t uuid, const String& rootCertPem, const String& rootKeyPem,
+    const String& certPem, const String& keyPem, String *failure)
+{
+  ProdigyTransportTLSBootstrap bootstrap = {};
+  bootstrap.uuid = uuid;
+  bootstrap.transport.generation = 1;
+  bootstrap.transport.clusterRootCertPem = rootCertPem;
+  bootstrap.transport.clusterRootKeyPem = rootKeyPem;
+  bootstrap.transport.localCertPem = certPem;
+  bootstrap.transport.localKeyPem = keyPem;
+  return ProdigyTransportTLSRuntime::configure(bootstrap, failure);
+}
+
 template <typename... Args>
 static Message *buildBrainMessage(String& buffer, BrainTopic topic, Args&&...args)
 {
@@ -1809,7 +2018,7 @@ int main(void)
 
     // Noop bootstrap reports this process as a non-master. getBrains() is the
     // only bootstrap path available to followers before a master election.
-    const int64_t startedAtMs = Time::now<TimeResolution::ms>();
+    const int64_t startedAtMs = Time::msSinceBoot();
     brain.getBrains();
     suite.expect(brain.weAreMaster == false && brain.noMasterYet,
                  "follower_bootstrap_heartbeat_ticker_keeps_follower_role");
@@ -1830,6 +2039,217 @@ int main(void)
                      startedAtMs + int64_t(brain.brainPeerHeartbeatTimeoutMs) * 2 -
                          int64_t(brain.brainPeerHeartbeatIntervalMs),
                  "follower_bootstrap_heartbeat_ticker_rearms_after_each_real_ring_receipt");
+  };
+
+  auto runFragmentedArtifactHeartbeatRingFixture = [&]() -> void {
+    // This fixture has no listener: its only transport is an AF_UNIX pair in
+    // the test process, so it cannot touch a deployed Brain's :313 socket.
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    brain.brainPeerHeartbeatIntervalMs = 2;
+    brain.brainPeerHeartbeatTimeoutMs = 100;
+
+    int fds[2] = {-1, -1};
+    suite.expect(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0,
+                 "brain_artifact_heartbeat_ring_creates_socketpair");
+    if (fds[0] < 0 || fds[1] < 0) return;
+    const int flags = ::fcntl(fds[1], F_GETFL, 0);
+    suite.expect(flags >= 0 && ::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) == 0,
+                 "brain_artifact_heartbeat_ring_sets_paced_remote_nonblocking");
+    int socketBuffer = 4096;
+    (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &socketBuffer, sizeof(socketBuffer));
+    (void)::setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &socketBuffer, sizeof(socketBuffer));
+
+    BrainView peer = {};
+    peer.uuid = uint128_t(0xA711CE);
+    peer.boottimens = 71;
+    peer.registrationFresh = true;
+    peer.connected = true;
+    peer.currentStreamAccepted = true; // Preserve the canonical accepted owner.
+    peer.artifactChunksEnabled = true;
+    peer.fd = fds[0];
+    RingDispatcher::installMultiplexee(&peer, &brain);
+    Ring::installFDIntoFixedFileSlot(&peer);
+    suite.expect(peer.isFixedFile && peer.fslot >= 0,
+                 "brain_artifact_heartbeat_ring_adopts_canonical_peer_fixed_slot");
+    if (!peer.isFixedFile || peer.fslot < 0)
+    {
+      ::close(fds[0]);
+      ::close(fds[1]);
+      return;
+    }
+    peer.noteTransportActivated();
+    const uint32_t initialTransportEpoch = peer.transportEpoch;
+    brain.brains.insert(&peer);
+
+    String payload = {};
+    payload.reserve(4u * 1024u * 1024u);
+    for (uint32_t i = 0; i < 4u * 1024u * 1024u; ++i) payload.append(uint8_t(i));
+    String artifact = {};
+    Message::construct(artifact, BrainTopic::updateBundle, payload);
+    String queueFailure = {};
+    suite.expect(peer.queueArtifactMessage(std::move(artifact), &queueFailure) && queueFailure.empty(),
+                 "brain_artifact_heartbeat_ring_queues_fragmented_artifact");
+
+    RingInterface *previousInterfacer = Ring::interfacer;
+    auto previousLifecycler = Ring::lifecycler;
+    Ring::interfacer = &brain;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::queueRecv(&peer);
+    Ring::queueSend(&peer);
+    PacedArtifactHeartbeatPeer remote(suite, brain, peer, fds[1]);
+    remote.arm();
+    Ring::start();
+
+    std::fprintf(stderr,
+                 "brain_artifact_heartbeat_ring_metrics ticks=%u requests=%u responseWrites=%u ack=%llu sent=%llu artifacts=%u deadline=%d parseFailed=%d epoch=%u closeQueued=%u closeProcessed=%u\n",
+                 remote.ticks, remote.heartbeatRequests, remote.heartbeatResponsesSent,
+                 static_cast<unsigned long long>(peer.lastHeartbeatAckNonce),
+                 static_cast<unsigned long long>(peer.lastHeartbeatSentNonce), remote.completedArtifacts,
+                 int(remote.deadlineFired), int(remote.parseFailed), peer.transportEpoch,
+                 peer.queuedCloseTransportEpoch, peer.processedCloseTransportEpoch);
+
+    suite.expect(remote.deadlineFired == false && remote.parseFailed == false,
+                 "brain_artifact_heartbeat_ring_completes_without_remote_framing_failure");
+    suite.expect(remote.completedArtifacts == 1,
+                 "brain_artifact_heartbeat_ring_delivers_fragmented_artifact_while_probing");
+    suite.expect(peer.lastHeartbeatAckNonce >= 30 &&
+                     peer.lastHeartbeatAckNonce == peer.lastHeartbeatSentNonce,
+                 "brain_artifact_heartbeat_ring_receives_30_heartbeats_during_paced_artifact");
+    suite.expect(peer.transportEpoch == initialTransportEpoch &&
+                     peer.queuedCloseTransportEpoch == 0 && peer.processedCloseTransportEpoch == 0 &&
+                     Ring::socketIsClosing(&peer) == false,
+                 "brain_artifact_heartbeat_ring_preserves_canonical_transport_without_close");
+
+    Ring::interfacer = previousInterfacer;
+    Ring::lifecycler = previousLifecycler;
+    Ring::exit = false;
+    Ring::uninstallFromFixedFileSlot(&peer);
+    ::close(fds[1]);
+    peer.fd = -1;
+    peer.isFixedFile = false;
+    brain.brains.erase(&peer);
+  };
+
+  auto runTlsFragmentedArtifactHeartbeatRingFixture = [&]() -> void {
+    // This is still an in-process AF_UNIX pair. TLS is the production stream
+    // owner; no listener or host-network resource is created.
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.brainPeerHeartbeatIntervalMs = 2;
+    // Accelerate probes for sampling; retain the production liveness deadline.
+    brain.brainPeerHeartbeatTimeoutMs = prodigyBrainPeerHeartbeatTimeoutMs;
+    ProdigyTransportTLSRuntime::clear();
+
+    String rootCert = {}, rootKey = {}, clientCert = {}, clientKey = {}, serverCert = {}, serverKey = {}, failure = {};
+    const uint128_t clientUUID = uint128_t(0xA711CE01);
+    const uint128_t serverUUID = uint128_t(0xA711CE02);
+    suite.expect(Vault::generateTransportRootCertificateEd25519(rootCert, rootKey, &failure) && failure.empty(),
+                 "tls_fragmented_artifact_generates_root");
+    suite.expect(Vault::generateTransportNodeCertificateEd25519(rootCert, rootKey, clientUUID, {}, clientCert, clientKey, &failure) && failure.empty(),
+                 "tls_fragmented_artifact_generates_client_certificate");
+    suite.expect(Vault::generateTransportNodeCertificateEd25519(rootCert, rootKey, serverUUID, {}, serverCert, serverKey, &failure) && failure.empty(),
+                 "tls_fragmented_artifact_generates_server_certificate");
+    if (rootCert.empty() || clientCert.empty() || serverCert.empty()) return;
+
+    int fds[2] = {-1, -1};
+    suite.expect(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0,
+                 "tls_fragmented_artifact_creates_socketpair");
+    if (fds[0] < 0 || fds[1] < 0) return;
+    const int flags = ::fcntl(fds[1], F_GETFL, 0);
+    suite.expect(flags >= 0 && ::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK) == 0,
+                 "tls_fragmented_artifact_sets_remote_nonblocking");
+    int socketBuffer = 4096;
+    (void)::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &socketBuffer, sizeof(socketBuffer));
+    (void)::setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &socketBuffer, sizeof(socketBuffer));
+
+    BrainView peer = {};
+    peer.uuid = serverUUID;
+    peer.boottimens = 72;
+    peer.registrationFresh = true;
+    // The remote has already acknowledged this fixture's master identity, so
+    // the heartbeat path does not inject an unrelated registration frame into
+    // the focused artifact/control parser.
+    peer.existingMasterUUID = neuron.uuid;
+    peer.connected = true;
+    peer.currentStreamAccepted = true;
+    peer.artifactChunksEnabled = true;
+    peer.fd = fds[0];
+    RingDispatcher::installMultiplexee(&peer, &brain);
+    Ring::installFDIntoFixedFileSlot(&peer);
+    suite.expect(peer.isFixedFile && peer.fslot >= 0,
+                 "tls_fragmented_artifact_adopts_fixed_slot");
+    if (!peer.isFixedFile || peer.fslot < 0)
+    {
+      ::close(fds[0]); ::close(fds[1]); return;
+    }
+    suite.expect(configurePacedTransportTLSRuntime(clientUUID, rootCert, rootKey, clientCert, clientKey, &failure) && failure.empty() &&
+                     peer.beginTransportTLS(false),
+                 "tls_fragmented_artifact_begins_client_tls");
+
+    PacedArtifactHeartbeatPeer remote(suite, brain, peer, fds[1], true, 64, 12);
+    remote.deadline.setTimeoutMs(8000);
+    remote.remote.fd = fds[1];
+    remote.remote.isNonBlocking = true;
+    suite.expect(configurePacedTransportTLSRuntime(serverUUID, rootCert, rootKey, serverCert, serverKey, &failure) && failure.empty() &&
+                     remote.remote.beginTransportTLS(true),
+                 "tls_fragmented_artifact_begins_server_tls");
+    peer.noteTransportActivated();
+    const uint32_t initialTransportEpoch = peer.transportEpoch;
+    brain.brains.insert(&peer);
+
+    String payload = {};
+    payload.reserve(4u * 1024u * 1024u);
+    for (uint32_t i = 0; i < 4u * 1024u * 1024u; ++i) payload.append(uint8_t(i));
+    String artifact = {};
+    Message::construct(artifact, BrainTopic::updateBundle, payload);
+    String queueFailure = {};
+    suite.expect(peer.queueArtifactMessage(std::move(artifact), &queueFailure) && queueFailure.empty(),
+                 "tls_fragmented_artifact_queues_bulk_frame");
+
+    RingInterface *previousInterfacer = Ring::interfacer;
+    auto previousLifecycler = Ring::lifecycler;
+    Ring::interfacer = &brain;
+    Ring::lifecycler = nullptr;
+    Ring::exit = false;
+    Ring::queueRecv(&peer);
+    Ring::queueSend(&peer);
+    remote.arm();
+    Ring::start();
+
+    std::fprintf(stderr,
+                 "tls_fragmented_artifact_metrics ticks=%u artifacts=%u controls=%u controlsCiphertext=%u ack=%llu sent=%llu deadline=%d parseFailed=%d epoch=%u closeQueued=%u closeProcessed=%u\n",
+                 remote.ticks, remote.completedArtifacts, remote.controlFramesReceived, remote.controlsQueuedWithCiphertext,
+                 static_cast<unsigned long long>(peer.lastHeartbeatAckNonce),
+                 static_cast<unsigned long long>(peer.lastHeartbeatSentNonce), int(remote.deadlineFired), int(remote.parseFailed),
+                 peer.transportEpoch, peer.queuedCloseTransportEpoch, peer.processedCloseTransportEpoch);
+    suite.expect(!remote.deadlineFired && !remote.parseFailed && remote.completedArtifacts == 1,
+                 "tls_fragmented_artifact_delivers_bulk_without_framing_failure");
+    suite.expect(remote.controlFramesReceived == 12 && remote.controlsQueuedWithCiphertext > 0,
+                 "tls_fragmented_artifact_orders_controls_during_ciphertext_send");
+    suite.expect(peer.lastHeartbeatAckNonce >= 64 && peer.lastHeartbeatAckNonce == peer.lastHeartbeatSentNonce,
+                 "tls_fragmented_artifact_receives_64_heartbeat_acks");
+    suite.expect(peer.isTLSNegotiated() && peer.tlsPeerVerified && peer.tlsPeerUUID == serverUUID,
+                 "tls_fragmented_artifact_authenticates_configured_server_identity");
+    suite.expect(peer.transportEpoch == initialTransportEpoch && peer.queuedCloseTransportEpoch == 0 &&
+                     peer.processedCloseTransportEpoch == 0 && Ring::socketIsClosing(&peer) == false,
+                 "tls_fragmented_artifact_preserves_connection_without_close");
+
+    Ring::interfacer = previousInterfacer;
+    Ring::lifecycler = previousLifecycler;
+    Ring::exit = false;
+    Ring::uninstallFromFixedFileSlot(&peer);
+    ::close(fds[1]);
+    peer.fd = -1;
+    peer.isFixedFile = false;
+    brain.brains.erase(&peer);
+    ProdigyTransportTLSRuntime::clear();
   };
 
   auto runRestoredDeploymentChainFixtures = [&]() -> void {
@@ -2401,6 +2821,16 @@ int main(void)
     if (std::strcmp(testOnly, "follower-bootstrap-heartbeat-ticker") == 0)
     {
       runFollowerBootstrapHeartbeatTickerFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "fragmented-artifact-heartbeat-ring") == 0)
+    {
+      runFragmentedArtifactHeartbeatRingFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "tls-fragmented-artifact-heartbeat-ring") == 0)
+    {
+      runTlsFragmentedArtifactHeartbeatRingFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
@@ -4009,7 +4439,7 @@ int main(void)
     suite.expect(installed, "brain_peer_heartbeat_tick_local_lag_peer_installs_socket");
     if (installed)
     {
-      int64_t staleMs = Time::now<TimeResolution::ms>() - 20;
+      int64_t staleMs = Time::msSinceBoot() - 20;
       brain.lastBrainPeerHeartbeatTickMs = staleMs;
       peer->noteTransportActivated();
       peer->lastHeartbeatAckMs = staleMs;
@@ -5815,12 +6245,12 @@ int main(void)
       brain.brains.insert(peerB);
       peerA->noteTransportActivated();
       peerB->noteTransportActivated();
-      peerA->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+      peerA->lastHeartbeatAckMs = Time::msSinceBoot() - 10;
       peerA->lastReceiveMs = peerA->lastHeartbeatAckMs;
       peerA->lastHeartbeatSendMs = peerA->lastHeartbeatAckMs;
       peerA->lastHeartbeatSentNonce = 2;
       peerA->lastHeartbeatAckNonce = 1;
-      peerB->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
+      peerB->lastHeartbeatAckMs = Time::msSinceBoot() - 10;
       peerB->lastReceiveMs = peerB->lastHeartbeatAckMs;
       peerB->lastHeartbeatSendMs = peerB->lastHeartbeatAckMs;
       peerB->lastHeartbeatSentNonce = 2;
@@ -5911,7 +6341,7 @@ int main(void)
     {
       brain.brains.insert(peer);
       peer->pendingRecv = true;
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 1000;
+      peer->lastReceiveMs = Time::msSinceBoot() - 1000;
       int64_t oldLastReceiveMs = peer->lastReceiveMs;
 
       String frame = {};
@@ -6065,7 +6495,7 @@ int main(void)
     suite.expect(installed, "brain_peer_heartbeat_tick_installs_socket");
     if (installed)
     {
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+      peer->lastReceiveMs = Time::msSinceBoot();
       brain.brains.insert(peer);
 
       brain.runBrainPeerHeartbeatTick();
@@ -6148,7 +6578,7 @@ int main(void)
     suite.expect(installed, "brain_peer_heartbeat_tick_master_installs_socket");
     if (installed)
     {
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+      peer->lastReceiveMs = Time::msSinceBoot();
       brain.brains.insert(peer);
 
       brain.runBrainPeerHeartbeatTick();
@@ -6204,8 +6634,8 @@ int main(void)
     if (installed)
     {
       peer->noteTransportActivated();
-      peer->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 10;
+      peer->lastHeartbeatAckMs = Time::msSinceBoot() - 10;
+      peer->lastReceiveMs = Time::msSinceBoot() - 10;
       peer->lastHeartbeatSendMs = peer->lastHeartbeatAckMs;
       peer->lastHeartbeatSentNonce = 2;
       peer->lastHeartbeatAckNonce = 1;
@@ -6241,7 +6671,7 @@ int main(void)
     {
       peer->noteTransportActivated();
       peer->lastHeartbeatAckMs = 0;
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>() - 10;
+      peer->lastReceiveMs = Time::msSinceBoot() - 10;
       brain.brains.insert(peer);
 
       brain.runBrainPeerHeartbeatTick();
@@ -6274,8 +6704,8 @@ int main(void)
     if (installed)
     {
       peer->noteTransportActivated();
-      peer->lastHeartbeatAckMs = Time::now<TimeResolution::ms>() - 10;
-      peer->lastReceiveMs = Time::now<TimeResolution::ms>();
+      peer->lastHeartbeatAckMs = Time::msSinceBoot() - 10;
+      peer->lastReceiveMs = Time::msSinceBoot();
       brain.brains.insert(peer);
 
       brain.runBrainPeerHeartbeatTick();

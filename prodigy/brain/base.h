@@ -69,6 +69,8 @@ public:
   bool transitionAfterBundleEcho = false;
   bool transitionAfterBundleAckSend = false;
   bool installedBundleReadPending = false;
+  // Local elapsed time only: wall-clock corrections must not suppress probes
+  // while Ring's elapsed-time liveness deadline continues to run.
   int64_t lastReceiveMs = 0;
   int64_t lastMasterRegistrationAdvertiseMs = 0;
   int64_t lastHeartbeatSendMs = 0;
@@ -142,7 +144,7 @@ public:
 
   void noteTransportActivated(void)
   {
-    int64_t nowMs = Time::now<TimeResolution::ms>();
+    int64_t nowMs = Time::msSinceBoot();
     lastReceiveMs = nowMs;
     lastMasterRegistrationAdvertiseMs = 0;
     lastHeartbeatSendMs = 0;
@@ -167,12 +169,12 @@ public:
     queuedCloseTransportEpoch = transportEpoch;
   }
 
-  void notePeerMessageReceived(int64_t nowMs = Time::now<TimeResolution::ms>())
+  void notePeerMessageReceived(int64_t nowMs = Time::msSinceBoot())
   {
     lastReceiveMs = nowMs;
   }
 
-  void notePeerHeartbeatAck(uint64_t nonce, int64_t nowMs = Time::now<TimeResolution::ms>())
+  void notePeerHeartbeatAck(uint64_t nonce, int64_t nowMs = Time::msSinceBoot())
   {
     if (nonce == 0 || nonce > lastHeartbeatSentNonce || nonce <= lastHeartbeatAckNonce)
     {
@@ -260,7 +262,7 @@ public:
     Ring::queueSend(this);
   }
 
-  void sendPeerHeartbeat(int64_t nowMs = Time::now<TimeResolution::ms>())
+  void sendPeerHeartbeat(int64_t nowMs = Time::msSinceBoot())
   {
     if (canQueueSend() == false)
     {

@@ -1874,6 +1874,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_brain_async_authority_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_async_authority_unit
    )
+   foreach(transport IN ITEMS fragmented-artifact tls-fragmented-artifact)
+      add_test(
+         NAME prodigy_brain_${transport}_heartbeat
+         COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=${transport}-heartbeat-ring ${CMAKE_BINARY_DIR}/prodigy_brain_master_uuid_unit
+      )
+   endforeach()
    add_test(
       NAME prodigy_gcp_neuron_startup_async_contract
       COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_gcp_neuron_startup_async_contract.cmake

@@ -1,7 +1,21 @@
+#include <cstdint>
+#include <time.h>
+
+// Change only this fixture's wall-clock reads. Kernel Ring deadlines and the
+// host/guest clocks remain untouched, so a clock correction is deterministic.
+static int64_t peerTestRealtimeOffsetSeconds = 0;
+static int peerTestClockGettime(clockid_t clock, struct timespec *value) noexcept
+{
+  const int result = ::clock_gettime(clock, value);
+  if (result == 0 && clock == CLOCK_REALTIME) value->tv_sec += peerTestRealtimeOffsetSeconds;
+  return result;
+}
+#define clock_gettime peerTestClockGettime
 #include <prodigy/prodigy.h>
 #include <prodigy/neuron.hub.h>
 #include <prodigy/brain/brain.h>
 #include <prodigy/persistent.writer.h>
+#undef clock_gettime
 
 #include <algorithm>
 #include <atomic>
@@ -133,6 +147,20 @@ public:
         [this, completion = std::move(completion)](auto&& result) mutable {
           completion(result.durable && result.snapshotDurable && result.bootStateDurable); ++completions;
         });
+  }
+  void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+  {
+    // Exercise the production master receipt shape: master changes snapshot the
+    // current authority state before the writer can acknowledge it.
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    snapshot.brainConfig = brainConfig;
+    snapshot.masterAuthority.runtimeState = masterAuthorityRuntimeState;
+    const uint64_t retainedBytes = 4 * sizeof(snapshot) + 4 * sizeof(ProdigyPersistentBootState) + 65536;
+    const bool admitted = writer->submitSnapshot(std::move(snapshot), {}, retainedBytes,
+        [completion](auto&& result) mutable {
+          if (completion) completion(result.durable && result.snapshotDurable && result.bootStateDurable);
+        });
+    if (!admitted && completion) completion(false);
   }
 };
 
@@ -361,6 +389,240 @@ static int runScenario(Scenario scenario)
   return suite.failed ? 1 : 0;
 }
 
+class ClockProbeBrain final : public Brain {
+public:
+  BrainView *master = nullptr;
+  bool masterClosed = false;
+  void respinApplication(ApplicationDeployment *) override {}
+  void pushSpinApplicationProgressToMothership(ApplicationDeployment *, const String&) override {}
+  void spinApplicationFailed(ApplicationDeployment *, const String&) override {}
+  void spinApplicationFin(ApplicationDeployment *) override {}
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    Brain::dispatchTimeout(packet);
+    if (master && master->queuedCloseTransportEpoch == master->transportEpoch)
+    {
+      masterClosed = true;
+      // Stop before recovery changes the connection. The production close
+      // decision is the observed failure, not an emulated test outcome.
+      Ring::exit = true;
+    }
+  }
+};
+
+static int runHeartbeatClockStep(int64_t correctionSeconds, bool silenceMaster)
+{
+  Suite suite;
+  TestRing ring;
+  LocalNeuron neuron; neuron.uuid = 0xF013; thisNeuron = &neuron;
+  ClockProbeBrain brain;
+  brain.boottimens = 8; brain.noMasterYet = false; brain.nBrains = 3;
+  brain.brainConfig.clusterUUID = 0x44;
+  PeerFixture master, follower;
+  suite.expect(master.open(brain, 0xCA21, true) && follower.open(brain, 0xCA22, false),
+               "clock_step_real_ring_peers_open");
+  master.peer.noteTransportActivated(); follower.peer.noteTransportActivated();
+  brain.master = &master.peer;
+  uint32_t masterProbes = 0, followerProbes = 0, liveMasterResponses = 0;
+  bool corrected = false, wireValid = true, completedWindow = false;
+  auto correctedAt = Clock::now(), lastMasterProbe = correctedAt;
+  uint64_t remoteNonce = 0;
+  ring.onTick = [&] {
+    const auto now = Clock::now();
+    auto readPeer = [&](PeerFixture& remote, uint32_t& probes, bool quiet) {
+      return remote.read([&](Message *message) {
+        uint8_t *args = message->args; bool response = false; uint64_t nonce = 0;
+        if (BrainTopic(message->topic) != BrainTopic::peerHeartbeat ||
+            !Message::extractArg<ArgumentNature::fixed>(args, response) ||
+            !Message::extractArg<ArgumentNature::fixed>(args, nonce))
+        { wireValid = false; return; }
+        if (response) { ++liveMasterResponses; return; }
+        ++probes;
+        if (!quiet) {
+          String echo; Message::construct(echo, BrainTopic::peerHeartbeat, true, nonce);
+          wireValid &= remote.send(echo);
+        }
+      });
+    };
+    wireValid &= readPeer(master, masterProbes, corrected && silenceMaster);
+    wireValid &= readPeer(follower, followerProbes, false);
+    if (!corrected && master.peer.lastHeartbeatAckNonce > 0 && follower.peer.lastHeartbeatAckNonce > 0)
+    {
+      peerTestRealtimeOffsetSeconds = correctionSeconds;
+      corrected = true; correctedAt = now; lastMasterProbe = now;
+    }
+    // A live master continues sending valid traffic after the correction.
+    // This distinguishes false master loss from an actually silent endpoint.
+    if (corrected && !silenceMaster && now - lastMasterProbe >= std::chrono::milliseconds(100))
+    {
+      String probe; Message::construct(probe, BrainTopic::peerHeartbeat, false, ++remoteNonce);
+      wireValid &= master.send(probe); lastMasterProbe = now;
+    }
+    brain.runBrainPeerHeartbeatTick();
+    if (corrected && now - correctedAt >= std::chrono::milliseconds(6200))
+    { completedWindow = true; Ring::exit = true; return; }
+    ring.arm(ring.tick, 10);
+  };
+  ring.arm(ring.tick, 1); ring.arm(ring.deadline, 8000); Ring::start();
+  const uint64_t elapsedUs = micros(Clock::now() - correctedAt);
+  peerTestRealtimeOffsetSeconds = 0;
+  suite.expect(corrected && !ring.timedOut && wireValid, "clock_step_fixture_corrected_without_wire_errors");
+  suite.expect(follower.peer.queuedCloseTransportEpoch == 0 && follower.peer.transportEpoch == 1,
+               "clock_step_follower_pair_stays_open");
+  if (silenceMaster)
+  {
+    suite.expect(brain.masterClosed && elapsedUs >= 4'900'000 && elapsedUs < 5'300'000,
+                 "clock_step_silent_master_still_expires_at_five_seconds");
+  }
+  else
+  {
+    suite.expect(completedWindow && !brain.masterClosed && masterProbes >= 6 && liveMasterResponses >= 50,
+                 "clock_step_live_master_keeps_probing_and_does_not_reconnect");
+  }
+  dprintf(1, "CLOCK_STEP seconds=%lld silent=%d master_probes=%u follower_probes=%u live_master_responses=%u elapsed_us=%llu master_close=%d\n",
+          (long long)correctionSeconds, int(silenceMaster), masterProbes, followerProbes,
+          liveMasterResponses, (unsigned long long)elapsedUs, int(brain.masterClosed));
+  ring.onTick = {}; ring.shutdown();
+  master.closeAfterRingShutdown(brain); follower.closeAfterRingShutdown(brain);
+  thisNeuron = nullptr;
+  return suite.failed ? 1 : 0;
+}
+
+static int runMasterAuthorityReplicationLoad()
+{
+  Suite suite;
+  std::filesystem::create_directories(".run");
+  char scratch[] = ".run/prodigy-brain-async-authority-master-XXXXXX";
+  char *created = ::mkdtemp(scratch);
+  suite.expect(created != nullptr, "master_replication_private_store_created");
+  if (!created) return 1;
+  String path; path.assign(created);
+  TestRing ring;
+  ProdigyPersistentStateStore store(path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "master_replication_artifact_worker_started");
+  if (!io) return 1;
+  LocalNeuron neuron; neuron.uuid = 0xF012; thisNeuron = &neuron;
+  ProdigyPersistentStateWriter writer(store, *io);
+  AsyncAuthorityBrain brain;
+  brain.writer = &writer;
+  brain.boottimens = 7;
+  brain.noMasterYet = false;
+  brain.weAreMaster = true;
+  brain.nBrains = 2;
+  brain.brainConfig.clusterUUID = 0x43;
+
+  // Keep 13 live plans on the master and serialize corresponding public TLS
+  // records. The synthetic PEM strings exercise authority serialization only;
+  // this is not a deployed-plan or certificate-validation equivalent.
+  std::vector<ApplicationDeployment *> deployments;
+  for (uint16_t index = 0; index < 13; ++index)
+  {
+    auto *deployment = new ApplicationDeployment();
+    deployment->plan.config.applicationID = uint16_t(50'000 + index);
+    deployment->plan.config.versionID = 1;
+    const uint64_t deploymentID = deployment->plan.config.deploymentID();
+    brain.deployments.insert_or_assign(deploymentID, deployment);
+    deployments.push_back(deployment);
+
+    PublicTlsCertificateState certificate = {};
+    certificate.spec.applicationID = deployment->plan.config.applicationID;
+    certificate.spec.deploymentID = deploymentID;
+    certificate.spec.wormholeName.assign("inbound"_ctv);
+    certificate.spec.identityName.snprintf<"load-tls-{}"_ctv>(index);
+    certificate.spec.domains.push_back("load.example.test"_ctv);
+    certificate.identity.name = certificate.spec.identityName;
+    certificate.identity.generation = 1;
+    certificate.identity.certPem.assign("certificate-material-for-authority-replication-load"_ctv);
+    certificate.identity.keyPem.assign("private-key-material-for-authority-replication-load"_ctv);
+    certificate.identity.chainPem.assign("chain-material-for-authority-replication-load"_ctv);
+    certificate.identity.dnsSans = certificate.spec.domains;
+    certificate.generation = 1;
+    brain.masterAuthorityRuntimeState.publicTlsCertificates.push_back(std::move(certificate));
+  }
+
+  PeerFixture peer;
+  suite.expect(peer.open(brain, 0xCA13, false), "master_replication_ring_peer_open");
+  std::vector<uint64_t> heartbeatUs, replicationUs;
+  uint64_t pendingNonce = 0;
+  uint32_t replicated = 0;
+  bool wireValid = true, authorityMutationPending = false;
+  auto heartbeatStarted = Clock::now();
+  auto replicationStarted = heartbeatStarted;
+  ring.onTick = [&] {
+    const auto now = Clock::now();
+    wireValid &= peer.read([&](Message *message) {
+      uint8_t *args = message->args;
+      if (BrainTopic(message->topic) == BrainTopic::peerHeartbeat)
+      {
+        bool response = false; uint64_t nonce = 0;
+        const bool valid = Message::extractArg<ArgumentNature::fixed>(args, response) &&
+                           Message::extractArg<ArgumentNature::fixed>(args, nonce) &&
+                           response && nonce == pendingNonce;
+        wireValid &= valid;
+        if (valid) { heartbeatUs.push_back(micros(now - heartbeatStarted)); pendingNonce = 0; }
+        return;
+      }
+      if (BrainTopic(message->topic) == BrainTopic::replicateMasterAuthorityState)
+      {
+        String serialized;
+        Message::extractToStringView(args, serialized);
+        ProdigyMasterAuthorityStateTransition transition = {};
+        wireValid &= BitseryEngine::deserializeSafe(serialized, transition) &&
+                     transition.runtimeState.publicTlsCertificates.size() == 13;
+        replicationUs.push_back(micros(now - replicationStarted));
+        ++replicated;
+        authorityMutationPending = false;
+      }
+      else wireValid = false;
+    });
+    if (replicated < 30 && authorityMutationPending == false && writer.hasPending() == false)
+    {
+      replicationStarted = now;
+      authorityMutationPending = true;
+      brain.noteMasterAuthorityRuntimeStateChanged();
+    }
+    if (heartbeatUs.size() < 30 && pendingNonce == 0)
+    {
+      pendingNonce = heartbeatUs.size() + 1;
+      String heartbeat;
+      Message::construct(heartbeat, BrainTopic::peerHeartbeat, false, pendingNonce);
+      wireValid &= peer.send(heartbeat);
+      heartbeatStarted = now;
+    }
+    if (replicated >= 30 && heartbeatUs.size() >= 30 && writer.hasPending() == false) { Ring::exit = true; return; }
+    ring.arm(ring.tick, 1);
+  };
+  ring.arm(ring.tick, 1); ring.arm(ring.deadline, 10'000); Ring::start();
+  auto p95 = [](std::vector<uint64_t> samples) {
+    std::sort(samples.begin(), samples.end());
+    return samples.empty() ? uint64_t(0) : samples[(samples.size() * 95 + 99) / 100 - 1];
+  };
+  suite.expect(!ring.timedOut && replicated == 30 && heartbeatUs.size() == 30,
+               "master_replication_thirty_authority_receipts_and_heartbeats_complete");
+  suite.expect(wireValid && peer.peer.connected && peer.peer.queuedCloseTransportEpoch == 0 &&
+                   peer.peer.processedCloseTransportEpoch == 0,
+               "master_replication_keeps_peer_open_and_frames_valid");
+  dprintf(1, "METRICS master_authority_replication deployments=13 public_tls=13 replication_n=%zu replication_p95_us=%llu heartbeat_n=%zu heartbeat_p95_us=%llu\n",
+          replicationUs.size(), (unsigned long long)p95(replicationUs), heartbeatUs.size(),
+          (unsigned long long)p95(heartbeatUs));
+  dprintf(1, "RAW_MASTER_REPLICATION_US");
+  for (uint64_t sample : replicationUs) dprintf(1, " %llu", (unsigned long long)sample);
+  dprintf(1, "\nRAW_MASTER_HEARTBEAT_US");
+  for (uint64_t sample : heartbeatUs) dprintf(1, " %llu", (unsigned long long)sample);
+  dprintf(1, "\n");
+  suite.expect(writer.drainForExec(), "master_replication_writer_drained");
+  io->stop(); ring.drainStoppedIO(); ring.shutdown();
+  peer.closeAfterRingShutdown(brain);
+  for (ApplicationDeployment *deployment : deployments) delete deployment;
+  brain.deployments.clear();
+  thisNeuron = nullptr; store.close();
+  String secrets; resolveProdigyPersistentSecretsDBPath(path, secrets);
+  std::error_code ignored;
+  std::filesystem::remove_all(path.c_str(), ignored); std::filesystem::remove_all(secrets.c_str(), ignored);
+  return suite.failed ? 1 : 0;
+}
+
 int main()
 {
   // Ring owns process-wide slots. Separate children give every case a fresh
@@ -375,6 +637,14 @@ int main()
     int status = 0;
     if (child < 0 || ::waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) ++failed;
   }
+  for (auto [correction, quiet] : {std::pair<int64_t, bool>{-20, false}, {20, false}, {-20, true}})
+  {
+    const pid_t child = ::fork();
+    if (child == 0) ::_exit(runHeartbeatClockStep(correction, quiet));
+    int status = 0;
+    if (child < 0 || ::waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) ++failed;
+  }
+  failed += runMasterAuthorityReplicationLoad() != 0;
   dprintf(1, "ASYNC_AUTHORITY_RESULT failed_scenarios=%d\n", failed);
   return failed ? 1 : 0;
 }

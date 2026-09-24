@@ -14183,7 +14183,7 @@ public:
       return;
     }
 
-    int64_t nowMs = Time::now<TimeResolution::ms>();
+    int64_t nowMs = Time::msSinceBoot();
     int64_t tickLagMs = 0;
     if (lastBrainPeerHeartbeatTickMs > 0 && nowMs > lastBrainPeerHeartbeatTickMs)
     {
