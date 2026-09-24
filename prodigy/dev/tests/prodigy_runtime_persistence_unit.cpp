@@ -326,10 +326,63 @@ static void testProductionPersistenceAPI(TestSuite& suite)
   }
 }
 
+static void testProductionPersistenceAdmissionFromArtifactCompletion(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_artifact_completion_starts_shared_writer");
+  if (!io) return;
+
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io);
+  ProdigyHostControlNetwork network;
+  bool artifactPublished = false;
+  bool receiptWasInline = false;
+  bool receiptDelivered = false;
+  bool durable = false;
+  bool queued = false;
+  {
+    ProdigyBrain brain(network, writer);
+    brain.brainConfig.clusterUUID = 0xA51EULL;
+    brain.brainConfig.bootstrapSshUser.assign("artifact-receipt"_ctv);
+    queued = io->submit(1, [] {}, [&] {
+      artifactPublished = true;
+      brain.persistLocalRuntimeStateAsync([&](bool result) {
+        receiptDelivered = true;
+        durable = result;
+        Ring::exit = true;
+      });
+      receiptWasInline = receiptDelivered;
+    }, [](std::exception_ptr) { Ring::exit = true; });
+    ring.armDeadline(1000);
+    Ring::start();
+    suite.expect(queued && !ring.timedOut && artifactPublished && !receiptWasInline && receiptDelivered && durable && writer->drainForExec(),
+                 "runtime_artifact_publish_completion_admits_production_snapshot_receipt");
+  }
+  writer.reset();
+  io->stop();
+  ring.drainStoppedIO();
+  io.reset();
+  (void)network.shutdown();
+  store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentBrainSnapshot persisted = {};
+  String failure = {};
+  suite.expect(reopened.loadBrainSnapshot(persisted, &failure) && persisted.brainConfig.clusterUUID == 0xA51EULL,
+               "runtime_artifact_publish_receipt_reopens_production_snapshot");
+  reopened.close();
+}
+
 int main(void)
 {
   TestSuite suite;
   testProductionPersistenceAPI(suite);
+  testProductionPersistenceAdmissionFromArtifactCompletion(suite);
   testPersistentWriterDetachesViewBackedSchemaFields(suite);
   testPersistentWriterRetainedAccountingChargesManyShortStrings(suite);
   testNeuronOSUpdateUsesOwnedReceiptDrivenRequest(suite);

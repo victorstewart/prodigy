@@ -1,6 +1,6 @@
 #pragma once
 
-#include <deque>
+#include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -15,9 +15,9 @@
 
 // While a request is pending, this is the sole live user of its store.
 // Work runs on ArtifactIO's worker and completions run on its Ring callback.
-// A false submit result means no callback will occur. The initial full-worker
-// lease intentionally excludes unrelated artifact work until this batch drains;
-// callers retry false admission from their Ring-owned recovery path.
+// Every request shares ArtifactIO's FIFO, job limit, and retained-byte budget.
+// A false submit result means no callback will occur; callers retry genuine
+// capacity rejection from their Ring-owned recovery path.
 class ProdigyPersistentStateWriter {
 public:
   static constexpr uint64_t maximumRetainedBytes = ProdigyArtifactIO::maximumBytes;
@@ -264,7 +264,6 @@ public:
     ProdigyPersistentLocalBrainState localState;
     bool writeSnapshot = false;
     bool writeLocalState = false;
-    uint64_t retainedBytes = 0;
     Completion completion;
   };
   using Commit = std::function<void(ProdigyPersistentStateStore&, Request&)>;
@@ -273,27 +272,11 @@ private:
   ProdigyPersistentStateStore& store;
   ProdigyArtifactIO& io;
   Commit commit;
-  std::deque<std::shared_ptr<Request>> pending;
   uint64_t nextSequence = 1;
-  uint64_t retainedBytes = 0;
+  uint32_t pendingRequests = 0;
   bool accepting = true;
-  bool inFlight = false;
   bool commitFailureLatched = false;
-  // Callers declare the bytes retained by their detached payload. Admission
-  // sums those declarations against ArtifactIO's existing maximum; the
-  // worker holds one full ArtifactIO lease for the whole FIFO batch because
-  // continueWith intentionally preserves that lease between requests.
-  void rejectPendingAfterFailure()
-  {
-    while (!pending.empty())
-    {
-      auto request = std::move(pending.front());
-      pending.pop_front();
-      retainedBytes -= request->retainedBytes;
-      request->result.failure.assign("persistent state failure fenced later commits"_ctv);
-      request->completion(std::move(request->result));
-    }
-  }
+  std::atomic<bool> workerFailureLatched = false;
 
   static bool commitFailed(const Request& request)
   {
@@ -302,73 +285,52 @@ private:
     return !request.result.bootStateDurable;
   }
 
-  void finish(std::shared_ptr<Request> request, bool workerFailed)
+  void commitRequest(const std::shared_ptr<Request>& request)
   {
-    if (workerFailed) request->result.failure.assign("persistent state worker failed"_ctv);
-    if (workerFailed || commitFailed(*request)) commitFailureLatched = true;
-    // The active closure still retains this request during the user callback.
-    // Reentrant admission must count its bytes and queue slot until it returns.
-    request->completion(std::move(request->result));
-    pending.pop_front();
-    retainedBytes -= request->retainedBytes;
-    if (commitFailureLatched)
+    // The worker can reach another queued request before the Ring receives
+    // this one's completion. Fence failed dependencies here, before any
+    // later write reaches the store, while delivering receipts on the Ring.
+    if (workerFailureLatched.load(std::memory_order_acquire))
     {
-      rejectPendingAfterFailure();
-      inFlight = false;
+      request->result.failure.assign("persistent state failure fenced later commits"_ctv);
       return;
     }
-    if (pending.empty())
+    try
     {
-      inFlight = false;
-      return;
+      commit(store, *request);
+      if (commitFailed(*request)) workerFailureLatched.store(true, std::memory_order_release);
     }
-    // This is a Ring completion. Reuse its ArtifactIO lease so the next FIFO
-    // request is not rejected while this callback still owns that lease.
-    auto next = pending.front();
-    const bool continued = io.continueWith(
-        [this, next] { commit(store, *next); },
-        [this, next] { finish(next, false); },
-        [this, next](std::exception_ptr) { finish(next, true); });
-    if (!continued)
+    catch (...)
     {
-      pending.pop_front();
-      retainedBytes -= next->retainedBytes;
-      next->result.failure.assign("persistent state continuation rejected"_ctv);
-      commitFailureLatched = true;
-      next->completion(std::move(next->result));
-      rejectPendingAfterFailure();
-      inFlight = false;
+      workerFailureLatched.store(true, std::memory_order_release);
+      throw;
     }
   }
 
-  bool startNext()
+  void finish(const std::shared_ptr<Request>& request, bool workerFailed)
   {
-    if (inFlight || pending.empty()) return true;
-    auto request = pending.front();
-    inFlight = true;
-    if (!io.submit(ProdigyArtifactIO::maximumBytes,
-                   [this, request] { commit(store, *request); },
-                   [this, request] { finish(request, false); },
-                   [this, request](std::exception_ptr) { finish(request, true); }))
-    {
-      // Artifact contention is an admission/backpressure result, never a
-      // disk-commit failure and therefore must not trip the snapshot latch.
-      inFlight = false;
-      pending.pop_front();
-      retainedBytes -= request->retainedBytes;
-      return false;
-    }
-    return true;
+    if (workerFailed) request->result.failure.assign("persistent state worker failed"_ctv);
+    if (workerFailed || commitFailed(*request)) commitFailureLatched = true;
+    // ArtifactIO retains the request's byte lease through this callback.
+    // Exec drain must also continue counting the callback's live request.
+    request->completion(std::move(request->result));
+    --pendingRequests;
   }
 
   bool submit(std::shared_ptr<Request> request, uint64_t requestBytes)
   {
     if (!accepting || commitFailureLatched || requestBytes == 0 || requestBytes > maximumRetainedBytes ||
-        pending.size() == maximumPendingRequests || retainedBytes > maximumRetainedBytes - requestBytes) return false;
-    request->retainedBytes = requestBytes;
-    retainedBytes += requestBytes;
-    pending.push_back(std::move(request));
-    return startNext();
+        pendingRequests == maximumPendingRequests) return false;
+    // Charge the actual detached request, including serialization growth,
+    // to the same owner as artifacts. In particular, an artifact's publish
+    // completion can enqueue its durable snapshot before releasing its own
+    // lease; it does not need exclusive ownership of the entire worker.
+    if (!io.submit(requestBytes,
+                   [this, request] { commitRequest(request); },
+                   [this, request] { finish(request, false); },
+                   [this, request](std::exception_ptr) { finish(request, true); })) return false;
+    ++pendingRequests;
+    return true;
   }
 
 public:
@@ -405,7 +367,7 @@ public:
   {
     // Destruction cannot safely cancel a durable request: ArtifactIO closures
     // retain this owner. Lifecycle must drain first and fail closed otherwise.
-    if (inFlight || !pending.empty()) std::abort();
+    if (hasPending()) std::abort();
   }
 
   // retainedBytes must cover the detached domain payload, including owned
@@ -449,6 +411,6 @@ public:
     return submit(std::move(request), retainedBytes);
   }
 
-  bool hasPending(void) const { return inFlight || !pending.empty(); }
+  bool hasPending(void) const { return pendingRequests != 0; }
   bool drainForExec(void) { accepting = false; return !hasPending(); }
 };

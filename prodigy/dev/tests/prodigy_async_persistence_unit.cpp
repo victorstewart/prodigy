@@ -445,10 +445,13 @@ int main()
     ProdigyPersistentStateStore store(root.path);
     auto io = ProdigyArtifactIO::startOwned();
     std::vector<ProdigyPersistentStateWriter::Result> results = {};
+    std::atomic<uint32_t> commits = 0;
+    std::atomic<bool> workerPassedDependent = false;
     suite.expect(io != nullptr, "async_persistence_starts_failure_writer");
     if (io)
     {
-      ProdigyPersistentStateWriter writer(store, *io, [failureMode](auto&, auto& request) {
+      ProdigyPersistentStateWriter writer(store, *io, [failureMode, &commits](auto&, auto& request) {
+        ++commits;
         request.result.snapshotDurable = failureMode != 0;
         request.result.durable = failureMode != 0;
         if (failureMode == 2) throw std::runtime_error("injected boot follow-up exception");
@@ -463,6 +466,12 @@ int main()
                          if (results.size() == 2) Ring::exit = true;
                        }),
                    "async_persistence_admits_dependent_before_snapshot_failure_is_known");
+      suite.expect(io->submit(1, [&] { workerPassedDependent = true; }, [] {}, [](std::exception_ptr) {}),
+                   "async_persistence_queues_post_dependent_worker_marker");
+      const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+      while (!workerPassedDependent && std::chrono::steady_clock::now() < workerDeadline) std::this_thread::yield();
+      suite.expect(workerPassedDependent && commits == 1,
+                   "async_persistence_worker_fences_dependent_before_any_ring_receipt");
       ring.armDeadline(1000);
       Ring::start();
       const bool fenced = results.size() == 2 && results[0].durable == (failureMode != 0) &&
@@ -476,9 +485,9 @@ int main()
     }
   }
 
-  // An ArtifactIO continuation is a bounded Ring resource.  If another Ring
-  // callback consumes it first, the queued writer request must receive exactly
-  // one explicit failure callback and must not strand the writer at teardown.
+  // A continuation chained by one persistence receipt must not consume an
+  // independently submitted writer job that was already accepted by
+  // ArtifactIO.
   {
     PersistenceRing ring;
     ScopedPersistentRoot root;
@@ -487,8 +496,9 @@ int main()
     uint32_t firstCallbacks = 0;
     uint32_t secondCallbacks = 0;
     bool continuationConsumed = false;
-    bool secondRejected = false;
-    suite.expect(io != nullptr, "async_persistence_starts_continuation_rejection_writer");
+    uint32_t continuations = 0;
+    bool secondDurable = false;
+    suite.expect(io != nullptr, "async_persistence_starts_independent_continuation_writer");
     if (io)
     {
       ProdigyPersistentStateWriter writer(store, *io, [](auto&, auto& request) {
@@ -497,19 +507,22 @@ int main()
       });
       suite.expect(writer.submitBootState(bootState("first"), bootRequestBytes, [&](auto&&) {
                      ++firstCallbacks;
-                     continuationConsumed = io->continueWith([] {}, [] {}, [](std::exception_ptr) {});
+                     continuationConsumed = io->continueWith([] {}, [&] {
+                       ++continuations;
+                       if (secondCallbacks == 1) Ring::exit = true;
+                     }, [](std::exception_ptr) { Ring::exit = true; });
                    }) &&
                        writer.submitBootState(bootState("second"), bootRequestBytes, [&](auto&& result) {
                          ++secondCallbacks;
-                         secondRejected = !result.durable && result.failure.size() > 0;
-                         Ring::exit = true;
+                         secondDurable = result.durable;
+                         if (continuations == 1) Ring::exit = true;
                        }),
-                   "async_persistence_admits_continuation_rejection_fixture");
+                   "async_persistence_admits_independent_continuation_fixture");
       ring.armDeadline(1000);
       Ring::start();
-      suite.expect(!ring.timedOut && continuationConsumed && firstCallbacks == 1 && secondCallbacks == 1 && secondRejected &&
+      suite.expect(!ring.timedOut && continuationConsumed && continuations == 1 && firstCallbacks == 1 && secondCallbacks == 1 && secondDurable &&
                        !writer.hasPending() && writer.drainForExec(),
-                   "async_persistence_continuation_rejection_completes_queued_request_exactly_once");
+                   "async_persistence_continuation_preserves_independent_writer_receipt");
       io->stop();
       ring.drainStoppedIO();
     }
@@ -547,6 +560,43 @@ int main()
       Ring::start();
       suite.expect(!ring.timedOut && completedWorkers == ProdigyArtifactIO::maximumJobs && !writerCallback,
                    "async_persistence_capacity_rejection_never_runs_or_callbacks_writer_request");
+      io->stop();
+      ring.drainStoppedIO();
+    }
+  }
+
+  // Publishing a received artifact retains its ArtifactIO lease through this
+  // Ring completion.  Its durable snapshot must still be admitted and only
+  // then permit the peer ACK; treating the active artifact lease as global
+  // writer backpressure silently leaves the deployment unacknowledged.
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    bool artifactPublished = false;
+    bool snapshotAdmitted = false;
+    bool snapshotDurable = false;
+    suite.expect(io != nullptr, "async_persistence_starts_artifact_publish_receipt_writer");
+    if (io)
+    {
+      ProdigyPersistentStateWriter writer(store, *io);
+      suite.expect(io->submit(1, [] {}, [&] {
+                     artifactPublished = true;
+                     ProdigyPersistentBrainSnapshot snapshot = {};
+                     snapshot.brainConfig.clusterUUID = 0xA51DULL;
+                     snapshotAdmitted = writer.submitSnapshot(std::move(snapshot), bootState("artifact-publish"), snapshotRequestBytes,
+                         [&](auto&& result) {
+                           snapshotDurable = result.durable && result.snapshotDurable && result.bootStateDurable;
+                           Ring::exit = true;
+                         });
+                     if (!snapshotAdmitted) Ring::exit = true;
+                   }, [](std::exception_ptr) { Ring::exit = true; }),
+                   "async_persistence_queues_artifact_publish_receipt_fixture");
+      ring.armDeadline(1000);
+      Ring::start();
+      suite.expect(!ring.timedOut && artifactPublished && snapshotAdmitted && snapshotDurable && writer.drainForExec(),
+                   "async_persistence_artifact_publish_completion_admits_durable_snapshot_receipt");
       io->stop();
       ring.drainStoppedIO();
     }
