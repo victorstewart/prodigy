@@ -133,7 +133,7 @@ public:
 
   String slug;
   MachineLifetime lifetime;
-  MachineState state;
+  MachineState state = MachineState::unknown;
   String type;
   String cloudID; // cloud provider resource identifier used by IaaS APIs
   uint8_t topologySource = 0; // ClusterMachineSource

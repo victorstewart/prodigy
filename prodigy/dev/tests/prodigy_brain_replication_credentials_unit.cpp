@@ -24356,6 +24356,26 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   thisBrain = previousBrain;
 }
 
+static void testMachineConstructionInitializesLifecycleState(TestSuite& suite)
+{
+  // A user-provided constructor does not zero scalar members for Machine{}.
+  // Reused storage must not make a new machine look retired or failed.
+  for (MachineState previous : {MachineState::hardwareFailure, MachineState::decommissioning})
+  {
+    alignas(Machine) unsigned char storage[sizeof(Machine)];
+    std::memset(storage, static_cast<unsigned char>(previous), sizeof(storage));
+    Machine *machine = new (storage) Machine{};
+    unsigned char stateRepresentation = 0;
+    static_assert(sizeof(machine->state) == sizeof(stateRepresentation));
+    std::memcpy(&stateRepresentation, &machine->state, sizeof(stateRepresentation));
+    suite.expect(stateRepresentation == static_cast<unsigned char>(MachineState::unknown),
+                 previous == MachineState::hardwareFailure
+                   ? "machine_construction_does_not_inherit_hardware_failure"
+                   : "machine_construction_does_not_inherit_decommissioning");
+    machine->~Machine();
+  }
+}
+
 static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -24370,6 +24390,7 @@ static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuit
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5218'0001);
+  machine.state = MachineState::healthy;
   machine.fragment = 1;
   machine.runtimeReady = true;
   brain.machines.insert(&machine);
@@ -27154,6 +27175,7 @@ int main(void)
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
   {
     testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testMachineConstructionInitializesLifecycleState(suite);
     testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(suite);
     testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(suite);
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
@@ -27591,6 +27613,7 @@ int main(void)
   testBrainNeuronRegistrationRefreshesWorkerAfterBundleTransition(suite);
   testPersistedLocalBrainRefreshBypassesIgnition(suite);
   testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+  testMachineConstructionInitializesLifecycleState(suite);
   testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(suite);
   testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
