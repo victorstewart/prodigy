@@ -378,6 +378,169 @@ static void testProductionPersistenceAdmissionFromArtifactCompletion(TestSuite& 
   reopened.close();
 }
 
+static void testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(TestSuite& suite)
+{
+  // The first durable receipt begins bundle progress.  Its ArtifactIO slot is
+  // intentionally still retained while the callback runs; seven queued jobs
+  // fill the remaining slots.  A nested snapshot must therefore be deferred
+  // until this receipt returns, rather than being synchronously rejected and
+  // permanently fencing the update.
+  for (int nestedMode = 0; nestedMode < 3; ++nestedMode)
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    suite.expect(io != nullptr, "runtime_reentrant_update_worker_starts");
+    if (!io) continue;
+
+    std::atomic<bool> firstCommitEntered = false;
+    std::atomic<bool> allowFirstCommit = false;
+    std::atomic<bool> releaseFillers = false;
+    std::atomic<uint32_t> snapshotWrites = 0, bootWrites = 0;
+    auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io,
+        [&](auto& backing, auto& request) {
+          if (!request.writeSnapshot) return;
+          const uint32_t write = ++snapshotWrites;
+          if (write == 1)
+          {
+            firstCommitEntered = true;
+            while (!allowFirstCommit.load())
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+          if (nestedMode == 1 && write == 2)
+          {
+            request.result.failure.assign("injected nested durable failure"_ctv);
+            return;
+          }
+          request.result.snapshotDurable = backing.saveBrainSnapshot(request.snapshot, &request.result.failure);
+          request.result.durable = request.result.snapshotDurable;
+          if (request.result.snapshotDurable)
+          {
+            request.result.bootStateDurable = backing.saveBootState(request.bootState, &request.result.failure);
+            if (request.result.bootStateDurable) ++bootWrites;
+          }
+        });
+
+    persistentLocalBrainState = {};
+    persistentBootState = {};
+    persistedBrainSnapshot = {};
+    havePersistedBrainSnapshot = false;
+    ProdigyHostControlNetwork network;
+    uint32_t fillersCompleted = 0, ticks = 0;
+    bool fillersQueued = false, firstReceipt = false, firstDurable = false;
+    bool noEarlyBundleSend = true, releasedFillers = false, epochInvalidated = false;
+    uint32_t settledAtTick = 0;
+    {
+      ProdigyBrain brain(network, writer);
+      brain.brainConfig.clusterUUID = 0xA5510000ULL + nestedMode;
+      brain.brainConfig.bootstrapSshUser.assign("reentrant-update"_ctv);
+      brain.updateSelfUseStagedBundleOnly = true;
+      BrainView peer = {};
+      peer.uuid = 0xA5511000ULL + nestedMode;
+      peer.boottimens = 1;
+      // A known but inactive peer makes a later transition observable without
+      // allowing this focused persistence fixture to queue a fake socket send.
+      brain.brains.insert(&peer);
+
+      brain.persistLocalRuntimeStateAsync([&](bool durable) {
+        firstReceipt = true;
+        firstDurable = durable;
+        if (!durable) return;
+        brain.beginUpdateSelfBundle(1);
+        noEarlyBundleSend = peer.wBuffer.empty() && brain.updateSelfBundleIssuedPeerKeys.empty();
+        // The deferred initiation must be fenced by the same authority epoch
+        // that owns the staged update, even though the original receipt was
+        // durable.  This mode verifies the stale request remains fail-closed.
+        if (nestedMode == 2)
+        {
+          brain.advanceMasterAuthorityEpoch();
+          epochInvalidated = true;
+        }
+      });
+
+      ring.tickAction = [&] {
+        ++ticks;
+        if (!fillersQueued && firstCommitEntered.load())
+        {
+          for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs - 1; ++index)
+          {
+            const bool admitted = io->submit(1,
+                [&] {
+                  while (!releaseFillers.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                },
+                [&] { ++fillersCompleted; },
+                [&](std::exception_ptr) { Ring::exit = true; });
+            suite.expect(admitted, "runtime_reentrant_update_fills_remaining_artifact_slots");
+          }
+          fillersQueued = true;
+          allowFirstCommit = true;
+        }
+        // After the first callback returns, the fixed path can admit the
+        // nested save as slot eight.  Releasing these jobs then lets it reach
+        // the worker without relying on a large snapshot or a timing race.
+        if (firstReceipt && fillersQueued && !releasedFillers &&
+            (brain.updateSelfPersistencePending != 0 || brain.updateSelfPersistenceFailed || ticks > 20))
+        {
+          releasedFillers = true;
+          releaseFillers = true;
+        }
+        const bool nestedDone = nestedMode == 1 ? brain.updateSelfPersistenceFailed :
+            (nestedMode == 2 || (brain.masterAuthorityRuntimeStateDurable &&
+             brain.durableMasterAuthorityRuntimeStateGeneration == brain.masterAuthorityRuntimeState.generation));
+        if (fillersCompleted == ProdigyArtifactIO::maximumJobs - 1 && firstReceipt && nestedDone)
+        {
+          // Successful continuations are intentionally one more Ring turn
+          // removed from the persistence receipt.  Keep pumping past the
+          // observed state so their timer and any ready work cannot retain
+          // Brain during this fixture's teardown.
+          if (settledAtTick == 0) settledAtTick = ticks;
+          if (ticks - settledAtTick >= 5)
+          {
+            Ring::exit = true;
+            return;
+          }
+        }
+        ring.armTick(1);
+      };
+      ring.armTick(1);
+      ring.armDeadline(3000);
+      Ring::start();
+      releaseFillers = true;
+
+      suite.expect(!ring.timedOut && ticks > 1 && fillersQueued && fillersCompleted == ProdigyArtifactIO::maximumJobs - 1,
+                   "runtime_reentrant_update_ring_remains_responsive_under_full_artifact_slots");
+      suite.expect(firstReceipt && firstDurable && noEarlyBundleSend &&
+                       brain.updateSelfState == Brain::UpdateSelfState::waitingForBundleEchos,
+                   "runtime_reentrant_update_does_not_send_bundle_before_nested_receipt");
+      const bool expectedFailure = nestedMode == 1;
+      const bool epochStale = nestedMode == 2;
+      suite.expect(brain.updateSelfPersistenceFailed == (expectedFailure || epochStale) &&
+                       brain.updateSelfPersistencePending == 0,
+                   "runtime_reentrant_update_fences_failed_or_stale_nested_receipt");
+      suite.expect(snapshotWrites.load() == (epochStale ? 1u : 2u) &&
+                       bootWrites.load() == (expectedFailure || epochStale ? 1u : 2u),
+                   "runtime_reentrant_update_nested_snapshot_admission_or_stale_suppression");
+      suite.expect(epochStale ? epochInvalidated && peer.wBuffer.empty() && brain.updateSelfBundleIssuedPeerKeys.empty() :
+                       (expectedFailure || (brain.masterAuthorityRuntimeStateDurable &&
+                        brain.durableMasterAuthorityRuntimeStateGeneration == brain.masterAuthorityRuntimeState.generation)),
+                   "runtime_reentrant_update_epoch_invalidated_request_cannot_send_stale_bundle");
+      brain.brains.erase(&peer);
+    }
+    writer.reset();
+    io->stop();
+    ring.drainStoppedIO();
+    io.reset();
+    (void)network.shutdown();
+    store.close();
+    persistentLocalBrainState = {};
+    persistentBootState = {};
+    persistedBrainSnapshot = {};
+    havePersistedBrainSnapshot = false;
+  }
+}
+
 static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -509,6 +672,14 @@ static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
 int main(void)
 {
   TestSuite suite;
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "reentrant-update-persistence") == 0)
+  {
+    testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
+    std::printf("REENTRANT_UPDATE_PERSISTENCE_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);

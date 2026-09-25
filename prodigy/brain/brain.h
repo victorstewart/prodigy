@@ -23308,6 +23308,13 @@ public:
 
   void dispatchTimeout(TimeoutPacket *packet) override
   {
+    if (packet == &updateSelfPersistenceTick)
+    {
+      updateSelfPersistenceTickQueued = false;
+      if (updateSelfPersistenceQueued) submitQueuedUpdateSelfPersistence();
+      else resumeDurableUpdateSelfProgress();
+      return;
+    }
     if (packet == &bundleExecRetryTick)
     {
       bundleExecRetryTickQueued = false;
@@ -23884,7 +23891,7 @@ public:
     {
       return;
     }
-    if (packet == &bundleExecRetryTick)
+    if (packet == &bundleExecRetryTick || packet == &updateSelfPersistenceTick)
     {
       dispatchTimeout(packet);
       return;
@@ -26040,12 +26047,19 @@ public:
     boottimens = Time::now<TimeResolution::ns>();
     forfeitMasterStatus();
     resetUpdateSelfState();
-    noteMasterAuthorityRuntimeStateChanged();
-    transitionToNewBundle();
+    persistUpdateSelfProgress([this] { transitionToNewBundle(); });
   }
 
   void resetUpdateSelfState(bool clearBundleBlob = true)
   {
+    // A queued tick may still arrive, but it cannot submit the old batch or
+    // deliver its continuations. A new operation can reuse that wakeup.
+    ++updateSelfPersistenceVersion;
+    updateSelfPersistenceQueued = false;
+    updateSelfPersistenceReady = false;
+    updateSelfPersistencePending = 0;
+    updateSelfPersistenceFailed = false;
+    updateSelfDurableContinuations.clear();
     updateSelfState = UpdateSelfState::idle;
     updateSelfExpectedEchos = 0;
     updateSelfBundleEchos = 0;
@@ -26785,25 +26799,115 @@ public:
   size_t updateSelfPersistencePending = 0;
   bool updateSelfPersistenceFailed = false;
   Vector<std::function<void()>> updateSelfDurableContinuations;
+  TimeoutPacket updateSelfPersistenceTick;
+  bool updateSelfPersistenceTickQueued = false;
+  bool updateSelfPersistenceQueued = false;
+  bool updateSelfPersistenceReady = false;
+  uint64_t updateSelfPersistenceVersion = 1;
+  uint64_t updateSelfPersistenceQueuedEpoch = 0;
+
+  void completeUpdateSelfPersistence(uint64_t version, bool durable)
+  {
+    if (version != updateSelfPersistenceVersion) return;
+    if (!durable && !updateSelfPersistenceFailed)
+      basics_log("updateProdigy progress persistence failed; commands remain fenced generation=%llu\n",
+                 (unsigned long long)masterAuthorityRuntimeState.generation);
+    updateSelfPersistenceFailed |= !durable;
+    if (--updateSelfPersistencePending != 0) return;
+    if (updateSelfPersistenceFailed)
+    {
+      updateSelfDurableContinuations.clear();
+      return;
+    }
+    updateSelfPersistenceReady = true;
+    if (!usesAsyncMasterAuthorityPersistence()) resumeDurableUpdateSelfProgress();
+    else if (!armUpdateSelfPersistenceTick())
+    {
+      updateSelfPersistenceFailed = true;
+      updateSelfDurableContinuations.clear();
+      basics_log("updateProdigy cannot schedule durable progress continuation\n");
+    }
+  }
+
+  void resumeDurableUpdateSelfProgress()
+  {
+    if (!updateSelfPersistenceReady || updateSelfPersistencePending || updateSelfPersistenceFailed) return;
+    updateSelfPersistenceReady = false;
+    if (masterAuthorityEpoch != updateSelfPersistenceQueuedEpoch)
+    {
+      updateSelfPersistenceFailed = true;
+      updateSelfDurableContinuations.clear();
+      return;
+    }
+    const uint64_t version = updateSelfPersistenceVersion;
+    auto continuations = std::move(updateSelfDurableContinuations);
+    updateSelfDurableContinuations.clear();
+    for (auto& resume : continuations)
+    {
+      if (version != updateSelfPersistenceVersion) return;
+      resume();
+    }
+    if (version != updateSelfPersistenceVersion) return;
+    queueWorkerBundleTransitionIfReady();
+    if (updateSelfExpectedEchos > 0)
+    {
+      maybeTransitionFollowersForUpdateSelf();
+      maybeRelinquishMasterForUpdateSelf();
+    }
+  }
+
+  void submitQueuedUpdateSelfPersistence()
+  {
+    if (!updateSelfPersistenceQueued) return;
+    updateSelfPersistenceQueued = false;
+    const uint64_t version = updateSelfPersistenceVersion;
+    if (masterAuthorityEpoch != updateSelfPersistenceQueuedEpoch)
+    {
+      completeUpdateSelfPersistence(version, false);
+      return;
+    }
+    commitMasterAuthorityStateChangeAsync([this, version](bool durable) {
+      completeUpdateSelfPersistence(version, durable);
+    });
+  }
+
+  bool armUpdateSelfPersistenceTick()
+  {
+    if (updateSelfPersistenceTickQueued) return true;
+    if (Ring::getRingFD() <= 0 || Ring::interfacer == nullptr) return false;
+    updateSelfPersistenceTick.clear();
+    updateSelfPersistenceTick.originator = this;
+    updateSelfPersistenceTick.dispatcher = this;
+    updateSelfPersistenceTick.setTimeoutMs(1);
+    updateSelfPersistenceTickQueued = true;
+    Ring::queueTimeout(&updateSelfPersistenceTick);
+    return true;
+  }
 
   void persistUpdateSelfProgress(std::function<void()> continuation = {})
   {
+    if (updateSelfPersistenceFailed) return;
     if (continuation) updateSelfDurableContinuations.push_back(std::move(continuation));
+    if (updateSelfPersistenceQueued) return;
     ++updateSelfPersistencePending;
-    commitMasterAuthorityStateChangeAsync([this](bool durable) {
-      updateSelfPersistenceFailed |= !durable;
-      if (--updateSelfPersistencePending != 0) return;
-      auto continuations = std::move(updateSelfDurableContinuations);
-      updateSelfDurableContinuations.clear();
-      if (updateSelfPersistenceFailed) return;
-      for (auto& resume : continuations) resume();
-      queueWorkerBundleTransitionIfReady();
-      if (updateSelfExpectedEchos > 0)
-      {
-        maybeTransitionFollowersForUpdateSelf();
-        maybeRelinquishMasterForUpdateSelf();
-      }
-    });
+    updateSelfPersistenceQueued = true;
+    updateSelfPersistenceQueuedEpoch = masterAuthorityEpoch;
+    if (!usesAsyncMasterAuthorityPersistence())
+    {
+      submitQueuedUpdateSelfPersistence();
+      return;
+    }
+    // A durable receipt still owns its snapshot's ArtifactIO slot and bytes
+    // until the callback returns. Capture and submit the next progress batch
+    // on the next Ring turn, after that lease is released. Successful receipts
+    // resume on that same turn boundary because exec preparation also persists.
+    // The pending fence prevents commands from consuming undurable progress.
+    if (!armUpdateSelfPersistenceTick())
+    {
+      updateSelfPersistenceQueued = false;
+      completeUpdateSelfPersistence(updateSelfPersistenceVersion, false);
+      return;
+    }
   }
 
   void beginUpdateSelfBundle(uint32_t expectedPeerEchos)
