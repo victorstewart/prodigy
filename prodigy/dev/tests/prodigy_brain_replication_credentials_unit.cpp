@@ -94,6 +94,8 @@ public:
   bool persistSucceeds = true;
   bool holdRuntimePersistence = false;
   std::deque<PersistenceCompletion> pendingRuntimePersistence;
+  bool asyncMasterAuthorityPersistence = false;
+  uint32_t masterAuthorityTransitionCandidatePersistCalls = 0;
   bool holdClusterOwnership = false;
   std::deque<std::function<void(bool)>> pendingClusterOwnership;
   BrainConfig lastPersistedBrainConfig = {};
@@ -184,6 +186,30 @@ public:
     auto completion = std::move(pendingRuntimePersistence.front());
     pendingRuntimePersistence.pop_front();
     completion(durable);
+  }
+
+  bool usesAsyncMasterAuthorityPersistence() const override
+  {
+    return asyncMasterAuthorityPersistence;
+  }
+
+  bool persistMasterAuthorityTransitionCandidate(
+      const ProdigyMasterAuthorityStateTransition& candidate,
+      std::function<void(bool)> completion) override
+  {
+    masterAuthorityTransitionCandidatePersistCalls += 1;
+    ownBrainConfig(candidate.brainConfig, lastPersistedBrainConfig);
+    lastPersistedMasterAuthorityState = candidate.runtimeState;
+    const bool result = persistSucceeds;
+    if (holdRuntimePersistence)
+    {
+      pendingRuntimePersistence.push_back(std::move(completion));
+    }
+    else if (completion)
+    {
+      completion(result);
+    }
+    return true;
   }
 
   bool claimLocalClusterOwnershipAsync(uint128_t clusterUUID, std::function<void(bool)> completion) override
@@ -14133,6 +14159,225 @@ static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& sui
   thisNeuron = previousNeuron;
 }
 
+static void testOrdinaryUpgradeAuthorityAdmission(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestNeuron masterSelf = {};
+  masterSelf.uuid = uint128_t(0x76'0001);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &masterSelf;
+
+  ProdigyMasterAuthorityRuntimeState state = {};
+  state.generation = 17;
+  BrainConfig config = {};
+  config.clusterUUID = uint128_t(0x76'0002);
+  String serialized = {};
+  serializeMasterAuthorityTransition(serialized, state, config);
+  String digest = {};
+  suite.require(prodigyComputeSHA256Hex(serialized, digest),
+                "ordinary_upgrade_authority_transition_digest_fixture");
+
+  auto acknowledgementCount = [](BrainView& peer,
+                                 ProdigyMasterAuthorityStateTransitionAck *last) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(peer.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState) return;
+      uint8_t *args = message->args;
+      String serializedAcknowledgement = {};
+      Message::extractToStringView(args, serializedAcknowledgement);
+      ProdigyMasterAuthorityStateTransitionAck decoded = {};
+      if (BitseryEngine::deserializeSafe(serializedAcknowledgement, decoded))
+      {
+        count += 1;
+        if (last) *last = std::move(decoded);
+      }
+    });
+    return count;
+  };
+
+  TestBrain master = {};
+  master.nBrains = 2;
+  master.weAreMaster = true;
+  master.noMasterYet = false;
+  master.brainConfig = config;
+  master.masterAuthorityRuntimeState = state;
+  master.masterAuthorityRuntimeStateDurable = true;
+  master.durableMasterAuthorityRuntimeStateGeneration = state.generation;
+  BrainView followerPeer = {};
+  followerPeer.connected = true;
+  followerPeer.isFixedFile = true;
+  followerPeer.fslot = 76;
+  followerPeer.registrationFresh = true;
+  followerPeer.uuid = uint128_t(0x76'0003);
+  followerPeer.boottimens = 76'003;
+  followerPeer.ioGeneration = 3;
+  followerPeer.transportEpoch = 4;
+  followerPeer.existingMasterUUID = masterSelf.uuid;
+  // This is a follower recipient, not a peer that claims the master role.
+  followerPeer.isMasterBrain = false;
+  master.brains.insert(&followerPeer);
+
+  auto currentAcknowledgement = [&]() {
+    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+    acknowledgement.generation = state.generation;
+    acknowledgement.peerUUID = followerPeer.uuid;
+    acknowledgement.peerBootNs = followerPeer.boottimens;
+    acknowledgement.transitionDigest.assign(digest);
+    return acknowledgement;
+  };
+  auto noteCurrentTransition = [&]() {
+    master.noteMasterAuthorityTransitionSentToPeer(&followerPeer, state, digest);
+  };
+
+  noteCurrentTransition();
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "ordinary_upgrade_authority_requires_current_follower_acknowledgement");
+  ProdigyMasterAuthorityStateTransitionAck invalid = currentAcknowledgement();
+  invalid.generation -= 1;
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, invalid);
+  invalid = currentAcknowledgement();
+  invalid.transitionDigest[0] = invalid.transitionDigest[0] == '0' ? '1' : '0';
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, invalid);
+  invalid = currentAcknowledgement();
+  invalid.generation += 1;
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, invalid);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "ordinary_upgrade_authority_rejects_missing_stale_and_future_revision_or_digest_acks");
+  const ProdigyMasterAuthorityStateTransitionAck firstCurrentAcknowledgement = currentAcknowledgement();
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, firstCurrentAcknowledgement);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers(),
+               "ordinary_upgrade_authority_exact_current_follower_ack_admits_master_barrier");
+
+  struct PeerFence {
+    const char *name;
+    std::function<void()> mutate;
+    std::function<void()> restore;
+  };
+  const uint128_t followerUUID = followerPeer.uuid;
+  const int64_t followerBoot = followerPeer.boottimens;
+  const uint64_t followerGeneration = followerPeer.ioGeneration;
+  const uint32_t followerEpoch = followerPeer.transportEpoch;
+  const int followerSlot = followerPeer.fslot;
+  std::array<PeerFence, 5> fences = {{
+      {"uuid", [&] { followerPeer.uuid = followerUUID + 1; }, [&] { followerPeer.uuid = followerUUID; }},
+      {"boot", [&] { followerPeer.boottimens = followerBoot + 1; }, [&] { followerPeer.boottimens = followerBoot; }},
+      {"generation", [&] { followerPeer.ioGeneration = followerGeneration + 1; }, [&] { followerPeer.ioGeneration = followerGeneration; }},
+      {"transport", [&] { followerPeer.transportEpoch = followerEpoch + 1; }, [&] { followerPeer.transportEpoch = followerEpoch; }},
+      {"slot", [&] { followerPeer.fslot = followerSlot + 1; }, [&] { followerPeer.fslot = followerSlot; }},
+  }};
+  for (const PeerFence& fence : fences)
+  {
+    fence.mutate();
+    suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+                 testName("ordinary_upgrade_authority_connection_fence_rejects", fence.name));
+    fence.restore();
+    noteCurrentTransition();
+    master.acknowledgeMasterAuthorityTransition(&followerPeer, currentAcknowledgement());
+    suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers(),
+                 testName("ordinary_upgrade_authority_connection_fence_recovers", fence.name));
+  }
+
+  BrainConfig changedConfig = config;
+  changedConfig.clusterUUID = uint128_t(0x76'0004);
+  master.brainConfig = changedConfig;
+  String changedSerialized = {};
+  serializeMasterAuthorityTransition(changedSerialized, state, changedConfig);
+  String changedDigest = {};
+  suite.require(prodigyComputeSHA256Hex(changedSerialized, changedDigest),
+                "ordinary_upgrade_authority_changed_digest_fixture");
+  master.noteMasterAuthorityTransitionSentToPeer(&followerPeer, state, changedDigest);
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, firstCurrentAcknowledgement);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "ordinary_upgrade_authority_same_generation_changed_digest_invalidates_old_ack");
+  ProdigyMasterAuthorityStateTransitionAck changedAcknowledgement = currentAcknowledgement();
+  changedAcknowledgement.transitionDigest.assign(changedDigest);
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, changedAcknowledgement);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers(),
+               "ordinary_upgrade_authority_current_changed_digest_ack_restores_admission");
+
+  followerPeer.boottimens += 1;
+  followerPeer.ioGeneration += 1;
+  followerPeer.transportEpoch += 1;
+  followerPeer.fslot += 1;
+  master.noteMasterAuthorityTransitionSentToPeer(&followerPeer, state, changedDigest);
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, changedAcknowledgement);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "ordinary_upgrade_authority_reconnect_requires_fresh_current_ack");
+  changedAcknowledgement.peerBootNs = followerPeer.boottimens;
+  master.acknowledgeMasterAuthorityTransition(&followerPeer, changedAcknowledgement);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers(),
+               "ordinary_upgrade_authority_reconnect_fresh_ack_restores_admission");
+
+  TestBrain follower = {};
+  follower.asyncMasterAuthorityPersistence = true;
+  follower.holdRuntimePersistence = true;
+  follower.boottimens = 76'004;
+  BrainView currentMaster = {};
+  authorizeMasterPeerForTest(follower, currentMaster, 77, masterSelf.uuid, 76'001);
+  currentMaster.ioGeneration = 7;
+  currentMaster.transportEpoch = 8;
+  follower.brains.insert(&currentMaster);
+  TestNeuron followerSelf = {};
+  followerSelf.uuid = uint128_t(0x76'0005);
+  thisNeuron = &followerSelf;
+  String messageBuffer = {};
+  follower.brainHandler(&currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(follower.masterAuthorityTransitionCandidatePersistCalls == 1 &&
+                   follower.pendingRuntimePersistence.size() == 1 &&
+                   acknowledgementCount(currentMaster, nullptr) == 0,
+               "ordinary_upgrade_authority_held_persistence_has_no_early_ack");
+  follower.finishRuntimePersistence(false);
+  suite.expect(follower.masterAuthorityRuntimeState.generation == 0 &&
+                   acknowledgementCount(currentMaster, nullptr) == 0,
+               "ordinary_upgrade_authority_failed_persistence_has_no_success_ack");
+  follower.brainHandler(&currentMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(follower.pendingRuntimePersistence.size() == 1,
+               "ordinary_upgrade_authority_retries_after_failed_persistence_without_ack");
+  follower.finishRuntimePersistence(true);
+  ProdigyMasterAuthorityStateTransitionAck followerAcknowledgement = {};
+  const uint32_t followerAcknowledgements = acknowledgementCount(currentMaster, &followerAcknowledgement);
+  suite.expect(followerAcknowledgements == 1 && followerAcknowledgement.generation == state.generation &&
+                   followerAcknowledgement.peerUUID == followerSelf.uuid &&
+                   followerAcknowledgement.peerBootNs == follower.boottimens &&
+                   followerAcknowledgement.transitionDigest.equals(digest),
+               "ordinary_upgrade_authority_successful_persistence_emits_one_exact_ack");
+
+  TestBrain staleFollower = {};
+  staleFollower.asyncMasterAuthorityPersistence = true;
+  staleFollower.holdRuntimePersistence = true;
+  staleFollower.boottimens = 76'006;
+  BrainView staleMaster = {};
+  authorizeMasterPeerForTest(staleFollower, staleMaster, 78, masterSelf.uuid, 76'001);
+  staleFollower.brains.insert(&staleMaster);
+  staleFollower.brainHandler(&staleMaster,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  staleFollower.masterAuthorityEpoch += 1;
+  staleFollower.finishRuntimePersistence(true);
+  suite.expect(acknowledgementCount(staleMaster, nullptr) == 0 &&
+                   staleFollower.masterAuthorityRuntimeState.generation == 0,
+               "ordinary_upgrade_authority_stale_completion_has_no_success_ack");
+
+  TestBrain wrongRoleFollower = {};
+  wrongRoleFollower.asyncMasterAuthorityPersistence = true;
+  BrainView wrongRolePeer = {};
+  authorizeMasterPeerForTest(wrongRoleFollower, wrongRolePeer, 79, masterSelf.uuid, 76'001);
+  wrongRolePeer.isMasterBrain = false;
+  wrongRoleFollower.brains.insert(&wrongRolePeer);
+  wrongRoleFollower.brainHandler(&wrongRolePeer,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(wrongRoleFollower.masterAuthorityTransitionCandidatePersistCalls == 0 &&
+                   wrongRoleFollower.pendingRuntimePersistence.empty() && wrongRolePeer.wBuffer.empty(),
+               "ordinary_upgrade_authority_wrong_role_ingress_is_rejected");
+
+  follower.brains.erase(&currentMaster);
+  staleFollower.brains.erase(&staleMaster);
+  wrongRoleFollower.brains.erase(&wrongRolePeer);
+  master.brains.erase(&followerPeer);
+  thisNeuron = previousNeuron;
+}
+
 static void testElasticCombinedTransitionAndQuarantine(TestSuite& suite)
 {
   TestBrain brain;
@@ -14244,6 +14489,7 @@ static void testElasticReplicationIdentityAndDivergenceGuards(TestSuite& suite)
   TestNeuron self;
   self.uuid = uint128_t(0x7100);
   thisNeuron = &self;
+  brain.weAreMaster = true;
   brain.boottimens = 71;
   brain.nBrains = 5;
 
@@ -14256,6 +14502,8 @@ static void testElasticReplicationIdentityAndDivergenceGuards(TestSuite& suite)
     peer->registrationFresh = true;
     peer->uuid = uint128_t(0x7101);
     peer->boottimens = 72;
+    peer->ioGeneration = 2;
+    peer->transportEpoch = 3;
     peer->existingMasterUUID = self.uuid;
   }
   peerA.fslot = 71;
@@ -14313,17 +14561,79 @@ static void testElasticReplicationIdentityAndDivergenceGuards(TestSuite& suite)
                    brain.pendingElasticAddressOperationHasMajority(1, 7) == false,
                "elastic_quorum_boot_refresh_replaces_state_without_adding_vote");
 
-  Brain::MasterAuthorityReplicationPeerState& tracking =
-      brain.masterAuthorityReplicationByPeer[&peerA];
-  tracking.acknowledgedElasticOperationIDs.insert(99);
-  tracking.sentElasticOperationIDsByGeneration[6].insert(99);
+  // Record the obsolete elastic receipt and an intervening ordinary transition
+  // through the same sender/acknowledgement ownership used by live peers. The
+  // ordinary transition has no elastic operations, but its digest remains an
+  // admissible authority receipt until it is acknowledged or the bounded
+  // history cap reaps it.
+  ProdigyMasterAuthorityRuntimeState obsolete = {};
+  obsolete.generation = 6;
+  ProdigyPendingElasticAddressRelease obsoleteRelease = {};
+  obsoleteRelease.operationID = 99;
+  obsolete.pendingElasticAddressReleases.push_back(std::move(obsoleteRelease));
+  String obsoleteSerializedTransition = {};
+  serializeMasterAuthorityTransition(obsoleteSerializedTransition,
+                                     obsolete,
+                                     brain.brainConfig);
+  String obsoleteTransitionDigest = {};
+  suite.require(prodigyComputeSHA256Hex(obsoleteSerializedTransition,
+                                        obsoleteTransitionDigest),
+                "elastic_ack_history_obsolete_transition_digest_fixture");
+  brain.noteMasterAuthorityTransitionSentToPeer(&peerA,
+                                                obsolete,
+                                                obsoleteTransitionDigest);
+  ProdigyMasterAuthorityStateTransitionAck obsoleteAcknowledgement = {};
+  obsoleteAcknowledgement.generation = obsolete.generation;
+  obsoleteAcknowledgement.peerUUID = peerA.uuid;
+  obsoleteAcknowledgement.peerBootNs = peerA.boottimens;
+  obsoleteAcknowledgement.transitionDigest.assign(obsoleteTransitionDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peerA, obsoleteAcknowledgement);
+
+  ProdigyMasterAuthorityRuntimeState ordinary = {};
+  ordinary.generation = 7;
+  String ordinarySerializedTransition = {};
+  serializeMasterAuthorityTransition(ordinarySerializedTransition,
+                                     ordinary,
+                                     brain.brainConfig);
+  String ordinaryTransitionDigest = {};
+  suite.require(prodigyComputeSHA256Hex(ordinarySerializedTransition,
+                                        ordinaryTransitionDigest),
+                "elastic_ack_history_ordinary_transition_digest_fixture");
+  brain.noteMasterAuthorityTransitionSentToPeer(&peerA,
+                                                ordinary,
+                                                ordinaryTransitionDigest);
   brain.noteMasterAuthorityTransitionSentToPeer(&peerA,
                                                 live,
                                                 liveTransitionDigest);
-  suite.expect(tracking.acknowledgedElasticOperationIDs.size() == 1 &&
+
+  Brain::MasterAuthorityReplicationPeerState& tracking =
+      brain.masterAuthorityReplicationByPeer[&peerA];
+  suite.expect(tracking.acknowledgedElasticOperationIDs.contains(99) == false &&
+                   tracking.acknowledgedElasticOperationIDs.contains(1) == false &&
+                   tracking.sentElasticOperationIDsByGeneration.contains(7) &&
+                   tracking.sentElasticOperationIDsByGeneration[7].empty() &&
+                   tracking.sentTransitionDigestsByGeneration.contains(7) &&
+                   tracking.sentElasticOperationIDsByGeneration.contains(live.generation) &&
+                   tracking.sentElasticOperationIDsByGeneration[live.generation].contains(1) &&
+                   tracking.sentElasticOperationIDsByGeneration.size() <=
+                       ProdigyBrainElasticAddressCoordinator::maximumQueuedOperations,
+               "elastic_ack_history_prunes_obsolete_operations_but_retains_bounded_ordinary_digest");
+
+  ProdigyMasterAuthorityStateTransitionAck liveAcknowledgement = {};
+  liveAcknowledgement.generation = live.generation;
+  liveAcknowledgement.peerUUID = peerA.uuid;
+  liveAcknowledgement.peerBootNs = peerA.boottimens;
+  liveAcknowledgement.transitionDigest.assign(liveTransitionDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peerA, liveAcknowledgement);
+  suite.expect(tracking.acknowledgedGeneration == live.generation &&
                    tracking.acknowledgedElasticOperationIDs.contains(1) &&
-                   tracking.sentElasticOperationIDsByGeneration.contains(6) == false,
-               "elastic_ack_history_prunes_non_live_operations");
+                   tracking.acknowledgedElasticOperationIDs.contains(99) == false &&
+                   tracking.sentElasticOperationIDsByGeneration.contains(live.generation) == false &&
+                   tracking.sentTransitionDigestsByGeneration.contains(live.generation) == false &&
+                   tracking.sentElasticOperationIDsByGeneration.contains(7) &&
+                   tracking.sentElasticOperationIDsByGeneration[7].empty() &&
+                   tracking.sentTransitionDigestsByGeneration.contains(7),
+               "elastic_ack_history_current_receipt_preserves_pending_ordinary_digest");
   thisNeuron = previousNeuron;
 }
 
@@ -24379,7 +24689,12 @@ static void testMachineConstructionInitializesLifecycleState(TestSuite& suite)
 static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
+  TestNeuron self = {};
+  self.uuid = uint128_t(0x5218'0000);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
   TestBrain brain = {};
+  brain.nBrains = 2;
   brain.weAreMaster = true;
   brain.brainConfig.datacenterFragment = 1;
   brain.masterAuthorityRuntimeState.generation = 9;
@@ -24447,14 +24762,35 @@ static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuit
   peer.connected = true;
   peer.registrationFresh = true;
   peer.isFixedFile = true;
-  peer.isMasterBrain = true;
   peer.fslot = 52;
+  peer.ioGeneration = 5;
+  peer.transportEpoch = 6;
+  peer.existingMasterUUID = self.uuid;
   brain.brains.insert(&peer);
-  Brain::MasterAuthorityReplicationPeerState tracking = {};
-  tracking.uuid = peer.uuid;
-  tracking.bootNs = peer.boottimens;
-  tracking.acknowledgedGeneration = 8;
-  brain.masterAuthorityReplicationByPeer.insert_or_assign(&peer, tracking);
+  String currentSerialized = {};
+  serializeMasterAuthorityTransition(currentSerialized, brain.masterAuthorityRuntimeState, brain.brainConfig);
+  String currentDigest = {};
+  suite.require(prodigyComputeSHA256Hex(currentSerialized, currentDigest),
+                "bundle_checkpoint_authority_ack_digest_fixture");
+  auto acknowledgement = [&](uint64_t generation) {
+    ProdigyMasterAuthorityStateTransitionAck ack = {};
+    ack.generation = generation;
+    ack.peerUUID = peer.uuid;
+    ack.peerBootNs = peer.boottimens;
+    ack.transitionDigest.assign(currentDigest);
+    return ack;
+  };
+  ProdigyMasterAuthorityRuntimeState staleState = brain.masterAuthorityRuntimeState;
+  staleState.generation -= 1;
+  String staleSerialized = {};
+  serializeMasterAuthorityTransition(staleSerialized, staleState, brain.brainConfig);
+  String staleDigest = {};
+  suite.require(prodigyComputeSHA256Hex(staleSerialized, staleDigest),
+                "bundle_checkpoint_stale_authority_ack_digest_fixture");
+  brain.noteMasterAuthorityTransitionSentToPeer(&peer, staleState, staleDigest);
+  ProdigyMasterAuthorityStateTransitionAck staleAcknowledgement = acknowledgement(staleState.generation);
+  staleAcknowledgement.transitionDigest.assign(staleDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peer, staleAcknowledgement);
 
   suite.expect(brain.prepareLocalBundleExecRecovery() == false &&
                    brain.updateSelfMachineRecoveryWitnesses.empty(),
@@ -24466,7 +24802,8 @@ static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuit
   suite.require(brain.collectNeuronStateUploadBootstraps(&machine, normalReplay) && normalReplay.size() == 2,
                 "normal_state_upload_replay_preserves_scheduled_uuid_without_authenticated_cache");
 
-  brain.masterAuthorityReplicationByPeer[&peer].acknowledgedGeneration = 9;
+  brain.noteMasterAuthorityTransitionSentToPeer(&peer, brain.masterAuthorityRuntimeState, currentDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peer, acknowledgement(brain.masterAuthorityRuntimeState.generation));
   suite.expect(brain.prepareLocalBundleExecRecovery() == false &&
                    brain.updateSelfMachineRecoveryWitnesses.empty() &&
                    brain.persistedMachineInventoryUploaded.contains(machine.uuid) == false &&
@@ -24511,6 +24848,7 @@ static void testBundleCheckpointCapturesOnlyAcknowledgedNeuronInventory(TestSuit
   brain.deployments.erase(deploymentID);
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
+  thisNeuron = previousNeuron;
 }
 
 static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite& suite)
@@ -24728,8 +25066,14 @@ static void testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(TestSuit
 static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
+  TestNeuron self = {};
+  self.uuid = uint128_t(0x521b0001);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
   TestBrain brain = {};
   brain.nBrains = 3;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
   brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
   brain.updateSelfExpectedEchos = 2;
   brain.updateSelfWorkerExpectedBundleSHA256 =
@@ -24744,6 +25088,9 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   brain.masterAuthorityRuntimeState.generation = 7;
   brain.masterAuthorityRuntimeStateDurable = true;
   brain.durableMasterAuthorityRuntimeStateGeneration = 7;
+  brain.refreshMasterAuthorityRuntimeStateFromLiveFields();
+  ProdigyMasterAuthorityRuntimeState projectedAuthority = brain.masterAuthorityRuntimeState;
+  projectedAuthority.updateSelf = Brain::projectUpdateSelfRecoveryWitness(projectedAuthority.updateSelf);
 
   BrainView peer = {};
   peer.uuid = uint128_t(0x521b0002);
@@ -24751,6 +25098,10 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   peer.connected = true;
   peer.isFixedFile = true;
   peer.fslot = 52;
+  peer.ioGeneration = 2;
+  peer.transportEpoch = 3;
+  peer.registrationFresh = true;
+  peer.existingMasterUUID = self.uuid;
   brain.brains.insert(&peer);
   BrainView secondPeer = {};
   secondPeer.uuid = uint128_t(0x521b0003);
@@ -24758,35 +25109,93 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   secondPeer.connected = true;
   secondPeer.isFixedFile = true;
   secondPeer.fslot = 53;
+  secondPeer.ioGeneration = 4;
+  secondPeer.transportEpoch = 5;
+  secondPeer.registrationFresh = true;
+  secondPeer.existingMasterUUID = self.uuid;
   brain.brains.insert(&secondPeer);
   brain.updateSelfFollowerRebootedPeerKeys.insert(peer.uuid);
   brain.updateSelfFollowerRebootedPeerKeys.insert(secondPeer.uuid);
-  Brain::MasterAuthorityReplicationPeerState tracking = {};
-  tracking.uuid = peer.uuid;
-  tracking.bootNs = peer.boottimens;
-  tracking.acknowledgedGeneration = 6;
-  brain.masterAuthorityReplicationByPeer.emplace(&peer, std::move(tracking));
-  Brain::MasterAuthorityReplicationPeerState secondTracking = {};
-  secondTracking.uuid = secondPeer.uuid;
-  secondTracking.bootNs = secondPeer.boottimens;
-  secondTracking.acknowledgedGeneration = 7;
-  brain.masterAuthorityReplicationByPeer.emplace(&secondPeer, std::move(secondTracking));
+  auto serializeState = [&](const ProdigyMasterAuthorityRuntimeState& authority, String& digest) {
+    String serialized = {};
+    serializeMasterAuthorityTransition(serialized, authority, brain.brainConfig);
+    return prodigyComputeSHA256Hex(serialized, digest);
+  };
+  auto acknowledgement = [](const BrainView& candidate, uint64_t generation, const String& digest) {
+    ProdigyMasterAuthorityStateTransitionAck ack = {};
+    ack.generation = generation;
+    ack.peerUUID = candidate.uuid;
+    ack.peerBootNs = candidate.boottimens;
+    ack.transitionDigest.assign(digest);
+    return ack;
+  };
+  ProdigyMasterAuthorityRuntimeState staleState = projectedAuthority;
+  staleState.generation -= 1;
+  String staleDigest = {};
+  suite.require(serializeState(staleState, staleDigest),
+                "update_self_recovery_witness_stale_ack_digest_fixture");
+  brain.noteMasterAuthorityTransitionSentToPeer(&peer, staleState, staleDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peer,
+      acknowledgement(peer, staleState.generation, staleDigest));
+  String currentDigest = {};
+  suite.require(serializeState(projectedAuthority, currentDigest),
+                "update_self_recovery_witness_current_ack_digest_fixture");
+  brain.noteMasterAuthorityTransitionSentToPeer(&secondPeer, projectedAuthority, currentDigest);
+  brain.acknowledgeMasterAuthorityTransition(&secondPeer,
+      acknowledgement(secondPeer, projectedAuthority.generation, currentDigest));
 
   brain.maybeRelinquishMasterForUpdateSelf();
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots,
                "update_self_recovery_witness_stale_ack_blocks_master_relinquish");
 
-  brain.masterAuthorityReplicationByPeer[&peer].acknowledgedGeneration = 7;
-  brain.maybeRelinquishMasterForUpdateSelf();
+  brain.noteMasterAuthorityTransitionSentToPeer(&peer, projectedAuthority, currentDigest);
+  brain.acknowledgeMasterAuthorityTransition(&peer,
+      acknowledgement(peer, projectedAuthority.generation, currentDigest));
+  auto relinquishFrames = [](BrainView& candidate) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(candidate.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) == BrainTopic::relinquishMasterStatus) count += 1;
+    });
+    return count;
+  };
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos &&
+                   brain.updateSelfRelinquishIssuedPeerKeys.empty() &&
+                   relinquishFrames(peer) == 0 && relinquishFrames(secondPeer) == 0,
+               "update_self_recovery_witness_relinquish_waits_for_authority_replication_send_drain");
+
+  // The successful ACK persists the next update phase and queues the current
+  // authority transition first. Simulate the matching Brain send completion;
+  // its normal post-send owner is what then queues relinquish commands.
+  bool drainedAuthorityFrames = true;
+  for (BrainView *candidate : {&peer, &secondPeer})
+  {
+    const uint32_t bytes = candidate->wBuffer.outstandingBytes();
+    if (!candidate->pendingSend || bytes == 0)
+    {
+      drainedAuthorityFrames = false;
+      continue;
+    }
+    candidate->pendingSendBytes = bytes;
+    brain.sendHandler(static_cast<void *>(candidate), int(bytes));
+  }
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos &&
+                   drainedAuthorityFrames &&
                    brain.updateSelfRelinquishIssuedPeerKeys.contains(peer.uuid) &&
-                   brain.updateSelfRelinquishIssuedPeerKeys.contains(secondPeer.uuid),
-               "update_self_recovery_witness_current_acks_allow_three_brain_master_relinquish");
+                   brain.updateSelfRelinquishIssuedPeerKeys.contains(secondPeer.uuid) &&
+                   relinquishFrames(peer) == 1 && relinquishFrames(secondPeer) == 1,
+               "update_self_recovery_witness_current_acks_queue_relinquish_after_authority_send_drain");
+  brain.brains.erase(&peer);
+  brain.brains.erase(&secondPeer);
+  thisNeuron = previousNeuron;
 }
 
 static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  TestNeuron masterSelf = {};
+  masterSelf.uuid = uint128_t(0x521c0001);
+  thisNeuron = &masterSelf;
   ProdigyMasterAuthorityRuntimeState state = {};
   state.generation = 1;
   state.nextPendingAddMachinesOperationID = 1;
@@ -24804,6 +25213,10 @@ static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestS
   }
 
   TestBrain master = {};
+  master.nBrains = 2;
+  master.weAreMaster = true;
+  master.noMasterYet = false;
+  master.masterAuthorityRuntimeState = state;
   BrainView followerPeer = {};
   followerPeer.connected = true;
   followerPeer.isFixedFile = true;
@@ -24811,9 +25224,14 @@ static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestS
   followerPeer.registrationFresh = true;
   followerPeer.uuid = uint128_t(0x521c0002);
   followerPeer.boottimens = 52'102;
+  followerPeer.ioGeneration = 2;
+  followerPeer.transportEpoch = 3;
+  followerPeer.existingMasterUUID = masterSelf.uuid;
+  followerPeer.isMasterBrain = false;
   String serialized = {};
   BrainConfig config = {};
   config.clusterUUID = uint128_t(0x521c0100);
+  master.brainConfig = config;
   serializeMasterAuthorityTransition(serialized, state, config);
   String digest = {};
   suite.require(prodigyComputeSHA256Hex(serialized, digest),
@@ -24829,7 +25247,6 @@ static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestS
   authorizeMasterPeerForTest(follower, currentMaster, 92, uint128_t(0x521c0001), 52'101);
   TestNeuron followerSelf = {};
   followerSelf.uuid = uint128_t(0x521c0002);
-  NeuronBase *previousNeuron = thisNeuron;
   thisNeuron = &followerSelf;
   follower.boottimens = 52'102;
   String messageBuffer = {};
@@ -27107,6 +27524,16 @@ int main(void)
     std::printf("RETAINED_HEALTH_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "ordinary-upgrade-authority") == 0)
+  {
+    testOrdinaryUpgradeAuthorityAdmission(suite);
+    testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
+    testElasticReplicationIdentityAndDivergenceGuards(suite);
+    testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
+    testAsyncMachineRetirementJournalDurability(suite);
+    std::printf("ORDINARY_UPGRADE_AUTHORITY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-kill-pending-restart") == 0)
   {
@@ -27498,6 +27925,7 @@ int main(void)
     testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
     testElasticSnapshotPersistenceRetriesSameGeneration(suite);
     testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
+    testOrdinaryUpgradeAuthorityAdmission(suite);
     testElasticCombinedTransitionAndQuarantine(suite);
     testElasticReplicationIdentityAndDivergenceGuards(suite);
     testElasticMutationHeadroomAndFenceReconciliation(suite);

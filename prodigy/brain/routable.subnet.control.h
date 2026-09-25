@@ -395,27 +395,17 @@ inline void Brain::noteMasterAuthorityTransitionSentToPeer(
     const ProdigyMasterAuthorityRuntimeState& state,
     const String& transitionDigest)
 {
-  const bool carriesUpdateSelfRecoveryWitness = hasUpdateSelfRecoveryWitness(state.updateSelf);
-  if (state.pendingElasticAddressAssignments.empty() &&
-      state.pendingElasticAddressReleases.empty() &&
-      machineRetirementJournalPresent(state) == false &&
-      carriesUpdateSelfRecoveryWitness == false)
-  {
-    masterAuthorityReplicationByPeer.erase(peer);
-    return;
-  }
-  if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
-      peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false)
-  {
-    return;
-  }
+  if (!peerCanReceiveMasterAuthorityState(peer)) return;
 
   MasterAuthorityReplicationPeerState& tracking = masterAuthorityReplicationByPeer[peer];
-  if (tracking.uuid != peer->uuid || tracking.bootNs != peer->boottimens)
+  if (!tracking.matchesPeer(peer))
   {
     tracking = {};
     tracking.uuid = peer->uuid;
     tracking.bootNs = peer->boottimens;
+    tracking.ioGeneration = peer->ioGeneration;
+    tracking.transportEpoch = peer->transportEpoch;
+    tracking.fileSlot = peer->fslot;
   }
 
   bytell_hash_set<uint64_t> liveOperationIDs;
@@ -454,15 +444,9 @@ inline void Brain::noteMasterAuthorityTransitionSentToPeer(
         operationIt = sent.erase(operationIt);
       }
     }
-    if (sent.empty())
-    {
-      tracking.sentTransitionDigestsByGeneration.erase(generationIt->first);
-      generationIt = tracking.sentElasticOperationIDsByGeneration.erase(generationIt);
-    }
-    else
-    {
-      ++generationIt;
-    }
+    // An empty operation set still carries an ordinary authority revision.
+    // Keep its digest until acknowledgment or the existing bounded-history cap.
+    ++generationIt;
   }
 
   bytell_hash_set<uint64_t>& operationIDs =
@@ -502,13 +486,7 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
     BrainView *peer,
     const ProdigyMasterAuthorityStateTransitionAck& acknowledgement)
 {
-  if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
-      (machineRetirementJournalPresent(masterAuthorityRuntimeState) &&
-       peer->version < machineRetirementJournalMinimumPeerVersion) ||
-      peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
-      (peer->transportTLSEnabled() &&
-       (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
-        peer->tlsPeerUUID != peer->uuid)) ||
+  if (!peerCanReceiveMasterAuthorityState(peer) ||
       acknowledgement.peerUUID != peer->uuid || acknowledgement.peerBootNs != peer->boottimens)
   {
     return;
@@ -519,7 +497,7 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
     return;
   }
   MasterAuthorityReplicationPeerState& tracking = trackingIt->second;
-  if (tracking.uuid != peer->uuid || tracking.bootNs != peer->boottimens)
+  if (!tracking.matchesPeer(peer))
   {
     masterAuthorityReplicationByPeer.erase(trackingIt);
     return;
@@ -531,8 +509,11 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
   {
     return;
   }
-  tracking.acknowledgedGeneration = std::max(tracking.acknowledgedGeneration,
-                                             acknowledgement.generation);
+  if (acknowledgement.generation >= tracking.acknowledgedGeneration)
+  {
+    tracking.acknowledgedGeneration = acknowledgement.generation;
+    tracking.acknowledgedTransitionDigest.assign(acknowledgement.transitionDigest);
+  }
   auto sentIt = tracking.sentElasticOperationIDsByGeneration.find(acknowledgement.generation);
   if (sentIt != tracking.sentElasticOperationIDsByGeneration.end())
   {

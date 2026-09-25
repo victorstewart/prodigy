@@ -1084,7 +1084,17 @@ public:
 
     uint128_t uuid = 0;
     int64_t bootNs = 0;
+    uint64_t ioGeneration = 0;
+    uint32_t transportEpoch = 0;
+    int fileSlot = -1;
     uint64_t acknowledgedGeneration = 0;
+    String acknowledgedTransitionDigest;
+    bool matchesPeer(const BrainView *peer) const
+    {
+      return peer != nullptr && uuid == peer->uuid && bootNs == peer->boottimens &&
+             ioGeneration == peer->ioGeneration && transportEpoch == peer->transportEpoch &&
+             fileSlot == peer->fslot;
+    }
     bytell_hash_map<uint64_t, bytell_hash_set<uint64_t>> sentElasticOperationIDsByGeneration;
     bytell_hash_map<uint64_t, String> sentTransitionDigestsByGeneration;
     bytell_hash_set<uint64_t> acknowledgedElasticOperationIDs;
@@ -6136,6 +6146,16 @@ public:
     }
   }
 
+  bool serializeCurrentMasterAuthorityTransition(String& serialized, String& digest) const
+  {
+    ProdigyMasterAuthorityStateTransition transition;
+    transition.runtimeState = masterAuthorityRuntimeState;
+    transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
+    ownBrainConfig(brainConfig, transition.brainConfig);
+    BitseryEngine::serialize(serialized, transition);
+    return prodigyComputeSHA256Hex(serialized, digest);
+  }
+
   void queueMasterAuthorityRuntimeStateReplication(void)
   {
     refreshMasterAuthorityRuntimeStateFromLiveFields();
@@ -6167,14 +6187,8 @@ public:
     }
 
     String serialized;
-    ProdigyMasterAuthorityStateTransition transition;
-    transition.runtimeState = masterAuthorityRuntimeState;
-    transition.runtimeState.updateSelf =
-        projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
-    ownBrainConfig(brainConfig, transition.brainConfig);
-    BitseryEngine::serialize(serialized, transition);
     String transitionDigest;
-    if (prodigyComputeSHA256Hex(serialized, transitionDigest) == false)
+    if (serializeCurrentMasterAuthorityTransition(serialized, transitionDigest) == false)
     {
       return;
     }
@@ -6196,7 +6210,7 @@ public:
     for (BrainView *peer : brains)
     {
       noteMasterAuthorityTransitionSentToPeer(peer,
-                                              transition.runtimeState,
+                                              masterAuthorityRuntimeState,
                                               transitionDigest);
     }
     queueBrainReplication(BrainTopic::replicateMasterAuthorityState, serialized);
@@ -7165,11 +7179,9 @@ public:
       BrainView *peer, const ProdigyMasterAuthorityRuntimeState& incoming, const String& serialized)
   {
     String transitionDigest;
-    if ((incoming.pendingElasticAddressAssignments.empty() == false ||
-         incoming.pendingElasticAddressReleases.empty() == false ||
-         machineRetirementJournalPresent(incoming) ||
-         hasUpdateSelfRecoveryWitness(incoming.updateSelf)) &&
-        applyReplicatedMachineRetirementTopology(incoming) &&
+    // Every authority revision participates in the same durable receipt barrier,
+    // including ordinary state with no elastic, retirement or update journal.
+    if (applyReplicatedMachineRetirementTopology(incoming) &&
         replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming) &&
         prodigyComputeSHA256Hex(serialized, transitionDigest))
     {
@@ -7271,17 +7283,28 @@ public:
     return true;
   }
 
-  bool peerCanReplicateMasterAuthorityState(BrainView *peer)
+  bool peerCanExchangeMasterAuthorityState(BrainView *peer) const
   {
     if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
         peer->uuid == 0 || peer->boottimens == 0 || peer->isFixedFile == false ||
-        peer->fslot < 0 || peerSocketActive(peer) == false ||
-        peer->isMasterBrain == false)
+        peer->fslot < 0 || peerSocketActive(peer) == false)
     {
       return false;
     }
     return peer->transportTLSEnabled() == false ||
            (peer->isTLSNegotiated() && peer->tlsPeerVerified && peer->tlsPeerUUID == peer->uuid);
+  }
+
+  bool peerCanReplicateMasterAuthorityState(BrainView *peer) const
+  {
+    return peerCanExchangeMasterAuthorityState(peer) && peer->isMasterBrain;
+  }
+
+  bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
+  {
+    return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (!machineRetirementJournalPresent(masterAuthorityRuntimeState) ||
+            peer->version >= machineRetirementJournalMinimumPeerVersion);
   }
 
   virtual void onMasterAuthorityRuntimeStateApplied(void)
@@ -26818,21 +26841,22 @@ public:
     {
       return false;
     }
+    String serialized, digest;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
     for (BrainView *peer : brains)
     {
-      if (peerCanReplicateMasterAuthorityState(peer) == false)
-      {
-        return false;
-      }
-      const auto tracking = masterAuthorityReplicationByPeer.find(peer);
-      if (tracking == masterAuthorityReplicationByPeer.end() || tracking->second.uuid != peer->uuid ||
-          tracking->second.bootNs != peer->boottimens ||
-          tracking->second.acknowledgedGeneration < masterAuthorityRuntimeState.generation)
-      {
-        return false;
-      }
+      if (!peerHasAcknowledgedCurrentMasterAuthority(peer, digest)) return false;
     }
     return true;
+  }
+
+  bool peerHasAcknowledgedCurrentMasterAuthority(BrainView *peer, const String& digest) const
+  {
+    if (!peerCanReceiveMasterAuthorityState(peer)) return false;
+    const auto tracking = masterAuthorityReplicationByPeer.find(peer);
+    return tracking != masterAuthorityReplicationByPeer.end() && tracking->second.matchesPeer(peer) &&
+           tracking->second.acknowledgedGeneration == masterAuthorityRuntimeState.generation &&
+           tracking->second.acknowledgedTransitionDigest.equals(digest);
   }
 
   bool updateSelfRecoveryWitnessAcknowledgedByPeers(
@@ -26842,30 +26866,18 @@ public:
     {
       return true;
     }
-    if (masterAuthorityRuntimeStateDurable == false)
+    if (masterAuthorityRuntimeStateDurable == false ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
     {
       return false;
     }
 
+    String serialized, digest;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
     for (uint128_t peerKey : requiredPeerKeys)
     {
-      BrainView *peer = findBrainViewByUpdateSelfPeerKey(peerKey);
-      if (peer == nullptr || peer->uuid == 0 || peer->boottimens == 0 ||
-          peerSocketActive(peer) == false)
-      {
+      if (!peerHasAcknowledgedCurrentMasterAuthority(findBrainViewByUpdateSelfPeerKey(peerKey), digest))
         return false;
-      }
-      auto trackingIt = masterAuthorityReplicationByPeer.find(peer);
-      if (trackingIt == masterAuthorityReplicationByPeer.end())
-      {
-        return false;
-      }
-      const MasterAuthorityReplicationPeerState& tracking = trackingIt->second;
-      if (tracking.uuid != peer->uuid || tracking.bootNs != peer->boottimens ||
-          tracking.acknowledgedGeneration < masterAuthorityRuntimeState.generation)
-      {
-        return false;
-      }
     }
     return true;
   }
@@ -28314,19 +28326,13 @@ public:
           }
           {
             String serializedRuntimeState;
-            ProdigyMasterAuthorityStateTransition transition;
-            transition.runtimeState = masterAuthorityRuntimeState;
-            transition.runtimeState.updateSelf =
-                projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
-            ownBrainConfig(brainConfig, transition.brainConfig);
-            BitseryEngine::serialize(serializedRuntimeState, transition);
             String transitionDigest;
-            if (prodigyComputeSHA256Hex(serializedRuntimeState, transitionDigest) == false)
+            if (serializeCurrentMasterAuthorityTransition(serializedRuntimeState, transitionDigest) == false)
             {
               break;
             }
             noteMasterAuthorityTransitionSentToPeer(bv,
-                                                    transition.runtimeState,
+                                                    masterAuthorityRuntimeState,
                                                     transitionDigest);
             Message::construct(bv->wBuffer, BrainTopic::replicateMasterAuthorityState, serializedRuntimeState);
           }
