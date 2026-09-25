@@ -3,10 +3,14 @@
 #include <services/debug.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 static bool approximatelyEqual(double lhs, double rhs, double epsilon = 1e-6)
 {
@@ -300,6 +304,115 @@ int main(void)
     suite.expect(
         decoded.metricSamples.size() == sampleCount && decoded.metricSamples.front() == snapshot.metricSamples.front() && decoded.metricSamples.back() == snapshot.metricSamples.back(),
         "metric_snapshot_above_uint16_edges");
+  }
+
+  {
+    MetricsStore snapshotStore;
+    const uint64_t snapshotDeployment = 0x5501;
+    const uint128_t snapshotContainer = uint128_t(0x5502);
+    const uint64_t snapshotMetric = 0x5503;
+    for (uint32_t index = 0; index < 1'500; ++index)
+      snapshotStore.record(snapshotDeployment, snapshotContainer, snapshotMetric, index, double(index));
+    Vector<ProdigyMetricSample> legacy;
+    snapshotStore.exportSamples(legacy);
+    const auto frozen = snapshotStore.captureSnapshot();
+    Vector<ProdigyMetricSample> captured;
+    frozen->exportSamples(captured);
+    bool exactLegacyOrder = captured.size() == legacy.size();
+    for (size_t index = 0; exactLegacyOrder && index < captured.size(); ++index)
+      exactLegacyOrder = captured[index] == legacy[index];
+    suite.expect(frozen->sampleCount() == 1'500 && frozen->retainedBytes() >= 1'500 * (sizeof(int64_t) + sizeof(float)) &&
+                     exactLegacyOrder,
+                 "metric_snapshot_exports_exact_legacy_flat_order_with_cached_accounting");
+
+    for (uint32_t index = 0; index < 2'000; ++index)
+      snapshotStore.record(snapshotDeployment, snapshotContainer, snapshotMetric, 2'000 + index, double(2'000 + index));
+    snapshotStore.trimRetention(3'999, 100);
+    snapshotStore.clear();
+    Vector<ProdigyMetricSample> afterMutation;
+    frozen->exportSamples(afterMutation);
+    suite.expect(afterMutation.size() == 1'500 && afterMutation.front().value == 0.0f &&
+                     afterMutation.back().value == 1'499.0f,
+                 "metric_snapshot_survives_append_growth_trim_and_store_clear");
+
+    MetricsStore concurrentStore;
+    for (uint32_t index = 0; index < 1'500; ++index)
+      concurrentStore.record(snapshotDeployment, snapshotContainer, snapshotMetric, index, double(index));
+    const auto concurrentFrozen = concurrentStore.captureSnapshot();
+    std::atomic<bool> readerSucceeded = true;
+    std::thread reader([&] {
+      for (uint32_t attempt = 0; attempt < 64; ++attempt)
+      {
+        Vector<ProdigyMetricSample> workerExport;
+        concurrentFrozen->exportSamples(workerExport);
+        if (workerExport.size() != 1'500 || workerExport.front().value != 0.0f || workerExport.back().value != 1'499.0f)
+          readerSucceeded.store(false);
+      }
+    });
+    for (uint32_t index = 0; index < 2'000; ++index)
+      concurrentStore.record(snapshotDeployment, snapshotContainer, snapshotMetric, 2'000 + index, double(index));
+    concurrentStore.trimRetention(3'999, 100);
+    concurrentStore.clear();
+    reader.join();
+    suite.expect(readerSucceeded.load(), "metric_snapshot_worker_export_is_immutable_during_append_trim_and_store_clear");
+  }
+
+  {
+    MetricRing wrapped;
+    for (uint32_t i = 0; i < 1024; ++i) wrapped.push(i, float(i));
+    wrapped.trimOlderThan(700);
+    for (uint32_t i = 1024; i < 1724; ++i) wrapped.push(i, float(i));
+    const auto frozen = wrapped.captureFrozen();
+    // Growth starts with a full ring whose first/last logical chunks share
+    // one physical block. Re-mapping must retain both halves before append.
+    for (uint32_t i = 1724; i < 5000; ++i) wrapped.push(i, float(i));
+    uint32_t expected = 700;
+    bool correct = frozen->sampleCount() == 1024;
+    frozen->forEachSample([&](int64_t ms, float value) {
+      correct = correct && ms == expected && value == float(expected);
+      ++expected;
+    });
+    correct = correct && expected == 1724;
+    expected = 700;
+    wrapped.forEachSample([&](int64_t ms, float value) {
+      correct = correct && ms == expected && value == float(expected);
+      ++expected;
+    });
+    suite.expect(correct && expected == 5000, "metric_snapshot_wrap_growth_retains_both_halves_and_live_order");
+  }
+
+  {
+    MetricsStore performanceStore;
+    constexpr uint32_t performanceSeries = 128;
+    constexpr uint32_t samplesPerSeries = 12'500;
+    for (uint32_t sample = 0; sample < samplesPerSeries; ++sample)
+      for (uint32_t seriesIndex = 0; seriesIndex < performanceSeries; ++seriesIndex)
+        performanceStore.record(0x6601, uint128_t(0x6602 + seriesIndex), 0x6603,
+                                int64_t(sample), double(sample + seriesIndex));
+    std::vector<uint64_t> captureSamples = {};
+    std::vector<std::shared_ptr<const MetricsStore::Snapshot>> captures = {};
+    captures.reserve(30);
+    for (uint32_t iteration = 0; iteration < 30; ++iteration)
+    {
+      const auto started = std::chrono::steady_clock::now();
+      captures.push_back(performanceStore.captureSnapshot());
+      performanceStore.record(0x6601, uint128_t(0x6602), 0x6603,
+                              samplesPerSeries + iteration, double(iteration));
+      captureSamples.push_back(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - started).count()));
+    }
+    std::vector<uint64_t> sortedCaptureSamples = captureSamples;
+    std::sort(sortedCaptureSamples.begin(), sortedCaptureSamples.end());
+    const uint64_t captureP95 = sortedCaptureSamples[(sortedCaptureSamples.size() * 95) / 100];
+    bool capturesImmutable = true;
+    for (size_t index = 0; index < captures.size(); ++index)
+      capturesImmutable = capturesImmutable && captures[index] &&
+          captures[index]->sampleCount() == size_t(performanceSeries) * samplesPerSeries + index;
+    std::fprintf(stderr, "METRIC_SNAPSHOT_CAPTURE_RAW_US=");
+    for (uint64_t sample : captureSamples) std::fprintf(stderr, "%llu,", static_cast<unsigned long long>(sample));
+    std::fprintf(stderr, " P95_US=%llu\n", static_cast<unsigned long long>(captureP95));
+    suite.expect(capturesImmutable && captureP95 < 10'000,
+                 "metric_snapshot_1_6m_samples_thirty_capture_append_p95_under_10ms");
   }
 
   if (suite.failed != 0)

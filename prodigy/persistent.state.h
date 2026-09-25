@@ -15,6 +15,7 @@
 #include <prodigy/runtime.environment.h>
 #include <prodigy/transport.tls.h>
 #include <prodigy/types.h>
+#include <prodigy/brain/metrics.h>
 #include <services/base64.h>
 #include <services/random.h>
 
@@ -277,6 +278,10 @@ public:
   BrainConfig brainConfig;
   ProdigyPersistentMasterAuthorityPackage masterAuthority;
   Vector<ProdigyMetricSample> metricSamples;
+  // Live snapshots retain an immutable generation without flattening history
+  // on the Ring. The existing persistence worker serializes this view using
+  // the same flat metric vector schema as snapshots loaded from disk.
+  std::shared_ptr<const MetricsStore::Snapshot> metricCapture;
 };
 
 static inline void prodigyReplaceCachedBrainSnapshot(
@@ -297,7 +302,25 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshot& snapshot)
   serializer.object(snapshot.topology);
   serializer.object(snapshot.brainConfig);
   serializer.object(snapshot.masterAuthority);
-  serializer.container(snapshot.metricSamples, UINT32_MAX);
+  if constexpr (requires { serializer.frozenMetricSamples(snapshot.metricSamples, snapshot.metricCapture); })
+  {
+    serializer.frozenMetricSamples(snapshot.metricSamples, snapshot.metricCapture);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value)
+  {
+    if (snapshot.metricCapture)
+    {
+      Vector<ProdigyMetricSample> samples;
+      snapshot.metricCapture->exportSamples(samples);
+      serializer.container(samples, UINT32_MAX);
+    }
+    else serializer.container(snapshot.metricSamples, UINT32_MAX);
+  }
+  else
+  {
+    snapshot.metricCapture.reset();
+    serializer.container(snapshot.metricSamples, UINT32_MAX);
+  }
 }
 
 static inline const char *defaultProdigyPersistentStateDBPath(void)

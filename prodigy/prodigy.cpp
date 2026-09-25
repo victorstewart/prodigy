@@ -1039,7 +1039,7 @@ public:
     prodigyStripMachineHardwareCapturesFromClusterTopology(snapshot.topology);
 
     capturePersistentMasterAuthorityPackage(snapshot.masterAuthority);
-    metrics.exportSamples(snapshot.metricSamples);
+    snapshot.metricCapture = metrics.captureSnapshot();
 
     if (snapshot.topology.machines.empty() == false)
     {
@@ -1119,7 +1119,7 @@ public:
         "prodigy persist snapshot-build-end topologyMachines=%zu brainPeers=%zu metricSamples=%zu\n",
         size_t(snapshot.topology.machines.size()),
         size_t(snapshot.brainPeers.size()),
-        size_t(snapshot.metricSamples.size()));
+        size_t(snapshot.metricCapture->sampleCount()));
     return snapshot;
   }
 

@@ -378,9 +378,138 @@ static void testProductionPersistenceAdmissionFromArtifactCompletion(TestSuite& 
   reopened.close();
 }
 
+static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "metric_capture_worker_starts");
+  if (!io) return;
+  constexpr uint32_t seriesCount = 128, perSeries = 12'500;
+  constexpr uint64_t sampleCount = uint64_t(seriesCount) * perSeries;
+  const auto ringThread = std::this_thread::get_id();
+  std::atomic<bool> entered = false, release = false;
+  bool workerThread = false;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io,
+      [&](auto& backing, auto& request) {
+        workerThread = std::this_thread::get_id() != ringThread;
+        entered = true;
+        while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        request.result.snapshotDurable = backing.saveBrainSnapshot(request.snapshot, &request.result.failure);
+        request.result.durable = request.result.snapshotDurable;
+        if (request.result.snapshotDurable)
+          request.result.bootStateDurable = backing.saveBootState(request.bootState, &request.result.failure);
+      });
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  ProdigyHostControlNetwork network;
+  Vector<int64_t> captures, controls;
+  uint32_t receipts = 0, heldTicks = 0;
+  bool durable = false, allDeferred = true, allAdmissible = true;
+  {
+    ProdigyBrain brain(network, writer);
+    brain.brainConfig.clusterUUID = 0xCA9701;
+    for (uint64_t key = 1; key <= seriesCount; ++key)
+      for (uint32_t i = 0; i < perSeries; ++i)
+        brain.metrics.record(7, 0xABC, key, i, i);
+
+    int64_t lastTick = 0;
+    ring.tickAction = [&] {
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t current = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+      if (lastTick) controls.push_back(current - lastTick);
+      lastTick = current;
+      if (captures.size() < 30)
+      {
+        {
+          auto snapshot = brain.buildPersistentBrainSnapshot();
+          const auto frozen = snapshot.metricCapture;
+          auto copy = snapshot;
+          allDeferred = allDeferred && frozen && frozen->sampleCount() == sampleCount &&
+              copy.metricSamples.empty() && copy.metricCapture == frozen;
+          allAdmissible = allAdmissible && ProdigyPersistentStateWriter::detach(copy) &&
+              ProdigyPersistentStateWriter::retainedBytesFor(copy) > 0;
+        }
+        captures.push_back(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - now).count());
+        ring.armTick(1);
+        return;
+      }
+      if (!receipts && heldTicks == 0)
+      {
+        brain.persistLocalRuntimeStateAsync([&](bool result) {
+          ++receipts;
+          durable = result;
+          Ring::exit = true;
+        });
+        suite.expect(receipts == 0, "metric_capture_no_inline_durable_ack");
+        // An admitted snapshot must retain its exact samples through mutation,
+        // expiry and destruction of all current live series.
+        brain.metrics.record(7, 0xABC, 1, perSeries, -1);
+        brain.metrics.trimRetention(perSeries + 1, 0);
+        brain.metrics.clear();
+        brain.metrics.record(9, 0xDEF, 2, 1, -2);
+      }
+      if (++heldTicks == 30) release = true;
+      ring.armTick(5);
+    };
+    ring.armTick(1); ring.armDeadline(10'000);
+    Ring::start();
+    release = true;
+    suite.expect(!ring.timedOut && captures.size() == 30 && controls.size() >= 30 &&
+                     entered && workerThread && heldTicks >= 30 && receipts == 1 && durable && writer->drainForExec(),
+                 "metric_capture_background_commit_progress_and_exact_receipt");
+    suite.expect(allDeferred, "metric_capture_does_not_flatten_or_copy_history_on_ring");
+    suite.expect(allAdmissible, "metric_capture_accounts_retained_graph_and_worker_encoding");
+    auto sorted = captures;
+    std::sort(sorted.begin(), sorted.end());
+    const int64_t captureP95 = sorted.size() == 30 ? sorted[28] : INT64_MAX;
+    suite.expect(captureP95 < 10'000, "metric_capture_submission_p95_under_10ms");
+    auto controlSorted = controls;
+    std::sort(controlSorted.begin(), controlSorted.end());
+    const int64_t controlP95 = controlSorted.empty() ? INT64_MAX : controlSorted[(controlSorted.size() * 95 + 99) / 100 - 1];
+    suite.expect(controlP95 < 10'000, "metric_capture_control_p95_under_10ms");
+    std::printf("METRIC_CAPTURE samples=%llu captureP95Us=%lld controlP95Us=%lld captureUs=",
+                (unsigned long long)sampleCount, (long long)captureP95, (long long)controlP95);
+    for (auto us : captures) std::printf("%lld,", (long long)us);
+    std::printf(" controlUs=");
+    for (auto us : controls) std::printf("%lld,", (long long)us);
+    std::printf("\n");
+  }
+  writer.reset(); io->stop(); ring.drainStoppedIO(); io.reset();
+  (void)network.shutdown(); store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentBrainSnapshot decoded;
+  String failure;
+  bool correct = reopened.loadBrainSnapshot(decoded, &failure) &&
+      decoded.brainConfig.clusterUUID == 0xCA9701 && decoded.metricSamples.size() == sampleCount;
+  std::array<uint32_t, seriesCount> counts = {};
+  for (const auto& sample : decoded.metricSamples)
+  {
+    const bool valid = sample.deploymentID == 7 && sample.containerUUID == 0xABC &&
+        sample.metricKey >= 1 && sample.metricKey <= seriesCount && sample.ms >= 0 &&
+        sample.ms < perSeries && sample.value == float(sample.ms);
+    correct = correct && valid;
+    if (valid)
+    {
+      correct = correct && uint32_t(sample.ms) == counts[sample.metricKey - 1];
+      ++counts[sample.metricKey - 1];
+    }
+  }
+  for (auto count : counts) correct = correct && count == perSeries;
+  suite.expect(correct, "metric_capture_reopens_exact_generation_after_live_mutation");
+  reopened.close();
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+}
+
 int main(void)
 {
   TestSuite suite;
+  testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);
   testPersistentWriterDetachesViewBackedSchemaFields(suite);

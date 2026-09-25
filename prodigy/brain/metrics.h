@@ -3,8 +3,11 @@
 #include <networking/includes.h>
 #include <prodigy/types.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -298,9 +301,12 @@ inline double metricsPercentileSelect(Vector<float>& samples, double percentile)
 
 class MetricRing {
 private:
-
-  Vector<int64_t> timestamps;
-  Vector<float> values;
+  static constexpr uint32_t samplesPerBlock = 1024;
+  struct Block {
+    std::array<int64_t, samplesPerBlock> timestamps = {};
+    std::array<float, samplesPerBlock> values = {};
+  };
+  std::vector<std::shared_ptr<Block>> blocks;
   uint32_t slotsMask = 0;
   uint64_t headIndex = 0;
   uint64_t tailIndex = 0;
@@ -323,7 +329,7 @@ private:
     while (lo < hi)
     {
       const uint64_t mid = lo + ((hi - lo) >> 1);
-      if (timestamps[size_t(mid & slotsMask)] < cutoffMs)
+      if (timestampAt(mid) < cutoffMs)
       {
         lo = mid + 1;
       }
@@ -351,25 +357,76 @@ private:
       return;
     }
 
-    Vector<int64_t> newTs;
-    Vector<float> newValues;
-    newTs.resize(capacity());
-    newValues.resize(capacity());
+    // Removing a whole table period preserves every physical block and offset.
+    // No sample needs to move, including samples retained by a frozen view.
+    const uint64_t shift = headIndex & ~uint64_t(slotsMask);
+    headIndex -= shift;
+    tailIndex -= shift;
+  }
 
-    for (uint64_t i = 0; i < live; ++i)
-    {
-      const size_t oldSlot = size_t((headIndex + i) & slotsMask);
-      newTs[size_t(i)] = timestamps[oldSlot];
-      newValues[size_t(i)] = values[oldSlot];
-    }
+  size_t blockSlot(uint64_t index) const
+  {
+    return size_t((index >> 10) & ((capacity() / samplesPerBlock) - 1));
+  }
 
-    timestamps.swap(newTs);
-    values.swap(newValues);
-    headIndex = 0;
-    tailIndex = live;
+  int64_t timestampAt(uint64_t index) const
+  {
+    const auto& block = blocks[blockSlot(index)];
+    return block->timestamps[index & (samplesPerBlock - 1)];
+  }
+
+  float valueAt(uint64_t index) const
+  {
+    const auto& block = blocks[blockSlot(index)];
+    return block->values[index & (samplesPerBlock - 1)];
+  }
+
+  Block& writableBlock(uint64_t index)
+  {
+    auto& block = blocks[blockSlot(index)];
+    if (!block) block = std::make_shared<Block>();
+    else if (!block.unique()) block = std::make_shared<Block>(*block);
+    return *block;
   }
 
 public:
+
+  class Frozen {
+  private:
+    std::vector<std::shared_ptr<const Block>> blocks;
+    uint32_t slotsMask = 0;
+    uint64_t headIndex = 0;
+    uint64_t tailIndex = 0;
+    size_t retained = 0;
+
+    size_t blockSlot(uint64_t index) const
+    {
+      return size_t((index >> 10) & (((slotsMask + 1) / samplesPerBlock) - 1));
+    }
+
+  public:
+    Frozen(std::vector<std::shared_ptr<const Block>> requestedBlocks, uint32_t requestedMask,
+           uint64_t requestedHead, uint64_t requestedTail)
+        : blocks(std::move(requestedBlocks)), slotsMask(requestedMask), headIndex(requestedHead),
+          tailIndex(requestedTail)
+    {
+      retained = sizeof(Frozen) + 128 + blocks.capacity() * sizeof(std::shared_ptr<const Block>);
+      for (const auto& block : blocks) if (block) retained += sizeof(Block) + 64;
+    }
+
+    size_t sampleCount(void) const { return size_t(tailIndex - headIndex); }
+    size_t retainedBytes(void) const { return retained; }
+
+    template <typename Handler>
+    void forEachSample(Handler&& handler) const
+    {
+      for (uint64_t index = headIndex; index < tailIndex; ++index)
+      {
+        const auto& block = blocks[blockSlot(index)];
+        handler(block->timestamps[index & (samplesPerBlock - 1)], block->values[index & (samplesPerBlock - 1)]);
+      }
+    }
+  };
 
   MetricRing()
   {
@@ -378,7 +435,7 @@ public:
 
   uint32_t capacity(void) const
   {
-    return uint32_t(timestamps.size());
+    return uint32_t(blocks.size() * samplesPerBlock);
   }
 
   uint64_t size(void) const
@@ -399,24 +456,21 @@ public:
       return;
     }
 
-    Vector<int64_t> newTs;
-    Vector<float> newValues;
-    newTs.resize(targetCapacity);
-    newValues.resize(targetCapacity);
-
-    const uint64_t live = size();
-    for (uint64_t i = 0; i < live; ++i)
+    // Re-map logical chunks to the larger power-of-two table. A wrapped live
+    // range can refer to one old physical block from two new positions; both
+    // positions share it until a later append copy-on-writes that block.
+    const uint32_t oldBlockMask = uint32_t(blocks.size() - 1);
+    std::vector<std::shared_ptr<Block>> grown(targetCapacity / samplesPerBlock);
+    if (!empty())
     {
-      const size_t oldSlot = size_t((headIndex + i) & slotsMask);
-      newTs[size_t(i)] = timestamps[oldSlot];
-      newValues[size_t(i)] = values[oldSlot];
+      const uint64_t firstChunk = headIndex >> 10;
+      const uint64_t lastChunk = (tailIndex - 1) >> 10;
+      const uint32_t newBlockMask = uint32_t(grown.size() - 1);
+      for (uint64_t chunk = firstChunk; chunk <= lastChunk; ++chunk)
+        grown[size_t(chunk & newBlockMask)] = blocks[size_t(chunk & oldBlockMask)];
     }
-
-    timestamps.swap(newTs);
-    values.swap(newValues);
+    blocks.swap(grown);
     slotsMask = targetCapacity - 1;
-    headIndex = 0;
-    tailIndex = live;
   }
 
   void push(int64_t sampleMs, float sampleValue)
@@ -439,18 +493,15 @@ public:
       reserveCapacity(capacity() << 1);
     }
 
-    const size_t slot = size_t(tailIndex & slotsMask);
-    timestamps[slot] = sampleMs;
-    values[slot] = sampleValue;
+    Block& block = writableBlock(tailIndex);
+    block.timestamps[tailIndex & (samplesPerBlock - 1)] = sampleMs;
+    block.values[tailIndex & (samplesPerBlock - 1)] = sampleValue;
     ++tailIndex;
   }
 
   void trimOlderThan(int64_t cutoffMs)
   {
-    while (headIndex < tailIndex && timestamps[size_t(headIndex & slotsMask)] < cutoffMs)
-    {
-      ++headIndex;
-    }
+    headIndex = lowerBoundTimestamp(cutoffMs);
 
     if (headIndex == tailIndex)
     {
@@ -481,14 +532,13 @@ public:
     const uint64_t count = tailIndex - start;
     out.resize(size_t(count));
 
-    const uint32_t cap = capacity();
-    const uint32_t startSlot = uint32_t(start & slotsMask);
-    const size_t firstSpan = size_t(std::min<uint64_t>(count, uint64_t(cap - startSlot)));
-
-    metricsCopyFloat(values.data() + startSlot, out.data(), firstSpan);
-    if (firstSpan < size_t(count))
+    for (uint64_t copied = 0; copied < count;)
     {
-      metricsCopyFloat(values.data(), out.data() + firstSpan, size_t(count) - firstSpan);
+      const uint64_t index = start + copied;
+      const size_t offset = size_t(index & (samplesPerBlock - 1));
+      const size_t span = size_t(std::min<uint64_t>(count - copied, samplesPerBlock - offset));
+      metricsCopyFloat(blocks[blockSlot(index)]->values.data() + offset, out.data() + copied, span);
+      copied += span;
     }
   }
 
@@ -497,14 +547,62 @@ public:
   {
     for (uint64_t index = headIndex; index < tailIndex; ++index)
     {
-      const size_t slot = size_t(index & slotsMask);
-      handler(timestamps[slot], values[slot]);
+      handler(timestampAt(index), valueAt(index));
     }
+  }
+
+  std::shared_ptr<const Frozen> captureFrozen(void) const
+  {
+    std::vector<std::shared_ptr<const Block>> frozenBlocks;
+    frozenBlocks.reserve(blocks.size());
+    for (const auto& block : blocks) frozenBlocks.push_back(block);
+    return std::make_shared<const Frozen>(std::move(frozenBlocks), slotsMask, headIndex, tailIndex);
   }
 };
 
 class MetricsStore {
 public:
+
+  class Snapshot {
+  public:
+    class SeriesView {
+    public:
+      uint64_t deploymentID = 0;
+      uint128_t containerUUID = 0;
+      uint64_t metricKey = 0;
+      std::shared_ptr<const MetricRing::Frozen> ring;
+    };
+
+  private:
+    std::vector<SeriesView> views;
+    size_t samples = 0;
+    size_t retained = sizeof(Snapshot) + 128;
+
+    friend class MetricsStore;
+
+  public:
+    size_t sampleCount(void) const { return samples; }
+    size_t retainedBytes(void) const { return retained; }
+
+    void exportSamples(Vector<ProdigyMetricSample>& out) const
+    {
+      out.clear();
+      out.reserve(samples);
+      for (const SeriesView& view : views)
+      {
+        if (!view.ring) continue;
+        view.ring->forEachSample([&](int64_t sampleMs, float sampleValue) {
+          ProdigyMetricSample sample = {};
+          sample.ms = sampleMs;
+          sample.deploymentID = view.deploymentID;
+          sample.containerUUID = view.containerUUID;
+          sample.metricKey = view.metricKey;
+          sample.value = sampleValue;
+          out.push_back(sample);
+        });
+      }
+    }
+  };
 
   // deploymentID -> containerUUID -> metricKey -> SoA ring
   bytell_hash_map<uint64_t, bytell_hash_map<uint128_t, bytell_hash_map<uint64_t, MetricRing>>> series;
@@ -655,6 +753,26 @@ public:
         }
       }
     }
+  }
+
+  std::shared_ptr<const Snapshot> captureSnapshot(void) const
+  {
+    auto snapshot = std::make_shared<Snapshot>();
+    for (const auto& [deploymentID, byContainer] : series)
+    {
+      for (const auto& [containerUUID, byMetric] : byContainer)
+      {
+        for (const auto& [metricKey, ring] : byMetric)
+        {
+          auto frozen = ring.captureFrozen();
+          snapshot->samples += frozen->sampleCount();
+          snapshot->retained += frozen->retainedBytes();
+          snapshot->views.push_back({deploymentID, containerUUID, metricKey, std::move(frozen)});
+        }
+      }
+    }
+    snapshot->retained += snapshot->views.capacity() * sizeof(Snapshot::SeriesView);
+    return snapshot;
   }
 
   void importSamples(const Vector<ProdigyMetricSample>& samples)

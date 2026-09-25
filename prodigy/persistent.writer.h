@@ -73,6 +73,8 @@ public:
     template <typename T> void text2b(T& value, uint64_t) { own(value); }
     template <typename T> void text4b(T& value, uint64_t) { own(value); }
     template <typename T> void object(T& value) { visit(value); }
+    void frozenMetricSamples(Vector<ProdigyMetricSample>&,
+                             const std::shared_ptr<const MetricsStore::Snapshot>&) {}
     template <typename T> void detachPersistentValue(T& value) { visit(value); }
     template <typename Map> void detachPersistentMap(Map& values)
     {
@@ -179,6 +181,12 @@ public:
     template <typename T> void text2b(T& value, uint64_t) { visit(value); }
     template <typename T> void text4b(T& value, uint64_t) { visit(value); }
     template <typename T> void object(T& value) { add(sizeof(value)); visit(value); }
+    void frozenMetricSamples(Vector<ProdigyMetricSample>& samples,
+                             const std::shared_ptr<const MetricsStore::Snapshot>& capture)
+    {
+      if (capture) add(capture->retainedBytes());
+      else container(samples, UINT32_MAX);
+    }
     template <typename T> void detachPersistentValue(T& value)
     {
       if constexpr (std::is_same_v<std::remove_cvref_t<T>, String>) visit(value);
@@ -255,6 +263,36 @@ public:
         serialized > (maximumRetainedBytes - retained.retained() * 2) / 3) return 0;
     // Encoded payload, record envelope, and serialization growth may coexist.
     return retained.retained() * 2 + serialized * 3;
+  }
+
+  static uint64_t retainedBytesFor(ProdigyPersistentBrainSnapshot& value)
+  {
+    if (!value.metricCapture) return retainedBytesFor<ProdigyPersistentBrainSnapshot>(value);
+    // Measure the ordinary schema with its empty flat vector, then charge the
+    // immutable graph, worker-only flat vector and encoded sample bytes. No
+    // live sample is visited, copied or serialized for admission accounting.
+    struct RestoreCapture {
+      ProdigyPersistentBrainSnapshot& snapshot;
+      std::shared_ptr<const MetricsStore::Snapshot> capture;
+      ~RestoreCapture() { snapshot.metricCapture = std::move(capture); }
+    } restore {value, std::move(value.metricCapture)};
+    if (!value.metricSamples.empty()) return 0;
+    const uint64_t base = retainedBytesFor<ProdigyPersistentBrainSnapshot>(value);
+    const uint64_t count = restore.capture->sampleCount();
+    if (!base || count > UINT32_MAX) return 0;
+    using Context = std::tuple<PointerLinkingContext>;
+    Context context;
+    bitsery::Serializer<bitsery::BasicMeasureSize<FastConfig>, Context> measure {context};
+    ProdigyMetricSample sample = {};
+    measure.object(sample);
+    measure.adapter().flush();
+    // Five bytes conservatively cover the schema's variable count prefix.
+    const uint64_t perSample = sizeof(ProdigyMetricSample) + 3 * measure.adapter().writtenBytesCount();
+    const uint64_t captured = restore.capture->retainedBytes();
+    if (captured > maximumRetainedBytes / 2 || count > maximumRetainedBytes / perSample) return 0;
+    const uint64_t extra = captured * 2 + count * perSample + 15;
+    if (extra > maximumRetainedBytes || base > maximumRetainedBytes - extra) return 0;
+    return base + extra;
   }
 
 public:
