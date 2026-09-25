@@ -44,6 +44,7 @@
 #include <prodigy/system.container.policy.h>
 #include <prodigy/wire.h>
 #include <prodigy/child.process.signal.h>
+#include <prodigy/command.capture.h>
 
 #include <prodigy/neuron/container.storage.layout.h>
 #include <switchboard/overlay.route.h>
@@ -1992,6 +1993,11 @@ public:
       return false;
     }
 
+    return applyHostNetkitIPv4SourceValidationValues(failureReport);
+  }
+
+  bool applyHostNetkitIPv4SourceValidationValues(String *failureReport = nullptr)
+  {
     // L3 netkit host peers intentionally have no IPv4 address. A reply from a
     // container portal can use a host-local IPv4 source, so Linux must neither
     // reverse-path filter this peer nor reject that local source before the
@@ -2064,79 +2070,21 @@ public:
 
   bool waitForHostNetkitUdevInitialization(String *failureReport = nullptr);
 
-  bool restoreNetwork(String *failureReport = nullptr)
+  // Keep kernel-program adoption on its existing Ring owner. The asynchronous
+  // preparation below must complete all Netlink acknowledgments before this
+  // function can publish maps or make a restored container available.
+  bool finishNetworkRestore(String *failureReport)
   {
-    int hostnetnsfd = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY);
-
     String path;
-    path.snprintf<"/proc/{itoa}/ns/net"_ctv>(pid);
-    int peernetnsfd = Filesystem::openFileAt(-1, path, O_RDONLY);
-
-    netdevs.setNames(String {plan.fragment});
-    netdevs.peer.moveSocketToNamespace(peernetnsfd, hostnetnsfd);
-    if (bringContainerLoopbackUp(peernetnsfd, hostnetnsfd, plan.uuid, failureReport) == false)
-    {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
-      return false;
-    }
-    netdevs.getInfo();
-    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)
-    {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
-      return false;
-    }
-    if (applyHostMTUToNetkitPair(failureReport) == false)
-    {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
-      return false;
-    }
-
     // Container netkit routers are neuron runtime infrastructure, not per-image artifacts.
     struct container_network_policy networkPolicy = {};
     if (buildContainerNetworkPolicy(networkPolicy, failureReport) == false)
     {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
       return false;
     }
 
     if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, false, path, failureReport) == false)
     {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
       return false;
     }
     peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
@@ -2148,14 +2096,6 @@ public:
       peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
       if (syncSystemEgressAllowlist(failureReport) == false)
       {
-        if (peernetnsfd >= 0)
-        {
-          ::close(peernetnsfd);
-        }
-        if (hostnetnsfd >= 0)
-        {
-          ::close(hostnetnsfd);
-        }
         return false;
       }
       thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
@@ -2163,14 +2103,6 @@ public:
 
     if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, true, path, failureReport) == false)
     {
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
       return false;
     }
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
@@ -2186,14 +2118,6 @@ public:
       {
         failureReport->assign("container wormhole flow state unavailable"_ctv);
       }
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
-      }
       return false;
     }
 
@@ -2203,14 +2127,6 @@ public:
       if (failureReport)
       {
         failureReport->assign("declared network state unavailable"_ctv);
-      }
-      if (peernetnsfd >= 0)
-      {
-        ::close(peernetnsfd);
-      }
-      if (hostnetnsfd >= 0)
-      {
-        ::close(hostnetnsfd);
       }
       return false;
     }
@@ -2222,16 +2138,153 @@ public:
       thisNeuron->syncContainerSwitchboardRuntime(this);
     }
 
-    if (peernetnsfd >= 0)
+    return synced;
+  }
+
+  static void retireRestoreDescriptor(int& descriptor)
+  {
+    if (descriptor < 0) return;
+    // Outside the running event loop there is no completion owner to retire a
+    // close. Runtime recovery always uses Ring; shutdown still releases its FD.
+    if (Ring::getRingFD() <= 0 || Ring::shuttingDown)
     {
-      ::close(peernetnsfd);
+      ::close(std::exchange(descriptor, -1));
+      return;
     }
-    if (hostnetnsfd >= 0)
+    struct Closing final : SocketBase, RingMultiplexer
     {
-      ::close(hostnetnsfd);
+      explicit Closing(int value)
+      {
+        fd = value;
+        RingDispatcher::installMultiplexee(static_cast<SocketBase *>(this), this);
+        Ring::queueClose(this, true);
+      }
+      void closeHandler(void *) override
+      {
+        RingDispatcher::eraseMultiplexee(static_cast<SocketBase *>(this));
+        delete this;
+      }
+    };
+    (void)new Closing(std::exchange(descriptor, -1));
+  }
+
+  // An unpublished retained-process wrapper does not own the live application's
+  // lifetime. Its abandoned recovery must not remove that application's netkit
+  // pair. Pending Netlink streams detach their callbacks during destruction.
+  void abandonRetainedNetworkForNeuronReplacement()
+  {
+    netdevs.host.ifidx = 0;
+    netdevs.peer.ifidx = 0;
+    retireRestoreDescriptor(pidfd);
+    retireRestoreDescriptor(cgroup);
+  }
+
+  ProdigyHostTask<bool> restoreNetworkAsync(CoroutineStack *coro, String *failureReport = nullptr,
+      std::function<bool()> current = {})
+  {
+    if (coro == nullptr)
+    {
+      if (failureReport) failureReport->assign("network restore requires a coroutine owner"_ctv);
+      co_return false;
+    }
+    // Namespace descriptors outlive all socket creation; no coroutine suspends
+    // while the Ring thread is inside the container's namespace.
+    struct NamespaceDescriptors
+    {
+      int host = -1;
+      int peer = -1;
+      ~NamespaceDescriptors()
+      {
+        Container::retireRestoreDescriptor(peer);
+        Container::retireRestoreDescriptor(host);
+      }
+    } namespaces;
+    namespaces.host = Filesystem::openFileAt(-1, "/proc/self/ns/net"_ctv, O_RDONLY | O_CLOEXEC);
+    String path;
+    path.snprintf<"/proc/{itoa}/ns/net"_ctv>(pid);
+    namespaces.peer = Filesystem::openFileAt(-1, path, O_RDONLY | O_CLOEXEC);
+    if (namespaces.host < 0 || namespaces.peer < 0)
+    {
+      if (failureReport) failureReport->assign("failed to open retained container network namespace"_ctv);
+      co_return false;
     }
 
-    return synced;
+    netdevs.setNames(String {plan.fragment});
+    NetDevice loopback;
+    loopback.name.assign("lo"_ctv);
+    if (!netdevs.peer.moveSocketToNamespace(namespaces.peer, namespaces.host) ||
+        !loopback.moveSocketToNamespace(namespaces.peer, namespaces.host))
+    {
+      if (failureReport) failureReport->assign("failed to create retained network namespace sockets"_ctv);
+      co_return false;
+    }
+    auto isCurrent = [&]() { return !current || current(); };
+    if (!isCurrent()) co_return false;
+    auto joinIndependent = [](auto startFirst, auto startSecond) {
+      return ProdigyHostCompletion<int>([startFirst, startSecond](std::function<void(int)> done) mutable {
+        struct Join { unsigned remaining = 2; int error = 0; std::function<void(int)> done; };
+        auto join = std::make_shared<Join>();
+        join->done = std::move(done);
+        auto complete = [join](int result) {
+          if (result < 0 && join->error == 0) join->error = result;
+          if (--join->remaining == 0) join->done(join->error);
+        };
+        startFirst(complete);
+        startSecond(complete);
+      });
+    };
+
+    // Resolve independent interfaces together. Both completions settle before
+    // the coroutine can leave and destroy either response destination.
+    const int resolved = co_await joinIndependent(
+        [&](auto complete) { loopback.getInfoAsync(complete); },
+        [&](auto complete) { netdevs.getInfoAsync(complete); });
+    if (!isCurrent()) co_return false;
+    if (resolved < 0 || loopback.ifidx == 0 || netdevs.host.ifidx == 0 || netdevs.peer.ifidx == 0)
+    {
+      if (failureReport) failureReport->assign("failed to resolve retained container network interfaces"_ctv);
+      co_return false;
+    }
+
+    const uint32_t desiredMTU = desiredInterContainerMTU(failureReport);
+    if (desiredMTU == 0) co_return false;
+    // One peer-namespace batch applies loopback state and the peer packet
+    // budget; the independent host budget is submitted in the same Ring turn.
+    netdevs.peer.generateRequest([&](NetlinkMessage *request) {
+      netdevs.peer.socket.bringUpInterface(request, 0, loopback.ifidx);
+    });
+    netdevs.peer.generateRequest([&](NetlinkMessage *request) {
+      netdevs.peer.socket.setInterfacePacketBudget(request, 0, netdevs.peer.ifidx, desiredMTU, 1);
+    });
+    netdevs.host.generateRequest([&](NetlinkMessage *request) {
+      netdevs.host.socket.setInterfacePacketBudget(request, 0, netdevs.host.ifidx, desiredMTU, 1);
+    });
+    const int configured = co_await joinIndependent(
+        [&](auto complete) { netdevs.peer.flushAsync(complete); },
+        [&](auto complete) { netdevs.host.flushAsync(complete); });
+    if (!isCurrent()) co_return false;
+    if (configured < 0)
+    {
+      if (failureReport) failureReport->assign("kernel rejected retained container network configuration"_ctv);
+      co_return false;
+    }
+    netdevs.host.mtu = netdevs.peer.mtu = desiredMTU;
+
+    if (access("/run/udev/control", F_OK) == 0)
+    {
+      // Netkit names are generated from the numeric fragment, not shell input.
+      // The existing command owner bounds output/deadline, reaps with waitid,
+      // and cancels the child before retiring its Ring operations.
+      String command = "exec udevadm wait --initialized=yes --timeout=5 /sys/class/net/"_ctv;
+      command.append(netdevs.host.name);
+      String output;
+      if (co_await ProdigyCommandCapture::run(coro, command, output,
+          ProdigyCommandCapture::Clock::now() + std::chrono::seconds(6), failureReport) == false)
+        co_return false;
+    }
+    if (!isCurrent()) co_return false;
+    if (applyHostNetkitIPv4SourceValidationValues(failureReport) == false) co_return false;
+    co_return finishNetworkRestore(failureReport);
   }
 
   bool setupNetwork(String *failureReport = nullptr)

@@ -140,6 +140,45 @@ protected:
   // Receipt-driven operations may complete after their control stream was
   // replaced.  The callback must not touch a destroyed Neuron.
   std::shared_ptr<uint8_t> asyncOperationLifetime = std::make_shared<uint8_t>(0);
+  // A state upload can restore a live process before it has a Neuron control
+  // socket.  Keep that candidate and its coroutine together until the
+  // Netlink operation has reached a terminal callback; `containers` remains
+  // the published, connectable set only.
+  struct StateUploadRestoreOperation final {
+    CoroutineStack coro;
+    std::unique_ptr<Container> container;
+    local_container_subnet6 fragment = {};
+    NeuronBrainControlStream *stream = nullptr;
+    uint64_t streamGeneration = 0;
+    uint64_t epoch = 0;
+    NeuronBrainControlStream *requestedStream = nullptr;
+    uint64_t requestedGeneration = 0;
+    bool settled = false;
+    String planIdentity = {};
+    std::unique_ptr<CoroutineGenerator<uint8_t>> runner;
+
+    ~StateUploadRestoreOperation()
+    {
+      // Destroying the outer coroutine destroys the HostTask awaiter, which
+      // detaches its pending Netlink/command callback before this candidate
+      // is released.
+      coro.cancelSuspended();
+      runner.reset();
+      if (container != nullptr)
+      {
+        // This Neuron can be destroyed for bundle replacement while the
+        // adopted process and its netkit pair remain live. The Container
+        // handoff disarms link removal and retires only wrapper resources;
+        // the replacement Neuron discovers the retained process.
+        container->abandonRetainedNetworkForNeuronReplacement();
+      }
+    }
+  };
+  bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
+  constexpr static uint32_t maximumPendingStateUploadRestores = 64;
+  uint64_t stateUploadRestoreEpoch = 0;
+  uint32_t stateUploadRestoreRemaining = 0;
+  bool stateUploadRestoreReplyPending = false;
   std::shared_ptr<PendingReceivedBundleArtifact> pendingBundleArtifact;
   bool deferredBundleTransition = false;
   String installedBundleDigest = {};
@@ -928,12 +967,27 @@ protected:
     destroyRetiredBrainControlStream(stream);
   }
 
+  void fenceStateUploadRestoresForControl(NeuronBrainControlStream *stream)
+  {
+    // Pointer plus socket generation does not identify a newly allocated
+    // stream at a retired address. Revoke the old identity before deletion;
+    // only a newly admitted state upload can authorize another attempt.
+    for (auto& [uuid, operation] : pendingStateUploadRestores)
+    {
+      (void)uuid;
+      if (operation->stream == stream) operation->stream = nullptr;
+      if (operation->requestedStream == stream) operation->requestedStream = nullptr;
+    }
+  }
+
   void retireBrainControlStream(NeuronBrainControlStream *stream, const char *reason = nullptr)
   {
     if (stream == nullptr)
     {
       return;
     }
+
+    fenceStateUploadRestoresForControl(stream);
 
     if (pendingBundleArtifact != nullptr && pendingBundleArtifact->stream == stream)
     {
@@ -2817,6 +2871,10 @@ public:
   ~Neuron()
   {
     asyncOperationLifetime.reset();
+    // Cancel HostTask awaiters before their retained containers or this Ring
+    // owner can be destroyed. Late Netlink/command callbacks then observe a
+    // detached operation instead of this Neuron.
+    pendingStateUploadRestores.clear();
     artifactIO.reset();
     if (wormholeFlowGC)
     {
@@ -4328,6 +4386,263 @@ public:
     return "/containers/store"_ctv;
   }
 
+  // The production path is Container-owned; tests use this narrow Neuron
+  // boundary to hold and settle a recovery completion without netns/BPF I/O.
+  virtual ProdigyHostTask<bool> restoreStateUploadNetworkAsync(
+      Container *container,
+      CoroutineStack *coro,
+      String *failure,
+      std::function<bool()> current)
+  {
+    if (container == nullptr)
+    {
+      if (failure) failure->assign("state upload restore container missing"_ctv);
+      co_return false;
+    }
+    co_return co_await container->restoreNetworkAsync(coro, failure, std::move(current));
+  }
+
+protected:
+
+  void queueNeuronStateUpload(void)
+  {
+    if (brain == nullptr)
+    {
+      return;
+    }
+
+    String inventoryFailure;
+    if (!liveContainerInventoryComplete(inventoryFailure))
+    {
+      basics_log("neuron stateUpload withheld: %s\n", inventoryFailure.c_str());
+      return;
+    }
+
+    uint32_t headerOffset = Message::appendHeader(brain->wBuffer, NeuronTopic::stateUpload);
+    Message::appendAlignedBuffer<Alignment::one>(brain->wBuffer, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, container->plan);
+      Message::appendValue(brain->wBuffer, serializedPlan);
+    }
+    for (const auto& [uuid, plan] : pendingContainerLaunchPlans)
+    {
+      if (containers.contains(uuid)) continue;
+      String serializedPlan = {};
+      BitseryEngine::serialize(serializedPlan, plan);
+      Message::appendValue(brain->wBuffer, serializedPlan);
+    }
+    Message::finish(brain->wBuffer, headerOffset);
+    if (streamIsActive(brain)) Ring::queueSend(brain);
+  }
+
+  bool stateUploadRestoreCurrent(const StateUploadRestoreOperation& operation, uint128_t containerUUID) const
+  {
+    return operation.container != nullptr && operation.container->pendingDestroy == false &&
+           operation.epoch == stateUploadRestoreEpoch &&
+           memcmp(&operation.fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
+           brain == operation.stream && brain != nullptr &&
+           brain->ioGeneration == operation.streamGeneration && streamIsActive(brain) &&
+           containers.contains(containerUUID) == false;
+  }
+
+  bool finishStateUploadRestore(uint128_t containerUUID, uint64_t epoch, bool restored, String failure)
+  {
+    auto it = pendingStateUploadRestores.find(containerUUID);
+    if (it == pendingStateUploadRestores.end() || it->second == nullptr || it->second->epoch != epoch)
+    {
+      return false;
+    }
+
+    StateUploadRestoreOperation *operation = it->second.get();
+    Container *container = operation->container.get();
+    const bool current = stateUploadRestoreCurrent(*operation, containerUUID);
+    if (!current)
+    {
+      // Do not publish a candidate prepared for an obsolete fragment or
+      // control generation. Keep its retained process/network wrapper for a
+      // later authoritative state upload; destroying it would synchronously
+      // delete the adopted netkit pair.
+      // A same-fragment upload on a replacement control stream is newer
+      // intent. Re-run only after this attempt has settled, preserving the
+      // same owned candidate and never publishing on the obsolete stream.
+      if (container != nullptr && !container->pendingDestroy && !containers.contains(containerUUID) &&
+          operation->requestedStream == brain && brain != nullptr && streamIsActive(brain) &&
+          operation->requestedGeneration == brain->ioGeneration &&
+          (operation->stream != brain || operation->streamGeneration != brain->ioGeneration) &&
+          epoch == stateUploadRestoreEpoch &&
+          memcmp(&operation->fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0)
+      {
+        operation->stream = brain;
+        operation->streamGeneration = brain->ioGeneration;
+        operation->epoch = stateUploadRestoreEpoch;
+        return true;
+      }
+      if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
+      if (epoch == stateUploadRestoreEpoch) stateUploadRestoreReplyPending = false;
+      operation->settled = true;
+      return false;
+    }
+
+    if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
+    finishPendingContainerLaunch(containerUUID);
+    container = operation->container.release();
+
+    if (!restored)
+    {
+      basics_log("restoreContainer network restore failed uuid=%llu reason=%s\n",
+                 (unsigned long long)container->plan.uuid, failure.c_str());
+      if (container->plan.config.type == ApplicationType::task)
+      {
+        TaskTermination termination = {};
+        termination.kind = TaskTerminationKind::lost;
+        termination.observedAtMs = Time::now<TimeResolution::ms>();
+        termination.summary.assign("task network restore failed"_ctv);
+        (void)noteTaskAttemptTerminal(container->plan, termination);
+        ContainerManager::destroyContainer(container);
+      }
+      else
+      {
+        const uint128_t restoredUUID = container->plan.uuid;
+        const bool restarted = container->plan.restartOnFailure;
+        if (restarted) ContainerManager::restartContainer(container);
+        else ContainerManager::destroyContainer(container);
+        String empty = {};
+        reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
+      }
+    }
+    else
+    {
+      container->assignNeuronListenerPath();
+      if (container->neuronListenerPath.size() == 0)
+      {
+        String empty = {};
+        reportContainerFailed(container->plan.uuid, 0, 0, empty, false);
+        ContainerManager::destroyContainer(container);
+      }
+      else
+      {
+        container->setSocketPath(container->neuronListenerPath.c_str());
+        pushContainer(container);
+        noteTaskAttemptRunning(container->plan);
+        ContainerManager::queueContainerWaitid(container);
+        Ring::queueConnect(container);
+      }
+    }
+    operation->settled = true;
+
+    if (!stateUploadRestoresPending() && stateUploadRestoreReplyPending && epoch == stateUploadRestoreEpoch)
+    {
+      stateUploadRestoreReplyPending = false;
+      queueNeuronStateUpload();
+    }
+    return false;
+  }
+
+  CoroutineGenerator<uint8_t> restoreStateUploadContainer(std::weak_ptr<uint8_t> lifetime, uint128_t containerUUID, uint64_t epoch)
+  {
+    auto it = pendingStateUploadRestores.find(containerUUID);
+    if (it == pendingStateUploadRestores.end() || it->second == nullptr || it->second->epoch != epoch) co_return;
+    // The map can rehash while suspended. Its individually owned operation
+    // stays at a stable address until this runner is retired.
+    StateUploadRestoreOperation *operation = it->second.get();
+    for (;;)
+    {
+      String failure = {};
+      auto current = [this, lifetime, containerUUID, epoch]() -> bool {
+        if (lifetime.expired()) return false;
+        auto found = pendingStateUploadRestores.find(containerUUID);
+        return found != pendingStateUploadRestores.end() && found->second != nullptr &&
+               found->second->epoch == epoch && stateUploadRestoreCurrent(*found->second, containerUUID);
+      };
+      const bool restored = co_await restoreStateUploadNetworkAsync(
+          operation->container.get(), &operation->coro, &failure, std::move(current));
+      if (lifetime.expired()) co_return;
+      if (!finishStateUploadRestore(containerUUID, epoch, restored, std::move(failure))) break;
+      epoch = operation->epoch;
+    }
+    // The owning operation retains this frame until a later Ring turn retires
+    // it. A void fire-and-forget coroutine has no owner to cancel safely.
+    co_yield uint8_t(0);
+  }
+
+  void resumeStateUploadRestore(StateUploadRestoreOperation& operation, uint128_t containerUUID, uint64_t epoch)
+  {
+    operation.coro.cancelSuspended();
+    operation.runner.reset();
+    operation.fragment = lcsubnet6;
+    operation.stream = brain;
+    operation.streamGeneration = brain ? brain->ioGeneration : 0;
+    operation.requestedStream = operation.stream;
+    operation.requestedGeneration = operation.streamGeneration;
+    operation.epoch = epoch;
+    operation.settled = false;
+    stateUploadRestoreRemaining += 1;
+    operation.runner = std::make_unique<CoroutineGenerator<uint8_t>>(
+        restoreStateUploadContainer(asyncOperationLifetime, containerUUID, epoch));
+    (void)operation.runner->advance();
+  }
+
+  void retireCompletedStateUploadRestores(void)
+  {
+    Vector<uint128_t> completed = {};
+    for (const auto& [uuid, operation] : pendingStateUploadRestores)
+    {
+      if (operation != nullptr && operation->settled && operation->container == nullptr)
+      {
+        completed.push_back(uuid);
+      }
+    }
+    for (uint128_t uuid : completed) pendingStateUploadRestores.erase(uuid);
+  }
+
+  bool stateUploadRestoresPending(void) const { return stateUploadRestoreRemaining != 0; }
+
+  uint64_t currentStateUploadRestoreRound(void)
+  {
+    return stateUploadRestoresPending() ? stateUploadRestoreEpoch : ++stateUploadRestoreEpoch;
+  }
+
+  bool admitRepeatedStateUploadRestore(const ContainerPlan& plan,
+      const NeuronContainerMetricPolicy& metrics, uint64_t epoch)
+  {
+    auto found = pendingStateUploadRestores.find(plan.uuid);
+    if (found == pendingStateUploadRestores.end()) return true; // Existing launch owner.
+    StateUploadRestoreOperation& operation = *found->second;
+    String identity;
+    BitseryEngine::serialize(identity, plan);
+    if (!operation.container || identity != operation.planIdentity ||
+        memcmp(&operation.fragment, &lcsubnet6, sizeof(lcsubnet6)) != 0) return false;
+    operation.container->neuronScalingDimensionsMask = metrics.scalingDimensionsMask;
+    operation.container->neuronMetricsCadenceMs = metrics.metricsCadenceMs;
+    operation.requestedStream = brain;
+    operation.requestedGeneration = brain ? brain->ioGeneration : 0;
+    if (operation.settled) resumeStateUploadRestore(operation, plan.uuid, epoch);
+    return true;
+  }
+
+  bool beginStateUploadRestore(std::unique_ptr<Container> container, uint64_t epoch)
+  {
+    if (container == nullptr) return false;
+    if (pendingStateUploadRestores.size() >= maximumPendingStateUploadRestores ||
+        beginPendingContainerLaunch(container->plan) == false)
+    {
+      container->abandonRetainedNetworkForNeuronReplacement();
+      return false;
+    }
+    const uint128_t containerUUID = container->plan.uuid;
+    auto operation = std::make_unique<StateUploadRestoreOperation>();
+    operation->container = std::move(container);
+    BitseryEngine::serialize(operation->planIdentity, operation->container->plan);
+    pendingStateUploadRestores.insert_or_assign(containerUUID, std::move(operation));
+    resumeStateUploadRestore(*pendingStateUploadRestores.find(containerUUID)->second, containerUUID, epoch);
+    return true;
+  }
+
+public:
+
   void neuronHandler(Message *message)
   {
     uint8_t *args = message->args;
@@ -4342,57 +4657,6 @@ public:
       }
       return;
     }
-
-    auto queueNeuronStateUpload = [&]() -> void {
-      if (brain == nullptr)
-      {
-        return;
-      }
-
-      String inventoryFailure;
-      if (!liveContainerInventoryComplete(inventoryFailure))
-      {
-        basics_log("neuron stateUpload withheld: %s\n", inventoryFailure.c_str());
-        return;
-      }
-
-      basics_log("neuron queue stateUpload dpfx=%u mpfx=%u.%u.%u containers=%llu brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
-                 unsigned(lcsubnet6.dpfx),
-                 unsigned(lcsubnet6.mpfx[0]),
-                 unsigned(lcsubnet6.mpfx[1]),
-                 unsigned(lcsubnet6.mpfx[2]),
-                 (unsigned long long)containers.size(),
-                 int(brain != nullptr),
-                 int(streamIsActive(brain)),
-                 (brain ? brain->fd : -1),
-                 (brain ? brain->fslot : -1));
-
-      uint32_t headerOffset = Message::appendHeader(brain->wBuffer, NeuronTopic::stateUpload);
-      Message::appendAlignedBuffer<Alignment::one>(brain->wBuffer, (uint8_t *)&lcsubnet6, sizeof(struct local_container_subnet6));
-
-      for (const auto& [uuid, container] : containers)
-      {
-        (void)uuid;
-        String serializedPlan = {};
-        BitseryEngine::serialize(serializedPlan, container->plan);
-        Message::appendValue(brain->wBuffer, serializedPlan);
-      }
-
-      for (const auto& [uuid, plan] : pendingContainerLaunchPlans)
-      {
-        if (containers.contains(uuid)) continue;
-        String serializedPlan;
-        BitseryEngine::serialize(serializedPlan, plan);
-        Message::appendValue(brain->wBuffer, serializedPlan);
-      }
-
-      Message::finish(brain->wBuffer, headerOffset);
-
-      if (streamIsActive(brain))
-      {
-        Ring::queueSend(brain);
-      }
-    };
 
     switch (NeuronTopic(message->topic))
     {
@@ -4413,11 +4677,25 @@ public:
         }
       case NeuronTopic::stateUpload:
         {
+          retireCompletedStateUploadRestores();
           // fragment(4, 1) containerPlan{4}...
           struct local_container_subnet6 uploadedFragment = {};
           Message::extractBytes<Alignment::one>(args, (uint8_t *)&uploadedFragment, sizeof(struct local_container_subnet6));
           const bool hadFragments = haveFragments();
           const bool fragmentChanged = (memcmp(&lcsubnet6, &uploadedFragment, sizeof(uploadedFragment)) != 0);
+          if (stateUploadRestoreRemaining != 0 && fragmentChanged)
+          {
+            // A pending restore is bound to its assigned fragment. Let the
+            // normal reconnect path obtain a fresh authoritative upload
+            // rather than publishing either generation under the other.
+            if (brain)
+            {
+              brain->rBuffer.clear();
+              queueCloseIfActive(brain);
+            }
+            break;
+          }
+          const uint64_t restoreEpoch = currentStateUploadRestoreRound();
           lcsubnet6 = uploadedFragment;
           basics_log("neuron apply stateUpload dpfx=%u mpfx=%u.%u.%u brainPresent=%d brainActive=%d fd=%d fslot=%d\n",
                      unsigned(lcsubnet6.dpfx),
@@ -4444,7 +4722,7 @@ public:
           // Container re-adoption carries several large domain values. Keep
           // them in a separate non-inlined frame so the bounded control
           // dispatcher does not reserve that storage for every Neuron topic.
-          auto applyStateUploadPlans = [this, &args, terminal]() __attribute__((noinline)) -> bool {
+          auto applyStateUploadPlans = [this, &args, terminal, restoreEpoch]() __attribute__((noinline)) -> bool {
             bool malformedStateUpload = false;
             while (args < terminal) // it's possible that some of these containers died right?
             {
@@ -4472,6 +4750,11 @@ public:
 
             if (isPendingContainerLaunch(restoredPlan.uuid))
             {
+              if (!admitRepeatedStateUploadRestore(restoredPlan, metricPolicy, restoreEpoch))
+              {
+                malformedStateUpload = true;
+                break;
+              }
               // The same UUID is still owned by a suspended spin coroutine.
               // Re-adoption is idempotent: wait for that launch rather than
               // manufacturing an absent-launch failure.
@@ -4584,41 +4867,16 @@ public:
 
               if (container->plan.useHostNetworkNamespace == false)
               {
-                String restoreFailure;
-                if (container->restoreNetwork(&restoreFailure) == false)
+                std::unique_ptr<Container> candidate(container);
+                if (beginStateUploadRestore(std::move(candidate), restoreEpoch) == false)
                 {
-                  basics_log("restoreContainer network restore failed uuid=%llu reason=%s\n",
-                             (unsigned long long)container->plan.uuid,
-                             restoreFailure.c_str());
-
-                  if (container->plan.config.type == ApplicationType::task)
-                  {
-                    TaskTermination termination = {};
-                    termination.kind = TaskTerminationKind::lost;
-                    termination.observedAtMs = Time::now<TimeResolution::ms>();
-                    termination.summary.assign("task network restore failed"_ctv);
-                    (void)noteTaskAttemptTerminal(container->plan, termination);
-                    ContainerManager::destroyContainer(container);
-                  }
-                  else
-                  {
-                    bool restarted = false;
-                    uint128_t restoredUUID = container->plan.uuid;
-                    if (container->plan.restartOnFailure)
-                    {
-                      restarted = true;
-                      ContainerManager::restartContainer(container);
-                    }
-                    else
-                    {
-                      ContainerManager::destroyContainer(container);
-                    }
-
-                    String empty;
-                    reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
-                  }
-                  continue;
+                  // A duplicate UUID was filtered above. Reaching this path
+                  // therefore means the bounded restore queue could not own
+                  // the candidate, so reject this malformed/overfull round.
+                  malformedStateUpload = true;
+                  break;
                 }
+                continue;
               }
               else
               {
@@ -4688,7 +4946,12 @@ public:
           }
           else
           {
-            queueNeuronStateUpload();
+            stateUploadRestoreReplyPending = true;
+            if (!stateUploadRestoresPending())
+            {
+              stateUploadRestoreReplyPending = false;
+              queueNeuronStateUpload();
+            }
           }
 
           break;

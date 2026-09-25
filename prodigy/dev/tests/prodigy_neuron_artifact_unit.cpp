@@ -87,6 +87,37 @@ public:
   uint32_t artifactFinishes = 0;
   bool lastArtifactAdopted = false;
   bool lastArtifactSourceCurrent = false;
+  std::function<void(bool)> pendingRestoreCompletion = {};
+  uint32_t restoreSubmissions = 0;
+
+  ProdigyHostTask<bool> restoreStateUploadNetworkAsync(
+      Container *, CoroutineStack *, String *, std::function<bool()> current) override
+  {
+    co_return co_await ProdigyHostCompletion<bool>([this, current = std::move(current)](std::function<void(bool)> complete) mutable {
+      restoreSubmissions += 1;
+      pendingRestoreCompletion = [current = std::move(current), complete = std::move(complete)](bool value) mutable {
+        complete(current() && value);
+      };
+    });
+  }
+
+  bool beginStateUploadRestoreForTest(std::unique_ptr<Container> container, uint64_t epoch)
+  {
+    (void)epoch;
+    return beginStateUploadRestore(std::move(container), currentStateUploadRestoreRound());
+  }
+
+  bool admitRestoreReplayForTest(const ContainerPlan& plan)
+  {
+    return admitRepeatedStateUploadRestore(plan, {}, currentStateUploadRestoreRound());
+  }
+  bool restoreBarrierPendingForTest() const { return stateUploadRestoresPending(); }
+  void fenceCurrentRestoreControlForTest() { fenceStateUploadRestoresForControl(brain); }
+
+  bool pendingStateUploadRestoreForTest(uint128_t uuid) const
+  {
+    return isPendingContainerLaunch(uuid);
+  }
 
   String containerArtifactStoreRoot(void) const override { return root; }
   void receivedContainerArtifactFinished(uint64_t, bool adopted, bool sourceCurrent) override
@@ -325,6 +356,96 @@ int main()
 
   ScopedArtifactStore store = {};
   suite.expect(store.root.size() > 0, "neuron_artifact_private_store_created");
+
+  {
+    TestNeuron restoreNeuron = {};
+    auto first = std::make_unique<Container>();
+    first->plan.uuid = uint128_t(0xA5510001);
+    first->plan.fragment = 1;
+    suite.expect(restoreNeuron.beginStateUploadRestoreForTest(std::move(first), 7) &&
+                     restoreNeuron.restoreSubmissions == 1 &&
+                     restoreNeuron.pendingStateUploadRestoreForTest(uint128_t(0xA5510001)),
+                 "neuron_state_upload_restore_admission_retains_uuid_until_async_completion");
+
+    auto duplicate = std::make_unique<Container>();
+    duplicate->plan.uuid = uint128_t(0xA5510001);
+    duplicate->plan.fragment = 1;
+    suite.expect(restoreNeuron.beginStateUploadRestoreForTest(std::move(duplicate), 7) == false &&
+                     restoreNeuron.restoreSubmissions == 1,
+                 "neuron_state_upload_restore_duplicate_uuid_does_not_start_second_operation");
+
+    suite.expect(bool(restoreNeuron.pendingRestoreCompletion),
+                 "neuron_state_upload_restore_test_completion_is_held");
+    restoreNeuron.pendingRestoreCompletion(true);
+    suite.expect(restoreNeuron.pendingStateUploadRestoreForTest(uint128_t(0xA5510001)),
+                 "neuron_state_upload_restore_stale_completion_preserves_retained_candidate");
+  }
+  {
+    TestNeuron replacementNeuron = {};
+    replacementNeuron.replaceBrainWithoutClosing();
+    auto candidate = std::make_unique<Container>();
+    candidate->plan.uuid = uint128_t(0xA5510003);
+    candidate->plan.fragment = 1;
+    ContainerPlan replay = candidate->plan;
+    suite.expect(replacementNeuron.beginStateUploadRestoreForTest(std::move(candidate), 9),
+                 "neuron_state_upload_restore_replacement_admits_candidate");
+    replacementNeuron.replaceBrainWithoutClosing();
+    suite.expect(replacementNeuron.admitRestoreReplayForTest(replay),
+                 "neuron_state_upload_restore_replacement_admits_exact_authoritative_plan");
+    auto obsolete = std::exchange(replacementNeuron.pendingRestoreCompletion, {});
+    obsolete(true);
+    suite.expect(replacementNeuron.restoreSubmissions == 2 && bool(replacementNeuron.pendingRestoreCompletion) &&
+                     replacementNeuron.restoreBarrierPendingForTest(),
+                 "neuron_state_upload_restore_replacement_retries_without_releasing_reply_barrier");
+    // A second replacement without a new state-upload request cannot silently
+    // adopt the old request. It settles without publication or another retry.
+    replacementNeuron.replaceBrainWithoutClosing();
+    auto unrequested = std::exchange(replacementNeuron.pendingRestoreCompletion, {});
+    unrequested(true);
+    suite.expect(replacementNeuron.restoreSubmissions == 2 && !replacementNeuron.restoreBarrierPendingForTest() &&
+                     replacementNeuron.pendingStateUploadRestoreForTest(replay.uuid),
+                 "neuron_state_upload_restore_replacement_without_upload_cannot_authorize_retry");
+    ContainerPlan divergent = replay;
+    divergent.fragment += 1;
+    suite.expect(!replacementNeuron.admitRestoreReplayForTest(divergent) && replacementNeuron.restoreSubmissions == 2,
+                 "neuron_state_upload_restore_divergent_plan_cannot_resume_retained_candidate");
+    suite.expect(replacementNeuron.admitRestoreReplayForTest(replay) && replacementNeuron.restoreSubmissions == 3 &&
+                     replacementNeuron.restoreBarrierPendingForTest(),
+                 "neuron_state_upload_restore_settled_candidate_resumes_only_after_matching_upload");
+  }
+  {
+    TestNeuron retiredIdentity = {};
+    retiredIdentity.replaceBrainWithoutClosing();
+    auto candidate = std::make_unique<Container>();
+    candidate->plan.uuid = uint128_t(0xA5510004);
+    candidate->plan.fragment = 1;
+    suite.expect(retiredIdentity.beginStateUploadRestoreForTest(std::move(candidate), 10),
+                 "neuron_state_upload_restore_identity_fence_admits_candidate");
+    retiredIdentity.fenceCurrentRestoreControlForTest();
+    // Keep the exact pointer and numeric socket generation visible, as they
+    // could be after allocator reuse. The retirement fence must still win.
+    auto completion = std::exchange(retiredIdentity.pendingRestoreCompletion, {});
+    completion(true);
+    suite.expect(retiredIdentity.restoreSubmissions == 1 && !retiredIdentity.restoreBarrierPendingForTest() &&
+                     retiredIdentity.pendingStateUploadRestoreForTest(uint128_t(0xA5510004)),
+                 "neuron_state_upload_restore_retired_control_identity_cannot_authorize_completion");
+  }
+  {
+    std::function<void(bool)> lateCompletion = {};
+    {
+      TestNeuron shutdownNeuron = {};
+      auto candidate = std::make_unique<Container>();
+      candidate->plan.uuid = uint128_t(0xA5510002);
+      candidate->plan.fragment = 1;
+      suite.expect(shutdownNeuron.beginStateUploadRestoreForTest(std::move(candidate), 8),
+                   "neuron_state_upload_restore_shutdown_admits_owned_runner");
+      lateCompletion = shutdownNeuron.pendingRestoreCompletion;
+    }
+    // The destroyed runner has detached its HostCompletion. A terminal
+    // callback after Neuron destruction must be inert.
+    if (lateCompletion) lateCompletion(true);
+    suite.expect(bool(lateCompletion), "neuron_state_upload_restore_shutdown_late_completion_is_inert");
+  }
   if (store.root.size() == 0) return EXIT_FAILURE;
 
   ArtifactRing ring = {};
