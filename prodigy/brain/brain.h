@@ -6156,20 +6156,46 @@ public:
     return prodigyComputeSHA256Hex(serialized, digest);
   }
 
-  void queueMasterAuthorityRuntimeStateReplication(void)
+  void queueMasterAuthorityRuntimeStateReplication(bool onlyUnacknowledged = false)
   {
-    refreshMasterAuthorityRuntimeStateFromLiveFields();
+    if (!onlyUnacknowledged) refreshMasterAuthorityRuntimeStateFromLiveFields();
     if (weAreMaster == false || nBrains <= 1)
     {
       return;
     }
-    if ((masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
+    if ((onlyUnacknowledged || masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
          masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
         (masterAuthorityRuntimeStateDurable == false ||
          durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
     {
       return;
     }
+
+    auto retryNeeded = [this](BrainView *peer) {
+      if (!peerCanReceiveMasterAuthorityState(peer) ||
+          peer->wBuffer.outstandingBytes() != 0 || peer->queuedSendOutstandingBytes() != 0)
+        return false;
+      const auto it = masterAuthorityReplicationByPeer.find(peer);
+      if (it == masterAuthorityReplicationByPeer.end() || !it->second.matchesPeer(peer)) return true;
+      const auto& tracking = it->second;
+      // Canonical authority changes advance generation; accepted ACKs already
+      // passed the exact sent-digest check in the existing receipt owner.
+      if (tracking.acknowledgedGeneration != masterAuthorityRuntimeState.generation ||
+          tracking.acknowledgedTransitionDigest.size() != 64) return true;
+      const auto sent = tracking.sentTransitionDigestsByGeneration.find(masterAuthorityRuntimeState.generation);
+      return sent != tracking.sentTransitionDigestsByGeneration.end() &&
+             !sent->second.equals(tracking.acknowledgedTransitionDigest);
+    };
+    if (onlyUnacknowledged)
+    {
+      bool pending = false;
+      for (BrainView *peer : brains) pending |= retryNeeded(peer);
+      // Healthy heartbeats must not copy or hash the authority snapshot. A
+      // missed send/ACK is retried by this same owner once its stream drains.
+      if (!pending) return;
+    }
+    // Retry the captured durable revision. Live update progress may already
+    // have changed while its deferred persistence turn has not run yet.
 
     if (prodigyDebugDeployHeapEnabled())
     {
@@ -6209,11 +6235,24 @@ public:
     }
     for (BrainView *peer : brains)
     {
+      if (onlyUnacknowledged &&
+          (!retryNeeded(peer) || peerHasAcknowledgedCurrentMasterAuthority(peer, transitionDigest))) continue;
+      if (onlyUnacknowledged)
+      {
+        const uint64_t appendBytes = uint64_t(serialized.size()) + brainPeerReplicationFrameHeadroomBytes;
+        if (appendBytes > brainPeerReplicationBufferedBytesLimit ||
+            brainPeerBufferedBytes(peer) > brainPeerReplicationBufferedBytesLimit - appendBytes) continue;
+      }
       noteMasterAuthorityTransitionSentToPeer(peer,
                                               masterAuthorityRuntimeState,
                                               transitionDigest);
+      if (onlyUnacknowledged)
+      {
+        Message::construct(peer->wBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
+        Ring::queueSend(peer);
+      }
     }
-    queueBrainReplication(BrainTopic::replicateMasterAuthorityState, serialized);
+    if (!onlyUnacknowledged) queueBrainReplication(BrainTopic::replicateMasterAuthorityState, serialized);
   }
 
   void noteMasterAuthorityRuntimeStateChanged(bool replicate = true, bool persist = true)
@@ -14322,6 +14361,9 @@ public:
     }
     lastBrainPeerHeartbeatTickMs = nowMs;
     const bool localHeartbeatTickLagged = (tickLagMs >= int64_t(brainPeerHeartbeatTimeoutMs));
+    // Retry before appending heartbeats, so an already queued control frame
+    // suppresses duplicate authority work without starving it behind this tick.
+    queueMasterAuthorityRuntimeStateReplication(true);
     for (BrainView *peer : brains)
     {
       auto noteMasterPeerHeartbeatEligibility = [&](uint8_t state, const char *reason) -> void {

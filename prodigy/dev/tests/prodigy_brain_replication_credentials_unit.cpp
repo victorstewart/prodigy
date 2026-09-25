@@ -14378,6 +14378,324 @@ static void testOrdinaryUpgradeAuthorityAdmission(TestSuite& suite)
   thisNeuron = previousNeuron;
 }
 
+
+static void testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestNeuron masterSelf = {};
+  masterSelf.uuid = uint128_t(0x76'1001);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &masterSelf;
+
+  TestBrain master = {};
+  master.nBrains = 3;
+  master.weAreMaster = true;
+  master.noMasterYet = false;
+  master.brainConfig.clusterUUID = uint128_t(0x76'1002);
+  master.masterAuthorityRuntimeState.generation = 23;
+  master.masterAuthorityRuntimeStateDurable = true;
+  master.durableMasterAuthorityRuntimeStateGeneration = 23;
+
+  auto configureFollower = [&](BrainView& peer, uint128_t uuid, int fslot) {
+    peer.uuid = uuid;
+    peer.boottimens = int64_t(uuid);
+    peer.ioGeneration = uint64_t(uuid);
+    peer.transportEpoch = uint32_t(uuid);
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.fslot = fslot;
+    peer.registrationFresh = true;
+    peer.existingMasterUUID = masterSelf.uuid;
+    peer.isMasterBrain = false;
+    // Fixed test slots use the stream as an outbox; no real socket SQE may be
+    // submitted by Ring while this fixture inspects queued frames.
+    peer.pendingSend = true;
+    peer.pendingSendBytes = 0;
+  };
+  BrainView retryPeer = {};
+  BrainView healthyPeer = {};
+  configureFollower(retryPeer, uint128_t(0x76'1003), 76);
+  configureFollower(healthyPeer, uint128_t(0x76'1004), 77);
+  master.brains.insert(&retryPeer);
+  master.brains.insert(&healthyPeer);
+
+  String serialized = {};
+  String digest = {};
+  suite.require(master.serializeCurrentMasterAuthorityTransition(serialized, digest) && digest.size() == 64,
+                "authority_retry_current_transition_fixture");
+
+  struct AuthorityFrames {
+    uint32_t count = 0;
+    bool exactCurrent = true;
+    bool capturedRuntime = true;
+  };
+  auto authorityFrames = [&](BrainView& peer) {
+    AuthorityFrames result = {};
+    forEachMessageInBuffer(peer.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState) return;
+      result.count += 1;
+      uint8_t *args = message->args;
+      String payload = {};
+      Message::extractToStringView(args, payload);
+      ProdigyMasterAuthorityStateTransition transition = {};
+      result.exactCurrent = result.exactCurrent && BitseryEngine::deserializeSafe(payload, transition) &&
+          transition.runtimeState.generation == master.masterAuthorityRuntimeState.generation &&
+          transition.brainConfig.clusterUUID == master.brainConfig.clusterUUID;
+      result.capturedRuntime = result.capturedRuntime &&
+          transition.runtimeState.hasCompletedInitialMasterElection ==
+              master.masterAuthorityRuntimeState.hasCompletedInitialMasterElection;
+    });
+    return result;
+  };
+  auto drain = [](BrainView& peer) {
+    peer.clearQueuedSendBytes();
+    // Keep fixed fake slots in outbox mode.  Clearing them must not arm a
+    // real socket SQE, which would let TLS consume the inspected bytes.
+    peer.pendingSend = true;
+    peer.pendingSendBytes = 0;
+  };
+  auto noteCurrent = [&](BrainView& peer) {
+    master.noteMasterAuthorityTransitionSentToPeer(&peer, master.masterAuthorityRuntimeState, digest);
+  };
+  auto acknowledgement = [&](BrainView& peer, uint64_t generation = 23) {
+    ProdigyMasterAuthorityStateTransitionAck result = {};
+    result.generation = generation;
+    result.peerUUID = peer.uuid;
+    result.peerBootNs = peer.boottimens;
+    result.transitionDigest.assign(digest);
+    return result;
+  };
+  auto heartbeat = [&]() {
+    master.lastBrainPeerHeartbeatTickMs = 0;
+    master.runBrainPeerHeartbeatTick();
+  };
+
+  // Model the first transmission being lost after its tracking record was
+  // captured, then require the existing heartbeat owner to retry it.
+  noteCurrent(retryPeer);
+  Message::construct(retryPeer.wBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
+  suite.expect(authorityFrames(retryPeer).count == 1,
+               "authority_retry_initial_dropped_frame_fixture");
+  drain(retryPeer);
+  // This live field is intentionally newer than the marked-durable captured
+  // state. A retry must not refresh it before the next persistence receipt.
+  master.hasCompletedInitialMasterElection = true;
+  heartbeat();
+  AuthorityFrames firstRetry = authorityFrames(retryPeer);
+  suite.expect(firstRetry.count == 1 && firstRetry.exactCurrent && firstRetry.capturedRuntime &&
+                   master.masterAuthorityRuntimeState.hasCompletedInitialMasterElection == false,
+               "authority_retry_heartbeat_resends_captured_durable_transition_after_dropped_frame");
+
+  // A second lost acknowledgement gets one retry on the next eligible tick,
+  // rather than fanout duplicates in the same buffered stream.
+  drain(retryPeer);
+  drain(healthyPeer);
+  heartbeat();
+  AuthorityFrames repeatedRetry = authorityFrames(retryPeer);
+  suite.expect(repeatedRetry.count == 1 && repeatedRetry.exactCurrent,
+               "authority_retry_repeated_lost_ack_retries_once_per_drained_heartbeat");
+
+  // A stale acknowledgement cannot satisfy the barrier and therefore leaves a
+  // retry due. The exact acknowledgement stops retries for this peer.
+  master.acknowledgeMasterAuthorityTransition(&retryPeer, acknowledgement(retryPeer, 22));
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "authority_retry_stale_generation_ack_is_not_credited");
+  drain(retryPeer);
+  drain(healthyPeer);
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 1,
+               "authority_retry_stale_generation_ack_remains_retryable");
+  master.acknowledgeMasterAuthorityTransition(&retryPeer, acknowledgement(retryPeer));
+
+  noteCurrent(healthyPeer);
+  master.acknowledgeMasterAuthorityTransition(&healthyPeer, acknowledgement(healthyPeer));
+  drain(retryPeer);
+  drain(healthyPeer);
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 0 && authorityFrames(healthyPeer).count == 0,
+               "authority_retry_exact_acks_stop_healthy_peer_resends");
+
+  // Reintroduce one missing recipient while retaining one healthy peer: only
+  // the unacknowledged recipient is serialized and queued.
+  master.masterAuthorityReplicationByPeer.erase(&retryPeer);
+  noteCurrent(retryPeer);
+  drain(retryPeer);
+  drain(healthyPeer);
+  heartbeat();
+  AuthorityFrames missingOnly = authorityFrames(retryPeer);
+  suite.expect(missingOnly.count == 1 && missingOnly.exactCurrent && authorityFrames(healthyPeer).count == 0,
+               "authority_retry_does_not_fanout_duplicate_to_healthy_peer");
+
+  // Existing stream bytes are the backpressure fence. A heartbeat must not
+  // append a second authority frame or close an otherwise current peer.
+  drain(retryPeer);
+  drain(healthyPeer);
+  Message::construct(retryPeer.wBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
+  const uint32_t bufferedFrames = authorityFrames(retryPeer).count;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == bufferedFrames && Ring::socketIsClosing(&retryPeer) == false,
+               "authority_retry_respects_existing_stream_backpressure_without_close");
+  drain(retryPeer);
+  drain(healthyPeer);
+
+  // A local durable receipt is required. No undurable state is serialized,
+  // but returning to the same durable revision makes the missing peer retry.
+  master.masterAuthorityRuntimeStateDurable = false;
+  master.durableMasterAuthorityRuntimeStateGeneration = 22;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 0,
+               "authority_retry_never_resends_undurable_current_state");
+  // The undurable tick itself may have appended an ordinary heartbeat.
+  drain(retryPeer);
+  drain(healthyPeer);
+  master.masterAuthorityRuntimeStateDurable = true;
+  master.durableMasterAuthorityRuntimeStateGeneration = 23;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 1,
+               "authority_retry_resumes_only_after_local_durable_receipt");
+  drain(retryPeer);
+  drain(healthyPeer);
+
+  // Connection identity replacement invalidates the old acknowledgement. The
+  // current authenticated connection receives a fresh retry and must ACK it
+  // with its new boot identity before the barrier can pass.
+  const int64_t oldBoot = retryPeer.boottimens;
+  retryPeer.boottimens += 1;
+  retryPeer.ioGeneration += 1;
+  retryPeer.transportEpoch += 1;
+  retryPeer.fslot += 1;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 1 &&
+                   master.masterAuthorityReplicationByPeer[&retryPeer].matchesPeer(&retryPeer),
+               "authority_retry_replacement_connection_receives_fresh_current_transition");
+  ProdigyMasterAuthorityStateTransitionAck staleConnectionAck = acknowledgement(retryPeer);
+  staleConnectionAck.peerBootNs = oldBoot;
+  master.acknowledgeMasterAuthorityTransition(&retryPeer, staleConnectionAck);
+  suite.expect(master.masterAuthorityRuntimeStateAcknowledgedByRegisteredPeers() == false,
+               "authority_retry_replacement_rejects_old_connection_ack");
+  master.acknowledgeMasterAuthorityTransition(&retryPeer, acknowledgement(retryPeer));
+  drain(retryPeer);
+  drain(healthyPeer);
+
+  // Ineligible streams and master-role loss do not make authority traffic.
+  master.weAreMaster = false;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 0,
+               "authority_retry_master_role_loss_suppresses_resend");
+  drain(retryPeer);
+  drain(healthyPeer);
+  master.weAreMaster = true;
+  // A fresh tracking record models the current authenticated peer before it
+  // temporarily becomes unavailable; it has no durable acknowledgement yet.
+  master.masterAuthorityReplicationByPeer.erase(&retryPeer);
+  noteCurrent(retryPeer);
+  retryPeer.connected = false;
+  heartbeat();
+  suite.expect(authorityFrames(retryPeer).count == 0,
+               "authority_retry_disconnected_peer_suppresses_resend");
+  drain(retryPeer);
+  drain(healthyPeer);
+  retryPeer.connected = true;
+  reserveTransportStream(retryPeer);
+  ProdigyTransportTLSStream tlsClient = {};
+  reserveTransportStream(tlsClient);
+  if (configureSingleNodeTransportRuntime(suite, "authority_retry_tls", retryPeer.uuid) &&
+      suite.require(retryPeer.beginTransportTLS(true), "authority_retry_tls_begin_server") &&
+      suite.require(tlsClient.beginTransportTLS(false), "authority_retry_tls_begin_client"))
+  {
+    heartbeat();
+    suite.expect(authorityFrames(retryPeer).count == 0,
+                 "authority_retry_tls_unready_peer_suppresses_resend");
+    suite.require(completeTransportHandshake(tlsClient, retryPeer),
+                  "authority_retry_tls_complete_handshake");
+    // The focused transport fixture verifies the cryptographic handshake; the
+    // Brain registration path owns identity attribution in production.
+    retryPeer.tlsPeerVerified = true;
+    retryPeer.tlsPeerUUID = retryPeer.uuid;
+    // Handshake bytes are not authority backpressure.  Restore the fixed
+    // slot outbox before observing the first authenticated retry.
+    drain(retryPeer);
+    drain(healthyPeer);
+    heartbeat();
+    suite.expect(authorityFrames(retryPeer).count == 1,
+                 "authority_retry_authenticated_ready_peer_resumes_resend");
+  }
+
+  // Exercise the real receiver handler with the held TestBrain durability
+  // seam.  A lost acknowledgement causes a duplicate delivery, but each
+  // delivery remains fenced until its own persistence receipt.
+  TestBrain receiver = {};
+  receiver.asyncMasterAuthorityPersistence = true;
+  receiver.holdRuntimePersistence = true;
+  receiver.boottimens = 76'105;
+  BrainView receiverMaster = {};
+  authorizeMasterPeerForTest(receiver, receiverMaster, 78, masterSelf.uuid, 76'001);
+  receiverMaster.ioGeneration = 9;
+  receiverMaster.transportEpoch = 10;
+  receiverMaster.pendingSend = true;
+  receiver.brains.insert(&receiverMaster);
+  TestNeuron receiverSelf = {};
+  receiverSelf.uuid = uint128_t(0x76'1005);
+  thisNeuron = &receiverSelf;
+  auto receiverAcknowledgements = [&](ProdigyMasterAuthorityStateTransitionAck *last) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(receiverMaster.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) != BrainTopic::replicateMasterAuthorityState) return;
+      uint8_t *args = message->args;
+      String acknowledgementBytes = {};
+      Message::extractToStringView(args, acknowledgementBytes);
+      ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+      if (BitseryEngine::deserializeSafe(acknowledgementBytes, acknowledgement))
+      {
+        count += 1;
+        if (last) *last = std::move(acknowledgement);
+      }
+    });
+    return count;
+  };
+  String receiverMessage = {};
+  receiver.brainHandler(&receiverMaster,
+      buildBrainMessage(receiverMessage, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(receiver.pendingRuntimePersistence.size() == 1 &&
+                   receiverAcknowledgements(nullptr) == 0,
+               "authority_retry_receiver_first_delivery_has_no_early_ack");
+  receiver.finishRuntimePersistence(true);
+  ProdigyMasterAuthorityStateTransitionAck firstReceiverAck = {};
+  suite.expect(receiverAcknowledgements(&firstReceiverAck) == 1 &&
+                   firstReceiverAck.generation == 23 &&
+                   firstReceiverAck.peerUUID == receiverSelf.uuid &&
+                   firstReceiverAck.peerBootNs == receiver.boottimens &&
+                   firstReceiverAck.transitionDigest.equals(digest) &&
+                   receiver.masterAuthorityRuntimeState.generation == 23 &&
+                   receiver.brainConfig.clusterUUID == master.brainConfig.clusterUUID,
+               "authority_retry_receiver_first_durable_receipt_emits_exact_ack");
+  // Model the first ACK being lost before it reaches the sender.
+  drain(receiverMaster);
+  receiver.brainHandler(&receiverMaster,
+      buildBrainMessage(receiverMessage, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(receiver.pendingRuntimePersistence.size() == 1 &&
+                   receiverAcknowledgements(nullptr) == 0,
+               "authority_retry_receiver_replay_has_no_early_ack");
+  receiver.finishRuntimePersistence(true);
+  ProdigyMasterAuthorityStateTransitionAck replayReceiverAck = {};
+  suite.expect(receiverAcknowledgements(&replayReceiverAck) == 1 &&
+                   replayReceiverAck.generation == firstReceiverAck.generation &&
+                   replayReceiverAck.peerUUID == firstReceiverAck.peerUUID &&
+                   replayReceiverAck.peerBootNs == firstReceiverAck.peerBootNs &&
+                   replayReceiverAck.transitionDigest.equals(firstReceiverAck.transitionDigest) &&
+                   receiver.masterAuthorityRuntimeState.generation == 23 &&
+                   receiver.brainConfig.clusterUUID == master.brainConfig.clusterUUID,
+               "authority_retry_receiver_replay_durable_receipt_emits_one_matching_ack");
+  receiver.brains.erase(&receiverMaster);
+  thisNeuron = &masterSelf;
+
+  ProdigyTransportTLSRuntime::clear();
+
+  master.brains.erase(&retryPeer);
+  master.brains.erase(&healthyPeer);
+  thisNeuron = previousNeuron;
+}
+
 static void testElasticCombinedTransitionAndQuarantine(TestSuite& suite)
 {
   TestBrain brain;
@@ -27524,6 +27842,12 @@ int main(void)
     std::printf("RETAINED_HEALTH_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "authority-retry") == 0)
+  {
+    testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(suite);
+    std::printf("AUTHORITY_RETRY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "ordinary-upgrade-authority") == 0)
   {
     testOrdinaryUpgradeAuthorityAdmission(suite);
@@ -27926,6 +28250,7 @@ int main(void)
     testElasticSnapshotPersistenceRetriesSameGeneration(suite);
     testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
     testOrdinaryUpgradeAuthorityAdmission(suite);
+    testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(suite);
     testElasticCombinedTransitionAndQuarantine(suite);
     testElasticReplicationIdentityAndDivergenceGuards(suite);
     testElasticMutationHeadroomAndFenceReconciliation(suite);
