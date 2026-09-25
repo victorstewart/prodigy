@@ -191,9 +191,215 @@ static void assertRetainedRecoveryRuntimeCidDriftPreservesLocalPlan(
   }
 }
 
+static int retainedPrecheckpointFailures(void)
+{
+  using namespace MothershipRetainedRecovery;
+  int failed = 0;
+  auto expect = [&](bool value, const char *label) {
+    if (!value) { std::fprintf(stderr, "FAIL: %s\n", label); ++failed; }
+  };
+
+  ProdigyPersistentBrainSnapshot prior = {};
+  prior.brainConfig.clusterUUID = 0xA551;
+  prior.brainConfig.datacenterFragment = 7;
+  DeploymentPlan frozen = retainedRecoveryCidFixturePlan();
+  const uint64_t deploymentID = frozen.config.deploymentID();
+  DeploymentPlan local = frozen;
+  local.wormholes[0].quicCidKeyState.activeKeyIndex = 1;
+  local.wormholes[0].quicCidKeyState.rotatedAtMs += 3600 * 1000;
+  local.wormholes[0].quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x303);
+  local.wormholes[0].quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0x404);
+  prior.masterAuthority.deploymentPlans.insert_or_assign(deploymentID, local);
+  ApiCredential credential = {};
+  credential.name.assign("precheckpoint-credential"_ctv);
+  credential.metadata.insert_or_assign("scope"_ctv, "retained"_ctv);
+  ApplicationApiCredentialSet credentialSet = {};
+  credentialSet.applicationID = frozen.config.applicationID;
+  credentialSet.credentials.push_back(credential);
+  prior.masterAuthority.apiCredentialSetsByApp.insert_or_assign(credentialSet.applicationID, credentialSet);
+
+  Request request = {};
+  request.clusterUUID = prior.brainConfig.clusterUUID;
+  String priorBlob = "retained-precheckpoint-installed-bundle"_ctv;
+  String currentBlob = "retained-precheckpoint-successor-bundle"_ctv;
+  String previousDigest = {}, currentDigest = {};
+  expect(prodigyComputeSHA256Hex(priorBlob, previousDigest), "precheckpoint_prior_digest_constructs");
+  expect(prodigyComputeSHA256Hex(currentBlob, currentDigest), "precheckpoint_current_digest_constructs");
+  request.bundleSHA = currentDigest;
+  request.plans.insert_or_assign(deploymentID, frozen);
+  for (uint32_t index = 1; index <= 3; ++index)
+  {
+    ClusterMachine topologyMachine = {};
+    topologyMachine.uuid = index;
+    prior.topology.machines.push_back(topologyMachine);
+    MothershipRetainedRecoveryMachineInput machine = {};
+    machine.machineUUID = index;
+    machine.machineFragment = index;
+    ContainerParameters parameters = {};
+    parameters.uuid = 0xB000 + index;
+    parameters.deploymentID = deploymentID;
+    parameters.memoryMB = frozen.config.memoryMB;
+    parameters.storageMB = frozen.config.storageMB;
+    parameters.nLogicalCores = applicationSharedCPUCoreHint(frozen.config);
+    parameters.cpuMode = frozen.config.cpuMode;
+    parameters.requestedCPUMillis = applicationRequestedCPUMillis(frozen.config);
+    parameters.wormholes = frozen.wormholes;
+    parameters.private6.network.is6 = true;
+    parameters.private6.cidr = 128;
+    std::memcpy(parameters.private6.network.v6, container_network_subnet6.value, 11);
+    parameters.private6.network.v6[11] = 7;
+    parameters.private6.network.v6[14] = index;
+    parameters.private6.network.v6[15] = 1;
+    machine.parameters.push_back(std::move(parameters));
+    machine.observedCreatedAtMs.push_back(1790350000000LL + index);
+    request.machines.push_back(std::move(machine));
+  }
+
+  auto& update = prior.masterAuthority.runtimeState.updateSelf;
+  update.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+  update.expectedEchos = 2;
+  update.bundleBlob = priorBlob;
+  update.workerExpectedBundleSHA256 = previousDigest;
+  for (const auto& machine : prior.topology.machines)
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machine.uuid;
+    update.machineRecoveryWitnesses.push_back(std::move(witness));
+  }
+
+  // The predecessor is explicitly sealed and no echo, handoff, worker or
+  // local execution evidence exists.  This is the live retained-12 shape.
+  expect(mothershipRetainedRecoveryCanReplaceUpdate(prior, currentDigest, previousDigest),
+         "precheckpoint_prior_predicate_accepts_sealed_previous");
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(prior, currentDigest, {}),
+         "precheckpoint_prior_predicate_rejects_absent_previous");
+  auto currentCandidate = prior;
+  currentCandidate.masterAuthority.runtimeState.updateSelf.bundleBlob = currentBlob;
+  currentCandidate.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = currentDigest;
+  expect(mothershipRetainedRecoveryCanReplaceUpdate(currentCandidate, currentDigest, {}),
+         "precheckpoint_current_candidate_keeps_empty_previous_compatibility");
+  String wrongPrevious = text(std::string(64, 'd'));
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(prior, currentDigest, wrongPrevious),
+         "precheckpoint_prior_predicate_rejects_wrong_previous");
+  auto wrongPayload = prior;
+  wrongPayload.masterAuthority.runtimeState.updateSelf.bundleBlob.assign("other-precheckpoint-bundle"_ctv);
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(wrongPayload, currentDigest, previousDigest),
+         "precheckpoint_prior_predicate_rejects_wrong_blob");
+  auto wrongDigest = prior;
+  wrongDigest.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = currentDigest;
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(wrongDigest, currentDigest, previousDigest),
+         "precheckpoint_prior_predicate_rejects_prior_blob_successor_digest");
+  auto wrongPair = prior;
+  wrongPair.masterAuthority.runtimeState.updateSelf.bundleBlob = currentBlob;
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(wrongPair, currentDigest, previousDigest),
+         "precheckpoint_prior_predicate_rejects_successor_blob_prior_digest");
+
+  struct UnsafeMutation { const char *name; void (*apply)(ProdigyPersistentUpdateSelfState&); };
+  const UnsafeMutation unsafe[] = {
+    {"phase", [](auto& value) { value.state = uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots); }},
+    {"missing-expected-echo", [](auto& value) { value.expectedEchos = 0; }},
+    {"unknown-echo", [](auto& value) { value.bundleEchos = 1; value.bundleEchoPeerKeys.push_back(99); }},
+    {"topology-echo-count", [](auto& value) { value.expectedEchos = 3; }},
+    {"relinquish-echo", [](auto& value) { value.relinquishEchos = 1; }},
+    {"planned-master", [](auto& value) { value.plannedMasterPeerKey = 1; }},
+    {"designated-master", [](auto& value) { value.pendingDesignatedMasterPeerKey = 1; }},
+    {"staged-only", [](auto& value) { value.useStagedBundleOnly = true; }},
+    {"relinquish-key", [](auto& value) { value.relinquishEchoPeerKeys.push_back(1); }},
+    {"follower-boot", [](auto& value) { value.followerBootNsByPeerKey.push_back({.peerKey = 1, .bootNs = 1}); }},
+    {"follower-reboot", [](auto& value) { value.followerRebootedPeerKeys.push_back(1); }},
+    {"worker-failure", [](auto& value) { value.workerFailure.assign("failed"_ctv); }},
+    {"worker-machine", [](auto& value) { value.workerMachineUUIDs.push_back(1); }},
+    {"worker-staged", [](auto& value) { value.workerStagedMachineUUIDs.push_back(1); }},
+    {"worker-transition", [](auto& value) { value.workerTransitionIssuedMachineUUIDs.push_back(1); }},
+    {"worker-reboot", [](auto& value) { value.workerRebootedMachineUUIDs.push_back(1); }},
+    {"worker-state-upload", [](auto& value) { value.workerStateUploadedMachineUUIDs.push_back(1); }},
+    {"local-machine", [](auto& value) { value.localMachineUUID = 1; }},
+    {"local-bundle", [](auto& value) { value.localBundleRegistered = true; }},
+    {"local-bootstrap", [](auto& value) { value.localContainerBootstraps.push_back("bootstrap"_ctv); }},
+  };
+  for (const UnsafeMutation& mutation : unsafe)
+  {
+    auto unsafePrior = prior;
+    mutation.apply(unsafePrior.masterAuthority.runtimeState.updateSelf);
+    const std::string label = std::string("precheckpoint_prior_predicate_rejects-") + mutation.name;
+    expect(!mothershipRetainedRecoveryCanReplaceUpdate(unsafePrior, currentDigest, previousDigest), label.c_str());
+  }
+  static constexpr const char *witnessMutationNames[] = {"missing", "duplicate", "unknown", "registered"};
+  for (uint32_t mutation = 0; mutation < 4; ++mutation)
+  {
+    auto unsafePrior = prior;
+    auto& witnesses = unsafePrior.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+    if (mutation == 0) witnesses.clear();
+    if (mutation == 1) witnesses.push_back(witnesses[0]);
+    if (mutation == 2) witnesses[0].machineUUID = 0xDEAD;
+    if (mutation == 3) witnesses[0].bundleRegistered = true;
+    const std::string label = std::string("precheckpoint_prior_predicate_rejects-witness-") + witnessMutationNames[mutation];
+    expect(!mothershipRetainedRecoveryCanReplaceUpdate(unsafePrior, currentDigest, previousDigest), label.c_str());
+  }
+
+  String failure = {};
+  auto prepared = prior;
+  expect(mothershipPrepareRetainedRecoverySnapshot(
+      prepared, request.plans, request.machines, currentDigest, &failure, previousDigest),
+      "precheckpoint_prior_snapshot_preparation_accepts_sealed_previous");
+  expect(prepared.masterAuthority.runtimeState.generation ==
+         prior.masterAuthority.runtimeState.generation + 1 &&
+      mothershipRetainedRecoveryEnvelopeMatches(
+          prepared.masterAuthority.runtimeState.updateSelf, currentDigest),
+      "precheckpoint_prior_preparation_advances_generation_and_envelopes");
+  const auto preparedPlan = prepared.masterAuthority.deploymentPlans.find(deploymentID);
+  const auto preparedCredentials = prepared.masterAuthority.apiCredentialSetsByApp.find(credentialSet.applicationID);
+  const auto priorCredentials = prior.masterAuthority.apiCredentialSetsByApp.find(credentialSet.applicationID);
+  expect(preparedPlan != prepared.masterAuthority.deploymentPlans.end() &&
+      preparedPlan->second.wormholes[0].quicCidKeyState.activeKeyIndex == 1 &&
+      preparedCredentials != prepared.masterAuthority.apiCredentialSetsByApp.end() &&
+      priorCredentials != prior.masterAuthority.apiCredentialSetsByApp.end() &&
+      prodigyPersistentSerializedEqual(preparedCredentials->second, priorCredentials->second),
+      "precheckpoint_prior_preparation_preserves_local_cid_and_credentials");
+
+  const auto root = std::filesystem::current_path() / ".run" /
+      ("retained-precheckpoint-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const auto statePath = (root / "state.new10").string();
+  const auto requestPath = (root / "request").string();
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath));
+    expect(store.saveBrainSnapshot(prior, &failure), "precheckpoint_private_seed_persists");
+  }
+  std::filesystem::create_directories(statePath + ".secrets");
+  String encoded = {};
+  BitseryEngine::serialize(encoded, request);
+  MothershipTidesMigration::durable(requestPath, encoded);
+  WitnessSet sealed = {};
+  sealed.requestSHA = MothershipTidesMigration::text(MothershipTidesMigration::digest(requestPath));
+  sealed.witnesses = prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  BitseryEngine::serialize(encoded, sealed);
+  MothershipTidesMigration::durable(requestPath + ".witnesses", encoded);
+  expect(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure, previousDigest),
+         "precheckpoint_private_prepare_accepts_sealed_previous");
+  ProdigyPersistentBrainSnapshot readback = {};
+  loadSnapshot(statePath, readback);
+  expect(prodigyPersistentBrainSnapshotsEqual(readback, prepared),
+         "precheckpoint_private_prepare_exact_readback");
+  expect(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure, previousDigest),
+         "precheckpoint_private_prepare_idempotent_retry");
+  expect(prepareLocal(requestPath.c_str(), statePath.c_str(), true, &failure, previousDigest),
+         "precheckpoint_private_prepare_idempotent_verify");
+  std::filesystem::remove_all(root);
+  return failed;
+}
+
 int main()
 {
   const bool runtimeCidDriftAccepted = retainedRecoveryAllowsRuntimeCidDrift();
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "retained-precheckpoint") == 0)
+  {
+    const int failedAssertions = retainedPrecheckpointFailures();
+    std::printf("RETAINED_PRECHECKPOINT_RESULT failed_assertions=%d\n", failedAssertions);
+    return failedAssertions == 0 ? 0 : 1;
+  }
   // The focused runner records the old-handler rejection without an assert
   // abort.  A corrected handler must return zero failed assertions.
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
@@ -204,6 +410,7 @@ int main()
     return failedAssertions == 0 ? 0 : 1;
   }
   assert(runtimeCidDriftAccepted);
+  assert(retainedPrecheckpointFailures() == 0);
   // Recovery must reject malformed input before it opens or mutates a private
   // state copy.  This is the boundary used by the command owner before fence.
   ProdigyPersistentBrainSnapshot snapshot = {};

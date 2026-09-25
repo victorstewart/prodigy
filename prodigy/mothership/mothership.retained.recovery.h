@@ -52,9 +52,10 @@ static inline bool mothershipRetainedRecoveryEnvelopeMatches(
 }
 
 // A fenced fleet may have stopped while the normal updater was only collecting
-// bundle echoes. Accept that transaction only for this exact successor, before
-// any exec or handoff evidence. The command owner proves the stopped runtime
-// and retained process identities; this owner validates the saved transaction.
+// bundle echoes. Accept that transaction only for this exact successor or the
+// sealed installed predecessor, before any exec or handoff evidence. The command
+// owner proves the stopped runtime and retained process identities; this owner
+// validates the saved transaction and its bundle bytes.
 static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
     const ProdigyPersistentBrainSnapshot& snapshot, const String& expectedBundleSHA256,
     const String& previousBundleSHA256 = {})
@@ -77,13 +78,20 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   // Followers can still hold the previous recovery envelope when the master's
   // next update is contained. Only the sealed installed predecessor is allowed.
   const bool previousEnvelope = mothershipRetainedRecoveryEnvelopeMatches(update, previousBundleSHA256);
+  // A failed ordinary same-bundle update retains the installed predecessor's
+  // payload while waiting for echoes. Fenced repair can install a separately
+  // approved successor without pretending that payload has the new digest.
+  const bool normalBundleMatches = update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
+      (prodigyIsSHA256HexDigest(previousBundleSHA256) &&
+       update.workerExpectedBundleSHA256 == previousBundleSHA256 &&
+       !update.machineRecoveryWitnesses.empty());
   if (!previousEnvelope && (update.state != uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos) ||
       update.expectedEchos == 0 || update.expectedEchos >= snapshot.topology.machines.size() ||
       update.bundleEchos > update.expectedEchos || update.bundleEchoPeerKeys.size() != update.bundleEchos ||
       update.relinquishEchos != 0 || update.plannedMasterPeerKey != 0 || update.pendingDesignatedMasterPeerKey != 0 ||
       update.useStagedBundleOnly || update.bundleBlob.empty() ||
       !update.relinquishEchoPeerKeys.empty() || !update.followerBootNsByPeerKey.empty() || !update.followerRebootedPeerKeys.empty() ||
-      update.workerExpectedBundleSHA256 != expectedBundleSHA256 || !update.workerFailure.empty() ||
+      !normalBundleMatches || !update.workerFailure.empty() ||
       !update.workerMachineUUIDs.empty() || !update.workerStagedMachineUUIDs.empty() ||
       !update.workerTransitionIssuedMachineUUIDs.empty() || !update.workerRebootedMachineUUIDs.empty() ||
       !update.workerStateUploadedMachineUUIDs.empty() || update.localMachineUUID != 0 ||
@@ -108,7 +116,7 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   }
   if (previousEnvelope) return true;
   String digest;
-  return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == expectedBundleSHA256;
+  return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == update.workerExpectedBundleSHA256;
 }
 
 // `approvedPlans` is read from the sealed seed copy.  Existing plans are never
