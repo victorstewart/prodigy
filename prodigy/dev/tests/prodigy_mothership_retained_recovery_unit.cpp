@@ -1,5 +1,7 @@
 #include <cassert>
+#include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 #include <prodigy/mothership/mothership.retained.recovery.h>
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
@@ -73,8 +75,135 @@ static void assertRetainedBootstrapUnorderedMapRoundTrip(void)
   assert(!prodigyPersistentRetainedBootstrapEqual(bootstrap, roundTrip));
 }
 
+static DeploymentPlan retainedRecoveryCidFixturePlan(void)
+{
+  DeploymentPlan plan = {};
+  plan.config.type = ApplicationType::stateless;
+  plan.config.applicationID = 77;
+  plan.config.versionID = 9;
+  plan.config.memoryMB = 256;
+  plan.config.storageMB = 128;
+  plan.config.nLogicalCores = 1;
+  Wormhole wormhole = {};
+  wormhole.name = "retained-cid-runtime"_ctv;
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = 17;
+  wormhole.isQuic = true;
+  wormhole.hasQuicCidKeyState = true;
+  wormhole.quicCidKeyState.rotationHours = 24;
+  wormhole.quicCidKeyState.activeKeyIndex = 0;
+  wormhole.quicCidKeyState.rotatedAtMs = 1790040000000LL;
+  wormhole.quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x101);
+  wormhole.quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0x202);
+  plan.wormholes.push_back(std::move(wormhole));
+  return plan;
+}
+
+static bool retainedRecoveryAllowsRuntimeCidDrift(void)
+{
+  const DeploymentPlan frozen = retainedRecoveryCidFixturePlan();
+  auto local = frozen;
+  auto& cid = local.wormholes[0].quicCidKeyState;
+  cid.activeKeyIndex = 1;
+  cid.rotatedAtMs += 3600 * 1000;
+  cid.keyMaterialByIndex[0] = uint128_t(0x303);
+  cid.keyMaterialByIndex[1] = uint128_t(0x404);
+  return mothershipRetainedRecoveryPlansEqual(local, frozen);
+}
+
+static void assertRetainedRecoveryRuntimeCidDriftPreservesLocalPlan(
+    const ProdigyPersistentBrainSnapshot& base,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
+    const Vector<MothershipRetainedRecoveryMachineInput>& machines,
+    const String& bundleSHA256,
+    uint64_t deploymentID)
+{
+  auto approved = approvedPlans;
+  DeploymentPlan frozen = retainedRecoveryCidFixturePlan();
+  assert(frozen.config.deploymentID() == deploymentID);
+  approved.insert_or_assign(deploymentID, frozen);
+  auto retainedMachines = machines;
+  for (auto& machine : retainedMachines)
+    for (auto& parameters : machine.parameters)
+      parameters.wormholes = frozen.wormholes;
+
+  DeploymentPlan local = frozen;
+  auto& localCid = local.wormholes[0].quicCidKeyState;
+  localCid.activeKeyIndex = 1;
+  localCid.rotatedAtMs += 3600 * 1000;
+  localCid.keyMaterialByIndex[0] = uint128_t(0x303);
+  localCid.keyMaterialByIndex[1] = uint128_t(0x404);
+
+  auto recovered = base;
+  recovered.masterAuthority.deploymentPlans.insert_or_assign(deploymentID, local);
+  String failure = {};
+  assert(mothershipPrepareRetainedRecoverySnapshot(recovered, approved, retainedMachines, bundleSHA256, &failure));
+  const auto retained = recovered.masterAuthority.deploymentPlans.find(deploymentID);
+  assert(retained != recovered.masterAuthority.deploymentPlans.end());
+  assert(prodigyPersistentSerializedEqual(retained->second, local));
+  const auto& retainedCid = retained->second.wormholes[0].quicCidKeyState;
+  assert(retainedCid.activeKeyIndex == localCid.activeKeyIndex &&
+         retainedCid.rotatedAtMs == localCid.rotatedAtMs &&
+         retainedCid.keyMaterialByIndex[0] == localCid.keyMaterialByIndex[0] &&
+         retainedCid.keyMaterialByIndex[1] == localCid.keyMaterialByIndex[1]);
+
+  auto recoveredAgain = base;
+  recoveredAgain.masterAuthority.deploymentPlans.insert_or_assign(deploymentID, frozen);
+  assert(mothershipPrepareRetainedRecoverySnapshot(recoveredAgain, approved, retainedMachines, bundleSHA256, &failure));
+  assert(MothershipRetainedRecovery::witnessesEquivalent(
+      recovered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
+      recoveredAgain.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
+  for (const auto& witness : recovered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)
+  {
+    assert(!witness.containerBootstraps.empty());
+    for (const auto& bytes : witness.containerBootstraps)
+    {
+      NeuronContainerBootstrap bootstrap;
+      assert(BitseryEngine::deserializeSafe(bytes, bootstrap));
+      assert(prodigyPersistentSerializedEqual(bootstrap.plan.wormholes, frozen.wormholes));
+    }
+  }
+
+  MothershipRetainedRecovery::WitnessSet sealed = {};
+  sealed.witnesses = recovered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  String encoded = {};
+  BitseryEngine::serialize(encoded, sealed);
+  MothershipRetainedRecovery::WitnessSet decoded = {};
+  assert(BitseryEngine::deserializeSafe(encoded, decoded));
+  assert(MothershipRetainedRecovery::witnessesEquivalent(sealed.witnesses, decoded.witnesses));
+
+  struct DeclarationMutation {
+    void (*apply)(DeploymentPlan&);
+  };
+  const DeclarationMutation mutations[] = {
+    {[](DeploymentPlan& plan) { ++plan.wormholes[0].quicCidKeyState.rotationHours; }},
+    {[](DeploymentPlan& plan) { ++plan.wormholes[0].externalPort; }},
+    {[](DeploymentPlan& plan) { plan.config.containerBlobSHA256.assign(std::string(64, 'a').c_str()); }},
+    {[](DeploymentPlan& plan) { ++plan.config.memoryMB; }},
+  };
+  for (const DeclarationMutation& mutation : mutations)
+  {
+    auto incompatible = base;
+    incompatible.masterAuthority.deploymentPlans.insert_or_assign(deploymentID, local);
+    mutation.apply(incompatible.masterAuthority.deploymentPlans.find(deploymentID)->second);
+    assert(!mothershipPrepareRetainedRecoverySnapshot(incompatible, approved, retainedMachines, bundleSHA256, &failure));
+  }
+}
+
 int main()
 {
+  const bool runtimeCidDriftAccepted = retainedRecoveryAllowsRuntimeCidDrift();
+  // The focused runner records the old-handler rejection without an assert
+  // abort.  A corrected handler must return zero failed assertions.
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "retained-cid") == 0)
+  {
+    const int failedAssertions = runtimeCidDriftAccepted ? 0 : 1;
+    std::printf("RETAINED_CID_RESULT failed_assertions=%d\n", failedAssertions);
+    return failedAssertions == 0 ? 0 : 1;
+  }
+  assert(runtimeCidDriftAccepted);
   // Recovery must reject malformed input before it opens or mutates a private
   // state copy.  This is the boundary used by the command owner before fence.
   ProdigyPersistentBrainSnapshot snapshot = {};
@@ -258,6 +387,9 @@ int main()
   }
   ApplicationApiCredentialSet credentials = {};credentials.applicationID=77;credentials.credentials.push_back(credential);
   snapshot.masterAuthority.apiCredentialSetsByApp[77]=credentials;
+
+  assertRetainedRecoveryRuntimeCidDriftPreservesLocalPlan(
+      snapshot, request.plans, request.machines, request.bundleSHA, deploymentID);
 
   // A normal update that stopped while merely collecting bundle echoes may be
   // replaced.  Both a complete and lagging echo set are pre-exec states.

@@ -21,6 +21,21 @@ static inline bool mothershipRetainedRecoveryPlansEqual(const DeploymentPlan& lh
 {
   String left = {}, right = {};
   DeploymentPlan leftCopy = lhs, rightCopy = rhs;
+  // CID rotation is replicated runtime state, so stopped peers can retain
+  // different key generations for the same declared deployment. Compare only
+  // copies: recovery must preserve each peer's keys until normal replication
+  // resumes. Rotation policy and every other declared field remain exact.
+  auto clearCidRuntime = [](DeploymentPlan& plan) {
+    for (Wormhole& wormhole : plan.wormholes)
+    {
+      const uint32_t rotationHours = wormhole.quicCidKeyState.rotationHours;
+      wormhole.hasQuicCidKeyState = false;
+      wormhole.quicCidKeyState = {};
+      wormhole.quicCidKeyState.rotationHours = rotationHours;
+    }
+  };
+  clearCidRuntime(leftCopy);
+  clearCidRuntime(rightCopy);
   BitseryEngine::serialize(left, leftCopy);
   BitseryEngine::serialize(right, rightCopy);
   return left == right;
@@ -98,7 +113,8 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
 
 // `approvedPlans` is read from the sealed seed copy.  Existing plans are never
 // overwritten; a missing plan is admitted only if its supplied deployment ID
-// and exact serialized plan agree with every recovered bootstrap.
+// and declared plan agree with every recovered bootstrap. Existing CID runtime
+// state remains local; it is never replaced with the seed's key generation.
 static inline bool mothershipPrepareRetainedRecoverySnapshot(
     ProdigyPersistentBrainSnapshot& snapshot,
     const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
