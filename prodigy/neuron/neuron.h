@@ -2459,9 +2459,9 @@ protected:
     }
     syncSwitchboardBalancerOverlayRoutingProgram();
 
-    // Wormhole refresh must also converge the target container's live peer
-    // runtime immediately, not just the broader switchboard state, so the
-    // first reply packets after a live refresh cannot miss the egress binding.
+    // Include the live peer and primary programs in the same reconciliation
+    // barrier as the broader Switchboard state. The refresh receipt is held
+    // until their egress bindings and the current routing generation converge.
     syncContainerSwitchboardRuntime(container);
   }
 

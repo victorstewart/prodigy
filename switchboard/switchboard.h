@@ -5,6 +5,9 @@
 #include <cstring>
 #include <services/debug.h>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <bpf/bpf.h>
@@ -68,7 +71,6 @@ public:
   // QUIC CID keys are Switchboard routing metadata only. They are unrelated to
   // TLS resumption ticket keys and must not be used for TLS ticket encryption.
   uint128_t quicCidKeyMaterialByIndex[2] = {};
-  std::array<uint32_t, RING_SIZE> hashRing;
   uint32_t slot;
 
   uint64_t hash(void) const
@@ -94,10 +96,6 @@ public:
     return portalDef;
   }
 
-  SwitchboardPortal()
-  {
-    hashRing.fill(-1);
-  }
 };
 
 using Portal = SwitchboardPortal;
@@ -470,7 +468,6 @@ public:
 
 #include <switchboard/maglevhashv2.h>
 #include <switchboard/maglev.ring.prepare.h>
-#include <unordered_map>
 
 class Switchboard {
   friend class SwitchboardRingTestAccess;
@@ -551,6 +548,38 @@ private:
   bool quicCidProgramSweepComplete = false;
   bytell_hash_set<uint32_t> quicCidSweepActiveMapIDs = {};
 
+  // Non-QUIC routing uses the same Ring wake and receipt barrier. Each hash
+  // map is adopted once by kernel identity, then only changed entries are
+  // written. No program or portal pointer survives a continuation.
+  // Withdraw changed/stale definitions before a slot is reassigned. Targets
+  // and complete inner rings must precede the new definitions, including
+  // across Ring turns; otherwise an old portal could select a different one.
+  enum class RuntimeMap : uint8_t { retiredPortals, targets, egress, egress4, rings, portals, count };
+  using RuntimeEntries = std::unordered_map<std::string, std::string>;
+  struct RuntimeMapState {
+    RuntimeEntries published;
+    std::string scanKey;
+    std::vector<std::string> dirty;
+    size_t cursor = 0;
+    uint64_t generation = 0;
+    bool removingPortals = false;
+    bool scanned = false;
+    bool failed = false;
+  };
+  std::unordered_map<uint32_t, RuntimeMapState> runtimeMaps;
+  std::array<RuntimeEntries, size_t(RuntimeMap::count)> runtimeDesired;
+  uint64_t runtimeGeneration = 1;
+  size_t runtimeProgramCursor = 0;
+  size_t runtimeMapCursor = 0;
+  std::vector<std::pair<uintptr_t, bool>> runtimeProgramIdentities;
+  std::unordered_set<uint32_t> runtimeActiveMapIDs;
+  bool runtimeRoutingDirty = false;
+  bool runtimeDesiredPending = false;
+  bool runtimeRoutingFailed = false;
+
+  template<class T> static std::string routingBytes(const T& value)
+  { return std::string(reinterpret_cast<const char *>(&value), sizeof(value)); }
+
   struct QuicCidReconcileWakeLifetime {
     uint32_t pending = 0;
   };
@@ -597,24 +626,20 @@ private:
     return true;
   }
 
-  bool publishPreparedRing(BPFProgram *program, SwitchboardPortal *portal,
-                           const SwitchboardMaglevRingPrepareResult& prepared)
-  {
-    if (program == nullptr || !prepared.prepared()) return false;
-    bool ok = false;
-    program->openMap("cid_rings"_ctv, [&](int mapFD) {
-      if (mapFD >= 0 && bpf_map_update_elem(mapFD, &portal->slot, &prepared.innerMapFD, BPF_ANY) == 0)
-        ok = true;
-      else
-        basics_log("Switchboard outer ring publication failed ifidx=%u slot=%u errno=%d\n",
-                   eth.ifidx, unsigned(portal->slot), errno);
-    });
-    return ok;
-  }
-
   void settleRingWaiters()
   {
     if (ringPreparationInFlight) return;
+    if (runtimeRoutingDirty || runtimeRoutingFailed)
+    {
+      if (runtimeRoutingFailed)
+      {
+        wormholeRevisionByContainer.clear();
+        auto failed = std::move(ringWaiters);
+        ringWaiters.clear();
+        for (auto& [id, completion] : failed) { (void)id; completion(false); }
+      }
+      return;
+    }
     if (quicCidReconciliationReady() == false)
     {
       if (quicCidReconciliationFailed())
@@ -663,6 +688,7 @@ private:
         if (!state.prepared || state.prepared->generation != state.generation) state.failed = true;
       }
       basics_log("Switchboard ring preparation failed ifidx=%u\n", eth.ifidx);
+      requestRuntimeRoutingReconciliation();
       settleRingWaiters();
     };
     if (!ringPreparation) { failed(); return; }
@@ -687,16 +713,12 @@ private:
               }
               auto prepared = std::make_shared<SwitchboardMaglevRingPrepareResult>(std::move(result));
               state.prepared = prepared;
-              bool ok = syncPortalDefinitionForProgram(bpf_router, portal);
-              if (host_ingress) ok = syncPortalDefinitionForProgram(host_ingress, portal) && ok;
-              forEachActivePeerProgram([&](BPFProgram *program) {
-                ok = syncPortalDefinitionForProgram(program, portal) && ok;
-              });
-              state.failed = !ok;
-              if (ok) portal->hashRing = prepared->ring;
               break;
             }
           }
+          // A failure must wake the routing barrier too: QUIC may already
+          // have completed while the worker was still preparing this batch.
+          requestRuntimeRoutingReconciliation();
           preparePendingRings();
         },
         [lifetime, failed](std::exception_ptr) { if (!lifetime.expired()) failed(); })) failed();
@@ -1001,37 +1023,6 @@ private:
     }
   }
 
-  template <typename Key>
-  static void clearHashMapFD(int mapFD, const char *mapName)
-  {
-    if (mapFD < 0)
-    {
-      basics_log("Switchboard clearHashMapFD missing map=%s\n", (mapName ? mapName : "hash"));
-      return;
-    }
-
-    Key nextKey = {};
-    int nextResult = 0;
-    errno = 0;
-    while ((nextResult = bpf_map_get_next_key(mapFD, nullptr, &nextKey)) == 0)
-    {
-      Key deleteKey = nextKey;
-      if (bpf_map_delete_elem(mapFD, &deleteKey) != 0)
-      {
-        basics_log("Switchboard clearHashMapFD delete failed map=%s errno=%d\n",
-                   (mapName ? mapName : "hash"),
-                   errno);
-        break;
-      }
-    }
-    if (nextResult != 0 && errno != ENOENT)
-    {
-      basics_log("Switchboard clearHashMapFD get_next failed map=%s errno=%d\n",
-                 (mapName ? mapName : "hash"),
-                 errno);
-    }
-  }
-
   bool refreshQuicCidDesired(void)
   {
     bytell_hash_map<uint32_t, quic_cid_aes_decrypt_state> desired = {};
@@ -1244,6 +1235,7 @@ private:
     }
     quicCidProgramSweepCount = programs.size();
     uint32_t remaining = quicCidReconcileOperationsPerTurn;
+    continueRuntimeRoutingReconciliation(remaining);
     while (quicCidProgramSweepCursor < programs.size() && remaining > 0)
     {
       if (reconcileQuicCidProgram(programs[quicCidProgramSweepCursor], remaining,
@@ -1264,7 +1256,8 @@ private:
       quicCidProgramSweepComplete = true;
     }
     quicCidReconciliationDirty = quicCidProgramStatesConverged() == false;
-    if (quicCidReconciliationReady() == false && quicCidReconciliationFailed() == false)
+    if ((runtimeRoutingDirty && !runtimeRoutingFailed && !runtimeRoutingWaitingForPreparation()) ||
+        (quicCidReconciliationReady() == false && quicCidReconciliationFailed() == false))
     {
       if (quicCidReconcileWake == nullptr)
       {
@@ -1302,6 +1295,247 @@ private:
     quicCidReconcileWake = new QuicCidReconcileWake(this, quicCidReconcileWakeLifetime);
     quicCidReconcileWake->packet.setTimeoutUs(1);
     Ring::queueTimeout(&quicCidReconcileWake->packet);
+  }
+
+  void requestRuntimeRoutingReconciliation()
+  {
+    if (resettingRings || ringPreparationQuiescing) return;
+    if (runtimeRoutingFailed)
+    {
+      for (auto& [id, state] : runtimeMaps)
+      { (void)id; if (state.failed) state = {}; }
+      runtimeRoutingFailed = false;
+    }
+    runtimeRoutingDirty = runtimeDesiredPending = true;
+    runtimeProgramCursor = runtimeMapCursor = 0;
+    runtimeActiveMapIDs.clear();
+    requestQuicCidReconciliation();
+  }
+
+  void refreshRuntimeRoutingDesired()
+  {
+    std::array<RuntimeEntries, size_t(RuntimeMap::count)> desired;
+    for (auto *portal : portals)
+    {
+      const auto ring = portalRings.find(portal);
+      if (ring == portalRings.end() || ring->second.failed || !ring->second.prepared ||
+          ring->second.prepared->generation != ring->second.generation) continue;
+      // The generation disambiguates an inner FD recycled after an older
+      // prepared ring is released. Only the FD prefix is passed to BPF.
+      std::string ringValue = routingBytes(ring->second.prepared->innerMapFD);
+      ringValue += routingBytes(ring->second.generation);
+      desired[size_t(RuntimeMap::rings)].emplace(routingBytes(portal->slot), std::move(ringValue));
+      portal_meta meta = {};
+      meta.flags = portal->isQuic ? F_QUIC_PORTAL : 0;
+      meta.slot = portal->slot;
+      desired[size_t(RuntimeMap::portals)].emplace(routingBytes(portal->generatePortalDefinition()), routingBytes(meta));
+    }
+    for (const auto& [containerID, wormholes] : wormholesByContainer)
+    {
+      (void)containerID;
+      for (const auto *wormhole : wormholes)
+      {
+        if (!wormhole || !wormhole->portal) continue;
+        switchboard_wormhole_target_key key = {};
+        if (!buildWormholeTargetKey(wormhole->portal, wormhole->containerID, key))
+        { runtimeRoutingFailed = true; return; }
+        const __u16 port = htons(wormhole->port);
+        desired[size_t(RuntimeMap::targets)].insert_or_assign(routingBytes(key), routingBytes(port));
+      }
+    }
+    Vector<SwitchboardWormholeEgressBindingEntry> egress = {};
+    Vector<SwitchboardWormholeEgress4BindingEntry> egress4 = {};
+    collectWormholeEgressBindingEntries(egress, egress4);
+    for (const auto& entry : egress)
+      desired[size_t(RuntimeMap::egress)].insert_or_assign(routingBytes(entry.key), routingBytes(entry.binding));
+    for (const auto& entry : egress4)
+      desired[size_t(RuntimeMap::egress4)].insert_or_assign(routingBytes(entry.key), routingBytes(entry.binding));
+    if (desired != runtimeDesired)
+    {
+      runtimeDesired = std::move(desired);
+      ++runtimeGeneration;
+    }
+  }
+
+  struct RuntimeProgram { BPFProgram *program; bool full; };
+
+  void collectActiveRuntimePrograms(std::vector<RuntimeProgram>& programs) const
+  {
+    auto add = [&programs](BPFProgram *program, bool full) {
+      if (!program) return;
+      for (auto& entry : programs)
+        if (entry.program == program) { entry.full |= full; return; }
+      programs.push_back({program, full});
+    };
+    add(bpf_router, true);
+    add(host_ingress, true);
+    add(host_egress, false);
+    if (!thisNeuron) return;
+    for (const auto& [id, container] : thisNeuron->containers)
+    {
+      (void)id;
+      if (!container || container->plan.useHostNetworkNamespace || !container->netdevs.areActive()) continue;
+      add(container->peer_program, true);
+      add(container->primary_program, false);
+    }
+  }
+
+  bool reconcileRuntimeMap(BPFProgram *program, RuntimeMap kind, uint32_t& remaining)
+  {
+    const bool rings = kind == RuntimeMap::rings;
+    const bool retiringPortals = kind == RuntimeMap::retiredPortals;
+    const size_t keySize = kind == RuntimeMap::targets ? sizeof(switchboard_wormhole_target_key) :
+        kind == RuntimeMap::egress ? sizeof(switchboard_wormhole_egress_key) :
+        kind == RuntimeMap::egress4 ? sizeof(switchboard_wormhole_egress4_key) :
+        rings ? sizeof(uint32_t) : sizeof(portal_definition);
+    const size_t valueSize = kind == RuntimeMap::targets ? sizeof(__u16) :
+        kind == RuntimeMap::egress || kind == RuntimeMap::egress4 ? sizeof(switchboard_wormhole_egress_binding) :
+        rings ? sizeof(uint32_t) : sizeof(portal_meta);
+    bool complete = false;
+    auto reconcile = [&](int fd) {
+      if (!remaining) return;
+      bpf_map_info info = {};
+      __u32 length = sizeof(info);
+      --remaining;
+      if (fd < 0 || bpf_map_get_info_by_fd(fd, &info, &length) != 0 || !info.id ||
+          info.key_size != keySize || info.value_size != valueSize ||
+          info.type != (rings ? BPF_MAP_TYPE_ARRAY_OF_MAPS : BPF_MAP_TYPE_HASH))
+      {
+        basics_log("Switchboard routing map identity/schema failed ifidx=%u kind=%u fd=%d errno=%d\n",
+                   eth.ifidx, unsigned(kind), fd, errno);
+        runtimeRoutingFailed = true;
+        return;
+      }
+      auto& state = runtimeMaps[info.id];
+      const auto& desired = runtimeDesired[size_t(retiringPortals ? RuntimeMap::portals : kind)];
+      auto fail = [&]() {
+        basics_log("Switchboard routing reconciliation failed ifidx=%u kind=%u map=%u errno=%d\n",
+                   eth.ifidx, unsigned(kind), info.id, errno);
+        state.failed = runtimeRoutingFailed = true;
+      };
+      if (state.failed) { runtimeRoutingFailed = true; return; }
+      // Old unreachable inner slots are inert without ext_portals. Publish
+      // every desired slot on adoption; never enumerate 1,024 empty slots.
+      if (rings) state.scanned = true;
+      while (!state.scanned && remaining >= 2)
+      {
+        std::string next(keySize, '\0');
+        --remaining;
+        if (bpf_map_get_next_key(fd, state.scanKey.empty() ? nullptr : state.scanKey.data(), next.data()) != 0)
+        {
+          if (errno != ENOENT) { fail(); return; }
+          state.scanned = true;
+          break;
+        }
+        std::string value(valueSize, '\0');
+        --remaining;
+        if (bpf_map_lookup_elem(fd, next.data(), value.data()) != 0)
+        { fail(); return; }
+        if (state.published.contains(next) || state.published.size() >= info.max_entries)
+        { errno = ELOOP; fail(); return; }
+        state.published.emplace(next, std::move(value));
+        state.scanKey = std::move(next);
+      }
+      if (!state.scanned) return;
+      if (state.generation != runtimeGeneration || state.removingPortals != retiringPortals)
+      {
+        state.dirty.clear();
+        if (!retiringPortals)
+          for (const auto& [key, value] : desired)
+          {
+            const auto observed = state.published.find(key);
+            if (observed == state.published.end() || observed->second != value) state.dirty.push_back(key);
+          }
+        for (const auto& [key, value] : state.published)
+        {
+          const auto expected = desired.find(key);
+          if (expected == desired.end() || (retiringPortals && expected->second != value)) state.dirty.push_back(key);
+        }
+        state.cursor = 0;
+        state.generation = runtimeGeneration;
+        state.removingPortals = retiringPortals;
+      }
+      while (remaining && state.cursor < state.dirty.size())
+      {
+        const auto& key = state.dirty[state.cursor];
+        const auto expected = desired.find(key);
+        --remaining;
+        if (retiringPortals || expected == desired.end())
+        {
+          if (bpf_map_delete_elem(fd, key.data()) != 0 && errno != ENOENT) { fail(); return; }
+          state.published.erase(key);
+        }
+        else
+        {
+          if (bpf_map_update_elem(fd, key.data(), expected->second.data(), BPF_ANY) != 0) { fail(); return; }
+          state.published.insert_or_assign(key, expected->second);
+        }
+        ++state.cursor;
+      }
+      complete = state.cursor == state.dirty.size();
+      if (complete) runtimeActiveMapIDs.insert(info.id);
+    };
+    switch (kind)
+    {
+      case RuntimeMap::retiredPortals: program->openMap("ext_portals"_ctv, reconcile); break;
+      case RuntimeMap::targets: program->openMap("wh_targets"_ctv, reconcile); break;
+      case RuntimeMap::egress: program->openMap("wh_egress"_ctv, reconcile); break;
+      case RuntimeMap::egress4: program->openMap("wh_egress4"_ctv, reconcile); break;
+      case RuntimeMap::rings: program->openMap("cid_rings"_ctv, reconcile); break;
+      case RuntimeMap::portals: program->openMap("ext_portals"_ctv, reconcile); break;
+      default: break;
+    }
+    return complete;
+  }
+
+  bool runtimeRoutingWaitingForPreparation() const
+  {
+    if (ringPreparationInFlight) return true;
+    for (const auto& [portal, state] : portalRings)
+    {
+      (void)portal;
+      if (!state.failed && (!state.prepared || state.prepared->generation != state.generation)) return true;
+    }
+    return false;
+  }
+
+  void continueRuntimeRoutingReconciliation(uint32_t& remaining)
+  {
+    if (!runtimeRoutingDirty || runtimeRoutingFailed) return;
+    if (runtimeDesiredPending)
+    {
+      // Prepared results schedule this owner; retain the previous applied
+      // view while a replacement inner map is being built privately.
+      if (runtimeRoutingWaitingForPreparation()) return;
+      runtimeDesiredPending = false;
+      refreshRuntimeRoutingDesired();
+      if (runtimeRoutingFailed) return;
+    }
+    std::vector<RuntimeProgram> programs;
+    collectActiveRuntimePrograms(programs);
+    std::vector<std::pair<uintptr_t, bool>> identities;
+    for (const auto& entry : programs)
+      identities.emplace_back(reinterpret_cast<uintptr_t>(entry.program), entry.full);
+    if (identities != runtimeProgramIdentities)
+    {
+      runtimeProgramIdentities = std::move(identities);
+      runtimeProgramCursor = runtimeMapCursor = 0;
+      runtimeActiveMapIDs.clear();
+    }
+    while (runtimeProgramCursor < programs.size() && remaining)
+    {
+      const auto& entry = programs[runtimeProgramCursor];
+      const auto kind = RuntimeMap(runtimeMapCursor);
+      if (entry.full || kind == RuntimeMap::egress || kind == RuntimeMap::egress4)
+        if (!reconcileRuntimeMap(entry.program, kind, remaining)) return;
+      if (++runtimeMapCursor == size_t(RuntimeMap::count))
+      { runtimeMapCursor = 0; ++runtimeProgramCursor; }
+    }
+    if (runtimeProgramCursor != programs.size()) return;
+    for (auto it = runtimeMaps.begin(); it != runtimeMaps.end();)
+      if (!runtimeActiveMapIDs.contains(it->first)) it = runtimeMaps.erase(it);
+      else ++it;
+    runtimeRoutingDirty = false;
   }
 
   template <typename Callback>
@@ -1452,229 +1686,20 @@ private:
     }
   }
 
-  BPFProgram *findLocalContainerPeerEgressProgram(uint32_t containerKey) const
+  bool validateWormholeTargetBinding(const SwitchboardPortal *portal,
+                                      const switchboard_runtime::Wormhole *wormhole,
+                                      const Wormhole& requestedWormhole) const
   {
-    if (thisNeuron == nullptr)
-    {
-      return nullptr;
-    }
-
-    uint8_t fragment = static_cast<uint8_t>((containerKey >> 24) & 0xFF);
-    BPFProgram *fallbackProgram = nullptr;
-
-    for (const auto& [uuid, container] : thisNeuron->containers)
-    {
-      (void)uuid;
-
-      if (container == nullptr || container->plan.fragment != fragment)
-      {
-        continue;
-      }
-
-      if (container->plan.useHostNetworkNamespace)
-      {
-        fallbackProgram = host_egress;
-        continue;
-      }
-
-      if (container->netdevs.areActive() && container->peer_program != nullptr)
-      {
-        return container->peer_program;
-      }
-    }
-
-    return fallbackProgram;
-  }
-
-  bool installWormholeEgressBindingForProgram(BPFProgram *program,
-                                              const switchboard_wormhole_egress_key& egressKey,
-                                              const switchboard_wormhole_egress_binding& binding,
-                                              uint32_t containerID,
-                                              uint16_t port,
-                                              uint8_t proto,
-                                              const char *scope) const
-  {
-    if (program == nullptr)
-    {
-      return false;
-    }
-
-    bool updated = false;
-    program->openMap("wh_egress"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing %s wh_egress map ifidx=%u\n",
-                   (scope ? scope : "egress"),
-                   eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_update_elem(map_fd, &egressKey, &binding, BPF_ANY) != 0)
-      {
-        basics_log("Switchboard %s wh_egress update failed ifidx=%u errno=%d containerID=%u port=%u proto=%u\n",
-                   (scope ? scope : "egress"),
-                   eth.ifidx,
-                   errno,
-                   containerID,
-                   unsigned(port),
-                   unsigned(proto));
-        return;
-      }
-
-      updated = true;
-    });
-
-    return updated;
-  }
-
-  void removeWormholeEgressBindingForProgram(BPFProgram *program,
-                                             const switchboard_wormhole_egress_key& egressKey) const
-  {
-    if (program == nullptr)
-    {
-      return;
-    }
-
-    program->openMap("wh_egress"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing wh_egress map for delete ifidx=%u\n", eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_delete_elem(map_fd, &egressKey) != 0)
-      {
-        basics_log("Switchboard wh_egress delete failed ifidx=%u errno=%d port=%u proto=%u\n",
-                   eth.ifidx,
-                   errno,
-                   unsigned(ntohs(egressKey.port)),
-                   unsigned(egressKey.proto));
-      }
-    });
-  }
-
-  bool installWormholeTargetBinding(const SwitchboardPortal *portal, const switchboard_runtime::Wormhole *wormhole, const Wormhole& requestedWormhole)
-  {
-    if (bpf_router == nullptr || portal == nullptr || wormhole == nullptr)
-    {
-      return false;
-    }
-
+    if (!bpf_router || !host_egress || !portal || !wormhole) return false;
     switchboard_wormhole_target_key targetKey = {};
     switchboard_wormhole_egress_key egressKey = {};
-    if (buildWormholeTargetKey(portal, wormhole->containerID, targetKey) == false)
-    {
-      return false;
-    }
-
-    const __u16 containerPort = htons(wormhole->port);
     switchboard_wormhole_egress_binding binding = {};
-    if (switchboardBuildWormholeEgressBinding(wormholeSwitchboardAddress(requestedWormhole),
-                                              requestedWormhole.externalPort,
-                                              requestedWormhole.layer4,
-                                              wormhole->ownerGeneration,
-                                              binding) == false)
-    {
-      return false;
-    }
-
-    bool targetUpdated = false;
-    bpf_router->openMap("wh_targets"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing wh_targets map ifidx=%u\n", eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_update_elem(map_fd, &targetKey, &containerPort, BPF_ANY) != 0)
-      {
-        basics_log("Switchboard wh_targets update failed ifidx=%u errno=%d slot=%u containerID=%u\n",
-                   eth.ifidx,
-                   errno,
-                   unsigned(portal->slot),
-                   wormhole->containerID);
-        return;
-      }
-
-      targetUpdated = true;
-    });
-    if (targetUpdated == false)
-    {
-      return false;
-    }
-
-    if (buildWormholeEgressKey(wormhole->containerID, wormhole->port, requestedWormhole.layer4, egressKey) == false)
-    {
-      return false;
-    }
-
-    if (installWormholeEgressBindingForProgram(host_egress,
-                                               egressKey,
-                                               binding,
-                                               wormhole->containerID,
-                                               wormhole->port,
-                                               requestedWormhole.layer4,
-                                               "host-egress") == false)
-    {
-      return false;
-    }
-
-    BPFProgram *peerProgram = findLocalContainerPeerEgressProgram(wormhole->containerID);
-    if (peerProgram != nullptr && peerProgram != host_egress)
-    {
-      return installWormholeEgressBindingForProgram(peerProgram,
-                                                    egressKey,
-                                                    binding,
-                                                    wormhole->containerID,
-                                                    wormhole->port,
-                                                    requestedWormhole.layer4,
-                                                    "container-egress");
-    }
-
-    return true;
-  }
-
-  void removeWormholeTargetBinding(const switchboard_runtime::Wormhole *wormhole)
-  {
-    if (bpf_router == nullptr || wormhole == nullptr || wormhole->portal == nullptr)
-    {
-      return;
-    }
-
-    switchboard_wormhole_target_key targetKey = {};
-    switchboard_wormhole_egress_key egressKey = {};
-    if (buildWormholeTargetKey(wormhole->portal, wormhole->containerID, targetKey) == false)
-    {
-      return;
-    }
-
-    bpf_router->openMap("wh_targets"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing wh_targets map for delete ifidx=%u\n", eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_delete_elem(map_fd, &targetKey) != 0)
-      {
-        basics_log("Switchboard wh_targets delete failed ifidx=%u errno=%d slot=%u containerID=%u\n",
-                   eth.ifidx,
-                   errno,
-                   unsigned(targetKey.slot),
-                   wormhole->containerID);
-      }
-    });
-
-    if (buildWormholeEgressKey(wormhole->containerID, wormhole->port, wormhole->proto, egressKey))
-    {
-      removeWormholeEgressBindingForProgram(host_egress, egressKey);
-
-      BPFProgram *peerProgram = findLocalContainerPeerEgressProgram(wormhole->containerID);
-      if (peerProgram != nullptr && peerProgram != host_egress)
-      {
-        removeWormholeEgressBindingForProgram(peerProgram, egressKey);
-      }
-    }
+    return buildWormholeTargetKey(portal, wormhole->containerID, targetKey) &&
+           buildWormholeEgressKey(wormhole->containerID, wormhole->port, requestedWormhole.layer4, egressKey) &&
+           switchboardBuildWormholeEgressBinding(wormholeSwitchboardAddress(requestedWormhole),
+                                                requestedWormhole.externalPort,
+                                                requestedWormhole.layer4,
+                                                wormhole->ownerGeneration, binding);
   }
 
   void syncBoundaryMaps(void)
@@ -2239,83 +2264,6 @@ private:
     installedWhiteholeBindingKeys.clear();
   }
 
-  bool syncPortalDefinitionForProgram(BPFProgram *program, SwitchboardPortal *portal)
-  {
-    if (program == nullptr || portal == nullptr)
-    {
-      return false;
-    }
-
-    auto ring = portalRings.find(portal);
-    if (ring == portalRings.end() || !ring->second.prepared ||
-        ring->second.prepared->generation != ring->second.generation)
-      return true; // desired definition is published by the prepared-map completion
-    if (ring->second.failed) return false;
-    if (!publishPreparedRing(program, portal, *ring->second.prepared))
-    { ring->second.failed = true; return false; }
-
-    portal_definition portalDef = portal->generatePortalDefinition();
-    portal_meta meta = {};
-    meta.flags = portal->isQuic ? F_QUIC_PORTAL : 0;
-    meta.slot = portal->slot;
-
-    bool updated = false;
-    program->openMap("ext_portals"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing ext_portals map ifidx=%u\n", eth.ifidx);
-        appendAttachLogf("Switchboard missing ext_portals map ifidx=%u", eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_update_elem(map_fd, &portalDef, &meta, BPF_ANY) != 0)
-      {
-        basics_log("Switchboard ext_portals update failed ifidx=%u errno=%d port=%u proto=%u\n",
-                   eth.ifidx,
-                   errno,
-                   unsigned(portal->port),
-                   unsigned(portal->proto));
-        appendAttachLogf("Switchboard ext_portals update failed ifidx=%u errno=%d port=%u proto=%u",
-                         eth.ifidx,
-                         errno,
-                         unsigned(portal->port),
-                         unsigned(portal->proto));
-        return;
-      }
-
-      updated = true;
-    });
-
-    if (!updated) ring->second.failed = true;
-    return updated;
-  }
-
-  void removePortalDefinitionForProgram(BPFProgram *program, const SwitchboardPortal *portal) const
-  {
-    if (program == nullptr || portal == nullptr)
-    {
-      return;
-    }
-
-    portal_definition portalDef = portal->generatePortalDefinition();
-    program->openMap("ext_portals"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing ext_portals map for delete ifidx=%u\n", eth.ifidx);
-        return;
-      }
-
-      if (bpf_map_delete_elem(map_fd, &portalDef) != 0)
-      {
-        basics_log("Switchboard ext_portals delete failed ifidx=%u errno=%d port=%u proto=%u\n",
-                   eth.ifidx,
-                   errno,
-                   unsigned(portal->port),
-                   unsigned(portal->proto));
-      }
-    });
-  }
-
   bool generateRingForPortalOnProgram(BPFProgram *program, SwitchboardPortal *portal)
   {
     if (portal == nullptr || program == nullptr || resettingRings || ringPreparationQuiescing) return false;
@@ -2334,9 +2282,8 @@ private:
     }
     if (state.prepared && state.prepared->generation == state.generation)
     {
-      const bool ok = publishPreparedRing(program, portal, *state.prepared);
-      state.failed = !ok;
-      return ok;
+      requestRuntimeRoutingReconciliation();
+      return true;
     }
     preparePendingRings();
     // This is admission only. Neuron waits for whenRingsReady before sending
@@ -2349,156 +2296,22 @@ private:
     return generateRingForPortalOnProgram(bpf_router, portal);
   }
 
-  bool syncPortalTargetBindingsForProgram(BPFProgram *program, const char *scope)
-  {
-    if (program == nullptr)
-    {
-      return false;
-    }
-
-    bool ok = true;
-    program->openMap("wh_targets"_ctv, [&](int map_fd) -> void {
-      if (map_fd < 0)
-      {
-        basics_log("Switchboard missing wh_targets map scope=%s ifidx=%u\n", (scope ? scope : "portal-sync"), eth.ifidx);
-        ok = false;
-        return;
-      }
-
-      for (const auto& [containerID, wormholes] : wormholesByContainer)
-      {
-        (void)containerID;
-
-        for (switchboard_runtime::Wormhole *wormhole : wormholes)
-        {
-          if (wormhole == nullptr || wormhole->portal == nullptr)
-          {
-            continue;
-          }
-
-          switchboard_wormhole_target_key targetKey = {};
-          if (buildWormholeTargetKey(wormhole->portal, wormhole->containerID, targetKey) == false)
-          {
-            ok = false;
-            continue;
-          }
-
-          const __u16 containerPort = htons(wormhole->port);
-          if (bpf_map_update_elem(map_fd, &targetKey, &containerPort, BPF_ANY) != 0)
-          {
-            basics_log("Switchboard wh_targets sync update failed scope=%s ifidx=%u errno=%d slot=%u containerID=%u\n",
-                       (scope ? scope : "portal-sync"),
-                       eth.ifidx,
-                       errno,
-                       unsigned(targetKey.slot),
-                       wormhole->containerID);
-            ok = false;
-          }
-        }
-      }
-    });
-
-    return ok;
-  }
-
   void syncPeerProgramRuntimeRouting(BPFProgram *program)
   {
-    if (program == nullptr)
-    {
-      return;
-    }
-
-    program->openMap("ext_portals"_ctv, [&](int map_fd) -> void {
-      clearHashMapFD<portal_definition>(map_fd, "ext_portals");
-    });
-
-    program->openMap("wh_targets"_ctv, [&](int map_fd) -> void {
-      clearHashMapFD<switchboard_wormhole_target_key>(map_fd, "wh_targets");
-    });
-
-    for (SwitchboardPortal *portal : portals)
-    {
-      syncPortalDefinitionForProgram(program, portal);
-      if (generateRingForPortalOnProgram(program, portal) == false)
-      {
-        basics_log("Switchboard peer-runtime-sync cid_rings install failed ifidx=%u slot=%u\n", eth.ifidx, unsigned(portal->slot));
-      }
-    }
-
-    requestQuicCidReconciliation();
-
-    (void)syncPortalTargetBindingsForProgram(program, "peer-runtime-sync");
-
-    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
-    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
-    switchboardSyncWormholeEgressBindingsForProgram(program, desiredBindings, eth.ifidx, "peer-runtime-sync");
-    switchboardSyncWormholeEgress4BindingsForProgram(program, desiredBindings4, eth.ifidx, "peer-runtime-sync");
+    if (program) requestRuntimeRoutingReconciliation();
   }
 
-  // Every Switchboard entry point must carry the same portal, target, and
-  // overlay routing state. Packets may enter through any Switchboard instance;
-  // the selected final destination must not depend on that entry point.
+  // Every active entry point converges before whenRingsReady emits a receipt.
   void syncHostIngressPortalRouting(void)
   {
-    if (host_ingress == nullptr)
-    {
-      return;
-    }
-
-    host_ingress->openMap("ext_portals"_ctv, [&](int map_fd) -> void {
-      clearHashMapFD<portal_definition>(map_fd, "ext_portals");
-    });
-
-    host_ingress->openMap("wh_targets"_ctv, [&](int map_fd) -> void {
-      clearHashMapFD<switchboard_wormhole_target_key>(map_fd, "wh_targets");
-    });
-
-    for (SwitchboardPortal *portal : portals)
-    {
-      syncPortalDefinitionForProgram(host_ingress, portal);
-      if (generateRingForPortalOnProgram(host_ingress, portal) == false)
-      {
-        basics_log("Switchboard host-ingress-sync cid_rings install failed ifidx=%u slot=%u\n", eth.ifidx, unsigned(portal->slot));
-      }
-    }
-
-    requestQuicCidReconciliation();
-
-    (void)syncPortalTargetBindingsForProgram(host_ingress, "host-ingress-sync");
-
-    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
-    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
-    switchboardSyncWormholeEgressBindingsForProgram(host_ingress, desiredBindings, eth.ifidx, "host-ingress-sync");
-    switchboardSyncWormholeEgress4BindingsForProgram(host_ingress, desiredBindings4, eth.ifidx, "host-ingress-sync");
+    if (host_ingress) requestRuntimeRoutingReconciliation();
   }
 
   void syncAllPeerProgramRuntimeRouting(void)
-  {
-    forEachActivePeerProgram([&](BPFProgram *program) -> void {
-      syncPeerProgramRuntimeRouting(program);
-    });
-  }
+  { requestRuntimeRoutingReconciliation(); }
 
   void syncAllContainerProgramRuntimeState(void)
-  {
-    if (thisNeuron == nullptr)
-    {
-      return;
-    }
-
-    for (const auto& [uuid, container] : thisNeuron->containers)
-    {
-      (void)uuid;
-      if (container == nullptr || container->plan.useHostNetworkNamespace || container->netdevs.areActive() == false ||
-          container->peer_program == nullptr || container->primary_program == nullptr)
-      {
-        continue;
-      }
-      syncContainerProgramRuntimeState(container->peer_program, container->primary_program);
-    }
-  }
+  { requestRuntimeRoutingReconciliation(); }
 
   void closeWormhole(switchboard_runtime::Wormhole *wormhole)
   {
@@ -2509,20 +2322,11 @@ private:
 
     SwitchboardPortal *portal = wormhole->portal;
     wormholesByContainer.eraseEntry(wormhole->containerID, wormhole);
-    removeWormholeTargetBinding(wormhole);
     portal->wormholes.erase(wormhole);
 
     if (portal->wormholes.empty())
     {
-      if (bpf_router)
-      {
-        removePortalDefinitionForProgram(bpf_router, portal);
-      }
-
       portals.erase(portal);
-      forEachActivePeerProgram([&](BPFProgram *program) -> void {
-        removePortalDefinitionForProgram(program, portal);
-      });
       portalRings.erase(portal);
       delete portal;
       requestQuicCidReconciliation();
@@ -2581,7 +2385,7 @@ public:
     // Each consumer retains only its latest request. Application refreshes
     // must not replace the Brain's independent routing acknowledgment.
     ringWaiters.insert_or_assign(key, std::move(completion));
-    requestQuicCidReconciliation();
+    requestRuntimeRoutingReconciliation();
     settleRingWaiters();
   }
 
@@ -2617,35 +2421,18 @@ public:
   void setHostEgressRouter(BPFProgram *program)
   {
     host_egress = program;
-
-    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
-    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
-    switchboardSyncWormholeEgressBindingsForProgram(host_egress, desiredBindings, eth.ifidx, "host-egress-sync");
-    switchboardSyncWormholeEgress4BindingsForProgram(host_egress, desiredBindings4, eth.ifidx, "host-egress-sync");
+    requestRuntimeRoutingReconciliation();
   }
 
   void setHostIngressRouter(BPFProgram *program)
   {
     host_ingress = program;
-    syncHostIngressPortalRouting();
+    requestRuntimeRoutingReconciliation();
   }
 
   void syncContainerProgramRuntimeState(BPFProgram *peerProgram, BPFProgram *primaryProgram)
   {
-    syncPeerProgramRuntimeRouting(peerProgram);
-
-    Vector<SwitchboardWormholeEgressBindingEntry> desiredBindings = {};
-    Vector<SwitchboardWormholeEgress4BindingEntry> desiredBindings4 = {};
-    collectWormholeEgressBindingEntries(desiredBindings, desiredBindings4);
-    switchboardSyncWormholeEgressBindingsForProgram(primaryProgram,
-                                                    desiredBindings,
-                                                    eth.ifidx,
-                                                    "container-ingress-sync");
-    switchboardSyncWormholeEgress4BindingsForProgram(primaryProgram,
-                                                     desiredBindings4,
-                                                     eth.ifidx,
-                                                     "container-ingress-sync");
+    if (peerProgram || primaryProgram) requestRuntimeRoutingReconciliation();
   }
 
   BPFProgram *boundaryRouterProgram(void)
@@ -2655,6 +2442,7 @@ public:
 
   void setLocalContainerSubnet(const struct local_container_subnet6& newSubnet)
   {
+    if (std::memcmp(&subnet, &newSubnet, sizeof(subnet)) == 0) return;
     subnet = newSubnet;
     appendAttachLogf("Switchboard setLocalContainerSubnet ifidx=%u dpfx=%u mpfx=%u.%u.%u",
                      eth.ifidx,
@@ -2682,6 +2470,12 @@ public:
   {
     resettingRings = true;
     if (QuicCidReconcileWake *wake = std::exchange(quicCidReconcileWake, nullptr)) wake->cancel();
+    runtimeMaps.clear();
+    for (auto& desired : runtimeDesired) desired.clear();
+    runtimeProgramIdentities.clear();
+    runtimeActiveMapIDs.clear();
+    runtimeProgramCursor = runtimeMapCursor = 0;
+    runtimeRoutingDirty = runtimeDesiredPending = runtimeRoutingFailed = false;
     quicCidPrograms.clear();
     quicCidDiscoveryFailed = false;
     quicCidReconciliationDirty = false;
@@ -2883,29 +2677,8 @@ public:
       (void)assignDeterministicPortalSlots();
       createdPortal = true;
 
-      if (syncPortalDefinitionForProgram(bpf_router, portal) == false)
-      {
-        basics_log("Switchboard openWormhole failed required ext_portals install ifidx=%u containerID=%u slot=%u port=%u proto=%u\n",
-                   eth.ifidx,
-                   containerID,
-                   unsigned(portal->slot),
-                   unsigned(portal->port),
-                   unsigned(portal->proto));
-        appendAttachLogf("Switchboard openWormhole failed required ext_portals install ifidx=%u containerID=%u slot=%u port=%u proto=%u",
-                         eth.ifidx,
-                         containerID,
-                         unsigned(portal->slot),
-                         unsigned(portal->port),
-                         unsigned(portal->proto));
-        portals.erase(portal);
-        portalRings.erase(portal);
-        delete portal;
-        (void)assignDeterministicPortalSlots();
-        syncPeerProgramRuntimeRouting(bpf_router);
-        syncAllPeerProgramRuntimeRouting();
-        return false;
-      }
-
+      // The definition is published after the prepared ring and target maps,
+      // by the same bounded reconciliation that gates the applied receipt.
     }
 
     requestQuicCidReconciliation();
@@ -2920,24 +2693,22 @@ public:
     wormhole->definition = requestedWormhole;
     wormhole->portal = portal;
 
-    if (installWormholeTargetBinding(portal, wormhole, requestedWormhole) == false)
+    if (validateWormholeTargetBinding(portal, wormhole, requestedWormhole) == false)
     {
-      basics_log("Switchboard openWormhole failed required target/egress map install ifidx=%u containerID=%u slot=%u port=%u proto=%u\n",
+      basics_log("Switchboard openWormhole failed target/egress admission validation ifidx=%u containerID=%u slot=%u port=%u proto=%u\n",
                  eth.ifidx,
                  containerID,
                  unsigned(portal->slot),
                  unsigned(portal->port),
                  unsigned(portal->proto));
-      appendAttachLogf("Switchboard openWormhole failed required target/egress map install ifidx=%u containerID=%u slot=%u port=%u proto=%u",
+      appendAttachLogf("Switchboard openWormhole failed target/egress admission validation ifidx=%u containerID=%u slot=%u port=%u proto=%u",
                        eth.ifidx,
                        containerID,
                        unsigned(portal->slot),
                        unsigned(portal->port),
                        unsigned(portal->proto));
-      removeWormholeTargetBinding(wormhole);
       if (createdPortal)
       {
-        removePortalDefinitionForProgram(bpf_router, portal);
         portals.erase(portal);
         portalRings.erase(portal);
         delete portal;

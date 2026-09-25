@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <map>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -161,6 +162,19 @@ public:
 struct FakeBPFKernel {
   static constexpr uint64_t quicSyscallCostUs = 50;
   uint64_t quicDelayUs = quicSyscallCostUs;
+  uint64_t routingDelayUs = 0;
+  uint32_t routingOperations = 0;
+  uint32_t routingUpdates = 0;
+  uint32_t routingDeletes = 0;
+  std::unordered_map<int, uint32_t> routingLookups = {};
+  bool failRouting = false;
+  bool failRoutingLookup = false;
+  bool failRoutingNext = false;
+  bool failRoutingUpdate = false;
+  bool failRoutingDelete = false;
+  bool requireRetiredPortalsBeforeRingPublication = false;
+  bool retiredPortalPresentAtRingPublication = false;
+  std::vector<std::string> retiredPortalKeys = {};
   struct Publication {
     int programFD = -1;
     uint32_t slot = 0;
@@ -194,13 +208,29 @@ struct FakeBPFKernel {
   uint32_t routerQuicMapID = 71001;
   uint32_t ingressQuicMapID = 71002;
   std::vector<uint32_t> quicOperationBatches = {};
+  std::vector<uint32_t> combinedRoutingOperationBatches = {};
   uint64_t lastQuicCallbackSerial = 0;
+  uint64_t lastCombinedRoutingCallbackSerial = 0;
   uint32_t quicMapInfoQueries = 0;
+  std::unordered_map<uint32_t, std::map<std::string, std::string>> routingMaps = {};
+  std::unordered_map<int, uint32_t> routingMapIDs = {};
 
   void reset(void)
   {
     std::lock_guard lock(mutex);
     quicDelayUs = quicSyscallCostUs;
+    routingDelayUs = 0;
+    routingOperations = 0;
+    routingUpdates = routingDeletes = 0;
+    routingLookups.clear();
+    failRouting = false;
+    failRoutingLookup = false;
+    failRoutingNext = false;
+    failRoutingUpdate = false;
+    failRoutingDelete = false;
+    requireRetiredPortalsBeforeRingPublication = false;
+    retiredPortalPresentAtRingPublication = false;
+    retiredPortalKeys.clear();
     holdInner = false;
     workerEntered = false;
     releaseInner = false;
@@ -217,14 +247,20 @@ struct FakeBPFKernel {
     routerQuicMapID = 71001;
     ingressQuicMapID = 71002;
     quicOperationBatches.clear();
+    combinedRoutingOperationBatches.clear();
     lastQuicCallbackSerial = 0;
+    lastCombinedRoutingCallbackSerial = 0;
     quicMapInfoQueries = 0;
+    routingMaps.clear();
+    routingMapIDs.clear();
   }
 
   uint32_t mapIDForFD(int fd) const
   {
     if (fd == 7021) return routerQuicMapID;
     if (fd == 7022) return ingressQuicMapID;
+    if (const auto found = routingMapIDs.find(fd); found != routingMapIDs.end()) return found->second;
+    if (fd == 7001 || fd == 7002 || (fd >= 7011 && fd <= 7052)) return uint32_t(80000 + fd);
     return 0;
   }
 
@@ -243,6 +279,71 @@ struct FakeBPFKernel {
     quicMaps[id].id = id;
   }
 
+  void replaceRoutingMap(int fd, uint32_t id)
+  {
+    std::lock_guard lock(mutex);
+    routingMapIDs.insert_or_assign(fd, id);
+    routingMaps[id].clear();
+  }
+
+  void clearRoutingTrace(void)
+  {
+    std::lock_guard lock(mutex);
+    routingOperations = routingUpdates = routingDeletes = 0;
+    routingLookups.clear();
+  }
+
+  template <typename Key, typename Value>
+  void seedRouting(int fd, const Key& key, const Value& value)
+  {
+    std::lock_guard lock(mutex);
+    routingMaps[mapIDForFD(fd)].insert_or_assign(
+        std::string(reinterpret_cast<const char*>(&key), sizeof(key)),
+        std::string(reinterpret_cast<const char*>(&value), sizeof(value)));
+  }
+
+  template <typename Key>
+  bool routingContains(int fd, const Key& key)
+  {
+    std::lock_guard lock(mutex);
+    const auto map = routingMaps.find(mapIDForFD(fd));
+    return map != routingMaps.end() && map->second.contains(std::string(reinterpret_cast<const char*>(&key), sizeof(key)));
+  }
+
+  void requirePortalRetirementBeforeRingPublication(const portal_definition& first,
+                                                    const portal_definition& second)
+  {
+    std::lock_guard lock(mutex);
+    requireRetiredPortalsBeforeRingPublication = true;
+    retiredPortalPresentAtRingPublication = false;
+    retiredPortalKeys = {
+        std::string(reinterpret_cast<const char*>(&first), sizeof(first)),
+        std::string(reinterpret_cast<const char*>(&second), sizeof(second))};
+  }
+
+  bool retiredPortalsAbsentAtAllRingPublications(void)
+  {
+    std::lock_guard lock(mutex);
+    return !retiredPortalPresentAtRingPublication;
+  }
+
+  template <typename Key, typename Value>
+  bool routingValueEquals(int fd, const Key& key, const Value& value)
+  {
+    std::lock_guard lock(mutex);
+    const auto map = routingMaps.find(mapIDForFD(fd));
+    if (map == routingMaps.end()) return false;
+    const auto found = map->second.find(std::string(reinterpret_cast<const char*>(&key), sizeof(key)));
+    return found != map->second.end() && found->second ==
+        std::string(reinterpret_cast<const char*>(&value), sizeof(value));
+  }
+
+  uint32_t routingLookupCount(int fd)
+  {
+    std::lock_guard lock(mutex);
+    return routingLookups[fd];
+  }
+
   void seedQuic(int fd, uint32_t index, const quic_cid_aes_decrypt_state& value)
   {
     std::lock_guard lock(mutex);
@@ -259,7 +360,9 @@ struct FakeBPFKernel {
       map.updated.clear();
     }
     quicOperationBatches.clear();
+    combinedRoutingOperationBatches.clear();
     lastQuicCallbackSerial = 0;
+    lastCombinedRoutingCallbackSerial = 0;
     quicMapInfoQueries = 0;
   }
 
@@ -271,6 +374,20 @@ struct FakeBPFKernel {
     }
     quicOperationBatches.back() += 1;
     lastQuicCallbackSerial = timeoutCallbackSerial;
+    noteCombinedRoutingOperation();
+  }
+
+  void noteRoutingOperation(void)
+  {
+    noteCombinedRoutingOperation();
+  }
+
+  void noteCombinedRoutingOperation(void)
+  {
+    if (combinedRoutingOperationBatches.empty() || timeoutCallbackSerial != lastCombinedRoutingCallbackSerial)
+      combinedRoutingOperationBatches.push_back(0);
+    combinedRoutingOperationBatches.back() += 1;
+    lastCombinedRoutingCallbackSerial = timeoutCallbackSerial;
   }
 
   uint32_t quicMapInfoCount(void)
@@ -284,6 +401,14 @@ struct FakeBPFKernel {
     std::lock_guard lock(mutex);
     uint32_t largest = 0;
     for (uint32_t count : quicOperationBatches) largest = std::max(largest, count);
+    return largest;
+  }
+
+  uint32_t largestCombinedRoutingOperationBatch(void)
+  {
+    std::lock_guard lock(mutex);
+    uint32_t largest = 0;
+    for (uint32_t count : combinedRoutingOperationBatches) largest = std::max(largest, count);
     return largest;
   }
 
@@ -381,6 +506,35 @@ static constexpr int routerPortalMapFD = 7011;
 static constexpr int ingressPortalMapFD = 7012;
 static constexpr int routerQuicMapFD = 7021;
 static constexpr int ingressQuicMapFD = 7022;
+static constexpr int routerTargetMapFD = 7031;
+static constexpr int ingressTargetMapFD = 7032;
+static constexpr int routerEgressMapFD = 7041;
+static constexpr int ingressEgressMapFD = 7042;
+static constexpr int routerEgress4MapFD = 7051;
+static constexpr int ingressEgress4MapFD = 7052;
+
+static bool isRoutingMapFD(int fd)
+{
+  return fd == routerPortalMapFD || fd == ingressPortalMapFD ||
+         fd == routerTargetMapFD || fd == ingressTargetMapFD ||
+         fd == routerEgressMapFD || fd == ingressEgressMapFD ||
+         fd == routerEgress4MapFD || fd == ingressEgress4MapFD;
+}
+
+static size_t routingKeySize(int fd)
+{
+  if (fd == routerPortalMapFD || fd == ingressPortalMapFD) return sizeof(portal_definition);
+  if (fd == routerTargetMapFD || fd == ingressTargetMapFD) return sizeof(switchboard_wormhole_target_key);
+  if (fd == routerEgressMapFD || fd == ingressEgressMapFD) return sizeof(switchboard_wormhole_egress_key);
+  return sizeof(switchboard_wormhole_egress4_key);
+}
+
+static size_t routingValueSize(int fd)
+{
+  if (fd == routerPortalMapFD || fd == ingressPortalMapFD) return sizeof(portal_meta);
+  if (fd == routerTargetMapFD || fd == ingressTargetMapFD) return sizeof(__u16);
+  return sizeof(switchboard_wormhole_egress_binding);
+}
 
 extern "C" int __wrap_bpf_map_create(enum bpf_map_type, const char *, __u32, __u32, __u32, const struct bpf_map_create_opts *)
 {
@@ -405,6 +559,17 @@ extern "C" int __wrap_bpf_map_update_elem(int fd, const void *key, const void *v
     const uint32_t slot = *reinterpret_cast<const uint32_t *>(key);
     const int innerFD = *reinterpret_cast<const int *>(value);
     std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.routingUpdates += 1;
+    fakeKernel.noteRoutingOperation();
+    if (fakeKernel.requireRetiredPortalsBeforeRingPublication)
+    {
+      const int portalFD = fd == routerRingMapFD ? routerPortalMapFD : ingressPortalMapFD;
+      const auto maps = fakeKernel.routingMaps.find(fakeKernel.mapIDForFD(portalFD));
+      if (maps != fakeKernel.routingMaps.end())
+        for (const auto& retired : fakeKernel.retiredPortalKeys)
+          if (maps->second.contains(retired)) fakeKernel.retiredPortalPresentAtRingPublication = true;
+    }
     if (fakeKernel.failOuter && fd == ingressRingMapFD)
     {
       errno = EIO;
@@ -418,14 +583,22 @@ extern "C" int __wrap_bpf_map_update_elem(int fd, const void *key, const void *v
     return 0;
   }
 
-  if (fd == routerPortalMapFD || fd == ingressPortalMapFD)
+  if (isRoutingMapFD(fd))
   {
+    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
     std::lock_guard lock(fakeKernel.mutex);
-    if (fakeKernel.failMetadata)
+    fakeKernel.routingOperations += 1;
+    fakeKernel.routingUpdates += 1;
+    fakeKernel.noteRoutingOperation();
+    if ((fakeKernel.failMetadata && (fd == routerPortalMapFD || fd == ingressPortalMapFD)) ||
+        fakeKernel.failRouting || fakeKernel.failRoutingUpdate)
     {
       errno = EIO;
       return -1;
     }
+    const std::string rawKey(static_cast<const char *>(key), routingKeySize(fd));
+    const std::string rawValue(static_cast<const char *>(value), routingValueSize(fd));
+    fakeKernel.routingMaps[fakeKernel.mapIDForFD(fd)].insert_or_assign(rawKey, rawValue);
     return 0;
   }
 
@@ -471,8 +644,11 @@ extern "C" struct bpf_map *__wrap_bpf_object__find_map_by_name(const struct bpf_
   const uintptr_t program = reinterpret_cast<uintptr_t>(object);
   const bool rings = name != nullptr && std::strcmp(name, "cid_rings") == 0;
   const bool quic = name != nullptr && std::strcmp(name, "quic_cid_dec") == 0;
-  if (program == routerRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(routerRingMapFD) : quic ? uintptr_t(routerQuicMapFD) : uintptr_t(routerPortalMapFD));
-  if (program == ingressRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(ingressRingMapFD) : quic ? uintptr_t(ingressQuicMapFD) : uintptr_t(ingressPortalMapFD));
+  const bool targets = name != nullptr && std::strcmp(name, "wh_targets") == 0;
+  const bool egress = name != nullptr && std::strcmp(name, "wh_egress") == 0;
+  const bool egress4 = name != nullptr && std::strcmp(name, "wh_egress4") == 0;
+  if (program == routerRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(routerRingMapFD) : quic ? uintptr_t(routerQuicMapFD) : targets ? uintptr_t(routerTargetMapFD) : egress ? uintptr_t(routerEgressMapFD) : egress4 ? uintptr_t(routerEgress4MapFD) : uintptr_t(routerPortalMapFD));
+  if (program == ingressRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(ingressRingMapFD) : quic ? uintptr_t(ingressQuicMapFD) : targets ? uintptr_t(ingressTargetMapFD) : egress ? uintptr_t(ingressEgressMapFD) : egress4 ? uintptr_t(ingressEgress4MapFD) : uintptr_t(ingressPortalMapFD));
   return nullptr;
 }
 
@@ -498,6 +674,40 @@ extern "C" int __wrap_bpf_map_get_info_by_fd(int fd, void *info, __u32 *infoLen)
     mapInfo->max_entries = MAX_PORTALS * 2;
     return 0;
   }
+  if ((fd == routerRingMapFD || fd == ingressRingMapFD) && info != nullptr && infoLen != nullptr && *infoLen >= sizeof(bpf_map_info))
+  {
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.noteRoutingOperation();
+    auto *mapInfo = static_cast<bpf_map_info *>(info);
+    *mapInfo = {};
+    mapInfo->id = fakeKernel.mapIDForFD(fd);
+    mapInfo->type = BPF_MAP_TYPE_ARRAY_OF_MAPS;
+    mapInfo->key_size = sizeof(uint32_t);
+    mapInfo->value_size = sizeof(int);
+    mapInfo->max_entries = MAX_PORTALS;
+    return 0;
+  }
+  if (isRoutingMapFD(fd) && info != nullptr && infoLen != nullptr && *infoLen >= sizeof(bpf_map_info))
+  {
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.noteRoutingOperation();
+    auto *mapInfo = static_cast<bpf_map_info *>(info);
+    *mapInfo = {};
+    mapInfo->id = fakeKernel.mapIDForFD(fd);
+    mapInfo->type = BPF_MAP_TYPE_HASH;
+    mapInfo->max_entries = 4096;
+    if (fd == routerPortalMapFD || fd == ingressPortalMapFD)
+    { mapInfo->key_size = sizeof(portal_definition); mapInfo->value_size = sizeof(portal_meta); }
+    else if (fd == routerTargetMapFD || fd == ingressTargetMapFD)
+    { mapInfo->key_size = sizeof(switchboard_wormhole_target_key); mapInfo->value_size = sizeof(__u16); }
+    else if (fd == routerEgressMapFD || fd == ingressEgressMapFD)
+    { mapInfo->key_size = sizeof(switchboard_wormhole_egress_key); mapInfo->value_size = sizeof(switchboard_wormhole_egress_binding); }
+    else
+    { mapInfo->key_size = sizeof(switchboard_wormhole_egress4_key); mapInfo->value_size = sizeof(switchboard_wormhole_egress_binding); }
+    return 0;
+  }
   errno = EBADF;
   return -1;
 }
@@ -520,6 +730,56 @@ extern "C" int __wrap_bpf_map_lookup_elem(int fd, const void *key, void *value)
     fakeKernel.noteQuicOperation();
     return 0;
   }
+  if (isRoutingMapFD(fd) && key != nullptr && value != nullptr)
+  {
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.noteRoutingOperation();
+    fakeKernel.routingLookups[fd] += 1;
+    if (fakeKernel.failRouting || fakeKernel.failRoutingLookup) { errno = EIO; return -1; }
+    const auto& map = fakeKernel.routingMaps[fakeKernel.mapIDForFD(fd)];
+    const auto found = map.find(std::string(static_cast<const char *>(key), routingKeySize(fd)));
+    if (found == map.end()) { errno = ENOENT; return -1; }
+    std::memcpy(value, found->second.data(), routingValueSize(fd));
+    return 0;
+  }
+  errno = EBADF;
+  return -1;
+}
+
+extern "C" int __wrap_bpf_map_get_next_key(int fd, const void *key, void *next)
+{
+  if (isRoutingMapFD(fd))
+  {
+    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.noteRoutingOperation();
+    if (fakeKernel.failRouting || fakeKernel.failRoutingNext) { errno = EIO; return -1; }
+    const auto& map = fakeKernel.routingMaps[fakeKernel.mapIDForFD(fd)];
+    auto found = key == nullptr ? map.begin() : map.upper_bound(std::string(static_cast<const char *>(key), routingKeySize(fd)));
+    if (found == map.end()) { errno = ENOENT; return -1; }
+    std::memcpy(next, found->first.data(), routingKeySize(fd));
+    return 0;
+  }
+  errno = EBADF;
+  return -1;
+}
+
+extern "C" int __wrap_bpf_map_delete_elem(int fd, const void *key)
+{
+  if (isRoutingMapFD(fd))
+  {
+    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
+    std::lock_guard lock(fakeKernel.mutex);
+    fakeKernel.routingOperations += 1;
+    fakeKernel.routingDeletes += 1;
+    fakeKernel.noteRoutingOperation();
+    if (fakeKernel.failRouting || fakeKernel.failRoutingDelete) { errno = EIO; return -1; }
+    auto& map = fakeKernel.routingMaps[fakeKernel.mapIDForFD(fd)];
+    if (map.erase(std::string(static_cast<const char *>(key), routingKeySize(fd))) == 0) { errno = ENOENT; return -1; }
+    return 0;
+  }
   errno = EBADF;
   return -1;
 }
@@ -540,9 +800,13 @@ public:
     portal->address = IPAddress("2001:db8::44", true);
     portal->port = 443;
     portal->proto = IPPROTO_TCP;
+    portal->isQuic = false;
     portal->slot = 9;
     auto *wormhole = new switchboard_runtime::Wormhole();
     wormhole->containerID = containerID;
+    wormhole->port = uint16_t(8000 + (containerID & 0xFF));
+    wormhole->proto = IPPROTO_TCP;
+    wormhole->ownerGeneration = 1;
     wormhole->weight = 1;
     wormhole->portal = portal;
     portal->wormholes.insert(wormhole);
@@ -612,6 +876,12 @@ public:
   static void syncPeerRuntime(Switchboard& board, BPFProgram& peer)
   {
     board.syncPeerProgramRuntimeRouting(&peer);
+  }
+
+  static bool targetKey(const Switchboard& board, const SwitchboardPortal *portal,
+                        uint32_t containerID, switchboard_wormhole_target_key& key)
+  {
+    return board.buildWormholeTargetKey(portal, containerID, key);
   }
 
   static void syncQuicOnly(Switchboard& board)
@@ -1153,13 +1423,27 @@ static void runOwnerFailuresRetry(TestSuite& suite, PublicationFailure failure)
   SwitchboardRingTestAccess::installPrograms(board, router, ingress);
   auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x01020304u);
   fakeKernel.reset();
-  if (failure == PublicationFailure::Inner) fakeKernel.failInner = true;
+  if (failure == PublicationFailure::Inner)
+  {
+    fakeKernel.failInner = true;
+    fakeKernel.hold();
+  }
   if (failure == PublicationFailure::Outer) fakeKernel.failOuter = true;
   if (failure == PublicationFailure::Metadata) fakeKernel.failMetadata = true;
   SwitchboardRingTestAccess::seedRevision(board, 123);
   bool failedReceipt = false, failedValue = true;
   suite.expect(SwitchboardRingTestAccess::generate(board, portal), "switchboard_ring_owner_admits_failure_candidate");
   board.whenRingsReady(123, [&](bool ready) { failedReceipt = true; failedValue = ready; });
+  if (failure == PublicationFailure::Inner)
+  {
+    suite.expect(ring.runUntil([&] {
+                   return fakeKernel.entered() &&
+                          fakeKernel.quicLookupCount(routerQuicMapFD) == MAX_PORTALS * 2 &&
+                          fakeKernel.quicLookupCount(ingressQuicMapFD) == MAX_PORTALS * 2;
+                 }) && !failedReceipt,
+                 "switchboard_ring_owner_delayed_failure_waits_until_quic_wake_finishes");
+    fakeKernel.release();
+  }
   const bool failedAsExpected = ring.runUntil([&] { return failedReceipt; }) && !failedValue &&
                                 SwitchboardRingTestAccess::revisionsEmpty(board);
   const bool noOuterPublication = fakeKernel.noPublication();
@@ -1175,12 +1459,286 @@ static void runOwnerFailuresRetry(TestSuite& suite, PublicationFailure failure)
   bool retryReceipt = false, retryValue = false;
   suite.expect(SwitchboardRingTestAccess::generate(board, portal), "switchboard_ring_owner_retries_failed_generation");
   board.whenRingsReady(123, [&](bool ready) { retryReceipt = true; retryValue = ready; });
-  suite.expect(ring.runUntil([&] { return retryReceipt; }) && retryValue && fakeKernel.published().size() == 2,
+  const size_t expectedRetryPublications = failure == PublicationFailure::Inner ? 2 : 1;
+  suite.expect(ring.runUntil([&] { return retryReceipt; }) && retryValue &&
+                   fakeKernel.published().size() == expectedRetryPublications,
                failure == PublicationFailure::Inner ? "switchboard_ring_owner_inner_failure_retry_publishes" :
                failure == PublicationFailure::Outer ? "switchboard_ring_owner_outer_failure_retry_publishes" :
                                                     "switchboard_ring_owner_metadata_failure_retry_publishes");
   suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
                "switchboard_ring_owner_quiesces_preparation_before_ring_shutdown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+static void runNonQuicRoutingFanoutRequestDeferral(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  fakeKernel.routingDelayUs = 150;
+  for (uint32_t index = 0; index < 13; ++index)
+  {
+    auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000000u + index);
+    portal->slot = index;
+    portal->port = uint16_t(40000 + index);
+    suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+                 "switchboard_nonquic_fanout_admits_portal_ring");
+  }
+  bool receipt = false, receiptValue = false;
+  std::vector<uint64_t> submissionIntervals = {};
+  board.whenRingsReady(401, [&](bool ready) { receipt = true; receiptValue = ready; });
+  for (uint32_t request = 0; request < 30; ++request)
+  {
+    const auto submitted = std::chrono::steady_clock::now();
+    SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+    SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+    submissionIntervals.push_back(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - submitted).count()));
+  }
+  suite.expect(fakeKernel.routingOperations == 0 && !receipt,
+               "switchboard_nonquic_fanout_coalesces_requests_without_inline_map_work");
+  std::vector<uint64_t> controlIntervals = {};
+  const bool settled = ring.runUntilWithControl([&] { return receipt; }, controlIntervals, 1500);
+  std::vector<uint64_t> sortedControlIntervals = controlIntervals;
+  std::sort(sortedControlIntervals.begin(), sortedControlIntervals.end());
+  const uint64_t p95 = sortedControlIntervals.empty() ? UINT64_MAX : sortedControlIntervals[(sortedControlIntervals.size() * 95) / 100];
+  const uint64_t maximum = sortedControlIntervals.empty() ? UINT64_MAX : sortedControlIntervals.back();
+  suite.expect(settled && receiptValue && controlIntervals.size() >= 30 && p95 < 10'000 && maximum < 50'000,
+               "switchboard_nonquic_fanout_receipts_after_bounded_convergence_with_control_continuity");
+  suite.expect(fakeKernel.largestCombinedRoutingOperationBatch() <= 32,
+               "switchboard_nonquic_and_quic_share_at_most_thirty_two_map_operations_per_callback");
+  dprintf(STDERR_FILENO, "NONQUIC_FANOUT_CONTROL_SAMPLES=%zu P95_US=%llu MAX_US=%llu OPS=%u\n",
+          controlIntervals.size(), static_cast<unsigned long long>(p95), static_cast<unsigned long long>(maximum),
+          fakeKernel.routingOperations);
+  dprintf(STDERR_FILENO, "NONQUIC_FANOUT_MAX_COMBINED_OPERATIONS=%u\n", fakeKernel.largestCombinedRoutingOperationBatch());
+  printSamples("NONQUIC_FANOUT_CONTROL_RAW_US=", controlIntervals);
+  printSamples("NONQUIC_FANOUT_SUBMISSION_RAW_US=", submissionIntervals);
+  fakeKernel.clearRoutingTrace();
+  bool warmReceipt = false, warmValue = false;
+  board.whenRingsReady(402, [&](bool ready) { warmReceipt = true; warmValue = ready; });
+  for (uint32_t request = 0; request < 30; ++request)
+  {
+    SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+    SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  }
+  suite.expect(ring.runUntil([&] { return warmReceipt; }) && warmValue &&
+                   fakeKernel.routingUpdates == 0 && fakeKernel.routingDeletes == 0,
+               "switchboard_nonquic_fanout_warm_thirty_replays_make_zero_map_mutations");
+  dprintf(STDERR_FILENO, "NONQUIC_FANOUT_WARM_UPDATES=%u DELETES=%u\n", fakeKernel.routingUpdates, fakeKernel.routingDeletes);
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_fanout_drains_before_teardown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+static void runNonQuicRoutingAdoptionSupersessionAndReplacement(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000101u);
+  portal->slot = 41;
+  suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+               "switchboard_nonquic_adoption_admits_portal_ring");
+  const portal_definition desired = portal->generatePortalDefinition();
+  portal_definition stale = desired;
+  stale.port ^= 1;
+  const portal_meta desiredMeta = {.flags = 0, .slot = portal->slot};
+  const portal_meta staleMeta = {.flags = 0, .slot = 777};
+  fakeKernel.seedRouting(routerPortalMapFD, desired, desiredMeta);
+  fakeKernel.seedRouting(routerPortalMapFD, stale, staleMeta);
+
+  bool adoptionReceipt = false, adoptionValue = false;
+  board.whenRingsReady(510, [&](bool ready) { adoptionReceipt = true; adoptionValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  suite.expect(ring.runUntil([&] { return adoptionReceipt; }) && adoptionValue &&
+                   fakeKernel.routingValueEquals(routerPortalMapFD, desired, desiredMeta) &&
+                   !fakeKernel.routingContains(routerPortalMapFD, stale),
+               "switchboard_nonquic_adoption_preserves_valid_entry_and_deletes_stale_entry");
+
+  // Replace an already converged map before seeding the next adoption; an
+  // external edit to a still-owned identity does not invalidate its mirror.
+  fakeKernel.replaceRoutingMap(routerPortalMapFD, 99000);
+  fakeKernel.seedRouting(routerPortalMapFD, desired, desiredMeta);
+  fakeKernel.seedRouting(routerPortalMapFD, stale, staleMeta);
+  fakeKernel.routingDelayUs = 50;
+  for (uint16_t index = 2; index < 42; ++index)
+  {
+    portal_definition extra = stale;
+    extra.port ^= index;
+    fakeKernel.seedRouting(routerPortalMapFD, extra, staleMeta);
+  }
+  fakeKernel.clearRoutingTrace();
+  bool replacementReceipt = false, replacementValue = false;
+  board.whenRingsReady(512, [&](bool ready) { replacementReceipt = true; replacementValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  bool replacedDuringAdoption = false;
+  std::vector<uint64_t> adoptionControl = {};
+  suite.expect(ring.runUntilWithControl([&] { return replacementReceipt; }, adoptionControl, 1500, [&] {
+                 if (!replacedDuringAdoption && fakeKernel.routingLookupCount(routerPortalMapFD) != 0)
+                 {
+                   fakeKernel.replaceRoutingMap(routerPortalMapFD, 99001);
+                   fakeKernel.seedRouting(routerPortalMapFD, desired, desiredMeta);
+                   fakeKernel.seedRouting(routerPortalMapFD, stale, staleMeta);
+                   for (uint16_t index = 2; index < 42; ++index)
+                   {
+                     portal_definition extra = stale;
+                     extra.port ^= index;
+                     fakeKernel.seedRouting(routerPortalMapFD, extra, staleMeta);
+                   }
+                   SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+                   replacedDuringAdoption = true;
+                 }
+               }) && replacementValue && replacedDuringAdoption &&
+                   fakeKernel.routingValueEquals(routerPortalMapFD, desired, desiredMeta) &&
+                   !fakeKernel.routingContains(routerPortalMapFD, stale),
+               "switchboard_nonquic_map_replacement_during_partial_adoption_reconciles_valid_and_stale_entries");
+
+  bool obsoleteReceipt = false;
+  bool latestReceipt = false, latestValue = false;
+  board.whenRingsReady(511, [&](bool) { obsoleteReceipt = true; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  portal->port = 8443;
+  const portal_definition replacement = portal->generatePortalDefinition();
+  board.whenRingsReady(511, [&](bool ready) { latestReceipt = true; latestValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  suite.expect(ring.runUntil([&] { return latestReceipt; }) && latestValue && !obsoleteReceipt &&
+                   fakeKernel.routingContains(routerPortalMapFD, replacement) &&
+                   !fakeKernel.routingContains(routerPortalMapFD, desired),
+               "switchboard_nonquic_changed_state_supersedes_pending_receipt_with_latest_map_contents");
+
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_adoption_drains_before_teardown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+enum class RoutingFailure { Lookup, Next, Update, Delete };
+
+static void runNonQuicRoutingFailureRetry(TestSuite& suite, RoutingFailure failure)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000201u);
+  portal->slot = 51;
+  suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+               "switchboard_nonquic_failure_admits_portal_ring");
+  portal_definition stale = portal->generatePortalDefinition();
+  stale.port ^= 1;
+  fakeKernel.seedRouting(routerPortalMapFD, stale, portal_meta{.flags = 0, .slot = 778});
+  fakeKernel.failRoutingLookup = failure == RoutingFailure::Lookup;
+  fakeKernel.failRoutingNext = failure == RoutingFailure::Next;
+  fakeKernel.failRoutingUpdate = failure == RoutingFailure::Update;
+  fakeKernel.failRoutingDelete = failure == RoutingFailure::Delete;
+  bool failedReceipt = false, failedValue = true;
+  board.whenRingsReady(520, [&](bool ready) { failedReceipt = true; failedValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  suite.expect(ring.runUntil([&] { return failedReceipt; }) && !failedValue,
+               failure == RoutingFailure::Lookup ? "switchboard_nonquic_lookup_failure_returns_false_receipt" :
+               failure == RoutingFailure::Next ? "switchboard_nonquic_getnext_failure_returns_false_receipt" :
+               failure == RoutingFailure::Update ? "switchboard_nonquic_update_failure_returns_false_receipt" :
+                                                    "switchboard_nonquic_delete_failure_returns_false_receipt");
+  fakeKernel.clearRoutingTrace();
+  const auto noRetryDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+  suite.expect(ring.runUntil([&] { return std::chrono::steady_clock::now() >= noRetryDeadline; }, 100) &&
+                   fakeKernel.routingOperations == 0,
+               "switchboard_nonquic_failure_does_not_busy_retry_without_new_request");
+  fakeKernel.failRoutingLookup = fakeKernel.failRoutingNext = false;
+  fakeKernel.failRoutingUpdate = fakeKernel.failRoutingDelete = false;
+  bool retryReceipt = false, retryValue = false;
+  board.whenRingsReady(521, [&](bool ready) { retryReceipt = true; retryValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  suite.expect(ring.runUntil([&] { return retryReceipt; }) && retryValue,
+               "switchboard_nonquic_explicit_request_retries_failed_map_reconciliation");
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_failure_retry_drains_before_teardown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+static void runNonQuicRoutingCancellation(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000301u);
+  suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+               "switchboard_nonquic_cancellation_admits_portal_ring");
+  bool receipt = false, receiptValue = true;
+  board.whenRingsReady(530, [&](bool ready) { receipt = true; receiptValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  board.resetState();
+  const bool blocked = !board.quiesceRingPreparationForExec();
+  suite.expect(receipt && !receiptValue && blocked &&
+                   ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_cancellation_fails_receipt_and_drains_terminal_wake");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+static void runNonQuicPortalRetirementBeforeRingReassignment(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  auto *first = SwitchboardRingTestAccess::addPortal(board, 0x03000401u);
+  auto *second = SwitchboardRingTestAccess::addPortal(board, 0x03000402u);
+  first->slot = 9; first->port = 4401;
+  second->slot = 10; second->port = 4402;
+  suite.expect(SwitchboardRingTestAccess::generate(board, first) &&
+                   SwitchboardRingTestAccess::generate(board, second),
+               "switchboard_nonquic_retirement_admits_two_initial_portal_rings");
+  const portal_definition firstDefinition = first->generatePortalDefinition();
+  const portal_definition secondDefinition = second->generatePortalDefinition();
+  bool initialReceipt = false, initialValue = false;
+  board.whenRingsReady(540, [&](bool ready) { initialReceipt = true; initialValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  suite.expect(ring.runUntil([&] { return initialReceipt; }) && initialValue,
+               "switchboard_nonquic_retirement_publishes_initial_two_portal_state");
+
+  fakeKernel.requirePortalRetirementBeforeRingPublication(firstDefinition, secondDefinition);
+  std::swap(first->slot, second->slot);
+  suite.expect(SwitchboardRingTestAccess::generate(board, first) &&
+                   SwitchboardRingTestAccess::generate(board, second),
+               "switchboard_nonquic_retirement_admits_swapped_slot_rings");
+  bool obsoleteReceipt = false;
+  bool receipt = false, receiptValue = false;
+  board.whenRingsReady(541, [&](bool) { obsoleteReceipt = true; });
+  board.whenRingsReady(541, [&](bool ready) { receipt = true; receiptValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  suite.expect(!receipt && ring.runUntil([&] { return receipt; }) && receiptValue && !obsoleteReceipt,
+               "switchboard_nonquic_retirement_holds_latest_receipt_until_reassignment_converges");
+  const portal_meta firstMeta = {.flags = 0, .slot = first->slot};
+  const portal_meta secondMeta = {.flags = 0, .slot = second->slot};
+  switchboard_wormhole_target_key firstTarget = {}, secondTarget = {};
+  const bool targetsBuilt = SwitchboardRingTestAccess::targetKey(board, first, 0x03000401u, firstTarget) &&
+                            SwitchboardRingTestAccess::targetKey(board, second, 0x03000402u, secondTarget);
+  const __u16 firstPort = htons(uint16_t(8000 + (0x03000401u & 0xFF)));
+  const __u16 secondPort = htons(uint16_t(8000 + (0x03000402u & 0xFF)));
+  suite.expect(fakeKernel.retiredPortalsAbsentAtAllRingPublications() &&
+                   fakeKernel.routingValueEquals(routerPortalMapFD, firstDefinition, firstMeta) &&
+                   fakeKernel.routingValueEquals(routerPortalMapFD, secondDefinition, secondMeta) &&
+                   targetsBuilt &&
+                   fakeKernel.routingValueEquals(routerTargetMapFD, firstTarget, firstPort) &&
+                   fakeKernel.routingValueEquals(routerTargetMapFD, secondTarget, secondPort),
+               "switchboard_nonquic_retirement_removes_old_portals_before_cid_write_then_restores_final_portals_and_targets");
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_retirement_drains_before_teardown");
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
@@ -1193,6 +1751,14 @@ int main()
   runOwnerFailuresRetry(suite, PublicationFailure::Inner);
   runOwnerFailuresRetry(suite, PublicationFailure::Outer);
   runOwnerFailuresRetry(suite, PublicationFailure::Metadata);
+  runNonQuicRoutingFanoutRequestDeferral(suite);
+  runNonQuicRoutingAdoptionSupersessionAndReplacement(suite);
+  runNonQuicRoutingFailureRetry(suite, RoutingFailure::Lookup);
+  runNonQuicRoutingFailureRetry(suite, RoutingFailure::Next);
+  runNonQuicRoutingFailureRetry(suite, RoutingFailure::Update);
+  runNonQuicRoutingFailureRetry(suite, RoutingFailure::Delete);
+  runNonQuicRoutingCancellation(suite);
+  runNonQuicPortalRetirementBeforeRingReassignment(suite);
   runQuicCidResetCancelsPending(suite);
   runQuicCidEmptyAdoptedMap(suite);
   runQuicCidTwoProgramCoalescing(suite);
