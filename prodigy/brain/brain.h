@@ -18909,6 +18909,9 @@ public:
                      unsigned(container->state));
         PRODIGY_DEBUG_FLUSH();
         const bool recoveringStatefulDeployment = deployment->materializedStatefulRecoveryOwnsTransition;
+        const bool recoveringStatelessDeployment = deployment->plan.isStateful == false &&
+                                                   deployment->plan.config.type != ApplicationType::task &&
+                                                   deployment->state == DeploymentState::none;
         deployment->containerIsHealthy(container);
         (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
@@ -18920,7 +18923,14 @@ public:
                      (unsigned long long)deployment->waitingOnContainers.size(),
                      unsigned(container->state));
         PRODIGY_DEBUG_FLUSH();
-        if (recoveringStatefulDeployment)
+        // A restored process can restart before the inventory recovery pass
+        // sees a healthy target. Its later health receipt must rejoin that
+        // same guarded owner, even when no further stateUpload will arrive.
+        // Wait for the complete target. Once running, repeated health receipts
+        // must not trigger another recovery/routing replay.
+        if (recoveringStatefulDeployment ||
+            (recoveringStatelessDeployment && deployment->nTarget() > 0 &&
+             deployment->nHealthy() >= deployment->nTarget()))
         {
           recoverDeploymentsAfterNeuronState();
         }

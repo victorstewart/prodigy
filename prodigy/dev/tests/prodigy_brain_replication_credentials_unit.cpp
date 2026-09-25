@@ -10277,6 +10277,180 @@ static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSui
   thisBrain = previousBrain;
 }
 
+// A retained stateless process can report healthy after its restored deployment
+// has returned to `none`.  That receipt must re-enter the existing full
+// recovery owner once, after the complete target is healthy; it must not turn
+// duplicate healthy reports into another recovery pass.
+static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  brain.brainConfig.datacenterFragment = 1;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'571;
+  Machine machine = {};
+  machine.uuid = uint128_t(0xA571);
+  machine.private4 = 0x0A000071;
+  machine.fragment = 0x571u;
+  machine.rack = &rack;
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+  // Leave the synthetic machine outside a live Neuron socket. It remains a
+  // schedulable recovered host, while the test never submits fake fixed-file
+  // I/O merely to observe the recovery transition.
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'571, 265'325'899'677'727ULL);
+  deployment.plan.stateless.nBase = 1;
+  deployment.state = DeploymentState::none;
+  deployment.nTargetBase = 1;
+  deployment.nDeployedBase = 1;
+  deployment.nHealthyBase = 1;
+  Wormhole wormhole = {};
+  wormhole.name.assign("retained-health"_ctv);
+  wormhole.externalAddress = IPAddress("2001:db8::571", true);
+  wormhole.externalPort = 443;
+  wormhole.containerPort = 8443;
+  wormhole.layer4 = IPPROTO_TCP;
+  deployment.plan.wormholes.push_back(wormhole);
+
+  ContainerView container = {};
+  // Destroy the isolated Ring before these stack-owned runtime records. Its
+  // queued autoscale timeouts cannot outlive their deployment fixture.
+  ScopedFreshRing ring = {};
+  container.uuid = uint128_t(0xA572);
+  container.deploymentID = deployment.plan.config.deploymentID();
+  container.applicationID = deployment.plan.config.applicationID;
+  container.machine = &machine;
+  container.fragment = 7;
+  container.lifetime = ApplicationLifetime::base;
+  container.state = ContainerState::healthy;
+  container.runtimeReady = true;
+  deployment.containers.insert(&container);
+  machine.upsertContainerIndexEntry(container.deploymentID, &container);
+  brain.containers.insert_or_assign(container.uuid, &container);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  // A restarted retained container brings the complete, one-container target
+  // back.  The health receipt is the only new recovery signal.
+  deployment.containerFailed(&container, 1'700'000'000'071LL, 11, "retained restart"_ctv, true);
+  suite.expect(container.state == ContainerState::crashedRestarting && deployment.nHealthy() == 0,
+               "retained_health_restart_leaves_stateless_deployment_unhealthy");
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::running,
+               "retained_health_complete_stateless_target_reenters_recovery_and_runs");
+  const uint32_t recoveryRoutingArms = brain.wormholeRuntimeAckDeadlineArmCalls;
+  suite.expect(recoveryRoutingArms > 0,
+               "retained_health_first_recovery_exercises_routing_replay");
+  const size_t recoveryScheduled = deployment.toSchedule.size();
+  const size_t recoveryWaiting = deployment.waitingOnContainers.size();
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::running &&
+                   brain.wormholeRuntimeAckDeadlineArmCalls == recoveryRoutingArms &&
+                   deployment.toSchedule.size() == recoveryScheduled &&
+                   deployment.waitingOnContainers.size() == recoveryWaiting,
+               "retained_health_duplicate_does_not_repeat_recovery_routing_or_schedule");
+
+  // An incomplete target remains in `none`; only the receipt that restores the
+  // final missing member is allowed to enter the recovery owner.
+  deployment.state = DeploymentState::none;
+  deployment.nTargetBase = 2;
+  deployment.nDeployedBase = 2;
+  deployment.nHealthyBase = 1;
+  container.state = ContainerState::healthy;
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::none && deployment.nHealthy() == 1,
+               "retained_health_partial_target_does_not_promote_stateless_deployment");
+
+  // The existing recovery owner remains fail-closed on its inventory and
+  // persistence barriers. A later duplicate health receipt may resume it once
+  // those barriers are genuinely gone.
+  deployment.nTargetBase = 1;
+  deployment.nDeployedBase = 1;
+  deployment.nHealthyBase = 1;
+  deployment.containerFailed(&container, 1'700'000'000'072LL, 11, "inventory gate"_ctv, true);
+  brain.recoveringPersistedNeuronInventory = true;
+  brain.persistedMachineInventoryEnumerated = false;
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::none,
+               "retained_health_inventory_barrier_keeps_stateless_deployment_none");
+  brain.recoveringPersistedNeuronInventory = false;
+  brain.persistedMachineInventoryEnumerated = false;
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::running,
+               "retained_health_inventory_completion_allows_existing_recovery_owner");
+
+  deployment.state = DeploymentState::none;
+  deployment.containerFailed(&container, 1'700'000'000'073LL, 11, "persistence gate"_ctv, true);
+  brain.recoveryPersistencePending = true;
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::none,
+               "retained_health_persistence_barrier_keeps_stateless_deployment_none");
+  brain.recoveryPersistencePending = false;
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::running,
+               "retained_health_durable_inventory_receipt_allows_existing_recovery_owner");
+
+  deployment.state = DeploymentState::failed;
+  deployment.containerFailed(&container, 1'700'000'000'074LL, 11, "failed terminal"_ctv, true);
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::failed,
+               "retained_health_failed_deployment_does_not_revive");
+  deployment.state = DeploymentState::decommissioning;
+  deployment.containerFailed(&container, 1'700'000'000'075LL, 11, "decommissioning terminal"_ctv, true);
+  brain.noteLocalContainerHealthy(container.uuid);
+  suite.expect(deployment.state == DeploymentState::decommissioning,
+               "retained_health_decommissioning_deployment_does_not_revive");
+
+  // Tasks do not use recoverAfterReboot. Their healthy receipts must not
+  // repeatedly replay the running services elsewhere in the fleet.
+  deployment.state = DeploymentState::running;
+  ApplicationDeployment task = {};
+  task.plan = makeDeploymentPlan(62'572, 265'325'899'677'728ULL);
+  task.plan.config.type = ApplicationType::task;
+  task.nTargetBase = task.nDeployedBase = task.nHealthyBase = 1;
+  ContainerView taskContainer = {};
+  taskContainer.uuid = uint128_t(0xA573);
+  taskContainer.deploymentID = task.plan.config.deploymentID();
+  taskContainer.applicationID = task.plan.config.applicationID;
+  taskContainer.machine = &machine;
+  taskContainer.lifetime = ApplicationLifetime::base;
+  taskContainer.state = ContainerState::healthy;
+  task.containers.insert(&taskContainer);
+  brain.containers.insert_or_assign(taskContainer.uuid, &taskContainer);
+  brain.deployments.insert_or_assign(task.plan.config.deploymentID(), &task);
+  brain.deploymentsByApp.insert_or_assign(task.plan.config.applicationID, &task);
+  const uint32_t beforeTaskHealth = brain.wormholeRuntimeAckDeadlineArmCalls;
+  brain.noteLocalContainerHealthy(taskContainer.uuid);
+  brain.noteLocalContainerHealthy(taskContainer.uuid);
+  suite.expect(task.state == DeploymentState::none &&
+                   brain.wormholeRuntimeAckDeadlineArmCalls == beforeTaskHealth,
+               "retained_health_task_receipts_do_not_replay_fleet_recovery");
+  brain.deploymentsByApp.erase(task.plan.config.applicationID);
+  brain.deployments.erase(task.plan.config.deploymentID());
+  brain.containers.erase(taskContainer.uuid);
+  task.containers.erase(&taskContainer);
+
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.containers.erase(container.uuid);
+  machine.removeContainerIndexEntry(container.deploymentID, &container);
+  deployment.containers.erase(&container);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  thisBrain = previousBrain;
+}
+
 static void testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -26906,6 +27080,12 @@ int main(void)
     std::printf("ARTIFACT_CAPACITY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "retained-health") == 0)
+  {
+    testRetainedStatelessHealthRestoresRunning(suite);
+    std::printf("RETAINED_HEALTH_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "neuron-kill-pending-restart") == 0)
   {
@@ -27258,6 +27438,7 @@ int main(void)
   testRegisteredRoutablePrefixWormholesRefreshHostedIngressBeforeOpen(suite);
   testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
   testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
+  testRetainedStatelessHealthRestoresRunning(suite);
   testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(suite);
   testApplyReplicatedDeploymentPlanLiveStateUpdatesTrackedContainers(suite);
   testApplyReplicatedDeploymentPlanCleansTlsResumptionState(suite);
