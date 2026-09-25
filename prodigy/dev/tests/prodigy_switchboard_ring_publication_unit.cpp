@@ -1020,9 +1020,15 @@ static void runQuicCidTwoProgramCoalescing(TestSuite& suite)
                    fakeKernel.quicEquals(ingressQuicMapFD, staleIndex, quic_cid_aes_decrypt_state{}),
                "switchboard_quic_two_programs_publish_only_latest_sparse_delta_to_router_and_ingress");
   const uint32_t initialMapInfoQueries = fakeKernel.quicMapInfoCount();
-  suite.expect(initialMapInfoQueries >= 2 && initialMapInfoQueries <= (MAX_PORTALS * 4 / 32) + 12,
+  // Each active callback revalidates its current map once. The only extra
+  // query is the transition to the second program within the same callback.
+  // Count actual callbacks: elapsed-time yields need not consume all 32 ops.
+  const size_t initialRoutingTurns = fakeKernel.quicOperationBatches.size();
+  suite.expect(initialMapInfoQueries >= 2 && initialMapInfoQueries >= initialRoutingTurns &&
+                   initialMapInfoQueries <= initialRoutingTurns + 1,
                "switchboard_quic_two_program_scan_bounds_map_identity_queries_by_turns_plus_programs");
-  dprintf(STDERR_FILENO, "QUIC_RECONCILIATION_TWO_PROGRAM_METADATA_QUERIES=%u\n", initialMapInfoQueries);
+  dprintf(STDERR_FILENO, "QUIC_RECONCILIATION_TWO_PROGRAM_METADATA_QUERIES=%u TURNS=%zu\n",
+          initialMapInfoQueries, initialRoutingTurns);
 
   fakeKernel.clearQuicTrace();
   for (uint32_t request = 0; request < 30; ++request)
@@ -1533,6 +1539,108 @@ static void runNonQuicRoutingFanoutRequestDeferral(TestSuite& suite)
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
+static void runNonQuicRoutingSlowMapDeadline(TestSuite& suite)
+{
+  constexpr uint32_t workloadCount = 30;
+  constexpr uint32_t portalCount = 13;
+  std::vector<uint64_t> controlIntervals = {};
+  uint32_t completedWorkloads = 0;
+  bool everyReceiptWasCurrent = true;
+  bool everyReceiptObservedAppliedState = true;
+  bool everyWorkloadDeferredItsReceipt = true;
+  bool everyWorkloadRespectedOperationBudget = true;
+
+  for (uint32_t workload = 0; workload < workloadCount; ++workload)
+  {
+    TestRing ring = {};
+    BPFProgram router = {}, ingress = {};
+    EthDevice eth = {};
+    Switchboard board(eth);
+    SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+    fakeKernel.reset();
+    // The artificial delay covers the routing hash-map get-next, update, and
+    // delete hooks.  Ring-array publication and map-info calls are not
+    // delayed. A count-only 32-operation continuation still blocks the
+    // control timer for roughly 32ms here; the elapsed deadline must yield.
+    fakeKernel.routingDelayUs = 1'000;
+    fakeKernel.quicDelayUs = 0;
+    std::vector<std::pair<portal_definition, portal_meta>> expectedPortals = {};
+    for (uint32_t index = 0; index < portalCount; ++index)
+    {
+      auto *portal = SwitchboardRingTestAccess::addPortal(board,
+          0x03010000u + workload * portalCount + index);
+      portal->slot = index;
+      portal->port = uint16_t(41000 + index);
+      suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+                   "switchboard_nonquic_slow_map_admits_portal_ring");
+      expectedPortals.emplace_back(portal->generatePortalDefinition(),
+          portal_meta{.flags = 0, .slot = portal->slot});
+    }
+
+    bool receipt = false, receiptValue = false;
+    board.whenRingsReady(600 + workload, [&](bool ready) {
+      receipt = true;
+      receiptValue = ready;
+    });
+    SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+    SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+    const bool deferred = !receipt && fakeKernel.routingOperations == 0;
+    everyWorkloadDeferredItsReceipt &= deferred;
+    suite.expect(deferred,
+                 "switchboard_nonquic_slow_map_does_not_ack_before_applied_reconciliation");
+
+    std::vector<uint64_t> workloadControlIntervals = {};
+    const bool settled = ring.runUntilWithControl([&] { return receipt; }, workloadControlIntervals, 1'500);
+    controlIntervals.insert(controlIntervals.end(), workloadControlIntervals.begin(), workloadControlIntervals.end());
+    const bool currentReceipt = settled && receiptValue;
+    bool appliedCurrentState = currentReceipt;
+    for (const auto& [definition, meta] : expectedPortals)
+    {
+      appliedCurrentState &= fakeKernel.routingValueEquals(routerPortalMapFD, definition, meta) &&
+                             fakeKernel.routingValueEquals(ingressPortalMapFD, definition, meta);
+    }
+    const auto publications = fakeKernel.published();
+    appliedCurrentState &= publications.size() == portalCount * 2;
+    for (const auto& publication : publications)
+      appliedCurrentState &= FakeBPFKernel::innerMapComplete(publication);
+    everyReceiptWasCurrent &= currentReceipt;
+    everyReceiptObservedAppliedState &= appliedCurrentState;
+    everyWorkloadRespectedOperationBudget &= fakeKernel.largestCombinedRoutingOperationBatch() <= 32;
+    suite.expect(currentReceipt,
+                 "switchboard_nonquic_slow_map_receipt_waits_for_current_applied_reconciliation");
+    suite.expect(appliedCurrentState,
+                 "switchboard_nonquic_slow_map_receipt_observes_all_current_portal_maps_and_complete_rings");
+    suite.expect(fakeKernel.largestCombinedRoutingOperationBatch() <= 32,
+                 "switchboard_nonquic_slow_map_keeps_shared_map_operation_ceiling");
+    completedWorkloads += currentReceipt ? 1 : 0;
+    suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+                 "switchboard_nonquic_slow_map_drains_before_workload_teardown");
+    SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+  }
+
+  std::vector<uint64_t> sortedControlIntervals = controlIntervals;
+  std::sort(sortedControlIntervals.begin(), sortedControlIntervals.end());
+  const uint64_t p95 = sortedControlIntervals.empty() ? UINT64_MAX :
+      sortedControlIntervals[(sortedControlIntervals.size() * 95) / 100];
+  const uint64_t maximum = sortedControlIntervals.empty() ? UINT64_MAX : sortedControlIntervals.back();
+  const bool timingAndSamplingPassed = controlIntervals.size() >= workloadCount &&
+                                       p95 < 3'000 && maximum < 50'000;
+  const bool passed = completedWorkloads == workloadCount && everyReceiptWasCurrent &&
+                      everyReceiptObservedAppliedState &&
+                      everyWorkloadDeferredItsReceipt && everyWorkloadRespectedOperationBudget &&
+                      timingAndSamplingPassed;
+  suite.expect(passed,
+               "switchboard_nonquic_slow_map_elapsed_deadline_preserves_control_p95");
+  dprintf(STDERR_FILENO,
+          "NONQUIC_SLOW_MAP_WORKLOADS=%u DELAY_US=1000 CONTROL_SAMPLES=%zu P95_US=%llu MAX_US=%llu FAILED=%u\n",
+          completedWorkloads, controlIntervals.size(), static_cast<unsigned long long>(p95),
+          static_cast<unsigned long long>(maximum), unsigned(!everyReceiptWasCurrent ||
+          !everyReceiptObservedAppliedState || !everyWorkloadDeferredItsReceipt ||
+          !everyWorkloadRespectedOperationBudget || completedWorkloads != workloadCount ||
+          !timingAndSamplingPassed));
+  printSamples("NONQUIC_SLOW_MAP_CONTROL_RAW_US=", controlIntervals);
+}
+
 static void runNonQuicRoutingAdoptionSupersessionAndReplacement(TestSuite& suite)
 {
   TestRing ring = {};
@@ -1752,6 +1860,7 @@ int main()
   runOwnerFailuresRetry(suite, PublicationFailure::Outer);
   runOwnerFailuresRetry(suite, PublicationFailure::Metadata);
   runNonQuicRoutingFanoutRequestDeferral(suite);
+  runNonQuicRoutingSlowMapDeadline(suite);
   runNonQuicRoutingAdoptionSupersessionAndReplacement(suite);
   runNonQuicRoutingFailureRetry(suite, RoutingFailure::Lookup);
   runNonQuicRoutingFailureRetry(suite, RoutingFailure::Next);

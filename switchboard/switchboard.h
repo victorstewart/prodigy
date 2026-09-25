@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <services/debug.h>
 #include <memory>
@@ -518,9 +519,27 @@ private:
   // can contain stale decrypt keys that must be removed before an applied
   // routing receipt is emitted.
   static constexpr uint32_t quicCidMapEntries = MAX_PORTALS * 2;
-  // Bounds map-ID metadata, BPF map lookup, and BPF map update syscalls per
-  // Ring turn.
+  // Bound both operation count and elapsed time: a count alone can still
+  // accumulate slow map calls into a long Ring callback. Yield through the
+  // existing reconciliation wake without releasing the routing receipt.
   static constexpr uint32_t quicCidReconcileOperationsPerTurn = 32;
+  struct RoutingReconcileBudget {
+    uint32_t remaining = quicCidReconcileOperationsPerTurn;
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+
+    bool available(uint32_t operations = 1) const
+    {
+      return remaining >= operations && std::chrono::steady_clock::now() < deadline;
+    }
+
+    bool take(uint32_t operations = 1)
+    {
+      if (!available(operations)) return false;
+      remaining -= operations;
+      return true;
+    }
+  };
   struct QuicCidProgramState {
     // Store only observed non-zero slots.  The initial scan proves every
     // omitted slot is zero, avoiding a 2,048-entry resident copy per peer.
@@ -1108,13 +1127,14 @@ private:
   }
 
   bool reconcileQuicCidProgram(BPFProgram *program,
-                               uint32_t& remaining,
+                               RoutingReconcileBudget& budget,
                                bytell_hash_set<uint32_t>& activeMapIDs)
   {
     if (program == nullptr) return true;
+    if (!budget.available()) return false;
     bool complete = false;
     uint32_t resolvedMapID = 0;
-    program->openMap("quic_cid_dec"_ctv, [this, &complete, &resolvedMapID, &remaining, &activeMapIDs](int mapFD) {
+    program->openMap("quic_cid_dec"_ctv, [this, &complete, &resolvedMapID, &budget, &activeMapIDs](int mapFD) {
       if (mapFD < 0)
       {
         basics_log("Switchboard missing quic_cid_dec during reconciliation ifidx=%u\n", eth.ifidx);
@@ -1122,8 +1142,7 @@ private:
         complete = true;
         return;
       }
-      if (remaining == 0) return;
-      remaining -= 1; // map-ID metadata lookup
+      if (!budget.take()) return; // map-ID metadata lookup
       const uint32_t mapID = kernelMapIDForFD(mapFD);
       if (mapID == 0)
       {
@@ -1134,11 +1153,10 @@ private:
       }
       resolvedMapID = mapID;
       QuicCidProgramState& state = quicCidPrograms[mapID];
-      while (remaining > 0 && state.scanned == false)
+      while (state.scanned == false && budget.take())
       {
         quic_cid_aes_decrypt_state observed = {};
         errno = 0;
-        remaining -= 1;
         if (bpf_map_lookup_elem(mapFD, &state.scanCursor, &observed) != 0)
         {
           basics_log("Switchboard quic_cid_dec read failed ifidx=%u map=%u index=%u errno=%d\n",
@@ -1159,7 +1177,7 @@ private:
         }
       }
       refreshQuicCidProgramDirtyIndices(state);
-      while (remaining > 0 && state.dirtyCursor < state.dirtyIndices.size())
+      while (state.dirtyCursor < state.dirtyIndices.size() && budget.take())
       {
         const uint32_t index = state.dirtyIndices[state.dirtyCursor];
         const auto desired = quicCidDesired.find(index);
@@ -1167,7 +1185,6 @@ private:
         const quic_cid_aes_decrypt_state& expected =
             desired == quicCidDesired.end() ? empty : desired->second;
         errno = 0;
-        remaining -= 1;
         if (bpf_map_update_elem(mapFD, &index, &expected, BPF_ANY) != 0)
         {
           basics_log("Switchboard quic_cid_dec reconcile update failed ifidx=%u map=%u index=%u errno=%d\n",
@@ -1219,6 +1236,7 @@ private:
   void continueQuicCidReconciliation(void)
   {
     if (resettingRings || ringPreparationQuiescing) return;
+    RoutingReconcileBudget budget;
     quicCidDiscoveryFailed = false;
     if (quicCidDesiredRefreshPending)
     {
@@ -1234,11 +1252,10 @@ private:
       quicCidSweepActiveMapIDs.clear();
     }
     quicCidProgramSweepCount = programs.size();
-    uint32_t remaining = quicCidReconcileOperationsPerTurn;
-    continueRuntimeRoutingReconciliation(remaining);
-    while (quicCidProgramSweepCursor < programs.size() && remaining > 0)
+    continueRuntimeRoutingReconciliation(budget);
+    while (quicCidProgramSweepCursor < programs.size() && budget.available())
     {
-      if (reconcileQuicCidProgram(programs[quicCidProgramSweepCursor], remaining,
+      if (reconcileQuicCidProgram(programs[quicCidProgramSweepCursor], budget,
                                   quicCidSweepActiveMapIDs) == false)
       {
         break;
@@ -1380,8 +1397,9 @@ private:
     }
   }
 
-  bool reconcileRuntimeMap(BPFProgram *program, RuntimeMap kind, uint32_t& remaining)
+  bool reconcileRuntimeMap(BPFProgram *program, RuntimeMap kind, RoutingReconcileBudget& budget)
   {
+    if (!budget.available()) return false;
     const bool rings = kind == RuntimeMap::rings;
     const bool retiringPortals = kind == RuntimeMap::retiredPortals;
     const size_t keySize = kind == RuntimeMap::targets ? sizeof(switchboard_wormhole_target_key) :
@@ -1393,10 +1411,9 @@ private:
         rings ? sizeof(uint32_t) : sizeof(portal_meta);
     bool complete = false;
     auto reconcile = [&](int fd) {
-      if (!remaining) return;
+      if (!budget.take()) return;
       bpf_map_info info = {};
       __u32 length = sizeof(info);
-      --remaining;
       if (fd < 0 || bpf_map_get_info_by_fd(fd, &info, &length) != 0 || !info.id ||
           info.key_size != keySize || info.value_size != valueSize ||
           info.type != (rings ? BPF_MAP_TYPE_ARRAY_OF_MAPS : BPF_MAP_TYPE_HASH))
@@ -1417,18 +1434,20 @@ private:
       // Old unreachable inner slots are inert without ext_portals. Publish
       // every desired slot on adoption; never enumerate 1,024 empty slots.
       if (rings) state.scanned = true;
-      while (!state.scanned && remaining >= 2)
+      // Keep enumeration and its value read together so yielding never loses
+      // an adopted key. A syscall (or this two-call pair) is not preemptible;
+      // check elapsed time before starting the next bounded unit of work.
+      while (!state.scanned && budget.take(2))
       {
         std::string next(keySize, '\0');
-        --remaining;
         if (bpf_map_get_next_key(fd, state.scanKey.empty() ? nullptr : state.scanKey.data(), next.data()) != 0)
         {
           if (errno != ENOENT) { fail(); return; }
+          ++budget.remaining; // No value lookup followed end-of-map.
           state.scanned = true;
           break;
         }
         std::string value(valueSize, '\0');
-        --remaining;
         if (bpf_map_lookup_elem(fd, next.data(), value.data()) != 0)
         { fail(); return; }
         if (state.published.contains(next) || state.published.size() >= info.max_entries)
@@ -1455,11 +1474,10 @@ private:
         state.generation = runtimeGeneration;
         state.removingPortals = retiringPortals;
       }
-      while (remaining && state.cursor < state.dirty.size())
+      while (state.cursor < state.dirty.size() && budget.take())
       {
         const auto& key = state.dirty[state.cursor];
         const auto expected = desired.find(key);
-        --remaining;
         if (retiringPortals || expected == desired.end())
         {
           if (bpf_map_delete_elem(fd, key.data()) != 0 && errno != ENOENT) { fail(); return; }
@@ -1499,7 +1517,7 @@ private:
     return false;
   }
 
-  void continueRuntimeRoutingReconciliation(uint32_t& remaining)
+  void continueRuntimeRoutingReconciliation(RoutingReconcileBudget& budget)
   {
     if (!runtimeRoutingDirty || runtimeRoutingFailed) return;
     if (runtimeDesiredPending)
@@ -1522,12 +1540,12 @@ private:
       runtimeProgramCursor = runtimeMapCursor = 0;
       runtimeActiveMapIDs.clear();
     }
-    while (runtimeProgramCursor < programs.size() && remaining)
+    while (runtimeProgramCursor < programs.size() && budget.available())
     {
       const auto& entry = programs[runtimeProgramCursor];
       const auto kind = RuntimeMap(runtimeMapCursor);
       if (entry.full || kind == RuntimeMap::egress || kind == RuntimeMap::egress4)
-        if (!reconcileRuntimeMap(entry.program, kind, remaining)) return;
+        if (!reconcileRuntimeMap(entry.program, kind, budget)) return;
       if (++runtimeMapCursor == size_t(RuntimeMap::count))
       { runtimeMapCursor = 0; ++runtimeProgramCursor; }
     }
