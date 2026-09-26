@@ -28,6 +28,23 @@ public:
     return artifacts.queue(std::move(frame), failure);
   }
 
+  bool reserveArtifactMessage(uint64_t bytes, String *failure = nullptr)
+  {
+    if (artifactChunksEnabled == false) return true;
+    return artifacts.reserveOutbound(bytes, failure);
+  }
+
+  void discardArtifactMessageReservation(uint64_t bytes)
+  {
+    if (artifactChunksEnabled) artifacts.discardOutboundReservation(bytes);
+  }
+
+  bool queueReservedArtifactMessage(String&& frame, uint64_t reservedBytes, String *failure = nullptr)
+  {
+    if (artifactChunksEnabled == false) return queueArtifactMessage(std::move(frame), failure);
+    return artifacts.queueReserved(std::move(frame), reservedBytes, failure);
+  }
+
   void prepareNextArtifactChunk(void)
   {
     // Do not add another artifact chunk behind ciphertext already in flight.

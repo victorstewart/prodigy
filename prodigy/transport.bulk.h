@@ -39,6 +39,8 @@ private:
 
   Vector<Outbound> outbound = {};
   uint64_t queuedOutboundBytes = 0;
+  uint32_t reservedOutboundTransfers = 0;
+  uint64_t reservedOutboundBytes = 0;
   uint64_t nextOutboundTransferID = 1;
 
   uint64_t incomingTransferID = 0;
@@ -188,6 +190,8 @@ public:
   {
     outbound.clear();
     queuedOutboundBytes = 0;
+    reservedOutboundTransfers = 0;
+    reservedOutboundBytes = 0;
     nextOutboundTransferID = 1;
     lastCompletedIncomingTransferID = 0;
     clearIncoming();
@@ -205,7 +209,7 @@ public:
 
   uint64_t pendingOutboundBytes(void) const
   {
-    return queuedOutboundBytes;
+    return queuedOutboundBytes + reservedOutboundBytes;
   }
 
   bool hasOutbound(void) const
@@ -228,12 +232,12 @@ public:
     {
       return false;
     }
-    if (outbound.size() >= maximumQueuedTransfers)
+    if (outbound.size() + reservedOutboundTransfers >= maximumQueuedTransfers)
     {
       setFailure(failure, "bulk outbound transfer queue is full");
       return false;
     }
-    if (completeMessage.size() > (maximumQueuedBytes - queuedOutboundBytes))
+    if (completeMessage.size() > (maximumQueuedBytes - queuedOutboundBytes - reservedOutboundBytes))
     {
       setFailure(failure, "bulk outbound transfer bytes exceed limit");
       return false;
@@ -250,6 +254,56 @@ public:
     queuedOutboundBytes += transfer.frame.size();
     outbound.emplace_back(std::move(transfer));
     return true;
+  }
+
+  // Disk preparation runs off the Ring thread. Reserve its eventual bulk lane
+  // before dispatch so independent completions cannot over-admit this bounded
+  // transport queue.
+  bool reserveOutbound(uint64_t bytes, String *failure = nullptr)
+  {
+    if (failure) failure->clear();
+    if (reservedOutboundTransfers >= maximumQueuedTransfers - outbound.size())
+    {
+      setFailure(failure, "bulk outbound transfer queue is full");
+      return false;
+    }
+    if (bytes > maximumQueuedBytes - queuedOutboundBytes - reservedOutboundBytes)
+    {
+      setFailure(failure, "bulk outbound transfer bytes exceed limit");
+      return false;
+    }
+    reservedOutboundTransfers += 1;
+    reservedOutboundBytes += bytes;
+    return true;
+  }
+
+  void discardOutboundReservation(uint64_t bytes)
+  {
+    if (reservedOutboundTransfers == 0 || bytes > reservedOutboundBytes) return;
+    reservedOutboundTransfers -= 1;
+    reservedOutboundBytes -= bytes;
+  }
+
+  bool queueReserved(String&& completeMessage, uint64_t reservedBytes, String *failure = nullptr)
+  {
+    if (reservedOutboundTransfers == 0 || reservedBytes > reservedOutboundBytes ||
+        completeMessage.size() > reservedBytes)
+    {
+      setFailure(failure, "bulk outbound transfer reservation is invalid");
+      return false;
+    }
+    if (validateCompleteMessage(completeMessage, failure) == false)
+    {
+      return false;
+    }
+    reservedOutboundTransfers -= 1;
+    reservedOutboundBytes -= reservedBytes;
+    if (queue(std::move(completeMessage), failure)) return true;
+    // Keep the reservation owned by the caller on every failed commit.  It
+    // may then either retry or discard exactly the reservation it acquired.
+    reservedOutboundTransfers += 1;
+    reservedOutboundBytes += reservedBytes;
+    return false;
   }
 
   // Returns true only when a fragment was appended. A non-empty stream buffer

@@ -2050,6 +2050,116 @@ static void runDirectMasterClaimReconciliationFixtures(TestSuite& suite)
 
   derivedFollower.brains.erase(derivedMaster);
   delete derivedMaster;
+
+  // A retained-deployment replay is only safe after the peer has acknowledged
+  // the selected master. Repeated conflicting registrations must be bounded,
+  // and a follower's later fresh claim must provide the second vote that lets
+  // the existing majority rule select one master.
+  TestBrain conflictingMaster = {};
+  conflictingMaster.iaas = new NoopBrainIaaS();
+  conflictingMaster.nBrains = 3;
+  conflictingMaster.boottimens = 10;
+  conflictingMaster.weAreMaster = true;
+  conflictingMaster.noMasterYet = false;
+  conflictingMaster.overrideRetirementTopology = true;
+
+  BrainView *claimedPeer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.16", false).v4);
+  claimedPeer->connected = true;
+  claimedPeer->isFixedFile = true;
+  claimedPeer->fslot = 85;
+  BrainView *followerPeer = makePeer(uint128_t(0x300), 30, IPAddress("10.0.0.17", false).v4);
+  followerPeer->connected = true;
+  followerPeer->isFixedFile = true;
+  followerPeer->fslot = 86;
+  conflictingMaster.brains.insert(claimedPeer);
+  conflictingMaster.brains.insert(followerPeer);
+
+  ClusterMachine claimedTopologyMachine = {};
+  claimedTopologyMachine.uuid = claimedPeer->uuid;
+  claimedTopologyMachine.isBrain = true;
+  conflictingMaster.retirementTopology.machines.push_back(claimedTopologyMachine);
+  ClusterMachine followerTopologyMachine = {};
+  followerTopologyMachine.uuid = followerPeer->uuid;
+  followerTopologyMachine.isBrain = true;
+  conflictingMaster.retirementTopology.machines.push_back(followerTopologyMachine);
+
+  DeploymentPlan retainedPlan = makeDeploymentPlan(61'100, 1);
+  ApplicationDeployment *retainedDeployment = new ApplicationDeployment();
+  retainedDeployment->plan = retainedPlan;
+  conflictingMaster.deployments.insert_or_assign(retainedPlan.config.deploymentID(), retainedDeployment);
+
+  auto countTopic = [](String& buffer, BrainTopic topic) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(buffer, [&count, topic](Message *message) {
+      if (BrainTopic(message->topic) == topic)
+      {
+        count += 1;
+      }
+    });
+    return count;
+  };
+
+  String conflictingRegistration = {};
+  const uint32_t initialConflictTransfers = claimedPeer->artifacts.queuedTransfers();
+  const uint64_t initialConflictTransferBytes = claimedPeer->artifacts.pendingOutboundBytes();
+  conflictingMaster.testBrainHandler(
+      claimedPeer,
+      buildBrainMessage(
+          conflictingRegistration,
+          BrainTopic::registration,
+          claimedPeer->uuid,
+          int64_t(20),
+          uint64_t(20),
+          claimedPeer->uuid));
+  const uint32_t firstConflictAdvertisements = countTopic(claimedPeer->wBuffer, BrainTopic::registration);
+  const uint32_t firstConflictTransfers = claimedPeer->artifacts.queuedTransfers();
+  const uint64_t firstConflictTransferBytes = claimedPeer->artifacts.pendingOutboundBytes();
+
+  conflictingRegistration.clear();
+  conflictingMaster.testBrainHandler(
+      claimedPeer,
+      buildBrainMessage(
+          conflictingRegistration,
+          BrainTopic::registration,
+          claimedPeer->uuid,
+          int64_t(20),
+          uint64_t(20),
+          claimedPeer->uuid));
+  const uint32_t repeatedConflictAdvertisements = countTopic(claimedPeer->wBuffer, BrainTopic::registration);
+  const uint32_t repeatedConflictTransfers = claimedPeer->artifacts.queuedTransfers();
+  const uint64_t repeatedConflictTransferBytes = claimedPeer->artifacts.pendingOutboundBytes();
+
+  String followerRegistration = {};
+  conflictingMaster.testBrainHandler(
+      followerPeer,
+      buildBrainMessage(
+          followerRegistration,
+          BrainTopic::registration,
+          followerPeer->uuid,
+          int64_t(30),
+          uint64_t(20),
+          claimedPeer->uuid));
+
+  suite.expect(firstConflictAdvertisements == 1 && repeatedConflictAdvertisements == 1,
+               "conflicting_master_registration_advertisement_is_heartbeat_bounded");
+  suite.expect(initialConflictTransfers == 0 && initialConflictTransferBytes == 0 &&
+                   firstConflictTransfers == 0 && repeatedConflictTransfers == 0 &&
+                   firstConflictTransferBytes == 0 && repeatedConflictTransferBytes == 0 &&
+                   firstConflictTransfers == initialConflictTransfers &&
+                   repeatedConflictTransfers == initialConflictTransfers &&
+                   firstConflictTransferBytes == initialConflictTransferBytes &&
+                   repeatedConflictTransferBytes == initialConflictTransferBytes,
+               "conflicting_master_registration_does_not_replay_retained_deployment");
+  suite.expect(conflictingMaster.weAreMaster == false && conflictingMaster.noMasterYet == false &&
+                   claimedPeer->isMasterBrain && followerPeer->isMasterBrain == false,
+               "conflicting_master_follower_claim_converges_to_existing_majority_master");
+
+  conflictingMaster.deployments.clear();
+  delete retainedDeployment;
+  conflictingMaster.brains.erase(claimedPeer);
+  conflictingMaster.brains.erase(followerPeer);
+  delete claimedPeer;
+  delete followerPeer;
 }
 
 int main(void)

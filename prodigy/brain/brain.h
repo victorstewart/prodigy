@@ -1117,6 +1117,7 @@ public:
 
   bool noMasterYet = true;
   bool weAreMaster = false;
+  bool peerMasterIdentityPublicationPending = false;
   uint64_t masterAuthorityEpoch = 1;
   uint64_t lastMothershipConnectionIncarnation = 0;
   uint64_t durableMasterAuthorityRuntimeStateGeneration = 0;
@@ -10758,6 +10759,8 @@ public:
   void replayUnacknowledgedDeploymentsToRegisteredBrain(BrainView *brain)
   {
     if (weAreMaster == false || peerSocketActive(brain) == false ||
+        peerHasFreshExistingMasterClaim(brain) == false ||
+        brain->existingMasterUUID != selfBrainUUID() ||
         authoritativeTopologyContainsRemoteBrainUUID(brain->uuid) == false)
     {
       return;
@@ -14211,6 +14214,27 @@ public:
     }
   }
 
+  bool advertiseSelectedMasterIdentityIfNeeded(BrainView *peer, int64_t nowMs)
+  {
+    const uint128_t selectedMasterUUID = getExistingMasterUUID();
+    if (peerMasterIdentityPublicationPending || peer == nullptr || selectedMasterUUID == 0 ||
+        (peerHasFreshExistingMasterClaim(peer) && peer->existingMasterUUID == selectedMasterUUID) ||
+        peerSocketActive(peer) == false)
+    {
+      return false;
+    }
+
+    if (peer->lastMasterRegistrationAdvertiseMs != 0 &&
+        nowMs - peer->lastMasterRegistrationAdvertiseMs < int64_t(brainPeerHeartbeatIntervalMs))
+    {
+      return false;
+    }
+
+    peer->sendRegistration(boottimens, version, selectedMasterUUID);
+    peer->lastMasterRegistrationAdvertiseMs = nowMs;
+    return true;
+  }
+
   void driveMasterPeerIdentityConvergence(BrainView *peer, int64_t nowMs)
   {
     if (weAreMaster == false || peer == nullptr)
@@ -14226,11 +14250,7 @@ public:
 
     if (peerSocketActive(peer))
     {
-      if (peer->lastMasterRegistrationAdvertiseMs == 0 || nowMs - peer->lastMasterRegistrationAdvertiseMs >= int64_t(brainPeerHeartbeatIntervalMs))
-      {
-        peer->sendRegistration(boottimens, version, getExistingMasterUUID());
-        peer->lastMasterRegistrationAdvertiseMs = nowMs;
-      }
+      (void)advertiseSelectedMasterIdentityIfNeeded(peer, nowMs);
       return;
     }
 
@@ -14517,6 +14537,13 @@ public:
       }
     }
     retryDeferredPeerArtifactReconciliations();
+    // A bounded store-read admission can leave the reconciliation suffix
+    // pending.  Reuse the existing heartbeat turn after ArtifactIO has
+    // released completed slots; replay itself fences peer-master authority.
+    if (weAreMaster)
+    {
+      for (BrainView *peer : brains) replayUnacknowledgedDeploymentsToRegisteredBrain(peer);
+    }
   }
 
   void brainMissing(BrainView *brain)
@@ -19536,6 +19563,7 @@ public:
   void resetMasterBrainAssignment(void)
   {
     noMasterYet = true;
+    peerMasterIdentityPublicationPending = false;
     isMasterMissing = false;
     pendingDesignatedMasterPeerKey = 0;
     cancelAllBrainLivenessWaiters("reset-master");
@@ -20776,6 +20804,7 @@ public:
     }
 
     noMasterYet = false;
+    peerMasterIdentityPublicationPending = true;
     pendingDesignatedMasterPeerKey = 0;
     brain->isMasterBrain = true;
     hasCompletedInitialMasterElection = true;
@@ -20792,6 +20821,7 @@ public:
       if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch ||
           std::find(brains.begin(), brains.end(), brain) == brains.end() ||
           brain->ioGeneration != incarnation || !brain->isMasterBrain) return;
+      peerMasterIdentityPublicationPending = false;
       publishLocalMasterIdentity();
       refreshMasterPeerLivenessWaiter(brain, "elect-master");
     });
@@ -28228,6 +28258,11 @@ public:
               {
                 String serializedPlan = {};
                 BitseryEngine::serialize(serializedPlan, deployment->plan);
+                // A replayed full frame still enters the established
+                // metadata-then-blob acknowledgment protocol here.  Consume
+                // its request marker so this first echo schedules the staged
+                // blob and the following echo remains the durable receipt.
+                bv->queuedStoreArtifactTransportEpochs.erase(deploymentID);
                 if (queueBrainDeploymentReplicationFromStoreToPeer(
                         bv,
                         serializedPlan,
@@ -28422,6 +28457,10 @@ public:
             {
               String serializedPlan;
               BitseryEngine::serialize(serializedPlan, deployment->plan);
+              // Its ID was absent from this peer's durable inventory.  Permit
+              // one new store read even when a prior send on this transport
+              // was queued; the receiver explicitly requested the retry.
+              bv->queuedStoreArtifactTransportEpochs.erase(deployment->plan.config.deploymentID());
               if (queueBrainDeploymentReplicationFromStoreToPeer(
                       bv,
                       serializedPlan,
@@ -28551,7 +28590,6 @@ public:
             PRODIGY_DEBUG_FLUSH();
           }
           synchronizeBrainUUIDToMachine(bv);
-          replayUnacknowledgedDeploymentsToRegisteredBrain(bv);
           refreshBrainPeerHandshakeWatchdog(bv, "registration");
           if (isActiveMaster() && bv->machine != nullptr)
           {
@@ -28686,10 +28724,11 @@ public:
 
           if (weAreMaster && bv->existingMasterUUID != selfBrainUUID())
           {
-            // Followers can still have a live stream to us while lacking an explicit
-            // current-master claim. Push our master identity immediately so liveness
-            // and failover logic do not wait for a later reconnect cycle.
-            bv->sendRegistration(boottimens, version, getExistingMasterUUID());
+            // A conflicting master claim must converge through the same bounded
+            // advertisement path as ordinary heartbeat reconciliation. Sending a
+            // registration for every received conflicting registration can form a
+            // two-master feedback loop and repeatedly replay durable artifacts.
+            driveMasterPeerIdentityConvergence(bv, Time::msSinceBoot());
           }
 
           if (noMasterYet && weAreMaster == false && pendingDesignatedMasterPeerKey > 0)
@@ -28749,6 +28788,23 @@ public:
               basics_log("registration waiting designated master peerKey=%s from=%s claim=%s\n",
                          pendingPeerKeyText.c_str(), fromUUIDText.c_str(), claimUUIDText.c_str());
             }
+          }
+
+          // A selected follower also answers a stale or empty claim. This is
+          // bounded by the same per-peer cadence as a master advertisement, so
+          // a dropped early publication cannot strand the next quorum vote.
+          if (weAreMaster == false && noMasterYet == false)
+          {
+            (void)advertiseSelectedMasterIdentityIfNeeded(bv, Time::msSinceBoot());
+          }
+
+          // A durable deployment replay is authoritative traffic. Do not send it
+          // until this peer has explicitly acknowledged the current master after
+          // the registration above has had a chance to converge authority.
+          if (isActiveMaster() && peerHasFreshExistingMasterClaim(bv) &&
+              bv->existingMasterUUID == selfBrainUUID())
+          {
+            replayUnacknowledgedDeploymentsToRegisteredBrain(bv);
           }
 
           const uint128_t selectedMasterUUID = getExistingMasterUUID();

@@ -83,6 +83,10 @@ public:
   uint32_t confirmedMissingTransportEpoch = 0;
   uint32_t queuedCloseTransportEpoch = 0;
   uint32_t processedCloseTransportEpoch = 0;
+  // A store-backed artifact is admitted once per peer request.  The receiver's
+  // next reconciliation request clears the marker if it still lacks the blob;
+  // a stale completion cannot suppress a fresh peer generation.
+  bytell_hash_map<uint64_t, uint32_t> queuedStoreArtifactTransportEpochs = {};
   uint8_t datacenterFragment = 0;
   String kernel;
   String osID;
@@ -1136,11 +1140,16 @@ public:
     }
 
     const uint64_t bufferedBytes = brainPeerBufferedBytes(brain);
-    const bool overLimit = (appendBytes > brainPeerReplicationBufferedBytesLimit || bufferedBytes > brainPeerReplicationBufferedBytesLimit || bufferedBytes + appendBytes > brainPeerReplicationBufferedBytesLimit);
-    if (overLimit == false)
+    if (appendBytes > brainPeerReplicationBufferedBytesLimit)
     {
-      return true;
+      std::fprintf(stderr, "brain replication request exceeds buffered limit private4=%u append=%llu limit=%llu\n",
+                   brain->private4, (unsigned long long)appendBytes,
+                   (unsigned long long)brainPeerReplicationBufferedBytesLimit);
+      return false;
     }
+    const bool overLimit = (bufferedBytes > brainPeerReplicationBufferedBytesLimit ||
+                            bufferedBytes + appendBytes > brainPeerReplicationBufferedBytesLimit);
+    if (overLimit == false) return true;
 
     String reasonText = {};
     reasonText.append(reason);
@@ -1154,19 +1163,8 @@ public:
         int(brain->transportTLSEnabled()),
         reasonText.c_str());
 
-    // Fail closed and force a fresh reconciliation on reconnect. Carrying
-    // arbitrarily large replication backlogs across peer churn can OOM the
-    // active master.
-    brain->noteSendCompleted();
-    brain->clearQueuedSendBytes();
-    brain->connected = false;
-
-    if (Ring::socketIsClosing(brain) == false)
-    {
-      brain->noteCloseQueuedForCurrentTransport();
-      Ring::queueClose(brain);
-    }
-
+    // This is normal bounded backpressure.  The heartbeat/reconciliation
+    // owner retries the unqueued suffix after the transport drains.
     return false;
   }
 
@@ -1204,6 +1202,14 @@ public:
 
   bool queueBrainDeploymentReplicationFromStoreToPeer(BrainView *brain, const String& serializedPlan, uint64_t deploymentID, uint64_t containerBlobBytes)
   {
+    if (brain == nullptr || brain->canQueueSend() == false) return false;
+    const uint32_t transportEpoch = brain->transportEpoch;
+    auto queued = brain->queuedStoreArtifactTransportEpochs.find(deploymentID);
+    if (queued != brain->queuedStoreArtifactTransportEpochs.end())
+    {
+      if (queued->second == transportEpoch) return true;
+      brain->queuedStoreArtifactTransportEpochs.erase(queued);
+    }
     const uint64_t appendBytes = (uint64_t(serializedPlan.size()) + containerBlobBytes + brainPeerReplicationFrameHeadroomBytes);
     if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateDeployment-store"_ctv) == false)
     {
@@ -1217,14 +1223,24 @@ public:
       queueBrainPeerLargePayloadKeepalive(brain);
     }
 
-    if (ensureArtifactIO() == false) return false;
+    String reservationFailure;
+    if (brain->reserveArtifactMessage(appendBytes, &reservationFailure) == false)
+    {
+      PRODIGY_DEBUG_LOG("brain stored artifact deferred: %s\n", reservationFailure.c_str());
+      return false;
+    }
+    if (ensureArtifactIO() == false)
+    {
+      brain->discardArtifactMessageReservation(appendBytes);
+      return false;
+    }
     struct ReadResult { String frame; bool success = false; };
     auto result = std::make_shared<ReadResult>();
     const uint64_t generation = brain->ioGeneration;
     const uint128_t peerUUID = brain->uuid;
     const String path = ContainerStore::pathForContainerImage(deploymentID);
     const String plan = serializedPlan.substr(0, serializedPlan.size(), Copy::yes);
-    return artifactIO->submit(appendBytes + containerBlobBytes,
+    const bool submitted = artifactIO->submit(appendBytes + containerBlobBytes,
         [result, path, plan, containerBlobBytes] {
           String blob;
           Filesystem::openReadAtClose(-1, path, blob);
@@ -1232,27 +1248,44 @@ public:
           Message::construct(result->frame, BrainTopic::replicateDeployment, plan, blob);
           result->success = true;
         },
-        [this, brain, generation, peerUUID, result] {
+        [this, brain, generation, peerUUID, deploymentID, transportEpoch, appendBytes, result] {
           if (brains.contains(brain) == false || brain->ioGeneration != generation ||
               brain->uuid != peerUUID || brain->canQueueSend() == false) return;
           String failure;
-          if (result->success == false || brain->queueArtifactMessage(std::move(result->frame), &failure) == false)
+          if (result->success == false)
           {
             std::fprintf(stderr, "brain stored artifact read/queue failed: %s\n", failure.c_str());
+            brain->discardArtifactMessageReservation(appendBytes);
             brain->noteCloseQueuedForCurrentTransport();
             Ring::queueClose(brain);
             return;
           }
+          if (brain->queueReservedArtifactMessage(std::move(result->frame), appendBytes, &failure) == false)
+          {
+            brain->discardArtifactMessageReservation(appendBytes);
+            if (brain->transportEpoch == transportEpoch) brain->queuedStoreArtifactTransportEpochs.erase(deploymentID);
+            PRODIGY_DEBUG_LOG("brain stored artifact deferred: %s\n", failure.c_str());
+            return;
+          }
           Ring::queueSend(brain);
         },
-        [this, brain, generation](std::exception_ptr) {
+        [this, brain, generation, deploymentID, transportEpoch, appendBytes](std::exception_ptr) {
           std::fprintf(stderr, "brain stored artifact worker failed\n");
           if (brains.contains(brain) && brain->ioGeneration == generation && brain->canQueueSend())
           {
+            if (brain->transportEpoch == transportEpoch) brain->queuedStoreArtifactTransportEpochs.erase(deploymentID);
+            brain->discardArtifactMessageReservation(appendBytes);
             brain->noteCloseQueuedForCurrentTransport();
             Ring::queueClose(brain);
           }
         });
+    if (submitted == false)
+    {
+      brain->discardArtifactMessageReservation(appendBytes);
+      return false;
+    }
+    brain->queuedStoreArtifactTransportEpochs.insert_or_assign(deploymentID, transportEpoch);
+    return true;
   }
 
   void queueBrainDeploymentReplication(StringType auto&& serializedPlan, StringType auto&& containerBlob)

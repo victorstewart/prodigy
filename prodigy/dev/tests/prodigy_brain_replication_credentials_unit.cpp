@@ -4267,6 +4267,8 @@ static void testInitialDeploymentWaitsForDurableAuthoritativePeerReplication(Tes
   scopedRing.runFor(100);
   suite.expect(deployment->state == DeploymentState::none,
                "initial_deployment_replication_first_replay_echo_only_queues_store_backed_completion");
+  suite.expect(followerB.artifacts.queuedTransfers() == 1,
+               "initial_deployment_replication_first_replay_echo_stages_second_blob_frame");
   brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, plan.config.deploymentID()));
   suite.expect(deployment->brainBlobEchoPeerKeys.contains(followerBUUID),
                "initial_deployment_replication_records_rejoined_follower_durable_ack");
@@ -4533,6 +4535,94 @@ static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuit
                "replicated_artifact_capacity_replaces_stale_generation_before_reconciliation");
   ContainerStore::destroy(plan.config.deploymentID());
   if (follower.artifactIO) { (void)quiesceArtifactIOForTest(follower.artifactIO.get()); follower.artifactIO.reset(); }
+}
+
+static void testStoreBackedArtifactBulkReservation(TestSuite& suite)
+{
+  ProdigyBulkTransfer transfer = {};
+  String failure = {};
+  Vector<String> frames = {};
+  for (uint32_t index = 0; index < ProdigyBulkTransfer::maximumQueuedTransfers; ++index)
+  {
+    String frame = {};
+    Message::construct(frame, uint16_t(0x7a00u + index), uint64_t(index));
+    suite.require(transfer.reserveOutbound(frame.size(), &failure),
+                  "store_backed_artifact_reservation_admits_bounded_bulk_slot");
+    frames.emplace_back(std::move(frame));
+  }
+
+  String overflow = {};
+  Message::construct(overflow, uint16_t(0x7b00u), uint64_t(0));
+  suite.expect(transfer.reserveOutbound(overflow.size(), &failure) == false &&
+                   failure == "bulk outbound transfer queue is full"_ctv,
+               "store_backed_artifact_reservation_defers_overflow_without_transport_close");
+
+  const uint64_t firstBytes = frames.front().size();
+  suite.require(transfer.queueReserved(std::move(frames.front()), firstBytes, &failure),
+                "store_backed_artifact_reservation_commits_reserved_frame");
+  frames.erase(frames.begin());
+  suite.expect(transfer.reserveOutbound(overflow.size(), &failure) == false,
+               "store_backed_artifact_reservation_keeps_total_lane_bound_after_commit");
+
+  StreamBuffer output = {};
+  suite.require(transfer.appendNextChunk(output, &failure),
+                "store_backed_artifact_reservation_drains_committed_frame");
+  output.clear();
+  suite.expect(transfer.reserveOutbound(overflow.size(), &failure),
+               "store_backed_artifact_reservation_reopens_slot_after_drain");
+}
+
+static void testStoreBackedArtifactReadDefersWithoutClosingPeer(TestSuite& suite)
+{
+  ScopedAsyncMothershipRing scopedRing = {};
+  TestBrain brain = {};
+  BrainView peer = {};
+  authorizeMasterPeerForTest(brain, peer, 24, uint128_t(0x62'023'01), 62'023);
+  peer.artifactChunksEnabled = true;
+  peer.pendingSend = true; // keep the fixture's completed artifact in its outbox.
+  peer.transportEpoch = 1;
+  brain.brains.insert(&peer);
+
+  constexpr uint64_t deploymentID = 62'023;
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers"_ctv, 0755) >= 0 || errno == EEXIST,
+                "store_backed_artifact_read_creates_container_root");
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers/store"_ctv, 0755) >= 0 || errno == EEXIST,
+                "store_backed_artifact_read_creates_artifact_store");
+  String blob = prodigyDiscombobulatorBlobHeaderText();
+  blob.append("store-backed-artifact-read-reservation"_ctv);
+  suite.require(ContainerStore::store(deploymentID, blob),
+                "store_backed_artifact_read_stores_fixture_blob");
+  String plan = {};
+  Message::construct(plan, BrainTopic::replicateDeployment, deploymentID);
+  const uint64_t reservationBytes = plan.size() + blob.size() + BrainBase::brainPeerReplicationFrameHeadroomBytes;
+
+  for (uint32_t index = 0; index < ProdigyBulkTransfer::maximumQueuedTransfers; ++index)
+  {
+    String failure = {};
+    suite.require(peer.reserveArtifactMessage(reservationBytes, &failure),
+                  "store_backed_artifact_read_fills_other_bulk_reservations");
+  }
+  suite.expect(brain.queueBrainDeploymentReplicationFromStoreToPeer(&peer, plan, deploymentID, blob.size()) == false &&
+                   Ring::socketIsClosing(&peer) == false,
+               "store_backed_artifact_read_capacity_defers_without_closing_peer");
+  for (uint32_t index = 0; index < ProdigyBulkTransfer::maximumQueuedTransfers; ++index)
+  {
+    peer.discardArtifactMessageReservation(reservationBytes);
+  }
+
+  suite.require(brain.queueBrainDeploymentReplicationFromStoreToPeer(&peer, plan, deploymentID, blob.size()),
+                "store_backed_artifact_read_admits_after_bulk_slot_releases");
+  suite.expect(brain.queueBrainDeploymentReplicationFromStoreToPeer(&peer, plan, deploymentID, blob.size()),
+               "store_backed_artifact_read_deduplicates_active_worker");
+  scopedRing.runFor(100);
+  suite.expect(peer.artifacts.queuedTransfers() == 1 && Ring::socketIsClosing(&peer) == false,
+               "store_backed_artifact_read_publishes_once_without_peer_churn");
+  suite.expect(brain.queueBrainDeploymentReplicationFromStoreToPeer(&peer, plan, deploymentID, blob.size()) &&
+                   peer.artifacts.queuedTransfers() == 1,
+               "store_backed_artifact_read_repeated_reconciliation_does_not_duplicate_pending_outbound");
+  brain.brains.erase(&peer);
+  ContainerStore::destroy(deploymentID);
+  if (brain.artifactIO) { (void)quiesceArtifactIOForTest(brain.artifactIO.get()); brain.artifactIO.reset(); }
 }
 
 static void testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(TestSuite& suite)
@@ -7172,7 +7262,7 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
   (void)::rmdir(scratch);
 }
 
-static void testDeploymentReplicationBackpressureClosesPeer(TestSuite& suite)
+static void testDeploymentReplicationBackpressureRejectsOversizedPeer(TestSuite& suite)
 {
   TestBrain brain;
   BrainView follower;
@@ -7196,14 +7286,12 @@ static void testDeploymentReplicationBackpressureClosesPeer(TestSuite& suite)
           0xDEADBEEF,
           BrainBase::brainPeerReplicationBufferedBytesLimit + 1) == false,
       "deployment_replication_backpressure_rejects_oversized_append");
-  suite.expect(Ring::socketIsClosing(&follower), "deployment_replication_backpressure_closes_peer");
-  suite.expect(follower.connected == false, "deployment_replication_backpressure_marks_peer_disconnected");
-  suite.expect(follower.wBuffer.outstandingBytes() == 0, "deployment_replication_backpressure_clears_buffer");
-
-  // This regression intentionally queues a close on a stack-owned peer view.
-  // Reset the ring so later tests cannot inherit its stale identity entry.
-  Ring::shutdownForExec();
-  Ring::createRing(8, 8, 32, 32, -1, -1, 0);
+  suite.expect(Ring::socketIsClosing(&follower) == false,
+               "deployment_replication_backpressure_keeps_peer_for_oversized_rejection");
+  suite.expect(follower.connected,
+               "deployment_replication_backpressure_keeps_peer_connected_for_oversized_rejection");
+  suite.expect(follower.wBuffer.outstandingBytes() == 0,
+               "deployment_replication_backpressure_does_not_queue_oversized_buffer");
 }
 
 static void testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(TestSuite& suite)
@@ -27833,6 +27921,8 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "artifact-capacity-reconciliation") == 0)
   {
     testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
+    testStoreBackedArtifactBulkReservation(suite);
+    testStoreBackedArtifactReadDefersWithoutClosingPeer(suite);
     std::printf("ARTIFACT_CAPACITY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -28157,7 +28247,7 @@ int main(void)
   testMothershipTunnelProviderStateUploadKillsStaleProvider(suite);
   testClusterReportIncludesMothershipConnectivityStatus(suite);
   testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(suite);
-  testDeploymentReplicationBackpressureClosesPeer(suite);
+  testDeploymentReplicationBackpressureRejectsOversizedPeer(suite);
   testMothershipConfigureAppliesClusterUUID(suite);
   testMothershipConfigureOwnsMachineConfigsForManagedSchemas(suite);
   testMothershipConfigureRejectsClusterTakeover(suite);
@@ -28175,6 +28265,8 @@ int main(void)
   testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
   testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
   testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
+  testStoreBackedArtifactBulkReservation(suite);
+  testStoreBackedArtifactReadDefersWithoutClosingPeer(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);
