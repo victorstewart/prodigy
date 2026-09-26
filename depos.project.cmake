@@ -36,7 +36,7 @@ set(
 )
 set(
   PRODIGY_BASICS_TIDESDB_DEPENDENCY_VERSION
-  "10.0.1.20260919.210236"
+  "10.0.1-prodigy-0bd3c045"
   CACHE STRING
   "Pinned TidesDB package version used when deriving the Basics-with-TidesDB release DepoFile variant"
   FORCE
