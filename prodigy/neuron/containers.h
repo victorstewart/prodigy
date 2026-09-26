@@ -2276,8 +2276,8 @@ public:
       // Netkit names are generated from the numeric fragment, not shell input.
       // The existing command owner bounds output/deadline, reaps with waitid,
       // and cancels the child before retiring its Ring operations.
-      String command = "exec udevadm wait --initialized=yes --timeout=5 /sys/class/net/"_ctv;
-      command.append(netdevs.host.name);
+      String command = {};
+      command.snprintf<"exec udevadm wait --initialized=yes --timeout=5 /sys/class/net/{}"_ctv>(netdevs.host.name);
       String output;
       if (co_await ProdigyCommandCapture::run(coro, command, output,
           ProdigyCommandCapture::Clock::now() + std::chrono::seconds(6), failureReport) == false)
