@@ -48,6 +48,7 @@ public:
   RingDispatcher dispatcher;
   TimeoutPacket deadline = {};
   bool timedOut = false;
+  bool shutdown = false;
   ArtifactRing()
   {
     Ring::interfacer = &dispatcher;
@@ -59,12 +60,20 @@ public:
   }
   ~ArtifactRing()
   {
-    Ring::shutdownForExec();
+    shutdownRing();
     Ring::interfacer = nullptr;
     Ring::lifecycler = nullptr;
     RingDispatcher::dispatcher = nullptr;
     Ring::exit = false;
     Ring::shuttingDown = false;
+  }
+  void shutdownRing()
+  {
+    if (shutdown == false)
+    {
+      Ring::shutdownForExec();
+      shutdown = true;
+    }
   }
   void arm(uint64_t ms)
   {
@@ -89,6 +98,8 @@ public:
   bool lastArtifactSourceCurrent = false;
   std::function<void(bool)> pendingRestoreCompletion = {};
   uint32_t restoreSubmissions = 0;
+  uint32_t publishedContainers = 0;
+  std::vector<std::unique_ptr<Container>> publishedContainerOwners = {};
 
   ProdigyHostTask<bool> restoreStateUploadNetworkAsync(
       Container *, CoroutineStack *, String *, std::function<bool()> current) override
@@ -119,6 +130,15 @@ public:
     return isPendingContainerLaunch(uuid);
   }
 
+  bool retainedCandidatePreservedForTest(uint128_t uuid, pid_t pid) const
+  {
+    auto found = pendingStateUploadRestores.find(uuid);
+    return found != pendingStateUploadRestores.end() && found->second != nullptr &&
+           found->second->settled && found->second->container != nullptr &&
+           found->second->container->pendingDestroy == false && found->second->container->pid == pid &&
+           isPendingContainerLaunch(uuid);
+  }
+
   String containerArtifactStoreRoot(void) const override { return root; }
   void receivedContainerArtifactFinished(uint64_t, bool adopted, bool sourceCurrent) override
   {
@@ -126,13 +146,22 @@ public:
     lastArtifactAdopted = adopted;
     lastArtifactSourceCurrent = sourceCurrent;
   }
-  void pushContainer(Container *) override {}
+  void pushContainer(Container *container) override
+  {
+    ++publishedContainers;
+    publishedContainerOwners.emplace_back(container);
+  }
   void popContainer(Container *) override {}
   void downloadContainer(CoroutineStack *, uint64_t) override {}
   bool ensureHostNetworkingReady(String *failure = nullptr) override
   {
     if (failure) failure->clear();
     return true;
+  }
+
+  void releasePublishedContainersAfterRingShutdownForTest()
+  {
+    publishedContainerOwners.clear();
   }
 
   bool startForArtifactTest(const String& storeRoot)
@@ -379,6 +408,44 @@ int main()
     restoreNeuron.pendingRestoreCompletion(true);
     suite.expect(restoreNeuron.pendingStateUploadRestoreForTest(uint128_t(0xA5510001)),
                  "neuron_state_upload_restore_stale_completion_preserves_retained_candidate");
+  }
+  {
+    // A successful retry reaches the normal publication tail, which queues
+    // retained-process observation on Ring even though this test does not run
+    // the queued I/O.
+    ArtifactRing restoreRing = {};
+    TestNeuron failedRestore = {};
+    failedRestore.replaceBrainWithoutClosing();
+    auto candidate = std::make_unique<Container>();
+    candidate->plan.uuid = uint128_t(0xA5510005);
+    candidate->plan.fragment = 1;
+    candidate->plan.restartOnFailure = true;
+    // Keep this synthetic candidate outside process supervision: no real PID
+    // can be observed if the publication path later acquires a pidfd seam.
+    candidate->pid = -1;
+    candidate->retainedPidfdWaitabilityFailed = true;
+    ContainerPlan replay = candidate->plan;
+    suite.expect(failedRestore.beginStateUploadRestoreForTest(std::move(candidate), 11) &&
+                     bool(failedRestore.pendingRestoreCompletion),
+                 "neuron_state_upload_restore_failure_admits_retained_candidate");
+    auto failed = std::exchange(failedRestore.pendingRestoreCompletion, {});
+    failed(false);
+    suite.expect(failedRestore.restoreSubmissions == 1 && !failedRestore.restoreBarrierPendingForTest() &&
+                     failedRestore.publishedContainers == 0 &&
+                     failedRestore.retainedCandidatePreservedForTest(replay.uuid, -1),
+                 "neuron_state_upload_restore_failure_preserves_live_process_and_launch_fence");
+    suite.expect(failedRestore.admitRestoreReplayForTest(replay) &&
+                     failedRestore.restoreSubmissions == 2 && failedRestore.restoreBarrierPendingForTest(),
+                 "neuron_state_upload_restore_failure_retries_only_after_matching_authoritative_upload");
+    auto succeeded = std::exchange(failedRestore.pendingRestoreCompletion, {});
+    succeeded(true);
+    suite.expect(failedRestore.publishedContainers == 1 &&
+                     !failedRestore.pendingStateUploadRestoreForTest(replay.uuid),
+                 "neuron_state_upload_restore_successful_retry_publishes_once");
+    // The publication tail can leave Ring operations holding the raw wrapper.
+    // Keep test ownership through Ring teardown, then release it explicitly.
+    restoreRing.shutdownRing();
+    failedRestore.releasePublishedContainersAfterRingShutdownForTest();
   }
   {
     TestNeuron replacementNeuron = {};

@@ -2242,7 +2242,8 @@ public:
     if (!isCurrent()) co_return false;
     if (resolved < 0 || loopback.ifidx == 0 || netdevs.host.ifidx == 0 || netdevs.peer.ifidx == 0)
     {
-      if (failureReport) failureReport->assign("failed to resolve retained container network interfaces"_ctv);
+      if (failureReport) failureReport->snprintf<"failed to resolve retained container network interfaces: result={} loopback={} host={} peer={}"_ctv>(
+          resolved, loopback.ifidx, netdevs.host.ifidx, netdevs.peer.ifidx);
       co_return false;
     }
 
@@ -2265,7 +2266,7 @@ public:
     if (!isCurrent()) co_return false;
     if (configured < 0)
     {
-      if (failureReport) failureReport->assign("kernel rejected retained container network configuration"_ctv);
+      if (failureReport) failureReport->snprintf<"kernel rejected retained container network configuration: result={}"_ctv>(configured);
       co_return false;
     }
     netdevs.host.mtu = netdevs.peer.mtu = desiredMTU;

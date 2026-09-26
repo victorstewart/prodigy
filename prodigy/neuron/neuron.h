@@ -4486,34 +4486,32 @@ protected:
       return false;
     }
 
+    if (!restored)
+    {
+      // A retained candidate owns an already-live process.  A network restore
+      // failure says nothing about that process's liveness, so it cannot use
+      // the normal failed-launch path: restartContainer clears pid/pidfd and
+      // launches a second process with this UUID while the original survives.
+      // Keep the wrapper and pending-launch fence until matching authoritative
+      // state can retry the restore.
+      String retainedIdentity;
+      retainedIdentity.snprintf<"{itoh}"_ctv>(containerUUID);
+      std::fprintf(stderr,
+                   "restoreContainer retained network restore failed uuid=%s pid=%d reason=%s; preserving retained process for authoritative retry\n",
+                   retainedIdentity.c_str(),
+                   container ? int(container->pid) : -1,
+                   failure.c_str());
+      std::fflush(stderr);
+      if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
+      stateUploadRestoreReplyPending = false;
+      operation->settled = true;
+      return false;
+    }
+
     if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
     finishPendingContainerLaunch(containerUUID);
     container = operation->container.release();
-
-    if (!restored)
-    {
-      basics_log("restoreContainer network restore failed uuid=%llu reason=%s\n",
-                 (unsigned long long)container->plan.uuid, failure.c_str());
-      if (container->plan.config.type == ApplicationType::task)
-      {
-        TaskTermination termination = {};
-        termination.kind = TaskTerminationKind::lost;
-        termination.observedAtMs = Time::now<TimeResolution::ms>();
-        termination.summary.assign("task network restore failed"_ctv);
-        (void)noteTaskAttemptTerminal(container->plan, termination);
-        ContainerManager::destroyContainer(container);
-      }
-      else
-      {
-        const uint128_t restoredUUID = container->plan.uuid;
-        const bool restarted = container->plan.restartOnFailure;
-        if (restarted) ContainerManager::restartContainer(container);
-        else ContainerManager::destroyContainer(container);
-        String empty = {};
-        reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
-      }
-    }
-    else
+    if (container != nullptr)
     {
       container->assignNeuronListenerPath();
       if (container->neuronListenerPath.size() == 0)
