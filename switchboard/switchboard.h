@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <services/debug.h>
 #include <memory>
 #include <string>
@@ -590,7 +591,7 @@ private:
   uint64_t runtimeGeneration = 1;
   size_t runtimeProgramCursor = 0;
   size_t runtimeMapCursor = 0;
-  std::vector<std::pair<uintptr_t, bool>> runtimeProgramIdentities;
+  std::vector<std::pair<uintptr_t, uint8_t>> runtimeProgramIdentities;
   std::unordered_set<uint32_t> runtimeActiveMapIDs;
   bool runtimeRoutingDirty = false;
   bool runtimeDesiredPending = false;
@@ -1374,26 +1375,33 @@ private:
     }
   }
 
-  struct RuntimeProgram { BPFProgram *program; bool full; };
+  struct RuntimeProgram {
+    static constexpr uint8_t ingress = 1;
+    static constexpr uint8_t egress = 2;
+    BPFProgram *program;
+    uint8_t directions;
+  };
 
   void collectActiveRuntimePrograms(std::vector<RuntimeProgram>& programs) const
   {
-    auto add = [&programs](BPFProgram *program, bool full) {
+    auto add = [&programs](BPFProgram *program, uint8_t directions) {
       if (!program) return;
       for (auto& entry : programs)
-        if (entry.program == program) { entry.full |= full; return; }
-      programs.push_back({program, full});
+        if (entry.program == program) { entry.directions |= directions; return; }
+      programs.push_back({program, directions});
     };
-    add(bpf_router, true);
-    add(host_ingress, true);
-    add(host_egress, false);
+    // A reopened program exposes only maps referenced by its BPF instructions.
+    // The balancer selects ingress targets; egress bindings belong to routers.
+    add(bpf_router, RuntimeProgram::ingress);
+    add(host_ingress, RuntimeProgram::ingress | RuntimeProgram::egress);
+    add(host_egress, RuntimeProgram::egress);
     if (!thisNeuron) return;
     for (const auto& [id, container] : thisNeuron->containers)
     {
       (void)id;
       if (!container || container->plan.useHostNetworkNamespace || !container->netdevs.areActive()) continue;
-      add(container->peer_program, true);
-      add(container->primary_program, false);
+      add(container->peer_program, RuntimeProgram::ingress | RuntimeProgram::egress);
+      add(container->primary_program, RuntimeProgram::egress);
     }
   }
 
@@ -1418,7 +1426,7 @@ private:
           info.key_size != keySize || info.value_size != valueSize ||
           info.type != (rings ? BPF_MAP_TYPE_ARRAY_OF_MAPS : BPF_MAP_TYPE_HASH))
       {
-        basics_log("Switchboard routing map identity/schema failed ifidx=%u kind=%u fd=%d errno=%d\n",
+        std::fprintf(stderr, "Switchboard routing map identity/schema failed ifidx=%u kind=%u fd=%d errno=%d\n",
                    eth.ifidx, unsigned(kind), fd, errno);
         runtimeRoutingFailed = true;
         return;
@@ -1426,7 +1434,7 @@ private:
       auto& state = runtimeMaps[info.id];
       const auto& desired = runtimeDesired[size_t(retiringPortals ? RuntimeMap::portals : kind)];
       auto fail = [&]() {
-        basics_log("Switchboard routing reconciliation failed ifidx=%u kind=%u map=%u errno=%d\n",
+        std::fprintf(stderr, "Switchboard routing reconciliation failed ifidx=%u kind=%u map=%u errno=%d\n",
                    eth.ifidx, unsigned(kind), info.id, errno);
         state.failed = runtimeRoutingFailed = true;
       };
@@ -1531,9 +1539,9 @@ private:
     }
     std::vector<RuntimeProgram> programs;
     collectActiveRuntimePrograms(programs);
-    std::vector<std::pair<uintptr_t, bool>> identities;
+    std::vector<std::pair<uintptr_t, uint8_t>> identities;
     for (const auto& entry : programs)
-      identities.emplace_back(reinterpret_cast<uintptr_t>(entry.program), entry.full);
+      identities.emplace_back(reinterpret_cast<uintptr_t>(entry.program), entry.directions);
     if (identities != runtimeProgramIdentities)
     {
       runtimeProgramIdentities = std::move(identities);
@@ -1544,7 +1552,8 @@ private:
     {
       const auto& entry = programs[runtimeProgramCursor];
       const auto kind = RuntimeMap(runtimeMapCursor);
-      if (entry.full || kind == RuntimeMap::egress || kind == RuntimeMap::egress4)
+      const bool egress = kind == RuntimeMap::egress || kind == RuntimeMap::egress4;
+      if (entry.directions & (egress ? RuntimeProgram::egress : RuntimeProgram::ingress))
         if (!reconcileRuntimeMap(entry.program, kind, budget)) return;
       if (++runtimeMapCursor == size_t(RuntimeMap::count))
       { runtimeMapCursor = 0; ++runtimeProgramCursor; }

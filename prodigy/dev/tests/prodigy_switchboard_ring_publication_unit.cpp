@@ -172,6 +172,7 @@ struct FakeBPFKernel {
   bool failRoutingNext = false;
   bool failRoutingUpdate = false;
   bool failRoutingDelete = false;
+  bool routerOmitsEgressMaps = false;
   bool requireRetiredPortalsBeforeRingPublication = false;
   bool retiredPortalPresentAtRingPublication = false;
   std::vector<std::string> retiredPortalKeys = {};
@@ -228,6 +229,7 @@ struct FakeBPFKernel {
     failRoutingNext = false;
     failRoutingUpdate = false;
     failRoutingDelete = false;
+    routerOmitsEgressMaps = false;
     requireRetiredPortalsBeforeRingPublication = false;
     retiredPortalPresentAtRingPublication = false;
     retiredPortalKeys.clear();
@@ -647,14 +649,22 @@ extern "C" struct bpf_map *__wrap_bpf_object__find_map_by_name(const struct bpf_
   const bool targets = name != nullptr && std::strcmp(name, "wh_targets") == 0;
   const bool egress = name != nullptr && std::strcmp(name, "wh_egress") == 0;
   const bool egress4 = name != nullptr && std::strcmp(name, "wh_egress4") == 0;
-  if (program == routerRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(routerRingMapFD) : quic ? uintptr_t(routerQuicMapFD) : targets ? uintptr_t(routerTargetMapFD) : egress ? uintptr_t(routerEgressMapFD) : egress4 ? uintptr_t(routerEgress4MapFD) : uintptr_t(routerPortalMapFD));
+  if (program == routerRingMapFD)
+  {
+    return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(routerRingMapFD) : quic ? uintptr_t(routerQuicMapFD) : targets ? uintptr_t(routerTargetMapFD) : egress ? uintptr_t(routerEgressMapFD) : egress4 ? uintptr_t(routerEgress4MapFD) : uintptr_t(routerPortalMapFD));
+  }
   if (program == ingressRingMapFD) return reinterpret_cast<struct bpf_map *>(rings ? uintptr_t(ingressRingMapFD) : quic ? uintptr_t(ingressQuicMapFD) : targets ? uintptr_t(ingressTargetMapFD) : egress ? uintptr_t(ingressEgressMapFD) : egress4 ? uintptr_t(ingressEgress4MapFD) : uintptr_t(ingressPortalMapFD));
   return nullptr;
 }
 
 extern "C" int __wrap_bpf_map__fd(const struct bpf_map *map)
 {
-  return int(reinterpret_cast<uintptr_t>(map));
+  const int fd = int(reinterpret_cast<uintptr_t>(map));
+  // The ELF may declare these maps, but an adopted balancer has no live FDs
+  // for maps its BPF instructions never reference.
+  if (fakeKernel.routerOmitsEgressMaps && (fd == routerEgressMapFD || fd == routerEgress4MapFD))
+    return -1;
+  return fd;
 }
 
 extern "C" int __wrap_bpf_map_get_info_by_fd(int fd, void *info, __u32 *infoLen)
@@ -882,6 +892,20 @@ public:
                         uint32_t containerID, switchboard_wormhole_target_key& key)
   {
     return board.buildWormholeTargetKey(portal, containerID, key);
+  }
+
+  static bool egressKey(const Switchboard& board, uint32_t containerID,
+                        uint16_t containerPort, uint8_t proto,
+                        switchboard_wormhole_egress_key& key)
+  {
+    return board.buildWormholeEgressKey(containerID, containerPort, proto, key);
+  }
+
+  static bool egress4Key(const Switchboard& board, const IPAddress& externalAddress,
+                         uint16_t containerPort, uint8_t proto,
+                         switchboard_wormhole_egress4_key& key)
+  {
+    return board.buildWormholeEgress4Key(externalAddress, containerPort, proto, key);
   }
 
   static void syncQuicOnly(Switchboard& board)
@@ -1476,6 +1500,45 @@ static void runOwnerFailuresRetry(TestSuite& suite, PublicationFailure failure)
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
+static void runNonQuicBalancerOptionalEgressMaps(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+  fakeKernel.routerOmitsEgressMaps = true;
+  constexpr uint32_t containerID = 0x03000091u;
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, containerID);
+  portal->address = IPAddress("198.18.0.91", false);
+  suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+               "switchboard_nonquic_balancer_missing_egress_admits_portal_ring");
+  switchboard_wormhole_egress_key key = {};
+  switchboard_wormhole_egress4_key key4 = {};
+  switchboard_wormhole_egress_binding binding = {};
+  const uint16_t containerPort = uint16_t(8000 + (containerID & 0xFF));
+  const bool expectedEgress = SwitchboardRingTestAccess::egressKey(
+      board, containerID, containerPort, IPPROTO_TCP, key) &&
+      SwitchboardRingTestAccess::egress4Key(board, portal->address, containerPort,
+                                            IPPROTO_TCP, key4) &&
+      switchboardBuildWormholeEgressBinding(portal->address, portal->port,
+                                             IPPROTO_TCP, 1, binding);
+  bool receipt = false, receiptValue = false;
+  board.whenRingsReady(570, [&](bool ready) { receipt = true; receiptValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  suite.expect(expectedEgress && ring.runUntil([&] { return receipt; }) && receiptValue &&
+                   fakeKernel.routingValueEquals(ingressEgressMapFD, key, binding) &&
+                   fakeKernel.routingValueEquals(ingressEgress4MapFD, key4, binding) &&
+                   !fakeKernel.routingContains(routerEgressMapFD, key) &&
+                   !fakeKernel.routingContains(routerEgress4MapFD, key4),
+               "switchboard_nonquic_balancer_missing_egress_preserves_readiness_and_populates_host_ingress");
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_nonquic_balancer_missing_egress_drains_before_teardown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
 static void runNonQuicRoutingFanoutRequestDeferral(TestSuite& suite)
 {
   TestRing ring = {};
@@ -1859,6 +1922,7 @@ int main()
   runOwnerFailuresRetry(suite, PublicationFailure::Inner);
   runOwnerFailuresRetry(suite, PublicationFailure::Outer);
   runOwnerFailuresRetry(suite, PublicationFailure::Metadata);
+  runNonQuicBalancerOptionalEgressMaps(suite);
   runNonQuicRoutingFanoutRequestDeferral(suite);
   runNonQuicRoutingSlowMapDeadline(suite);
   runNonQuicRoutingAdoptionSupersessionAndReplacement(suite);
