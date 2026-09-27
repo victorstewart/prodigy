@@ -1,15 +1,16 @@
 # Copyright 2026 Victor Stewart
 # SPDX-License-Identifier: Apache-2.0
 NAME tidesdb
-VERSION 10.0.1-prodigy-0bd3c045
+VERSION 10.0.1-prodigy-b54457c1
 SYSTEM_LIBS ALLOW
-# Fork fixes value-log recovery descriptor exhaustion and idle-reopen segment growth.
+# Fork bounds value-log descriptors during recovery and full-store inspection.
+# Reuse a newest header-only tail to prevent idle-reopen segment growth.
 # Pinned by immutable commit and archive checksum; upstream base 2e029f971e66.
 DEPENDS zstd VERSION 1.5.7
 DEPENDS snappy VERSION 1.2.2
 DEPENDS lz4 VERSION 1.10.0
-SOURCE URL https://github.com/victorstewart/tidesdb/archive/0bd3c0454595dc1e4797caadef81a8c089af1b37.tar.gz
-SHA256 7be1aa992701d0ad33a7b9dfcfe2001a3166c84da39ebe267499d44bdaa6b430
+SOURCE URL https://github.com/victorstewart/tidesdb/archive/b54457c1de640423c75a0ca40f657c8cc8966c6a.tar.gz
+SHA256 f48fb1ae5e091343ae609f69ba96f7cb842fca0edeb3eee47dab476a346276ce
 BUILD_SYSTEM CMAKE
 CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:zstd};${dep:snappy};${dep:lz4}"
 CMAKE_ARG "-DCMAKE_C_FLAGS=-I${dep:zstd}/include -I${dep:snappy}/include -I${dep:lz4}/include"
