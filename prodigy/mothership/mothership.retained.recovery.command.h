@@ -132,14 +132,21 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       if (!mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                      request.bundleSHA,&why,previousBundleSHA256,
                                                      request.interruptedBundleSHA)) {
-        // Only the old coordinator can require this path.  Its witness is
-        // reconstructed from the same sealed inventory before its later phase
-        // is discarded; every other private copy remains echo-only or idle.
+        // A successor can retain the sealed interrupted envelope or a later
+        // pre-exec echo collection with the known earlier digest failure.
+        // Both forms prove the same inventory before the old coordinator's
+        // later handoff case is considered.
         expected=before;
-        require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
-                    expected,request.plans,request.machines,request.bundleSHA,
-                    previousBundleSHA256,request.interruptedBundleSHA,
-                    request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
+        if (!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+                expected,request.plans,request.machines,request.bundleSHA,
+                previousBundleSHA256,request.interruptedBundleSHA,
+                request.mixedSuccessorMachineUUIDs,&why)) {
+          expected=before;
+          require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+                      expected,request.plans,request.machines,request.bundleSHA,
+                      previousBundleSHA256,request.interruptedBundleSHA,
+                      request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
+        }
       }
     } else {
       require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,

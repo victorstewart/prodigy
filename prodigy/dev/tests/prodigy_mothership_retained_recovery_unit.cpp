@@ -781,6 +781,67 @@ int main()
   assert(mothershipPrepareRetainedRecoverySnapshot(mixedWitness,request.plans,request.machines,
                                                    interruptedBundleSHA,&failure));
   Vector<uint128_t> mixedSuccessors={2,3};
+  // A successor can retain the exact interrupted envelope without taking any
+  // update step. Its reconstructed witness must still contain no registered
+  // successor before it can be replaced.
+  auto mixedInterruptedEnvelope=mixedWitness;
+  assert(mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedInterruptedEnvelope,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedBundleSHA,mixedSuccessors,&failure));
+  assert(mothershipRetainedRecoveryEnvelopeMatches(
+      mixedInterruptedEnvelope.masterAuthority.runtimeState.updateSelf,request.bundleSHA));
+  auto mixedInterruptedEnvelopeRegistered=mixedWitness;
+  mixedInterruptedEnvelopeRegistered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[1].bundleRegistered=true;
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedInterruptedEnvelopeRegistered,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedBundleSHA,mixedSuccessors,&failure));
+
+  // A later phase-one echo collection can retain the known earlier
+  // digest failure. Echoes are from the old coordinator and need
+  // only be unique known peers; they are not the successor cohort.
+  String interruptedEchoBlob="mixed-interrupted-echo-bundle"_ctv,interruptedEchoSHA={};
+  assert(prodigyComputeSHA256Hex(interruptedEchoBlob,interruptedEchoSHA));
+  auto mixedEchoWitness=snapshot;
+  mixedEchoWitness.masterAuthority.runtimeState.updateSelf={};
+  assert(mothershipPrepareRetainedRecoverySnapshot(mixedEchoWitness,request.plans,request.machines,
+                                                   interruptedEchoSHA,&failure));
+  auto mixedEcho=mixedEchoWitness;
+  auto& mixedEchoUpdate=mixedEcho.masterAuthority.runtimeState.updateSelf;
+  mixedEchoUpdate.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+  mixedEchoUpdate.expectedEchos=2; mixedEchoUpdate.bundleEchos=2;
+  mixedEchoUpdate.bundleEchoPeerKeys={1,3};
+  mixedEchoUpdate.bundleBlob=interruptedEchoBlob;
+  mixedEchoUpdate.workerExpectedBundleSHA256=interruptedEchoSHA;
+  mixedEchoUpdate.workerFailure="local post-exec bundle digest mismatch"_ctv;
+  for (auto& witness:mixedEchoUpdate.machineRecoveryWitnesses)
+    witness.bundleRegistered=witness.machineUUID==2 || witness.machineUUID==3;
+  auto mixedEchoPrepared=mixedEcho;
+  assert(mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedEchoPrepared,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+  assert(mothershipRetainedRecoveryEnvelopeMatches(
+      mixedEchoPrepared.masterAuthority.runtimeState.updateSelf,request.bundleSHA));
+  auto mixedEchoWrongFailure=mixedEcho;
+  mixedEchoWrongFailure.masterAuthority.runtimeState.updateSelf.workerFailure="other failure"_ctv;
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedEchoWrongFailure,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+  auto mixedEchoWrongDigest=mixedEcho;
+  mixedEchoWrongDigest.masterAuthority.runtimeState.updateSelf.bundleBlob="other interrupted echo bundle"_ctv;
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedEchoWrongDigest,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+  auto mixedEchoWrongRegistration=mixedEcho;
+  mixedEchoWrongRegistration.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[1].bundleRegistered=false;
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedEchoWrongRegistration,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+  auto mixedEchoTransition=mixedEcho;
+  mixedEchoTransition.masterAuthority.runtimeState.updateSelf.workerTransitionIssuedMachineUUIDs.push_back(2);
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      mixedEchoTransition,request.plans,request.machines,request.bundleSHA,
+      previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+
   auto mixedCoordinator=snapshot;
   auto& mixedUpdate=mixedCoordinator.masterAuthority.runtimeState.updateSelf;
   mixedUpdate.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
