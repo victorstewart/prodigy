@@ -25819,7 +25819,7 @@ static void testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(TestSuite&
                    formerMaster.updateSelfRelinquishEchoPeerKeys.empty() &&
                    formerMaster.updateSelfMachineRecoveryWitnesses.size() == 3 &&
                    formerMaster.updateSelfMachineRecoveryWitnesses[0].bundleRegistered == false &&
-                   formerMaster.lastPersistedUpdateSelfState.state == Brain::UpdateSelfState::idle &&
+                   formerMaster.lastPersistedUpdateSelfState.state == uint8_t(Brain::UpdateSelfState::idle) &&
                    formerMaster.lastPersistedUpdateSelfState.machineRecoveryWitnesses.size() == 3,
                "former_master_coordinator_retires_progress_but_preserves_narrow_witness");
 
