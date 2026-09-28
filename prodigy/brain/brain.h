@@ -6893,10 +6893,30 @@ public:
       localUpdateCoordinator.machineRecoveryWitnesses.clear();
     }
 
+    // A former master can receive a newer durable authority projection after
+    // it has relinquished. Its phase/echo coordinator is no longer an owner:
+    // the successor is the only process allowed to advance it. Keep the
+    // exact recovery witness so a later local re-adoption remains bound to
+    // the same bundle, but retire stale progress before persisting the newer
+    // authority. A current master and an equal/older projection retain their
+    // coordinator unchanged.
+    const bool incomingWitnessMatchesLocal =
+        (incomingHasAllMachineWitness || incomingHasLegacyWitness) &&
+        (localHasAllMachineWitness || localHasLegacyWitness) &&
+        updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness);
+    if (weAreMaster == false &&
+        incoming.generation > masterAuthorityRuntimeState.generation &&
+        incomingWitnessMatchesLocal &&
+        updateSelfCoordinatorActiveBeyondRecoveryWitness(localUpdateCoordinator))
+    {
+      localUpdateCoordinator = projectUpdateSelfRecoveryWitness(incomingRecoveryWitness);
+    }
+
     ProdigyMasterAuthorityRuntimeState sanitizedIncoming = incoming;
-    // A follower must retain its own update coordinator, but a successor must
-    // also durably retain the former master's narrow local re-adoption witness.
-    // Do not replicate coordinator echos, peer state, or the bundle payload.
+    // A follower normally retains its own update coordinator, while a
+    // relinquished former master above retains only its narrow re-adoption
+    // witness. A successor also durably retains that witness. Do not replicate
+    // coordinator echos, peer state, or the bundle payload.
     sanitizedIncoming.updateSelf = localUpdateCoordinator;
     ProdigyMachineRetirementJournal retirementJournal = {};
     if (decodeMachineRetirementJournal(sanitizedIncoming, retirementJournal) == false)
@@ -26302,6 +26322,7 @@ public:
     updateSelfPersistenceReady = false;
     updateSelfPersistencePending = 0;
     updateSelfPersistenceFailed = false;
+    updateSelfPersistenceBackpressureDeferrals = 0;
     updateSelfDurableContinuations.clear();
     updateSelfState = UpdateSelfState::idle;
     updateSelfExpectedEchos = 0;
@@ -27039,6 +27060,18 @@ public:
   // All bundle progress in one receipt batch must be durable before a peer
   // command or local exec can consume it. A failed batch remains fenced until
   // recovery restores the durable coordinator state.
+  enum class UpdateSelfPersistenceAdmission : uint8_t { admitted, backpressured, rejected };
+
+  // Production can preflight an ArtifactIO byte/job-capacity miss before it
+  // detaches a large authority snapshot. Base and focused test owners have no
+  // separate queue and therefore admit immediately.
+  virtual UpdateSelfPersistenceAdmission updateSelfPersistenceAdmission(void)
+  {
+    return UpdateSelfPersistenceAdmission::admitted;
+  }
+
+  static constexpr uint32_t maximumUpdateSelfPersistenceBackpressureDeferrals = 20;
+  uint32_t updateSelfPersistenceBackpressureDeferrals = 0;
   size_t updateSelfPersistencePending = 0;
   bool updateSelfPersistenceFailed = false;
   Vector<std::function<void()>> updateSelfDurableContinuations;
@@ -27053,8 +27086,24 @@ public:
   {
     if (version != updateSelfPersistenceVersion) return;
     if (!durable && !updateSelfPersistenceFailed)
-      basics_log("updateProdigy progress persistence failed; commands remain fenced generation=%llu\n",
-                 (unsigned long long)masterAuthorityRuntimeState.generation);
+    {
+      if (masterAuthorityEpoch != updateSelfPersistenceQueuedEpoch)
+      {
+        std::fprintf(stderr,
+                     "updateProdigy progress persistence fenced: authority epoch changed queued=%llu current=%llu generation=%llu\n",
+                     (unsigned long long)updateSelfPersistenceQueuedEpoch,
+                     (unsigned long long)masterAuthorityEpoch,
+                     (unsigned long long)masterAuthorityRuntimeState.generation);
+        std::fflush(stderr);
+      }
+      else
+      {
+        std::fprintf(stderr,
+                     "updateProdigy progress persistence failed; commands remain fenced generation=%llu\n",
+                     (unsigned long long)masterAuthorityRuntimeState.generation);
+        std::fflush(stderr);
+      }
+    }
     updateSelfPersistenceFailed |= !durable;
     if (--updateSelfPersistencePending != 0) return;
     if (updateSelfPersistenceFailed)
@@ -27109,19 +27158,42 @@ public:
       completeUpdateSelfPersistence(version, false);
       return;
     }
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission == UpdateSelfPersistenceAdmission::backpressured)
+    {
+      if (++updateSelfPersistenceBackpressureDeferrals > maximumUpdateSelfPersistenceBackpressureDeferrals ||
+          armUpdateSelfPersistenceTick(50) == false)
+      {
+        std::fprintf(stderr,
+                     "updateProdigy progress persistence rejected after bounded ArtifactIO backpressure deferral generation=%llu attempts=%u\n",
+                     (unsigned long long)masterAuthorityRuntimeState.generation,
+                     unsigned(updateSelfPersistenceBackpressureDeferrals));
+        std::fflush(stderr);
+        completeUpdateSelfPersistence(version, false);
+        return;
+      }
+      updateSelfPersistenceQueued = true;
+      return;
+    }
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      completeUpdateSelfPersistence(version, false);
+      return;
+    }
+    updateSelfPersistenceBackpressureDeferrals = 0;
     commitMasterAuthorityStateChangeAsync([this, version](bool durable) {
       completeUpdateSelfPersistence(version, durable);
     });
   }
 
-  bool armUpdateSelfPersistenceTick()
+  bool armUpdateSelfPersistenceTick(uint64_t delayMs = 1)
   {
     if (updateSelfPersistenceTickQueued) return true;
     if (Ring::getRingFD() <= 0 || Ring::interfacer == nullptr) return false;
     updateSelfPersistenceTick.clear();
     updateSelfPersistenceTick.originator = this;
     updateSelfPersistenceTick.dispatcher = this;
-    updateSelfPersistenceTick.setTimeoutMs(1);
+    updateSelfPersistenceTick.setTimeoutMs(delayMs);
     updateSelfPersistenceTickQueued = true;
     Ring::queueTimeout(&updateSelfPersistenceTick);
     return true;

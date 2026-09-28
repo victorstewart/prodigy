@@ -327,6 +327,73 @@ static void runUpdateBundleWriterMeasurement(TestSuite& suite, const char *bundl
   ring.drainStoppedIO();
 }
 
+static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char *bundlePath)
+{
+  if (bundlePath == nullptr || bundlePath[0] == '\0') return;
+  String bundle = {};
+  Filesystem::openReadAtClose(-1, String(bundlePath), bundle);
+  suite.require(bundle.size() == 34'931'059,
+                "async_persistence_backpressure_reads_runtime6_sized_bundle");
+  if (bundle.size() != 34'931'059) return;
+
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.require(io != nullptr, "async_persistence_backpressure_starts_writer");
+  if (!io) return;
+  ProdigyPersistentStateWriter writer(store, *io);
+  auto snapshotWithBundle = [&bundle](uint64_t generation) {
+    ProdigyPersistentBrainSnapshot snapshot = {};
+    snapshot.masterAuthority.runtimeState.generation = generation;
+    snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob.assign(bundle.data(), bundle.size());
+    snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 =
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv;
+    return snapshot;
+  };
+  auto requestBytesFor = [](ProdigyPersistentBrainSnapshot& snapshot) {
+    ProdigyPersistentBootState boot = {};
+    const uint64_t snapshotBytes = ProdigyPersistentStateWriter::retainedBytesFor(snapshot);
+    const uint64_t bootBytes = ProdigyPersistentStateWriter::retainedBytesFor(boot);
+    return snapshotBytes && bootBytes && snapshotBytes <= ProdigyPersistentStateWriter::maximumRetainedBytes - bootBytes
+        ? snapshotBytes + bootBytes : uint64_t(0);
+  };
+  ProdigyPersistentBrainSnapshot first = snapshotWithBundle(1);
+  const uint64_t requestBytes = requestBytesFor(first);
+  suite.require(requestBytes != 0 && requestBytes < ProdigyPersistentStateWriter::maximumRetainedBytes,
+                "async_persistence_backpressure_uses_exact_schema_accounting");
+  if (!requestBytes)
+  {
+    io->stop();
+    ring.drainStoppedIO();
+    return;
+  }
+
+  uint32_t completedReceipts = 0;
+  uint32_t durableReceipts = 0;
+  const bool firstAdmitted = writer.submitSnapshot(std::move(first), {}, requestBytes,
+      [&completedReceipts, &durableReceipts](auto&& result) {
+        durableReceipts += result.snapshotDurable && result.bootStateDurable;
+        if (++completedReceipts == 2) Ring::exit = true;
+      });
+  const bool secondAdmitted = writer.submitSnapshot(snapshotWithBundle(2), {}, requestBytes,
+      [&completedReceipts, &durableReceipts](auto&& result) {
+        durableReceipts += result.snapshotDurable && result.bootStateDurable;
+        if (++completedReceipts == 2) Ring::exit = true;
+      });
+  const ProdigyArtifactIO::Admission thirdAdmission = writer.admission(requestBytes);
+  const bool thirdAdmitted = writer.submitSnapshot(snapshotWithBundle(3), {}, requestBytes,
+      [&durableReceipts](auto&& result) { durableReceipts += result.snapshotDurable && result.bootStateDurable; });
+  ring.armDeadline(10'000);
+  Ring::start();
+  suite.expect(firstAdmitted && secondAdmitted &&
+                   thirdAdmission == ProdigyArtifactIO::Admission::byteCapacity &&
+                   thirdAdmitted == false && completedReceipts == 2 && durableReceipts == 2 && writer.drainForExec(),
+               "async_persistence_backpressure_rejects_only_transient_third_runtime6_snapshot");
+  io->stop();
+  ring.drainStoppedIO();
+}
+
 int main()
 {
   TestSuite suite;
@@ -334,6 +401,7 @@ int main()
   testPersistentWriterOwnsVersionedAuthorityState(suite);
   testPersistentWriterRetainsOwnedStorage(suite);
   runUpdateBundleWriterMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
+  runUpdateBundleBackpressureMeasurement(suite, std::getenv("PRODIGY_TEST_PERSISTENCE_BACKPRESSURE_BUNDLE"));
 
   // The actual TidesDB owner remains private to the state store.  This proves
   // the default commit crosses ArtifactIO and only reports durable completion

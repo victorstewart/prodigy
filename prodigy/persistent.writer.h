@@ -411,6 +411,14 @@ public:
 
   // retainedBytes must cover the detached domain payload, including owned
   // blobs and serialization growth; it is an admission contract, not a hint.
+  ProdigyArtifactIO::Admission admission(uint64_t retainedBytes) const
+  {
+    if (accepting == false) return ProdigyArtifactIO::Admission::stopping;
+    if (commitFailureLatched || retainedBytes == 0) return ProdigyArtifactIO::Admission::submissionRejected;
+    if (pendingRequests == maximumPendingRequests) return ProdigyArtifactIO::Admission::jobCapacity;
+    return io.admission(retainedBytes);
+  }
+
   bool submitSnapshot(ProdigyPersistentBrainSnapshot snapshot, ProdigyPersistentBootState bootState,
                       uint64_t retainedBytes, Completion completion)
   {

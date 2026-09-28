@@ -1,5 +1,6 @@
 #include <prodigy/prodigy.h>
 #include <prodigy/neuron.hub.h>
+#include <prodigy/persistent.writer.h>
 #include <limits.h>
 #include <services/debug.h>
 #include <prodigy/brain/brain.h>
@@ -95,6 +96,8 @@ public:
   bool holdRuntimePersistence = false;
   std::deque<PersistenceCompletion> pendingRuntimePersistence;
   bool asyncMasterAuthorityPersistence = false;
+  uint32_t updateSelfPersistenceBackpressureResponses = 0;
+  bool rejectUpdateSelfPersistenceAdmission = false;
   uint32_t masterAuthorityTransitionCandidatePersistCalls = 0;
   bool holdClusterOwnership = false;
   std::deque<std::function<void(bool)>> pendingClusterOwnership;
@@ -191,6 +194,17 @@ public:
   bool usesAsyncMasterAuthorityPersistence() const override
   {
     return asyncMasterAuthorityPersistence;
+  }
+
+  UpdateSelfPersistenceAdmission updateSelfPersistenceAdmission(void) override
+  {
+    if (rejectUpdateSelfPersistenceAdmission) return UpdateSelfPersistenceAdmission::rejected;
+    if (updateSelfPersistenceBackpressureResponses > 0)
+    {
+      --updateSelfPersistenceBackpressureResponses;
+      return UpdateSelfPersistenceAdmission::backpressured;
+    }
+    return UpdateSelfPersistenceAdmission::admitted;
   }
 
   bool persistMasterAuthorityTransitionCandidate(
@@ -25761,6 +25775,135 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   thisNeuron = previousNeuron;
 }
 
+static void testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(TestSuite& suite)
+{
+  TestBrain formerMaster = {};
+  formerMaster.weAreMaster = false;
+  formerMaster.masterAuthorityRuntimeState.generation = 7;
+  formerMaster.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  formerMaster.updateSelfExpectedEchos = 2;
+  formerMaster.updateSelfBundleEchos = 2;
+  formerMaster.updateSelfRelinquishEchos = 1;
+  formerMaster.updateSelfWorkerExpectedBundleSHA256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+  formerMaster.updateSelfWorkerFailure.assign("local post-exec bundle digest mismatch"_ctv);
+  formerMaster.updateSelfBundleEchoPeerKeys.insert(uint128_t(0x521d0002));
+  formerMaster.updateSelfFollowerRebootedPeerKeys.insert(uint128_t(0x521d0002));
+  formerMaster.updateSelfRelinquishEchoPeerKeys.insert(uint128_t(0x521d0003));
+  for (uint128_t machineUUID : {uint128_t(0x521d0001), uint128_t(0x521d0002), uint128_t(0x521d0003)})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.bundleRegistered = true;
+    witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+    formerMaster.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  }
+
+  ProdigyMasterAuthorityRuntimeState successorAuthority = {};
+  successorAuthority.generation = 8;
+  successorAuthority.nextPendingAddMachinesOperationID = 1;
+  successorAuthority.nextPendingElasticAddressOperationID = 1;
+  successorAuthority.nextDNSIntentRevision = 1;
+  successorAuthority.nextTlsResumptionGeneration = 1;
+  successorAuthority.updateSelf = Brain::projectUpdateSelfRecoveryWitness(
+      formerMaster.capturePersistentUpdateSelfState());
+  suite.require(formerMaster.applyReplicatedMasterAuthorityRuntimeState(successorAuthority, true),
+                "former_master_coordinator_accepts_newer_matching_authority");
+  suite.expect(formerMaster.updateSelfState == Brain::UpdateSelfState::idle &&
+                   formerMaster.updateSelfExpectedEchos == 0 &&
+                   formerMaster.updateSelfBundleEchos == 0 &&
+                   formerMaster.updateSelfRelinquishEchos == 0 &&
+                   formerMaster.updateSelfWorkerFailure.empty() &&
+                   formerMaster.updateSelfBundleEchoPeerKeys.empty() &&
+                   formerMaster.updateSelfFollowerRebootedPeerKeys.empty() &&
+                   formerMaster.updateSelfRelinquishEchoPeerKeys.empty() &&
+                   formerMaster.updateSelfMachineRecoveryWitnesses.size() == 3 &&
+                   formerMaster.updateSelfMachineRecoveryWitnesses[0].bundleRegistered == false &&
+                   formerMaster.lastPersistedUpdateSelfState.state == Brain::UpdateSelfState::idle &&
+                   formerMaster.lastPersistedUpdateSelfState.machineRecoveryWitnesses.size() == 3,
+               "former_master_coordinator_retires_progress_but_preserves_narrow_witness");
+
+  TestBrain activeMaster = {};
+  activeMaster.weAreMaster = true;
+  activeMaster.masterAuthorityRuntimeState.generation = 7;
+  activeMaster.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  activeMaster.updateSelfExpectedEchos = 2;
+  activeMaster.updateSelfWorkerExpectedBundleSHA256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+  for (const auto& witness : formerMaster.updateSelfMachineRecoveryWitnesses)
+  {
+    activeMaster.updateSelfMachineRecoveryWitnesses.push_back(witness);
+  }
+  suite.require(activeMaster.applyReplicatedMasterAuthorityRuntimeState(successorAuthority, true),
+                "active_master_accepts_newer_matching_authority");
+  suite.expect(activeMaster.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots &&
+                   activeMaster.updateSelfExpectedEchos == 2,
+               "active_master_retains_current_update_coordinator");
+}
+
+static void testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(TestSuite& suite)
+{
+  // This matches the sealed runtime6 bundle size that reached the update
+  // coordinator. It exercises the production schema accounting, rather than
+  // a hand-written multiplier, before a writer can reject the snapshot.
+  constexpr size_t runtimeBundleBytes = 34'931'059;
+  std::string bundle(runtimeBundleBytes, 'u');
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  snapshot.masterAuthority.runtimeState.generation = 360;
+  snapshot.masterAuthority.runtimeState.updateSelf.bundleBlob.assign(bundle.data(), bundle.size());
+  snapshot.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 =
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv;
+  ProdigyPersistentBootState bootState = {};
+  const uint64_t snapshotBytes = ProdigyPersistentStateWriter::retainedBytesFor(snapshot);
+  const uint64_t bootStateBytes = ProdigyPersistentStateWriter::retainedBytesFor(bootState);
+  const bool budgeted = snapshotBytes != 0 && bootStateBytes != 0 &&
+      snapshotBytes <= ProdigyPersistentStateWriter::maximumRetainedBytes - bootStateBytes;
+  suite.require(budgeted,
+                "ordinary_update_bundle_35mb_fits_detached_snapshot_retention_budget");
+  if (budgeted)
+  {
+    suite.expect(ProdigyPersistentStateWriter::detach(snapshot) &&
+                     ProdigyPersistentStateWriter::detach(bootState),
+                 "ordinary_update_bundle_35mb_detaches_for_async_persistence");
+  }
+}
+
+static void testUpdateSelfPersistenceBackpressureDefersOnlyCapacityMisses(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestBrain deferred = {};
+  deferred.asyncMasterAuthorityPersistence = true;
+  deferred.updateSelfPersistenceBackpressureResponses = 1;
+  bool resumed = false;
+  Ring::exit = false;
+  deferred.persistUpdateSelfProgress([&] {
+    resumed = true;
+    Ring::exit = true;
+  });
+  Ring::start();
+  suite.expect(resumed && deferred.persistCalls == 1 &&
+                   deferred.updateSelfPersistenceFailed == false,
+               "update_self_persistence_backpressure_defers_then_resumes_durable_progress");
+
+  TestBrain rejected = {};
+  rejected.rejectUpdateSelfPersistenceAdmission = true;
+  bool rejectedResumed = false;
+  rejected.persistUpdateSelfProgress([&] { rejectedResumed = true; });
+  suite.expect(rejected.persistCalls == 0 && rejectedResumed == false &&
+                   rejected.updateSelfPersistenceFailed,
+               "update_self_persistence_terminal_admission_remains_fenced");
+
+  TestBrain superseded = {};
+  superseded.holdRuntimePersistence = true;
+  bool supersededResumed = false;
+  superseded.persistUpdateSelfProgress([&] { supersededResumed = true; });
+  superseded.advanceMasterAuthorityEpoch();
+  superseded.finishRuntimePersistence(true);
+  suite.expect(superseded.persistCalls == 1 && supersededResumed == false &&
+                   superseded.updateSelfPersistenceFailed,
+               "update_self_persistence_epoch_supersession_remains_fenced");
+}
+
 static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -28110,6 +28253,9 @@ int main(void)
     testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
     testElasticReplicationIdentityAndDivergenceGuards(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
+    testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
+    testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(suite);
+    testUpdateSelfPersistenceBackpressureDefersOnlyCapacityMisses(suite);
     testAsyncMachineRetirementJournalDurability(suite);
     std::printf("ORDINARY_UPGRADE_AUTHORITY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -28187,6 +28333,7 @@ int main(void)
     testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(suite);
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
+    testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
     testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
     testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
