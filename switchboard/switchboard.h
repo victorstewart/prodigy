@@ -2278,7 +2278,10 @@ private:
       return;
     }
 
-    if (!portals.empty())
+    // A configured secondary ingress is itself a boundary-router consumer.
+    // Resetting portals must not leave it attached to an old program/map set
+    // while a subsequent wormhole recreates only the primary router.
+    if (additionalIngressEth != nullptr || !portals.empty())
     {
       return;
     }

@@ -94,6 +94,11 @@ public:
   {
     return board.subnet;
   }
+  static void setBoundaryConsumer(Switchboard& board, BPFProgram *router, EthDevice *ingress)
+  {
+    board.bpf_router = router;
+    board.additionalIngressEth = ingress;
+  }
 };
 
 class TestNeuron final : public Neuron {
@@ -401,6 +406,16 @@ int main()
     suite.expect(lazySwitchboard != nullptr && seeded.dpfx == 9 && seeded.mpfx[0] == 4 &&
                      seeded.mpfx[1] == 5 && seeded.mpfx[2] == 6,
                  "neuron_lazy_switchboard_receives_existing_fragment_before_optional_ingress");
+    BPFProgram retainedRouter = {};
+    EthDevice selectedIngress = {};
+    SwitchboardRingTestAccess::setBoundaryConsumer(*lazySwitchboard, &retainedRouter, &selectedIngress);
+    lazySwitchboard->resetState();
+    suite.expect(lazySwitchboard->boundaryRouterProgram() == &retainedRouter,
+                 "switchboard_reset_preserves_router_used_by_selected_ingress");
+    SwitchboardRingTestAccess::setBoundaryConsumer(*lazySwitchboard, &retainedRouter, nullptr);
+    lazySwitchboard->resetState();
+    suite.expect(lazySwitchboard->boundaryRouterProgram() == nullptr,
+                 "switchboard_reset_releases_router_without_remaining_consumers");
   }
   String fixture = {};
   const bool hasArtifactFixture = loadFixture(fixture);
