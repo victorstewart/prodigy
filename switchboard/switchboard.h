@@ -481,6 +481,15 @@ private:
   BPFProgram *bpf_router = nullptr;
   BPFProgram *host_ingress = nullptr;
   BPFProgram *host_egress = nullptr;
+  // An optional Ethernet veth delivers decrypted web-tunnel packets.  It
+  // deliberately reuses the boundary programs, rather than loading another
+  // object with a divergent copy of the routing maps.
+  EthDevice *additionalIngressEth = nullptr;
+  int additionalIngressTCXLink = -1;
+  bool additionalIngressXDPAttached = false;
+  uint32_t additionalIngressIfidx = 0;
+  uint32_t additionalIngressXDPProgramID = 0;
+  uint32_t additionalIngressTCXProgramID = 0;
   struct local_container_subnet6 subnet = {};
 
   Vector<IPPrefix> announcingPrefixes;
@@ -2437,6 +2446,7 @@ public:
 
   ~Switchboard()
   {
+    detachAdditionalIngress();
     ringPreparationLifetime.reset();
     ringPreparationQuiescing = true;
     ringWaiters.clear();
@@ -2455,6 +2465,159 @@ public:
   {
     host_ingress = program;
     requestRuntimeRoutingReconciliation();
+  }
+
+  void detachAdditionalIngress(void)
+  {
+    if (additionalIngressTCXLink >= 0)
+    {
+      (void)bpf_link_detach(additionalIngressTCXLink);
+      ::close(additionalIngressTCXLink);
+      additionalIngressTCXLink = -1;
+    }
+    if (additionalIngressXDPAttached && additionalIngressIfidx != 0)
+    {
+      __u32 currentID = 0;
+      if (bpf_xdp_query_id(additionalIngressIfidx, XDP_FLAGS_SKB_MODE, &currentID) == 0 &&
+          currentID == additionalIngressXDPProgramID)
+      {
+        const int oldProgramFD = bpf_prog_get_fd_by_id(additionalIngressXDPProgramID);
+        if (oldProgramFD >= 0)
+        {
+          struct bpf_xdp_attach_opts options = {};
+          options.sz = sizeof(options);
+          options.old_prog_fd = oldProgramFD;
+          (void)bpf_xdp_attach(additionalIngressIfidx, -1, XDP_FLAGS_SKB_MODE, &options);
+          ::close(oldProgramFD);
+        }
+      }
+    }
+    additionalIngressXDPAttached = false;
+    additionalIngressIfidx = 0;
+    additionalIngressXDPProgramID = 0;
+    additionalIngressTCXProgramID = 0;
+    additionalIngressEth = nullptr;
+  }
+
+  static uint32_t kernelProgramID(BPFProgram *program)
+  {
+    if (program == nullptr || program->prog_fd < 0) return 0;
+    struct bpf_prog_info info = {};
+    __u32 length = sizeof(info);
+    return bpf_prog_get_info_by_fd(program->prog_fd, &info, &length) == 0 ? info.id : 0;
+  }
+
+  // The tunnel endpoint is an Ethernet veth peer, so the existing XDP and TCX
+  // programs can process it unchanged.  Attaching the same program FDs means
+  // the authoritative maps and their reconciliation stay singular.
+  bool configureAdditionalIngress(EthDevice& ingress, BPFProgram *ingressProgram, String *failureReport = nullptr)
+  {
+    if (ingress.ifidx == 0 || ingressProgram == nullptr || ensureBoundaryRouterConfigured() == false || bpf_router == nullptr)
+    {
+      if (failureReport) failureReport->assign("additional ingress routing programs unavailable"_ctv);
+      return false;
+    }
+    const uint32_t desiredXDPProgramID = kernelProgramID(bpf_router);
+    const uint32_t desiredTCXProgramID = kernelProgramID(ingressProgram);
+    if (desiredXDPProgramID == 0 || desiredTCXProgramID == 0)
+    {
+      if (failureReport) failureReport->assign("additional ingress program identity unavailable"_ctv);
+      return false;
+    }
+    if (additionalIngressEth && (additionalIngressEth != &ingress || additionalIngressIfidx != ingress.ifidx))
+    {
+      detachAdditionalIngress();
+    }
+    additionalIngressEth = &ingress;
+
+    if (additionalIngressXDPAttached)
+    {
+      __u32 currentID = 0;
+      if (bpf_xdp_query_id(ingress.ifidx, XDP_FLAGS_SKB_MODE, &currentID) != 0)
+      {
+        if (failureReport) failureReport->assign("additional ingress XDP identity query failed"_ctv);
+        return false;
+      }
+      if (currentID != additionalIngressXDPProgramID)
+      {
+        if (currentID != 0)
+        {
+          if (failureReport) failureReport->assign("additional ingress XDP is not Switchboard-owned"_ctv);
+          return false;
+        }
+        additionalIngressXDPAttached = false;
+        additionalIngressXDPProgramID = 0;
+      }
+      else if (currentID != desiredXDPProgramID)
+      {
+        detachAdditionalIngress();
+        additionalIngressEth = &ingress;
+      }
+    }
+
+    if (additionalIngressXDPAttached == false)
+    {
+      __u32 existingID = 0;
+      if (bpf_xdp_query_id(ingress.ifidx, XDP_FLAGS_SKB_MODE, &existingID) != 0)
+      {
+        if (failureReport) failureReport->assign("additional ingress XDP identity query failed"_ctv);
+        additionalIngressEth = nullptr;
+        return false;
+      }
+      if (existingID == desiredXDPProgramID)
+      {
+        additionalIngressXDPAttached = true;
+        additionalIngressIfidx = ingress.ifidx;
+        additionalIngressXDPProgramID = desiredXDPProgramID;
+      }
+      else if (existingID != 0)
+      {
+        if (failureReport) failureReport->assign("additional ingress XDP is not Switchboard-owned"_ctv);
+        additionalIngressEth = nullptr;
+        return false;
+      }
+    }
+
+    if (additionalIngressXDPAttached == false)
+    {
+      const int attachResult = bpf_xdp_attach(ingress.ifidx, bpf_router->prog_fd, XDP_FLAGS_SKB_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST, nullptr);
+      if (attachResult != 0 && attachResult != -EEXIST && errno != EEXIST)
+      {
+        if (failureReport) failureReport->snprintf<"additional ingress XDP attach failed ifidx={itoa} errno={itoa}"_ctv>(ingress.ifidx, uint32_t(errno));
+        additionalIngressEth = nullptr;
+        return false;
+      }
+      __u32 attachedID = 0;
+      if (bpf_xdp_query_id(ingress.ifidx, XDP_FLAGS_SKB_MODE, &attachedID) != 0 || attachedID != desiredXDPProgramID)
+      {
+        if (failureReport) failureReport->assign("additional ingress XDP identity verification failed"_ctv);
+        additionalIngressEth = nullptr;
+        return false;
+      }
+      additionalIngressXDPAttached = true;
+      additionalIngressIfidx = ingress.ifidx;
+      additionalIngressXDPProgramID = desiredXDPProgramID;
+    }
+
+    if (additionalIngressTCXLink >= 0 && additionalIngressTCXProgramID != desiredTCXProgramID)
+    {
+      (void)bpf_link_detach(additionalIngressTCXLink);
+      ::close(additionalIngressTCXLink);
+      additionalIngressTCXLink = -1;
+    }
+    if (additionalIngressTCXLink < 0)
+    {
+      additionalIngressTCXLink = bpf_link_create(ingressProgram->prog_fd, ingress.ifidx, BPF_TCX_INGRESS, nullptr);
+      if (additionalIngressTCXLink < 0)
+      {
+        if (failureReport) failureReport->snprintf<"additional ingress TCX attach failed ifidx={itoa} errno={itoa}"_ctv>(ingress.ifidx, uint32_t(errno));
+        detachAdditionalIngress();
+        return false;
+      }
+      additionalIngressTCXProgramID = desiredTCXProgramID;
+    }
+    requestRuntimeRoutingReconciliation();
+    return true;
   }
 
   void syncContainerProgramRuntimeState(BPFProgram *peerProgram, BPFProgram *primaryProgram)

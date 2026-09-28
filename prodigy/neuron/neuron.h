@@ -11,7 +11,9 @@
 #include <utility>
 #include <poll.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -111,6 +113,7 @@ protected:
   NeuronIaaS *iaas;
   std::unique_ptr<NeuronBGPRuntime> bgp;
   std::unique_ptr<Switchboard> switchboard;
+  std::unique_ptr<EthDevice> additionalIngressEth;
   SwitchboardOverlayRoutingConfig overlayRoutingConfig;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix4_key> installedIngressOverlayPrefixes4;
   ProdigyOverlayPresenceMirror<switchboard_overlay_prefix6_key> installedIngressOverlayPrefixes6;
@@ -881,6 +884,52 @@ protected:
 
     hostIngressPath.assign(ingressEnv);
     hostEgressPath.assign(egressEnv);
+    return true;
+  }
+
+  bool resolveOptionalAdditionalIngressDevice(String& device, String *failureReport = nullptr) const
+  {
+    static constexpr const char *path = "/etc/prodigy/additional-ingress-interface";
+    device.clear();
+    int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+    {
+      if (errno == ENOENT) return true;
+      if (failureReport) failureReport->snprintf<"additional ingress configuration open failed errno={itoa}"_ctv>(uint32_t(errno));
+      return false;
+    }
+    struct stat metadata = {};
+    char value[IF_NAMESIZE + 2] = {};
+    ssize_t bytes = ::read(fd, value, sizeof(value));
+    const int readErrno = errno;
+    const bool safe = ::fstat(fd, &metadata) == 0 && S_ISREG(metadata.st_mode) && metadata.st_uid == 0 &&
+                      (metadata.st_mode & 0022) == 0 && metadata.st_nlink == 1 && bytes > 0 && bytes < ssize_t(sizeof(value));
+    ::close(fd);
+    if (safe == false)
+    {
+      if (failureReport) failureReport->snprintf<"additional ingress configuration rejected errno={itoa}"_ctv>(uint32_t(readErrno));
+      return false;
+    }
+    if (value[bytes - 1] == '\n')
+    {
+      --bytes;
+      value[bytes] = '\0';
+    }
+    if (bytes == 0 || bytes >= IF_NAMESIZE || value[bytes] != '\0')
+    {
+      if (failureReport) failureReport->assign("additional ingress interface name is invalid"_ctv);
+      return false;
+    }
+    for (ssize_t index = 0; index < bytes; ++index)
+    {
+      const unsigned char c = static_cast<unsigned char>(value[index]);
+      if (!(c == '_' || c == '-' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
+      {
+        if (failureReport) failureReport->assign("additional ingress interface name is invalid"_ctv);
+        return false;
+      }
+    }
+    device.assign(value, bytes);
     return true;
   }
 
@@ -2775,6 +2824,48 @@ protected:
     syncOverlayRoutingPrograms();
   }
 
+  bool ensureAdditionalIngressReady(String *failureReport = nullptr)
+  {
+    String device = {};
+    if (resolveOptionalAdditionalIngressDevice(device, failureReport) == false)
+    {
+      return false;
+    }
+    if (device.size() == 0)
+    {
+      if (switchboard) switchboard->detachAdditionalIngress();
+      additionalIngressEth.reset();
+      return true;
+    }
+    if (tcx_ingress_program == nullptr)
+    {
+      if (failureReport) failureReport->assign("additional ingress requires host ingress router"_ctv);
+      return false;
+    }
+    if (!additionalIngressEth) additionalIngressEth = std::make_unique<EthDevice>();
+    additionalIngressEth->setDevice(device);
+    if (additionalIngressEth->ifidx == 0 || additionalIngressEth->ifidx == eth.ifidx)
+    {
+      if (failureReport) failureReport->assign("additional ingress is not a distinct veth"_ctv);
+      return false;
+    }
+    String iflinkPath = "/sys/class/net/"_ctv;
+    iflinkPath.append(device);
+    iflinkPath.append("/iflink"_ctv);
+    char iflink[32] = {};
+    int iflinkFD = ::open(iflinkPath.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const ssize_t iflinkBytes = iflinkFD >= 0 ? ::read(iflinkFD, iflink, sizeof(iflink) - 1) : -1;
+    if (iflinkFD >= 0) ::close(iflinkFD);
+    char *end = nullptr;
+    const unsigned long peerIfidx = iflinkBytes > 0 ? ::strtoul(iflink, &end, 10) : 0;
+    if (peerIfidx == 0 || end == iflink || peerIfidx == additionalIngressEth->ifidx)
+    {
+      if (failureReport) failureReport->assign("additional ingress does not prove a veth peer"_ctv);
+      return false;
+    }
+    return ensureSwitchboard()->configureAdditionalIngress(*additionalIngressEth, tcx_ingress_program, failureReport);
+  }
+
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) override
   {
     if (writeProcSysctlValue("/proc/sys/net/ipv4/ip_forward", "1") == false)
@@ -2797,7 +2888,7 @@ protected:
 
     if (tcx_ingress_program && tcx_egress_program)
     {
-      return true;
+      return ensureAdditionalIngressReady(failureReport);
     }
 
     if (haveFragments() == false)
@@ -2857,7 +2948,7 @@ protected:
       return false;
     }
 
-    return true;
+    return ensureAdditionalIngressReady(failureReport);
   }
 
 public:
@@ -2882,6 +2973,8 @@ public:
       wormholeFlowGC = nullptr;
       gc->stop();
     }
+    if (switchboard) switchboard->detachAdditionalIngress();
+    additionalIngressEth.reset();
   }
 
   static int64_t registrationBootTimeMs(void)
