@@ -2822,6 +2822,21 @@ protected:
 
     syncWhiteholeBindingsProgram();
     syncOverlayRoutingPrograms();
+
+    // Retained recovery invokes setupNetworking directly before it restores any
+    // container network. Consume the optional, root-owned ingress selection
+    // here too, rather than relying on a later container setup to attach it.
+    String additionalIngressFailure = {};
+    if (ensureAdditionalIngressReady(&additionalIngressFailure) == false)
+    {
+      if (failureReport && failureReport->empty())
+      {
+        failureReport->assign(additionalIngressFailure);
+      }
+      std::fprintf(stderr, "neuron additional ingress setup failed reason=%s\n",
+                   additionalIngressFailure.c_str());
+      std::fflush(stderr);
+    }
   }
 
   bool ensureAdditionalIngressReady(String *failureReport = nullptr)
