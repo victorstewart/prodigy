@@ -486,6 +486,37 @@ int main()
     fs::remove_all(directory);
   }
 
+  // Version two is deliberately confined to retained recovery and binds every
+  // observed executable pair to one of exactly two locally approved bundles.
+  // Parser failures happen before any Mothership connection or lifecycle work.
+  {
+    fs::create_directories(".run");
+    char directory[]=".run/retained-mixed-plan-unit-XXXXXX";
+    assert(::mkdtemp(directory));
+    const std::string path=std::string(directory)+"/plan.json";
+    const std::string oldRuntime(64,'a'), oldBundle(64,'b');
+    const std::string newRuntime(64,'c'), interruptedBundle(64,'d');
+    auto planJSON=[&](bool retained=true) {
+      return std::string("{\"schemaVersion\":2,\"retainedRecoveryMode\":")+(retained?"true":"false")+
+        ",\"clusterUUID\":\"0x7\",\"operationID\":\"0x8\",\"operationRoot\":\"/private/operation\",\"registryRoot\":\"/private/registry\",\"bundlePath\":\"/private/successor.bundle\",\"runtimeRoot\":\"/root/prodigy-nuc\",\"statePath\":\"/var/lib/prodigy/state\",\"secretsPath\":\"/var/lib/prodigy/secrets\",\"expectedOldRuntimeSHA256\":\""+oldRuntime+"\",\"expectedOldBundleSHA256\":\""+oldBundle+"\",\"machines\":["
+        "{\"machineUUID\":\"0x1\",\"linuxMachineID\":\"11111111111111111111111111111111\",\"sshAddress\":\"fd72::1\",\"installedRuntimeRoot\":\"/root/prodigy-nuc\",\"installedRuntimeSHA256\":\""+oldRuntime+"\",\"installedBundleSHA256\":\""+oldBundle+"\"},"
+        "{\"machineUUID\":\"0x2\",\"linuxMachineID\":\"22222222222222222222222222222222\",\"sshAddress\":\"fd72::2\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+newRuntime+"\",\"installedBundleSHA256\":\""+interruptedBundle+"\"},"
+        "{\"machineUUID\":\"0x3\",\"linuxMachineID\":\"33333333333333333333333333333333\",\"sshAddress\":\"fd72::3\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+newRuntime+"\",\"installedBundleSHA256\":\""+interruptedBundle+"\"}],\"approvedPredecessors\":["
+        "{\"runtimeSHA256\":\""+oldRuntime+"\",\"bundleSHA256\":\""+oldBundle+"\",\"bundlePath\":\"/private/old.bundle\"},"
+        "{\"runtimeSHA256\":\""+newRuntime+"\",\"bundleSHA256\":\""+interruptedBundle+"\",\"bundlePath\":\"/private/interrupted.bundle\"}]}";
+    };
+    auto writePlan=[&](const std::string& value) { durable(path,text(value)); assert(::chmod(path.c_str(),0600)==0); };
+    auto rejects=[&](const std::string& value) { writePlan(value); bool rejected=false; try {(void)MothershipTidesMigration::parse(path.c_str());} catch(const std::exception&) {rejected=true;} assert(rejected); };
+    writePlan(planJSON()); const auto parsed=MothershipTidesMigration::parse(path.c_str());
+    assert(parsed.mixedPredecessors && parsed.approvedPredecessors.size()==2 && parsed.machines[0].runtimeRoot=="/root/prodigy-nuc");
+    auto missingIdentity=planJSON(); const auto identity="\"installedRuntimeSHA256\":\""+oldRuntime+"\","; missingIdentity.erase(missingIdentity.find(identity),identity.size()); rejects(missingIdentity);
+    auto unknownPair=planJSON(); unknownPair.replace(unknownPair.find("\"installedRuntimeSHA256\":\""+newRuntime),std::string("\"installedRuntimeSHA256\":\"").size()+newRuntime.size(),"\"installedRuntimeSHA256\":\""+std::string(64,'e')); rejects(unknownPair);
+    auto duplicatePair=planJSON(); const auto second="{\"runtimeSHA256\":\""+newRuntime+"\",\"bundleSHA256\":\""+interruptedBundle+"\",\"bundlePath\":\"/private/interrupted.bundle\"}"; const auto first="{\"runtimeSHA256\":\""+oldRuntime+"\",\"bundleSHA256\":\""+oldBundle+"\",\"bundlePath\":\"/private/old.bundle\"}"; duplicatePair.replace(duplicatePair.find(second),second.size(),first); rejects(duplicatePair);
+    auto duplicateMachine=planJSON(); duplicateMachine.replace(duplicateMachine.find("\"machineUUID\":\"0x3\""),std::strlen("\"machineUUID\":\"0x3\""),"\"machineUUID\":\"0x2\""); rejects(duplicateMachine);
+    rejects(planJSON(false));
+    fs::remove_all(directory);
+  }
+
   Request request;request.clusterUUID=1;
   String interruptedBundle = "retained-recovery-interrupted-update-bundle"_ctv;
   assert(prodigyComputeSHA256Hex(interruptedBundle,request.bundleSHA));
@@ -519,10 +550,14 @@ int main()
   predecessorPlan.registryRoot="/root/registry"; successorPlan.registryRoot="/root/registry"; predecessorPlan.runtimeRoot="/root/prodigy"; successorPlan.runtimeRoot="/root/prodigy";
   predecessorPlan.statePath="/var/lib/prodigy/state"; successorPlan.statePath=predecessorPlan.statePath; predecessorPlan.secretsPath="/var/lib/prodigy/secrets"; successorPlan.secretsPath=predecessorPlan.secretsPath;
   predecessorPlan.oldRuntimeSHA=std::string(64,'a'); successorPlan.oldRuntimeSHA=predecessorPlan.oldRuntimeSHA; predecessorPlan.oldBundleSHA=std::string(64,'b'); successorPlan.oldBundleSHA=predecessorPlan.oldBundleSHA;
-  MothershipTidesMigration::Machine plannedMachine = {}; plannedMachine.uuid=3; plannedMachine.linuxID="0123456789abcdef0123456789abcdef"; plannedMachine.address="fd72::1"; predecessorPlan.machines.push_back(plannedMachine); successorPlan.machines.push_back(plannedMachine);
+  MothershipTidesMigration::Machine plannedMachine = {}; plannedMachine.uuid=3; plannedMachine.linuxID="0123456789abcdef0123456789abcdef"; plannedMachine.address="fd72::1"; plannedMachine.runtimeRoot="/root/observed-prodigy"; plannedMachine.installedRuntimeSHA=std::string(64,'a'); plannedMachine.installedBundleSHA=std::string(64,'b'); predecessorPlan.machines.push_back(plannedMachine); successorPlan.machines.push_back(plannedMachine);
   assert(samePlanTarget(predecessorPlan,successorPlan)); successorPlan.operationRoot=predecessorPlan.operationRoot;
   assert(!samePlanTarget(predecessorPlan,successorPlan));
   successorPlan.operationRoot="/root/new";
+  MothershipTidesMigration::Execution serviceRootFixture(predecessorPlan);
+  assert(serviceRootFixture.activeRuntimeRoot(serviceRootFixture.plan.machines[0])=="/root/observed-prodigy");
+  assert(serviceRootFixture.serviceRuntimeRoot()=="/root/prodigy");
+  assert(serviceRootFixture.serviceExecStartCheck().find("/root/prodigy/prodigy")!=std::string::npos);
   for (auto member : {&MothershipTidesMigration::Plan::statePath, &MothershipTidesMigration::Plan::secretsPath,
                       &MothershipTidesMigration::Plan::runtimeRoot, &MothershipTidesMigration::Plan::registryRoot,
                       &MothershipTidesMigration::Plan::oldRuntimeSHA, &MothershipTidesMigration::Plan::oldBundleSHA}) {
@@ -732,6 +767,57 @@ int main()
   assert(mothershipPrepareRetainedRecoverySnapshot(predecessorPrepared,request.plans,request.machines,request.bundleSHA,&failure,previousBundleSHA));
   assert(predecessorPrepared.masterAuthority.runtimeState.generation==predecessorEnvelopeSnapshot.masterAuthority.runtimeState.generation+1);
   assert(mothershipRetainedRecoveryEnvelopeMatches(predecessorPrepared.masterAuthority.runtimeState.updateSelf,request.bundleSHA));
+
+  // A mixed predecessor can have its former coordinator at the only later
+  // phase accepted by retained recovery.  The exact all-machine witness and
+  // both successor-machine reboot records make this distinct from an ordinary
+  // phase-two update.
+  const String interruptedBundleSHA=text(std::string(64,'e'));
+  auto mixedWitness=snapshot;
+  mixedWitness.masterAuthority.runtimeState.updateSelf={};
+  assert(mothershipPrepareRetainedRecoverySnapshot(mixedWitness,request.plans,request.machines,
+                                                   interruptedBundleSHA,&failure));
+  Vector<uint128_t> mixedSuccessors={2,3};
+  auto mixedCoordinator=snapshot;
+  auto& mixedUpdate=mixedCoordinator.masterAuthority.runtimeState.updateSelf;
+  mixedUpdate.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  mixedUpdate.expectedEchos=2;
+  mixedUpdate.bundleEchos=2;
+  mixedUpdate.bundleEchoPeerKeys=mixedSuccessors;
+  mixedUpdate.followerRebootedPeerKeys=mixedSuccessors;
+  for (uint128_t peer : mixedSuccessors) {
+    ProdigyPersistentUpdateSelfFollowerBoot boot={};boot.peerKey=peer;boot.bootNs=int64_t(peer);
+    mixedUpdate.followerBootNsByPeerKey.push_back(boot);
+  }
+  mixedUpdate.workerExpectedBundleSHA256=interruptedBundleSHA;
+  mixedUpdate.machineRecoveryWitnesses=mixedWitness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  mixedUpdate.workerFailure="local post-exec bundle digest mismatch"_ctv;
+  for (auto& witness : mixedUpdate.machineRecoveryWitnesses)
+    witness.bundleRegistered = witness.machineUUID == 2 || witness.machineUUID == 3;
+  assert(mothershipRetainedRecoveryCanReplaceMixedHandoff(
+      mixedCoordinator,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
+  auto mixedPrepared=mixedCoordinator;
+  assert(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+      mixedPrepared,request.plans,request.machines,request.bundleSHA,previousBundleSHA,
+      interruptedBundleSHA,mixedSuccessors,&failure));
+  // The exceptional proof removes only the exact, validated update record.
+  // Snapshot equality covers the topology, plans, config, paired credentials,
+  // and runtime key material under the normal persistent-state owner.
+  auto mixedExpected=mixedCoordinator;
+  mixedExpected.masterAuthority.runtimeState.updateSelf={};
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      mixedExpected,request.plans,request.machines,request.bundleSHA,&failure));
+  assert(prodigyPersistentBrainSnapshotsEqual(mixedPrepared,mixedExpected));
+  assert(mothershipRetainedRecoveryEnvelopeMatches(
+      mixedPrepared.masterAuthority.runtimeState.updateSelf,request.bundleSHA));
+  auto mixedWrongPeer=mixedCoordinator;
+  mixedWrongPeer.masterAuthority.runtimeState.updateSelf.followerRebootedPeerKeys[1]=1;
+  assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
+      mixedWrongPeer,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
+  auto mixedTransition=mixedCoordinator;
+  mixedTransition.masterAuthority.runtimeState.updateSelf.workerTransitionIssuedMachineUUIDs.push_back(2);
+  assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
+      mixedTransition,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
   auto preexistingSnapshot=preparedSnapshot;
   String& originalBootstrap=preexistingSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
   NeuronContainerBootstrap decodedBootstrap = {};assert(BitseryEngine::deserializeSafe(originalBootstrap,decodedBootstrap));

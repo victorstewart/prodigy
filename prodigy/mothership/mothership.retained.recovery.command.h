@@ -16,11 +16,17 @@ using namespace MothershipTidesMigration;
 struct Request {
   uint128_t clusterUUID = 0;
   String bundleSHA;
+  // Empty for the established uniform-predecessor format.  A nonempty value
+  // is an explicitly approved normal-update payload that may be replaced only
+  // through the mixed-handoff proof below.
+  String interruptedBundleSHA;
+  Vector<uint128_t> mixedSuccessorMachineUUIDs;
   bytell_hash_map<uint64_t,DeploymentPlan> plans;
   Vector<MothershipRetainedRecoveryMachineInput> machines;
 };
 template<typename S> void serialize(S&& s, Request& r) {
-  s.value16b(r.clusterUUID); s.text1b(r.bundleSHA,UINT32_MAX); s.object(r.plans); s.object(r.machines);
+  s.value16b(r.clusterUUID); s.text1b(r.bundleSHA,UINT32_MAX); s.text1b(r.interruptedBundleSHA,UINT32_MAX);
+  s.object(r.mixedSuccessorMachineUUIDs); s.object(r.plans); s.object(r.machines);
 }
 // The seed generates these bytes once. Every Brain must receive identical
 // witness strings, even when unordered maps decode in a different order.
@@ -116,7 +122,29 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       require(expected.masterAuthority.runtimeState.generation>0,"recovery generation missing"); --expected.masterAuthority.runtimeState.generation;
     }
     String why;
-    require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,request.bundleSHA,&why,previousBundleSHA256),str(why).c_str());
+    const bool mixed = !request.interruptedBundleSHA.empty();
+    if (mixed) {
+      require(prodigyIsSHA256HexDigest(request.interruptedBundleSHA) &&
+              request.mixedSuccessorMachineUUIDs.size()==2 &&
+              request.mixedSuccessorMachineUUIDs[0] != 0 &&
+              request.mixedSuccessorMachineUUIDs[0] < request.mixedSuccessorMachineUUIDs[1],
+              "invalid sealed mixed handoff");
+      if (!mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
+                                                     request.bundleSHA,&why,previousBundleSHA256,
+                                                     request.interruptedBundleSHA)) {
+        // Only the old coordinator can require this path.  Its witness is
+        // reconstructed from the same sealed inventory before its later phase
+        // is discarded; every other private copy remains echo-only or idle.
+        expected=before;
+        require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+                    expected,request.plans,request.machines,request.bundleSHA,
+                    previousBundleSHA256,request.interruptedBundleSHA,
+                    request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
+      }
+    } else {
+      require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
+                                                        request.bundleSHA,&why,previousBundleSHA256),str(why).c_str());
+    }
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
     if(alreadyPrepared) {
@@ -226,11 +254,16 @@ inline bool sameCanonicalRecordIdentity(const Manifest& left,const Manifest& rig
   return canonical==23;
 }
 inline bool samePlanTarget(const Plan& oldPlan,const Plan& successor) {
-  if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.machines.size()!=successor.machines.size())return false;
-  for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address)return false;
+  if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.mixedPredecessors!=successor.mixedPredecessors || oldPlan.machines.size()!=successor.machines.size() || oldPlan.approvedPredecessors.size()!=successor.approvedPredecessors.size())return false;
+  for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address || oldPlan.machines[i].runtimeRoot!=successor.machines[i].runtimeRoot || oldPlan.machines[i].installedRuntimeSHA!=successor.machines[i].installedRuntimeSHA || oldPlan.machines[i].installedBundleSHA!=successor.machines[i].installedBundleSHA)return false;
+  for(size_t i=0;i<oldPlan.approvedPredecessors.size();++i)if(oldPlan.approvedPredecessors[i].runtimeSHA!=successor.approvedPredecessors[i].runtimeSHA || oldPlan.approvedPredecessors[i].bundleSHA!=successor.approvedPredecessors[i].bundleSHA || oldPlan.approvedPredecessors[i].bundlePath!=successor.approvedPredecessors[i].bundlePath)return false;
   return true;
 }
 inline bool sameContainedSuccessorTarget(const Plan& predecessor,const MothershipTidesDBMigrationReceipt& receipt,const Plan& successor) {
+  // A mixed predecessor has multiple prior executable roots.  The existing
+  // contained-successor protocol has one active receipt identity, so refuse
+  // to reinterpret it as a mixed handoff.
+  if(predecessor.mixedPredecessors || successor.mixedPredecessors)return false;
   if(successor.oldRuntimeSHA!=str(receipt.newRuntimeSHA256) || successor.oldBundleSHA!=str(receipt.approvedBundleSHA256))return false;
   Plan current=predecessor;
   current.oldRuntimeSHA=successor.oldRuntimeSHA;
@@ -247,8 +280,8 @@ inline void requirePreactivation(Execution& e,const Execution *successor=nullptr
     std::string fence="test \"$(cat "+quote(e.fencePath())+")\" = "+quote(e.plan.planSHA);
     if(successor)fence="( "+fence+" || test \"$(cat "+quote(successor->fencePath())+")\" = "+quote(successor->plan.planSHA)+" )";
     e.run(machine.uuid,"test \"$(systemctl show -p MainPID --value prodigy)\" = 0; "+fence+
-      "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(e.plan.oldRuntimeSHA)+
-      "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(e.plan.oldBundleSHA));
+      "; test \"$(sha256sum "+quote(e.activeRuntimeRoot(machine)+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(machine.installedRuntimeSHA)+
+      "; test \"$(sha256sum "+quote(e.activeRuntimeRoot(machine)+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(machine.installedBundleSHA));
   }
 }
 // A repair bundle supplies tools only. It cannot replace the deployment bundle,
@@ -360,8 +393,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       // Validate the installed generation on every host before fencing any host.
       // Never roll back a database that has had v10 writers.
       for(const auto& machine:e.plan.machines)e.run(machine.uuid,
-        "test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.newRuntimeSHA256))+
-        "; test \"$(sha256sum "+quote(e.plan.runtimeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.approvedBundleSHA256)));
+        "test \"$(sha256sum "+quote(e.serviceRuntimeRoot()+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.newRuntimeSHA256))+
+        "; test \"$(sha256sum "+quote(e.serviceRuntimeRoot()+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(str(e.receipt.approvedBundleSHA256)));
       durable(containment,text(e.plan.planSHA+"\n"));
       e.fenceWriters();
       for(const auto& machine:e.plan.machines)e.run(machine.uuid,
@@ -475,6 +508,17 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","retained recovery must run on selected seed");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);
         require(seed.brainConfig.clusterUUID==e.plan.clusterUUID,"seed authority cluster mismatch");manifest.request.plans=seed.masterAuthority.deploymentPlans;
+        if (e.plan.mixedPredecessors) {
+          for (const auto& machine : e.plan.machines) {
+            if (machine.installedBundleSHA != e.plan.oldBundleSHA) {
+              manifest.request.interruptedBundleSHA=text(machine.installedBundleSHA);
+              manifest.request.mixedSuccessorMachineUUIDs.push_back(machine.uuid);
+            }
+          }
+          std::sort(manifest.request.mixedSuccessorMachineUUIDs.begin(),manifest.request.mixedSuccessorMachineUUIDs.end());
+          require(manifest.request.mixedSuccessorMachineUUIDs.size()==2 &&
+                  prodigyIsSHA256HexDigest(manifest.request.interruptedBundleSHA),"invalid mixed predecessor mapping");
+        }
         for(const auto& r:manifest.records) {
           String encoded,why,bytes;
           require(e.command(r.machine,"test \"$(sha256sum "+quote(r.paramsPath)+" | cut -d' ' -f1)\" = "+quote(r.paramsSHA)+"; base64 -w0 "+quote(r.paramsPath),&why,&encoded),"retained parameters read failed");
@@ -493,7 +537,14 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
         Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
-        require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,request.bundleSHA,&why,text(e.plan.oldBundleSHA)),str(why).c_str());
+        if (!request.interruptedBundleSHA.empty()) {
+          require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+                      seed,request.plans,request.machines,request.bundleSHA,text(e.plan.oldBundleSHA),
+                      request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
+        } else {
+          require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,
+                                                            request.bundleSHA,&why,text(e.plan.oldBundleSHA)),str(why).c_str());
+        }
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);
       }
