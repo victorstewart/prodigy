@@ -369,27 +369,43 @@ static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char 
     return;
   }
 
+  // The runtime bundle size may admit more than two snapshots under the
+  // 512 MiB owner budget. Fill the actual smaller byte/job bound, then prove
+  // the next request is transiently rejected and every admitted request drains.
+  const uint32_t byteAdmissionCount = static_cast<uint32_t>(ProdigyPersistentStateWriter::maximumRetainedBytes / requestBytes);
+  const uint32_t admittedCount = std::min(byteAdmissionCount, ProdigyArtifactIO::maximumJobs);
+  suite.expect(admittedCount != 0, "async_persistence_backpressure_has_runtime6_admission_capacity");
+  if (admittedCount == 0)
+  {
+    io->stop();
+    ring.drainStoppedIO();
+    return;
+  }
+  const ProdigyArtifactIO::Admission expectedRejection = admittedCount == ProdigyArtifactIO::maximumJobs
+      ? ProdigyArtifactIO::Admission::jobCapacity : ProdigyArtifactIO::Admission::byteCapacity;
+  std::fprintf(stderr, "async_persistence_backpressure requestBytes=%llu admittedCount=%u expectedAdmission=%u\n",
+               static_cast<unsigned long long>(requestBytes), admittedCount, static_cast<unsigned>(expectedRejection));
+
   uint32_t completedReceipts = 0;
   uint32_t durableReceipts = 0;
-  const bool firstAdmitted = writer.submitSnapshot(std::move(first), {}, requestBytes,
-      [&completedReceipts, &durableReceipts](auto&& result) {
-        durableReceipts += result.snapshotDurable && result.bootStateDurable;
-        if (++completedReceipts == 2) Ring::exit = true;
-      });
-  const bool secondAdmitted = writer.submitSnapshot(snapshotWithBundle(2), {}, requestBytes,
-      [&completedReceipts, &durableReceipts](auto&& result) {
-        durableReceipts += result.snapshotDurable && result.bootStateDurable;
-        if (++completedReceipts == 2) Ring::exit = true;
-      });
-  const ProdigyArtifactIO::Admission thirdAdmission = writer.admission(requestBytes);
-  const bool thirdAdmitted = writer.submitSnapshot(snapshotWithBundle(3), {}, requestBytes,
+  bool allAdmitted = true;
+  for (uint32_t index = 0; index < admittedCount; ++index)
+  {
+    ProdigyPersistentBrainSnapshot snapshot = index == 0 ? std::move(first) : snapshotWithBundle(index + 1);
+    allAdmitted &= writer.submitSnapshot(std::move(snapshot), {}, requestBytes,
+        [&completedReceipts, &durableReceipts, admittedCount](auto&& result) {
+          durableReceipts += result.snapshotDurable && result.bootStateDurable;
+          if (++completedReceipts == admittedCount) Ring::exit = true;
+        });
+  }
+  const ProdigyArtifactIO::Admission nextAdmission = writer.admission(requestBytes);
+  const bool nextAdmitted = writer.submitSnapshot(snapshotWithBundle(admittedCount + 1), {}, requestBytes,
       [&durableReceipts](auto&& result) { durableReceipts += result.snapshotDurable && result.bootStateDurable; });
   ring.armDeadline(10'000);
   Ring::start();
-  suite.expect(firstAdmitted && secondAdmitted &&
-                   thirdAdmission == ProdigyArtifactIO::Admission::byteCapacity &&
-                   thirdAdmitted == false && completedReceipts == 2 && durableReceipts == 2 && writer.drainForExec(),
-               "async_persistence_backpressure_rejects_only_transient_third_runtime6_snapshot");
+  suite.expect(allAdmitted && nextAdmission == expectedRejection && nextAdmitted == false &&
+                   completedReceipts == admittedCount && durableReceipts == admittedCount && writer.drainForExec(),
+               "async_persistence_backpressure_rejects_only_transient_next_runtime6_snapshot");
   io->stop();
   ring.drainStoppedIO();
 }
