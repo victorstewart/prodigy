@@ -332,7 +332,7 @@ static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char 
   if (bundlePath == nullptr || bundlePath[0] == '\0') return;
   String bundle = {};
   Filesystem::openReadAtClose(-1, String(bundlePath), bundle);
-  suite.require(bundle.size() == 34'931'059,
+  suite.expect(bundle.size() == 34'931'059,
                 "async_persistence_backpressure_reads_runtime6_sized_bundle");
   if (bundle.size() != 34'931'059) return;
 
@@ -340,7 +340,7 @@ static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char 
   ScopedPersistentRoot root;
   ProdigyPersistentStateStore store(root.path);
   auto io = ProdigyArtifactIO::startOwned();
-  suite.require(io != nullptr, "async_persistence_backpressure_starts_writer");
+  suite.expect(io != nullptr, "async_persistence_backpressure_starts_writer");
   if (!io) return;
   ProdigyPersistentStateWriter writer(store, *io);
   auto snapshotWithBundle = [&bundle](uint64_t generation) {
@@ -360,7 +360,7 @@ static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char 
   };
   ProdigyPersistentBrainSnapshot first = snapshotWithBundle(1);
   const uint64_t requestBytes = requestBytesFor(first);
-  suite.require(requestBytes != 0 && requestBytes < ProdigyPersistentStateWriter::maximumRetainedBytes,
+  suite.expect(requestBytes != 0 && requestBytes < ProdigyPersistentStateWriter::maximumRetainedBytes,
                 "async_persistence_backpressure_uses_exact_schema_accounting");
   if (!requestBytes)
   {
