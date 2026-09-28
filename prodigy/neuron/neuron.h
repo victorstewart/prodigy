@@ -2864,7 +2864,8 @@ protected:
       if (failureReport) failureReport->assign("additional ingress is not a distinct veth"_ctv);
       return false;
     }
-    String iflinkPath = "/sys/class/net/"_ctv;
+    String iflinkPath = {};
+    iflinkPath.assign("/sys/class/net/"_ctv);
     iflinkPath.append(device);
     iflinkPath.append("/iflink"_ctv);
     char iflink[32] = {};
