@@ -4370,6 +4370,7 @@ static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuit
   // Keep frames in the fixture outbox. A fake fixed slot is valid for state
   // fencing but is not a registered io_uring fixed-file entry.
   master.pendingSend = true;
+  master.transportEpoch = 1;
   follower.brains.insert(&master);
   suite.require(follower.ensureArtifactIO(), "replicated_artifact_capacity_starts_worker");
 
@@ -4481,6 +4482,55 @@ static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuit
   });
   suite.expect(durableAcks == 1 && durableAckID == plan.config.deploymentID(),
                "replicated_artifact_capacity_acks_exact_replayed_id_after_durable_snapshot_receipt");
+  follower.deploymentPlans.erase(plan.config.deploymentID());
+
+  master.wBuffer.clear();
+  follower.holdRuntimePersistence = true;
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  pumpUntil([&] { return follower.pendingRuntimePersistence.empty() == false; },
+            "replicated_artifact_failed_receipt_waits_for_full_blob_durable_receipt");
+  follower.finishRuntimePersistence(false);
+  follower.holdRuntimePersistence = false;
+  follower.runBrainPeerHeartbeatTick();
+  String failedReceiptReconcile = {};
+  BrainReconcileStateRequest failedReceiptRequest = {};
+  const bool requestedRetry =
+      extractSerializedBrainPayload(master.wBuffer, BrainTopic::reconcileState, failedReceiptReconcile) &&
+      BitseryEngine::deserializeSafe(failedReceiptReconcile, failedReceiptRequest);
+  bool omitsArtifactForRetry = true;
+  for (uint64_t deploymentID : failedReceiptRequest.deploymentIDs)
+  {
+    omitsArtifactForRetry &= (deploymentID != plan.config.deploymentID());
+  }
+  uint32_t failedReceiptAcks = 0;
+  forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+    failedReceiptAcks += (BrainTopic(message->topic) == BrainTopic::replicateDeployment &&
+                          message->payloadSize() == sizeof(uint64_t));
+  });
+  suite.expect(requestedRetry && omitsArtifactForRetry && failedReceiptAcks == 0 &&
+                   follower.deploymentPlans.contains(plan.config.deploymentID()),
+               "replicated_artifact_failed_receipt_reconciles_same_epoch_as_missing_artifact");
+
+  master.wBuffer.clear();
+  follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+  auto countRetriedAcks = [&]() {
+    uint32_t count = 0;
+    forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) == BrainTopic::replicateDeployment &&
+          message->payloadSize() == sizeof(uint64_t))
+      {
+        uint8_t *args = message->args;
+        uint64_t acknowledgedID = 0;
+        Message::extractArg<ArgumentNature::fixed>(args, acknowledgedID);
+        count += (acknowledgedID == plan.config.deploymentID());
+      }
+    });
+    return count;
+  };
+  pumpUntil([&] { return countRetriedAcks() == 1; },
+            "replicated_artifact_failed_receipt_retry_waits_for_durable_ack");
+  suite.expect(countRetriedAcks() == 1 && follower.deploymentPlans.contains(plan.config.deploymentID()),
+               "replicated_artifact_failed_receipt_retry_acks_after_successful_snapshot");
   follower.deploymentPlans.erase(plan.config.deploymentID());
 
   master.wBuffer.clear();

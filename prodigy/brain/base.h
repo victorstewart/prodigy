@@ -533,6 +533,9 @@ public:
     metrics.record(deploymentID, containerUUID, metricKey, sampleTimeMs, value);
 
     int64_t nowMs = Time::now<TimeResolution::ms>();
+    // Followers receive the same history but do not run deployment autoscaling.
+    // Enforce retention here before either role captures a persistent snapshot.
+    trimContainerMetrics(nowMs);
     if (lastMetricPersistMs == 0 || (nowMs - lastMetricPersistMs) >= metricPersistMinIntervalMs)
     {
       lastMetricPersistMs = nowMs;

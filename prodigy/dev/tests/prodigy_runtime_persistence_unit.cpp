@@ -541,6 +541,34 @@ static void testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactL
   }
 }
 
+static void testFollowerMetricIngestionTrimsBeforePersistence(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ProdigyHostControlNetwork network;
+  class Follower final : public ProdigyBrain {
+  public:
+    uint32_t receipts = 0;
+    size_t capturedSamples = 0;
+    explicit Follower(ProdigyHostControlNetwork& network) : ProdigyBrain(network, {}) {}
+    void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+    {
+      ++receipts;
+      capturedSamples = metrics.captureSnapshot()->sampleCount();
+      if (completion) completion(true);
+    }
+  } brain(network);
+  brain.weAreMaster = false;
+  const int64_t nowMs = Time::now<TimeResolution::ms>();
+  brain.metrics.record(7, 0xABC, 1, nowMs - BrainBase::metricRetentionMs - 60'000, 1);
+  brain.metrics.record(7, 0xABC, 1, nowMs - 1'000, 2);
+  brain.recordContainerMetric(7, 0xABC, 1, nowMs, 3);
+  suite.expect(brain.deployments.empty() && brain.receipts == 1 && brain.capturedSamples == 2,
+               "follower_metric_ingestion_expires_history_before_snapshot_without_autoscaling");
+  suite.expect(brain.metrics.series.at(7).at(0xABC).at(1).size() == 2 &&
+                   brain.metrics.fleetSeries.at(7).at(1).size() == 2,
+               "follower_metric_retention_preserves_recent_instance_and_fleet_samples");
+}
+
 static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -680,6 +708,7 @@ int main(void)
     return suite.failed == 0 ? 0 : 1;
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
+  testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);

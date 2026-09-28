@@ -27974,7 +27974,22 @@ public:
                 applyPendingReplicatedContainerRuntimeStates(deploymentID);
                 std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
                 persistLocalRuntimeStateAsync([this, lifetime, operation, deploymentID](bool durable) {
-                  if (!durable || lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
+                  if (!durable)
+                  {
+                    if (lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
+                    if (!deferPeerArtifactReconciliation(
+                            operation->peer, deploymentID, operation->plan.config.containerBlobBytes))
+                    {
+                      std::fprintf(stderr, "peer artifact durable receipt retry rejected deploymentID=%llu\n",
+                                   (unsigned long long)deploymentID);
+                      queueBrainCloseIfActive(operation->peer, "artifact-durable-receipt-retry", -ENOBUFS);
+                      return;
+                    }
+                    // The existing heartbeat retries after this persistence
+                    // callback releases its ArtifactIO admission lease.
+                    return;
+                  }
+                  if (lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
                   completeDeferredPeerArtifactReconciliation(*operation);
                   Message::construct(operation->peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
                   Ring::queueSend(operation->peer);
