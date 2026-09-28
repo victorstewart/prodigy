@@ -2574,10 +2574,18 @@ public:
     }
     Vector<__u32> mapIDs = {};
     mapIDs.resize(info.nr_map_ids);
-    info.map_ids = reinterpret_cast<__u64>(mapIDs.data());
     const __u32 expectedMapCount = info.nr_map_ids;
-    const bool readIDs = bpf_prog_get_info_by_fd(programFD, &info, &infoLength) == 0 &&
-                         info.nr_map_ids == expectedMapCount;
+    // bpf_prog_get_info_by_fd treats every nonzero length in the supplied
+    // info struct as a request to copy through its paired pointer. The first
+    // response has program instruction lengths but no instruction buffers;
+    // never reuse it for the map-ID request or the kernel can reject its null
+    // instruction pointers before returning map IDs.
+    struct bpf_prog_info mapIDsInfo = {};
+    mapIDsInfo.nr_map_ids = expectedMapCount;
+    mapIDsInfo.map_ids = reinterpret_cast<__u64>(mapIDs.data());
+    __u32 mapIDsInfoLength = sizeof(mapIDsInfo);
+    const bool readIDs = bpf_prog_get_info_by_fd(programFD, &mapIDsInfo, &mapIDsInfoLength) == 0 &&
+                         mapIDsInfo.nr_map_ids == expectedMapCount;
     ::close(programFD);
     if (readIDs == false) return false;
 
