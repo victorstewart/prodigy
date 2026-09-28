@@ -6139,6 +6139,122 @@ static void testTlsResumptionRotationAckCoverage(TestSuite& suite)
   suite.expect(brain.advanceTlsResumptionLifecycleForDeployment(plan, 1'700'000'101'580, false, false) == 1, "resumption_rotation_scheduler_promotes_after_acks");
   expectRole(secondGeneration, TlsResumptionKeyRole::acceptOnly, "resumption_rotation_scheduler_demotes_previous_issue");
   expectRole(thirdGeneration, TlsResumptionKeyRole::issueAndAccept, "resumption_rotation_scheduler_promotes_new_issue");
+
+  // A retained container can reconnect after the initial resumption delta was
+  // sent. Keep its generation but demote its role to prove that reconciliation
+  // compares the full authoritative snapshot, not bundleGeneration alone.
+  containerA.state = ContainerState::none;
+  containerB.state = ContainerState::none;
+  containerScheduled.state = ContainerState::none;
+  containerRestarting.state = ContainerState::none;
+  Machine reconnectMachine = {};
+  reconnectMachine.uuid = uint128_t(0xB006);
+  reconnectMachine.neuron.machine = &reconnectMachine;
+  reconnectMachine.neuron.isFixedFile = true;
+  reconnectMachine.neuron.fslot = 6;
+  reconnectMachine.neuron.connected = true;
+  ContainerView reconnectContainer = {};
+  reconnectContainer.uuid = uint128_t(0xB007);
+  reconnectContainer.machine = &reconnectMachine;
+  reconnectContainer.deploymentID = plan.config.deploymentID();
+  reconnectContainer.state = ContainerState::healthy;
+  reconnectContainer.hasCredentialBundle = true;
+  TlsResumptionSnapshot staleSnapshot = *currentSnapshot();
+  for (TlsResumptionKeyEpoch& epoch : staleSnapshot.keyRing)
+  {
+    if (epoch.generation == thirdGeneration)
+    {
+      epoch.role = TlsResumptionKeyRole::acceptOnly;
+      epoch.issueUntilMs = 0;
+    }
+  }
+  reconnectContainer.credentialBundle.bundleGeneration = staleSnapshot.generation;
+  reconnectContainer.credentialBundle.tlsResumptionSnapshots.push_back(staleSnapshot);
+  deployment.containers.insert(&reconnectContainer);
+  brain.containers.insert_or_assign(reconnectContainer.uuid, &reconnectContainer);
+  brain.weAreMaster = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+
+  brain.masterAuthorityRuntimeStateDurable = false;
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 0 && reconnectMachine.neuron.wBuffer.empty(),
+               "resumption_reconcile_does_not_publish_nondurable_key_material");
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.weAreMaster = false;
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 0 && reconnectMachine.neuron.wBuffer.empty(),
+               "resumption_reconcile_does_not_publish_from_follower");
+  brain.weAreMaster = true;
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 1, "resumption_reconcile_reconnected_container_retries_missing_role_promotion");
+  uint128_t refreshedContainerUUID = {};
+  CredentialDelta refreshedDelta = {};
+  suite.expect(extractQueuedCredentialDelta(reconnectMachine, refreshedContainerUUID, refreshedDelta) &&
+                   refreshedContainerUUID == reconnectContainer.uuid &&
+                   refreshedDelta.updatedResumptionSnapshots.size() == 1 &&
+                   prodigyTlsResumptionSnapshotsEqual(refreshedDelta.updatedResumptionSnapshots[0], *currentSnapshot()),
+               "resumption_reconcile_delta_uses_full_authoritative_snapshot");
+  reconnectMachine.neuron.wBuffer.clear();
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 0 && reconnectMachine.neuron.wBuffer.empty(),
+               "resumption_reconcile_pending_ack_suppresses_duplicate_retry");
+
+  Wormhole secondWormhole = makeTlsResumptionTestWormhole();
+  secondWormhole.name.assign("public-api-quic-reconnect"_ctv);
+  plan.wormholes.push_back(secondWormhole);
+  deployment.plan = plan;
+  TlsResumptionSnapshot *secondSnapshot = brain.beginTlsResumptionAcceptOnlyRollout(
+      plan, plan.wormholes.back(), 1'700'000'101'700, false, &failure);
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  suite.expect(secondSnapshot != nullptr && brain.retryStaleTlsIdentityDeltas() == 1,
+               "resumption_reconcile_missing_snapshot_retries_while_other_snapshot_pending");
+  CredentialDelta secondDelta = {};
+  suite.expect(extractQueuedCredentialDelta(reconnectMachine, refreshedContainerUUID, secondDelta) &&
+                   secondDelta.updatedResumptionSnapshots.size() == 1 &&
+                   secondSnapshot != nullptr &&
+                   prodigyTlsResumptionSnapshotsEqual(secondDelta.updatedResumptionSnapshots[0], *secondSnapshot),
+               "resumption_reconcile_second_delta_does_not_resend_pending_snapshot");
+  reconnectMachine.neuron.wBuffer.clear();
+  TlsResumptionApplyAck successfulAck = makeTlsResumptionAck(plan.wormholes[0].name, thirdGeneration);
+  suite.expect(brain.noteContainerTlsResumptionApplyAck(reconnectContainer.uuid, successfulAck) &&
+                   reconnectContainer.hasPendingCredentialBundle &&
+                   reconnectContainer.credentialRefreshFailure.empty() &&
+                   brain.recordTlsResumptionApplyAck(reconnectContainer.uuid, successfulAck),
+               "resumption_reconcile_first_partial_ack_keeps_other_snapshot_pending");
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 0,
+               "resumption_reconcile_partial_ack_does_not_duplicate_other_pending_delta");
+  reconnectMachine.neuron.wBuffer.clear();
+  TlsResumptionApplyAck secondSuccessfulAck = makeTlsResumptionAck(plan.wormholes[1].name, secondSnapshot != nullptr ? secondSnapshot->generation : 0);
+  suite.expect(brain.noteContainerTlsResumptionApplyAck(reconnectContainer.uuid, secondSuccessfulAck) &&
+                   reconnectContainer.hasPendingCredentialBundle == false &&
+                   reconnectContainer.credentialBundle.tlsResumptionSnapshots.size() == 2 &&
+                   prodigyTlsResumptionSnapshotsEqual(reconnectContainer.credentialBundle.tlsResumptionSnapshots[0], *currentSnapshot()) &&
+                   secondSnapshot != nullptr &&
+                   prodigyTlsResumptionSnapshotsEqual(reconnectContainer.credentialBundle.tlsResumptionSnapshots[1], *secondSnapshot),
+               "resumption_reconcile_second_typed_success_promotes_full_snapshot");
+  suite.expect(brain.recordTlsResumptionApplyAck(reconnectContainer.uuid, secondSuccessfulAck),
+               "resumption_reconcile_second_ack_records_authoritative_coverage");
+  CredentialBundle uploadedBundle = reconnectContainer.credentialBundle;
+  brain.noteContainerCredentialBundleApplied(&reconnectContainer, &uploadedBundle);
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 1,
+               "resumption_reconcile_uploaded_bundle_without_current_ack_replays");
+  CredentialDelta uploadedReplayDelta = {};
+  suite.expect(extractQueuedCredentialDelta(reconnectMachine, refreshedContainerUUID, uploadedReplayDelta) &&
+                   uploadedReplayDelta.updatedResumptionSnapshots.size() == 2,
+               "resumption_reconcile_uploaded_bundle_does_not_suppress_missing_receipt");
+  reconnectMachine.neuron.wBuffer.clear();
+  TlsResumptionApplyAck rejectedAck = successfulAck;
+  rejectedAck.results[0].success = false;
+  suite.expect(brain.noteContainerTlsResumptionApplyAck(reconnectContainer.uuid, rejectedAck) == false &&
+                   reconnectContainer.hasPendingCredentialBundle == false,
+               "resumption_reconcile_explicit_rejection_does_not_promote_pending_bundle");
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 1,
+               "resumption_reconcile_retries_after_explicit_rejection");
+  reconnectMachine.neuron.wBuffer.clear();
+  successfulAck.results.push_back(secondSuccessfulAck.results[0]);
+  suite.expect(brain.noteContainerTlsResumptionApplyAck(reconnectContainer.uuid, successfulAck) &&
+                   brain.recordTlsResumptionApplyAck(reconnectContainer.uuid, successfulAck),
+               "resumption_reconcile_replayed_snapshot_reacquires_authoritative_receipt");
+  suite.expect(brain.retryStaleTlsIdentityDeltas() == 0 && reconnectMachine.neuron.wBuffer.empty(),
+               "resumption_reconcile_successful_ack_suppresses_future_retry");
 }
 
 static void testBrainHandlerReplicationPaths(TestSuite& suite)

@@ -2758,7 +2758,7 @@ public:
     return false;
   }
 
-  static void noteContainerCredentialBundleApplied(ContainerView *container, const CredentialBundle *bundle)
+  void noteContainerCredentialBundleApplied(ContainerView *container, const CredentialBundle *bundle)
   {
     if (container == nullptr)
     {
@@ -2770,9 +2770,10 @@ public:
     container->hasCredentialBundle = bundle != nullptr;
     container->credentialBundle = bundle == nullptr ? CredentialBundle {} : *bundle;
     container->credentialRefreshFailure.clear();
+    clearTlsResumptionAcksForContainer(container->deploymentID, container->uuid);
   }
 
-  static void noteContainerCredentialDeltaPending(ContainerView *container, const CredentialDelta& delta)
+  void noteContainerCredentialDeltaPending(ContainerView *container, const CredentialDelta& delta)
   {
     if (container == nullptr)
     {
@@ -2784,6 +2785,15 @@ public:
     container->hasPendingCredentialBundle = true;
     container->pendingCredentialBundleSinceMs = Time::now<TimeResolution::ms>();
     container->credentialRefreshFailure.clear();
+    // Promotion changes a key's role within the same generation. Require a new
+    // receipt for each snapshot sent, while retaining receipts for other deltas.
+    for (const TlsResumptionSnapshot& snapshot : delta.updatedResumptionSnapshots)
+    {
+      if (auto state = mutableTlsResumptionStateForWormhole(container->deploymentID, snapshot.wormholeName))
+      {
+        state->acksByContainer.erase(container->uuid);
+      }
+    }
   }
 
   bool noteContainerCredentialRefreshAck(uint128_t containerUUID)
@@ -2808,6 +2818,18 @@ public:
     for (const TlsIdentity& identity : bundle.tlsIdentities)
     {
       if (identity.name.equals(result.identityName) && identity.generation == result.generation)
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool credentialBundleHasTlsResumptionSnapshot(const CredentialBundle& bundle, const TlsResumptionSnapshot& expected)
+  {
+    for (const TlsResumptionSnapshot& snapshot : bundle.tlsResumptionSnapshots)
+    {
+      if (prodigyTlsResumptionSnapshotsEqual(snapshot, expected))
       {
         return true;
       }
@@ -2870,6 +2892,49 @@ public:
     container->pendingCredentialBundleSinceMs = 0;
     container->credentialRefreshFailure = std::move(failure);
     return false;
+  }
+
+  bool noteContainerTlsResumptionApplyAck(uint128_t containerUUID, const TlsResumptionApplyAck& ack)
+  {
+    auto containerIt = containers.find(containerUUID);
+    if (containerIt == containers.end() || containerIt->second == nullptr ||
+        containerIt->second->hasPendingCredentialBundle == false || ack.results.empty())
+    {
+      return false;
+    }
+
+    ContainerView *container = containerIt->second;
+    for (const TlsResumptionApplyResult& result : ack.results)
+    {
+      if (result.success == false)
+      {
+        container->pendingCredentialBundle = {};
+        container->hasPendingCredentialBundle = false;
+        container->pendingCredentialBundleSinceMs = 0;
+        container->credentialRefreshFailure.assign("TLS resumption refresh was rejected"_ctv);
+        return false;
+      }
+    }
+    for (const TlsResumptionSnapshot& snapshot : container->pendingCredentialBundle.tlsResumptionSnapshots)
+    {
+      if (containerTlsResumptionSnapshotAcked(*container, snapshot)) continue;
+      bool found = false;
+      for (const TlsResumptionApplyResult& result : ack.results)
+      {
+        if (result.wormholeName.equals(snapshot.wormholeName) && result.generation == snapshot.generation && result.success)
+        {
+          found = true;
+          break;
+        }
+      }
+      if (found == false)
+      {
+        // Each lifecycle delta has its own ACK. Keep the merged pending bundle
+        // until the other valid receipts arrive; the handler records this one.
+        return true;
+      }
+    }
+    return noteContainerCredentialRefreshAck(containerUUID);
   }
 
   const PublicTlsCertificateState *findPublicTlsCertificateState(uint16_t applicationID, uint64_t deploymentID, const String& wormholeName, const String& certName) const
@@ -8997,6 +9062,32 @@ public:
     }
   }
 
+  void clearTlsResumptionAcksForContainer(uint64_t deploymentID, uint128_t containerUUID)
+  {
+    auto deploymentIt = tlsResumptionStateByDeployment.find(deploymentID);
+    if (deploymentIt == tlsResumptionStateByDeployment.end())
+    {
+      return;
+    }
+    for (auto& [wormholeName, state] : deploymentIt->second.wormholes)
+    {
+      (void)wormholeName;
+      state.acksByContainer.erase(containerUUID);
+    }
+  }
+
+  bool containerTlsResumptionSnapshotAcked(const ContainerView& container, const TlsResumptionSnapshot& snapshot) const
+  {
+    const BrainTlsResumptionWormholeState *state = tlsResumptionStateForWormhole(container.deploymentID, snapshot.wormholeName);
+    if (state == nullptr || prodigyTlsResumptionSnapshotsEqual(state->snapshot, snapshot) == false)
+    {
+      return false;
+    }
+    auto ackIt = state->acksByContainer.find(container.uuid);
+    return ackIt != state->acksByContainer.end() &&
+           ackIt->second.generation == snapshot.generation && ackIt->second.success;
+  }
+
   bool recordTlsResumptionApplyResult(uint128_t containerUUID, const TlsResumptionApplyResult& result)
   {
     auto containerIt = containers.find(containerUUID);
@@ -9761,6 +9852,45 @@ public:
     return true;
   }
 
+  bool containerTlsResumptionSnapshotsFresh(const DeploymentPlan& deploymentPlan, const ContainerView& container, bool *pending = nullptr)
+  {
+    if (pending)
+    {
+      *pending = false;
+    }
+
+    CredentialBundle expected = {};
+    if (buildCredentialBundleForContainer(deploymentPlan, container, expected) == false || expected.tlsResumptionSnapshots.empty())
+    {
+      return true;
+    }
+
+    const bool pendingCurrent = container.hasPendingCredentialBundle &&
+                                (container.pendingCredentialBundleSinceMs <= 0 ||
+                                 Time::now<TimeResolution::ms>() - container.pendingCredentialBundleSinceMs < credentialDeltaAckTimeoutMs);
+    bool waitingForAck = false;
+    for (const TlsResumptionSnapshot& snapshot : expected.tlsResumptionSnapshots)
+    {
+      if (container.hasCredentialBundle &&
+          credentialBundleHasTlsResumptionSnapshot(container.credentialBundle, snapshot) &&
+          containerTlsResumptionSnapshotAcked(container, snapshot))
+      {
+        continue;
+      }
+      if (pendingCurrent && credentialBundleHasTlsResumptionSnapshot(container.pendingCredentialBundle, snapshot))
+      {
+        waitingForAck = true;
+        continue;
+      }
+      return false;
+    }
+    if (pending)
+    {
+      *pending = waitingForAck;
+    }
+    return waitingForAck == false;
+  }
+
   bool tlsIdentityCoverageSatisfied(const DeploymentPlan& deploymentPlan, String *failure = nullptr)
   {
     if (failure)
@@ -9858,21 +9988,62 @@ public:
         {
           continue;
         }
-        bool pending = false;
-        if (containerTlsIdentitiesFresh(deployment->plan, *container, &pending, nullptr) || pending)
+        bool identitiesPending = false;
+        const bool identitiesFresh = containerTlsIdentitiesFresh(deployment->plan, *container, &identitiesPending, nullptr);
+        bool resumptionPending = false;
+        const bool resumptionFresh = containerTlsResumptionSnapshotsFresh(deployment->plan, *container, &resumptionPending);
+        if ((identitiesFresh || identitiesPending) && (resumptionFresh || resumptionPending))
         {
           continue;
         }
 
         CredentialBundle expected = {};
-        if (buildCredentialBundleForContainer(deployment->plan, *container, expected) == false || expected.tlsIdentities.empty())
+        if (buildCredentialBundleForContainer(deployment->plan, *container, expected) == false)
         {
           continue;
         }
         CredentialDelta delta = {};
         delta.bundleGeneration = expected.bundleGeneration;
-        delta.updatedTls = std::move(expected.tlsIdentities);
-        delta.reason = "tls-identity-stale-retry"_ctv;
+        if (!identitiesFresh && !identitiesPending)
+        {
+          for (const TlsIdentity& identity : expected.tlsIdentities)
+          {
+            if (container->hasCredentialBundle == false ||
+                credentialBundleHasTlsIdentityGeneration(container->credentialBundle, identity.name, identity.generation) == false)
+            {
+              delta.updatedTls.push_back(identity);
+            }
+          }
+        }
+        if (!resumptionFresh && !resumptionPending)
+        {
+          // buildCredentialBundleForContainer may have advanced a local key ring.
+          // Do not publish that new material until this exact authority generation is durable.
+          if (weAreMaster && masterAuthorityRuntimeStateDurable &&
+              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
+          {
+            for (const TlsResumptionSnapshot& snapshot : expected.tlsResumptionSnapshots)
+            {
+              const bool applied = container->hasCredentialBundle &&
+                                   credentialBundleHasTlsResumptionSnapshot(container->credentialBundle, snapshot) &&
+                                   containerTlsResumptionSnapshotAcked(*container, snapshot);
+              const bool pendingCurrent = container->hasPendingCredentialBundle &&
+                                          (container->pendingCredentialBundleSinceMs <= 0 ||
+                                           Time::now<TimeResolution::ms>() - container->pendingCredentialBundleSinceMs < credentialDeltaAckTimeoutMs);
+              const bool alreadyPending = pendingCurrent &&
+                                          credentialBundleHasTlsResumptionSnapshot(container->pendingCredentialBundle, snapshot);
+              if (applied == false && alreadyPending == false)
+              {
+                delta.updatedResumptionSnapshots.push_back(snapshot);
+              }
+            }
+          }
+        }
+        if (delta.updatedTls.empty() && delta.updatedResumptionSnapshots.empty())
+        {
+          continue;
+        }
+        delta.reason = "credential-stale-retry"_ctv;
         sent += pushCredentialDeltaToContainer(container, delta) ? 1 : 0;
       }
     }
@@ -37128,7 +37299,7 @@ public:
             }
             else
             {
-              (void)noteContainerCredentialRefreshAck(containerUUID);
+              (void)noteContainerTlsResumptionApplyAck(containerUUID, resumptionAck);
             }
             (void)recordTlsResumptionApplyAck(containerUUID, resumptionAck);
             if (genericAck)
