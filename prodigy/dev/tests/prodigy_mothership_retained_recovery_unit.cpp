@@ -797,8 +797,28 @@ int main()
   mixedUpdate.workerFailure="local post-exec bundle digest mismatch"_ctv;
   for (auto& witness : mixedUpdate.machineRecoveryWitnesses)
     witness.bundleRegistered = witness.machineUUID == 2 || witness.machineUUID == 3;
+  const auto mixedExpectedWitnesses=mixedUpdate.machineRecoveryWitnesses;
   assert(mothershipRetainedRecoveryCanReplaceMixedHandoff(
-      mixedCoordinator,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
+      mixedCoordinator,interruptedBundleSHA,mixedExpectedWitnesses,mixedSuccessors));
+  // Recovery observes a later timestamp and inventory order than the saved
+  // process state.  Matching remains UUID-bound and every other bootstrap
+  // field remains subject to the existing semantic equality owner.
+  auto mixedReordered=mixedCoordinator;
+  auto& reorderedBootstraps=mixedReordered.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps;
+  assert(reorderedBootstraps.size() > 1);
+  for (auto& encoded : reorderedBootstraps) {
+    NeuronContainerBootstrap bootstrap={}; assert(BitseryEngine::deserializeSafe(encoded,bootstrap));
+    ++bootstrap.plan.createdAtMs; BitseryEngine::serialize(encoded,bootstrap);
+  }
+  std::swap(reorderedBootstraps[0],reorderedBootstraps[1]);
+  assert(mothershipRetainedRecoveryCanReplaceMixedHandoff(
+      mixedReordered,interruptedBundleSHA,mixedExpectedWitnesses,mixedSuccessors));
+  auto mixedStableFieldChanged=mixedReordered;
+  String& changedBootstrap=mixedStableFieldChanged.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
+  NeuronContainerBootstrap changed={}; assert(BitseryEngine::deserializeSafe(changedBootstrap,changed));
+  changed.plan.runtimeReady=!changed.plan.runtimeReady; BitseryEngine::serialize(changedBootstrap,changed);
+  assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
+      mixedStableFieldChanged,interruptedBundleSHA,mixedExpectedWitnesses,mixedSuccessors));
   auto mixedPrepared=mixedCoordinator;
   assert(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
       mixedPrepared,request.plans,request.machines,request.bundleSHA,previousBundleSHA,
@@ -816,11 +836,11 @@ int main()
   auto mixedWrongPeer=mixedCoordinator;
   mixedWrongPeer.masterAuthority.runtimeState.updateSelf.followerRebootedPeerKeys[1]=1;
   assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
-      mixedWrongPeer,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
+      mixedWrongPeer,interruptedBundleSHA,mixedExpectedWitnesses,mixedSuccessors));
   auto mixedTransition=mixedCoordinator;
   mixedTransition.masterAuthority.runtimeState.updateSelf.workerTransitionIssuedMachineUUIDs.push_back(2);
   assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
-      mixedTransition,interruptedBundleSHA,mixedUpdate.machineRecoveryWitnesses,mixedSuccessors));
+      mixedTransition,interruptedBundleSHA,mixedExpectedWitnesses,mixedSuccessors));
   auto preexistingSnapshot=preparedSnapshot;
   String& originalBootstrap=preexistingSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
   NeuronContainerBootstrap decodedBootstrap = {};assert(BitseryEngine::deserializeSafe(originalBootstrap,decodedBootstrap));

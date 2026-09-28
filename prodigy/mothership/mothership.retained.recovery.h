@@ -64,12 +64,28 @@ static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
     for (uint128_t machine : successorMachineUUIDs) successor |= machine == right.machineUUID;
     if (left.machineUUID != right.machineUUID || left.bundleRegistered != successor ||
         left.containerBootstraps.size() != right.containerBootstraps.size()) return false;
-    for (size_t bootstrap = 0; bootstrap < right.containerBootstraps.size(); ++bootstrap)
+    Vector<uint8_t> used(right.containerBootstraps.size());
+    bytell_hash_set<uint128_t> observedContainers;
+    for (const auto& bytes : left.containerBootstraps)
     {
       NeuronContainerBootstrap observed={}, reconstructed={};
-      if (!BitseryEngine::deserializeSafe(left.containerBootstraps[bootstrap],observed) ||
-          !BitseryEngine::deserializeSafe(right.containerBootstraps[bootstrap],reconstructed) ||
-          !prodigyPersistentRetainedBootstrapEqual(observed,reconstructed)) return false;
+      if (!BitseryEngine::deserializeSafe(bytes,observed) ||
+          !observedContainers.insert(observed.plan.uuid).second) return false;
+      bool matched=false;
+      for (size_t bootstrap = 0; bootstrap < right.containerBootstraps.size(); ++bootstrap)
+      {
+        if (used[bootstrap]) continue;
+        if (!BitseryEngine::deserializeSafe(right.containerBootstraps[bootstrap],reconstructed) ||
+            reconstructed.plan.uuid != observed.plan.uuid) continue;
+        // A retained process owns its original creation timestamp.  The
+        // recovery inventory observes it later, so rebuilds with that later
+        // observation by design.  Preserve the saved timestamp only after its
+        // container UUID has bound the two otherwise complete bootstraps.
+        reconstructed.plan.createdAtMs=observed.plan.createdAtMs;
+        if (!prodigyPersistentRetainedBootstrapEqual(observed,reconstructed)) return false;
+        used[bootstrap]=1; matched=true; break;
+      }
+      if (!matched) return false;
     }
   }
   return true;
@@ -335,7 +351,7 @@ static inline bool mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
   if (!mothershipPrepareRetainedRecoverySnapshot(witnessSnapshot, approvedPlans, machines,
                                                  interruptedBundleSHA256, &why))
   {
-    if (failure) failure->assign("retained recovery refuses an unproven mixed handoff"_ctv);
+    if (failure) failure->assign(why);
     return false;
   }
   for (auto& witness : witnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)
