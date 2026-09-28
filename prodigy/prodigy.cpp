@@ -1465,45 +1465,96 @@ public:
 
   void prepareForBundleExecAsync(std::function<void(bool, String)> completion) override
   {
-    stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
-    if (execPersistence->prepared)
-    {
-      completion(execPersistence->durable, execPersistence->failure);
-      return;
-    }
-    execPersistence->prepared = true;
-    if (!ensurePersistentWriter())
-    {
-      execPersistence->failure.assign("persistent writer unavailable for bundle exec"_ctv);
-      completion(false, execPersistence->failure);
-      return;
-    }
-    auto state = execPersistence;
-    ProdigyPersistentLocalBrainState local = persistentLocalBrainState;
-    if (!ProdigyPersistentStateWriter::detach(local))
-    {
-      execPersistence->failure.assign("final local state ownership capture failed"_ctv);
-      completion(false, execPersistence->failure);
-      return;
-    }
-    const uint64_t retainedBytes = retainedBytesForLocal(local);
-    if (!retainedBytes)
-    {
-      state->failure.assign("final local state exceeds persistence capacity"_ctv);
-      completion(false, state->failure);
-      return;
-    }
     auto callback = std::make_shared<std::function<void(bool, String)>>(std::move(completion));
-    const bool admitted = persistentWriter->submitLocalBrainState(std::move(local), retainedBytes,
-        [state, callback](auto&& result) mutable {
-          state->durable = result.durable;
-          state->failure = result.failure;
-          if (*callback) (*callback)(state->durable, state->failure);
+    auto finish = [callback](bool ready, String failure) mutable {
+      if (*callback)
+      {
+        auto completion = std::move(*callback);
+        completion(ready, std::move(failure));
+      }
+    };
+    auto persistForExec = [this, finish]() mutable {
+      stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
+      if (execPersistence->prepared)
+      {
+        finish(execPersistence->durable, execPersistence->failure);
+        return;
+      }
+      execPersistence->prepared = true;
+      if (!ensurePersistentWriter())
+      {
+        execPersistence->failure.assign("persistent writer unavailable for bundle exec"_ctv);
+        finish(false, execPersistence->failure);
+        return;
+      }
+      auto state = execPersistence;
+      ProdigyPersistentLocalBrainState local = persistentLocalBrainState;
+      if (!ProdigyPersistentStateWriter::detach(local))
+      {
+        execPersistence->failure.assign("final local state ownership capture failed"_ctv);
+        finish(false, execPersistence->failure);
+        return;
+      }
+      const uint64_t retainedBytes = retainedBytesForLocal(local);
+      if (!retainedBytes)
+      {
+        state->failure.assign("final local state exceeds persistence capacity"_ctv);
+        finish(false, state->failure);
+        return;
+      }
+      const bool admitted = persistentWriter->submitLocalBrainState(std::move(local), retainedBytes,
+          [state, finish](auto&& result) mutable {
+            state->durable = result.durable;
+            state->failure = result.failure;
+            finish(state->durable, state->failure);
+          });
+      if (!admitted)
+      {
+        state->failure.assign("final local state persistence admission rejected"_ctv);
+        finish(false, state->failure);
+      }
+    };
+
+    if (bundleExecExpectedSHA256.empty())
+    {
+      persistForExec();
+      return;
+    }
+    if (!ensureArtifactIO())
+    {
+      finish(false, "bundle exec artifact I/O is unavailable"_ctv);
+      return;
+    }
+
+    struct StagedBundleDigest
+    {
+      bool computed = false;
+      String digest = {};
+      String failure = {};
+    };
+    auto stagedDigest = std::make_shared<StagedBundleDigest>();
+    const String expectedDigest = bundleExecExpectedSHA256;
+    const String stagedPath = prodigyStagedBundlePath();
+    const bool admitted = artifactIO->submit(0,
+        [stagedDigest, stagedPath] {
+          stagedDigest->computed = prodigyComputeFileSHA256Hex(
+              stagedPath, stagedDigest->digest, &stagedDigest->failure);
+        },
+        [stagedDigest, expectedDigest, persistForExec, finish] mutable {
+          if (stagedDigest->computed == false ||
+              stagedDigest->digest.equals(expectedDigest) == false)
+          {
+            finish(false, "approved staged bundle digest mismatch"_ctv);
+            return;
+          }
+          persistForExec();
+        },
+        [finish](std::exception_ptr) mutable {
+          finish(false, "approved staged bundle digest worker failed"_ctv);
         });
     if (!admitted)
     {
-      state->failure.assign("final local state persistence admission rejected"_ctv);
-      if (*callback) (*callback)(false, state->failure);
+      finish(false, "approved staged bundle digest admission rejected"_ctv);
     }
   }
 

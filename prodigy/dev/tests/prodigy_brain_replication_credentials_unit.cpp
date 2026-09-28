@@ -10337,12 +10337,108 @@ static void testSwitchboardWormholeFleetAcknowledgementTransaction(TestSuite& su
                    container.runtimeReady == false && container.wormholeRuntimeFailure.empty() == false,
                "wormhole_fleet_transaction_surfaces_rollback_failure_fail_closed");
 
-  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
-  brain.neuronHandler(&active.neuron,
+  disconnected.neuron.connected = true;
+  disconnected.neuron.isFixedFile = true;
+  disconnected.neuron.fslot = 22;
+  disconnected.neuron.pendingSend = true;
+  disconnected.neuron.wBuffer.clear();
+  {
+    // Exercise the production normal-deadline -> retry-deadline replacement.
+    // The target is disconnected before the retry fires, so this Ring run
+    // dispatches only timer work and cannot attempt a fake test socket write.
+    ScopedAsyncMothershipRing scopedRing = {};
+    ContainerView deadlineContainer = {};
+    deadlineContainer.uuid = uint128_t(0xC0A111);
+    deadlineContainer.machine = &active;
+    deadlineContainer.fragment = 8;
+    deadlineContainer.state = ContainerState::healthy;
+    SwitchboardWormholeOperation deadlineOperation = {};
+    suite.require(prodigyPrepareSwitchboardWormholeOperation(deadlineContainer.generateContainerID(), empty, deadlineOperation),
+                  "wormhole_fleet_transaction_prepares_deadline_transition_operation");
+    deadlineContainer.wormholeRuntimeRevision = deadlineOperation.revision;
+    deadlineContainer.wormholeRuntimeDesired = deadlineOperation.desired;
+    deadlineContainer.wormholeRuntimePendingMachines.insert(disconnected.fragment);
+    brain.containers.insert_or_assign(deadlineContainer.uuid, &deadlineContainer);
+    brain.Brain::armWormholeRuntimeAckDeadline(&deadlineContainer);
+    TimeoutPacket *normalDeadline = deadlineContainer.wormholeRuntimeAckDeadline;
+
+    deadlineContainer.wormholeRuntimePendingMachines.clear();
+    deadlineContainer.wormholeRuntimeFailedMachines.insert(disconnected.fragment);
+    deadlineContainer.wormholeRuntimeRetryRevision = deadlineContainer.wormholeRuntimeRevision;
+    deadlineContainer.wormholeRuntimeRetryAttempts[disconnected.fragment] = 0;
+    disconnected.neuron.connected = false;
+    brain.Brain::armWormholeRuntimeAckDeadline(&deadlineContainer);
+    TimeoutPacket *retryDeadline = deadlineContainer.wormholeRuntimeAckDeadline;
+    suite.expect(normalDeadline != nullptr && retryDeadline != nullptr && normalDeadline != retryDeadline &&
+                     deadlineContainer.wormholeRuntimeAckDeadlineIsRetry,
+                 "wormhole_fleet_transaction_replaces_normal_deadline_with_retry_deadline");
+    scopedRing.runFor(300);
+    suite.expect(deadlineContainer.wormholeRuntimeAckDeadline == nullptr &&
+                     deadlineContainer.wormholeRuntimePendingMachines.empty() &&
+                     deadlineContainer.wormholeRuntimeFailedMachines.contains(disconnected.fragment),
+                 "wormhole_fleet_transaction_dispatches_retry_deadline_without_unbounded_offline_retry");
+    brain.containers.erase(deadlineContainer.uuid);
+    disconnected.neuron.connected = true;
+  }
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TimeoutPacket *retryDeadline = new TimeoutPacket();
+    retryDeadline->flags = uint64_t(BrainTimeoutFlags::wormholeRuntimeAckDeadline);
+    retryDeadline->identifier = container.uuid;
+    retryDeadline->dispatcher = &brain;
+    RingDispatcher::installMultiplexee(retryDeadline, &brain);
+    container.wormholeRuntimeAckDeadline = retryDeadline;
+    container.wormholeRuntimeAckDeadlineIsRetry = true;
+    brain.timeoutHandlerForTest(retryDeadline, 0);
+  }
+  bool retriedExactFailedMachine = false;
+  forEachMessageInBuffer(disconnected.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes)
+    {
+      return;
+    }
+    SwitchboardWormholeOperation operation = {};
+    Vector<Wormhole> decoded = {};
+    retriedExactFailedMachine = decodeSwitchboardWormholeOperation(queued, operation, decoded) &&
+                             operation.containerID == container.generateContainerID() &&
+                             operation.revision.equals(container.wormholeRuntimeRevision) && decoded.empty();
+  });
+  suite.expect(retriedExactFailedMachine &&
+                   container.wormholeRuntimePendingMachines.contains(disconnected.fragment) &&
+                   container.wormholeRuntimeFailedMachines.empty() &&
+                   container.wormholeRuntimeRetryAttempts[disconnected.fragment] == 1 &&
+                   container.runtimeReady == false,
+               "wormhole_fleet_transaction_retries_only_failed_machine_with_exact_current_payload");
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TimeoutPacket *staleDeadline = new TimeoutPacket();
+    staleDeadline->flags = uint64_t(BrainTimeoutFlags::wormholeRuntimeAckDeadline);
+    staleDeadline->identifier = container.uuid;
+    staleDeadline->dispatcher = &brain;
+    RingDispatcher::installMultiplexee(staleDeadline, &brain);
+    TimeoutPacket *currentDeadline = new TimeoutPacket();
+    currentDeadline->flags = uint64_t(BrainTimeoutFlags::wormholeRuntimeAckDeadline);
+    currentDeadline->identifier = container.uuid;
+    currentDeadline->dispatcher = &brain;
+    RingDispatcher::installMultiplexee(currentDeadline, &brain);
+    container.wormholeRuntimeAckDeadline = currentDeadline;
+    container.wormholeRuntimeAckDeadlineIsRetry = false;
+    brain.timeoutHandlerForTest(staleDeadline, 0);
+    suite.expect(container.wormholeRuntimePendingMachines.contains(disconnected.fragment) &&
+                     container.wormholeRuntimeAckDeadline == currentDeadline,
+                 "wormhole_fleet_transaction_stale_deadline_cannot_fail_current_revision");
+    RingDispatcher::eraseMultiplexee(currentDeadline);
+    delete currentDeadline;
+    container.wormholeRuntimeAckDeadline = nullptr;
+  }
+  brain.neuronHandler(&disconnected.neuron,
                       buildNeuronSwitchboardWormholeAcknowledgement(inbound,
                                                                     container.generateContainerID(),
-                                                                    container.wormholeRuntimeRevision,
+                                                                    staleRevision,
                                                                     SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.contains(disconnected.fragment) &&
+                   container.runtimeReady == false,
+               "wormhole_fleet_transaction_stale_retry_ack_does_not_heal_current_revision");
   brain.neuronHandler(&disconnected.neuron,
                       buildNeuronSwitchboardWormholeAcknowledgement(inbound,
                                                                     container.generateContainerID(),
@@ -10358,6 +10454,34 @@ static void testSwitchboardWormholeFleetAcknowledgementTransaction(TestSuite& su
                                                                     SwitchboardWormholeOperationStatus::applied));
   suite.expect(container.runtimeReady && container.wormholeRuntimePendingMachines.empty(),
                "wormhole_fleet_transaction_duplicate_current_ack_is_idempotent");
+
+  brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
+  brain.neuronHandler(&active.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::applied));
+  brain.neuronHandler(&disconnected.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                    container.generateContainerID(),
+                                                                    container.wormholeRuntimeRevision,
+                                                                    SwitchboardWormholeOperationStatus::rejected));
+  for (uint8_t attempt = 0; attempt < prodigyWormholeRuntimeMaximumRetryAttempts; ++attempt)
+  {
+    brain.retryFailedWormholeRuntimeAcknowledgements(&container);
+    brain.neuronHandler(&disconnected.neuron,
+                        buildNeuronSwitchboardWormholeAcknowledgement(inbound,
+                                                                      container.generateContainerID(),
+                                                                      container.wormholeRuntimeRevision,
+                                                                      SwitchboardWormholeOperationStatus::rejected));
+  }
+  const size_t exhaustedRetryBytes = disconnected.neuron.wBuffer.size();
+  brain.retryFailedWormholeRuntimeAcknowledgements(&container);
+  suite.expect(container.wormholeRuntimePendingMachines.empty() &&
+                   container.wormholeRuntimeFailedMachines.contains(disconnected.fragment) &&
+                   container.wormholeRuntimeRetryAttempts[disconnected.fragment] == prodigyWormholeRuntimeMaximumRetryAttempts &&
+                   disconnected.neuron.wBuffer.size() == exhaustedRetryBytes && container.runtimeReady == false,
+               "wormhole_fleet_transaction_exhausts_bounded_rejected_retries_fail_closed");
 
   brain.sendNeuronOpenSwitchboardWormholes(&container, empty);
   brain.failWormholeRuntimeAckDeadline(&container);
@@ -25963,13 +26087,126 @@ static void testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(TestSuite
                    formerMaster.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos,
                "former_master_successor_authority_defers_local_exec_until_durable");
 
+  formerMaster.finishRuntimePersistence(false);
+  suite.expect(formerMaster.masterAuthorityRuntimeState.generation == 47 &&
+                   formerMaster.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos &&
+                   formerMaster.transitionToNewBundleCalls == 0,
+               "former_master_successor_authority_failed_receipt_does_not_exec");
+
+  formerMaster.brainHandler(
+      &successor,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(formerMaster.pendingRuntimePersistence.size() == 1 &&
+                   formerMaster.transitionToNewBundleCalls == 0,
+               "former_master_successor_authority_retry_remains_held_until_durable");
+
   formerMaster.finishRuntimePersistence(true);
   suite.expect(formerMaster.masterAuthorityRuntimeState.generation == 48 &&
                    formerMaster.updateSelfState == Brain::UpdateSelfState::idle &&
                    formerMaster.transitionToNewBundleCalls == 1,
                "former_master_successor_authority_resumes_final_local_exec_after_durable_apply");
 
+  formerMaster.brainHandler(
+      &successor,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+  suite.expect(formerMaster.transitionToNewBundleCalls == 1,
+               "former_master_successor_authority_duplicate_apply_does_not_repeat_final_exec");
+
   formerMaster.brains.erase(&successor);
+  thisNeuron = previousNeuron;
+}
+
+static void testFormerMasterFinalExecRequiresAuthenticatedPhaseThreeHandoff(TestSuite& suite)
+{
+  const uint128_t localMachineUUID = uint128_t(0x521d1101);
+  const uint128_t firstFollowerUUID = uint128_t(0x521d1102);
+  const uint128_t secondFollowerUUID = uint128_t(0x521d1103);
+  TestNeuron localNeuron = {};
+  localNeuron.uuid = localMachineUUID;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &localNeuron;
+
+  auto configureCandidate = [&](TestBrain& formerMaster) {
+    formerMaster.weAreMaster = false;
+    formerMaster.noMasterYet = false;
+    formerMaster.masterAuthorityRuntimeState.generation = 51;
+    formerMaster.masterAuthorityRuntimeStateDurable = true;
+    formerMaster.durableMasterAuthorityRuntimeStateGeneration = 51;
+    formerMaster.updateSelfState = Brain::UpdateSelfState::waitingForRelinquishEchos;
+    formerMaster.updateSelfExpectedEchos = 2;
+    formerMaster.updateSelfBundleEchos = 2;
+    formerMaster.updateSelfRelinquishEchos = 1;
+    formerMaster.updateSelfPlannedMasterPeerKey = secondFollowerUUID;
+    formerMaster.updateSelfWorkerExpectedBundleSHA256 =
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"_ctv;
+    for (uint128_t machineUUID : {localMachineUUID, firstFollowerUUID, secondFollowerUUID})
+    {
+      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+      witness.machineUUID = machineUUID;
+      witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+      formerMaster.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+    }
+    formerMaster.updateSelfBundleEchoPeerKeys.insert(firstFollowerUUID);
+    formerMaster.updateSelfBundleEchoPeerKeys.insert(secondFollowerUUID);
+    formerMaster.updateSelfFollowerBootNsByPeerKey.insert_or_assign(firstFollowerUUID, 52'122);
+    formerMaster.updateSelfFollowerBootNsByPeerKey.insert_or_assign(secondFollowerUUID, 52'123);
+    formerMaster.updateSelfFollowerRebootedPeerKeys.insert(firstFollowerUUID);
+    formerMaster.updateSelfFollowerRebootedPeerKeys.insert(secondFollowerUUID);
+    formerMaster.updateSelfRelinquishEchoPeerKeys.insert(firstFollowerUUID);
+  };
+
+  auto requireNoFinalExec = [&](const char *name, auto&& alter) {
+    TestBrain formerMaster = {};
+    configureCandidate(formerMaster);
+    BrainView successor = {};
+    authorizeMasterPeerForTest(formerMaster, successor, 95, secondFollowerUUID, 52'123);
+    formerMaster.brains.insert(&successor);
+    alter(formerMaster);
+
+    ProdigyMasterAuthorityRuntimeState successorAuthority = {};
+    successorAuthority.generation = 52;
+    successorAuthority.nextPendingAddMachinesOperationID = 1;
+    successorAuthority.nextPendingElasticAddressOperationID = 1;
+    successorAuthority.nextDNSIntentRevision = 1;
+    successorAuthority.nextTlsResumptionGeneration = 1;
+    successorAuthority.updateSelf = Brain::projectUpdateSelfRecoveryWitness(
+        formerMaster.capturePersistentUpdateSelfState());
+    alter(successorAuthority);
+    (void)formerMaster.applyReplicatedMasterAuthorityRuntimeState(successorAuthority, true);
+    suite.expect(formerMaster.transitionToNewBundleCalls == 0, name);
+    formerMaster.brains.erase(&successor);
+  };
+
+  requireNoFinalExec("former_master_successor_authority_missing_reboot_cohort_does_not_exec",
+      [&](auto& state) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(state)>, TestBrain>)
+        {
+          state.updateSelfFollowerRebootedPeerKeys.erase(secondFollowerUUID);
+        }
+      });
+  requireNoFinalExec("former_master_successor_authority_missing_local_witness_does_not_exec",
+      [&](auto& state) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(state)>, TestBrain>)
+        {
+          state.updateSelfMachineRecoveryWitnesses.erase(state.updateSelfMachineRecoveryWitnesses.begin());
+        }
+      });
+  requireNoFinalExec("former_master_successor_authority_mismatched_digest_does_not_exec",
+      [&](auto& state) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(state)>, ProdigyMasterAuthorityRuntimeState>)
+        {
+          state.updateSelf.workerExpectedBundleSHA256 =
+              "dededededededededededededededededededededededededededededededededede"_ctv;
+        }
+      });
+  requireNoFinalExec("former_master_successor_authority_wrong_current_master_does_not_exec",
+      [&](auto& state) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(state)>, TestBrain>)
+        {
+          state.updateSelfPlannedMasterPeerKey = firstFollowerUUID;
+        }
+      });
+
   thisNeuron = previousNeuron;
 }
 
@@ -28387,6 +28624,7 @@ int main(void)
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
     testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(suite);
+    testFormerMasterFinalExecRequiresAuthenticatedPhaseThreeHandoff(suite);
     testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(suite);
     testUpdateSelfPersistenceBackpressureDefersOnlyCapacityMisses(suite);
     testAsyncMachineRetirementJournalDurability(suite);
@@ -28468,6 +28706,7 @@ int main(void)
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
     testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(suite);
+    testFormerMasterFinalExecRequiresAuthenticatedPhaseThreeHandoff(suite);
     testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
     testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
@@ -28526,6 +28765,17 @@ int main(void)
   {
     testWormholeDNSLeasesAndCredentialValidation(suite);
     testDNSBindingTopicsReserveAddressAndApplyProvider(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "wormhole-runtime-ack-retry") == 0)
+  {
+    testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
+    std::printf("WORMHOLE_RUNTIME_ACK_RETRY_RESULT failed_assertions=%d\n", suite.failed);
     if (createdRing)
     {
       Ring::shutdownForExec();

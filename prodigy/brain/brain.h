@@ -642,6 +642,26 @@ static inline void prodigyCancelWormholeRuntimeAckDeadline(ContainerView *contai
     Ring::queueCancelTimeout(container->wormholeRuntimeAckDeadline);
     container->wormholeRuntimeAckDeadline = nullptr;
   }
+  if (container != nullptr)
+  {
+    container->wormholeRuntimeAckDeadlineIsRetry = false;
+  }
+}
+
+static constexpr uint8_t prodigyWormholeRuntimeMaximumRetryAttempts = 3;
+
+static inline void prodigyResetWormholeRuntimeRetries(ContainerView *container,
+                                                       const String& revision)
+{
+  if (container == nullptr)
+  {
+    return;
+  }
+  if (container->wormholeRuntimeRetryRevision.equals(revision) == false)
+  {
+    container->wormholeRuntimeRetryAttempts.clear();
+    container->wormholeRuntimeRetryRevision.assign(revision);
+  }
 }
 
 inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
@@ -722,6 +742,11 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
 
     if (prodigyWormholeRuntimeTargetMachine(machine))
     {
+      if (container->wormholeRuntimeAckDeadlineIsRetry)
+      {
+        prodigyCancelWormholeRuntimeAckDeadline(container);
+      }
+      prodigyResetWormholeRuntimeRetries(container, operation.revision);
       container->wormholeRuntimePendingMachines.insert(machine->fragment);
       container->wormholeRuntimeFailedMachines.erase(machine->fragment);
       if (container->runtimeReady)
@@ -803,6 +828,8 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
   container->wormholeRuntimeRevision = operation.revision;
   container->wormholeRuntimeDesired = operation.desired;
   prodigyCancelWormholeRuntimeAckDeadline(container);
+  container->wormholeRuntimeRetryAttempts.clear();
+  container->wormholeRuntimeRetryRevision.assign(operation.revision);
   container->wormholeRuntimePendingMachines.clear();
   container->wormholeRuntimeFailedMachines.clear();
   container->wormholeRuntimeFailure.clear();
@@ -6842,7 +6869,52 @@ public:
     ProdigyMasterAuthorityRuntimeState runtimeState;
     bool shouldApply = false;
     bool sameState = false;
+    bool resumePreemptedLocalBundleExec = false;
+    String preemptedLocalBundleSHA256 = {};
   };
+
+  bool preemptedLocalBundleExecMayResume(
+      const ProdigyPersistentUpdateSelfState& local,
+      const ProdigyPersistentUpdateSelfState& incomingWitness,
+      const ProdigyMasterAuthorityRuntimeState& incoming) const
+  {
+    if (local.state != uint8_t(UpdateSelfState::waitingForRelinquishEchos) ||
+        local.expectedEchos == 0 || local.plannedMasterPeerKey == 0 ||
+        local.workerExpectedBundleSHA256.empty() ||
+        prodigyIsSHA256HexDigest(local.workerExpectedBundleSHA256) == false ||
+        local.workerExpectedBundleSHA256.equals(incomingWitness.workerExpectedBundleSHA256) == false ||
+        incoming.generation <= masterAuthorityRuntimeState.generation ||
+        local.bundleEchos != local.expectedEchos ||
+        local.followerBootNsByPeerKey.size() != local.expectedEchos ||
+        local.followerRebootedPeerKeys.size() != local.expectedEchos ||
+        local.bundleEchoPeerKeys.size() != local.expectedEchos)
+    {
+      return false;
+    }
+    for (uint128_t peerKey : local.followerRebootedPeerKeys)
+    {
+      if (std::none_of(local.followerBootNsByPeerKey.begin(), local.followerBootNsByPeerKey.end(),
+                       [peerKey](const ProdigyPersistentUpdateSelfFollowerBoot& follower) {
+                         return follower.peerKey == peerKey;
+                       }) ||
+          local.bundleEchoPeerKeys.contains(peerKey) == false)
+      {
+        return false;
+      }
+    }
+    const uint128_t localUUID = selfBrainUUID();
+    if (localUUID == 0 ||
+        std::none_of(local.machineRecoveryWitnesses.begin(), local.machineRecoveryWitnesses.end(),
+                     [localUUID](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) {
+                       return witness.machineUUID == localUUID;
+                     }))
+    {
+      return false;
+    }
+    BrainView *currentMaster = findBrainViewByUUID(getExistingMasterUUID());
+    return currentMaster != nullptr &&
+           updateSelfPeerKeyMatchesBrain(local.plannedMasterPeerKey, currentMaster);
+  }
 
   // Validation and witness preparation have no provider or live-state effects.
   // Both synchronous restoration and asynchronous replication use this owner.
@@ -6855,6 +6927,8 @@ public:
         projectUpdateSelfRecoveryWitness(incoming.updateSelf);
     ProdigyPersistentUpdateSelfState localUpdateCoordinator =
         capturePersistentUpdateSelfState();
+    const ProdigyPersistentUpdateSelfState preProjectionLocalUpdateCoordinator =
+        localUpdateCoordinator;
     const ProdigyPersistentUpdateSelfState localRecoveryWitness =
         projectUpdateSelfRecoveryWitness(localUpdateCoordinator);
     const bool incomingHasAllMachineWitness = incomingRecoveryWitness.machineRecoveryWitnesses.empty() == false;
@@ -6918,6 +6992,13 @@ public:
         incomingWitnessMatchesLocal &&
         updateSelfCoordinatorIsRelinquishedMasterCandidate(localUpdateCoordinator))
     {
+      if (preemptedLocalBundleExecMayResume(
+              preProjectionLocalUpdateCoordinator, incomingRecoveryWitness, incoming))
+      {
+        prepared.resumePreemptedLocalBundleExec = true;
+        prepared.preemptedLocalBundleSHA256 =
+            preProjectionLocalUpdateCoordinator.workerExpectedBundleSHA256;
+      }
       localUpdateCoordinator = projectUpdateSelfRecoveryWitness(incomingRecoveryWitness);
     }
 
@@ -6973,6 +7054,8 @@ public:
   bool applyPreparedMasterAuthorityRuntimeState(
       PreparedMasterAuthorityRuntimeState prepared, bool persist, bool alreadyDurable = false)
   {
+    const bool resumePreemptedLocalBundleExec = prepared.resumePreemptedLocalBundleExec;
+    String preemptedLocalBundleSHA256 = std::move(prepared.preemptedLocalBundleSHA256);
     ProdigyMasterAuthorityRuntimeState sanitizedIncoming = std::move(prepared.runtimeState);
     const ProdigyPersistentUpdateSelfState localUpdateCoordinator = sanitizedIncoming.updateSelf;
     const ProdigyPersistentUpdateSelfState previousLiveUpdateCoordinator = capturePersistentUpdateSelfState();
@@ -7107,6 +7190,17 @@ public:
     }
 
     onMasterAuthorityRuntimeStateApplied();
+    if (resumePreemptedLocalBundleExec && (persist || alreadyDurable) &&
+        masterAuthorityRuntimeStateDurable &&
+        durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
+    {
+      // The successor now owns the coordinator.  Retire only this former
+      // master's fenced transient receipt before it resumes its already
+      // approved local exec through the ordinary bundle owner.
+      resetUpdateSelfState();
+      bundleExecExpectedSHA256 = std::move(preemptedLocalBundleSHA256);
+      transitionToNewBundle();
+    }
     (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
     reconcileRetiredMachineLocalAliases();
     reapRetiringMachines();
@@ -23459,21 +23553,62 @@ public:
     {
       return;
     }
-    if (container->wormholeRuntimePendingMachines.empty())
+    bool awaitingAcknowledgement = container->wormholeRuntimePendingMachines.empty() == false;
+    bool retryingFailedDelivery = false;
+    uint8_t retryAttempt = 0;
+    if (awaitingAcknowledgement == false &&
+        container->wormholeRuntimeRetryRevision.equals(container->wormholeRuntimeRevision))
+    {
+      for (uint32_t fragment : container->wormholeRuntimeFailedMachines)
+      {
+        auto attempt = container->wormholeRuntimeRetryAttempts.find(fragment);
+        Machine *machine = nullptr;
+        for (Machine *candidate : machines)
+        {
+          if (candidate != nullptr && candidate->fragment == fragment)
+          {
+            machine = candidate;
+            break;
+          }
+        }
+        if (attempt != container->wormholeRuntimeRetryAttempts.end() &&
+            attempt->second < prodigyWormholeRuntimeMaximumRetryAttempts &&
+            prodigyWormholeRuntimeTargetMachine(machine) && neuronControlStreamActive(machine))
+        {
+          retryingFailedDelivery = true;
+          retryAttempt = std::max(retryAttempt, attempt->second);
+        }
+      }
+    }
+    if (awaitingAcknowledgement == false && retryingFailedDelivery == false)
     {
       prodigyCancelWormholeRuntimeAckDeadline(container);
       return;
     }
-    if (container->wormholeRuntimeAckDeadline != nullptr)
+    if (container->wormholeRuntimeAckDeadline != nullptr &&
+        container->wormholeRuntimeAckDeadlineIsRetry == retryingFailedDelivery)
     {
       return;
+    }
+    if (container->wormholeRuntimeAckDeadline != nullptr)
+    {
+      prodigyCancelWormholeRuntimeAckDeadline(container);
     }
 
     TimeoutPacket *timeout = new TimeoutPacket();
     timeout->flags = uint64_t(BrainTimeoutFlags::wormholeRuntimeAckDeadline);
     timeout->identifier = container->uuid;
     timeout->dispatcher = this;
-    timeout->setTimeoutMs(wormholeRuntimeAckTimeoutMs);
+    if (awaitingAcknowledgement)
+    {
+      timeout->setTimeoutMs(wormholeRuntimeAckTimeoutMs);
+      container->wormholeRuntimeAckDeadlineIsRetry = false;
+    }
+    else
+    {
+      timeout->setTimeoutMs(250 << retryAttempt);
+      container->wormholeRuntimeAckDeadlineIsRetry = true;
+    }
     RingDispatcher::installMultiplexee(timeout, this);
     Ring::queueTimeout(timeout);
     container->wormholeRuntimeAckDeadline = timeout;
@@ -23485,9 +23620,11 @@ public:
     {
       return;
     }
+    prodigyResetWormholeRuntimeRetries(container, container->wormholeRuntimeRevision);
     for (uint32_t machineFragment : container->wormholeRuntimePendingMachines)
     {
       container->wormholeRuntimeFailedMachines.insert(machineFragment);
+      (void)container->wormholeRuntimeRetryAttempts[machineFragment];
       basics_log("brain wormhole runtime acknowledgement timeout containerID=%u machineFragment=%u\n",
                  container->generateContainerID(),
                  machineFragment);
@@ -23495,6 +23632,53 @@ public:
     container->wormholeRuntimeFailure.assign("wormhole routing acknowledgement timed out"_ctv);
     container->wormholeRuntimePendingMachines.clear();
     replicateContainerRuntimeStateToFollowers(container);
+    armWormholeRuntimeAckDeadline(container);
+  }
+
+  void retryFailedWormholeRuntimeAcknowledgements(ContainerView *container)
+  {
+    if (weAreMaster == false || container == nullptr ||
+        container->wormholeRuntimeFailedMachines.empty() ||
+        container->wormholeRuntimeRetryRevision.equals(container->wormholeRuntimeRevision) == false)
+    {
+      return;
+    }
+
+    SwitchboardWormholeOperation operation = {};
+    operation.containerID = container->generateContainerID();
+    operation.desired = container->wormholeRuntimeDesired;
+    if (operation.containerID == 0 || operation.desired.size() > SwitchboardWormholeOperation::maximumDesiredBytes ||
+        prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, operation.revision) == false ||
+        operation.revision.equals(container->wormholeRuntimeRevision) == false)
+    {
+      return;
+    }
+
+    bool queued = false;
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || container->wormholeRuntimeFailedMachines.contains(machine->fragment) == false ||
+          prodigyWormholeRuntimeTargetMachine(machine) == false || neuronControlStreamActive(machine) == false)
+      {
+        continue;
+      }
+      uint8_t& attempt = container->wormholeRuntimeRetryAttempts[machine->fragment];
+      if (attempt >= prodigyWormholeRuntimeMaximumRetryAttempts)
+      {
+        continue;
+      }
+      attempt += 1;
+      container->wormholeRuntimeFailedMachines.erase(machine->fragment);
+      container->wormholeRuntimePendingMachines.insert(machine->fragment);
+      prodigyQueueSwitchboardWormholeOperation(machine, operation);
+      Ring::queueSend(&machine->neuron);
+      queued = true;
+    }
+    if (queued)
+    {
+      replicateContainerRuntimeStateToFollowers(container);
+    }
+    armWormholeRuntimeAckDeadline(container);
   }
 
   void restoreWormholeRuntimeReadiness(ContainerView *container)
@@ -23531,6 +23715,7 @@ public:
       }
       bool changed = container->wormholeRuntimePendingMachines.erase(machine->fragment) > 0;
       changed = container->wormholeRuntimeFailedMachines.erase(machine->fragment) > 0 || changed;
+      container->wormholeRuntimeRetryAttempts.erase(machine->fragment);
       if (changed == false)
       {
         continue;
@@ -23625,8 +23810,17 @@ public:
               containerIt->second->wormholeRuntimeAckDeadline == packet)
           {
             ContainerView *container = containerIt->second;
+            bool retry = container->wormholeRuntimeAckDeadlineIsRetry;
             container->wormholeRuntimeAckDeadline = nullptr;
-            failWormholeRuntimeAckDeadline(container);
+            container->wormholeRuntimeAckDeadlineIsRetry = false;
+            if (retry)
+            {
+              retryFailedWormholeRuntimeAcknowledgements(container);
+            }
+            else
+            {
+              failWormholeRuntimeAckDeadline(container);
+            }
           }
           RingDispatcher::eraseMultiplexee(packet);
           delete packet;
@@ -26241,6 +26435,7 @@ public:
 
   bool bundlePersistencePreparing = false;
   bool bundlePersistenceReady = false;
+  String bundleExecExpectedSHA256 = {};
 
   virtual void transitionToNewBundle(void)
   {
@@ -37254,10 +37449,13 @@ public:
             if (operation.status == SwitchboardWormholeOperationStatus::applied)
             {
               container->wormholeRuntimeFailedMachines.erase(machineFragment);
+              container->wormholeRuntimeRetryAttempts.erase(machineFragment);
             }
             else if (failed == false)
             {
               container->wormholeRuntimeFailedMachines.insert(machineFragment);
+              prodigyResetWormholeRuntimeRetries(container, operation.revision);
+              (void)container->wormholeRuntimeRetryAttempts[machineFragment];
               if (operation.status == SwitchboardWormholeOperationStatus::rollbackFailed)
               {
                 container->wormholeRuntimeFailure.snprintf<"wormhole routing rollback failed on machine fragment {itoa}"_ctv>(machineFragment);

@@ -39,8 +39,14 @@ public:
   String wormholeRuntimeDesired;
   bytell_hash_set<uint32_t> wormholeRuntimePendingMachines;
   bytell_hash_set<uint32_t> wormholeRuntimeFailedMachines;
+  // This is Brain-local delivery bookkeeping.  The durable route transaction
+  // remains the revision plus desired bytes above; a recovered Brain may make
+  // a fresh bounded delivery attempt for an unresolved machine.
+  bytell_hash_map<uint32_t, uint8_t> wormholeRuntimeRetryAttempts;
+  String wormholeRuntimeRetryRevision;
   String wormholeRuntimeFailure;
   TimeoutPacket *wormholeRuntimeAckDeadline = nullptr;
+  bool wormholeRuntimeAckDeadlineIsRetry = false;
   bool wormholeRuntimeFailureSuppressedReady = false;
   bool statefulTopologyCutoverReady = false;
   uint32_t statefulTopologyCutoverSourceEpoch = 0;

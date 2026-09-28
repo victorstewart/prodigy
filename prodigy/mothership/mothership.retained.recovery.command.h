@@ -260,6 +260,12 @@ inline bool sameCanonicalRecordIdentity(const Manifest& left,const Manifest& rig
   }
   return canonical==23;
 }
+inline bool retainedRecoveryHasMixedInstalledPredecessors(const Plan& plan) {
+  std::set<std::pair<std::string,std::string>> installed;
+  for (const auto& machine : plan.machines)
+    installed.emplace(machine.installedRuntimeSHA,machine.installedBundleSHA);
+  return installed.size() > 1;
+}
 inline bool samePlanTarget(const Plan& oldPlan,const Plan& successor) {
   if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.mixedPredecessors!=successor.mixedPredecessors || oldPlan.machines.size()!=successor.machines.size() || oldPlan.approvedPredecessors.size()!=successor.approvedPredecessors.size())return false;
   for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address || oldPlan.machines[i].runtimeRoot!=successor.machines[i].runtimeRoot || oldPlan.machines[i].installedRuntimeSHA!=successor.machines[i].installedRuntimeSHA || oldPlan.machines[i].installedBundleSHA!=successor.machines[i].installedBundleSHA)return false;
@@ -515,7 +521,12 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","retained recovery must run on selected seed");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);
         require(seed.brainConfig.clusterUUID==e.plan.clusterUUID,"seed authority cluster mismatch");manifest.request.plans=seed.masterAuthority.deploymentPlans;
-        if (e.plan.mixedPredecessors) {
+        // Schema-v2 also represents a uniform executable temporarily installed
+        // below a root other than systemd's registered service root. That uses
+        // the normal retained-snapshot predicate, which still validates any
+        // active coordinator against the target and logical predecessor digests.
+        // Only genuinely mixed installed predecessors use interrupted handoff.
+        if (e.plan.mixedPredecessors && retainedRecoveryHasMixedInstalledPredecessors(e.plan)) {
           for (const auto& machine : e.plan.machines) {
             if (machine.installedBundleSHA != e.plan.oldBundleSHA) {
               manifest.request.interruptedBundleSHA=text(machine.installedBundleSHA);

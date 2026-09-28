@@ -97,10 +97,23 @@ inline Plan parse(const char *file) {
       for (const auto& old : p.approvedPredecessors) require(old.runtimeSHA!=predecessor.runtimeSHA || old.bundleSHA!=predecessor.bundleSHA, "duplicate approved predecessor identity");
       p.approvedPredecessors.push_back(std::move(predecessor)); }
     require(p.approvedPredecessors.size()==2, "mixed recovery requires exactly two approved predecessor bundles");
-    bool logical=false; std::set<std::pair<std::string,std::string>> used;
+    bool logical=false, servicePredecessorObservedAtDifferentRoot=false;
+    std::set<std::pair<std::string,std::string>> used;
     for (const auto& predecessor : p.approvedPredecessors) logical |= predecessor.runtimeSHA==p.oldRuntimeSHA && predecessor.bundleSHA==p.oldBundleSHA;
     require(logical, "logical predecessor bundle is not approved");
-    for (const auto& machine : p.machines) { bool approved=false; for (const auto& predecessor : p.approvedPredecessors) approved |= predecessor.runtimeSHA==machine.installedRuntimeSHA && predecessor.bundleSHA==machine.installedBundleSHA; require(approved, "machine predecessor is not approved"); used.emplace(machine.installedRuntimeSHA,machine.installedBundleSHA); }
+    for (const auto& machine : p.machines) {
+      bool approved=false;
+      for (const auto& predecessor : p.approvedPredecessors)
+        approved |= predecessor.runtimeSHA==machine.installedRuntimeSHA && predecessor.bundleSHA==machine.installedBundleSHA;
+      require(approved, "machine predecessor is not approved");
+      used.emplace(machine.installedRuntimeSHA,machine.installedBundleSHA);
+      servicePredecessorObservedAtDifferentRoot |= machine.runtimeRoot != p.runtimeRoot;
+    }
+    // A retained recovery can observe a uniformly installed successor under a
+    // temporary root while systemd still owns the logical predecessor root.
+    // Count that separately verified service predecessor only in that split-root
+    // case; a same-root uniform plan must still prove two actual predecessors.
+    if (servicePredecessorObservedAtDifferentRoot) used.emplace(p.oldRuntimeSHA,p.oldBundleSHA);
     require(used.size()==2 && used.contains({p.oldRuntimeSHA,p.oldBundleSHA}), "mixed recovery requires both predecessor identities"); p.mixedPredecessors=true;
   }
   return p;
