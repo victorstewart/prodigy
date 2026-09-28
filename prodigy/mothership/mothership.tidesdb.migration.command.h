@@ -531,7 +531,11 @@ public:
 };
 
 inline bool run(const char *planPath, bool rollback, String *failure) {
-  try { Execution execution(parse(planPath)); if(rollback) execution.rollback(); else execution.execute(); return true; }
+  try {
+    Plan plan=parse(planPath);
+    require(!plan.mixedPredecessors,"mixed predecessors require the retained recovery command");
+    Execution execution(std::move(plan)); if(rollback) execution.rollback(); else execution.execute(); return true;
+  }
   catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }
 }
 } // namespace MothershipTidesMigration

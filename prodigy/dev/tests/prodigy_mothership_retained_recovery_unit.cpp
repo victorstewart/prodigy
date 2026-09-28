@@ -509,6 +509,9 @@ int main()
     auto rejects=[&](const std::string& value) { writePlan(value); bool rejected=false; try {(void)MothershipTidesMigration::parse(path.c_str());} catch(const std::exception&) {rejected=true;} assert(rejected); };
     writePlan(planJSON()); const auto parsed=MothershipTidesMigration::parse(path.c_str());
     assert(parsed.mixedPredecessors && parsed.approvedPredecessors.size()==2 && parsed.machines[0].runtimeRoot=="/root/prodigy-nuc");
+    String genericFailure;
+    assert(!MothershipTidesMigration::run(path.c_str(),false,&genericFailure));
+    assert(genericFailure=="mixed predecessors require the retained recovery command"_ctv);
     auto missingIdentity=planJSON(); const auto identity="\"installedRuntimeSHA256\":\""+oldRuntime+"\","; missingIdentity.erase(missingIdentity.find(identity),identity.size()); rejects(missingIdentity);
     auto unknownPair=planJSON(); unknownPair.replace(unknownPair.find("\"installedRuntimeSHA256\":\""+newRuntime),std::string("\"installedRuntimeSHA256\":\"").size()+newRuntime.size(),"\"installedRuntimeSHA256\":\""+std::string(64,'e')); rejects(unknownPair);
     auto duplicatePair=planJSON(); const auto second="{\"runtimeSHA256\":\""+newRuntime+"\",\"bundleSHA256\":\""+interruptedBundle+"\",\"bundlePath\":\"/private/interrupted.bundle\"}"; const auto first="{\"runtimeSHA256\":\""+oldRuntime+"\",\"bundleSHA256\":\""+oldBundle+"\",\"bundlePath\":\"/private/old.bundle\"}"; duplicatePair.replace(duplicatePair.find(second),second.size(),first); rejects(duplicatePair);
