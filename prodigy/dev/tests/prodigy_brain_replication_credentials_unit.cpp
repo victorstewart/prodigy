@@ -25839,6 +25839,50 @@ static void testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(TestSuite&
   suite.expect(activeMaster.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots &&
                    activeMaster.updateSelfExpectedEchos == 2,
                "active_master_retains_current_update_coordinator");
+
+  TestBrain workerFollower = {};
+  workerFollower.weAreMaster = false;
+  workerFollower.masterAuthorityRuntimeState.generation = 7;
+  workerFollower.updateSelfWorkerExpectedBundleSHA256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+  workerFollower.updateSelfWorkerFailure.assign("worker staging acknowledgement digest mismatch"_ctv);
+  workerFollower.updateSelfWorkerMachineUUIDs.insert(uint128_t(0x521d0001));
+  for (const auto& witness : formerMaster.updateSelfMachineRecoveryWitnesses)
+  {
+    workerFollower.updateSelfMachineRecoveryWitnesses.push_back(witness);
+  }
+  suite.require(workerFollower.applyReplicatedMasterAuthorityRuntimeState(successorAuthority, true),
+                "worker_follower_accepts_newer_matching_authority");
+  suite.expect(workerFollower.updateSelfState == Brain::UpdateSelfState::idle &&
+                   workerFollower.updateSelfWorkerFailure.equals("worker staging acknowledgement digest mismatch"_ctv) &&
+                   workerFollower.updateSelfWorkerMachineUUIDs.contains(uint128_t(0x521d0001)),
+               "worker_follower_state_is_not_retired_as_former_master_handoff");
+
+  TestBrain equalGenerationFollower = {};
+  equalGenerationFollower.weAreMaster = false;
+  equalGenerationFollower.masterAuthorityRuntimeState.generation = 7;
+  equalGenerationFollower.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  equalGenerationFollower.updateSelfExpectedEchos = 2;
+  equalGenerationFollower.updateSelfWorkerExpectedBundleSHA256 =
+      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+  for (const auto& witness : formerMaster.updateSelfMachineRecoveryWitnesses)
+  {
+    equalGenerationFollower.updateSelfMachineRecoveryWitnesses.push_back(witness);
+  }
+  ProdigyMasterAuthorityRuntimeState equalAuthority = successorAuthority;
+  equalAuthority.generation = 7;
+  suite.require(equalGenerationFollower.applyReplicatedMasterAuthorityRuntimeState(equalAuthority, true),
+                "equal_generation_matching_authority_is_accepted");
+  suite.expect(equalGenerationFollower.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots &&
+                   equalGenerationFollower.updateSelfExpectedEchos == 2,
+               "equal_generation_matching_authority_does_not_retire_coordinator");
+
+  ProdigyMasterAuthorityRuntimeState mismatchedAuthority = successorAuthority;
+  mismatchedAuthority.generation = 9;
+  mismatchedAuthority.updateSelf.machineRecoveryWitnesses[0].machineUUID = uint128_t(0x521d0099);
+  suite.expect(equalGenerationFollower.applyReplicatedMasterAuthorityRuntimeState(mismatchedAuthority, true) == false &&
+                   equalGenerationFollower.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots,
+               "mismatched_newer_authority_does_not_retire_coordinator");
 }
 
 static void testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(TestSuite& suite)

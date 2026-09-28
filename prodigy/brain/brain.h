@@ -2217,6 +2217,15 @@ public:
            state.workerStateUploadedMachineUUIDs.empty() == false;
   }
 
+  static bool updateSelfCoordinatorIsRelinquishedMasterCandidate(
+      const ProdigyPersistentUpdateSelfState& state)
+  {
+    return state.expectedEchos != 0 &&
+           (state.state == uint8_t(UpdateSelfState::waitingForBundleEchos) ||
+            state.state == uint8_t(UpdateSelfState::waitingForFollowerReboots) ||
+            state.state == uint8_t(UpdateSelfState::waitingForRelinquishEchos));
+  }
+
   ProdigyResumptionRegistry::SnapshotMap captureTlsResumptionSnapshotsByWormhole(void) const
   {
     ProdigyResumptionRegistry::SnapshotMap snapshots;
@@ -6907,7 +6916,7 @@ public:
     if (weAreMaster == false &&
         incoming.generation > masterAuthorityRuntimeState.generation &&
         incomingWitnessMatchesLocal &&
-        updateSelfCoordinatorActiveBeyondRecoveryWitness(localUpdateCoordinator))
+        updateSelfCoordinatorIsRelinquishedMasterCandidate(localUpdateCoordinator))
     {
       localUpdateCoordinator = projectUpdateSelfRecoveryWitness(incomingRecoveryWitness);
     }
