@@ -88,6 +88,14 @@ public:
   }
 };
 
+class SwitchboardRingTestAccess {
+public:
+  static const local_container_subnet6& subnet(const Switchboard& board)
+  {
+    return board.subnet;
+  }
+};
+
 class TestNeuron final : public Neuron {
 public:
   String root = {};
@@ -124,6 +132,14 @@ public:
   }
   bool restoreBarrierPendingForTest() const { return stateUploadRestoresPending(); }
   void fenceCurrentRestoreControlForTest() { fenceStateUploadRestoresForControl(brain); }
+  void assignFragmentForLazySwitchboardTest(uint8_t datacenter, uint8_t machine0, uint8_t machine1, uint8_t machine2)
+  {
+    lcsubnet6.dpfx = datacenter;
+    lcsubnet6.mpfx[0] = machine0;
+    lcsubnet6.mpfx[1] = machine1;
+    lcsubnet6.mpfx[2] = machine2;
+  }
+  Switchboard *createLazySwitchboardForTest() { return ensureSwitchboard(); }
 
   bool pendingStateUploadRestoreForTest(uint128_t uuid) const
   {
@@ -376,6 +392,16 @@ static void runRingUntil(ArtifactRing& ring, const std::function<bool()>& done)
 int main()
 {
   TestSuite suite = {};
+  {
+    ArtifactRing lazySwitchboardRing = {};
+    TestNeuron lazySwitchboardNeuron = {};
+    lazySwitchboardNeuron.assignFragmentForLazySwitchboardTest(9, 4, 5, 6);
+    Switchboard *lazySwitchboard = lazySwitchboardNeuron.createLazySwitchboardForTest();
+    const local_container_subnet6& seeded = SwitchboardRingTestAccess::subnet(*lazySwitchboard);
+    suite.expect(lazySwitchboard != nullptr && seeded.dpfx == 9 && seeded.mpfx[0] == 4 &&
+                     seeded.mpfx[1] == 5 && seeded.mpfx[2] == 6,
+                 "neuron_lazy_switchboard_receives_existing_fragment_before_optional_ingress");
+  }
   String fixture = {};
   const bool hasArtifactFixture = loadFixture(fixture);
   if (!hasArtifactFixture)

@@ -2464,6 +2464,10 @@ protected:
     if (!switchboard)
     {
       switchboard = std::make_unique<Switchboard>(eth);
+      // Direct retained startup has already accepted this fragment before the
+      // first optional ingress asks for Switchboard. Seed it on creation so
+      // boundary-router setup does not observe the default empty subnet.
+      switchboard->setLocalContainerSubnet(lcsubnet6);
     }
 
     switchboard->setHostIngressRouter(tcx_ingress_program);
