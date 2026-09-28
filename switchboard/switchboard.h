@@ -490,6 +490,17 @@ private:
   uint32_t additionalIngressIfidx = 0;
   uint32_t additionalIngressXDPProgramID = 0;
   uint32_t additionalIngressTCXProgramID = 0;
+  // An ordinary Prodigy exec can leave the prior process's additional XDP
+  // attachment alive while this Switchboard replaces the primary attachment.
+  // Keep an exact, pre-replacement primary-program witness for the normal
+  // successor path. An older orphan can instead be admitted only after the
+  // stricter compiled-program family, map-shape, and subnet validation below.
+  struct RetainedAdditionalIngressXDPWitness {
+    uint32_t programID = 0;
+    uint32_t mapCount = 0;
+    uint8_t tag[BPF_TAG_SIZE] = {};
+    bool valid = false;
+  } retainedAdditionalIngressXDPWitness;
   struct local_container_subnet6 subnet = {};
 
   Vector<IPPrefix> announcingPrefixes;
@@ -2130,6 +2141,12 @@ private:
       String balancerObjectPath = resolveBalancerObjectPath();
       bool preattachedMode = usePreattachedXDPProgram();
 
+      // Capture before attachBalancer replaces the primary XDP program. A
+      // retained secondary ingress may still reference that exact program
+      // after an ordinary exec; an older orphan must pass the strict family
+      // proof in configureAdditionalIngress before the same CAS replacement.
+      captureRetainedAdditionalIngressWitness();
+
       auto attachBalancer = [&](uint32_t flags) -> BPFProgram * {
         auto attachedProgramID = [&](void) -> __u32 {
           __u32 prog_id = 0;
@@ -2510,6 +2527,235 @@ public:
     return bpf_prog_get_info_by_fd(program->prog_fd, &info, &length) == 0 ? info.id : 0;
   }
 
+  static bool retainedAdditionalIngressProgramInfoMatches(const RetainedAdditionalIngressXDPWitness& witness,
+                                                          uint32_t programID,
+                                                          const struct bpf_prog_info& info)
+  {
+    return witness.valid && programID != 0 && programID == witness.programID &&
+           info.id == programID && info.type == BPF_PROG_TYPE_XDP &&
+           info.nr_map_ids == witness.mapCount && info.nr_map_ids != 0 &&
+           strncmp(reinterpret_cast<const char *>(info.name), "bal_ingress", BPF_OBJ_NAME_LEN) == 0 &&
+           memcmp(info.tag, witness.tag, sizeof(witness.tag)) == 0;
+  }
+
+  static bool retainedAdditionalIngressProgramMatchesCurrentFamily(uint32_t programID,
+                                                                    const struct bpf_prog_info& candidate,
+                                                                    const struct bpf_prog_info& current)
+  {
+    return candidate.id == programID && candidate.type == BPF_PROG_TYPE_XDP &&
+           current.type == BPF_PROG_TYPE_XDP && candidate.nr_map_ids != 0 &&
+           candidate.nr_map_ids == current.nr_map_ids &&
+           strncmp(reinterpret_cast<const char *>(candidate.name), "bal_ingress", BPF_OBJ_NAME_LEN) == 0 &&
+           strncmp(reinterpret_cast<const char *>(current.name), "bal_ingress", BPF_OBJ_NAME_LEN) == 0 &&
+           memcmp(candidate.tag, current.tag, sizeof(candidate.tag)) == 0;
+  }
+
+  struct RetainedAdditionalIngressMapShape {
+    char name[BPF_OBJ_NAME_LEN] = {};
+    __u32 type = 0;
+    __u32 keySize = 0;
+    __u32 valueSize = 0;
+    __u32 maxEntries = 0;
+    __u32 mapFlags = 0;
+  };
+
+  static bool readRetainedAdditionalIngressMapShapes(uint32_t programID,
+                                                      Vector<RetainedAdditionalIngressMapShape>& shapes,
+                                                      int *localSubnetFD = nullptr)
+  {
+    int programFD = bpf_prog_get_fd_by_id(programID);
+    if (programFD < 0) return false;
+    struct bpf_prog_info info = {};
+    __u32 infoLength = sizeof(info);
+    if (bpf_prog_get_info_by_fd(programFD, &info, &infoLength) != 0 || info.nr_map_ids == 0)
+    {
+      ::close(programFD);
+      return false;
+    }
+    Vector<__u32> mapIDs = {};
+    mapIDs.resize(info.nr_map_ids);
+    info.map_ids = reinterpret_cast<__u64>(mapIDs.data());
+    const __u32 expectedMapCount = info.nr_map_ids;
+    const bool readIDs = bpf_prog_get_info_by_fd(programFD, &info, &infoLength) == 0 &&
+                         info.nr_map_ids == expectedMapCount;
+    ::close(programFD);
+    if (readIDs == false) return false;
+
+    int retainedLocalSubnetFD = -1;
+    for (__u32 mapID : mapIDs)
+    {
+      int mapFD = bpf_map_get_fd_by_id(mapID);
+      if (mapFD < 0)
+      {
+        if (retainedLocalSubnetFD >= 0) ::close(retainedLocalSubnetFD);
+        return false;
+      }
+      struct bpf_map_info mapInfo = {};
+      __u32 mapInfoLength = sizeof(mapInfo);
+      if (bpf_obj_get_info_by_fd(mapFD, &mapInfo, &mapInfoLength) != 0)
+      {
+        ::close(mapFD);
+        if (retainedLocalSubnetFD >= 0) ::close(retainedLocalSubnetFD);
+        return false;
+      }
+      RetainedAdditionalIngressMapShape shape = {};
+      memcpy(shape.name, mapInfo.name, sizeof(shape.name));
+      shape.type = mapInfo.type;
+      shape.keySize = mapInfo.key_size;
+      shape.valueSize = mapInfo.value_size;
+      shape.maxEntries = mapInfo.max_entries;
+      shape.mapFlags = mapInfo.map_flags;
+      shapes.push_back(shape);
+      if (strncmp(reinterpret_cast<const char *>(mapInfo.name), "lc_subnet", BPF_OBJ_NAME_LEN) == 0)
+      {
+        if (retainedLocalSubnetFD >= 0)
+        {
+          ::close(mapFD);
+          ::close(retainedLocalSubnetFD);
+          return false;
+        }
+        retainedLocalSubnetFD = mapFD;
+      }
+      else
+      {
+        ::close(mapFD);
+      }
+    }
+    std::sort(shapes.begin(), shapes.end(), [](const auto& lhs, const auto& rhs) {
+      return memcmp(&lhs, &rhs, sizeof(lhs)) < 0;
+    });
+    if (localSubnetFD)
+    {
+      *localSubnetFD = retainedLocalSubnetFD;
+    }
+    else if (retainedLocalSubnetFD >= 0)
+    {
+      ::close(retainedLocalSubnetFD);
+    }
+    return retainedLocalSubnetFD >= 0;
+  }
+
+  bool validateRetainedAdditionalIngressProgram(uint32_t programID)
+  {
+    if (bpf_router == nullptr) return false;
+    int candidateFD = bpf_prog_get_fd_by_id(programID);
+    if (candidateFD < 0) return false;
+    struct bpf_prog_info candidate = {};
+    __u32 candidateLength = sizeof(candidate);
+    const bool readCandidate = bpf_prog_get_info_by_fd(candidateFD, &candidate, &candidateLength) == 0;
+    ::close(candidateFD);
+    const uint32_t currentProgramID = kernelProgramID(bpf_router);
+    int currentFD = currentProgramID ? bpf_prog_get_fd_by_id(currentProgramID) : -1;
+    struct bpf_prog_info current = {};
+    __u32 currentLength = sizeof(current);
+    const bool readCurrent = currentFD >= 0 && bpf_prog_get_info_by_fd(currentFD, &current, &currentLength) == 0;
+    if (currentFD >= 0) ::close(currentFD);
+    const bool witnessedPrimary = readCandidate &&
+                                  retainedAdditionalIngressProgramInfoMatches(retainedAdditionalIngressXDPWitness,
+                                                                              programID, candidate);
+    const bool compiledFamily = readCandidate && readCurrent &&
+                                retainedAdditionalIngressProgramMatchesCurrentFamily(programID, candidate, current);
+    if (witnessedPrimary == false && compiledFamily == false)
+    {
+      return false;
+    }
+
+    Vector<RetainedAdditionalIngressMapShape> candidateShapes = {};
+    Vector<RetainedAdditionalIngressMapShape> currentShapes = {};
+    int localSubnetFD = -1;
+    const bool readCandidateMaps = readRetainedAdditionalIngressMapShapes(programID, candidateShapes, &localSubnetFD);
+    const bool readCurrentMaps = compiledFamily && readRetainedAdditionalIngressMapShapes(currentProgramID, currentShapes);
+    if (readCandidateMaps == false ||
+        (compiledFamily && (readCurrentMaps == false || candidateShapes.size() != currentShapes.size() ||
+                            memcmp(candidateShapes.data(), currentShapes.data(), candidateShapes.size() * sizeof(RetainedAdditionalIngressMapShape)) != 0)))
+    {
+      if (localSubnetFD >= 0) ::close(localSubnetFD);
+      return false;
+    }
+    const auto localSubnetShape = std::find_if(candidateShapes.begin(), candidateShapes.end(), [](const auto& shape) {
+      return strncmp(shape.name, "lc_subnet", BPF_OBJ_NAME_LEN) == 0;
+    });
+    if (localSubnetShape == candidateShapes.end() || localSubnetShape->type != BPF_MAP_TYPE_ARRAY ||
+        localSubnetShape->keySize != sizeof(uint32_t) ||
+        localSubnetShape->valueSize != sizeof(local_container_subnet6) || localSubnetShape->maxEntries < 1)
+    {
+      ::close(localSubnetFD);
+      return false;
+    }
+    uint32_t zero = 0;
+    struct local_container_subnet6 observed = {};
+    const bool matchingSubnet = bpf_map_lookup_elem(localSubnetFD, &zero, &observed) == 0 &&
+                                memcmp(&observed, &subnet, sizeof(subnet)) == 0;
+    ::close(localSubnetFD);
+    // The compiled-family comparison repairs a pre-existing orphan such as an
+    // older exec's additional attachment.  An exact primary witness permits a
+    // normal immediate-predecessor migration across a balancer code change;
+    // it still proves the candidate map inventory and local subnet above.
+    return matchingSubnet && (witnessedPrimary || compiledFamily);
+  }
+
+  void captureRetainedAdditionalIngressWitness(void)
+  {
+    retainedAdditionalIngressXDPWitness = {};
+    __u32 programID = 0;
+    static constexpr uint32_t xdpQueryModes[] = {
+        XDP_FLAGS_DRV_MODE,
+        XDP_FLAGS_SKB_MODE,
+        0};
+    for (uint32_t flags : xdpQueryModes)
+    {
+      programID = 0;
+      if (bpf_xdp_query_id(eth.ifidx, flags, &programID) == 0 && programID != 0)
+      {
+        break;
+      }
+    }
+    if (programID == 0)
+    {
+      return;
+    }
+
+    int programFD = bpf_prog_get_fd_by_id(programID);
+    if (programFD < 0)
+    {
+      return;
+    }
+    struct bpf_prog_info info = {};
+    __u32 infoLength = sizeof(info);
+    const bool readableInfo = bpf_prog_get_info_by_fd(programFD, &info, &infoLength) == 0;
+    ::close(programFD);
+    if (readableInfo == false || info.type != BPF_PROG_TYPE_XDP || info.nr_map_ids == 0 ||
+        strncmp(reinterpret_cast<const char *>(info.name), "bal_ingress", BPF_OBJ_NAME_LEN) != 0)
+    {
+      return;
+    }
+
+    retainedAdditionalIngressXDPWitness.programID = programID;
+    retainedAdditionalIngressXDPWitness.mapCount = info.nr_map_ids;
+    memcpy(retainedAdditionalIngressXDPWitness.tag, info.tag, sizeof(info.tag));
+    retainedAdditionalIngressXDPWitness.valid = true;
+  }
+
+  bool replaceValidatedRetainedAdditionalIngressXDP(EthDevice& ingress, uint32_t retainedProgramID)
+  {
+    if (validateRetainedAdditionalIngressProgram(retainedProgramID) == false)
+    {
+      return false;
+    }
+
+    int oldProgramFD = bpf_prog_get_fd_by_id(retainedProgramID);
+    if (oldProgramFD < 0)
+    {
+      return false;
+    }
+    struct bpf_xdp_attach_opts options = {};
+    options.sz = sizeof(options);
+    options.old_prog_fd = oldProgramFD;
+    const int result = bpf_xdp_attach(ingress.ifidx, bpf_router->prog_fd, XDP_FLAGS_SKB_MODE, &options);
+    ::close(oldProgramFD);
+    return result == 0;
+  }
+
   // The tunnel endpoint is an Ethernet veth peer, so the existing XDP and TCX
   // programs can process it unchanged.  Attaching the same program FDs means
   // the authoritative maps and their reconciliation stay singular.
@@ -2575,9 +2821,26 @@ public:
       }
       else if (existingID != 0)
       {
-        if (failureReport) failureReport->assign("additional ingress XDP is not Switchboard-owned"_ctv);
-        additionalIngressEth = nullptr;
-        return false;
+        // Do not detach an unknown XDP program.  The sole retained-process
+        // bridge is the exact primary program witnessed before this runtime
+        // replaced it, and bpf_xdp_attach performs the final kernel CAS.
+        if (replaceValidatedRetainedAdditionalIngressXDP(ingress, existingID) == false)
+        {
+          if (failureReport) failureReport->assign("additional ingress XDP is not Switchboard-owned"_ctv);
+          additionalIngressEth = nullptr;
+          return false;
+        }
+        __u32 replacedID = 0;
+        if (bpf_xdp_query_id(ingress.ifidx, XDP_FLAGS_SKB_MODE, &replacedID) != 0 ||
+            replacedID != desiredXDPProgramID)
+        {
+          if (failureReport) failureReport->assign("additional ingress retained XDP replacement verification failed"_ctv);
+          additionalIngressEth = nullptr;
+          return false;
+        }
+        additionalIngressXDPAttached = true;
+        additionalIngressIfidx = ingress.ifidx;
+        additionalIngressXDPProgramID = desiredXDPProgramID;
       }
     }
 

@@ -99,6 +99,49 @@ public:
     board.bpf_router = router;
     board.additionalIngressEth = ingress;
   }
+
+  static bool retainedAdditionalIngressWitnessMatches(uint32_t witnessedProgramID,
+                                                      uint32_t candidateProgramID,
+                                                      uint32_t candidateMapCount,
+                                                      uint32_t candidateType,
+                                                      const char *candidateName,
+                                                      uint8_t candidateTag)
+  {
+    Switchboard::RetainedAdditionalIngressXDPWitness witness = {};
+    witness.programID = witnessedProgramID;
+    witness.mapCount = candidateMapCount;
+    witness.valid = true;
+    memset(witness.tag, candidateTag, sizeof(witness.tag));
+
+    struct bpf_prog_info info = {};
+    info.id = candidateProgramID;
+    info.type = candidateType;
+    info.nr_map_ids = candidateMapCount;
+    strncpy(reinterpret_cast<char *>(info.name), candidateName, BPF_OBJ_NAME_LEN - 1);
+    memset(info.tag, candidateTag, sizeof(info.tag));
+    return Switchboard::retainedAdditionalIngressProgramInfoMatches(witness, candidateProgramID, info);
+  }
+
+  static bool retainedAdditionalIngressMatchesCurrentFamily(uint32_t candidateProgramID,
+                                                            uint32_t currentProgramID,
+                                                            uint32_t candidateMapCount,
+                                                            uint8_t candidateTag,
+                                                            uint8_t currentTag)
+  {
+    struct bpf_prog_info candidate = {};
+    candidate.id = candidateProgramID;
+    candidate.type = BPF_PROG_TYPE_XDP;
+    candidate.nr_map_ids = candidateMapCount;
+    strncpy(reinterpret_cast<char *>(candidate.name), "bal_ingress", BPF_OBJ_NAME_LEN - 1);
+    memset(candidate.tag, candidateTag, sizeof(candidate.tag));
+    struct bpf_prog_info current = {};
+    current.id = currentProgramID;
+    current.type = BPF_PROG_TYPE_XDP;
+    current.nr_map_ids = candidateMapCount;
+    strncpy(reinterpret_cast<char *>(current.name), "bal_ingress", BPF_OBJ_NAME_LEN - 1);
+    memset(current.tag, currentTag, sizeof(current.tag));
+    return Switchboard::retainedAdditionalIngressProgramMatchesCurrentFamily(candidateProgramID, candidate, current);
+  }
 };
 
 class TestNeuron final : public Neuron {
@@ -397,6 +440,24 @@ static void runRingUntil(ArtifactRing& ring, const std::function<bool()>& done)
 int main()
 {
   TestSuite suite = {};
+  suite.expect(
+      SwitchboardRingTestAccess::retainedAdditionalIngressWitnessMatches(
+          10713, 10713, 12, BPF_PROG_TYPE_XDP, "bal_ingress", 0x5a),
+      "neuron_retained_additional_ingress_accepts_exact_preexec_primary_xdp");
+  suite.expect(
+      SwitchboardRingTestAccess::retainedAdditionalIngressWitnessMatches(
+          10713, 10923, 12, BPF_PROG_TYPE_XDP, "bal_ingress", 0x5a) == false,
+      "neuron_retained_additional_ingress_rejects_reconnected_or_replaced_xdp");
+  suite.expect(
+      SwitchboardRingTestAccess::retainedAdditionalIngressWitnessMatches(
+          10713, 10713, 12, BPF_PROG_TYPE_XDP, "foreign_xdp", 0x5a) == false,
+      "neuron_retained_additional_ingress_rejects_unknown_xdp");
+  suite.expect(
+      SwitchboardRingTestAccess::retainedAdditionalIngressMatchesCurrentFamily(10713, 10923, 12, 0x5a, 0x5a),
+      "neuron_retained_additional_ingress_accepts_orphaned_prior_family_after_exec");
+  suite.expect(
+      SwitchboardRingTestAccess::retainedAdditionalIngressMatchesCurrentFamily(10713, 10923, 12, 0x5a, 0x6b) == false,
+      "neuron_retained_additional_ingress_rejects_foreign_compiled_family");
   {
     ArtifactRing lazySwitchboardRing = {};
     TestNeuron lazySwitchboardNeuron = {};
