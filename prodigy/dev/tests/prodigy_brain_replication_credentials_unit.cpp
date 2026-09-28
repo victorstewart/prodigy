@@ -25885,6 +25885,94 @@ static void testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(TestSuite&
                "mismatched_newer_authority_does_not_retire_coordinator");
 }
 
+static void testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(TestSuite& suite)
+{
+  // The successor can become visible before the former master's final
+  // relinquish acknowledgement returns.  Its durable authority must retire
+  // phase/echo ownership, but cannot strand the former master's approved
+  // local bundle transition.
+  const uint128_t localMachineUUID = uint128_t(0x521d1001);
+  const uint128_t firstFollowerUUID = uint128_t(0x521d1002);
+  const uint128_t secondFollowerUUID = uint128_t(0x521d1003);
+  TestNeuron localNeuron = {};
+  localNeuron.uuid = localMachineUUID;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &localNeuron;
+
+  TestBrain formerMaster = {};
+  formerMaster.asyncMasterAuthorityPersistence = true;
+  formerMaster.holdRuntimePersistence = true;
+  formerMaster.masterAuthorityRuntimeState.generation = 47;
+  formerMaster.masterAuthorityRuntimeStateDurable = true;
+  formerMaster.durableMasterAuthorityRuntimeStateGeneration = 47;
+  formerMaster.updateSelfState = Brain::UpdateSelfState::waitingForRelinquishEchos;
+  formerMaster.updateSelfExpectedEchos = 2;
+  formerMaster.updateSelfBundleEchos = 2;
+  formerMaster.updateSelfRelinquishEchos = 1;
+  formerMaster.updateSelfPlannedMasterPeerKey = secondFollowerUUID;
+  formerMaster.updateSelfWorkerExpectedBundleSHA256 =
+      "abababababababababababababababababababababababababababababababab"_ctv;
+  for (uint128_t machineUUID : {localMachineUUID, firstFollowerUUID, secondFollowerUUID})
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+    witness.machineUUID = machineUUID;
+    witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
+    formerMaster.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  }
+  formerMaster.updateSelfBundleEchoPeerKeys.insert(firstFollowerUUID);
+  formerMaster.updateSelfBundleEchoPeerKeys.insert(secondFollowerUUID);
+  formerMaster.updateSelfFollowerBootNsByPeerKey.insert_or_assign(firstFollowerUUID, 52'112);
+  formerMaster.updateSelfFollowerBootNsByPeerKey.insert_or_assign(secondFollowerUUID, 52'113);
+  formerMaster.updateSelfFollowerRebootedPeerKeys.insert(firstFollowerUUID);
+  formerMaster.updateSelfFollowerRebootedPeerKeys.insert(secondFollowerUUID);
+  formerMaster.updateSelfRelinquishEchoPeerKeys.insert(firstFollowerUUID);
+
+  BrainView successor = {};
+  authorizeMasterPeerForTest(formerMaster, successor, 94, secondFollowerUUID, 52'113);
+  successor.ioGeneration = 8;
+  successor.transportEpoch = 9;
+  formerMaster.brains.insert(&successor);
+
+  // This is the forced-election handoff: the old coordinator's outstanding
+  // progress receipt is fenced by its former authority epoch before the
+  // successor's newer, authenticated authority is committed.
+  formerMaster.updateSelfPersistenceFailed = true;
+  formerMaster.updateSelfPersistenceQueuedEpoch = formerMaster.masterAuthorityEpoch;
+  formerMaster.advanceMasterAuthorityEpoch();
+  formerMaster.weAreMaster = false;
+  formerMaster.noMasterYet = false;
+
+  ProdigyMasterAuthorityStateTransition successorAuthority = {};
+  successorAuthority.brainConfig.clusterUUID = uint128_t(0x521d1010);
+  successorAuthority.runtimeState.generation = 48;
+  successorAuthority.runtimeState.nextPendingAddMachinesOperationID = 1;
+  successorAuthority.runtimeState.nextPendingElasticAddressOperationID = 1;
+  successorAuthority.runtimeState.nextDNSIntentRevision = 1;
+  successorAuthority.runtimeState.nextTlsResumptionGeneration = 1;
+  successorAuthority.runtimeState.updateSelf = Brain::projectUpdateSelfRecoveryWitness(
+      formerMaster.capturePersistentUpdateSelfState());
+  String serialized = {};
+  BitseryEngine::serialize(serialized, successorAuthority);
+  String messageBuffer = {};
+  formerMaster.brainHandler(
+      &successor,
+      buildBrainMessage(messageBuffer, BrainTopic::replicateMasterAuthorityState, serialized));
+
+  suite.expect(formerMaster.pendingRuntimePersistence.size() == 1 &&
+                   formerMaster.transitionToNewBundleCalls == 0 &&
+                   formerMaster.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos,
+               "former_master_successor_authority_defers_local_exec_until_durable");
+
+  formerMaster.finishRuntimePersistence(true);
+  suite.expect(formerMaster.masterAuthorityRuntimeState.generation == 48 &&
+                   formerMaster.updateSelfState == Brain::UpdateSelfState::idle &&
+                   formerMaster.transitionToNewBundleCalls == 1,
+               "former_master_successor_authority_resumes_final_local_exec_after_durable_apply");
+
+  formerMaster.brains.erase(&successor);
+  thisNeuron = previousNeuron;
+}
+
 static void testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(TestSuite& suite)
 {
   // This matches the sealed runtime6 bundle size that reached the update
@@ -28298,6 +28386,7 @@ int main(void)
     testElasticReplicationIdentityAndDivergenceGuards(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
+    testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(suite);
     testOrdinaryUpdateBundleFitsPersistentSnapshotBudget(suite);
     testUpdateSelfPersistenceBackpressureDefersOnlyCapacityMisses(suite);
     testAsyncMachineRetirementJournalDurability(suite);
@@ -28378,6 +28467,7 @@ int main(void)
     testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(suite);
     testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(suite);
     testFormerMasterCoordinatorYieldsToNewerMatchingAuthority(suite);
+    testFormerMasterFinalExecSurvivesDurableSuccessorAuthority(suite);
     testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(suite);
     testBrainNeuronRegistrationKeepsHealthyRuntimeReadyWithoutRefresh(suite);
     testNeuronControlClosePreservesScheduledOwnerUntilFreshInventory(suite);
