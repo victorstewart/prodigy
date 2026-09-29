@@ -20927,6 +20927,74 @@ static void testNeuronContainerHandlerMarksMasterLocalContainerHealthyWithoutBra
   std::fprintf(stderr, "suite-check healthy-master-no-brain exit failed=%d\n", suite.failed);
 }
 
+static void testNeuronContainerHandlerRecordsMasterLocalTlsResumptionAckWithoutBrainStream(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  TestNeuron neuron = {};
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  DeploymentPlan plan = makeDeploymentPlan(62'014, 1);
+  plan.wormholes.push_back(makeTlsResumptionTestWormhole());
+  ApplicationDeployment deployment = {};
+  deployment.plan = plan;
+  brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(plan.config.applicationID, &deployment);
+
+  Container container = {};
+  container.plan.uuid = uint128_t(0x5107);
+  container.plan.config = plan.config;
+  container.plan.state = ContainerState::healthy;
+
+  ContainerView view = {};
+  view.uuid = container.plan.uuid;
+  view.deploymentID = plan.config.deploymentID();
+  view.applicationID = plan.config.applicationID;
+  view.state = ContainerState::healthy;
+  deployment.containers.insert(&view);
+  brain.containers.insert_or_assign(view.uuid, &view);
+
+  String failure = {};
+  const int64_t nowMs = Time::now<TimeResolution::ms>();
+  TlsResumptionSnapshot *snapshot = brain.beginTlsResumptionAcceptOnlyRollout(plan, plan.wormholes[0], nowMs, false, &failure);
+  const uint64_t generation = snapshot ? snapshot->generation : 0;
+  suite.require(snapshot != nullptr && failure.empty(), "neuron_local_resumption_ack_creates_accept_only_snapshot");
+  suite.expect(brain.tlsResumptionAckCoverageSatisfied(plan, plan.wormholes[0], &failure) == false,
+               "neuron_local_resumption_ack_starts_without_coverage");
+
+  String malformedFrame = {};
+  Message *malformed = buildContainerMessage(malformedFrame, ContainerTopic::credentialsRefresh, "not-a-resumption-ack"_ctv);
+  neuron.containerHandler(&container, malformed);
+  suite.expect(brain.tlsResumptionAckCoverageSatisfied(plan, plan.wormholes[0], &failure) == false,
+               "neuron_local_resumption_ack_rejects_malformed_typed_receipt");
+
+  TlsResumptionApplyAck ack = makeTlsResumptionAck(plan.wormholes[0].name, generation);
+  String serializedAck = {};
+  suite.require(ProdigyWire::serializeTlsResumptionApplyAck(serializedAck, ack),
+                "neuron_local_resumption_ack_serializes_typed_receipt");
+  String frame = {};
+  suite.require(ProdigyWire::constructPackedFrame(frame, ContainerTopic::credentialsRefresh, serializedAck),
+                "neuron_local_resumption_ack_constructs_real_container_frame");
+  neuron.containerHandler(&container, reinterpret_cast<Message *>(frame.data()));
+
+  snapshot = brain.mutableTlsResumptionSnapshotForWormhole(plan.config.deploymentID(), plan.wormholes[0].name);
+  suite.expect(neuron.brainStreamForTest() == nullptr, "neuron_local_resumption_ack_has_no_control_stream");
+  suite.expect(brain.tlsResumptionAckCoverageSatisfied(plan, plan.wormholes[0], &failure),
+               "neuron_local_resumption_ack_records_canonical_coverage");
+  suite.expect(snapshot != nullptr && tlsResumptionSnapshotHasEpochRole(snapshot, generation, TlsResumptionKeyRole::issueAndAccept),
+               "neuron_local_resumption_ack_promotes_accept_only_epoch");
+
+  brain.containers.erase(view.uuid);
+  deployment.containers.erase(&view);
+  brain.deploymentsByApp.erase(plan.config.applicationID);
+  brain.deployments.erase(plan.config.deploymentID());
+  thisBrain = previousBrain;
+}
+
 static void testNeuronContainerHandlerRelaysHealthyToMasterPeerWithoutBrainStream(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -28734,6 +28802,7 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY") != nullptr)
   {
     testTlsResumptionRotationAckCoverage(suite);
+    testNeuronContainerHandlerRecordsMasterLocalTlsResumptionAckWithoutBrainStream(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_AUTONOMOUS_PROVISIONING_JOURNAL") != nullptr)
@@ -28928,6 +28997,7 @@ int main(void)
   testApiCredentialPolicyAvailability(suite);
   testApiCredentialExpiryNotificationLifecycle(suite);
   testTlsResumptionRotationAckCoverage(suite);
+  testNeuronContainerHandlerRecordsMasterLocalTlsResumptionAckWithoutBrainStream(suite);
   testBrainHandlerReplicationPaths(suite);
   testReconcileStateReplicatesCredentialAndTlsState(suite);
   testSystemContainerArtifactReplicationQueuesTypedBlob(suite);

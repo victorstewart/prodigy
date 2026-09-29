@@ -3951,27 +3951,36 @@ public:
         }
       case ContainerTopic::credentialsRefresh:
         {
+          TlsResumptionApplyAck result;
+          const bool hasTypedAck = args < terminal &&
+                                   ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), result);
+          if (args < terminal && hasTypedAck == false)
+          {
+            break;
+          }
+
+          const bool controllingBrainActive = brain != nullptr && streamIsActive(brain);
+          if (hasTypedAck && thisBrain != nullptr && thisBrain->canControlNeurons())
+          {
+            // The local master owns this receipt. Keep the one-shot container
+            // ACK independent from the replaceable loopback control stream.
+            thisBrain->noteLocalContainerTlsResumptionApplyAck(container->plan.uuid, result);
+            break;
+          }
+
           if (brain)
           {
-            if (args < terminal)
+            if (hasTypedAck)
             {
               String serializedAck;
               serializedAck.setInvariant(args, uint64_t(terminal - args));
-              TlsResumptionApplyAck result;
-              if (ProdigyWire::deserializeTlsResumptionApplyAckFramePayload(args, uint64_t(terminal - args), result))
-              {
-                Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid, serializedAck);
-              }
-              else
-              {
-                break;
-              }
+              Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid, serializedAck);
             }
             else
             {
               Message::construct(brain->wBuffer, NeuronTopic::refreshContainerCredentials, container->plan.uuid);
             }
-            if (streamIsActive(brain))
+            if (controllingBrainActive)
             {
               Ring::queueSend(brain);
             }

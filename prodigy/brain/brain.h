@@ -19335,6 +19335,30 @@ public:
     }
   }
 
+  void recordTlsResumptionApplyAckAndAdvance(uint128_t containerUUID, const TlsResumptionApplyAck& ack)
+  {
+    const int64_t nowMs = Time::now<TimeResolution::ms>();
+    (void)recordTlsResumptionApplyAck(containerUUID, ack);
+    if (auto containerIt = containers.find(containerUUID); containerIt != containers.end() && containerIt->second != nullptr)
+    {
+      if (auto deploymentIt = deployments.find(containerIt->second->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr)
+      {
+        (void)advanceTlsResumptionLifecycleForDeployment(deploymentIt->second->plan, nowMs, false);
+      }
+    }
+  }
+
+  void noteLocalContainerTlsResumptionApplyAck(uint128_t containerUUID, const TlsResumptionApplyAck& ack) override
+  {
+    if (weAreMaster == false)
+    {
+      return;
+    }
+
+    (void)noteContainerTlsResumptionApplyAck(containerUUID, ack);
+    recordTlsResumptionApplyAckAndAdvance(containerUUID, ack);
+  }
+
   void noteLocalContainerRuntimeReady(uint128_t containerUUID) override
   {
     if (weAreMaster == false)
@@ -37570,17 +37594,17 @@ public:
               break;
             }
 
-            const int64_t nowMs = Time::now<TimeResolution::ms>();
             if (genericAck)
             {
               (void)noteContainerCredentialApplyAck(containerUUID, credentialAck);
               resumptionAck.results = std::move(credentialAck.resumptionResults);
+              recordTlsResumptionApplyAckAndAdvance(containerUUID, resumptionAck);
             }
             else
             {
               (void)noteContainerTlsResumptionApplyAck(containerUUID, resumptionAck);
+              recordTlsResumptionApplyAckAndAdvance(containerUUID, resumptionAck);
             }
-            (void)recordTlsResumptionApplyAck(containerUUID, resumptionAck);
             if (genericAck)
             {
               for (const TlsIdentityApplyResult& tlsResult : credentialAck.tlsResults)
@@ -37603,13 +37627,6 @@ public:
                          unsigned(resumptionResult.success));
             }
 
-            if (auto containerIt = containers.find(containerUUID); containerIt != containers.end() && containerIt->second != nullptr)
-            {
-              if (auto deploymentIt = deployments.find(containerIt->second->deploymentID); deploymentIt != deployments.end() && deploymentIt->second != nullptr)
-              {
-                (void)advanceTlsResumptionLifecycleForDeployment(deploymentIt->second->plan, nowMs, false);
-              }
-            }
           }
           else
           {

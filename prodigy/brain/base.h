@@ -30,6 +30,7 @@ class ApplicationDeployment;
 class MachineTicket;
 class Mesh;
 class Wormhole;
+class TlsResumptionApplyAck;
 
 constexpr inline int64_t prodigyOperatorCancellationTombstoneRetentionMs =
     24LL * 60LL * 60LL * 1000LL;
@@ -599,6 +600,11 @@ public:
   virtual void noteLocalContainerRuntimeReady(uint128_t containerUUID)
   {
     (void)containerUUID;
+  }
+  virtual void noteLocalContainerTlsResumptionApplyAck(uint128_t containerUUID, const TlsResumptionApplyAck& ack)
+  {
+    (void)containerUUID;
+    (void)ack;
   }
   virtual void armWormholeRuntimeAckDeadline(ContainerView *container)
   {
