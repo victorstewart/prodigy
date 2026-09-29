@@ -1149,6 +1149,7 @@ public:
   uint64_t lastMothershipConnectionIncarnation = 0;
   uint64_t durableMasterAuthorityRuntimeStateGeneration = 0;
   bool masterAuthorityRuntimeStateDurable = false;
+  uint32_t masterAuthorityPersistencePending = 0;
   bytell_hash_map<uint64_t, uint64_t> durableElasticOperationTransitions;
   bool hasCompletedInitialMasterElection = false;
 
@@ -6371,8 +6372,11 @@ public:
       const uint64_t epoch = masterAuthorityEpoch;
       const uint64_t generation = masterAuthorityRuntimeState.generation;
       const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+      ++masterAuthorityPersistencePending;
       persistLocalRuntimeStateAsync([this, lifetime, epoch, generation, replicate](bool durable) {
-        if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch ||
+        if (lifetime.expired()) return;
+        --masterAuthorityPersistencePending;
+        if (!durable || masterAuthorityEpoch != epoch ||
             masterAuthorityRuntimeState.generation != generation) return;
         masterAuthorityRuntimeStateDurable = true;
         durableMasterAuthorityRuntimeStateGeneration = generation;
@@ -6428,9 +6432,11 @@ public:
     const uint64_t epoch = masterAuthorityEpoch;
     const uint64_t generation = masterAuthorityRuntimeState.generation;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    ++masterAuthorityPersistencePending;
     persistLocalRuntimeStateAsync([this, lifetime, epoch, generation,
                                   completion = std::move(completion)](bool durable) mutable {
       if (lifetime.expired()) return;
+      --masterAuthorityPersistencePending;
       const bool currentAuthority = masterAuthorityEpoch == epoch;
       if (durable && currentAuthority && masterAuthorityRuntimeState.generation == generation)
       {
@@ -6441,6 +6447,18 @@ public:
       }
       if (completion) completion(durable && currentAuthority);
     });
+  }
+
+  void retryMasterAuthorityRuntimeStatePersistence(void)
+  {
+    if (!weAreMaster || masterAuthorityPersistencePending != 0 ||
+        (masterAuthorityRuntimeStateDurable &&
+         durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)) return;
+    // A bounded writer can reject an authority change while an artifact or an
+    // earlier completion still owns its lease. Retry the current state on the
+    // next heartbeat after receipts drain; do not mint a revision or publish
+    // credentials until this exact revision has a successful durable receipt.
+    commitMasterAuthorityStateChangeAsync({}, false);
   }
 
   static int64_t apiCredentialEffectiveDeadlineMs(const ApiCredential& credential)
@@ -14677,6 +14695,7 @@ public:
     const bool localHeartbeatTickLagged = (tickLagMs >= int64_t(brainPeerHeartbeatTimeoutMs));
     // Retry before appending heartbeats, so an already queued control frame
     // suppresses duplicate authority work without starving it behind this tick.
+    retryMasterAuthorityRuntimeStatePersistence();
     queueMasterAuthorityRuntimeStateReplication(true);
     for (BrainView *peer : brains)
     {

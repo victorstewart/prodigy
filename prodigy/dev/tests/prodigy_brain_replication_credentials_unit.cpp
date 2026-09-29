@@ -14930,18 +14930,29 @@ static void testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(TestSuit
   drain(retryPeer);
   drain(healthyPeer);
 
-  // A local durable receipt is required. No undurable state is serialized,
-  // but returning to the same durable revision makes the missing peer retry.
-  master.masterAuthorityRuntimeStateDurable = false;
-  master.durableMasterAuthorityRuntimeStateGeneration = 22;
+  // A held current-generation receipt closes the same durable gate used in
+  // production. The heartbeat must not manufacture a retry while that writer
+  // owns the receipt, and publication resumes only after it completes.
+  master.holdRuntimePersistence = true;
+  master.persistSucceeds = true;
+  master.commitMasterAuthorityStateChangeAsync({}, false);
+  suite.require(master.masterAuthorityPersistencePending == 1 &&
+                    master.masterAuthorityRuntimeStateDurable == false,
+                "authority_retry_held_current_receipt_closes_durable_gate");
   heartbeat();
   suite.expect(authorityFrames(retryPeer).count == 0,
-               "authority_retry_never_resends_undurable_current_state");
-  // The undurable tick itself may have appended an ordinary heartbeat.
+               "authority_retry_never_resends_while_current_receipt_is_pending");
+  // The pending tick itself may have appended an ordinary heartbeat.
   drain(retryPeer);
   drain(healthyPeer);
-  master.masterAuthorityRuntimeStateDurable = true;
-  master.durableMasterAuthorityRuntimeStateGeneration = 23;
+  master.finishRuntimePersistence(true);
+  suite.expect(master.masterAuthorityPersistencePending == 0 &&
+                   master.masterAuthorityRuntimeStateDurable &&
+                   authorityFrames(retryPeer).count == 1,
+               "authority_retry_receipt_publishes_current_durable_transition");
+  drain(retryPeer);
+  drain(healthyPeer);
+  master.holdRuntimePersistence = false;
   heartbeat();
   suite.expect(authorityFrames(retryPeer).count == 1,
                "authority_retry_resumes_only_after_local_durable_receipt");
@@ -15085,6 +15096,151 @@ static void testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(TestSuit
 
   master.brains.erase(&retryPeer);
   master.brains.erase(&healthyPeer);
+  thisNeuron = previousNeuron;
+}
+
+static void testMasterAuthorityPersistenceRetryAfterRejectedReceipt(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+  TestNeuron self = {};
+  self.uuid = uint128_t(0x76'2001);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+
+  auto configureMaster = [&](TestBrain& brain, uint64_t generation) {
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    brain.nBrains = 2;
+    brain.masterAuthorityRuntimeState.generation = generation;
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = generation;
+  };
+  auto authorityFrames = [](BrainView& peer) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(peer.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) == BrainTopic::replicateMasterAuthorityState) ++count;
+    });
+    return count;
+  };
+
+  TestBrain noted = {};
+  configureMaster(noted, 41);
+  BrainView peer = {};
+  peer.uuid = uint128_t(0x76'2002);
+  peer.boottimens = 76'202;
+  peer.ioGeneration = 2;
+  peer.transportEpoch = 2;
+  peer.connected = true;
+  peer.isFixedFile = true;
+  peer.fslot = 76;
+  peer.registrationFresh = true;
+  peer.existingMasterUUID = self.uuid;
+  peer.pendingSend = true;
+  noted.brains.insert(&peer);
+  noted.holdRuntimePersistence = true;
+  noted.persistSucceeds = false;
+
+  noted.noteMasterAuthorityRuntimeStateChanged();
+  const uint64_t firstGeneration = noted.masterAuthorityRuntimeState.generation;
+  noted.noteMasterAuthorityRuntimeStateChanged();
+  const uint64_t newestGeneration = noted.masterAuthorityRuntimeState.generation;
+  suite.require(firstGeneration == 42 && newestGeneration == 43 &&
+                    noted.masterAuthorityPersistencePending == 2 &&
+                    noted.pendingRuntimePersistence.size() == 2 &&
+                    authorityFrames(peer) == 0,
+                "authority_persistence_note_changes_stay_unpublished_until_receipts");
+
+  noted.retryMasterAuthorityRuntimeStatePersistence();
+  suite.expect(noted.persistCalls == 2 && noted.masterAuthorityPersistencePending == 2 &&
+                   noted.pendingRuntimePersistence.size() == 2,
+               "authority_persistence_pending_notes_coalesce_retry");
+  noted.finishRuntimePersistence(false);
+  noted.retryMasterAuthorityRuntimeStatePersistence();
+  suite.expect(noted.masterAuthorityPersistencePending == 1 && noted.persistCalls == 2 &&
+                   authorityFrames(peer) == 0,
+               "authority_persistence_older_failed_note_cannot_retry_while_newest_pending");
+  noted.finishRuntimePersistence(false);
+  suite.expect(noted.masterAuthorityPersistencePending == 0 &&
+                   noted.masterAuthorityRuntimeStateDurable == false &&
+                   noted.masterAuthorityRuntimeState.generation == newestGeneration &&
+                   authorityFrames(peer) == 0,
+               "authority_persistence_failed_notes_leave_newest_generation_unpublished");
+
+  noted.persistSucceeds = true;
+  noted.lastBrainPeerHeartbeatTickMs = 0;
+  noted.runBrainPeerHeartbeatTick();
+  suite.expect(noted.persistCalls == 3 && noted.masterAuthorityPersistencePending == 1 &&
+                   noted.pendingRuntimePersistence.size() == 1 &&
+                   noted.masterAuthorityRuntimeState.generation == newestGeneration &&
+                   authorityFrames(peer) == 0,
+               "authority_persistence_retry_reuses_newest_generation_without_publication");
+  noted.retryMasterAuthorityRuntimeStatePersistence();
+  suite.expect(noted.persistCalls == 3 && noted.masterAuthorityPersistencePending == 1,
+               "authority_persistence_retry_does_not_duplicate_pending_writer");
+  noted.finishRuntimePersistence(true);
+  suite.expect(noted.masterAuthorityPersistencePending == 0 &&
+                   noted.masterAuthorityRuntimeStateDurable &&
+                   noted.durableMasterAuthorityRuntimeStateGeneration == newestGeneration &&
+                   authorityFrames(peer) == 1,
+               "authority_persistence_newest_retry_publishes_once_after_durable_receipt");
+
+  TestBrain committed = {};
+  configureMaster(committed, 51);
+  committed.holdRuntimePersistence = true;
+  committed.persistSucceeds = false;
+  committed.commitMasterAuthorityStateChangeAsync({}, false);
+  suite.require(committed.masterAuthorityPersistencePending == 1 &&
+                    committed.masterAuthorityRuntimeStateDurable == false &&
+                    committed.pendingRuntimePersistence.size() == 1,
+                "authority_persistence_commit_path_waits_for_first_receipt");
+  committed.finishRuntimePersistence(false);
+  suite.expect(committed.masterAuthorityPersistencePending == 0 &&
+                   committed.masterAuthorityRuntimeStateDurable == false,
+               "authority_persistence_commit_failure_keeps_gate_closed");
+  committed.persistSucceeds = true;
+  committed.retryMasterAuthorityRuntimeStatePersistence();
+  suite.expect(committed.persistCalls == 2 && committed.masterAuthorityPersistencePending == 1 &&
+                   committed.masterAuthorityRuntimeState.generation == 51,
+               "authority_persistence_commit_retry_reuses_current_generation");
+  committed.finishRuntimePersistence(true);
+  suite.expect(committed.masterAuthorityPersistencePending == 0 &&
+                   committed.masterAuthorityRuntimeStateDurable &&
+                   committed.durableMasterAuthorityRuntimeStateGeneration == 51,
+               "authority_persistence_commit_retry_reopens_gate_after_receipt");
+
+  committed.masterAuthorityRuntimeStateDurable = false;
+  committed.durableMasterAuthorityRuntimeStateGeneration = 50;
+  committed.weAreMaster = false;
+  const uint32_t followerPersistCalls = committed.persistCalls;
+  committed.retryMasterAuthorityRuntimeStatePersistence();
+  suite.expect(committed.persistCalls == followerPersistCalls &&
+                   committed.masterAuthorityPersistencePending == 0,
+               "authority_persistence_follower_never_retries_current_generation");
+
+  TestBrain superseded = {};
+  configureMaster(superseded, 61);
+  superseded.holdRuntimePersistence = true;
+  superseded.commitMasterAuthorityStateChangeAsync({}, false);
+  suite.require(superseded.masterAuthorityPersistencePending == 1,
+                "authority_persistence_epoch_change_has_outstanding_receipt");
+  superseded.masterAuthorityEpoch += 1;
+  superseded.finishRuntimePersistence(true);
+  suite.expect(superseded.masterAuthorityPersistencePending == 0 &&
+                   superseded.masterAuthorityRuntimeStateDurable == false,
+               "authority_persistence_epoch_changed_receipt_cannot_open_current_gate");
+  const uint32_t supersededPersistCalls = superseded.persistCalls;
+  superseded.retryMasterAuthorityRuntimeStatePersistence();
+  suite.require(superseded.persistCalls == supersededPersistCalls + 1 &&
+                    superseded.masterAuthorityPersistencePending == 1 &&
+                    superseded.masterAuthorityRuntimeState.generation == 61,
+                "authority_persistence_epoch_changed_master_retries_current_generation");
+  superseded.finishRuntimePersistence(true);
+  suite.expect(superseded.masterAuthorityPersistencePending == 0 &&
+                   superseded.masterAuthorityRuntimeStateDurable &&
+                   superseded.durableMasterAuthorityRuntimeStateGeneration == 61,
+               "authority_persistence_epoch_changed_current_receipt_reopens_gate");
+
+  noted.brains.erase(&peer);
   thisNeuron = previousNeuron;
 }
 
@@ -28684,6 +28840,12 @@ int main(void)
     std::printf("AUTHORITY_RETRY_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "authority-persistence-retry") == 0)
+  {
+    testMasterAuthorityPersistenceRetryAfterRejectedReceipt(suite);
+    std::printf("AUTHORITY_PERSISTENCE_RETRY_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "ordinary-upgrade-authority") == 0)
   {
     testOrdinaryUpgradeAuthorityAdmission(suite);
@@ -29110,6 +29272,7 @@ int main(void)
     testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
     testOrdinaryUpgradeAuthorityAdmission(suite);
     testMasterAuthorityHeartbeatRetriesCurrentDurableTransition(suite);
+    testMasterAuthorityPersistenceRetryAfterRejectedReceipt(suite);
     testElasticCombinedTransitionAndQuarantine(suite);
     testElasticReplicationIdentityAndDivergenceGuards(suite);
     testElasticMutationHeadroomAndFenceReconciliation(suite);
