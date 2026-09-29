@@ -10366,12 +10366,12 @@ static void testSwitchboardWormholeFleetAcknowledgementTransaction(TestSuite& su
     deadlineContainer.wormholeRuntimeFailedMachines.insert(disconnected.fragment);
     deadlineContainer.wormholeRuntimeRetryRevision = deadlineContainer.wormholeRuntimeRevision;
     deadlineContainer.wormholeRuntimeRetryAttempts[disconnected.fragment] = 0;
-    disconnected.neuron.connected = false;
     brain.Brain::armWormholeRuntimeAckDeadline(&deadlineContainer);
     TimeoutPacket *retryDeadline = deadlineContainer.wormholeRuntimeAckDeadline;
     suite.expect(normalDeadline != nullptr && retryDeadline != nullptr && normalDeadline != retryDeadline &&
                      deadlineContainer.wormholeRuntimeAckDeadlineIsRetry,
                  "wormhole_fleet_transaction_replaces_normal_deadline_with_retry_deadline");
+    disconnected.neuron.connected = false;
     scopedRing.runFor(300);
     suite.expect(deadlineContainer.wormholeRuntimeAckDeadline == nullptr &&
                      deadlineContainer.wormholeRuntimePendingMachines.empty() &&
