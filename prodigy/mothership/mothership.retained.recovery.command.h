@@ -575,10 +575,12 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     require(!m.orphanedStatefulPredecessorPriorRequestPath.empty() &&
                 !m.orphanedStatefulPredecessorPriorManifestPath.empty(),
             "orphaned stateful predecessor historical source paths are missing");
-    std::string identity=str(descriptor.operation.operationID);
-    identity.erase(std::remove(identity.begin(),identity.end(),'-'),identity.end());
-    require(uuid("0x"+identity)==p.operationID && descriptor.machineUUID!=0 && descriptor.parameters.uuid!=0,
-            "orphaned stateful predecessor differs from sealed migration identity");
+    // The migration attempt and the durable application handoff are separate
+    // authority domains. A later sealed migration may carry the same active
+    // handoff; its operation ID must not be forced to equal this attempt ID.
+    require(partialHandoffEnvelopeValid(descriptor.operation) &&
+                descriptor.machineUUID != 0 && descriptor.parameters.uuid != 0,
+            "orphaned stateful predecessor authority is invalid");
     uint32_t matches=0, extras=0;
     for (const Record& record : m.records) {
       extras += !record.canonical;

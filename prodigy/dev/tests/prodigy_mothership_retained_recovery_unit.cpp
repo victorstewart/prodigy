@@ -1350,6 +1350,39 @@ int main()
     auto rejectsEmptyManifest=[&](std::string value) { durable(path,text(value)); bool rejected=false; try {(void)parseManifest(path,plan);} catch(const std::exception&) {rejected=true;} assert(rejected); };
     auto badEmptyType=emptyManifest; badEmptyType.replace(badEmptyType.find("\"emptyRetainedInventory\":true"),std::strlen("\"emptyRetainedInventory\":true"),"\"emptyRetainedInventory\":1"); rejectsEmptyManifest(std::move(badEmptyType));
     auto unsealedEmpty=emptyManifest; unsealedEmpty.erase(unsealedEmpty.find("\"emptyRetainedInventory\":true,"),std::strlen("\"emptyRetainedInventory\":true,")); rejectsEmptyManifest(std::move(unsealedEmpty));
+
+    // A schema-four migration attempt has its own identity. It may preserve
+    // a durable application handoff from an earlier attempt, so those UUIDs
+    // must remain distinct while the handoff itself stays well-formed.
+    Plan prior = plan;
+    prior.schemaVersion = 4; prior.operationID = 0x70; prior.operationRoot = "/private/prior";
+    prior.sealedCanonicalContainerCount = 3;
+    Plan successor = prior;
+    successor.operationID = 0x71; successor.operationRoot = "/private/successor";
+    assert(samePlanTarget(prior, successor));
+    const std::string digest(64, 'a');
+    const std::string handoffID = "123e4567-e89b-42d3-a456-426614174000";
+    const std::string schema4Orphan =
+        "{\"schemaVersion\":4,\"clusterUUID\":\"0x7\",\"bundleSHA256\":\"" + digest +
+        "\",\"canonicalContainerCount\":3,\"machines\":["
+        "{\"machineUUID\":\"0x1\",\"machineFragment\":1,\"records\":["
+        "{\"uuid\":\"0x65\",\"pid\":201,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\"" + digest + "\",\"paramsSHA256\":\"" + digest + "\",\"paramsPath\":\"/private/params1\",\"canonical\":true},"
+        "{\"uuid\":\"0x68\",\"pid\":204,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\"" + digest + "\",\"paramsSHA256\":\"" + digest + "\",\"paramsPath\":\"/private/params4\",\"canonical\":false}]},"
+        "{\"machineUUID\":\"0x2\",\"machineFragment\":2,\"records\":[{\"uuid\":\"0x66\",\"pid\":202,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\"" + digest + "\",\"paramsSHA256\":\"" + digest + "\",\"paramsPath\":\"/private/params2\",\"canonical\":true}]},"
+        "{\"machineUUID\":\"0x3\",\"machineFragment\":3,\"records\":[{\"uuid\":\"0x67\",\"pid\":203,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\"" + digest + "\",\"paramsSHA256\":\"" + digest + "\",\"paramsPath\":\"/private/params3\",\"canonical\":true}]}],"
+        "\"orphanedStatefulPredecessor\":{\"operationID\":\"" + handoffID + "\",\"activeDeploymentID\":11,\"successorDeploymentID\":12,\"successorBlobSHA256\":\"" + digest + "\",\"updatedAtMs\":1,\"machineUUID\":\"0x1\",\"containerUUID\":\"0x68\",\"priorRequestSHA256\":\"" + digest + "\",\"priorManifestSHA256\":\"" + digest + "\",\"priorRequestPath\":\"/private/prior-request\",\"priorManifestPath\":\"/private/prior-manifest\"}}";
+    durable(path, text(schema4Orphan));
+    const auto priorOrphan = parseManifest(path, prior);
+    const auto parsedOrphan = parseManifest(path, successor);
+    assert(priorOrphan.orphanedStatefulPredecessor.operation.operationID == text(handoffID) &&
+        parsedOrphan.orphanedStatefulPredecessor.operation.operationID == text(handoffID) &&
+        successor.operationID != uuid("0x123e4567e89b42d3a456426614174000"));
+    auto malformedHandoff = schema4Orphan;
+    malformedHandoff.replace(malformedHandoff.find(handoffID), handoffID.size(), "not-a-uuid");
+    durable(path, text(malformedHandoff));
+    bool rejectedMalformedHandoff = false;
+    try { (void)parseManifest(path, successor); } catch (const std::exception&) { rejectedMalformedHandoff = true; }
+    assert(rejectedMalformedHandoff);
     fs::remove_all(directory);
   }
 
