@@ -30,6 +30,46 @@ template<typename S> void serialize(S&& s, Request& r) {
   s.value16b(r.clusterUUID); s.text1b(r.bundleSHA,UINT32_MAX); s.text1b(r.interruptedBundleSHA,UINT32_MAX);
   s.object(r.mixedSuccessorMachineUUIDs); s.object(r.plans); s.object(r.machines);
 }
+// A schema-four request is explicitly framed, leaving the established request
+// serialization byte-for-byte usable by an older retained operation.
+struct Schema4Request {
+  Request request;
+  MothershipRetainedRecoveryMixedProof proof;
+};
+template<typename S> void serialize(S&& s, Schema4Request& r) {
+  s.object(r.request); s.value4b(r.proof.canonicalContainerCount);
+  s.value4b(r.proof.staleCoordinatorCanonicalContainerCount);
+  s.value4b(r.proof.interruptedExpectedEchos); s.value16b(r.proof.staleExcludedContainerUUID);
+}
+inline String encodeRequest(const Request& request,const Plan& plan) {
+  String bytes;
+  if (plan.schemaVersion == 4) {
+    Schema4Request wrapped; wrapped.request=request;
+    wrapped.proof.canonicalContainerCount=plan.sealedCanonicalContainerCount;
+    wrapped.proof.staleCoordinatorCanonicalContainerCount=plan.staleCoordinatorCanonicalContainerCount;
+    wrapped.proof.interruptedExpectedEchos=plan.sealedInterruptedExpectedEchos;
+    wrapped.proof.staleExcludedContainerUUID=plan.staleExcludedContainerUUID;
+    BitseryEngine::serialize(bytes,wrapped);
+    require(!bytes.empty(),"schema-four request serialization is empty");
+    String framed={}; framed.append("RRF4",4); framed.append(bytes.data(),bytes.size());
+    require(framed.size()==4+bytes.size(),"schema-four request framing is incomplete");
+    return framed;
+  }
+  Request copy=request; BitseryEngine::serialize(bytes,copy); return bytes;
+}
+inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof) {
+  if (raw.size()>=4 && raw.compare(0,4,"RRF4")==0) {
+    Schema4Request wrapped;
+    if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
+        wrapped.proof.canonicalContainerCount==0 ||
+        wrapped.proof.staleCoordinatorCanonicalContainerCount==0 ||
+        wrapped.proof.staleCoordinatorCanonicalContainerCount>=wrapped.proof.canonicalContainerCount ||
+        wrapped.proof.canonicalContainerCount>256 || wrapped.proof.interruptedExpectedEchos==0 || wrapped.proof.staleExcludedContainerUUID==0) return false;
+    request=std::move(wrapped.request); if(proof)*proof=wrapped.proof; return true;
+  }
+  if (!BitseryEngine::deserializeSafe(text(raw),request)) return false;
+  if(proof)*proof={}; return true;
+}
 // The seed generates these bytes once. Every Brain must receive identical
 // witness strings, even when unordered maps decode in a different order.
 struct WitnessSet {
@@ -61,6 +101,7 @@ struct Record {
 };
 struct Manifest {
   Request request;
+  uint32_t canonicalContainerCount = 23;
   std::vector<Record> records;
 };
 inline void privateFile(const std::string& path, uint64_t maximum=UINT32_MAX) {
@@ -75,6 +116,14 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
   auto raw=read(path); require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery manifest JSON");
   require(number(doc,"schemaVersion")==1 && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
   Manifest m; m.request.clusterUUID=p.clusterUUID; m.request.bundleSHA=text(field(doc,"bundleSHA256"));
+  if (p.schemaVersion >= 4) {
+    const uint64_t canonicalCount=number(doc,"canonicalContainerCount");
+    require(canonicalCount<=256,"declared canonical inventory count overflow");
+    m.canonicalContainerCount=uint32_t(canonicalCount);
+    require(m.canonicalContainerCount>0 && m.canonicalContainerCount<=256,"invalid declared canonical inventory count");
+    require(m.canonicalContainerCount==p.sealedCanonicalContainerCount,"recovery manifest count differs from sealed plan");
+  }
+
   require(prodigyIsSHA256HexDigest(m.request.bundleSHA),"invalid recovery bundle digest");
   simdjson::dom::array machines; require(doc["machines"].get_array().get(machines)==simdjson::SUCCESS,"recovery machines missing");
   bytell_hash_set<uint128_t> seenMachines,seenContainers; uint32_t canonical=0;
@@ -96,7 +145,7 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     }
     m.request.machines.push_back(std::move(machine));
   }
-  require(seenMachines.size()==3 && canonical==23,"recovery requires the sealed three-host inventory with 23 canonical containers");
+  require(seenMachines.size()==3 && canonical==m.canonicalContainerCount,"recovery canonical inventory differs from sealed three-host declaration");
   return m;
 }
 inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot) {
@@ -110,8 +159,10 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     privateFile(requestPath); const std::string path=statePath;pathCheck(path);
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
-    Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"recovery request decode failed");
+    Request request; MothershipRetainedRecoveryMixedProof proof;
+    require(decodeRequest(read(requestPath),request,&proof),"recovery request decode failed");
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
+    require(!proof.canonicalContainerCount || proof.validFor(before),"recovery request proof differs from frozen topology");
     const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
     WitnessSet sealed;require(BitseryEngine::deserializeSafe(text(read(witnessPath)),sealed) && sealed.requestSHA==text(digest(requestPath)),"sealed recovery witnesses differ from request");
     // An interrupted normal update is active too. Only the recovery envelope
@@ -127,10 +178,10 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     const bool mixed = !request.interruptedBundleSHA.empty();
     if (mixed) {
       require(prodigyIsSHA256HexDigest(request.interruptedBundleSHA) &&
-              request.mixedSuccessorMachineUUIDs.size()==2 &&
-              request.mixedSuccessorMachineUUIDs[0] != 0 &&
-              request.mixedSuccessorMachineUUIDs[0] < request.mixedSuccessorMachineUUIDs[1],
+              (proof.canonicalContainerCount ? request.mixedSuccessorMachineUUIDs.size()==1 : request.mixedSuccessorMachineUUIDs.size()==2),
               "invalid sealed mixed handoff");
+      for (size_t i=0;i<request.mixedSuccessorMachineUUIDs.size();++i)
+        require(request.mixedSuccessorMachineUUIDs[i]!=0 && (!i || request.mixedSuccessorMachineUUIDs[i-1]<request.mixedSuccessorMachineUUIDs[i]),"invalid sealed mixed handoff");
       if (!mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                      request.bundleSHA,&why,previousBundleSHA256,
                                                      request.interruptedBundleSHA)) {
@@ -139,15 +190,20 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
         // Both forms prove the same inventory before the old coordinator's
         // later handoff case is considered.
         expected=before;
-        if (!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
-                expected,request.plans,request.machines,request.bundleSHA,
-                previousBundleSHA256,request.interruptedBundleSHA,
-                request.mixedSuccessorMachineUUIDs,&why)) {
+        if (!(proof.canonicalContainerCount ?
+              mothershipPrepareRetainedRecoverySchema4Snapshot(
+                  expected,request.plans,request.machines,request.bundleSHA,
+                  previousBundleSHA256,request.interruptedBundleSHA,
+                  request.mixedSuccessorMachineUUIDs,proof,&why) :
+              mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+                  expected,request.plans,request.machines,request.bundleSHA,
+                  previousBundleSHA256,request.interruptedBundleSHA,
+                  request.mixedSuccessorMachineUUIDs,&why))) {
           expected=before;
-          require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
-                      expected,request.plans,request.machines,request.bundleSHA,
-                      previousBundleSHA256,request.interruptedBundleSHA,
-                      request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
+          require(!proof.canonicalContainerCount && mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+              expected,request.plans,request.machines,request.bundleSHA,
+              previousBundleSHA256,request.interruptedBundleSHA,
+              request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
         }
       }
     } else {
@@ -251,7 +307,7 @@ inline bool sameRecordIdentity(const Manifest& left,const Manifest& right) {
 inline bool sameCanonicalRecordIdentity(const Manifest& left,const Manifest& right) {
   std::map<uint128_t,const Record*> index;
   for(const auto& record:left.records)if(record.canonical)index.emplace(record.container,&record);
-  if(index.size()!=23)return false;
+  if(index.size()!=left.canonicalContainerCount || left.canonicalContainerCount!=right.canonicalContainerCount)return false;
   uint32_t canonical=0;
   for(const auto& record:right.records) {
     if(!record.canonical)continue;
@@ -260,7 +316,7 @@ inline bool sameCanonicalRecordIdentity(const Manifest& left,const Manifest& rig
     const auto& expected=*found->second;
     if(expected.machine!=record.machine || expected.pid!=record.pid || expected.created!=record.created || expected.start!=record.start || expected.executableSHA!=record.executableSHA || expected.paramsSHA!=record.paramsSHA || expected.paramsPath!=record.paramsPath)return false;
   }
-  return canonical==23;
+  return canonical==left.canonicalContainerCount;
 }
 inline bool retainedRecoveryHasMixedInstalledPredecessors(const Plan& plan) {
   std::set<std::pair<std::string,std::string>> installed;
@@ -269,7 +325,7 @@ inline bool retainedRecoveryHasMixedInstalledPredecessors(const Plan& plan) {
   return installed.size() > 1;
 }
 inline bool samePlanTarget(const Plan& oldPlan,const Plan& successor) {
-  if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.mixedPredecessors!=successor.mixedPredecessors || oldPlan.machines.size()!=successor.machines.size() || oldPlan.approvedPredecessors.size()!=successor.approvedPredecessors.size())return false;
+  if(oldPlan.operationID==successor.operationID || oldPlan.operationRoot==successor.operationRoot || oldPlan.schemaVersion!=successor.schemaVersion || oldPlan.clusterUUID!=successor.clusterUUID || oldPlan.identity!=successor.identity || oldPlan.registryRoot!=successor.registryRoot || oldPlan.runtimeRoot!=successor.runtimeRoot || oldPlan.statePath!=successor.statePath || oldPlan.secretsPath!=successor.secretsPath || oldPlan.oldRuntimeSHA!=successor.oldRuntimeSHA || oldPlan.oldBundleSHA!=successor.oldBundleSHA || oldPlan.serviceRuntimeSHA!=successor.serviceRuntimeSHA || oldPlan.serviceBundleSHA!=successor.serviceBundleSHA || oldPlan.serviceBundlePath!=successor.serviceBundlePath || oldPlan.sealedCanonicalContainerCount!=successor.sealedCanonicalContainerCount || oldPlan.staleCoordinatorCanonicalContainerCount!=successor.staleCoordinatorCanonicalContainerCount || oldPlan.sealedInterruptedExpectedEchos!=successor.sealedInterruptedExpectedEchos || oldPlan.staleExcludedContainerUUID!=successor.staleExcludedContainerUUID || oldPlan.mixedPredecessors!=successor.mixedPredecessors || oldPlan.machines.size()!=successor.machines.size() || oldPlan.approvedPredecessors.size()!=successor.approvedPredecessors.size())return false;
   for(size_t i=0;i<oldPlan.machines.size();++i)if(oldPlan.machines[i].uuid!=successor.machines[i].uuid || oldPlan.machines[i].linuxID!=successor.machines[i].linuxID || oldPlan.machines[i].address!=successor.machines[i].address || oldPlan.machines[i].runtimeRoot!=successor.machines[i].runtimeRoot || oldPlan.machines[i].installedRuntimeSHA!=successor.machines[i].installedRuntimeSHA || oldPlan.machines[i].installedBundleSHA!=successor.machines[i].installedBundleSHA)return false;
   for(size_t i=0;i<oldPlan.approvedPredecessors.size();++i)if(oldPlan.approvedPredecessors[i].runtimeSHA!=successor.approvedPredecessors[i].runtimeSHA || oldPlan.approvedPredecessors[i].bundleSHA!=successor.approvedPredecessors[i].bundleSHA || oldPlan.approvedPredecessors[i].bundlePath!=successor.approvedPredecessors[i].bundlePath)return false;
   return true;
@@ -536,8 +592,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
             }
           }
           std::sort(manifest.request.mixedSuccessorMachineUUIDs.begin(),manifest.request.mixedSuccessorMachineUUIDs.end());
-          require(manifest.request.mixedSuccessorMachineUUIDs.size()==2 &&
-                  prodigyIsSHA256HexDigest(manifest.request.interruptedBundleSHA),"invalid mixed predecessor mapping");
+          const size_t split=manifest.request.mixedSuccessorMachineUUIDs.size();
+          require(split>0 && split<e.plan.machines.size() && prodigyIsSHA256HexDigest(manifest.request.interruptedBundleSHA),"invalid mixed predecessor mapping");
+          require(split==2 || (e.plan.schemaVersion==4 && e.plan.explicitMixedRuntimeInventory && split==1),
+                  "legacy mixed predecessor mapping requires two successors");
         }
         for(const auto& r:manifest.records) {
           String encoded,why,bytes,machine,container,diagnostic,phase;
@@ -562,16 +620,20 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
-        String bytes;BitseryEngine::serialize(bytes,manifest.request); if(!requestAlreadySealed)durable(requestPath,bytes);
+        String bytes=encodeRequest(manifest.request,e.plan); if(!requestAlreadySealed)durable(requestPath,bytes);
         durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(requestPath)+"\n"));
       }
       const auto witnessPath=requestPath+".witnesses";
       if(!fs::exists(witnessPath)) {
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
-        Request request;require(BitseryEngine::deserializeSafe(text(read(requestPath)),request),"sealed request unreadable");
+        Request request; MothershipRetainedRecoveryMixedProof proof;
+        require(decodeRequest(read(requestPath),request,&proof),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
         if (!request.interruptedBundleSHA.empty()) {
-          require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
+          if (proof.canonicalContainerCount) require(mothershipPrepareRetainedRecoverySchema4Snapshot(
+                      seed,request.plans,request.machines,request.bundleSHA,text(e.plan.oldBundleSHA),
+                      request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,proof,&why),str(why).c_str());
+          else require(mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
                       seed,request.plans,request.machines,request.bundleSHA,text(e.plan.oldBundleSHA),
                       request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
         } else {

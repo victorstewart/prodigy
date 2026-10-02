@@ -61,9 +61,11 @@ struct ApprovedPredecessor {
   std::string runtimeSHA, bundleSHA, bundlePath;
 };
 struct Plan {
-  std::string identity, operationRoot, registryRoot, bundle, runtimeRoot, statePath, secretsPath, oldRuntimeSHA, oldBundleSHA, planSHA;
-  bool retainedRecovery = false, mixedPredecessors = false;
-  uint128_t operationID = 0, clusterUUID = 0;
+  std::string identity, operationRoot, registryRoot, bundle, runtimeRoot, statePath, secretsPath, oldRuntimeSHA, oldBundleSHA, serviceRuntimeSHA, serviceBundleSHA, serviceBundlePath, planSHA;
+  bool retainedRecovery = false, mixedPredecessors = false, explicitMixedRuntimeInventory = false;
+  uint128_t operationID = 0, clusterUUID = 0; uint64_t schemaVersion = 0;
+  uint32_t sealedCanonicalContainerCount = 0, staleCoordinatorCanonicalContainerCount = 0, sealedInterruptedExpectedEchos = 0;
+  uint128_t staleExcludedContainerUUID = 0;
   std::vector<Machine> machines; std::vector<ApprovedPredecessor> approvedPredecessors;
 };
 inline Plan parse(const char *file) {
@@ -71,9 +73,9 @@ inline Plan parse(const char *file) {
   require(st.st_size > 0 && st.st_size <= 65536, "migration plan size invalid");
   simdjson::dom::parser parser; simdjson::dom::element doc;
   const auto contents = read(file); require(parser.parse(contents).get(doc) == simdjson::SUCCESS, "migration plan JSON invalid");
-  uint64_t version = 0; require(doc["schemaVersion"].get_uint64().get(version) == simdjson::SUCCESS && (version == 1 || version == 2 || version == 3), "unsupported migration plan");
+  uint64_t version = 0; require(doc["schemaVersion"].get_uint64().get(version) == simdjson::SUCCESS && (version == 1 || version == 2 || version == 3 || version == 4), "unsupported migration plan");
   if (version >= 2) { bool retained=false; require(doc["retainedRecoveryMode"].get_bool().get(retained) == simdjson::SUCCESS && retained, "installed predecessor observations require retained recovery"); }
-  Plan p; p.identity = field(doc, "clusterUUID"); p.clusterUUID = uuid(p.identity); p.operationID = uuid(field(doc,"operationID"));
+  Plan p; p.schemaVersion=version; p.identity = field(doc, "clusterUUID"); p.clusterUUID = uuid(p.identity); p.operationID = uuid(field(doc,"operationID"));
   p.operationRoot=field(doc,"operationRoot"); p.registryRoot=field(doc,"registryRoot"); p.bundle=field(doc,"bundlePath");
   p.runtimeRoot=field(doc,"runtimeRoot"); p.statePath=field(doc,"statePath"); p.secretsPath=field(doc,"secretsPath");
   p.oldRuntimeSHA=field(doc,"expectedOldRuntimeSHA256"); p.oldBundleSHA=field(doc,"expectedOldBundleSHA256"); p.planSHA=digest(file);
@@ -90,7 +92,7 @@ inline Plan parse(const char *file) {
     for (const auto& old : p.machines) require(old.uuid!=m.uuid && old.linuxID!=m.linuxID && old.address!=m.address, "duplicate migration machine");
     p.machines.push_back(std::move(m)); }
   require(p.machines.size()==3, "migration requires the explicitly selected three-Brain cluster");
-  if (version == 2) {
+  if (version == 2 || version == 4) {
     simdjson::dom::array predecessors; require(doc["approvedPredecessors"].get_array().get(predecessors) == simdjson::SUCCESS, "mixed predecessor bundles missing");
     for (auto value : predecessors) { ApprovedPredecessor predecessor; predecessor.runtimeSHA=field(value,"runtimeSHA256"); predecessor.bundleSHA=field(value,"bundleSHA256"); predecessor.bundlePath=field(value,"bundlePath"); pathCheck(predecessor.bundlePath);
       require(prodigyIsSHA256HexDigest(text(predecessor.runtimeSHA)) && prodigyIsSHA256HexDigest(text(predecessor.bundleSHA)), "invalid approved predecessor identity");
@@ -115,6 +117,37 @@ inline Plan parse(const char *file) {
     // case; a same-root uniform plan must still prove two actual predecessors.
     if (servicePredecessorObservedAtDifferentRoot) used.emplace(p.oldRuntimeSHA,p.oldBundleSHA);
     require(used.size()==2 && used.contains({p.oldRuntimeSHA,p.oldBundleSHA}), "mixed recovery requires both predecessor identities"); p.mixedPredecessors=true;
+  }
+  if (version == 4) {
+    // Schema four is retained recovery only: it seals the observed 1+2
+    // per-host predecessor split and the two distinct frozen coordinator
+    // witnesses. Normal migration never reads this form.
+    simdjson::dom::element recovery; require(doc["sealedRetainedRecovery"].get(recovery)==simdjson::SUCCESS, "sealed retained recovery proof missing");
+    uint64_t canonical=0, stale=0, echos=0;
+    require(recovery["canonicalContainerCount"].get_uint64().get(canonical)==simdjson::SUCCESS &&
+            recovery["staleCoordinatorCanonicalContainerCount"].get_uint64().get(stale)==simdjson::SUCCESS &&
+            recovery["interruptedExpectedEchos"].get_uint64().get(echos)==simdjson::SUCCESS &&
+            canonical>0 && canonical<=256 && stale>0 && stale<canonical && echos>0 && echos<p.machines.size(),
+            "invalid sealed retained recovery proof");
+    p.sealedCanonicalContainerCount=uint32_t(canonical);
+    p.staleCoordinatorCanonicalContainerCount=uint32_t(stale);
+    p.sealedInterruptedExpectedEchos=uint32_t(echos);
+    p.staleExcludedContainerUUID=uuid(field(recovery,"staleExcludedContainerUUID"));
+    require(p.staleExcludedContainerUUID!=0,"invalid sealed stale excluded container");
+    p.serviceRuntimeSHA=field(recovery,"serviceRuntimeSHA256");
+    p.serviceBundleSHA=field(recovery,"serviceBundleSHA256");
+    p.serviceBundlePath=field(recovery,"serviceBundlePath"); pathCheck(p.serviceBundlePath);
+    require(prodigyIsSHA256HexDigest(text(p.serviceRuntimeSHA)) && prodigyIsSHA256HexDigest(text(p.serviceBundleSHA)),
+            "invalid sealed service predecessor identity");
+    require(p.approvedPredecessors.size()==2, "mixed runtime recovery requires exactly two approved predecessors");
+    std::map<std::pair<std::string,std::string>,uint32_t> observed;
+    for (const auto& machine : p.machines) observed[{machine.installedRuntimeSHA,machine.installedBundleSHA}]++;
+    require(observed.size()==2, "mixed runtime recovery requires two observed predecessor identities");
+    for (const auto& predecessor : p.approvedPredecessors)
+      require(observed.contains({predecessor.runtimeSHA,predecessor.bundleSHA}), "observed predecessor is not approved");
+    require(observed.contains({p.oldRuntimeSHA,p.oldBundleSHA}), "logical predecessor is not observed");
+    for (const auto& [identity,count] : observed) require(count > 0 && count < p.machines.size(), "invalid mixed runtime predecessor distribution");
+    p.mixedPredecessors=true; p.explicitMixedRuntimeInventory=true;
   }
   if (version == 3) {
     // Schema three describes one logical predecessor installed under different
@@ -164,6 +197,8 @@ public:
   }
   const std::string& activeRuntimeRoot(const Machine& machine) const { return machine.runtimeRoot; }
   const std::string& serviceRuntimeRoot() const { return plan.runtimeRoot; }
+  const std::string& servicePredecessorRuntimeSHA() const { return plan.schemaVersion==4 ? plan.serviceRuntimeSHA : plan.oldRuntimeSHA; }
+  const std::string& servicePredecessorBundleSHA() const { return plan.schemaVersion==4 ? plan.serviceBundleSHA : plan.oldBundleSHA; }
   std::string serviceExecStartCheck() const {
     return "systemctl show -p ExecStart --value prodigy | grep -F -- "+quote(serviceRuntimeRoot()+"/prodigy")+" > /dev/null; ";
   }
@@ -177,6 +212,15 @@ public:
       if (!fs::exists(root)) require(prodigyInstallBundleToRoot(text(predecessor.bundlePath),text(root),&failure),"mixed predecessor bundle staging failed");
       require(digest(root+"/prodigy")==predecessor.runtimeSHA && digest(root+"/prodigy.bundle.tar.zst")==predecessor.bundleSHA,
               "mixed predecessor runtime contents differ");
+    }
+    if (plan.schemaVersion==4) {
+      String approved, failure;
+      require(prodigyApproveBundleArtifact(text(plan.serviceBundlePath),approved,&failure) && str(approved)==plan.serviceBundleSHA,
+              "sealed service predecessor bundle is not approved");
+      const auto root=plan.operationRoot+"/service-predecessor-"+plan.serviceBundleSHA.substr(0,16);
+      if (!fs::exists(root)) require(prodigyInstallBundleToRoot(text(plan.serviceBundlePath),text(root),&failure),"sealed service predecessor staging failed");
+      require(digest(root+"/prodigy")==plan.serviceRuntimeSHA && digest(root+"/prodigy.bundle.tar.zst")==plan.serviceBundleSHA,
+              "sealed service predecessor contents differ");
     }
   }
   ~Execution() { for (int fd : databaseLocks) ::close(fd); if(lockFD>=0) ::close(lockFD); }
@@ -390,7 +434,7 @@ public:
         std::string cmd="test \"$(sha256sum "+quote(binary)+" | cut -d' ' -f1)\" = "+quote(machine.installedRuntimeSHA)+"; test \"$(sha256sum "+quote(activeRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(machine.installedBundleSHA)+"; ";
         cmd+=serviceExecStartCheck()+"test \"$(systemctl show -p KillMode --value prodigy)\" = control-group; test \"$(systemctl show -p Restart --value prodigy)\" = always; ";
         if (activeRoot != serviceRuntimeRoot())
-          cmd+="test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(plan.oldRuntimeSHA)+"; test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(plan.oldBundleSHA)+"; ";
+          cmd+="test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(servicePredecessorRuntimeSHA())+"; test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(servicePredecessorBundleSHA())+"; ";
         cmd+="pid=$(systemctl show -p MainPID --value prodigy); test \"$pid\" -gt 1; test \"$(readlink -f /proc/$pid/exe)\" = "+quote(binary)+"; test \"$(cat /proc/$pid/cgroup)\" = '0::/system.slice/prodigy.service'; ";
         cmd+="fds=$(for f in /proc/$pid/fd/*; do readlink \"$f\" || true; done); ";
         for(const auto& dbPath:{plan.statePath,plan.secretsPath}) cmd+="test -d "+quote(dbPath)+"; test ! -L "+quote(dbPath)+"; test \"$(stat -c %d "+quote(dbPath)+")\" = \"$(stat -c %d "+quote(remoteRoot)+")\"; "+descriptorLockCheckCommand(dbPath+"/LOCK");
@@ -473,8 +517,8 @@ public:
       if (observedRoot != serviceRoot)
         cmd+="if test -e "+quote(observedRetained)+"; then test \"$(sha256sum "+quote(observedRetained+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(machine.installedRuntimeSHA)+"; else test \"$(sha256sum "+quote(observedRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(machine.installedRuntimeSHA)+"; cp -a --reflink=auto "+quote(observedRoot)+" "+quote(observedRetained)+"; sync -f "+quote(fs::path(observedRoot).parent_path().string())+"; fi; ";
       const auto& oldRoot=observedRoot == serviceRoot ? observedRoot : serviceRoot;
-      const auto& oldSHA=observedRoot == serviceRoot ? machine.installedRuntimeSHA : plan.oldRuntimeSHA;
-      const auto& oldBundle=observedRoot == serviceRoot ? machine.installedBundleSHA : plan.oldBundleSHA;
+      const auto& oldSHA=observedRoot == serviceRoot ? machine.installedRuntimeSHA : servicePredecessorRuntimeSHA();
+      const auto& oldBundle=observedRoot == serviceRoot ? machine.installedBundleSHA : servicePredecessorBundleSHA();
       const auto& retained=observedRoot == serviceRoot ? observedRetained : serviceRetained;
       cmd+="if test -e "+quote(retained)+"; then test \"$(sha256sum "+quote(retained+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldSHA)+"; else test \"$(sha256sum "+quote(oldRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldSHA)+"; test \"$(sha256sum "+quote(oldRoot+"/prodigy.bundle.tar.zst")+" | cut -d' ' -f1)\" = "+quote(oldBundle)+"; mv -T "+quote(oldRoot)+" "+quote(retained)+"; sync -f "+quote(fs::path(oldRoot).parent_path().string())+"; fi; ";
       // Keep the utility staging root throughout the operation, including after
@@ -514,7 +558,7 @@ public:
       for(auto& m:plan.machines) {
         std::string cmd="test \"$(sha256sum "+quote(activeRuntimeRoot(m)+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(m.installedRuntimeSHA)+"; ";
         if (activeRuntimeRoot(m) != serviceRuntimeRoot())
-          cmd+=serviceExecStartCheck()+"test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(plan.oldRuntimeSHA);
+          cmd+=serviceExecStartCheck()+"test \"$(sha256sum "+quote(serviceRuntimeRoot()+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(servicePredecessorRuntimeSHA());
         run(m.uuid,cmd);
       }
       for(auto& m:plan.machines) { unfence(m); run(m.uuid,"systemctl start prodigy; systemctl is-active --quiet prodigy"); }
@@ -538,7 +582,7 @@ public:
       const auto retained=(observedRoot == serviceRoot
           ? observedRoot+(plan.retainedRecovery ? ".retained10-" : ".tidesdb9-")
           : serviceRoot+(plan.retainedRecovery ? ".service-retained10-" : ".service-tidesdb9-"))+plan.planSHA.substr(0,16);
-      const auto& oldSHA=observedRoot == serviceRoot ? m.installedRuntimeSHA : plan.oldRuntimeSHA;
+      const auto& oldSHA=observedRoot == serviceRoot ? m.installedRuntimeSHA : servicePredecessorRuntimeSHA();
       std::string cmd="if test -e "+quote(retained)+"; then test \"$(sha256sum "+quote(retained+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldSHA)+"; if test -e "+quote(serviceRoot)+"; then test \"$(sha256sum "+quote(serviceRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(str(receipt.newRuntimeSHA256))+"; test ! -e "+quote(remoteRoot+"/rolled-back-runtime")+"; mv -T "+quote(serviceRoot)+" "+quote(remoteRoot+"/rolled-back-runtime")+"; fi; mv -T "+quote(retained)+" "+quote(serviceRoot)+"; sync -f "+quote(fs::path(serviceRoot).parent_path().string())+"; fi; ";
       cmd+=serviceExecStartCheck()+"test \"$(sha256sum "+quote(serviceRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(oldSHA)+"; test \"$(sha256sum "+quote(observedRoot+"/prodigy")+" | cut -d' ' -f1)\" = "+quote(m.installedRuntimeSHA); run(m.uuid,cmd);
     }

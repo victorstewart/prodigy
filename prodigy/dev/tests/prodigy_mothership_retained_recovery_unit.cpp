@@ -467,7 +467,7 @@ int main()
     Plan plan; plan.clusterUUID=7;
     for(uint32_t machine=1;machine<=3;++machine) { MothershipTidesMigration::Machine selected; selected.uuid=machine; plan.machines.push_back(selected); }
     for(uint32_t count:{23u,31u,34u}) {
-      std::string json="{\"schemaVersion\":1,\"clusterUUID\":\"0x7\",\"bundleSHA256\":\""+std::string(64,'a')+"\",\"machines\":[";
+      std::string json="{\"schemaVersion\":1,\"clusterUUID\":\"0x7\",\"bundleSHA256\":\""+std::string(64,'a')+"\",\"canonicalContainerCount\":23,\"machines\":[";
       for(uint32_t machine=1;machine<=3;++machine) {
         if(machine>1)json+=",";
         json+="{\"machineUUID\":\"0x"+std::to_string(machine)+"\",\"machineFragment\":"+std::to_string(machine)+",\"records\":[";
@@ -529,6 +529,15 @@ int main()
     auto duplicateMachine=planJSON(); duplicateMachine.replace(duplicateMachine.find("\"machineUUID\":\"0x3\""),std::strlen("\"machineUUID\":\"0x3\""),"\"machineUUID\":\"0x2\""); rejects(duplicateMachine);
     rejects(planJSON(false));
     fs::remove_all(directory);
+  }
+
+  // Schema four seals a three-host 1+2 installed predecessor inventory.
+  {
+    fs::create_directories(".run"); char directory[]=".run/retained-mixed14-plan-unit-XXXXXX"; assert(::mkdtemp(directory));
+    const std::string path=std::string(directory)+"/plan.json", a(64,'a'), b(64,'b'), c(64,'c'), d(64,'d');
+    const auto planJSON=std::string("{\"schemaVersion\":4,\"retainedRecoveryMode\":true,\"clusterUUID\":\"0x7\",\"operationID\":\"0x8\",\"operationRoot\":\"/private/operation\",\"registryRoot\":\"/private/registry\",\"bundlePath\":\"/private/successor.bundle\",\"runtimeRoot\":\"/root/prodigy\",\"statePath\":\"/var/lib/prodigy/state\",\"secretsPath\":\"/var/lib/prodigy/secrets\",\"expectedOldRuntimeSHA256\":\"")+a+"\",\"expectedOldBundleSHA256\":\""+b+"\",\"sealedRetainedRecovery\":{\"canonicalContainerCount\":24,\"staleCoordinatorCanonicalContainerCount\":23,\"interruptedExpectedEchos\":2,\"staleExcludedContainerUUID\":\"0x3e8\",\"serviceRuntimeSHA256\":\""+std::string(64,'e')+"\",\"serviceBundleSHA256\":\""+std::string(64,'f')+"\",\"serviceBundlePath\":\"/private/service.bundle\"},\"machines\":[{\"machineUUID\":\"0x1\",\"linuxMachineID\":\"11111111111111111111111111111111\",\"sshAddress\":\"fd72::1\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+a+"\",\"installedBundleSHA256\":\""+b+"\"},{\"machineUUID\":\"0x2\",\"linuxMachineID\":\"22222222222222222222222222222222\",\"sshAddress\":\"fd72::2\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+a+"\",\"installedBundleSHA256\":\""+b+"\"},{\"machineUUID\":\"0x3\",\"linuxMachineID\":\"33333333333333333333333333333333\",\"sshAddress\":\"fd72::3\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+c+"\",\"installedBundleSHA256\":\""+d+"\"}],\"approvedPredecessors\":[{\"runtimeSHA256\":\""+a+"\",\"bundleSHA256\":\""+b+"\",\"bundlePath\":\"/private/old.bundle\"},{\"runtimeSHA256\":\""+c+"\",\"bundleSHA256\":\""+d+"\",\"bundlePath\":\"/private/new.bundle\"}]}";
+    durable(path,text(planJSON)); assert(::chmod(path.c_str(),0600)==0); const auto parsed=MothershipTidesMigration::parse(path.c_str());
+    assert(parsed.explicitMixedRuntimeInventory && parsed.mixedPredecessors); fs::remove_all(directory);
   }
 
   // Version three is the retained-only form for a uniform logical
@@ -884,6 +893,123 @@ int main()
   assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
       mixedEchoTransition,request.plans,request.machines,request.bundleSHA,
       previousBundleSHA,interruptedEchoSHA,mixedSuccessors,&failure));
+
+  // The runtime-12 recovery case has a 24-container sealed fleet, one
+  // installed runtime-13 successor, and two acknowledged bundle echoes.  Its
+  // old coordinator has a separate inert 23-container failed witness; it is
+  // never treated as the 24-container successor witness.
+  auto schema4Request=request;
+  for (uint32_t machine=0;machine<schema4Request.machines.size();++machine) {
+    const auto original=schema4Request.machines[machine].parameters[0];
+    for (uint32_t replica=2;replica<=8;++replica) {
+      auto parameters=original; parameters.uuid=uint128_t(10000+machine*100+replica);
+      parameters.private6.network.v6[15]=uint8_t(replica);
+      schema4Request.machines[machine].parameters.push_back(parameters);
+      schema4Request.machines[machine].observedCreatedAtMs.push_back(1790040000000LL+replica);
+    }
+  }
+  String schema4Blob="sealed-schema-four-interrupted-bundle"_ctv,schema4InterruptedSHA={};
+  assert(prodigyComputeSHA256Hex(schema4Blob,schema4InterruptedSHA));
+  auto schema4Witness=snapshot; schema4Witness.masterAuthority.runtimeState.updateSelf={};
+  assert(mothershipPrepareRetainedRecoverySnapshot(schema4Witness,schema4Request.plans,schema4Request.machines,
+                                                   schema4InterruptedSHA,&failure));
+  MothershipRetainedRecoveryMixedProof schema4Proof={24,23,2,schema4Request.machines[0].parameters.back().uuid};
+  assert(mothershipRetainedRecoveryWitnessContainerCount(
+      schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)==24);
+  Vector<uint128_t> oneSuccessor={3};
+  auto dormantSeed=schema4Witness;
+  dormantSeed.masterAuthority.runtimeState.updateSelf.state=0;
+  dormantSeed.masterAuthority.runtimeState.updateSelf.expectedEchos=0;
+  dormantSeed.masterAuthority.runtimeState.updateSelf.bundleEchos=0;
+  dormantSeed.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256=schema4InterruptedSHA;
+  assert(mothershipPrepareRetainedRecoverySchema4Snapshot(
+      dormantSeed,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,schema4Proof,&failure));
+  auto dormantWithWork=dormantSeed;
+  dormantWithWork.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256=schema4InterruptedSHA;
+  dormantWithWork.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.push_back(1);
+  assert(!mothershipPrepareRetainedRecoverySchema4Snapshot(
+      dormantWithWork,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,schema4Proof,&failure));
+  auto dormantWithoutWitness=dormantSeed;
+  dormantWithoutWitness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.clear();
+  assert(!mothershipPrepareRetainedRecoverySchema4Snapshot(
+      dormantWithoutWitness,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,schema4Proof,&failure));
+  auto schema4Master=schema4Witness;
+  auto& schema4Update=schema4Master.masterAuthority.runtimeState.updateSelf;
+  schema4Update.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForBundleEchos);
+  schema4Update.expectedEchos=2; schema4Update.bundleEchos=2; schema4Update.bundleEchoPeerKeys={1,3};
+  schema4Update.bundleBlob=schema4Blob; schema4Update.workerExpectedBundleSHA256=schema4InterruptedSHA;
+  schema4Update.workerFailure.clear();
+  for (auto& witness:schema4Update.machineRecoveryWitnesses) witness.bundleRegistered=witness.machineUUID==3;
+  auto schema4Prepared=schema4Master;
+  assert(mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      schema4Prepared,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,&failure,&schema4Proof));
+  auto schema4UnexpectedFailure=schema4Master;
+  schema4UnexpectedFailure.masterAuthority.runtimeState.updateSelf.workerFailure="unrelated failure"_ctv;
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      schema4UnexpectedFailure,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,&failure,&schema4Proof));
+  // Exercise the exact framed local preparation path too: the proof and its
+  // witnesses are request-digest sealed before the private snapshot is opened.
+  const auto schema4Root=root/"schema-four"; std::filesystem::create_directories(schema4Root);
+  const auto schema4State=(schema4Root/"state.new10").string(), schema4RequestPath=(schema4Root/"request").string();
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(schema4State)); assert(store.saveBrainSnapshot(schema4Master,&failure)); }
+  std::filesystem::create_directories(schema4State+".secrets");
+  Request schema4FileRequest=schema4Request; schema4FileRequest.interruptedBundleSHA=schema4InterruptedSHA;
+  schema4FileRequest.mixedSuccessorMachineUUIDs=oneSuccessor;
+  MothershipTidesMigration::Plan schema4Plan={}; schema4Plan.schemaVersion=4;
+  schema4Plan.sealedCanonicalContainerCount=24; schema4Plan.staleCoordinatorCanonicalContainerCount=23; schema4Plan.sealedInterruptedExpectedEchos=2;
+  schema4Plan.staleExcludedContainerUUID=schema4Proof.staleExcludedContainerUUID;
+  const String schema4Bytes=encodeRequest(schema4FileRequest,schema4Plan);
+  Request schema4Decoded={}; MothershipRetainedRecoveryMixedProof schema4DecodedProof={};
+  assert(schema4Bytes.size()>4 && decodeRequest(MothershipTidesMigration::str(schema4Bytes),schema4Decoded,&schema4DecodedProof));
+  assert(schema4Decoded.clusterUUID==schema4FileRequest.clusterUUID &&
+         schema4Decoded.bundleSHA==schema4FileRequest.bundleSHA &&
+         schema4Decoded.interruptedBundleSHA==schema4InterruptedSHA &&
+         schema4Decoded.mixedSuccessorMachineUUIDs==oneSuccessor &&
+         schema4DecodedProof.canonicalContainerCount==schema4Proof.canonicalContainerCount &&
+         schema4DecodedProof.staleCoordinatorCanonicalContainerCount==schema4Proof.staleCoordinatorCanonicalContainerCount &&
+         schema4DecodedProof.interruptedExpectedEchos==schema4Proof.interruptedExpectedEchos &&
+         schema4DecodedProof.staleExcludedContainerUUID==schema4Proof.staleExcludedContainerUUID);
+  MothershipTidesMigration::durable(schema4RequestPath,schema4Bytes);
+  WitnessSet schema4Sealed={}; schema4Sealed.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(schema4RequestPath));
+  schema4Sealed.witnesses=schema4Prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  BitseryEngine::serialize(bytes,schema4Sealed); MothershipTidesMigration::durable(schema4RequestPath+".witnesses",bytes);
+  const bool schema4LocalPrepared=prepareLocal(
+      schema4RequestPath.c_str(),schema4State.c_str(),false,&failure,previousBundleSHA);
+  if (!schema4LocalPrepared)
+    std::fprintf(stderr,"schema-four local preparation: %s\n",failure.c_str());
+  assert(schema4LocalPrepared);
+  auto activeHandoff=schema4Master;
+  activeHandoff.masterAuthority.runtimeState.updateSelf.state=uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots);
+  assert(!mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+      activeHandoff,schema4Request.plans,schema4Request.machines,request.bundleSHA,
+      previousBundleSHA,schema4InterruptedSHA,oneSuccessor,&failure,&schema4Proof));
+  auto staleWizard=schema4Witness;
+  auto& staleUpdate=staleWizard.masterAuthority.runtimeState.updateSelf;
+  staleUpdate={}; staleUpdate.workerExpectedBundleSHA256=previousBundleSHA;
+  staleUpdate.workerFailure="local post-exec bundle digest mismatch"_ctv;
+  staleUpdate.machineRecoveryWitnesses=schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  staleUpdate.machineRecoveryWitnesses[0].containerBootstraps.pop_back();
+  for (auto& witness:staleUpdate.machineRecoveryWitnesses) witness.bundleRegistered=false;
+  assert(mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(staleWizard,previousBundleSHA,schema4Proof,schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
+  auto staleWrongDigest=staleWizard;
+  staleWrongDigest.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256=schema4InterruptedSHA;
+  assert(!mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(staleWrongDigest,previousBundleSHA,schema4Proof,schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
+  auto staleUnknown=staleWizard;
+  staleUnknown.masterAuthority.runtimeState.updateSelf.workerMachineUUIDs.push_back(1);
+  assert(!mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(staleUnknown,previousBundleSHA,schema4Proof,schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
+  auto staleChanged=staleWizard;
+  staleChanged.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].bundleRegistered=true;
+  assert(!mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(staleChanged,previousBundleSHA,schema4Proof,schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
+  auto staleCrossMachine=staleWizard;
+  auto moved=staleCrossMachine.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps.back();
+  staleCrossMachine.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps.pop_back();
+  staleCrossMachine.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[1].containerBootstraps.push_back(std::move(moved));
+  assert(!mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(staleCrossMachine,previousBundleSHA,schema4Proof,schema4Witness.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses));
 
   auto mixedCoordinator=snapshot;
   auto& mixedUpdate=mixedCoordinator.masterAuthority.runtimeState.updateSelf;

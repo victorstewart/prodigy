@@ -213,6 +213,14 @@ public:
     return true;
   }
 
+  // The Neuron computes this from the installed bundle in its ArtifactIO
+  // worker before it registers with Brain.  Consumers may only observe the
+  // ready cached attestation; they must never trigger filesystem work here.
+  virtual const String *readyInstalledBundleDigest(void) const
+  {
+    return nullptr;
+  }
+
   // A base-only Neuron implementation cannot prove that its live containers
   // have no control operations.  Block bundle exec until it has none.
   virtual bool quiesceContainerControlSocketsForBundleExec(void)

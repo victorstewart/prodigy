@@ -5,6 +5,7 @@
 // responsible for fencing, atomic swaps, and activation.
 #include <algorithm>
 #include <limits>
+#include <map>
 
 #include <prodigy/persistent.state.h>
 #include <prodigy/retained.container.recovery.h>
@@ -49,6 +50,25 @@ static inline bool mothershipRetainedRecoveryEnvelopeMatches(
   envelope.workerExpectedBundleSHA256 = bundleSHA256;
   envelope.machineRecoveryWitnesses = update.machineRecoveryWitnesses;
   return update == envelope;
+}
+
+struct MothershipRetainedRecoveryMixedProof {
+  uint32_t canonicalContainerCount = 0;
+  uint32_t staleCoordinatorCanonicalContainerCount = 0;
+  uint32_t interruptedExpectedEchos = 0;
+  uint128_t staleExcludedContainerUUID = 0;
+  bool validFor(const ProdigyPersistentBrainSnapshot& snapshot) const {
+    return canonicalContainerCount > staleCoordinatorCanonicalContainerCount &&
+        canonicalContainerCount <= 256 && staleCoordinatorCanonicalContainerCount > 0 &&
+        interruptedExpectedEchos > 0 && interruptedExpectedEchos < snapshot.topology.machines.size() &&
+        staleExcludedContainerUUID != 0;
+  }
+};
+
+static inline uint32_t mothershipRetainedRecoveryWitnessContainerCount(
+    const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& witnesses)
+{
+  uint32_t count=0; for (const auto& witness:witnesses) count+=witness.containerBootstraps.size(); return count;
 }
 
 static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
@@ -164,19 +184,23 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
 }
 
 // A successor can retain either the exact interrupted recovery envelope, or
-// a later pre-exec echo collection retaining the known earlier digest
-// failure. Both forms must still reconstruct every retained container from
-// the sealed inventory before the generic updater guard is reused.
+// a later pre-exec echo collection. Schema four also admits the captured
+// clean v13 echo collector; legacy recovery still requires the known digest
+// failure. Both forms reconstruct every retained container before the generic
+// updater guard is reused.
 static inline bool mothershipRetainedRecoveryCanReplaceMixedInterruptedUpdate(
     const ProdigyPersistentBrainSnapshot& snapshot, const String& expectedBundleSHA256,
     const String& previousBundleSHA256, const String& interruptedBundleSHA256,
     const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& expectedWitnesses,
-    const Vector<uint128_t>& successorMachineUUIDs)
+    const Vector<uint128_t>& successorMachineUUIDs, const MothershipRetainedRecoveryMixedProof *proof = nullptr)
 {
-  if (!prodigyIsSHA256HexDigest(interruptedBundleSHA256) || successorMachineUUIDs.size() != 2 ||
-      successorMachineUUIDs[0] == 0 || successorMachineUUIDs[1] == 0 ||
-      successorMachineUUIDs[0] >= successorMachineUUIDs[1]) return false;
+  if (!prodigyIsSHA256HexDigest(interruptedBundleSHA256) || successorMachineUUIDs.empty() ||
+      successorMachineUUIDs.size() >= snapshot.topology.machines.size() || successorMachineUUIDs[0] == 0 ||
+      (proof ? (!proof->validFor(snapshot) || successorMachineUUIDs.size()!=1) : successorMachineUUIDs.size()!=2)) return false;
+  for (size_t index=1; index<successorMachineUUIDs.size(); ++index)
+    if (successorMachineUUIDs[index] == 0 || successorMachineUUIDs[index-1] >= successorMachineUUIDs[index]) return false;
   const auto& update=snapshot.masterAuthority.runtimeState.updateSelf;
+  if (proof && mothershipRetainedRecoveryWitnessContainerCount(expectedWitnesses)!=proof->canonicalContainerCount) return false;
   if (mothershipRetainedRecoveryEnvelopeMatches(update,interruptedBundleSHA256))
   {
     if (!mothershipRetainedRecoveryMixedWitnessesMatch(
@@ -184,9 +208,10 @@ static inline bool mothershipRetainedRecoveryCanReplaceMixedInterruptedUpdate(
     return mothershipRetainedRecoveryCanReplaceUpdate(
         snapshot,expectedBundleSHA256,interruptedBundleSHA256,interruptedBundleSHA256);
   }
-  if (update.expectedEchos != successorMachineUUIDs.size() || update.bundleEchos != update.expectedEchos ||
+  if (update.expectedEchos != (proof ? proof->interruptedExpectedEchos : successorMachineUUIDs.size()) || update.bundleEchos != update.expectedEchos ||
       update.workerExpectedBundleSHA256 != interruptedBundleSHA256 ||
-      update.workerFailure != "local post-exec bundle digest mismatch"_ctv ||
+      (proof ? !(update.workerFailure.empty() || update.workerFailure == "local post-exec bundle digest mismatch"_ctv)
+             : update.workerFailure != "local post-exec bundle digest mismatch"_ctv) ||
       !mothershipRetainedRecoveryMixedWitnessesMatch(
           update.machineRecoveryWitnesses,expectedWitnesses,successorMachineUUIDs,true)) return false;
   auto comparable=snapshot;
@@ -206,12 +231,11 @@ static inline bool mothershipRetainedRecoveryCanReplaceMixedInterruptedUpdate(
 static inline bool mothershipRetainedRecoveryCanReplaceMixedHandoff(
     const ProdigyPersistentBrainSnapshot& snapshot, const String& interruptedBundleSHA256,
     const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& expectedWitnesses,
-    const Vector<uint128_t>& successorMachineUUIDs)
+    const Vector<uint128_t>& successorMachineUUIDs, const MothershipRetainedRecoveryMixedProof *proof = nullptr)
 {
   const auto& update = snapshot.masterAuthority.runtimeState.updateSelf;
   if (!prodigyIsSHA256HexDigest(interruptedBundleSHA256) ||
-      successorMachineUUIDs.size() != 2 || successorMachineUUIDs[0] == 0 ||
-      successorMachineUUIDs[1] == 0 || successorMachineUUIDs[0] >= successorMachineUUIDs[1] ||
+      (proof != nullptr || successorMachineUUIDs.size() != 2) || successorMachineUUIDs[0] == 0 ||
       update.state != uint8_t(ProdigyPersistentUpdateSelfState::Phase::waitingForFollowerReboots) ||
       update.expectedEchos != successorMachineUUIDs.size() ||
       update.bundleEchos != update.expectedEchos || update.relinquishEchos != 0 ||
@@ -232,7 +256,7 @@ static inline bool mothershipRetainedRecoveryCanReplaceMixedHandoff(
   }
   for (size_t index = 0; index < successorMachineUUIDs.size(); ++index)
   {
-    if (successorMachineUUIDs[index] == 0 ||
+    if (successorMachineUUIDs[index] == 0 || (index && successorMachineUUIDs[index-1] >= successorMachineUUIDs[index]) ||
         update.followerBootNsByPeerKey[index].peerKey != successorMachineUUIDs[index] ||
         update.followerBootNsByPeerKey[index].bootNs <= 0)
       return false;
@@ -365,6 +389,77 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   return true;
 }
 
+// A superseded coordinator may have failed locally before it issued any
+// work. This narrow schema-four proof accepts only its sealed older witness;
+// it cannot admit a handoff, a running worker, or an unknown failure.
+static inline bool mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(
+    const ProdigyPersistentBrainSnapshot& snapshot, const String& interruptedBundleSHA256,
+    const MothershipRetainedRecoveryMixedProof& proof,
+    const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& currentWitnesses)
+{
+  if (!proof.validFor(snapshot) || !prodigyIsSHA256HexDigest(interruptedBundleSHA256)) return false;
+  const auto& update=snapshot.masterAuthority.runtimeState.updateSelf;
+  if (update.state != 0 || update.expectedEchos != 0 || update.bundleEchos != 0 ||
+      update.relinquishEchos != 0 || update.plannedMasterPeerKey != 0 ||
+      update.pendingDesignatedMasterPeerKey != 0 || update.useStagedBundleOnly ||
+      !update.bundleBlob.empty() || update.workerExpectedBundleSHA256 != interruptedBundleSHA256 ||
+      update.workerFailure != "local post-exec bundle digest mismatch"_ctv ||
+      !update.bundleEchoPeerKeys.empty() || !update.relinquishEchoPeerKeys.empty() ||
+      !update.followerBootNsByPeerKey.empty() || !update.followerRebootedPeerKeys.empty() ||
+      !update.workerMachineUUIDs.empty() || !update.workerStagedMachineUUIDs.empty() ||
+      !update.workerTransitionIssuedMachineUUIDs.empty() || !update.workerRebootedMachineUUIDs.empty() ||
+      !update.workerStateUploadedMachineUUIDs.empty() || update.localMachineUUID != 0 ||
+      update.localBundleRegistered || !update.localContainerBootstraps.empty() ||
+      update.machineRecoveryWitnesses.size()!=snapshot.topology.machines.size()) return false;
+  if (mothershipRetainedRecoveryWitnessContainerCount(currentWitnesses)!=proof.canonicalContainerCount) return false;
+  struct BoundBootstrap { uint128_t machineUUID=0; NeuronContainerBootstrap bootstrap; };
+  std::map<uint128_t,BoundBootstrap> current;
+  for (const auto& witness:currentWitnesses) for (const auto& bytes:witness.containerBootstraps) {
+    NeuronContainerBootstrap bootstrap={}; if(!BitseryEngine::deserializeSafe(bytes,bootstrap) ||
+        !current.emplace(bootstrap.plan.uuid,BoundBootstrap{witness.machineUUID,std::move(bootstrap)}).second) return false;
+  }
+  if (!current.contains(proof.staleExcludedContainerUUID)) return false;
+  uint32_t containers=0; bytell_hash_set<uint128_t> machines, seen;
+  for (const auto& witness:update.machineRecoveryWitnesses) {
+    if (witness.machineUUID==0 || witness.bundleRegistered || !machines.insert(witness.machineUUID).second) return false;
+    bool known=false; for (const auto& machine:snapshot.topology.machines) known |= machine.uuid==witness.machineUUID;
+    if (!known) return false;
+    for (const auto& bytes:witness.containerBootstraps) {
+      NeuronContainerBootstrap observed={}; if(!BitseryEngine::deserializeSafe(bytes,observed) ||
+          observed.plan.uuid==proof.staleExcludedContainerUUID || !seen.insert(observed.plan.uuid).second) return false;
+      const auto found=current.find(observed.plan.uuid); if(found==current.end()) return false;
+      if (found->second.machineUUID!=witness.machineUUID) return false;
+      auto expected=found->second.bootstrap; expected.plan.createdAtMs=observed.plan.createdAtMs;
+      if(!prodigyPersistentRetainedBootstrapEqual(observed,expected)) return false;
+      ++containers;
+    }
+  }
+  return containers==proof.staleCoordinatorCanonicalContainerCount;
+}
+
+// The designated schema-four seed can be a clean v13 coordinator with its
+// sealed, unregistered witnesses but before it requested echoes. Its nonempty
+// expected digest is retained state, so admit it only with every progress,
+// local, and payload field still empty.
+static inline bool mothershipRetainedRecoveryCanReplaceMixedDormantCoordinator(
+    const ProdigyPersistentBrainSnapshot& snapshot, const String& interruptedBundleSHA256,
+    const MothershipRetainedRecoveryMixedProof& proof,
+    const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& currentWitnesses)
+{
+  if (!proof.validFor(snapshot) || !prodigyIsSHA256HexDigest(interruptedBundleSHA256)) return false;
+  const auto& update=snapshot.masterAuthority.runtimeState.updateSelf;
+  return update.state==0 && update.expectedEchos==0 && update.bundleEchos==0 && update.relinquishEchos==0 &&
+      update.plannedMasterPeerKey==0 && update.pendingDesignatedMasterPeerKey==0 && !update.useStagedBundleOnly &&
+      update.bundleBlob.empty() && update.workerExpectedBundleSHA256==interruptedBundleSHA256 && update.workerFailure.empty() &&
+      update.bundleEchoPeerKeys.empty() && update.relinquishEchoPeerKeys.empty() && update.followerBootNsByPeerKey.empty() &&
+      update.followerRebootedPeerKeys.empty() && update.workerMachineUUIDs.empty() && update.workerStagedMachineUUIDs.empty() &&
+      update.workerTransitionIssuedMachineUUIDs.empty() && update.workerRebootedMachineUUIDs.empty() &&
+      update.workerStateUploadedMachineUUIDs.empty() && update.localMachineUUID==0 && !update.localBundleRegistered &&
+      update.localContainerBootstraps.empty() &&
+      mothershipRetainedRecoveryWitnessContainerCount(currentWitnesses)==proof.canonicalContainerCount &&
+      mothershipRetainedRecoveryMixedWitnessesMatch(update.machineRecoveryWitnesses,currentWitnesses,{},false);
+}
+
 // The command owner invokes this only for its explicitly declared old-runtime
 // coordinator after every private paired copy has been fenced.  Build the
 // expected interrupted witness from the same sealed request before admitting a
@@ -376,7 +471,7 @@ static inline bool mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
     const Vector<MothershipRetainedRecoveryMachineInput>& machines,
     const String& expectedBundleSHA256, const String& previousBundleSHA256,
     const String& interruptedBundleSHA256, const Vector<uint128_t>& successorMachineUUIDs,
-    String *failure = nullptr)
+    String *failure = nullptr, const MothershipRetainedRecoveryMixedProof *proof = nullptr)
 {
   if (failure) failure->clear();
   ProdigyPersistentBrainSnapshot witnessSnapshot = snapshot;
@@ -398,7 +493,7 @@ static inline bool mothershipPrepareRetainedRecoveryMixedHandoffSnapshot(
       !mothershipRetainedRecoveryCanReplaceMixedHandoff(
           snapshot, interruptedBundleSHA256,
           witnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
-          successorMachineUUIDs))
+          successorMachineUUIDs,proof))
   {
     if (failure) failure->assign("retained recovery refuses an unproven mixed handoff"_ctv);
     return false;
@@ -415,7 +510,7 @@ static inline bool mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
     const Vector<MothershipRetainedRecoveryMachineInput>& machines,
     const String& expectedBundleSHA256, const String& previousBundleSHA256,
     const String& interruptedBundleSHA256, const Vector<uint128_t>& successorMachineUUIDs,
-    String *failure = nullptr)
+    String *failure = nullptr, const MothershipRetainedRecoveryMixedProof *proof = nullptr)
 {
   if (failure) failure->clear();
   auto witnessSnapshot=snapshot;
@@ -430,7 +525,7 @@ static inline bool mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
   if (!mothershipRetainedRecoveryCanReplaceMixedInterruptedUpdate(
           snapshot,expectedBundleSHA256,previousBundleSHA256,interruptedBundleSHA256,
           witnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
-          successorMachineUUIDs))
+          successorMachineUUIDs,proof))
   {
     if (failure) failure->assign("retained recovery refuses an unproven mixed interrupted update"_ctv);
     return false;
@@ -439,6 +534,44 @@ static inline bool mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
   return mothershipPrepareRetainedRecoverySnapshot(snapshot,approvedPlans,machines,
                                                    expectedBundleSHA256,failure,
                                                    previousBundleSHA256,interruptedBundleSHA256);
+}
+
+// Schema four has three explicitly sealed coordinator forms: the 24-container
+// v13 echo collector, the dormant v13 seed with unregistered witnesses, and
+// the obsolete inert 23-container v12 witness. All normalize into the same
+// new recovery envelope before any state write.
+static inline bool mothershipPrepareRetainedRecoverySchema4Snapshot(
+    ProdigyPersistentBrainSnapshot& snapshot,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
+    const Vector<MothershipRetainedRecoveryMachineInput>& machines,
+    const String& expectedBundleSHA256, const String& previousBundleSHA256,
+    const String& interruptedBundleSHA256, const Vector<uint128_t>& successorMachineUUIDs,
+    const MothershipRetainedRecoveryMixedProof& proof, String *failure = nullptr)
+{
+  if (mothershipPrepareRetainedRecoveryMixedInterruptedSnapshot(
+          snapshot,approvedPlans,machines,expectedBundleSHA256,previousBundleSHA256,
+          interruptedBundleSHA256,successorMachineUUIDs,failure,&proof)) return true;
+  auto current=snapshot; current.masterAuthority.runtimeState.updateSelf={}; String why;
+  if (!mothershipPrepareRetainedRecoverySnapshot(current,approvedPlans,machines,expectedBundleSHA256,&why)) {
+    if (failure) failure->assign(why); return false;
+  }
+  auto interrupted=current; interrupted.masterAuthority.runtimeState.updateSelf={};
+  if (!mothershipPrepareRetainedRecoverySnapshot(interrupted,approvedPlans,machines,interruptedBundleSHA256,&why)) {
+    if (failure) failure->assign(why); return false;
+  }
+  if (mothershipRetainedRecoveryCanReplaceMixedDormantCoordinator(
+          snapshot,interruptedBundleSHA256,proof,interrupted.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)) {
+    snapshot=current; return true;
+  }
+  if (
+      !mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(
+          snapshot,previousBundleSHA256,proof,current.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)) {
+    if (failure) failure->assign("retained recovery refuses an unproven schema-four coordinator"_ctv);
+    return false;
+  }
+  snapshot.masterAuthority.runtimeState.updateSelf={};
+  return mothershipPrepareRetainedRecoverySnapshot(snapshot,approvedPlans,machines,expectedBundleSHA256,
+                                                   failure,previousBundleSHA256,interruptedBundleSHA256);
 }
 
 // This is intentionally separate from the normal state-store constructor.

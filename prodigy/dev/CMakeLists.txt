@@ -2115,6 +2115,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_container_crash_recovery_unit PROPERTIES TIMEOUT 30)
    add_test(
+      NAME prodigy_completed_witness_supersession_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=completed-witness-supersession
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_completed_witness_supersession_unit PROPERTIES TIMEOUT 30)
+   add_test(
       NAME prodigy_predecessor_cgroup_drain_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CGROUP_DRAIN_ONLY=1
               $<TARGET_FILE:prodigy_deployments_unit>

@@ -1244,6 +1244,12 @@ public:
     iaas = &localIaaS;
   }
 
+  void setInstalledBundleDigestForTest(const String& digest, bool ready = true)
+  {
+    installedBundleDigest.assign(digest);
+    installedBundleDigestReady = ready;
+  }
+
   void pushContainer(Container *container) override
   {
     (void)container;
@@ -26124,6 +26130,154 @@ static void testReplicatedAllMachineBundleRecoveryWitnessIsUUIDIndexed(TestSuite
                "all_machine_bundle_recovery_refuses_partial_persisted_inventory_capture");
 }
 
+static void testCompletedLocalRecoveryWitnessSupersedesNewerAuthority(TestSuite& suite)
+{
+  const String oldDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv;
+  const String newDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+  const uint128_t localUUID = 0x5219a001;
+  const uint128_t remoteUUID = 0x5219a002;
+  NeuronBase *previousNeuron = thisNeuron;
+  TestNeuron localNeuron = {};
+  localNeuron.uuid = localUUID;
+  thisNeuron = &localNeuron;
+
+  auto serializeCapturedBootstrap = [&](uint128_t uuid, uint32_t fragment) {
+    ContainerPlan plan = {};
+    plan.uuid = uuid;
+    plan.fragment = fragment;
+    IPPrefix address = {};
+    address.network.is6 = true;
+    address.cidr = 128;
+    std::memcpy(address.network.v6,
+                container_network_subnet6.value,
+                sizeof(container_network_subnet6.value));
+    address.network.v6[11] = 1;
+    address.network.v6[12] = static_cast<uint8_t>((fragment >> 16) & 0xff);
+    address.network.v6[13] = static_cast<uint8_t>((fragment >> 8) & 0xff);
+    address.network.v6[14] = static_cast<uint8_t>(fragment & 0xff);
+    address.network.v6[15] = static_cast<uint8_t>(fragment);
+    plan.addresses.push_back(address);
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan = std::move(plan);
+    String serialized = {};
+    BitseryEngine::serialize(serialized, bootstrap);
+    return serialized;
+  };
+  auto makeIncoming = [&](uint64_t generation, const String& digest) {
+    ProdigyMasterAuthorityRuntimeState state = {};
+    state.generation = generation;
+    state.nextPendingAddMachinesOperationID = 1;
+    state.nextPendingElasticAddressOperationID = 1;
+    state.nextDNSIntentRevision = 1;
+    state.nextTlsResumptionGeneration = 1;
+    state.updateSelf.workerExpectedBundleSHA256 = digest;
+    uint32_t fragment = 0x521900;
+    for (uint128_t uuid : {localUUID, remoteUUID})
+    {
+      ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+      witness.machineUUID = uuid;
+      witness.containerBootstraps.push_back(serializeCapturedBootstrap(uuid, fragment++));
+      state.updateSelf.machineRecoveryWitnesses.push_back(std::move(witness));
+    }
+    return state;
+  };
+  auto initializeOldWitness = [&](TestBrain& follower) {
+    follower.weAreMaster = false;
+    follower.masterAuthorityRuntimeState = makeIncoming(10, oldDigest);
+    follower.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
+    follower.updateSelfMachineRecoveryWitnesses = follower.masterAuthorityRuntimeState.updateSelf.machineRecoveryWitnesses;
+    follower.updateSelfWorkerFailure.assign("local post-exec bundle digest mismatch"_ctv);
+  };
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    const auto successor = makeIncoming(11, newDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(successor, true) &&
+                     follower.masterAuthorityRuntimeState.generation == successor.generation &&
+                     follower.updateSelfWorkerExpectedBundleSHA256.equals(newDigest) &&
+                     follower.updateSelfMachineRecoveryWitnesses.size() == 2 &&
+                     follower.updateSelfMachineRecoveryWitnesses[0].bundleRegistered == false &&
+                     follower.updateSelfWorkerFailure.empty(),
+                 "completed_local_recovery_witness_yields_to_newer_attested_authority");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    follower.updateSelfState = Brain::UpdateSelfState::waitingForBundleEchos;
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_rejects_active_coordinator");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    localNeuron.setInstalledBundleDigestForTest(newDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_requires_matching_local_installation_attestation");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    localNeuron.setInstalledBundleDigestForTest(oldDigest, false);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_requires_ready_local_installation_attestation");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    follower.updateSelfWorkerExpectedBundleSHA256.assign("not-a-sha256-digest"_ctv);
+    localNeuron.setInstalledBundleDigestForTest("not-a-sha256-digest"_ctv);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_rejects_unknown_old_bundle");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(10, newDigest), true) == false,
+                 "completed_local_recovery_witness_rejects_equal_generation");
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(9, newDigest), true) == false,
+                 "completed_local_recovery_witness_rejects_older_generation");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    follower.updateSelfWorkerFailure.assign("different active recovery failure"_ctv);
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_rejects_unrelated_active_failure");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    follower.updateSelfMachineRecoveryWitnesses.erase(follower.updateSelfMachineRecoveryWitnesses.begin());
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(makeIncoming(11, newDigest), true) == false,
+                 "completed_local_recovery_witness_requires_local_witness");
+  }
+
+  {
+    TestBrain follower = {};
+    initializeOldWitness(follower);
+    auto successor = makeIncoming(11, newDigest);
+    successor.updateSelf.machineRecoveryWitnesses.erase(successor.updateSelf.machineRecoveryWitnesses.begin());
+    localNeuron.setInstalledBundleDigestForTest(oldDigest);
+    suite.expect(follower.applyReplicatedMasterAuthorityRuntimeState(successor, true) == false,
+                 "completed_local_recovery_witness_requires_incoming_local_witness");
+  }
+
+  thisNeuron = previousNeuron;
+}
+
 static void testReplicatedLocalBundleRecoveryWitnessIsDurableAndBounded(TestSuite& suite)
 {
   TestBrain successor = {};
@@ -29144,6 +29298,12 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "completed-witness-supersession") == 0)
+  {
+    testCompletedLocalRecoveryWitnessSupersedesNewerAuthority(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "crash-recovery") == 0)
   {
     testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
@@ -29488,6 +29648,7 @@ int main(void)
   testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
   testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
+  testCompletedLocalRecoveryWitnessSupersedesNewerAuthority(suite);
   testAdoptedMachineRackUpdates(suite);
   testResumePendingAddMachinesOperations(suite);
   testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);

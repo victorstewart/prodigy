@@ -2973,6 +2973,11 @@ protected:
 
 public:
 
+  const String *readyInstalledBundleDigest(void) const override
+  {
+    return installedBundleDigestReady ? &installedBundleDigest : nullptr;
+  }
+
   bool isBrain;
   TCPSocket brainListener;
   NeuronBrainControlStream *brain = nullptr;

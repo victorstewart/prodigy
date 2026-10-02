@@ -2245,6 +2245,58 @@ public:
            state.workerStateUploadedMachineUUIDs.empty() == false;
   }
 
+  // A follower may retain a completed prior all-machine record after a
+  // bundle restart.  Only its own Neuron's already-computed installation
+  // attestation can retire that record in favor of a newer authority.  The
+  // normal registration owner computes this digest off the Ring thread.
+  bool completedLocalRecoveryWitnessMayYieldToNewerAuthority(
+      const ProdigyPersistentUpdateSelfState& local,
+      const ProdigyPersistentUpdateSelfState& incomingWitness,
+      uint64_t incomingGeneration) const
+  {
+    if (weAreMaster || incomingGeneration <= masterAuthorityRuntimeState.generation ||
+        local.machineRecoveryWitnesses.empty() || incomingWitness.machineRecoveryWitnesses.empty() ||
+        prodigyIsSHA256HexDigest(local.workerExpectedBundleSHA256) == false ||
+        prodigyIsSHA256HexDigest(incomingWitness.workerExpectedBundleSHA256) == false ||
+        thisNeuron == nullptr)
+    {
+      return false;
+    }
+
+    const String *installedDigest = thisNeuron->readyInstalledBundleDigest();
+    const uint128_t localUUID = selfBrainUUID();
+    if (installedDigest == nullptr || installedDigest->equals(local.workerExpectedBundleSHA256) == false ||
+        localUUID == 0)
+    {
+      return false;
+    }
+
+    const bool localWitnessPresent = std::any_of(
+        local.machineRecoveryWitnesses.begin(), local.machineRecoveryWitnesses.end(),
+        [localUUID](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) {
+          return witness.machineUUID == localUUID;
+        });
+    const bool incomingWitnessPresent = std::any_of(
+        incomingWitness.machineRecoveryWitnesses.begin(), incomingWitness.machineRecoveryWitnesses.end(),
+        [localUUID](const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness) {
+          return witness.machineUUID == localUUID;
+        });
+    if (localWitnessPresent == false || incomingWitnessPresent == false)
+    {
+      return false;
+    }
+
+    ProdigyPersistentUpdateSelfState completed = local;
+    // This diagnostic is recorded by the registration owner when a different
+    // machine reports another bundle.  It is not local work once this
+    // follower's cached installed-bundle attestation matches the old witness.
+    if (completed.workerFailure == "local post-exec bundle digest mismatch"_ctv)
+    {
+      completed.workerFailure.clear();
+    }
+    return updateSelfCoordinatorActiveBeyondRecoveryWitness(completed) == false;
+  }
+
   static bool updateSelfCoordinatorIsRelinquishedMasterCandidate(
       const ProdigyPersistentUpdateSelfState& state)
   {
@@ -7001,11 +7053,22 @@ public:
     const bool localHasAllMachineWitness = localRecoveryWitness.machineRecoveryWitnesses.empty() == false;
     const bool incomingHasLegacyWitness = incomingRecoveryWitness.localMachineUUID != 0;
     const bool localHasLegacyWitness = localRecoveryWitness.localMachineUUID != 0;
-    if ((incomingHasAllMachineWitness || incomingHasLegacyWitness) &&
+    const bool recoveryWitnessMismatch =
+        (incomingHasAllMachineWitness || incomingHasLegacyWitness) &&
         (localHasAllMachineWitness || localHasLegacyWitness) &&
-        updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness) == false)
+        updateSelfRecoveryWitnessMatches(incomingRecoveryWitness, localRecoveryWitness) == false;
+    const bool completedLocalWitnessSuperseded = recoveryWitnessMismatch &&
+        completedLocalRecoveryWitnessMayYieldToNewerAuthority(
+            localUpdateCoordinator, incomingRecoveryWitness, incoming.generation);
+    if (recoveryWitnessMismatch && completedLocalWitnessSuperseded == false)
     {
       return false;
+    }
+    if (completedLocalWitnessSuperseded)
+    {
+      // The narrow predicate above proves this was the stale diagnostic from
+      // another machine's registration, not a local in-flight operation.
+      localUpdateCoordinator.workerFailure.clear();
     }
 
     if (incomingHasAllMachineWitness)
