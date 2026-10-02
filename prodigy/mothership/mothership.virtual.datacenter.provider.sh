@@ -23,11 +23,11 @@ run_machine()
    local workspace="$1"
    local machine_root="$2"
    local containers_root="$3"
-   local shared_transport_tls="$4"
-   local storage_root="$5"
-   local storage_device_count="$6"
-   local child_ns="$7"
-   local boot_path="$8"
+   local storage_root="$4"
+   local storage_device_count="$5"
+   local child_ns="$6"
+   local boot_path="$7"
+   local transport_tls_path="$8"
    local host_netns_inode="$9"
    local brain_count="${10}"
    local fake_ingress="${11}"
@@ -37,9 +37,8 @@ run_machine()
    mount --bind "${machine_root}/var/log/prodigy" /var/log/prodigy
    mount --bind "${machine_root}/root" /root
    mount --bind "${containers_root}" /containers
-   mkdir -p "${workspace}" /containers/store "${shared_transport_tls}" /containers/store/prodigy-transport-tls
+   mkdir -p "${workspace}" /containers/store
    mount --bind /mnt/prodigy-vdc-workspace "${workspace}"
-   mount --bind "${shared_transport_tls}" /containers/store/prodigy-transport-tls
 
    local storage_mounts=""
    local device=""
@@ -59,7 +58,6 @@ run_machine()
       "PRODIGY_DEV_TEST_OVERCOMMIT_CPUS=1"
       "PRODIGY_HOST_NETNS_INO=${host_netns_inode}"
       "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brain_count}"
-      "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls"
       "PRODIGY_CRASH_REPORT_PATH=/root/prodigy-crashreport.txt"
       "PRODIGY_STATE_DB=/containers/prodigy.state"
    )
@@ -86,7 +84,7 @@ run_machine()
       umount /sys/fs/bpf >/dev/null 2>&1 || true
       mount -t bpf bpf /sys/fs/bpf
       exec "$@"
-   ' _ /root/prodigy/prodigy --isolated --netdev=bond0 "--boot-json=${boot_json}"
+   ' _ /root/prodigy/prodigy --isolated --netdev=bond0 "--boot-json=${boot_json}" "--transport-tls-json-path=${transport_tls_path}"
 }
 
 bounded_machine_log()
@@ -749,8 +747,9 @@ cgroup_scope=""
 cgroup_control=""
 cgroup_lock=""
 cgroup_root=""
-shared_transport_tls="${filesystem_root}/shared-transport-tls"
 provisioned_path="${workspace}/virtual-datacenter.provisioned"
+members_provisioned_path="${workspace}/virtual-datacenter.members-provisioned"
+seed_runtime_path="${workspace}/virtual-datacenter.seed-runtime"
 ready_path="${workspace}/virtual-datacenter.ready"
 runtime_path="${workspace}/virtual-datacenter.runtime"
 pid_path="${workspace}/virtual-datacenter.pid"
@@ -850,7 +849,7 @@ cleanup()
    [[ ! -e "${cgroup_root}/cgroup.kill" ]] || printf '1\n' > "${cgroup_root}/cgroup.kill" 2>/dev/null || true
    find "${cgroup_root}" -depth -type d -exec rmdir {} \; >/dev/null 2>&1 || true
    restore_cgroup_scope_if_idle
-   rm -f "${ready_path}" "${runtime_path}" >/dev/null 2>&1 || true
+   rm -f "${ready_path}" "${seed_runtime_path}" "${runtime_path}" >/dev/null 2>&1 || true
    rm -f -- "${control_socket_path}" >/dev/null 2>&1 || true
    rmdir -- "${control_socket_path%/*}" >/dev/null 2>&1 || true
    exit "${status}"
@@ -872,16 +871,16 @@ trap 'exit 143' TERM
 
 if [[ "${adopted_mode}" -eq 0 ]]
 then
-mkdir -p "${workspace}/boot" "${filesystem_root}"
+mkdir -p "${workspace}/boot" "${workspace}/transport-tls" "${filesystem_root}"
 install -d -m 0700 "${control_socket_path%/*}"
-rm -f "${provisioned_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
+rm -f "${provisioned_path}" "${members_provisioned_path}" "${seed_runtime_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
 filesystem_size_bytes=$(( (machine_storage_mb * machine_count + 4096) * 1048576 ))
 machine_memory_bytes=$(( machine_memory_mb * 1048576 ))
 machine_storage_bytes=$(( machine_storage_mb * 1048576 ))
 truncate -s "${filesystem_size_bytes}" "${filesystem_image}"
 mkfs.btrfs -f "${filesystem_image}" >/dev/null
 mount -o loop "${filesystem_image}" "${filesystem_root}"
-mkdir -p "${shared_transport_tls}" "${filesystem_root}/machines"
+mkdir -p "${filesystem_root}/machines"
 btrfs quota enable "${filesystem_root}"
 
 prepare_cgroup_scope
@@ -1047,17 +1046,18 @@ start_machine()
    local storage_root="${filesystem_root}/storage/${index}"
    local machine_cgroup="${cgroup_root}/machine${index}"
    local boot_path="${workspace}/boot/${index}.json"
+   local transport_tls_path="${workspace}/transport-tls/${index}.json"
    local log_path="${workspace}/machine${index}.log"
    local fake_ingress=""
    [[ "${fake_boundary}" != "1" ]] || fake_ingress="/root/prodigy/host.ingress.router.dev.ebpf.o"
-   [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" ]]
+   [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" && -r "${transport_tls_path}" ]]
 
    local -a enter_arguments=( "${machine_cgroup}" )
    if [[ "${index}" -eq "${recovering_machine}" && -n "${PRODIGY_VDC_RECOVERY_CGROUP_FD:-}" ]]
    then
       enter_arguments+=( "${PRODIGY_VDC_RECOVERY_CGROUP_FD}" )
    fi
-   enter_arguments+=( "${workspace}" "${machine_root}" "${containers_root}" "${shared_transport_tls}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" )
+   enter_arguments+=( "${workspace}" "${machine_root}" "${containers_root}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${transport_tls_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" )
    setsid bash "$0" --enter-machine "${enter_arguments[@]}" \
       > >(bash "$0" --bounded-log "${log_path}" 2 67108864 4194304) 2>&1 &
    machine_pids[$((index - 1))]="$!"
@@ -1184,13 +1184,31 @@ handle_machine_exit()
    publish_runtime
 }
 
+start_initial_runtime()
+{
+   # Mothership publishes canonical seed material first.  Followers are not
+   # allowed to create an unowned identity while the seed is being configured.
+   start_machine 1
+   printf '%s\n' "${machine_pids[0]}" > "${seed_runtime_path}.${pid}.tmp"
+   mv -f "${seed_runtime_path}.${pid}.tmp" "${seed_runtime_path}"
+   if [[ "${machine_count}" -gt 1 ]]
+   then
+      while [[ ! -r "${members_provisioned_path}" ]]
+      do
+         sleep 0.05
+      done
+      [[ "$(<"${members_provisioned_path}")" == "members" ]]
+      for index in $(seq 2 "${machine_count}")
+      do
+         start_machine "${index}"
+         sleep 0.25
+      done
+   fi
+}
+
 if [[ "${adopted_mode}" -eq 0 ]]
 then
-   for index in $(seq 1 "${machine_count}")
-   do
-      start_machine "${index}"
-      sleep 0.25
-   done
+   start_initial_runtime
 else
    # Retained cgroup membership and the runtime receipt are the adoption source
    # of truth: application processes may have been reparented after worker exit.

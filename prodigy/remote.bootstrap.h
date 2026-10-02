@@ -1482,6 +1482,62 @@ static inline bool prodigyRemoteBootstrapShouldAwaitControlSocket(const ClusterM
   return bootState.bootstrapConfig.bootstrapPeers.empty();
 }
 
+// The identity, topology, and transport credentials are the portable part of
+// remote bootstrap.  Keep them in one builder so a typed provider can install
+// the exact same first-boot state without impersonating the SSH executor.
+static inline bool prodigyBuildRemoteBootstrapBootMaterial(
+    const ClusterMachine& clusterMachine,
+    const AddMachines& request,
+    const ClusterTopology& topology,
+    const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+    String& bootJSON,
+    String& transportTLSJSON,
+    String *failure = nullptr)
+{
+  bootJSON.clear();
+  transportTLSJSON.clear();
+  if (request.controlSocketPath.empty() || request.clusterUUID == 0)
+  {
+    if (failure) failure->assign("addMachines controlSocketPath and clusterUUID required for bootstrap material"_ctv);
+    return false;
+  }
+
+  ProdigyPersistentLocalBrainState localState = {};
+  localState.ownerClusterUUID = request.clusterUUID;
+  ClusterTopology bootTopology = {};
+  if (prodigyBuildRemoteBootstrapTransportTLSState(clusterMachine, topology, localState, bootTopology, failure) == false)
+  {
+    return false;
+  }
+
+  ProdigyPersistentBootState bootState = {};
+  prodigyRenderClusterTopologyBootstrapPeers(clusterMachine, bootTopology, bootState.bootstrapConfig.bootstrapPeers);
+  bootState.bootstrapConfig.nodeRole = clusterMachine.isBrain ? ProdigyBootstrapNodeRole::brain : ProdigyBootstrapNodeRole::neuron;
+  bootState.bootstrapConfig.controlSocketPath = request.controlSocketPath;
+  bootState.bootstrapSshUser = request.bootstrapSshUser;
+  bootState.bootstrapSshKeyPackage = request.bootstrapSshKeyPackage;
+  bootState.bootstrapSshHostKeyPackage = request.bootstrapSshHostKeyPackage;
+  bootState.bootstrapSshPrivateKeyPath = request.bootstrapSshPrivateKeyPath;
+  ProdigyRuntimeEnvironmentConfig effectiveRuntimeEnvironment = runtimeEnvironment;
+  // Bootstrap files can reach a machine before its configured control path is
+  // live. Keep provider credentials and refresh commands out of this durable,
+  // provider-delivered material; configure supplies them after authentication.
+  effectiveRuntimeEnvironment.providerCredentialMaterial.reset();
+  effectiveRuntimeEnvironment.aws.bootstrapCredentialRefreshCommand.reset();
+  effectiveRuntimeEnvironment.aws.bootstrapCredentialRefreshFailureHint.reset();
+  effectiveRuntimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand.reset();
+  effectiveRuntimeEnvironment.gcp.bootstrapAccessTokenRefreshFailureHint.reset();
+  effectiveRuntimeEnvironment.azure.bootstrapAccessTokenRefreshCommand.reset();
+  effectiveRuntimeEnvironment.azure.bootstrapAccessTokenRefreshFailureHint.reset();
+  prodigyApplyInternalRuntimeEnvironmentDefaults(effectiveRuntimeEnvironment);
+  prodigyOwnRuntimeEnvironmentConfig(effectiveRuntimeEnvironment, bootState.runtimeEnvironment);
+  bootState.initialTopology = std::move(bootTopology);
+  renderProdigyPersistentBootStateJSON(bootState, bootJSON);
+  renderProdigyPersistentLocalBrainStateJSON(localState, transportTLSJSON);
+  if (failure) failure->clear();
+  return true;
+}
+
 static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& clusterMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyRemoteBootstrapPlan& plan, String *failure = nullptr)
 {
   plan = {};
@@ -1585,41 +1641,17 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   plan.remoteUnitPath.assign("/etc/systemd/system/prodigy.service"_ctv);
   plan.connectRetryBudgetMs = uint64_t(clusterMachine.source == ClusterMachineSource::created ? Time::minsToMs(10) : Time::minsToMs(2));
 
-  ProdigyPersistentLocalBrainState localState = {};
-  localState.ownerClusterUUID = request.clusterUUID;
-  ClusterTopology bootTopology = {};
-  if (prodigyBuildRemoteBootstrapTransportTLSState(clusterMachine, topology, localState, bootTopology, failure) == false)
+  if (prodigyBuildRemoteBootstrapBootMaterial(clusterMachine, request, topology, runtimeEnvironment,
+                                               plan.bootJSON, plan.transportTLSJSON, failure) == false)
   {
     return false;
   }
 
   ProdigyPersistentBootState bootState = {};
-  prodigyRenderClusterTopologyBootstrapPeers(clusterMachine, bootTopology, bootState.bootstrapConfig.bootstrapPeers);
-  bootState.bootstrapConfig.nodeRole = clusterMachine.isBrain ? ProdigyBootstrapNodeRole::brain : ProdigyBootstrapNodeRole::neuron;
-  bootState.bootstrapConfig.controlSocketPath = request.controlSocketPath;
-  bootState.bootstrapSshUser = request.bootstrapSshUser;
-  bootState.bootstrapSshKeyPackage = request.bootstrapSshKeyPackage;
-  bootState.bootstrapSshHostKeyPackage = request.bootstrapSshHostKeyPackage;
-  bootState.bootstrapSshPrivateKeyPath = request.bootstrapSshPrivateKeyPath;
-  ProdigyRuntimeEnvironmentConfig effectiveRuntimeEnvironment = runtimeEnvironment;
-  // First boot only needs provider identity so the node can derive self metadata.
-  // Hold back provider secrets until the live control socket is reachable and
-  // Mothership can push the full runtime environment over configure.
-  // `clear()` on a view-backed String leaves the old capacity in place, which
-  // can revive the prior length on a later copy. Hard-reset the secret field
-  // before serializing first-boot state.
-  effectiveRuntimeEnvironment.providerCredentialMaterial.reset();
-  effectiveRuntimeEnvironment.aws.bootstrapCredentialRefreshCommand.reset();
-  effectiveRuntimeEnvironment.aws.bootstrapCredentialRefreshFailureHint.reset();
-  effectiveRuntimeEnvironment.gcp.bootstrapAccessTokenRefreshCommand.reset();
-  effectiveRuntimeEnvironment.gcp.bootstrapAccessTokenRefreshFailureHint.reset();
-  effectiveRuntimeEnvironment.azure.bootstrapAccessTokenRefreshCommand.reset();
-  effectiveRuntimeEnvironment.azure.bootstrapAccessTokenRefreshFailureHint.reset();
-  prodigyApplyInternalRuntimeEnvironmentDefaults(effectiveRuntimeEnvironment);
-  prodigyOwnRuntimeEnvironmentConfig(effectiveRuntimeEnvironment, bootState.runtimeEnvironment);
-  bootState.initialTopology = bootTopology;
-  renderProdigyPersistentBootStateJSON(bootState, plan.bootJSON);
-  renderProdigyPersistentLocalBrainStateJSON(localState, plan.transportTLSJSON);
+  if (parseProdigyPersistentBootStateJSON(plan.bootJSON, bootState, failure) == false)
+  {
+    return false;
+  }
 
   prodigyBuildInstallRootPaths(request.remoteProdigyPath, plan.installPaths);
 

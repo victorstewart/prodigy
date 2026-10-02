@@ -7,17 +7,30 @@ set(_launcher "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_test_cluster.sh")
 set(_provider "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh")
 set(_mothership "${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp")
 set(_mothership_cluster_test "${PRODIGY_ROOT}/prodigy/mothership/mothership.cluster.test.h")
+set(_virtual_datacenter "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.h")
 file(READ "${_harness}" _source)
 file(READ "${_launcher}" _launcher_source)
 file(READ "${_provider}" _provider_source)
 file(READ "${_mothership}" _mothership_source)
 file(READ "${_mothership_cluster_test}" _mothership_cluster_test_source)
+file(READ "${_virtual_datacenter}" _virtual_datacenter_source)
 
 file(READ "${PRODIGY_ROOT}/tools/evaluation/session.py" _evaluation_source)
 foreach(_forbidden IN ITEMS "ip netns" "bpftool" "iptables" "mkfs" "mount --" "container exec" "unshare" "os.kill" "tar --zstd")
    string(FIND "${_evaluation_source}" "${_forbidden}" _position)
    if(NOT _position EQUAL -1)
       message(FATAL_ERROR "evaluation client assumes infrastructure ownership: ${_forbidden}")
+   endif()
+endforeach()
+
+foreach(_required IN ITEMS
+   "mothershipProvisionVirtualDatacenterSeed"
+   "mothershipProvisionVirtualDatacenterMembers"
+   "prodigyBuildRemoteBootstrapBootMaterial"
+   "mothershipVirtualDatacenterMembersProvisionedFilename")
+   string(FIND "${_virtual_datacenter_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "Mothership must own canonical virtual-datacenter bootstrap material and phase receipts: ${_required}")
    endif()
 endforeach()
 foreach(_required IN ITEMS [[client.command("createCluster"]] [[client.command("removeCluster"]] [[client.command("reserveApplicationID"]] [[self.command("deploy"]])
@@ -91,12 +104,24 @@ endforeach()
 
 foreach(_required IN ITEMS
    "mount --bind \"\${containers_root}\" /containers"
-   "shared_transport_tls=\"\${filesystem_root}/shared-transport-tls\""
-   "mount --bind \"\${shared_transport_tls}\" /containers/store/prodigy-transport-tls"
-   "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=/containers/store/prodigy-transport-tls")
+   "local transport_tls_path=\"\${workspace}/transport-tls/\${index}.json\""
+   "--transport-tls-json-path=\${transport_tls_path}"
+   "members_provisioned_path=\"\${workspace}/virtual-datacenter.members-provisioned\""
+   "start_machine 1"
+   "while [[ ! -r \"\${members_provisioned_path}\" ]]")
    string(FIND "${_provider_source}" "${_required}" _position)
    if(_position EQUAL -1)
-      message(FATAL_ERROR "virtual datacenter machine-local container-store contract missing: ${_required}")
+      message(FATAL_ERROR "virtual datacenter canonical two-phase bootstrap contract missing: ${_required}")
+   endif()
+endforeach()
+
+foreach(_forbidden IN ITEMS
+   "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR="
+   "shared-transport-tls"
+   "/containers/store/prodigy-transport-tls")
+   string(FIND "${_provider_source}" "${_forbidden}" _position)
+   if(NOT _position EQUAL -1)
+      message(FATAL_ERROR "virtual datacenter must receive Mothership-issued transport TLS material, not shared development TLS: ${_forbidden}")
    endif()
 endforeach()
 

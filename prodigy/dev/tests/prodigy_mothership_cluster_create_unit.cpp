@@ -282,6 +282,10 @@ public:
   uint32_t createSeedCalls = 0;
   uint32_t remoteBootstrapCalls = 0;
   uint32_t configureCalls = 0;
+  uint32_t addTestMembersCalls = 0;
+  bool testMemberAdmissionSawConfiguredSeed = false;
+  bool testMemberAdmissionSawConfiguredRuntimeEnvironment = false;
+  ClusterTopology testMemberAdmissionSeedTopology = {};
   uint32_t fetchTopologyCalls = 0;
   uint32_t addMachinesCalls = 0;
   uint32_t upsertMachineSchemasCalls = 0;
@@ -447,6 +451,27 @@ public:
     {
       failure->clear();
     }
+    return true;
+  }
+
+  bool addTestClusterMembers(const MothershipProdigyCluster& cluster, const ClusterTopology& seedTopology,
+                             const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+                             ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr,
+                             String *failure = nullptr) override
+  {
+    (void)cluster;
+    addTestMembersCalls += 1;
+    testMemberAdmissionSawConfiguredSeed = configureCalls == 1;
+    testMemberAdmissionSawConfiguredRuntimeEnvironment = runtimeEnvironment.test.enabled;
+    testMemberAdmissionSeedTopology = seedTopology;
+    topology = finalTopology.machines.empty() ? fetchedTopology : finalTopology;
+    if (timingAttribution != nullptr) *timingAttribution = addMachinesTiming;
+    if (failApplyAddMachines)
+    {
+      if (failure) failure->assign("apply test members failed"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
     return true;
   }
 
@@ -1099,7 +1124,12 @@ int main(void)
     suite.expect(hooks.remoteBootstrapCalls == 1, "create_test_bootstraps_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_configures_cluster");
     suite.expect(hooks.fetchTopologyCalls == 1, "create_test_fetches_topology");
-    suite.expect(hooks.addMachinesCalls == 0, "create_test_no_addmachines");
+    suite.expect(hooks.addTestMembersCalls == 1, "create_test_admits_members_after_seed_configuration");
+    suite.expect(hooks.testMemberAdmissionSawConfiguredSeed, "create_test_member_admission_observes_configured_seed");
+    suite.expect(hooks.testMemberAdmissionSawConfiguredRuntimeEnvironment,
+                 "create_test_member_admission_receives_configured_runtime_environment");
+    suite.expect(hooks.testMemberAdmissionSeedTopology.machines.size() == 1,
+                 "create_test_member_admission_receives_actual_single_seed_topology");
     suite.expect(cluster.topology == hooks.fetchedTopology, "create_test_topology_persisted");
     suite.expect(cluster.environmentConfigured, "create_test_environment_configured");
     suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == 1500, "create_test_config_shared_cpu_overcommit");
@@ -1222,6 +1252,47 @@ int main(void)
                                                         ClusterCreateCall::configure,
                                                         ClusterCreateCall::destroyCreatedSeed}),
                  "create_test_failure_call_sequence");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "test-single-seed"_ctv;
+    cluster.clusterUUID = 0x7778;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.nBrains = 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/test-single-seed"_ctv;
+    cluster.test.machineCount = 1;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/test-single-seed.sock"_ctv));
+
+    FakeClusterCreateHooks hooks = {};
+    hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:22::a"_ctv, true, ClusterMachineSource::adopted));
+    String failure = {};
+    bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
+    suite.expect(ok && failure.empty(), "create_test_single_seed_succeeds");
+    suite.expect(hooks.addTestMembersCalls == 0, "create_test_single_seed_skips_empty_member_admission");
+    suite.expect(hooks.lastConfig.runtimeEnvironment.test.enabled, "create_test_single_seed_preserves_test_runtime_environment");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "test-member-admission-failure"_ctv;
+    cluster.clusterUUID = 0x7779;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.nBrains = 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/test-member-admission-failure"_ctv;
+    cluster.test.machineCount = 2;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/test-member-admission-failure.sock"_ctv));
+
+    FakeClusterCreateHooks hooks = {};
+    hooks.failApplyAddMachines = true;
+    String failure = {};
+    bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
+    suite.expect(ok == false && failure.equals("apply test members failed"_ctv), "create_test_member_admission_failure_propagates");
+    suite.expect(hooks.configureCalls == 1 && hooks.addTestMembersCalls == 1 && hooks.fetchTopologyCalls == 0,
+                 "create_test_member_admission_failure_stops_before_topology_fetch");
+    suite.expect(hooks.destroyCreatedSeedCalls == 1, "create_test_member_admission_failure_cleans_provider_seed");
   }
 
   {

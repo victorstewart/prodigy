@@ -2245,6 +2245,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_mothership_virtual_datacenter_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_virtual_datacenter_unit
    )
+   set_tests_properties(prodigy_mothership_virtual_datacenter_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_mothership_neuron_checkpoint_unit

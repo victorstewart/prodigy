@@ -4503,52 +4503,41 @@ static bool mothershipWaitForVirtualDatacenterReady(const MothershipProdigyClust
   return false;
 }
 
-static bool mothershipWaitForVirtualDatacenterRuntime(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 180'000)
+static bool mothershipWaitForVirtualDatacenterRuntimeReceipt(
+    const MothershipProdigyCluster& cluster,
+    const char *receiptFilename,
+    String *failure = nullptr,
+    int timeoutMs = 180'000)
 {
-  String runtimePath = {};
+  String receiptPath = {};
   String controlSocketPath = {};
   String pidPath = {};
-  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterRuntimeFilename, runtimePath);
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, receiptFilename, receiptPath);
   mothershipResolveTestClusterControlSocketPath(cluster, controlSocketPath);
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterPIDFilename, pidPath);
   int64_t deadline = Time::now<TimeResolution::ms>() + timeoutMs;
-
   while (Time::now<TimeResolution::ms>() < deadline)
   {
-    if (::access(runtimePath.c_str(), R_OK) == 0 && ::access(controlSocketPath.c_str(), F_OK) == 0)
+    if (::access(receiptPath.c_str(), R_OK) == 0 && ::access(controlSocketPath.c_str(), F_OK) == 0)
     {
-      if (failure)
-      {
-        failure->clear();
-      }
+      if (failure) failure->clear();
       return true;
     }
-
     String pidText = {};
-    if (::access(pidPath.c_str(), R_OK) == 0)
-    {
-      Filesystem::openReadAtClose(-1, pidPath, pidText);
-    }
+    if (::access(pidPath.c_str(), R_OK) == 0) Filesystem::openReadAtClose(-1, pidPath, pidText);
     if (pidText.size() > 0)
     {
       pidText.addNullTerminator();
-      pid_t pid = pid_t(std::strtol(pidText.c_str(), nullptr, 10));
-      if (pid > 0 && ::kill(pid, 0) != 0 && errno == ESRCH)
+      pid_t providerPID = pid_t(std::strtol(pidText.c_str(), nullptr, 10));
+      if (providerPID > 0 && ::kill(providerPID, 0) != 0 && errno == ESRCH)
       {
-        if (failure)
-        {
-          failure->assign("virtual datacenter provider exited before Prodigy became ready"_ctv);
-        }
+        if (failure) failure->assign("virtual datacenter provider exited before runtime receipt"_ctv);
         return false;
       }
     }
     ::usleep(100'000);
   }
-
-  if (failure)
-  {
-    failure->snprintf<"timed out waiting for virtual datacenter runtime workspaceRoot={} controlSocket={}"_ctv>(cluster.test.workspaceRoot, controlSocketPath);
-  }
+  if (failure) failure->snprintf<"timed out waiting for virtual datacenter runtime receipt={} workspaceRoot={} controlSocket={}"_ctv>(String(receiptFilename), cluster.test.workspaceRoot, controlSocketPath);
   return false;
 }
 
@@ -9098,9 +9087,6 @@ private:
 
       if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
       {
-        (void)seedMachine;
-        (void)request;
-        (void)topology;
         ClusterTopology virtualTopology = {};
         if (mothershipBuildVirtualDatacenterTopology(cluster, virtualTopology, failure) == false)
         {
@@ -9112,8 +9098,8 @@ private:
         String bundlePath = {};
         if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
             prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false ||
-            mothershipProvisionVirtualDatacenter(cluster, virtualTopology, runtimeEnvironment, bundlePath, failure) == false ||
-            mothershipWaitForVirtualDatacenterRuntime(cluster, failure) == false)
+            mothershipProvisionVirtualDatacenterSeed(cluster, topology, request, runtimeEnvironment, bundlePath, failure) == false ||
+            mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterSeedRuntimeFilename, failure) == false)
         {
           finalizeTiming();
           return false;
@@ -9411,6 +9397,40 @@ private:
         failure->clear();
       }
       return true;
+    }
+
+    bool addTestClusterMembers(const MothershipProdigyCluster& cluster, const ClusterTopology& seedTopology,
+                               const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+                               ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr,
+                               String *failure = nullptr) override
+    {
+      if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || seedTopology.machines.size() != 1)
+      {
+        if (failure) failure->assign("test cluster member admission requires exactly one configured seed"_ctv);
+        return false;
+      }
+
+      ClusterTopology virtualTopology = {};
+      if (mothershipBuildVirtualDatacenterTopology(cluster, virtualTopology, failure) == false)
+      {
+        return false;
+      }
+
+      AddMachines request = {};
+      if (mothershipBuildClusterBootstrapRequest(cluster, request, failure) == false)
+      {
+        return false;
+      }
+      if (mothershipProvisionVirtualDatacenterMembers(cluster, virtualTopology, request, runtimeEnvironment, failure) == false ||
+          mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterRuntimeFilename, failure) == false)
+      {
+        return false;
+      }
+      for (const ClusterMachine& machine : virtualTopology.machines)
+      {
+        if (machine.sameIdentityAs(seedTopology.machines[0]) == false) request.readyMachines.push_back(machine);
+      }
+      return applyAddMachines(cluster, request, topology, timingAttribution, failure);
     }
 
     bool applyAddMachines(const MothershipProdigyCluster& cluster, const AddMachines& request, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
