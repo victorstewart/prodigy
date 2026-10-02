@@ -1290,6 +1290,12 @@ add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha2
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
+foreach(_prodigy_artifact_test IN ITEMS
+   prodigy_artifact_io_unit
+   prodigy_mothership_artifact_responsiveness_unit
+   prodigy_neuron_artifact_unit)
+   add_dependencies(${_prodigy_artifact_test} prodigy_pingpong_container_artifact)
+endforeach()
 add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
 add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
@@ -1757,6 +1763,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
    )
    add_test(NAME prodigy_neuron_artifact_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_artifact_unit)
+   set_tests_properties(
+      prodigy_artifact_io_unit
+      prodigy_mothership_artifact_responsiveness_unit
+      prodigy_neuron_artifact_unit
+      PROPERTIES ENVIRONMENT "PRODIGY_TEST_APP_ARTIFACT=${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
+   )
 
    add_test(
       NAME prodigy_ring_recvmsg_multishot_unit
