@@ -842,7 +842,6 @@ target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
 target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoquic::picoquic)
 target_link_libraries(prodigy_public_tls_probe_container PRIVATE openssl::ssl openssl::crypto)
-target_include_directories(prodigy_resumption_readiness_probe_container PRIVATE "${PRODIGY_ROOT}/.depos/.root/downloads/picoquic/release/master-6a14757/src/picoquic")
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
 list(REMOVE_ITEM PRODIGY_PTHREAD_TARGETS prodigy mothership prodigy_sdk_cpp_unit)
