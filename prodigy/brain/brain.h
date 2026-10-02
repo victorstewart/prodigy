@@ -1472,6 +1472,12 @@ public:
   ProdigyMasterAuthorityRuntimeState masterAuthorityRuntimeState;
   bytell_hash_map<uint64_t, Vector<BrainReplicatedContainerRuntimeState>> pendingReplicatedContainerRuntimeStates;
 
+  bool failedDeploymentRetentionWaitsForCanonicalRuntime(uint64_t deploymentID) const override
+  {
+    auto pending = pendingReplicatedContainerRuntimeStates.find(deploymentID);
+    return pending != pendingReplicatedContainerRuntimeStates.end() && pending->second.empty() == false;
+  }
+
   // 2,592,000 seconds in 30 days. so even if each reboot took 20 seconds (in reality it'll be closer to 10 seconds, but should be more like 5 seconds)
   // we'd still have capacity to be rebooting to update the OS on over 125,000 machines a month, never doing more than 1 machine at at time.
   // google updates their machines at least once a month

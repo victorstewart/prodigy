@@ -11206,6 +11206,15 @@ inline uint32_t BrainBase::expireFailedDeployments(int64_t nowMs)
     {
       continue;
     }
+    if (failed.hasOperatorCancellation == false &&
+        failedDeploymentRetentionWaitsForCanonicalRuntime(deploymentID))
+    {
+      // The durable runtime row has not yet been attached to its rebuilt
+      // deployment. Keep the plan/image and move the next bounded check out
+      // of the election turn instead of repeatedly expiring this stale record.
+      failed.failedAtMs = nowMs;
+      continue;
+    }
     const int64_t retentionMs = failed.hasOperatorCancellation
                                     ? prodigyOperatorCancellationTombstoneRetentionMs
                                     : int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);

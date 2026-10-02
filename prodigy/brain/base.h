@@ -318,6 +318,14 @@ public:
     return UpdateSelfPersistenceAdmission::admitted;
   }
 
+  // Brain retains canonical container records until deployment and machine objects
+  // exist. A terminal-failure cleaner must not cull that deployment meanwhile.
+  virtual bool failedDeploymentRetentionWaitsForCanonicalRuntime(uint64_t deploymentID) const
+  {
+    (void)deploymentID;
+    return false;
+  }
+
   std::unique_ptr<ProdigyArtifactIO> artifactIO;
 
   bool ensureArtifactIO(void)

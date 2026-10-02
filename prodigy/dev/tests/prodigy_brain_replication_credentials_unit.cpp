@@ -22224,6 +22224,59 @@ static void testBrainReplicatedContainerRuntimeStateWaitsForDeployment(TestSuite
   thisBrain = previousBrain;
 }
 
+static void testFailedDeploymentCleanerDefersPendingCanonicalRuntime(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+
+  const DeploymentPlan plan = makeDeploymentPlan(62'049, 1);
+  const uint64_t deploymentID = plan.config.deploymentID();
+  const int64_t expiredAtMs = Time::now<TimeResolution::ms>() -
+                              int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+  FailedDeploymentRecord failed = {};
+  failed.applicationID = plan.config.applicationID;
+  failed.deploymentID = deploymentID;
+  failed.failedAtMs = expiredAtMs;
+  failed.hasTerminalReport = true;
+
+  BrainReplicatedContainerRuntimeState canonical = {};
+  canonical.machineUUID = uint128_t(0x62049);
+  canonical.machinePrivate4 = 0x0A000031;
+  canonical.plan.config = plan.config;
+  canonical.plan.uuid = uint128_t(0x6204901);
+  canonical.plan.lifetime = ApplicationLifetime::base;
+  canonical.plan.state = ContainerState::scheduled;
+  canonical.plan.fragment = 11;
+  canonical.plan.createdAtMs = 123'464;
+
+  ProdigyPersistentMasterAuthorityPackage package = {};
+  package.deploymentPlans.insert_or_assign(deploymentID, plan);
+  package.failedDeployments.insert_or_assign(deploymentID, failed);
+  package.containerRuntimeStates.push_back(canonical);
+  suite.require(brain.applyPersistentMasterAuthorityPackage(package),
+                "failed_cleanup_pending_runtime_package_applies");
+  auto pending = brain.pendingReplicatedContainerRuntimeStates.find(deploymentID);
+  suite.require(pending != brain.pendingReplicatedContainerRuntimeStates.end() && pending->second.size() == 1,
+                "failed_cleanup_pending_runtime_is_deferred_before_materialization");
+
+  const int64_t cleanupAtMs = expiredAtMs + int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs);
+  suite.expect(brain.expireFailedDeployments(cleanupAtMs) == 0,
+               "failed_cleanup_pending_runtime_defers_expired_terminal_failure");
+  suite.expect(brain.deploymentPlans.contains(deploymentID),
+               "failed_cleanup_pending_runtime_preserves_durable_plan");
+  suite.expect(brain.failedDeployments.contains(deploymentID) &&
+                   brain.failedDeployments.at(deploymentID).failedAtMs == cleanupAtMs,
+               "failed_cleanup_pending_runtime_rearms_bounded_retention");
+
+  brain.pendingReplicatedContainerRuntimeStates.erase(deploymentID);
+  suite.expect(brain.expireFailedDeployments(cleanupAtMs + int64_t(prodigyBrainFailedDeploymentCleanerIntervalMs)) == 1,
+               "failed_cleanup_pending_runtime_becomes_eligible_after_runtime_applies");
+  suite.expect(brain.deploymentPlans.contains(deploymentID) == false &&
+                   brain.failedDeployments.contains(deploymentID) == false,
+               "failed_cleanup_pending_runtime_ordinary_cleanup_remains_intact");
+}
+
 static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& suite)
 {
   TestBrain source = {};
@@ -29594,9 +29647,16 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "failed-deployment-pending-runtime") == 0)
+  {
+    testFailedDeploymentCleanerDefersPendingCanonicalRuntime(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "crash-recovery") == 0)
   {
     testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
+    testFailedDeploymentCleanerDefersPendingCanonicalRuntime(suite);
     testContainerLaunchWaitsForDurableRuntimeInventory(suite);
     testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
     testBrainReplicatedContainerRuntimeStateWaitsForDeployment(suite);
@@ -30051,6 +30111,7 @@ int main(void)
   testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
   testBrainReplicatedContainerRuntimeStateWaitsForDeployment(suite);
   testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
+  testFailedDeploymentCleanerDefersPendingCanonicalRuntime(suite);
   testContainerLaunchWaitsForDurableRuntimeInventory(suite);
   testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
   testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);

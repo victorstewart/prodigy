@@ -10084,6 +10084,24 @@ private:
     basics_log("prepareRetainedRecoveryLocal success=1\n");
   }
 
+  void runPrepareRetainedRecoveryArtifactLocal(int argc, char *argv[])
+  {
+    String failure = {};
+    uint64_t deploymentID = 0;
+    const bool validArguments = argc == 5 &&
+        mothershipParseUnsignedArgument(argv[2], UINT64_MAX, deploymentID) && deploymentID != 0 &&
+        (std::strcmp(argv[4], "prepare") == 0 || std::strcmp(argv[4], "verify") == 0);
+    if (!validArguments ||
+        !MothershipRetainedRecovery::prepareArtifactLocal(
+            argv[0], argv[1], deploymentID, argv[3], std::strcmp(argv[4], "verify") == 0, &failure))
+    {
+      basics_log("prepareRetainedRecoveryArtifactLocal success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("prepareRetainedRecoveryArtifactLocal success=1 deploymentID=%llu\n",
+               static_cast<unsigned long long>(deploymentID));
+  }
+
   void runVerifyRetiredConflictingClientLocal(int argc, char *argv[])
   {
     String failure, previousBundleSHA, kind;
@@ -19067,6 +19085,7 @@ public:
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
+        {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
         {"printClusters",                   &Mothership::runPrintClusters                  },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },

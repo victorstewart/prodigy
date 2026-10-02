@@ -6,6 +6,7 @@
 // bundle installation, fences, receipt, atomic renames and activation boundary.
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.h>
+#include <prodigy/containerstore.h>
 #include <prodigy/wire.h>
 #include <set>
 
@@ -360,6 +361,17 @@ struct Manifest {
   MothershipRetainedRecoveryOrphanedStatefulPredecessor orphanedStatefulPredecessor;
   String orphanedStatefulPredecessorPriorRequestPath;
   String orphanedStatefulPredecessorPriorManifestPath;
+  // A sealed earlier canonical request may supply only plans that the current
+  // stopped authority no longer retains. It never replaces current authority.
+  String priorCanonicalRequestPath;
+  String priorCanonicalRequestSHA256;
+  struct ArtifactInput {
+    uint64_t deploymentID = 0;
+    String blobPath;
+    String sha256;
+    uint64_t bytes = 0;
+  };
+  Vector<ArtifactInput> artifacts;
 };
 inline bool coldCanonicalMetadata(const String& value) {
   if (value.size() <= 4) return false;
@@ -491,6 +503,39 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     m.request.machines.push_back(std::move(machine));
   }
   require(seenMachines.size()==3 && canonical==m.canonicalContainerCount,"recovery canonical inventory differs from sealed three-host declaration");
+  simdjson::dom::element priorCanonicalPath, priorCanonicalSHA;
+  const bool hasPriorCanonicalPath=doc["priorCanonicalRequestPath"].get(priorCanonicalPath)==simdjson::SUCCESS;
+  const bool hasPriorCanonicalSHA=doc["priorCanonicalRequestSHA256"].get(priorCanonicalSHA)==simdjson::SUCCESS;
+  require(hasPriorCanonicalPath==hasPriorCanonicalSHA,
+          "prior canonical request path and digest must be supplied together");
+  if (hasPriorCanonicalPath) {
+    std::string_view pathValue, digestValue;
+    require(priorCanonicalPath.get_string().get(pathValue)==simdjson::SUCCESS &&
+                priorCanonicalSHA.get_string().get(digestValue)==simdjson::SUCCESS,
+            "prior canonical request authority is invalid");
+    m.priorCanonicalRequestPath.assign(pathValue.data(),pathValue.size());
+    m.priorCanonicalRequestSHA256.assign(digestValue.data(),digestValue.size());
+    pathCheck(str(m.priorCanonicalRequestPath));
+    require(prodigyIsSHA256HexDigest(m.priorCanonicalRequestSHA256),
+            "prior canonical request digest is invalid");
+  }
+  simdjson::dom::element artifacts;
+  if (doc["artifacts"].get(artifacts)==simdjson::SUCCESS) {
+    simdjson::dom::array inputs;
+    require(artifacts.get_array().get(inputs)==simdjson::SUCCESS,"recovery artifacts are invalid");
+    bytell_hash_set<uint64_t> deploymentIDs;
+    for (auto input : inputs) {
+      Manifest::ArtifactInput artifact = {};
+      artifact.deploymentID=number(input,"deploymentID");
+      artifact.blobPath=text(field(input,"blobPath")); artifact.sha256=text(field(input,"sha256"));
+      artifact.bytes=number(input,"bytes");
+      pathCheck(str(artifact.blobPath));
+      require(artifact.deploymentID != 0 && artifact.bytes != 0 &&
+                  prodigyIsSHA256HexDigest(artifact.sha256) && deploymentIDs.insert(artifact.deploymentID).second,
+              "recovery artifact identity is invalid or duplicated");
+      m.artifacts.push_back(std::move(artifact));
+    }
+  }
   if (schemaVersion == 2 || schemaVersion == 3) {
     require(m.emptyRetainedInventoryMachineUUID != 0 && p.schemaVersion != 4,
             "cold canonical source requires a uniform empty retained machine");
@@ -592,6 +637,123 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     require(matches==1 && extras==1,"orphaned stateful predecessor record is absent, duplicated, or has unrelated extras");
   }
   return m;
+}
+// Decode a separately hashed historical request only at sealing time.  The
+// historical request can prove a plan for a currently canonical process but
+// cannot introduce a process, machine, or deployment on its own.
+inline bool loadPriorCanonicalRecoveryRequest(const Manifest& manifest,Request& prior) {
+  prior={};
+  if(manifest.priorCanonicalRequestPath.empty()) return false;
+  const std::string path=str(manifest.priorCanonicalRequestPath);
+  privateFile(path);
+  require(text(digest(path))==manifest.priorCanonicalRequestSHA256,
+          "prior canonical request digest differs");
+  MothershipRetainedRecoveryMixedProof proof={}; uint128_t retired=0, emptyMachine=0;
+  ColdCanonicalSource cold={}; ProdigyMaterializedStatefulRecoveryOperation handoff={};
+  MothershipRetainedRecoveryOrphanedStatefulPredecessor orphan={};
+  require(decodeRequest(read(path),prior,&proof,&retired,&emptyMachine,&cold,&handoff,&orphan) &&
+              prior.clusterUUID==manifest.request.clusterUUID,
+          "prior canonical request is malformed or cluster differs");
+  return true;
+}
+inline const DeploymentPlan& bindCanonicalRecoveryPlan(Manifest& manifest,const Request *prior,
+                                                        const Record& record,uint64_t deploymentID) {
+  auto current=manifest.request.plans.find(deploymentID);
+  if(!prior) {
+    require(current!=manifest.request.plans.end(),"retained deployment absent from authority");
+    return current->second;
+  }
+  const auto historical=prior->plans.find(deploymentID);
+  if(current!=manifest.request.plans.end()) {
+    require(historical==prior->plans.end() ||
+                mothershipRetainedRecoveryPlansEqual(current->second,historical->second),
+            "prior canonical request conflicts with retained authority");
+    return current->second;
+  }
+  require(record.canonical && historical!=prior->plans.end(),
+          "prior canonical request lacks a missing canonical deployment plan");
+  manifest.request.plans.insert_or_assign(deploymentID,historical->second);
+  current=manifest.request.plans.find(deploymentID);
+  require(current!=manifest.request.plans.end(),"missing canonical deployment plan was not admitted");
+  return current->second;
+}
+inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot);
+inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure,
+                         const String& previousBundleSHA256);
+inline const DeploymentPlan& bindRecoveryArtifact(const Request& request,uint64_t deploymentID) {
+  const auto plan=request.plans.find(deploymentID);
+  require(plan!=request.plans.end() && plan->second.config.containerBlobBytes!=0 &&
+              prodigyIsSHA256HexDigest(plan->second.config.containerBlobSHA256),
+          "recovery artifact deployment plan is unavailable");
+  bool canonical=false;
+  for(const auto& machine:request.machines) for(const auto& parameters:machine.parameters)
+    canonical |= parameters.deploymentID==deploymentID;
+  require(canonical,"recovery artifact deployment is not canonical");
+  return plan->second;
+}
+inline void validateRecoveryArtifacts(const Manifest& manifest,const Request& request) {
+  for(const auto& artifact:manifest.artifacts) {
+    const DeploymentPlan& plan=bindRecoveryArtifact(request,artifact.deploymentID);
+    require(plan.config.containerBlobSHA256==artifact.sha256 && plan.config.containerBlobBytes==artifact.bytes,
+            "recovery artifact differs from sealed deployment plan");
+  }
+}
+// Local, fenced artifact preparation.  It works only after the same sealed
+// request has verified the private prepared snapshot; ContainerStore retains
+// no-replace ownership of the final image path.
+inline bool prepareArtifactLocal(const char *requestPath,const char *statePath,uint64_t deploymentID,
+                                 const char *blobPath,bool verifyOnly,String *failure) {
+  try {
+    require(deploymentID!=0 && blobPath!=nullptr && blobPath[0]!=0,
+            "recovery artifact input is invalid");
+    privateFile(requestPath); const std::string state=statePath, blob=blobPath;
+    pathCheck(state); pathCheck(blob); privateFile(blob);
+    require(prepareLocal(requestPath,statePath,true,failure,String{}),
+            failure && failure->size() ? str(*failure).c_str() : "recovery artifact requires a prepared snapshot");
+    Request request={}; MothershipRetainedRecoveryMixedProof proof={}; uint128_t retired=0,empty=0;
+    ColdCanonicalSource cold={}; ProdigyMaterializedStatefulRecoveryOperation handoff={};
+    MothershipRetainedRecoveryOrphanedStatefulPredecessor orphan={};
+    require(decodeRequest(read(requestPath),request,&proof,&retired,&empty,&cold,&handoff,&orphan),
+            "recovery artifact request decode failed");
+    const DeploymentPlan& plan=bindRecoveryArtifact(request,deploymentID);
+    ProdigyPersistentBrainSnapshot prepared={}; loadSnapshot(state,prepared);
+    const auto preparedPlan=prepared.masterAuthority.deploymentPlans.find(deploymentID);
+    require(preparedPlan!=prepared.masterAuthority.deploymentPlans.end() &&
+                mothershipRetainedRecoveryPlansEqual(preparedPlan->second,plan),
+            "recovery artifact prepared snapshot plan differs");
+    if (verifyOnly) {
+      require(ContainerStore::verify(deploymentID,plan.config.containerBlobSHA256,
+                                     plan.config.containerBlobBytes,nullptr,nullptr,failure),
+              failure && failure->size() ? str(*failure).c_str() : "recovery artifact final is unavailable");
+      return true;
+    }
+    String blobBytes={}; Filesystem::openReadAtClose(-1,text(blob),blobBytes);
+    String stage=ContainerStore::pathForContainerImage(deploymentID);
+    stage.append(".retained-recovery.XXXXXX"_ctv); stage.addNullTerminator();
+    const int stageFD=::mkstemp(reinterpret_cast<char*>(stage.data()));
+    require(stageFD>=0,"recovery artifact stage creation failed");
+    struct stat createdStage = {}; require(::fstat(stageFD,&createdStage)==0,"recovery artifact stage identity failed");
+    ::close(stageFD);
+    ContainerStore::PreparedAppArtifact preparedArtifact={}; String artifactFailure={};
+    if (!ContainerStore::prepareAppArtifactAtPath(preparedArtifact,deploymentID,stage,blobBytes,
+                plan.config.containerBlobSHA256,plan.config.containerBlobBytes,&artifactFailure)) {
+      // Only remove the empty inode this invocation created. A different inode
+      // may be a raced immutable artifact and is never ours to delete.
+      struct stat currentStage = {};
+      if (::stat(stage.c_str(),&currentStage)==0 && currentStage.st_dev==createdStage.st_dev &&
+          currentStage.st_ino==createdStage.st_ino) (void)::unlink(stage.c_str());
+      require(false,artifactFailure.size()?str(artifactFailure).c_str():"recovery artifact preparation failed");
+    }
+    if (!ContainerStore::publishPreparedAppArtifact(preparedArtifact,&artifactFailure) ||
+        !ContainerStore::adoptPreparedAppArtifact(preparedArtifact)) {
+      ContainerStore::discardPreparedAppArtifact(preparedArtifact);
+      require(false,artifactFailure.size()?str(artifactFailure).c_str():"recovery artifact publication failed");
+    }
+    require(ContainerStore::verify(deploymentID,plan.config.containerBlobSHA256,
+                                   plan.config.containerBlobBytes,nullptr,nullptr,&artifactFailure),
+            artifactFailure.size()?str(artifactFailure).c_str():"recovery artifact verification failed");
+    return true;
+  } catch(const std::exception& error) { if(failure)failure->assign(error.what()); return false; }
 }
 inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot) {
   require(fs::is_directory(path) && fs::is_directory(path+".secrets") && !fs::is_symlink(path) && !fs::is_symlink(path+".secrets"),"paired private recovery databases absent");
@@ -1527,6 +1689,12 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     }
     const auto requestPath=e.plan.operationRoot+(conflictingClientRetired?"/recovery.request.retired-conflicting-client":"/recovery.request");
     const auto authorityPath=e.plan.operationRoot+(conflictingClientRetired?"/conflicting-client-retirement-authority":"/stateless-extras-authority");
+    for(const auto& artifact:manifest.artifacts) {
+      const std::string source=str(artifact.blobPath);
+      privateFile(source);
+      const std::string remote=e.remoteRoot+"/artifact-"+std::to_string(artifact.deploymentID)+".zst";
+      for(auto& machine:e.plan.machines)e.upload(machine,source,remote);
+    }
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated || !fs::exists(authorityPath)) {
       if(conflictingClientRetired) {
         privateFile(requestPath); privateFile(authorityPath,4096);
@@ -1542,6 +1710,9 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","retained recovery must run on selected seed");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);
         require(seed.brainConfig.clusterUUID==e.plan.clusterUUID,"seed authority cluster mismatch");manifest.request.plans=seed.masterAuthority.deploymentPlans;
+        Request priorCanonicalRequest = {};
+        const Request *priorCanonicalRequestAuthority =
+            loadPriorCanonicalRecoveryRequest(manifest,priorCanonicalRequest) ? &priorCanonicalRequest : nullptr;
         const bool retiringOrphanedStatefulPredecessor =
             manifest.orphanedStatefulPredecessor.parameters.uuid != 0;
         DeploymentPlan orphanedPredecessorHistoricalPlan = {};
@@ -1652,9 +1823,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
             orphan.parameters=std::move(params);
             continue;
           }
-          auto deployment=manifest.request.plans.find(params.deploymentID);require(deployment!=manifest.request.plans.end(),"retained deployment absent from authority");
-          prodigyRestoreRetainedStartupCPUFields(bytes,deployment->second,params);
-          if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
+          const DeploymentPlan& deployment=bindCanonicalRecoveryPlan(
+              manifest,priorCanonicalRequestAuthority,r,params.deploymentID);
+          prodigyRestoreRetainedStartupCPUFields(bytes,deployment,params);
+          if(!r.canonical) {require(!deployment.isStateful && deployment.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
         if (retiringOrphanedStatefulPredecessor) {
@@ -1681,6 +1853,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(!retiringOrphanedStatefulPredecessor ||
                     mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(manifest.orphanedStatefulPredecessor),
                 "orphaned stateful predecessor was not sealed from live parameters");
+        validateRecoveryArtifacts(manifest,manifest.request);
         String bytes=retiringOrphanedStatefulPredecessor ?
             encodeOrphanedStatefulPredecessorRequest(manifest.request,e.plan,manifest.orphanedStatefulPredecessor) :
             !manifest.partialHandoff.operationID.empty() ?
@@ -1783,7 +1956,14 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         const auto marker=e.remoteRoot+"/prepared.request.sha256",requestSHA=digest(requestPath);
         std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";
         const auto invoke="LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10");
-        cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare "+quote(e.plan.oldBundleSHA)+"; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";e.run(m.uuid,cmd);
+        cmd+="if test -f "+quote(marker)+"; then test \"$(cat "+quote(marker)+")\" = "+quote(requestSHA)+"; "+invoke+" verify; else "+invoke+" prepare "+quote(e.plan.oldBundleSHA)+"; printf %s "+quote(requestSHA)+" > "+quote(marker)+"; sync -f "+quote(marker)+"; fi";
+        for(const auto& artifact:manifest.artifacts) {
+          const std::string remote=e.remoteRoot+"/artifact-"+std::to_string(artifact.deploymentID)+".zst";
+          cmd+="; LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryArtifactLocal "+
+              quote(e.remoteRoot+"/recovery.request")+" "+quote(e.remoteRoot+"/state.new10")+" "+
+              std::to_string(artifact.deploymentID)+" "+quote(remote)+" prepare";
+        }
+        e.run(m.uuid,cmd);
       }
       verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);e.receipt.phase=MothershipTidesDBMigrationPhase::validated;e.persist(e.receipt,nullptr);
     }
@@ -1809,7 +1989,13 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read(requestAuthority)==str(coldCanonicalBinding)+digest(requestPath)+"\n",
                 "cold canonical source changed after preparation");
       }
-      verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);for(auto& m:e.plan.machines)e.run(m.uuid,"LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
+      verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);for(auto& m:e.plan.machines) {
+        std::string verifyCommand="LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify";
+        for(const auto& artifact:manifest.artifacts) verifyCommand+="; LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryArtifactLocal "+
+            quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" "+std::to_string(artifact.deploymentID)+" "+
+            quote(e.remoteRoot+"/artifact-"+std::to_string(artifact.deploymentID)+".zst")+" verify";
+        e.run(m.uuid,verifyCommand);
+      }
       e.installRuntimes();
     }
     e.activate();return true;

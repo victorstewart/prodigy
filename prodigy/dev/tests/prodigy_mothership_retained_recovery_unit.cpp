@@ -1383,6 +1383,80 @@ int main()
     bool rejectedMalformedHandoff = false;
     try { (void)parseManifest(path, successor); } catch (const std::exception&) { rejectedMalformedHandoff = true; }
     assert(rejectedMalformedHandoff);
+
+    // A prior canonical request is hash-bound authority for only a plan absent
+    // from the current stopped snapshot. It cannot replace an extant plan.
+    const std::string priorPath=std::string(directory)+"/prior.request";
+    Request priorRequest = {}; priorRequest.clusterUUID=7; priorRequest.bundleSHA=text(digest);
+    DeploymentPlan historical = {}; historical.config.type=ApplicationType::stateful;
+    historical.config.applicationID=99; historical.config.versionID=7;
+    historical.config.memoryMB=128; historical.config.storageMB=64;
+    historical.config.nLogicalCores=1; historical.isStateful=true;
+    const uint64_t historicalID=historical.config.deploymentID();
+    priorRequest.plans.insert_or_assign(historicalID,historical);
+    String priorBytes = {}; BitseryEngine::serialize(priorBytes,priorRequest);
+    durable(priorPath,priorBytes); assert(::chmod(priorPath.c_str(),0600)==0);
+    Manifest bound = {}; bound.request.clusterUUID=7;
+    bound.priorCanonicalRequestPath.assign(priorPath.c_str());
+    bound.priorCanonicalRequestSHA256=text(MothershipTidesMigration::digest(priorPath));
+    Request decodedPrior = {}; assert(loadPriorCanonicalRecoveryRequest(bound,decodedPrior));
+    Record canonicalRecord = {}; canonicalRecord.canonical=true;
+    const DeploymentPlan& admitted=bindCanonicalRecoveryPlan(bound,&decodedPrior,canonicalRecord,historicalID);
+    assert(mothershipRetainedRecoveryPlansEqual(admitted,historical));
+    assert(bound.request.plans.size()==1);
+    bool rejectedMissing=false;
+    try { (void)bindCanonicalRecoveryPlan(bound,&decodedPrior,canonicalRecord,historicalID+1); }
+    catch(const std::exception&) { rejectedMissing=true; }
+    assert(rejectedMissing);
+    DeploymentPlan conflicting=historical; ++conflicting.config.memoryMB;
+    bound.request.plans.insert_or_assign(historicalID,conflicting);
+    bool rejectedConflict=false;
+    try { (void)bindCanonicalRecoveryPlan(bound,&decodedPrior,canonicalRecord,historicalID); }
+    catch(const std::exception&) { rejectedConflict=true; }
+    assert(rejectedConflict);
+    priorRequest.clusterUUID=8; BitseryEngine::serialize(priorBytes,priorRequest);
+    durable(priorPath,priorBytes); assert(::chmod(priorPath.c_str(),0600)==0);
+    bound.priorCanonicalRequestSHA256=text(MothershipTidesMigration::digest(priorPath));
+    bool rejectedCluster=false;
+    try { (void)loadPriorCanonicalRecoveryRequest(bound,decodedPrior); }
+    catch(const std::exception&) { rejectedCluster=true; }
+    assert(rejectedCluster);
+    durable(priorPath,text("malformed-prior-request")); assert(::chmod(priorPath.c_str(),0600)==0);
+    bound.priorCanonicalRequestSHA256=text(MothershipTidesMigration::digest(priorPath));
+    bool rejectedMalformedPrior=false;
+    try { (void)loadPriorCanonicalRecoveryRequest(bound,decodedPrior); }
+    catch(const std::exception&) { rejectedMalformedPrior=true; }
+    assert(rejectedMalformedPrior);
+    auto incompletePrior=emptyManifest;
+    incompletePrior.insert(incompletePrior.rfind("}"), ",\"priorCanonicalRequestPath\":\"/private/prior.request\"");
+    rejectsEmptyManifest(std::move(incompletePrior));
+    auto pairedPrior=emptyManifest;
+    pairedPrior.insert(pairedPrior.rfind("}"), ",\"priorCanonicalRequestPath\":\"/private/prior.request\",\"priorCanonicalRequestSHA256\":\""+std::string(64,'d')+"\",\"artifacts\":[{\"deploymentID\":99,\"blobPath\":\"/private/Hot.artifact.zst\",\"sha256\":\""+std::string(64,'e')+"\",\"bytes\":42}]");
+    durable(path,text(pairedPrior)); const auto parsedPrior=parseManifest(path,plan);
+    assert(parsedPrior.priorCanonicalRequestPath=="/private/prior.request"_ctv &&
+        parsedPrior.priorCanonicalRequestSHA256==text(std::string(64,'d')) &&
+        parsedPrior.artifacts.size()==1 && parsedPrior.artifacts[0].deploymentID==99 &&
+        parsedPrior.artifacts[0].bytes==42);
+
+    // Artifact metadata is only a transport input. The sealed request plan and
+    // an existing canonical parameter are the authority for its identity.
+    Manifest artifactManifest = {}; Request artifactRequest = {};
+    artifactRequest.clusterUUID=7; DeploymentPlan artifactPlan = historical;
+    artifactPlan.config.containerBlobSHA256=text(std::string(64,'e'));
+    artifactPlan.config.containerBlobBytes=42;
+    artifactRequest.plans.insert_or_assign(historicalID,artifactPlan);
+    MothershipRetainedRecoveryMachineInput artifactMachine = {}; artifactMachine.machineUUID=1;
+    ContainerParameters artifactParameters = {}; artifactParameters.deploymentID=historicalID;
+    artifactMachine.parameters.push_back(artifactParameters); artifactRequest.machines.push_back(artifactMachine);
+    Manifest::ArtifactInput artifact = {}; artifact.deploymentID=historicalID;
+    artifact.blobPath="/private/Hot.artifact.zst"_ctv; artifact.sha256=artifactPlan.config.containerBlobSHA256;
+    artifact.bytes=artifactPlan.config.containerBlobBytes; artifactManifest.artifacts.push_back(artifact);
+    validateRecoveryArtifacts(artifactManifest,artifactRequest);
+    artifactManifest.artifacts[0].bytes++;
+    bool rejectedArtifact=false;
+    try { validateRecoveryArtifacts(artifactManifest,artifactRequest); }
+    catch(const std::exception&) { rejectedArtifact=true; }
+    assert(rejectedArtifact);
     fs::remove_all(directory);
   }
 
