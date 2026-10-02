@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <linux/pkt_cls.h>
 #include <linux/ip.h>
 #include <netinet/tcp.h>
@@ -39,6 +40,78 @@ public:
   {
     expect(condition, name);
     return condition;
+  }
+};
+
+class ScopedRuntimeSyncRing final : public TimeoutDispatcher {
+public:
+  RingDispatcher dispatcher {false};
+  RingInterface *savedInterfacer = nullptr;
+  RingLifecycle *savedLifecycler = nullptr;
+  RingDispatcher *savedDispatcher = nullptr;
+  TimeoutPacket retry = {};
+  std::function<bool()> ready = {};
+  uint32_t retries = 0;
+  bool complete = false;
+  bool timedOut = false;
+
+  ScopedRuntimeSyncRing()
+  {
+    savedInterfacer = Ring::interfacer;
+    savedLifecycler = Ring::lifecycler;
+    savedDispatcher = RingDispatcher::dispatcher;
+    RingDispatcher::dispatcher = &dispatcher;
+    Ring::interfacer = &dispatcher;
+    Ring::lifecycler = &dispatcher;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+    Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+    retry.dispatcher = this;
+  }
+
+  ~ScopedRuntimeSyncRing()
+  {
+    Ring::shutdownForExec();
+    Ring::interfacer = savedInterfacer;
+    Ring::lifecycler = savedLifecycler;
+    RingDispatcher::dispatcher = savedDispatcher;
+    Ring::exit = false;
+    Ring::shuttingDown = false;
+  }
+
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    if (packet != &retry) return;
+    if (ready && ready())
+    {
+      complete = true;
+      Ring::exit = true;
+    }
+    else if (++retries < 500)
+    {
+      retry.clear();
+      retry.setTimeoutMs(1);
+      Ring::queueTimeout(&retry);
+    }
+    else
+    {
+      timedOut = true;
+      Ring::exit = true;
+    }
+  }
+
+  bool runUntil(std::function<bool()> condition)
+  {
+    if (condition()) return true;
+    ready = std::move(condition);
+    retry.clear();
+    retry.setTimeoutMs(1);
+    Ring::queueTimeout(&retry);
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    ready = {};
+    return complete && timedOut == false;
   }
 };
 
@@ -930,16 +1003,27 @@ static void testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings
                                                      0,
                                                      "unit-container-ingress-clear");
 
-    EthDevice hostIngressEth = {};
-    Switchboard hostIngressSwitchboard(hostIngressEth);
-    hostIngressSwitchboard.setHostIngressRouter(&hostIngressProgram);
-    suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
-                 "container_peer_runtime_sync_removes_ipv4_ingress_binding");
-    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress"_ctv, desired.key, loadedBinding) == false,
-                 "container_peer_runtime_sync_production_replay_removes_ipv6_host_ingress_binding");
-    suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
-                 "container_peer_runtime_sync_production_replay_removes_ipv4_host_ingress_binding");
-    hostIngressSwitchboard.setHostIngressRouter(nullptr);
+    {
+      ScopedRuntimeSyncRing runtimeRing = {};
+      EthDevice hostIngressEth = {};
+      Switchboard hostIngressSwitchboard(hostIngressEth);
+      hostIngressSwitchboard.setHostIngressRouter(&hostIngressProgram);
+      const bool hostIngressBindingsCleared = runtimeRing.runUntil([&] {
+        loadedBinding = {};
+        const bool ipv6BindingCleared = lookupProgramMapElement(hostIngressProgram, "wh_egress"_ctv, desired.key, loadedBinding) == false;
+        loadedBinding = {};
+        const bool ipv4BindingCleared = lookupProgramMapElement(hostIngressProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false;
+        return ipv6BindingCleared && ipv4BindingCleared;
+      });
+      suite.expect(hostIngressBindingsCleared,
+                   "container_peer_runtime_sync_production_replay_converges_after_router_installation");
+      suite.expect(lookupProgramMapElement(primaryProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
+                   "container_peer_runtime_sync_removes_ipv4_ingress_binding");
+      suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress"_ctv, desired.key, loadedBinding) == false,
+                   "container_peer_runtime_sync_production_replay_removes_ipv6_host_ingress_binding");
+      suite.expect(lookupProgramMapElement(hostIngressProgram, "wh_egress4"_ctv, desired4.key, loadedBinding) == false,
+                   "container_peer_runtime_sync_production_replay_removes_ipv4_host_ingress_binding");
+    }
   }
 
   hostIngressProgram.close();
@@ -2302,6 +2386,12 @@ int main(void)
   }
 
   TestSuite suite = {};
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && std::strcmp(only, "container-peer-runtime-sync") == 0)
+  {
+    testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   testContainerRouterBPFPathsResolveAlongsideExecutable(suite);
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
