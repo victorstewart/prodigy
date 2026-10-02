@@ -22483,6 +22483,11 @@ public:
       releaseObservedDeploymentQuiescence(retirement, graph);
     }
     authorizeCompletedMachineRetirements(graph);
+    if (machineRetirementPersistencePending)
+    {
+      armMachineRetirementRecheck();
+      return;
+    }
 
     Vector<NeuronView *> candidates;
     for (auto& [neuron, retirement] : retiringMachinesByNeuron)
@@ -22636,6 +22641,7 @@ public:
         append(candidate);
       }
       bytell_hash_set<DeploymentWork *> work;
+      bytell_hash_set<DeploymentWork *> visited;
       auto appendContainer = [&](ContainerView *container) -> void {
         if (container != nullptr)
         {
@@ -22672,7 +22678,7 @@ public:
       {
         DeploymentWork *pending = *work.begin();
         work.erase(pending);
-        if (pending == nullptr)
+        if (pending == nullptr || visited.insert(pending).second == false)
         {
           continue;
         }
@@ -22963,10 +22969,18 @@ public:
       return;
     }
 
-    // Every same-identity alias is quarantined separately before this exact drain.
+    // drainMachine removes its current container-index entry.  Snapshot the
+    // deployment IDs so that removal cannot invalidate this traversal.
+    Vector<uint64_t> deploymentIDs;
+    deploymentIDs.reserve(machine->containersByDeploymentID.size());
     for (const auto& [deploymentID, containersOnMachine] : machine->containersByDeploymentID)
     {
       (void)containersOnMachine;
+      deploymentIDs.push_back(deploymentID);
+    }
+    // Every same-identity alias is quarantined separately before this exact drain.
+    for (uint64_t deploymentID : deploymentIDs)
+    {
       if (auto it = deployments.find(deploymentID); it != deployments.end() && it->second)
       {
         it->second->drainMachine(machine, true);

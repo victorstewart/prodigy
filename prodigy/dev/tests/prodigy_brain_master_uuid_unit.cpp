@@ -127,6 +127,8 @@ public:
   uint32_t retirementTopologyPersistCalls = 0;
   ClusterTopology retirementTopology = {};
   bool failRuntimeStatePersist = false;
+  bool holdRuntimeStatePersist = false;
+  Vector<PersistenceCompletion> pendingRuntimeStatePersistence;
 
   void enableMachineRetirementAuthority(void)
   {
@@ -139,6 +141,11 @@ public:
   void testReapRetiringMachines(void)
   {
     reapRetiringMachines();
+  }
+
+  void testEvacuateFailedMachineContainers(Machine *machine)
+  {
+    evacuateFailedMachineContainers(machine);
   }
 
   bool testActiveBrainRegistrationsReadyForMasterElection(void)
@@ -578,6 +585,33 @@ public:
   {
     persistCalls += 1;
     return failRuntimeStatePersist == false;
+  }
+
+  void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+  {
+    if (holdRuntimeStatePersist)
+    {
+      pendingRuntimeStatePersistence.push_back(std::move(completion));
+      return;
+    }
+    const bool durable = persistLocalRuntimeState();
+    if (completion)
+    {
+      completion(durable);
+    }
+  }
+
+  void finishRuntimeStatePersistence(bool durable)
+  {
+    Vector<PersistenceCompletion> pending = std::move(pendingRuntimeStatePersistence);
+    pendingRuntimeStatePersistence.clear();
+    for (PersistenceCompletion& completion : pending)
+    {
+      if (completion)
+      {
+        completion(durable);
+      }
+    }
   }
 
   void checkMetroReachabilityForMasterFailover(bool& connectedMajority, bool& reachableSwitchMajority) override
@@ -2564,6 +2598,112 @@ int main(void)
     }
   };
 
+  auto runMachineDecommissionFailedDrainSnapshotFixture = [&]() -> void {
+    BrainBase *savedBrain = thisBrain;
+    TestBrain brain = {};
+    Mesh mesh = {};
+    brain.mesh = &mesh;
+    thisBrain = &brain;
+
+    Machine machine = {};
+    ApplicationDeployment first = {};
+    ApplicationDeployment second = {};
+    ApplicationDeployment firstSuccessor = {};
+    ApplicationDeployment secondSuccessor = {};
+    first.plan = makeDeploymentPlan(6092, 1);
+    second.plan = makeDeploymentPlan(6093, 1);
+    firstSuccessor.state = DeploymentState::deploying;
+    secondSuccessor.state = DeploymentState::deploying;
+    first.next = &firstSuccessor;
+    second.next = &secondSuccessor;
+    brain.deployments.insert_or_assign(first.plan.config.deploymentID(), &first);
+    brain.deployments.insert_or_assign(second.plan.config.deploymentID(), &second);
+
+    auto addHealthyContainer = [&](ApplicationDeployment& deployment, uint128_t uuid) {
+      ContainerView *container = new ContainerView();
+      container->uuid = uuid;
+      container->applicationID = deployment.plan.config.applicationID;
+      container->deploymentID = deployment.plan.config.deploymentID();
+      container->lifetime = ApplicationLifetime::base;
+      container->state = ContainerState::healthy;
+      container->machine = &machine;
+      deployment.containers.insert(container);
+      machine.upsertContainerIndexEntry(container->deploymentID, container);
+      brain.containers.insert_or_assign(container->uuid, container);
+    };
+    addHealthyContainer(first, uint128_t(609201));
+    addHealthyContainer(second, uint128_t(609301));
+
+    brain.testEvacuateFailedMachineContainers(&machine);
+    suite.expect(machine.containersByDeploymentID.size() == 0 && first.containers.empty() &&
+                     second.containers.empty() && brain.containers.empty(),
+                 "machine_decommission_failed_drain_snapshots_all_deployments");
+
+    brain.deployments.clear();
+    thisBrain = savedBrain;
+  };
+
+  auto runMachineDecommissionEvacuationReceiptFixture = [&]() -> void {
+    BrainBase *savedBrain = thisBrain;
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    thisBrain = &brain;
+    ScopedRing scopedRing = {};
+
+    Rack *rack = new Rack();
+    rack->uuid = 6094;
+    Machine *machine = new Machine();
+    machine->uuid = uint128_t(609401);
+    machine->state = MachineState::decommissioning;
+    machine->rack = rack;
+    machine->rackUUID = rack->uuid;
+    machine->neuron.machine = machine;
+    rack->machines.insert(machine);
+    brain.racks.insert_or_assign(rack->uuid, rack);
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+
+    brain.decommissionMachine(machine);
+    auto retirement = brain.retiringMachinesByNeuron.find(&machine->neuron);
+    if (retirement != brain.retiringMachinesByNeuron.end())
+    {
+      retirement->second.closeQueued = true;
+      retirement->second.ringCloseObserved = true;
+    }
+    NeuronView *retiringNeuron = &machine->neuron;
+    const uint32_t rackUUID = rack->uuid;
+
+    brain.holdRuntimeStatePersist = true;
+    brain.testReapRetiringMachines();
+    suite.expect(brain.pendingRuntimeStatePersistence.size() == 1 &&
+                     brain.retiringMachinesByNeuron.contains(retiringNeuron) && brain.racks.contains(rackUUID),
+                 "machine_decommission_held_evacuation_receipt_retains_physical_machine");
+
+    brain.weAreMaster = false;
+    brain.finishRuntimeStatePersistence(false);
+    suite.expect(brain.pendingRuntimeStatePersistence.empty() && brain.retiringMachinesByNeuron.contains(retiringNeuron) &&
+                     brain.retiredMachineIdentities.size() == 1 &&
+                     brain.retiredMachineIdentities.begin()->second.evacuationComplete == false,
+                 "machine_decommission_failed_evacuation_receipt_retains_physical_machine");
+
+    brain.weAreMaster = true;
+    brain.holdRuntimeStatePersist = true;
+    brain.testReapRetiringMachines();
+    suite.expect(brain.pendingRuntimeStatePersistence.size() == 1 &&
+                     brain.retiringMachinesByNeuron.contains(retiringNeuron),
+                 "machine_decommission_successful_evacuation_receipt_waits_before_physical_reap");
+
+    brain.holdRuntimeStatePersist = false;
+    brain.finishRuntimeStatePersistence(true);
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.empty(),
+                 "machine_decommission_successful_evacuation_receipt_allows_physical_reap");
+
+    thisBrain = savedBrain;
+  };
+
   auto runMachineDecommissionSuspendedDrainFixture = [&]() -> void {
     BrainBase *savedBrain = thisBrain;
     NoopBrainIaaS provider = {};
@@ -2578,6 +2718,8 @@ int main(void)
 
     DeploymentPlan plan = makeDeploymentPlan(6091, 1);
     plan.canaryCount = 0;
+    plan.hasApiCredentialPolicy = true;
+    plan.apiCredentialPolicy.applicationID = plan.config.applicationID;
     ApplicationDeployment *deployment = new ApplicationDeployment();
     deployment->plan = plan;
     deployment->state = DeploymentState::running;
@@ -3005,6 +3147,11 @@ int main(void)
     if (std::strcmp(testOnly, "machine-decommission-suspended-drain") == 0)
     {
       runMachineDecommissionSuspendedDrainFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "machine-decommission-evacuation-receipt") == 0)
+    {
+      runMachineDecommissionEvacuationReceiptFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (std::strcmp(testOnly, "should-we-connect-family-fallback") == 0)
@@ -4301,6 +4448,8 @@ int main(void)
     thisBrain = savedBrain;
   }
 
+  runMachineDecommissionFailedDrainSnapshotFixture();
+  runMachineDecommissionEvacuationReceiptFixture();
   runMachineDecommissionSuspendedDrainFixture();
 
   {

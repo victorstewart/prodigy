@@ -2123,6 +2123,19 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_brain_master_uuid_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_master_uuid_unit
    )
+   set_tests_properties(prodigy_brain_master_uuid_unit PROPERTIES TIMEOUT 120)
+   add_test(
+      NAME prodigy_machine_decommission_suspended_drain_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-decommission-suspended-drain
+              $<TARGET_FILE:prodigy_brain_master_uuid_unit>
+   )
+   set_tests_properties(prodigy_machine_decommission_suspended_drain_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_machine_decommission_evacuation_receipt_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-decommission-evacuation-receipt
+              $<TARGET_FILE:prodigy_brain_master_uuid_unit>
+   )
+   set_tests_properties(prodigy_machine_decommission_evacuation_receipt_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_brain_ipv6_topology_unit
