@@ -7,6 +7,7 @@
 #include <prodigy/iaas/vultr/vultr.h>
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cstdio>
 #include <simdjson.h>
 #include <sys/socket.h>
@@ -36,6 +37,58 @@ static bool parseJSON(const String& json, simdjson::dom::parser& parser, simdjso
   padded.assign(json);
   padded.need(simdjson::SIMDJSON_PADDING);
   return parser.parse(padded.c_str(), padded.size()).get(doc) == simdjson::SUCCESS;
+}
+
+class ScriptedVultrHttp
+{
+public:
+
+  MultiCurlClient::Callback callback = {};
+  MultiCurlClient::Ticket ticket = {};
+  Vector<MultiCurlClient::Request> requests = {};
+
+  static MultiCurlClient::Ticket submit(void *context,
+                                        MultiCurlClient::Request&& request,
+                                        MultiCurlClient::Callback callback)
+  {
+    ScriptedVultrHttp& client = *static_cast<ScriptedVultrHttp *>(context);
+    client.ticket = {client.ticket.identifier + 1, 1};
+    client.callback = callback;
+    client.requests.push_back(std::move(request));
+    return client.ticket;
+  }
+
+  static bool cancel(void *, MultiCurlClient::Ticket)
+  {
+    return true;
+  }
+
+  ProdigyHostHttpSubmission submission(void)
+  {
+    return {this, submit, cancel};
+  }
+
+  void complete(MultiCurlClient::Status status, long statusCode, const String& body = {})
+  {
+    MultiCurlClient::Result result = {};
+    result.status = status;
+    result.statusCode = statusCode;
+    result.body = body;
+    MultiCurlClient::Callback completion = callback;
+    completion.function(completion.context, ticket, std::move(result));
+  }
+};
+
+static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVultrHttp& http)
+{
+  ProdigyProviderServices services = {};
+  services.http = http.submission();
+  services.operationDeadline = MultiCurlClient::Clock::now() + std::chrono::minutes(1);
+  provider.configureProviderServices(services);
+  ProdigyRuntimeEnvironmentConfig runtime = {};
+  runtime.kind = ProdigyEnvironmentKind::vultr;
+  runtime.providerCredentialMaterial.assign("unit-test-vultr-credential"_ctv);
+  provider.configureRuntimeEnvironment(runtime);
 }
 
 int main(void)
@@ -594,6 +647,56 @@ int main(void)
     suite.expect(
         VultrBrainIaaS::nextMachineProvisioningPollDelayMs(&initial, changed) == 0,
         "vultr_machine_provisioning_changed_phase_polls_immediately");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "gone-machine"_ctv, failure);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 1 &&
+                     http.requests[0].method == MultiCurlClient::Method::get,
+                 "vultr_delete_missing_machine_checks_bare_metal_before_idempotent_success");
+    http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 2 &&
+                     http.requests[1].method == MultiCurlClient::Method::get,
+                 "vultr_delete_missing_machine_checks_vm_before_idempotent_success");
+    http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty(),
+                 "vultr_delete_verified_missing_machine_is_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "ambiguous-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::transportFailure, 404);
+    suite.expect(stack.hasSuspendedCoroutines() == false &&
+                     failure == "vultr machine deletion failed"_ctv,
+                 "vultr_delete_transport_failure_is_not_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http);
+    CoroutineStack stack = {};
+    String failure = {};
+    provider.destroyMachine(&stack, "raced-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instance":{"id":"raced-machine"}})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 3 &&
+                     http.requests[2].method == MultiCurlClient::Method::delete_,
+                 "vultr_delete_verified_machine_submits_exact_vm_delete");
+    http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty(),
+                 "vultr_delete_raced_verified_not_found_is_idempotent");
   }
 
   basics_log("SUMMARY: failed=%d\n", suite.failed);

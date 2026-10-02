@@ -44,6 +44,22 @@ public:
   }
 };
 
+static bool shellSyntaxValid(String command)
+{
+  pid_t child = ::fork();
+  if (child == 0)
+  {
+    ::execl("/bin/sh", "sh", "-n", "-c", command.c_str(), nullptr);
+    _exit(127);
+  }
+  if (child < 0)
+  {
+    return false;
+  }
+  int status = 0;
+  return ::waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 class ScopedEnvVar {
 public:
 
@@ -1381,6 +1397,8 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v zstd"), "plan_install_command_zstd_preflight");
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v btrfs"), "plan_install_command_btrfs_preflight");
   suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install -y --no-install-recommends zstd"), "plan_install_command_zstd_install_fallback");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "pacman -Syu --noconfirm --needed zstd btrfs-progs"), "plan_install_command_arch_zstd_btrfs_install_fallback");
+  suite.expect(shellSyntaxValid(singleSeedPlan.installCommand), "plan_install_command_shell_syntax_valid");
   suite.expect(stringContains(singleSeedPlan.installCommand, "btrfs-progs"), "plan_install_command_btrfs_install_fallback");
   suite.expect(stringContains(singleSeedPlan.installCommand, "mkfs.btrfs -f"), "plan_install_command_container_root_mkfs");
   suite.expect(stringContains(singleSeedPlan.installCommand, "mount -o loop,nosuid,nodev"), "plan_install_command_container_root_mount");
