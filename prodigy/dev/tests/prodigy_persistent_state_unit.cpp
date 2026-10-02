@@ -1967,6 +1967,131 @@ int main(void)
                 expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0]),
         "extract_snapshot_secrets_moves_full_runtime_container_record_to_private_sidecar");
     {
+      ProdigyPersistentBrainSnapshot twoRuntimeRecords = expectedManagedSnapshot;
+      BrainReplicatedContainerRuntimeState firstRuntimeRecord =
+          twoRuntimeRecords.masterAuthority.containerRuntimeStates[0];
+      firstRuntimeRecord.machineUUID = uint128_t(0x72900001);
+      firstRuntimeRecord.plan.uuid = uint128_t(0x72910001);
+      firstRuntimeRecord.plan.credentialBundle.apiCredentials[0].material.assign(
+          "runtime-sidecar-credential-a"_ctv);
+      firstRuntimeRecord.plan.subscriptionPairings.clear();
+      SubscriptionPairing firstRuntimePairing = {};
+      firstRuntimePairing.secret = uint128_t(0x72920001);
+      firstRuntimePairing.address = uint128_t(0x72930001);
+      firstRuntimePairing.service = uint64_t(0x72940001);
+      firstRuntimePairing.port = 17001;
+      firstRuntimeRecord.plan.subscriptionPairings.insert(0x72950001, firstRuntimePairing);
+      firstRuntimeRecord.plan.wormholes.clear();
+      Wormhole firstRuntimeWormhole = {};
+      firstRuntimeWormhole.name.assign("sidecar-a"_ctv);
+      firstRuntimeWormhole.externalPort = 17001;
+      firstRuntimeWormhole.containerPort = 17001;
+      firstRuntimeWormhole.layer4 = 17;
+      firstRuntimeWormhole.isQuic = true;
+      firstRuntimeWormhole.hasQuicCidKeyState = true;
+      firstRuntimeWormhole.quicCidKeyState.rotationHours = 48;
+      firstRuntimeWormhole.quicCidKeyState.activeKeyIndex = 1;
+      firstRuntimeWormhole.quicCidKeyState.rotatedAtMs = 1'700'729'001'000;
+      firstRuntimeWormhole.quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x72960001);
+      firstRuntimeWormhole.quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0x72960002);
+      firstRuntimeRecord.plan.wormholes.push_back(firstRuntimeWormhole);
+
+      BrainReplicatedContainerRuntimeState secondRuntimeRecord = firstRuntimeRecord;
+      secondRuntimeRecord.machineUUID = uint128_t(0x72900002);
+      secondRuntimeRecord.plan.uuid = uint128_t(0x72910002);
+      secondRuntimeRecord.plan.credentialBundle.apiCredentials[0].material.assign(
+          "runtime-sidecar-credential-b"_ctv);
+      secondRuntimeRecord.plan.subscriptionPairings.clear();
+      SubscriptionPairing secondRuntimePairing = {};
+      secondRuntimePairing.secret = uint128_t(0x72920002);
+      secondRuntimePairing.address = uint128_t(0x72930002);
+      secondRuntimePairing.service = uint64_t(0x72940002);
+      secondRuntimePairing.port = 17002;
+      secondRuntimeRecord.plan.subscriptionPairings.insert(0x72950002, secondRuntimePairing);
+      secondRuntimeRecord.plan.wormholes[0].name.assign("sidecar-b"_ctv);
+      secondRuntimeRecord.plan.wormholes[0].externalPort = 17002;
+      secondRuntimeRecord.plan.wormholes[0].containerPort = 17002;
+      secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.rotationHours = 72;
+      secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.activeKeyIndex = 0;
+      secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.rotatedAtMs = 1'700'729'002'000;
+      secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[0] = uint128_t(0x72960003);
+      secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1] = uint128_t(0x72960004);
+      twoRuntimeRecords.masterAuthority.containerRuntimeStates.clear();
+      twoRuntimeRecords.masterAuthority.containerRuntimeStates.push_back(firstRuntimeRecord);
+      twoRuntimeRecords.masterAuthority.containerRuntimeStates.push_back(secondRuntimeRecord);
+
+      ProdigyPersistentBrainSnapshot publicTwoRuntimeRecords = {};
+      ProdigyPersistentBrainSnapshotSecrets twoRuntimeRecordSecrets = {};
+      prodigyExtractPersistentBrainSnapshotSecrets(
+          std::move(twoRuntimeRecords), publicTwoRuntimeRecords, twoRuntimeRecordSecrets);
+      String rawPublicTwoRuntimeRecords = {};
+      String rawTwoRuntimeRecordSecrets = {};
+      BitseryEngine::serialize(rawPublicTwoRuntimeRecords, publicTwoRuntimeRecords);
+      BitseryEngine::serialize(rawTwoRuntimeRecordSecrets, twoRuntimeRecordSecrets);
+      String firstRuntimePairingNeedle = {};
+      firstRuntimePairingNeedle.assign(
+          reinterpret_cast<const char *>(&firstRuntimePairing.secret), sizeof(firstRuntimePairing.secret));
+      String secondRuntimePairingNeedle = {};
+      secondRuntimePairingNeedle.assign(
+          reinterpret_cast<const char *>(&secondRuntimePairing.secret), sizeof(secondRuntimePairing.secret));
+      String firstRuntimeCidNeedle = {};
+      firstRuntimeCidNeedle.assign(
+          reinterpret_cast<const char *>(&firstRuntimeWormhole.quicCidKeyState.keyMaterialByIndex[0]),
+          sizeof(firstRuntimeWormhole.quicCidKeyState.keyMaterialByIndex[0]));
+      String secondRuntimeCidNeedle = {};
+      secondRuntimeCidNeedle.assign(
+          reinterpret_cast<const char *>(&secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1]),
+          sizeof(secondRuntimeRecord.plan.wormholes[0].quicCidKeyState.keyMaterialByIndex[1]));
+      suite.expect(
+          stringContains(rawPublicTwoRuntimeRecords, "runtime-sidecar-credential-a"_ctv) == false &&
+              stringContains(rawPublicTwoRuntimeRecords, "runtime-sidecar-credential-b"_ctv) == false &&
+              stringContains(rawPublicTwoRuntimeRecords, firstRuntimePairingNeedle) == false &&
+              stringContains(rawPublicTwoRuntimeRecords, secondRuntimePairingNeedle) == false &&
+              stringContains(rawPublicTwoRuntimeRecords, firstRuntimeCidNeedle) == false &&
+              stringContains(rawPublicTwoRuntimeRecords, secondRuntimeCidNeedle) == false,
+          "extract_snapshot_secrets_scrubs_two_runtime_sidecar_credentials_pairings_and_quic_cids");
+
+      ProdigyPersistentBrainSnapshot restoredTwoRuntimeRecords = {};
+      ProdigyPersistentBrainSnapshotSecrets restoredTwoRuntimeRecordSecrets = {};
+      const bool decodedTwoRuntimeRecords =
+          BitseryEngine::deserializeSafe(rawPublicTwoRuntimeRecords, restoredTwoRuntimeRecords) &&
+          BitseryEngine::deserializeSafe(rawTwoRuntimeRecordSecrets, restoredTwoRuntimeRecordSecrets);
+      suite.expect(
+          decodedTwoRuntimeRecords,
+          "two_runtime_sidecars_roundtrip_through_existing_snapshot_schema");
+      const bool haveTwoRuntimeSidecars =
+          decodedTwoRuntimeRecords && restoredTwoRuntimeRecordSecrets.containerRuntimeStateSecrets.size() == 2;
+      suite.expect(
+          haveTwoRuntimeSidecars,
+          "two_runtime_sidecars_roundtrip_keeps_exact_sidecar_count");
+      if (haveTwoRuntimeSidecars)
+      {
+        std::swap(
+            restoredTwoRuntimeRecordSecrets.containerRuntimeStateSecrets[0],
+            restoredTwoRuntimeRecordSecrets.containerRuntimeStateSecrets[1]);
+        String twoRuntimeRecordRestoreFailure = {};
+        suite.expect(
+            prodigyApplyPersistentBrainSnapshotSecrets(
+                restoredTwoRuntimeRecords, restoredTwoRuntimeRecordSecrets, &twoRuntimeRecordRestoreFailure),
+            "apply_snapshot_secrets_accepts_reordered_two_runtime_sidecars");
+        const auto& restoredRuntimeRecords = restoredTwoRuntimeRecords.masterAuthority.containerRuntimeStates;
+        suite.expect(
+            restoredRuntimeRecords.size() == 2 &&
+                restoredRuntimeRecords[0].machineUUID == firstRuntimeRecord.machineUUID &&
+                restoredRuntimeRecords[0].plan.uuid == firstRuntimeRecord.plan.uuid &&
+                prodigyPersistentContainerRuntimeStateEqual(restoredRuntimeRecords[0], firstRuntimeRecord) &&
+                restoredRuntimeRecords[1].machineUUID == secondRuntimeRecord.machineUUID &&
+                restoredRuntimeRecords[1].plan.uuid == secondRuntimeRecord.plan.uuid &&
+                prodigyPersistentContainerRuntimeStateEqual(restoredRuntimeRecords[1], secondRuntimeRecord),
+            "apply_snapshot_secrets_reordered_sidecars_restore_matching_runtime_identity_records");
+      }
+      else
+      {
+        suite.expect(false, "apply_snapshot_secrets_accepts_reordered_two_runtime_sidecars");
+        suite.expect(false, "apply_snapshot_secrets_reordered_sidecars_restore_matching_runtime_identity_records");
+      }
+    }
+    {
       ProdigyPersistentBrainSnapshot restoredPublic = publicSnapshot;
       String restoreFailure = {};
       suite.expect(

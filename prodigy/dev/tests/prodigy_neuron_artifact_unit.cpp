@@ -482,7 +482,7 @@ int main()
   const bool hasArtifactFixture = loadFixture(fixture);
   if (!hasArtifactFixture)
   {
-    dprintf(STDERR_FILENO, "SKIP: neuron artifact fixture requires PRODIGY_TEST_APP_ARTIFACT; callback receipt cases remain active\n");
+    suite.expect(false, "neuron_artifact_fixture_requires_PRODIGY_TEST_APP_ARTIFACT");
   }
 
   ScopedArtifactStore store = {};

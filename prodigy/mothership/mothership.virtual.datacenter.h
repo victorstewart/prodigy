@@ -15,10 +15,13 @@
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/persistent.state.h>
+#include <prodigy/remote.bootstrap.h>
 
 constexpr static const char *mothershipVirtualDatacenterPIDFilename = "virtual-datacenter.pid";
 constexpr static const char *mothershipVirtualDatacenterReadyFilename = "virtual-datacenter.ready";
 constexpr static const char *mothershipVirtualDatacenterProvisionedFilename = "virtual-datacenter.provisioned";
+constexpr static const char *mothershipVirtualDatacenterMembersProvisionedFilename = "virtual-datacenter.members-provisioned";
+constexpr static const char *mothershipVirtualDatacenterSeedRuntimeFilename = "virtual-datacenter.seed-runtime";
 constexpr static const char *mothershipVirtualDatacenterRuntimeFilename = "virtual-datacenter.runtime";
 
 static inline void mothershipVirtualDatacenterPath(const String& workspaceRoot, const char *name, String& path)
@@ -180,9 +183,28 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
   return true;
 }
 
-static inline bool mothershipProvisionVirtualDatacenter(
+static inline bool mothershipWriteVirtualDatacenterBootstrapMaterial(
     const MothershipProdigyCluster& cluster,
-    const ClusterTopology& topology,
+    uint32_t machineIndex,
+    const String& bootJSON,
+    const String& transportTLSJSON,
+    String *failure = nullptr)
+{
+  String bootPath = {};
+  bootPath.snprintf<"{}/boot/{itoa}.json"_ctv>(cluster.test.workspaceRoot, uint64_t(machineIndex));
+  if (mothershipVirtualDatacenterWriteFile(bootPath, bootJSON, 0600, failure) == false)
+  {
+    return false;
+  }
+  String transportTLSPath = {};
+  transportTLSPath.snprintf<"{}/transport-tls/{itoa}.json"_ctv>(cluster.test.workspaceRoot, uint64_t(machineIndex));
+  return mothershipVirtualDatacenterWriteFile(transportTLSPath, transportTLSJSON, 0600, failure);
+}
+
+static inline bool mothershipProvisionVirtualDatacenterSeed(
+    const MothershipProdigyCluster& cluster,
+    const ClusterTopology& seedTopology,
+    const AddMachines& request,
     const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
     const String& bundlePath,
     String *failure = nullptr)
@@ -193,10 +215,10 @@ static inline bool mothershipProvisionVirtualDatacenter(
     return false;
   }
 
-  String bootDirectory = {};
-  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "boot", bootDirectory);
-
-  for (uint32_t index = 0; index < topology.machines.size(); ++index)
+  // The provider has already created every disposable root, but only this
+  // phase authorizes the seed executable. Followers cannot start before their
+  // configured, cluster-owned transport state exists.
+  for (uint32_t index = 0; index < cluster.test.machineCount; ++index)
   {
     String installRoot = {};
     installRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(index + 1));
@@ -205,24 +227,50 @@ static inline bool mothershipProvisionVirtualDatacenter(
       return false;
     }
 
-    ProdigyPersistentBootState state = {};
-    state.bootstrapConfig.nodeRole = topology.machines[index].isBrain ? ProdigyBootstrapNodeRole::brain : ProdigyBootstrapNodeRole::neuron;
-    mothershipResolveTestClusterControlSocketPath(cluster, state.bootstrapConfig.controlSocketPath);
-    prodigyRenderClusterTopologyBootstrapPeers(topology.machines[index], topology, state.bootstrapConfig.bootstrapPeers);
-    state.initialTopology = topology;
-    prodigyOwnRuntimeEnvironmentConfig(runtimeEnvironment, state.runtimeEnvironment);
+  }
 
-    String bootJSON = {};
-    renderProdigyPersistentBootStateJSON(state, bootJSON);
-    String bootPath = {};
-    bootPath.snprintf<"{}/{itoa}.json"_ctv>(bootDirectory, uint64_t(index + 1));
-    if (mothershipVirtualDatacenterWriteFile(bootPath, bootJSON, 0600, failure) == false)
-    {
-      return false;
-    }
+  if (seedTopology.machines.size() != 1)
+  {
+    if (failure) failure->assign("virtual datacenter seed bootstrap requires one-machine topology"_ctv);
+    return false;
+  }
+  String bootJSON = {}, transportTLSJSON = {};
+  if (prodigyBuildRemoteBootstrapBootMaterial(seedTopology.machines[0], request, seedTopology,
+                                              runtimeEnvironment, bootJSON, transportTLSJSON, failure) == false ||
+      mothershipWriteVirtualDatacenterBootstrapMaterial(cluster, 1, bootJSON, transportTLSJSON, failure) == false)
+  {
+    return false;
   }
 
   String provisionedPath = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterProvisionedFilename, provisionedPath);
   return mothershipVirtualDatacenterWriteFile(provisionedPath, approvedDigest, 0600, failure);
+}
+
+static inline bool mothershipProvisionVirtualDatacenterMembers(
+    const MothershipProdigyCluster& cluster,
+    const ClusterTopology& topology,
+    const AddMachines& request,
+    const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
+    String *failure = nullptr)
+{
+  if (topology.machines.size() != cluster.test.machineCount || topology.machines.empty())
+  {
+    if (failure) failure->assign("virtual datacenter member bootstrap topology is invalid"_ctv);
+    return false;
+  }
+  for (uint32_t index = 1; index < topology.machines.size(); ++index)
+  {
+    String bootJSON = {}, transportTLSJSON = {};
+    if (prodigyBuildRemoteBootstrapBootMaterial(topology.machines[index], request, topology, runtimeEnvironment,
+                                                bootJSON, transportTLSJSON, failure) == false ||
+        mothershipWriteVirtualDatacenterBootstrapMaterial(cluster, index + 1, bootJSON, transportTLSJSON, failure) == false)
+    {
+      return false;
+    }
+  }
+  String membersProvisionedPath = {};
+  mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, mothershipVirtualDatacenterMembersProvisionedFilename,
+                                  membersProvisionedPath);
+  return mothershipVirtualDatacenterWriteFile(membersProvisionedPath, "members\n"_ctv, 0600, failure);
 }

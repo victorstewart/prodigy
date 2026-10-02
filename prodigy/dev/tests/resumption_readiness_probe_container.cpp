@@ -26,7 +26,6 @@
 #include <mutex>
 #include <poll.h>
 #include <picoquic.h>
-#include <picoquic_internal.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1404,7 +1403,7 @@ static int runPicoquicClientMode(int argc, char *argv[])
   context.connection = picoquic_create_cnx(
       context.quic,
       initialConnectionID,
-      picoquic_null_connection_id,
+      picoquic_connection_id_t{},
       reinterpret_cast<const sockaddr *>(&serverAddress),
       picoquic_current_time(),
       0,

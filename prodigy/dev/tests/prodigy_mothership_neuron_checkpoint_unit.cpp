@@ -22,12 +22,12 @@ int main()
   original.runtimeReady = true;
   original.hasCredentialBundle = true;
   original.credentialBundle.bundleGeneration = 19;
-  original.subscriptionPairings.push_back(SubscriptionPairing(0x1111, 0x2222, 37, 8080));
-  original.advertisementPairings.push_back(AdvertisementPairing(0x3333, 0x4444, 37));
+  original.subscriptionPairings[37].push_back(SubscriptionPairing(0x1111, 0x2222, 37, 8080));
+  original.advertisementPairings[37].push_back(AdvertisementPairing(0x3333, 0x4444, 37));
   ContainerPlan second = original;
   second.uuid = 72;
   second.credentialBundle.bundleGeneration = 20;
-  second.subscriptionPairings[0].secret = 0x5555;
+  second.subscriptionPairings[37][0].secret = 0x5555;
 
   String serialized = {}, serializedSecond = {};
   BitseryEngine::serialize(serialized, original);

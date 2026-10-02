@@ -7542,14 +7542,40 @@ public:
       BrainView *peer, const ProdigyMasterAuthorityRuntimeState& incoming, const String& serialized)
   {
     String transitionDigest;
-    // Every authority revision participates in the same durable receipt barrier,
-    // including ordinary state with no elastic, retirement or update journal.
-    if (applyReplicatedMachineRetirementTopology(incoming) &&
-        replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming) &&
-        prodigyComputeSHA256Hex(serialized, transitionDigest))
+    if (peer == nullptr ||
+        prodigyComputeSHA256Hex(serialized, transitionDigest) == false)
     {
-      sendMasterAuthorityTransitionAcknowledgement(peer, incoming.generation, transitionDigest);
+      return;
     }
+
+    // A retirement topology write is part of accepting this authority revision.
+    // Keep the acknowledgement behind its receipt, and re-resolve the peer after
+    // an asynchronous completion so an old transport generation cannot ACK it.
+    const uint64_t authorityEpoch = masterAuthorityEpoch;
+    const uint128_t peerUUID = peer->uuid;
+    const int64_t peerBootTime = peer->boottimens;
+    const uint64_t peerGeneration = peer->ioGeneration;
+    const int peerFileSlot = peer->fslot;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    (void)applyReplicatedMachineRetirementTopology(
+        incoming,
+        [this, lifetime, authorityEpoch, peerUUID, peerBootTime, peerGeneration, peerFileSlot,
+         generation = incoming.generation, incoming, transitionDigest = std::move(transitionDigest)](bool applied) mutable {
+          if (!applied || lifetime.expired() || weAreMaster || masterAuthorityEpoch != authorityEpoch ||
+              masterAuthorityRuntimeState.generation != generation ||
+              replicatedRuntimeStateCoversPendingElasticAddressOperations(incoming) == false)
+          {
+            return;
+          }
+          BrainView *currentPeer = findBrainViewByUUID(peerUUID);
+          if (currentPeer == nullptr || currentPeer->boottimens != peerBootTime ||
+              currentPeer->ioGeneration != peerGeneration || currentPeer->fslot != peerFileSlot ||
+              peerCanReplicateMasterAuthorityState(currentPeer) == false)
+          {
+            return;
+          }
+          sendMasterAuthorityTransitionAcknowledgement(currentPeer, generation, transitionDigest);
+        });
   }
 
   bool beginReplicatedMasterAuthorityTransition(
@@ -17694,7 +17720,9 @@ public:
 
     const bool wroteCarrier = writeMachineRetirementJournalCarrier();
     const bool carrierPresent = machineRetirementJournalPresent(masterAuthorityRuntimeState);
-    if (wroteCarrier == false || carrierPresent == false)
+    const bool clearedCarrier = hadPreviousCarrier && wroteCarrier && carrierPresent == false;
+    if (wroteCarrier == false ||
+        (carrierPresent == false && clearedCarrier == false))
     {
       if (hadPreviousCarrier)
       {
@@ -17887,6 +17915,20 @@ public:
       return false;
     }
 
+    // This API reports whether the retirement journal was admitted.  Reject an
+    // initial carrier before mutating local retirement state when the current
+    // peer set cannot recover that carrier.  Later durable receipt failure is
+    // reported through `completion`, because production persistence is async.
+    auto existingCarrier = masterAuthorityRuntimeState.taskExecutions.find(
+        machineRetirementJournalExecutionID);
+    if ((existingCarrier != masterAuthorityRuntimeState.taskExecutions.end() &&
+         machineRetirementJournalCarrier(existingCarrier->second) == false) ||
+        (existingCarrier == masterAuthorityRuntimeState.taskExecutions.end() &&
+         machineRetirementPeersSupportJournal() == false))
+    {
+      return false;
+    }
+
     bytell_hash_map<uint64_t, RetiredMachineIdentity> previousRetirements = retiredMachineIdentities;
     const uint64_t previousNextIdentityID = nextRetiredMachineIdentityID;
     RetiredMachineIdentity merged = {};
@@ -18062,11 +18104,14 @@ public:
   }
 
   bool applyReplicatedMachineRetirementTopology(
-      const ProdigyMasterAuthorityRuntimeState& state)
+      const ProdigyMasterAuthorityRuntimeState& state,
+      PersistenceCompletion completion = {})
   {
+    const uint64_t authorityGeneration = state.generation;
     ProdigyMachineRetirementJournal journal = {};
     if (decodeMachineRetirementJournal(state, journal) == false)
     {
+      if (completion) completion(false);
       return false;
     }
     uint64_t requiredVersion = 0;
@@ -18076,12 +18121,14 @@ public:
     }
     if (requiredVersion == 0)
     {
+      if (completion) completion(true);
       return true;
     }
 
     ClusterTopology topology = {};
     if (loadAuthoritativeClusterTopology(topology) == false)
     {
+      if (completion) completion(false);
       return false;
     }
     const uint32_t before = uint32_t(topology.machines.size());
@@ -18104,24 +18151,28 @@ public:
     {
       if (machineRetirementPersistencePending)
       {
+        if (completion) completion(false);
         return false;
       }
       const uint64_t authorityEpoch = masterAuthorityEpoch;
       const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
       machineRetirementPersistencePending = true;
       persistAuthoritativeClusterTopologyAsync(topology,
-          [this, lifetime, topology, authorityEpoch](bool durable) {
+          [this, lifetime, topology, authorityEpoch, authorityGeneration,
+           completion = std::move(completion)](bool durable) mutable {
             if (lifetime.expired()) return;
             machineRetirementPersistencePending = false;
-            if (durable && masterAuthorityEpoch == authorityEpoch)
-            {
-              (void)applyPostRetirementBrainMembership(topology);
-            }
+            const bool current = durable && masterAuthorityEpoch == authorityEpoch &&
+                                 masterAuthorityRuntimeState.generation == authorityGeneration;
+            const bool applied = current && applyPostRetirementBrainMembership(topology);
+            if (completion) completion(applied);
             armMachineRetirementRecheck();
           });
       return true;
     }
-    return applyPostRetirementBrainMembership(topology);
+    const bool applied = applyPostRetirementBrainMembership(topology);
+    if (completion) completion(applied);
+    return applied;
   }
 
   void finishRetiredMachineAuthoritativeTopology(
@@ -22658,6 +22709,11 @@ public:
       releaseObservedDeploymentQuiescence(retirement, graph);
     }
     authorizeCompletedMachineRetirements(graph);
+    if (machineRetirementPersistencePending)
+    {
+      armMachineRetirementRecheck();
+      return;
+    }
 
     Vector<NeuronView *> candidates;
     for (auto& [neuron, retirement] : retiringMachinesByNeuron)
@@ -22811,6 +22867,7 @@ public:
         append(candidate);
       }
       bytell_hash_set<DeploymentWork *> work;
+      bytell_hash_set<DeploymentWork *> visited;
       auto appendContainer = [&](ContainerView *container) -> void {
         if (container != nullptr)
         {
@@ -22847,7 +22904,7 @@ public:
       {
         DeploymentWork *pending = *work.begin();
         work.erase(pending);
-        if (pending == nullptr)
+        if (pending == nullptr || visited.insert(pending).second == false)
         {
           continue;
         }
@@ -23138,10 +23195,18 @@ public:
       return;
     }
 
-    // Every same-identity alias is quarantined separately before this exact drain.
+    // drainMachine removes its current container-index entry.  Snapshot the
+    // deployment IDs so that removal cannot invalidate this traversal.
+    Vector<uint64_t> deploymentIDs;
+    deploymentIDs.reserve(machine->containersByDeploymentID.size());
     for (const auto& [deploymentID, containersOnMachine] : machine->containersByDeploymentID)
     {
       (void)containersOnMachine;
+      deploymentIDs.push_back(deploymentID);
+    }
+    // Every same-identity alias is quarantined separately before this exact drain.
+    for (uint64_t deploymentID : deploymentIDs)
+    {
       if (auto it = deployments.find(deploymentID); it != deployments.end() && it->second)
       {
         it->second->drainMachine(machine, true);

@@ -880,6 +880,10 @@ public:
   virtual bool destroyCreatedSeedMachine(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, String *failure = nullptr) = 0;
   virtual bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool configureSeedCluster(const MothershipProdigyCluster& cluster, const BrainConfig& config, String *failure = nullptr) = 0;
+  // Test providers receive canonical follower bootstrap material only after
+  // the seed has accepted this configuration. They then use ordinary
+  // addMachines admission; the provider never changes Brain state itself.
+  virtual bool addTestClusterMembers(const MothershipProdigyCluster& cluster, const ClusterTopology& seedTopology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool fetchSeedTopology(const MothershipProdigyCluster& cluster, ClusterTopology& topology, String *failure = nullptr) = 0;
   virtual bool applyAddMachines(const MothershipProdigyCluster& cluster, const AddMachines& request, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool upsertMachineSchemas(const MothershipProdigyCluster& cluster, const Vector<ProdigyManagedMachineSchemaPatch>& patches, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
@@ -1054,6 +1058,19 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   }
 
   ClusterTopology currentTopology = cluster.topology;
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.machineCount > 1)
+  {
+    ClusterTopology expandedTopology = {};
+    String localFailure = {};
+    ProdigyTimingAttribution stageTiming = {};
+    if (hooks.addTestClusterMembers(cluster, currentTopology, config.runtimeEnvironment, expandedTopology, &stageTiming, &localFailure) == false)
+    {
+      return failWithCleanup(localFailure);
+    }
+    currentTopology = std::move(expandedTopology);
+    cluster.topology = currentTopology;
+    mothershipAccumulateClusterCreateTimingStage(timingSummary, &MothershipClusterCreateTimingSummary::applyAddMachines, stageTiming);
+  }
   bool requiresExplicitSeedTopologyFetch =
       cluster.deploymentMode != MothershipClusterDeploymentMode::remote || cluster.machines.empty() == false;
   if (requiresExplicitSeedTopologyFetch)

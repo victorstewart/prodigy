@@ -434,6 +434,8 @@ set(PRODIGY_PINGPONG_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong.Discom
 set(PRODIGY_PINGPONG_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.DiscombobuFile")
 set(PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.DiscombobuFile")
+set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
 set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 configure_file(
@@ -451,6 +453,11 @@ set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_isolation)
 configure_file(
    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
    "${PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE}"
+   @ONLY
+)
+configure_file(
+   "${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider.DiscombobuFile.in"
+   "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
    @ONLY
 )
 set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_unready)
@@ -564,6 +571,7 @@ add_executable(prodigy_bootstrap_config_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/p
 add_executable(prodigy_persistent_state_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_persistent_state_unit.cpp)
 add_executable(prodigy_async_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_async_persistence_unit.cpp)
 add_executable(prodigy_brain_async_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_async_authority_unit.cpp)
+add_executable(prodigy_brain_retirement_authority_ack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_retirement_authority_ack_unit.cpp)
 add_executable(prodigy_runtime_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_persistence_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(prodigy_runtime_environment_bgp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_environment_bgp_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_tls_unit.cpp)
@@ -667,6 +675,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_persistent_state_unit
    prodigy_async_persistence_unit
    prodigy_brain_async_authority_unit
+   prodigy_brain_retirement_authority_ack_unit
    prodigy_runtime_environment_bgp_unit
    prodigy_runtime_persistence_unit
    prodigy_transport_tls_unit
@@ -842,7 +851,6 @@ target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
 target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoquic::picoquic)
 target_link_libraries(prodigy_public_tls_probe_container PRIVATE openssl::ssl openssl::crypto)
-target_include_directories(prodigy_resumption_readiness_probe_container PRIVATE "${PRODIGY_ROOT}/.depos/.root/downloads/picoquic/release/master-6a14757/src/picoquic")
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
 list(REMOVE_ITEM PRODIGY_PTHREAD_TARGETS prodigy mothership prodigy_sdk_cpp_unit)
@@ -876,7 +884,10 @@ target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1 PRODI
 target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_machine_pinger_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
-target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC
+   PRODIGY_DEBUG=1
+   PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT="${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+)
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_container_overlay_sync_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_switchboard_whitehole_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
@@ -925,6 +936,7 @@ target_compile_options(prodigy_bootstrap_config_unit PUBLIC -O2)
 target_compile_options(prodigy_persistent_state_unit PUBLIC -O2)
 target_compile_options(prodigy_async_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_async_authority_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_retirement_authority_ack_unit PUBLIC -O2)
 target_compile_options(prodigy_runtime_environment_bgp_unit PUBLIC -O2)
 target_compile_options(prodigy_runtime_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
@@ -1196,6 +1208,27 @@ add_custom_command(
 add_custom_target(prodigy_pingpong_isolation_container_artifact ALL DEPENDS "${PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT}")
 
 add_custom_command(
+   OUTPUT "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
+           --context "provider=$<TARGET_FILE_DIR:prodigy_mothership_tunnel_provider>"
+           --output "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+           --kind mothership-tunnel-provider
+   DEPENDS prodigy_mothership_tunnel_provider
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider.DiscombobuFile.in"
+           "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building Prodigy Mothership tunnel-provider system container"
+   VERBATIM
+)
+add_custom_target(prodigy_mothership_tunnel_provider_artifact DEPENDS "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}")
+
+add_custom_command(
    OUTPUT "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
@@ -1291,6 +1324,13 @@ add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha2
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
+add_dependencies(prodigy_brain_replication_credentials_unit prodigy_mothership_tunnel_provider_artifact)
+foreach(_prodigy_artifact_test IN ITEMS
+   prodigy_artifact_io_unit
+   prodigy_mothership_artifact_responsiveness_unit
+   prodigy_neuron_artifact_unit)
+   add_dependencies(${_prodigy_artifact_test} prodigy_pingpong_container_artifact)
+endforeach()
 add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
 add_dependencies(prodigy_mothership_cluster_report_unit mothership)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
@@ -1758,6 +1798,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_hub_unit
    )
    add_test(NAME prodigy_neuron_artifact_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_neuron_artifact_unit)
+   set_tests_properties(
+      prodigy_artifact_io_unit
+      prodigy_mothership_artifact_responsiveness_unit
+      prodigy_neuron_artifact_unit
+      PROPERTIES ENVIRONMENT "PRODIGY_TEST_APP_ARTIFACT=${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
+   )
 
    add_test(
       NAME prodigy_ring_recvmsg_multishot_unit
@@ -1829,6 +1875,16 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_test_cluster_darwin_route_unit PROPERTIES TIMEOUT 15)
    add_test(
+      NAME prodigy_dev_netns_harness_cleanup_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness_cleanup_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness.sh
+   )
+   set_tests_properties(prodigy_dev_netns_harness_cleanup_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_virtual_datacenter_cgroup_root_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_cgroup_root_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
+   )
+   set_tests_properties(prodigy_virtual_datacenter_cgroup_root_unit PROPERTIES TIMEOUT 15)
+   add_test(
       NAME prodigy_virtual_datacenter_bounded_log_unit
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_bounded_log_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
    )
@@ -1887,6 +1943,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_async_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit
    )
+   add_test(NAME prodigy_brain_retirement_authority_ack_unit
+      COMMAND $<TARGET_FILE:prodigy_brain_retirement_authority_ack_unit>)
+   set_tests_properties(prodigy_brain_retirement_authority_ack_unit PROPERTIES TIMEOUT 30)
    add_test(
       NAME prodigy_brain_async_authority_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_async_authority_unit
@@ -2096,6 +2155,19 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_brain_master_uuid_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_master_uuid_unit
    )
+   set_tests_properties(prodigy_brain_master_uuid_unit PROPERTIES TIMEOUT 120)
+   add_test(
+      NAME prodigy_machine_decommission_suspended_drain_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-decommission-suspended-drain
+              $<TARGET_FILE:prodigy_brain_master_uuid_unit>
+   )
+   set_tests_properties(prodigy_machine_decommission_suspended_drain_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_machine_decommission_evacuation_receipt_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-decommission-evacuation-receipt
+              $<TARGET_FILE:prodigy_brain_master_uuid_unit>
+   )
+   set_tests_properties(prodigy_machine_decommission_evacuation_receipt_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_brain_ipv6_topology_unit
@@ -2109,11 +2181,52 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
 
    add_test(
+      NAME prodigy_authority_persistence_retry_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=authority-persistence-retry
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_authority_persistence_retry_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_async_retirement_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-retirement
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_async_retirement_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_brain_configuration_replication_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=credential-fixture-repairs
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_brain_configuration_replication_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_async_tls_publication_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-tls
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   add_test(
+      NAME prodigy_tls_resumption_ack_stability_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_async_tls_publication_unit prodigy_tls_resumption_ack_stability_unit
+      PROPERTIES TIMEOUT 30)
+
+   add_test(
       NAME prodigy_container_crash_recovery_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=crash-recovery
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
    )
    set_tests_properties(prodigy_container_crash_recovery_unit PROPERTIES TIMEOUT 30)
+   foreach(scenario IN ITEMS api-credential-policy api-credential-expiry-notification
+      durable-container-launch duplicate-inventory-recovery persisted-inventory-runtime)
+      string(REPLACE "-" "_" scenario_name "${scenario}")
+      add_test(
+         NAME prodigy_${scenario_name}_unit
+         COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=${scenario}
+                 $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+      )
+      set_tests_properties(prodigy_${scenario_name}_unit PROPERTIES TIMEOUT 30)
+   endforeach()
    add_test(
       NAME prodigy_completed_witness_supersession_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=completed-witness-supersession
@@ -2217,6 +2330,7 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_mothership_virtual_datacenter_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_virtual_datacenter_unit
    )
+   set_tests_properties(prodigy_mothership_virtual_datacenter_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_mothership_neuron_checkpoint_unit
@@ -2290,5 +2404,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
          NAME prodigy_ci_runner_help
          COMMAND ${CMAKE_BINARY_DIR}/prodigy_ci --help
       )
+      add_test(
+         NAME prodigy_ci_runner_unit
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_ci_runner_unit.py
+                 ${RUSTC_EXECUTABLE} ${PRODIGY_CI_RS} ${CMAKE_COMMAND}
+      )
+      set_tests_properties(prodigy_ci_runner_unit PROPERTIES TIMEOUT 240)
    endif()
 endif()

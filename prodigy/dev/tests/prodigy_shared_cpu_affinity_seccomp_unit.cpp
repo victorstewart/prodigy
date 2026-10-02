@@ -4,8 +4,8 @@
 
 static_assert(std::is_same_v<
               decltype(&ContainerManager::spinContainer),
-              void (*)(ContainerPlan, uint128_t, NeuronContainerMetricPolicy)>,
-              "suspending container launch must own its metric policy");
+              void (*)(ContainerPlan, uint128_t, NeuronContainerMetricPolicy, RetainedContainerStorageSource)>,
+              "suspending container launch must own its metric policy and retained storage source");
 
 #include <atomic>
 #include <cerrno>

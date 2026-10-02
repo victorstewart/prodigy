@@ -53,6 +53,13 @@ static void testPublicationPreservesSelectedMachine(TestSuite& suite)
   if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
   { suite.expect(false, "publication_fixture_reads_provider_owner"); return; }
   std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  suite.expect(text.find("members_provisioned_path=") != std::string::npos &&
+               text.find("while [[ ! -r \"${members_provisioned_path}\" ]]") != std::string::npos &&
+               text.find("start_machine 1") != std::string::npos,
+               "provider_starts_seed_before_member_receipt");
+  suite.expect(text.find("--transport-tls-json-path=${transport_tls_path}") != std::string::npos &&
+               text.find("PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR=") == std::string::npos,
+               "provider_requires_canonical_transport_tls_material");
   size_t begin = text.find("publish_runtime()\n{\n");
   size_t end = text.find("\nrecovery_hold()\n", begin);
   if (begin == std::string::npos || end == std::string::npos)
@@ -104,6 +111,62 @@ publish_runtime
   for (const char *name : {"probe.sh", "manifest.json", "runtime"})
   { String path = {}; mothershipVirtualDatacenterPath(String(temporary), name, path); ::unlink(path.c_str()); }
   ::rmdir(temporary);
+}
+
+static void testTwoPhaseStartGate(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  suite.expect(root != std::string::npos, "phase_gate_fixture_locates_provider_owner");
+  if (root == std::string::npos) return;
+  sourcePath.resize(root);
+  sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024) == false)
+  { suite.expect(false, "phase_gate_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  size_t begin = text.find("start_initial_runtime()\n{\n");
+  size_t end = text.find("\nif [[ \"${adopted_mode}\" -eq 0 ]]", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "phase_gate_fixture_extracts_provider_owner"); return; }
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+workspace="$PWD/workspace"
+seed_runtime_path="$workspace/seed-runtime"
+members_provisioned_path="$workspace/members-provisioned"
+machine_count=3
+pid=987
+machine_pids=()
+mkdir -p "$workspace"
+start_machine() { local index="$1"; machine_pids[$((index - 1))]=$((100 + index)); printf '%s\n' "$index" >> "$workspace/starts"; }
+start_initial_runtime & gate=$!
+for _ in $(seq 1 100); do [[ -r "$workspace/starts" ]] && break; sleep 0.01; done
+[[ "$(<"$workspace/starts")" == 1 ]]
+[[ ! -e "$seed_runtime_path" || "$(<"$seed_runtime_path")" == 101 ]]
+printf 'members\n' > "$members_provisioned_path"
+wait "$gate"
+[[ "$(tr '\n' ' ' < "$workspace/starts")" == '1 2 3 ' ]]
+rm -f "$workspace/starts" "$members_provisioned_path"
+start_initial_runtime & malformed=$!
+for _ in $(seq 1 100); do [[ -r "$workspace/starts" ]] && break; sleep 0.01; done
+printf 'unexpected\n' > "$members_provisioned_path"
+if wait "$malformed"; then exit 1; fi
+[[ "$(<"$workspace/starts")" == 1 ]]
+)TEST";
+  char temporary[] = "./vdc-phase-gate-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr)
+  { suite.expect(false, "phase_gate_fixture_creates_owned_directory"); return; }
+  String scriptPath = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", scriptPath);
+  String failure = {};
+  bool written = mothershipVirtualDatacenterWriteFile(scriptPath, String(script.c_str()), 0600, &failure);
+  pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0;
+  pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && waited == child && child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "provider_phase_gate_starts_seed_then_requires_valid_member_receipt");
+  std::filesystem::remove_all(temporary);
 }
 
 static void testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(TestSuite& suite)
@@ -347,6 +410,7 @@ int main(void)
 {
   TestSuite suite;
   testPublicationPreservesSelectedMachine(suite);
+  testTwoPhaseStartGate(suite);
   testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(suite);
   testFaultDatacenterBindsResetTicketToKilledPID(suite);
   testFaultLinkRebindsPublishedProvider(suite);
@@ -394,6 +458,41 @@ int main(void)
   suite.expect(containsAddress(topology.machines[0].addresses.privateAddresses, "fd00:10::a", 64), "topology_first_private_ipv6");
   suite.expect(containsAddress(topology.machines[0].addresses.publicAddresses, "2001:db8:100::a", 64), "topology_first_public_ipv6");
   suite.expect(topology.machines[0].peerAddresses.size() == 2, "topology_multihome_peer_addresses");
+
+  ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
+  AddMachines bootstrapRequest = {};
+  bootstrapRequest.clusterUUID = cluster.clusterUUID;
+  bootstrapRequest.controlSocketPath = controlSocketPath;
+  ClusterTopology seedTopology = topology;
+  seedTopology.machines.erase(seedTopology.machines.begin() + 1, seedTopology.machines.end());
+  String seedBootJSON = {}, seedTLSJSON = {}, peerBootJSON = {}, peerTLSJSON = {};
+  suite.expect(prodigyBuildRemoteBootstrapBootMaterial(seedTopology.machines[0], bootstrapRequest, seedTopology,
+                                                       runtimeEnvironment, seedBootJSON, seedTLSJSON, &failure),
+               "bootstrap_seed_material_builds");
+  ProdigyPersistentBootState seedBoot = {};
+  ProdigyPersistentLocalBrainState seedTLS = {};
+  suite.expect(parseProdigyPersistentBootStateJSON(seedBootJSON, seedBoot, &failure) &&
+               parseProdigyPersistentLocalBrainStateJSON(seedTLSJSON, seedTLS, &failure),
+               "bootstrap_seed_material_parses");
+  suite.expect(seedBoot.initialTopology.machines.size() == 1 &&
+               seedBoot.bootstrapConfig.bootstrapPeers.empty(),
+               "bootstrap_seed_starts_alone");
+  suite.expect(seedTLS.ownerClusterUUID == cluster.clusterUUID && seedTLS.transportTLSConfigured(),
+               "bootstrap_seed_uses_configured_cluster_tls_authority");
+  suite.expect(prodigyBuildRemoteBootstrapBootMaterial(topology.machines[1], bootstrapRequest, topology,
+                                                       runtimeEnvironment, peerBootJSON, peerTLSJSON, &failure),
+               "bootstrap_peer_material_builds");
+  ProdigyPersistentBootState peerBoot = {};
+  ProdigyPersistentLocalBrainState peerTLS = {};
+  suite.expect(parseProdigyPersistentBootStateJSON(peerBootJSON, peerBoot, &failure) &&
+               parseProdigyPersistentLocalBrainStateJSON(peerTLSJSON, peerTLS, &failure),
+               "bootstrap_peer_material_parses");
+  suite.expect(peerBoot.initialTopology.machines.size() == topology.machines.size() &&
+               peerBoot.bootstrapConfig.bootstrapPeers.size() == clusterTopologyBrainCount(topology) - 1,
+               "bootstrap_peer_receives_full_membership_before_admission");
+  suite.expect(peerTLS.ownerClusterUUID == seedTLS.ownerClusterUUID && peerTLS.uuid != seedTLS.uuid &&
+               peerTLS.transportTLS.clusterRootCertPem.equals(seedTLS.transportTLS.clusterRootCertPem),
+               "bootstrap_peer_shares_seed_authority_with_distinct_identity");
 
   uint64_t parsed = 0;
   char processState = 0;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 
 const PRODIGY_TARGET_ALL_FILTER: &str =
-   "^(prodigy_dev_[a-z0-9_]+|prodigy_[a-z0-9_]+)$";
+   "^(prodigy_dev_[a-z0-9_-]+|prodigy_[a-z0-9_-]+)$";
 const PRODIGY_TARGET_MESH_FILTER: &str =
    "^(prodigy_dev_mesh_unit|prodigy_dev_service_mesh_matrix_smoke|prodigy_dev_service_mesh_matrix_ci)$";
 const PRODIGY_TARGET_DEPLOYMENTS_FILTER: &str =
@@ -217,6 +217,7 @@ fn main() -> ExitCode
       .arg("--test-dir")
       .arg(&options.build_dir)
       .arg("--output-on-failure")
+      .arg("--no-tests=error")
       .arg("-R")
       .arg(&options.ctest_filter)
       .stdout(Stdio::inherit())

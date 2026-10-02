@@ -1,0 +1,4 @@
+FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@
+COPY {provider} ./mothership-tunnel-provider /tunnel/mothership-tunnel-provider
+SURVIVE /tunnel/mothership-tunnel-provider
+EXECUTE ["/tunnel/mothership-tunnel-provider"]

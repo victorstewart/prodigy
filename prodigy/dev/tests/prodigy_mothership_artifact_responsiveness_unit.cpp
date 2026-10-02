@@ -244,7 +244,7 @@ static void testBlockedArtifactWorkerDoesNotBlockRingOrAdmitStaleRequest(TestSui
   String blob = {};
   if (loadDiscombobulatorFixture(blob) == false)
   {
-    dprintf(STDERR_FILENO, "SKIP: mothership artifact responsiveness requires PRODIGY_TEST_APP_ARTIFACT\n");
+    suite.expect(false, "mothership_artifact_responsiveness_requires_PRODIGY_TEST_APP_ARTIFACT");
     return;
   }
 

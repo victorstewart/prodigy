@@ -224,16 +224,39 @@ cleanup()
 {
    local status="$?"
    local preserve_tmp="${keep_tmp}"
+   local cleanup_failure=
+   local remove_status=0
+   local observation_logs_copied=0
    trap - EXIT HUP INT TERM
    set +e
    [[ "${status}" -eq 0 ]] || preserve_tmp=1
+
+   preserve_observation_logs()
+   {
+      [[ "${observation_logs_copied}" == 1 ]] && return
+      copy_observation_logs
+      observation_logs_copied=1
+   }
+
    if [[ "${preserve_tmp}" == 1 ]]
    then
-      copy_observation_logs
+      preserve_observation_logs
    fi
    if [[ "${cluster_created}" == 1 ]]
    then
-      "${mothership_bin}" removeCluster "${cluster_name}" >"${tmpdir}/remove.log" 2>&1 || true
+      "${mothership_bin}" removeCluster "${cluster_name}" >"${tmpdir}/remove.log" 2>&1 || remove_status="$?"
+      if [[ "${remove_status}" -ne 0 ]]
+      then
+         cleanup_failure="removeCluster exited with status ${remove_status}"
+      elif ! rg -q '(^|[[:space:]])removeCluster success=1([[:space:]]|$)' "${tmpdir}/remove.log"
+      then
+         cleanup_failure="removeCluster did not report exact success receipt"
+      fi
+      if [[ -n "${cleanup_failure}" ]]
+      then
+         preserve_tmp=1
+         preserve_observation_logs
+      fi
    fi
    if [[ "${manifest_path}" != "${provider_manifest}" && -L "${manifest_path}" ]]
    then
@@ -244,6 +267,11 @@ cleanup()
       echo "DEBUG: preserved tmpdir ${tmpdir}"
    else
       rm -rf "${tmpdir}"
+   fi
+   if [[ -n "${cleanup_failure}" ]]
+   then
+      echo "FAIL: ${cleanup_failure}" >&2
+      [[ "${status}" -ne 0 ]] || status=1
    fi
    exit "${status}"
 }
@@ -304,6 +332,10 @@ create_request="$(jq -nc \
 
 if ! "${mothership_bin}" createCluster "${create_request}" >"${create_log}" 2>&1
 then
+   if rg -q "^createCluster success=0 created=1 name=${cluster_name} failure=" "${create_log}"
+   then
+      cluster_created=1
+   fi
    sed -n '1,260p' "${create_log}" >&2
    fail "Mothership could not create the test cluster"
 fi
