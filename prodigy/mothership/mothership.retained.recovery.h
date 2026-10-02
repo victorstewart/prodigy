@@ -71,6 +71,30 @@ static inline uint32_t mothershipRetainedRecoveryWitnessContainerCount(
   uint32_t count=0; for (const auto& witness:witnesses) count+=witness.containerBootstraps.size(); return count;
 }
 
+// A fenced retained process may have advanced its in-memory lifecycle after the
+// sealed parameters were captured.  Those observations are not recovery
+// authority: only a scheduled or healthy process is admissible, and its
+// readiness and live mesh edges must be rebuilt after recovery.  Every other
+// bootstrap field, including credentials, services, subscriptions and
+// advertisements, stays byte-equivalent under the persistent comparator.
+static inline bool mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(
+    const NeuronContainerBootstrap& observed,
+    NeuronContainerBootstrap reconstructed)
+{
+  if ((observed.plan.state != ContainerState::scheduled && observed.plan.state != ContainerState::healthy) ||
+      reconstructed.plan.state != ContainerState::scheduled || reconstructed.plan.runtimeReady)
+    return false;
+  reconstructed.plan.createdAtMs = observed.plan.createdAtMs;
+  reconstructed.plan.state = observed.plan.state;
+  reconstructed.plan.runtimeReady = observed.plan.runtimeReady;
+  reconstructed.plan.subscriptionPairings.clear();
+  reconstructed.plan.advertisementPairings.clear();
+  auto normalizedObserved = observed;
+  normalizedObserved.plan.subscriptionPairings.clear();
+  normalizedObserved.plan.advertisementPairings.clear();
+  return prodigyPersistentRetainedBootstrapEqual(normalizedObserved, reconstructed);
+}
+
 static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
     const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& actual,
     const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness>& expected,
@@ -101,8 +125,7 @@ static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
         // recovery inventory observes it later, so rebuilds with that later
         // observation by design.  Preserve the saved timestamp only after its
         // container UUID has bound the two otherwise complete bootstraps.
-        reconstructed.plan.createdAtMs=observed.plan.createdAtMs;
-        if (!prodigyPersistentRetainedBootstrapEqual(observed,reconstructed)) return false;
+        if (!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed,reconstructed)) return false;
         used[bootstrap]=1; matched=true; break;
       }
       if (!matched) return false;
@@ -512,8 +535,7 @@ static inline bool mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(
           observed.plan.uuid==proof.staleExcludedContainerUUID || !seen.insert(observed.plan.uuid).second) return false;
       const auto found=current.find(observed.plan.uuid); if(found==current.end()) return false;
       if (found->second.machineUUID!=witness.machineUUID) return false;
-      auto expected=found->second.bootstrap; expected.plan.createdAtMs=observed.plan.createdAtMs;
-      if(!prodigyPersistentRetainedBootstrapEqual(observed,expected)) return false;
+      if(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed,found->second.bootstrap)) return false;
       ++containers;
     }
   }

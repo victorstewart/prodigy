@@ -75,6 +75,60 @@ static void assertRetainedBootstrapUnorderedMapRoundTrip(void)
   assert(!prodigyPersistentRetainedBootstrapEqual(bootstrap, roundTrip));
 }
 
+static void assertRetainedRecoveryObservedLifecycleComparison(void)
+{
+  NeuronContainerBootstrap reconstructed = {};
+  reconstructed.plan.uuid = 0x91;
+  reconstructed.plan.state = ContainerState::scheduled;
+  reconstructed.plan.runtimeReady = false;
+  reconstructed.plan.config.memoryMB = 256;
+  reconstructed.plan.statefulMeshRoles.sibling = 41;
+  reconstructed.plan.subscriptions[100] = Subscription(100, ContainerState::scheduled,
+      ContainerState::destroying, SubscriptionNature::any);
+  reconstructed.plan.advertisements[200] = Advertisement(200, ContainerState::scheduled,
+      ContainerState::destroying, 4443);
+  SubscriptionPairing subscription = {};
+  subscription.service = 100; subscription.port = 4443; subscription.address = 0x12; subscription.secret = 0x34;
+  AdvertisementPairing advertisement = {};
+  advertisement.service = 200; advertisement.address = 0x56; advertisement.secret = 0x78;
+  reconstructed.plan.subscriptionPairings.insert(subscription.service, subscription);
+  reconstructed.plan.advertisementPairings.insert(advertisement.service, advertisement);
+
+  auto observed = reconstructed;
+  observed.plan.state = ContainerState::healthy;
+  observed.plan.runtimeReady = true;
+  // ContainerView::generatePlan owns these live edges and may rotate them after
+  // launch.  The retained comparator intentionally ignores only these maps.
+  observed.plan.subscriptionPairings.clear();
+  observed.plan.advertisementPairings.clear();
+  for (const auto state : {ContainerState::scheduled, ContainerState::healthy}) {
+    for (const bool ready : {false, true}) {
+      observed.plan.state = state;
+      observed.plan.runtimeReady = ready;
+      assert(mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, reconstructed));
+    }
+  }
+  auto invalidReconstruction = reconstructed;
+  invalidReconstruction.plan.runtimeReady = true;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed, invalidReconstruction));
+
+  auto invalidLifecycle = observed;
+  invalidLifecycle.plan.state = ContainerState::destroying;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(invalidLifecycle, reconstructed));
+  auto changedConfig = observed;
+  ++changedConfig.plan.config.memoryMB;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(changedConfig, reconstructed));
+  auto changedService = observed;
+  changedService.plan.advertisements.find(200)->second.port++;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(changedService, reconstructed));
+  auto changedRole = observed;
+  ++changedRole.plan.statefulMeshRoles.sibling;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(changedRole, reconstructed));
+  auto changedCredentials = observed;
+  changedCredentials.plan.hasCredentialBundle = true;
+  assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(changedCredentials, reconstructed));
+}
+
 static DeploymentPlan retainedRecoveryCidFixturePlan(void)
 {
   DeploymentPlan plan = {};
@@ -515,6 +569,7 @@ static void assertSchema4ConflictingClientRetirement(void)
 
 int main()
 {
+  assertRetainedRecoveryObservedLifecycleComparison();
   const bool runtimeCidDriftAccepted = retainedRecoveryAllowsRuntimeCidDrift();
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "retained-precheckpoint") == 0)
@@ -1217,7 +1272,7 @@ int main()
   auto mixedStableFieldChanged=mixedReordered;
   String& changedBootstrap=mixedStableFieldChanged.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0];
   NeuronContainerBootstrap changed={}; assert(BitseryEngine::deserializeSafe(changedBootstrap,changed));
-  changed.plan.runtimeReady=!changed.plan.runtimeReady; BitseryEngine::serialize(changedBootstrap,changed);
+  ++changed.plan.config.memoryMB; BitseryEngine::serialize(changedBootstrap,changed);
   assert(!mothershipRetainedRecoveryCanReplaceMixedHandoff(
       mixedStableFieldChanged,interruptedBundleSHA,mixedReorderedExpected,mixedSuccessors));
   auto mixedPrepared=mixedCoordinator;
