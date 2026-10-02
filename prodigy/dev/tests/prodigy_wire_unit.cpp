@@ -837,6 +837,46 @@ int main(void)
 
   {
     ContainerParameters expected = makeContainerParameters();
+    expected.subscriptionPairings.clear();
+    expected.subscriptionPairings.map[0xABCDEF0000000006ULL] = {};
+    String encoded;
+    suite.expect(ProdigyWire::serializeContainerParameters(encoded, expected), "container_params_encode_empty_subscription_pairing_bucket");
+
+    ContainerParameters decoded;
+    suite.expect(ProdigyWire::deserializeContainerParameters(encoded, decoded), "container_params_decode_empty_subscription_pairing_bucket");
+    suite.expect(decoded.subscriptionPairings.map.contains(0xABCDEF0000000006ULL) == false,
+                 "container_params_decode_drops_empty_subscription_pairing_bucket");
+    suite.expect(equalContainerParameters(expected, decoded), "container_params_empty_subscription_pairing_bucket_semantic_roundtrip");
+  }
+
+  {
+    ContainerParameters expected = makeContainerParameters();
+    expected.advertisementPairings.clear();
+    expected.advertisementPairings.map[0xABCDEF0000000007ULL] = {};
+    String encoded;
+    suite.expect(ProdigyWire::serializeContainerParameters(encoded, expected), "container_params_encode_empty_advertisement_pairing_bucket");
+
+    ContainerParameters decoded;
+    suite.expect(ProdigyWire::deserializeContainerParameters(encoded, decoded), "container_params_decode_empty_advertisement_pairing_bucket");
+    suite.expect(decoded.advertisementPairings.map.contains(0xABCDEF0000000007ULL) == false,
+                 "container_params_decode_drops_empty_advertisement_pairing_bucket");
+    suite.expect(equalContainerParameters(expected, decoded), "container_params_empty_advertisement_pairing_bucket_semantic_roundtrip");
+  }
+
+  {
+    ContainerParameters expected = makeContainerParameters();
+    expected.subscriptionPairings.map[0xABCDEF0000000006ULL] = {};
+    expected.advertisementPairings.map[0xABCDEF0000000007ULL] = {};
+    String encoded;
+    suite.expect(ProdigyWire::serializeContainerParameters(encoded, expected), "container_params_encode_mixed_empty_pairing_buckets");
+
+    ContainerParameters decoded;
+    suite.expect(ProdigyWire::deserializeContainerParameters(encoded, decoded), "container_params_decode_mixed_empty_pairing_buckets");
+    suite.expect(equalContainerParameters(expected, decoded), "container_params_mixed_empty_pairing_buckets_semantic_roundtrip");
+  }
+
+  {
+    ContainerParameters expected = makeContainerParameters();
     expected.wormholes.push_back(makeContainerParametersWormhole());
 
     String encoded;

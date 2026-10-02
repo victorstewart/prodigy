@@ -1146,40 +1146,40 @@ static bool deserializeCredentialApplyAckFramePayload(const uint8_t *input, uint
   return deserializeCredentialApplyAck(payload, ack);
 }
 
-static uint32_t countSubscriptionPairings(const ContainerParameters& parameters)
+static bool countSubscriptionPairings(const ContainerParameters& parameters, uint32_t& result)
 {
   uint64_t count = 0;
 
   for (const auto& [service, pairings] : parameters.subscriptionPairings.map)
   {
     (void)service;
+    if (pairings.size() > std::numeric_limits<uint32_t>::max() - count)
+    {
+      return false;
+    }
     count += pairings.size();
   }
 
-  if (count > std::numeric_limits<uint32_t>::max())
-  {
-    return 0;
-  }
-
-  return static_cast<uint32_t>(count);
+  result = static_cast<uint32_t>(count);
+  return true;
 }
 
-static uint32_t countAdvertisementPairings(const ContainerParameters& parameters)
+static bool countAdvertisementPairings(const ContainerParameters& parameters, uint32_t& result)
 {
   uint64_t count = 0;
 
   for (const auto& [service, pairings] : parameters.advertisementPairings.map)
   {
     (void)service;
+    if (pairings.size() > std::numeric_limits<uint32_t>::max() - count)
+    {
+      return false;
+    }
     count += pairings.size();
   }
 
-  if (count > std::numeric_limits<uint32_t>::max())
-  {
-    return 0;
-  }
-
-  return static_cast<uint32_t>(count);
+  result = static_cast<uint32_t>(count);
+  return true;
 }
 
 static bool serializeCredentialBundle(String& output, const CredentialBundle& bundle)
@@ -1283,10 +1283,10 @@ static bool serializeContainerParameters(String& output, const ContainerParamete
     return false;
   }
 
-  uint32_t subscriptionCount = countSubscriptionPairings(parameters);
-  uint32_t advertisementCount = countAdvertisementPairings(parameters);
-  if ((subscriptionCount == 0 && parameters.subscriptionPairings.isEmpty() == false) ||
-      (advertisementCount == 0 && parameters.advertisementPairings.isEmpty() == false))
+  uint32_t subscriptionCount = 0;
+  uint32_t advertisementCount = 0;
+  if (countSubscriptionPairings(parameters, subscriptionCount) == false ||
+      countAdvertisementPairings(parameters, advertisementCount) == false)
   {
     return false;
   }
