@@ -164,6 +164,11 @@ template<typename S> void serialize(S&& s, Schema9OrphanedStatefulPredecessorReq
   s.text1b(r.canonicalRequest, UINT32_MAX); s.object(r.orphan.operation);
   s.value16b(r.orphan.machineUUID); s.object(r.orphan.parameters);
   s.text1b(r.orphan.priorRequestSHA256, 128); s.text1b(r.orphan.priorManifestSHA256, 128);
+  s.text1b(r.orphan.rejectedCandidateSHA256, 128);
+  s.container(r.orphan.successorBootstraps, 3, [](S& nested,
+      MothershipRetainedRecoverySealedSuccessorBootstrap& bootstrap) {
+    nested.value16b(bootstrap.machineUUID); nested.text1b(bootstrap.bootstrap, UINT32_MAX);
+  });
 }
 inline bool partialHandoffEnvelopeValid(const ProdigyMaterializedStatefulRecoveryOperation& operation) {
   return prodigyCanonicalOperationUUID(operation.operationID) && operation.activeDeploymentID != 0 &&
@@ -559,6 +564,12 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     descriptor.parameters.uuid=uuid(field(orphan,"containerUUID"));
     descriptor.priorRequestSHA256=text(field(orphan,"priorRequestSHA256"));
     descriptor.priorManifestSHA256=text(field(orphan,"priorManifestSHA256"));
+    simdjson::dom::element rejectedCandidate;
+    if (orphan["rejectedCandidateSHA256"].get(rejectedCandidate)==simdjson::SUCCESS) {
+      std::string_view value; require(rejectedCandidate.get_string().get(value)==simdjson::SUCCESS,
+          "orphaned stateful predecessor rejected candidate digest is invalid");
+      descriptor.rejectedCandidateSHA256.assign(value.data(), value.size());
+    }
     m.orphanedStatefulPredecessorPriorRequestPath=text(field(orphan,"priorRequestPath"));
     m.orphanedStatefulPredecessorPriorManifestPath=text(field(orphan,"priorManifestPath"));
     require(!m.orphanedStatefulPredecessorPriorRequestPath.empty() &&
@@ -716,44 +727,39 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     const bool alreadyPrepared=mothershipRetainedRecoveryEnvelopeMatches(
         before.masterAuthority.runtimeState.updateSelf,request.bundleSHA);
     const bool retiringOrphanedStatefulPredecessor = orphanedPredecessor.parameters.uuid != 0;
+    Vector<MothershipRetainedRecoverySealedSuccessorBootstrap> sealedOrphanSuccessors = {};
     if (retiringOrphanedStatefulPredecessor) {
       auto successor=request.plans.find(orphanedPredecessor.operation.successorDeploymentID);
-      require(request.plans.find(orphanedPredecessor.operation.activeDeploymentID)==request.plans.end() &&
-                  successor!=request.plans.end() && successor->second.isStateful && !successor->second.stateful.allMasters &&
+      require(successor!=request.plans.end() && successor->second.isStateful && !successor->second.stateful.allMasters &&
                   successor->second.config.containerBlobSHA256.equals(orphanedPredecessor.operation.successorBlobSHA256),
               "orphaned stateful predecessor request does not bind its approved successor");
       String orphanFailure = {};
-      // Only an already sealed envelope may omit the target: the exact
-      // request-digest witness is loaded below and compared before this
-      // function can persist or accept the retry.
       require(mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
                   before,orphanedPredecessor,&orphanFailure,alreadyPrepared),str(orphanFailure).c_str());
-      uint32_t successorParameters=0, successorClients=0, successorRuntimeStates=0, successorRuntimeClients=0;
-      for (const MothershipRetainedRecoveryMachineInput& machine : request.machines) {
-        for (const ContainerParameters& parameters : machine.parameters) {
-          if (parameters.deploymentID != orphanedPredecessor.operation.successorDeploymentID) continue;
-          ++successorParameters;
-          successorClients += parameters.statefulMeshRoles.client != 0;
-          bool matched = false;
-          for (const BrainReplicatedContainerRuntimeState& state : before.masterAuthority.containerRuntimeStates) {
-            if (state.plan.uuid != parameters.uuid) continue;
-            matched = state.machineUUID == machine.machineUUID && state.plan.isStateful &&
-                state.plan.config.deploymentID() == parameters.deploymentID &&
-                state.plan.lifetime == ApplicationLifetime::base && state.plan.shardGroup == 0 &&
-                state.plan.state == ContainerState::healthy && state.plan.runtimeReady &&
-                state.plan.statefulMeshRoles.client == parameters.statefulMeshRoles.client;
-            break;
-          }
-          require(matched,"orphaned stateful predecessor successor is not an exact healthy canonical runtime record");
+      bytell_hash_set<uint128_t> successorUUIDs = {}; uint32_t successorClients = 0;
+      for (const auto& sealed : orphanedPredecessor.successorBootstraps) {
+        NeuronContainerBootstrap observed = {};
+        require(sealed.machineUUID != 0 && BitseryEngine::deserializeSafe(sealed.bootstrap, observed) &&
+                    observed.plan.isStateful && observed.plan.config.deploymentID() == successor->first &&
+                    observed.plan.lifetime == ApplicationLifetime::base && observed.plan.shardGroup == 0 &&
+                    observed.plan.state == ContainerState::healthy && observed.plan.runtimeReady &&
+                    successorUUIDs.insert(observed.plan.uuid).second,
+                "orphaned stateful predecessor sealed successor proof is invalid");
+        bool matched = false;
+        for (const auto& machine : request.machines) for (uint32_t i=0;i<machine.parameters.size();++i) {
+          const auto& parameters=machine.parameters[i]; if (machine.machineUUID != sealed.machineUUID || parameters.uuid != observed.plan.uuid) continue;
+          NeuronContainerBootstrap reconstructed = {}; String why = {};
+          require(prodigyBuildRetainedContainerBootstrap(successor->second, parameters, machine.machineFragment,
+                  before.brainConfig.datacenterFragment, machine.observedCreatedAtMs[i], reconstructed, &why) &&
+                  mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(observed,reconstructed),
+                  "orphaned stateful predecessor sealed successor differs from current canonical request");
+          matched = true; successorClients += observed.plan.statefulMeshRoles.client != 0;
         }
+        require(matched,"orphaned stateful predecessor sealed successor is not canonical");
       }
-      for (const BrainReplicatedContainerRuntimeState& state : before.masterAuthority.containerRuntimeStates) {
-        if (state.plan.config.deploymentID() != orphanedPredecessor.operation.successorDeploymentID) continue;
-        ++successorRuntimeStates;
-        successorRuntimeClients += state.plan.statefulMeshRoles.client != 0;
-      }
-      require(successorParameters==2 && successorClients==1 && successorRuntimeStates==2 && successorRuntimeClients==1,
+      require(successorUUIDs.size()==2 && successorClients==1,
               "orphaned stateful predecessor does not retain an exact 2+1 healthy successor cohort");
+      sealedOrphanSuccessors = orphanedPredecessor.successorBootstraps;
     }
     require(!proof.canonicalContainerCount || proof.validFor(before),"recovery request proof differs from frozen topology");
     const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
@@ -767,10 +773,41 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       require(expected.masterAuthority.runtimeState.generation>0,"recovery generation missing"); --expected.masterAuthority.runtimeState.generation;
     }
     if (retiringOrphanedStatefulPredecessor) {
+      bytell_hash_set<uint128_t> sealedLineageUUIDs = {};
+      sealedLineageUUIDs.insert(orphanedPredecessor.parameters.uuid);
+      for (const auto& sealedSuccessor : sealedOrphanSuccessors) {
+        NeuronContainerBootstrap bootstrap = {};
+        require(BitseryEngine::deserializeSafe(sealedSuccessor.bootstrap, bootstrap),
+                "orphaned stateful predecessor sealed successor cannot be decoded");
+        sealedLineageUUIDs.insert(bootstrap.plan.uuid);
+      }
+      const uint64_t activeID = orphanedPredecessor.operation.activeDeploymentID;
+      auto requestedActivePlan = request.plans.find(activeID);
+      require(requestedActivePlan != request.plans.end(),
+              "orphaned stateful predecessor proof-only active plan is absent");
+      auto persistedActivePlan = expected.masterAuthority.deploymentPlans.find(activeID);
+      require(persistedActivePlan == expected.masterAuthority.deploymentPlans.end() ||
+                  mothershipRetainedRecoveryPlansEqual(
+                      persistedActivePlan->second, requestedActivePlan->second),
+              "orphaned stateful predecessor retained active plan differs from sealed authority");
+      for (const auto& machine : request.machines)
+        for (const auto& parameters : machine.parameters)
+          require(parameters.deploymentID != activeID,
+                  "orphaned stateful predecessor proof-only active plan is canonical");
+      expected.masterAuthority.deploymentPlans.erase(activeID);
       auto& states=expected.masterAuthority.containerRuntimeStates;
+      for (const auto& state : states) {
+        const uint64_t deploymentID = state.plan.config.deploymentID();
+        if (deploymentID != orphanedPredecessor.operation.activeDeploymentID &&
+            deploymentID != orphanedPredecessor.operation.successorDeploymentID) continue;
+        if (sealedLineageUUIDs.contains(state.plan.uuid)) continue;
+        require((state.plan.state == ContainerState::planned || state.plan.state == ContainerState::scheduled) &&
+                    !state.plan.runtimeReady,
+                "orphaned stateful predecessor retains an unknown healthy or ready lineage record");
+      }
       states.erase(std::remove_if(states.begin(),states.end(),[&](const auto& state) {
-        return state.machineUUID==orphanedPredecessor.machineUUID &&
-               state.plan.uuid==orphanedPredecessor.parameters.uuid;
+        return state.plan.config.deploymentID()==orphanedPredecessor.operation.activeDeploymentID ||
+               state.plan.config.deploymentID()==orphanedPredecessor.operation.successorDeploymentID;
       }),states.end());
       for (const auto& state:states)
         require(state.plan.uuid!=orphanedPredecessor.parameters.uuid,
@@ -869,7 +906,22 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                         request.bundleSHA,&why,previousBundleSHA256,{},0,nullptr,false,true,
                                                         emptyRetainedInventoryMachineUUID,coldCanonicalSource.states,
-                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff),str(why).c_str());
+                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff,
+                                                        retiringOrphanedStatefulPredecessor ? orphanedPredecessor.rejectedCandidateSHA256 : String{}),str(why).c_str());
+    }
+    if (retiringOrphanedStatefulPredecessor) {
+      for (const auto& sealedSuccessor : sealedOrphanSuccessors) {
+        NeuronContainerBootstrap bootstrap = {};
+        require(BitseryEngine::deserializeSafe(sealedSuccessor.bootstrap, bootstrap),
+                "orphaned stateful predecessor sealed successor cannot be restored");
+        BrainReplicatedContainerRuntimeState canonical = {};
+        canonical.machineUUID = sealedSuccessor.machineUUID; canonical.plan = bootstrap.plan;
+        canonical.plan.state = ContainerState::scheduled; canonical.plan.runtimeReady = false;
+        canonical.runtimeLogicalCores = uint16_t(applicationSharedCPUCoreHint(canonical.plan.config));
+        canonical.runtimeMemoryMB = canonical.plan.config.totalMemoryMB();
+        canonical.runtimeStorageMB = canonical.plan.config.totalStorageMB();
+        expected.masterAuthority.containerRuntimeStates.push_back(std::move(canonical));
+      }
     }
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
@@ -1495,8 +1547,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         if (retiringOrphanedStatefulPredecessor) {
           auto& orphan = manifest.orphanedStatefulPredecessor;
           auto successor = manifest.request.plans.find(orphan.operation.successorDeploymentID);
-          require(manifest.request.plans.find(orphan.operation.activeDeploymentID) == manifest.request.plans.end() &&
-                      successor != manifest.request.plans.end() && successor->second.isStateful &&
+          require(successor != manifest.request.plans.end() && successor->second.isStateful &&
                       !successor->second.stateful.allMasters &&
                       successor->second.config.containerBlobSHA256.equals(orphan.operation.successorBlobSHA256),
                   "orphaned stateful predecessor does not bind a culled active deployment and approved successor");
@@ -1524,6 +1575,13 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                       !historicalPlan->second.stateful.allMasters,
                   "orphaned stateful predecessor historical active plan is unavailable");
           orphanedPredecessorHistoricalPlan = historicalPlan->second;
+          auto retainedActivePlan = manifest.request.plans.find(orphan.operation.activeDeploymentID);
+          require(retainedActivePlan == manifest.request.plans.end() ||
+                      mothershipRetainedRecoveryPlansEqual(retainedActivePlan->second, historicalPlan->second),
+                  "orphaned stateful predecessor retained active plan differs from historical authority");
+          // Keep the validated old plan in the sealed request as proof-only.
+          // `prepareLocal` compares each stopped copy against it, then erases
+          // it from the reconstructed authority before generic recovery.
           uint32_t historicalMatches = 0;
           for (const MothershipRetainedRecoveryMachineInput& machine : priorRequest.machines) {
             for (const ContainerParameters& parameters : machine.parameters) {
@@ -1597,6 +1655,27 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
+        if (retiringOrphanedStatefulPredecessor) {
+          auto& orphan = manifest.orphanedStatefulPredecessor;
+          orphan.successorBootstraps.clear();
+          for (const BrainReplicatedContainerRuntimeState& state : seed.masterAuthority.containerRuntimeStates) {
+            if (state.plan.config.deploymentID() != orphan.operation.successorDeploymentID ||
+                state.plan.state != ContainerState::healthy || !state.plan.runtimeReady) continue;
+            bool requested = false;
+            for (const MothershipRetainedRecoveryMachineInput& machine : manifest.request.machines)
+              for (const ContainerParameters& parameters : machine.parameters)
+                requested |= machine.machineUUID == state.machineUUID && parameters.uuid == state.plan.uuid;
+            if (!requested) continue;
+            NeuronContainerBootstrap bootstrap = {};
+            bootstrap.plan = state.plan;
+            bootstrap.metricPolicy = prodigyNeuronMetricPolicyForDeployment(
+                manifest.request.plans.find(orphan.operation.successorDeploymentID)->second);
+            String serialized = {}; BitseryEngine::serialize(serialized, bootstrap);
+            orphan.successorBootstraps.push_back({state.machineUUID, std::move(serialized)});
+          }
+          std::sort(orphan.successorBootstraps.begin(), orphan.successorBootstraps.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.machineUUID < rhs.machineUUID; });
+        }
         require(!retiringOrphanedStatefulPredecessor ||
                     mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(manifest.orphanedStatefulPredecessor),
                 "orphaned stateful predecessor was not sealed from live parameters");
@@ -1664,8 +1743,10 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
         ColdCanonicalSource coldCanonicalSource = {};
         ProdigyMaterializedStatefulRecoveryOperation partialHandoff = {};
+        MothershipRetainedRecoveryOrphanedStatefulPredecessor orphanedPredecessor = {};
         require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,
-                              &emptyRetainedInventoryMachineUUID,&coldCanonicalSource,&partialHandoff),"sealed request unreadable");
+                              &emptyRetainedInventoryMachineUUID,&coldCanonicalSource,&partialHandoff,
+                              &orphanedPredecessor),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
         if (retiredConflictingClientUUID != 0) {
           const auto originalRequestPath=e.plan.operationRoot+"/recovery.request"; privateFile(originalRequestPath);
@@ -1687,7 +1768,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,
                                                             request.bundleSHA,&why,text(e.plan.oldBundleSHA),{},0,nullptr,false,true,
                                                             emptyRetainedInventoryMachineUUID,coldCanonicalSource.states,
-                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff),str(why).c_str());
+                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff,
+                                                        orphanedPredecessor.parameters.uuid != 0 ? orphanedPredecessor.rejectedCandidateSHA256 : String{}),str(why).c_str());
         }
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);

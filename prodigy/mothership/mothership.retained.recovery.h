@@ -83,6 +83,11 @@ static inline bool mothershipRetainedRecoveryPartialHandoffEqual(
          lhs.completed == rhs.completed && lhs.updatedAtMs == rhs.updatedAtMs;
 }
 
+struct MothershipRetainedRecoverySealedSuccessorBootstrap {
+  uint128_t machineUUID = 0;
+  String bootstrap = {};
+};
+
 // A deployed predecessor can outlive its deployment record after an accepted
 // materialized handoff.  This descriptor does not create a replacement: it
 // binds the one process that an already-started handoff may retire before the
@@ -96,6 +101,8 @@ struct MothershipRetainedRecoveryOrphanedStatefulPredecessor {
   // never merged into the current recovery authority.
   String priorRequestSHA256 = {};
   String priorManifestSHA256 = {};
+  String rejectedCandidateSHA256 = {};
+  Vector<MothershipRetainedRecoverySealedSuccessorBootstrap> successorBootstraps;
 };
 
 static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(
@@ -109,6 +116,13 @@ static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(
          orphan.operation.updatedAtMs > 0 && orphan.machineUUID != 0 && orphan.parameters.uuid != 0 &&
          prodigyIsSHA256HexDigest(orphan.priorRequestSHA256) &&
          prodigyIsSHA256HexDigest(orphan.priorManifestSHA256) &&
+         prodigyIsSHA256HexDigest(orphan.rejectedCandidateSHA256) &&
+         orphan.successorBootstraps.size() == 2 &&
+         orphan.successorBootstraps[0].machineUUID != 0 &&
+         orphan.successorBootstraps[1].machineUUID != 0 &&
+         orphan.successorBootstraps[0].machineUUID < orphan.successorBootstraps[1].machineUUID &&
+         !orphan.successorBootstraps[0].bootstrap.empty() &&
+         !orphan.successorBootstraps[1].bootstrap.empty() &&
          orphan.parameters.deploymentID == orphan.operation.activeDeploymentID &&
          orphan.parameters.statefulMeshRoles.client == 0 &&
          orphan.parameters.statefulTopology.shardGroup == 0 &&
@@ -297,7 +311,8 @@ static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
 // validates the saved transaction and its bundle bytes.
 static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
     const ProdigyPersistentBrainSnapshot& snapshot, const String& expectedBundleSHA256,
-    const String& previousBundleSHA256 = {}, const String& interruptedBundleSHA256 = {})
+    const String& previousBundleSHA256 = {}, const String& interruptedBundleSHA256 = {},
+    const String& rejectedCandidateSHA256 = {})
 {
   const auto& update = snapshot.masterAuthority.runtimeState.updateSelf;
   if (!update.active()) return true;
@@ -309,10 +324,14 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
   unstarted.workerExpectedBundleSHA256 = update.workerExpectedBundleSHA256;
   unstarted.workerFailure = update.workerFailure;
   if (update == unstarted && !update.bundleBlob.empty() && !update.workerFailure.empty() &&
-      update.workerExpectedBundleSHA256 == expectedBundleSHA256)
+      (update.workerExpectedBundleSHA256 == expectedBundleSHA256 ||
+       (prodigyIsSHA256HexDigest(rejectedCandidateSHA256) &&
+        rejectedCandidateSHA256 != expectedBundleSHA256 &&
+        update.workerExpectedBundleSHA256 == rejectedCandidateSHA256)))
   {
     String digest;
-    return prodigyComputeSHA256Hex(update.bundleBlob, digest) && digest == expectedBundleSHA256;
+    return prodigyComputeSHA256Hex(update.bundleBlob, digest) &&
+        digest == update.workerExpectedBundleSHA256;
   }
   // Followers can still hold the previous recovery envelope when the master's
   // next update is contained. Only the sealed installed predecessor is allowed.
@@ -461,7 +480,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     bool validateCoordinator = true,
     uint128_t emptyRetainedInventoryMachineUUID = 0,
     const Vector<BrainReplicatedContainerRuntimeState>& coldCanonicalRuntimeStates = {},
-    const ProdigyMaterializedStatefulRecoveryOperation *partialHandoff = nullptr)
+    const ProdigyMaterializedStatefulRecoveryOperation *partialHandoff = nullptr,
+    const String& rejectedCandidateSHA256 = {})
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -476,7 +496,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   auto& runtime = snapshot.masterAuthority.runtimeState;
   if (runtime.generation == std::numeric_limits<uint64_t>::max() ||
       (validateCoordinator && !mothershipRetainedRecoveryCanReplaceUpdate(snapshot, expectedBundleSHA256, previousBundleSHA256,
-                                                                           interruptedBundleSHA256)))
+                                                                           interruptedBundleSHA256, rejectedCandidateSHA256)))
   {
     if (failure) failure->assign("retained recovery refuses an incompatible or exhausted update coordinator"_ctv);
     return false;

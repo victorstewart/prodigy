@@ -546,10 +546,17 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   orphan.machineUUID = 3;
   orphan.priorRequestSHA256 = MothershipTidesMigration::text(std::string(64, 'a'));
   orphan.priorManifestSHA256 = MothershipTidesMigration::text(std::string(64, 'b'));
+  orphan.rejectedCandidateSHA256 = MothershipTidesMigration::text(std::string(64, 'c'));
+  orphan.successorBootstraps.push_back({2, "seed-successor-a"_ctv});
+  orphan.successorBootstraps.push_back({3, "seed-successor-b"_ctv});
   for (const ContainerParameters& parameters : machines[2].parameters)
     if (parameters.deploymentID == activeHotID && parameters.statefulMeshRoles.client == 0)
       orphan.parameters = parameters;
   assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(orphan));
+  auto duplicateSuccessorMachine = orphan;
+  duplicateSuccessorMachine.successorBootstraps[1].machineUUID =
+      duplicateSuccessorMachine.successorBootstraps[0].machineUUID;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(duplicateSuccessorMachine));
   assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(partialPrepared, orphan, &failure));
   assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorParametersMatchHistorical(
       orphan.parameters, orphan.parameters));
@@ -558,13 +565,12 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorParametersMatchHistorical(
       orphan.parameters, wrongHistoricalParameters));
   Request orphanRequest = request;
-  orphanRequest.plans.erase(activeHotID);
   const String rrf9 = encodeOrphanedStatefulPredecessorRequest(
       orphanRequest, MothershipTidesMigration::Plan{}, orphan);
   MothershipRetainedRecoveryOrphanedStatefulPredecessor decodedOrphan = {};
   assert(decodeRequest(MothershipTidesMigration::str(rrf9), decodedRequest, &decodedProof,
       nullptr, &decodedEmpty, &decodedCold, &decodedPartial, &decodedOrphan) &&
-      decodedRequest.plans.find(activeHotID) == decodedRequest.plans.end() &&
+      decodedRequest.plans.find(activeHotID) != decodedRequest.plans.end() &&
       decodedRequest.plans.find(successorHotID) != decodedRequest.plans.end() &&
       decodedOrphan.machineUUID == orphan.machineUUID &&
       decodedOrphan.parameters.uuid == orphan.parameters.uuid &&
@@ -605,12 +611,15 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
 
-  // Exercise the command-local RRF9 projection.  Its request deliberately
-  // has no active deployment plan: only the exact durable operation and the
-  // sealed non-client predecessor parameters authorize removing that stale
-  // runtime entry while the two successor members remain canonical.
+  // Exercise the command-local RRF9 projection. Its request retains the old
+  // plan solely to compare every stopped copy before preparation erases it;
+  // only the exact durable operation and sealed non-client predecessor permit
+  // removing that stale runtime entry while successors remain canonical.
   auto orphanSnapshot = source;
   orphanSnapshot.masterAuthority.deploymentPlans.clear();
+  // The seed can retain the culled predecessor plan and its current a6cb-like
+  // runtime record; RRF9 retains that plan only as immutable proof.
+  orphanSnapshot.masterAuthority.deploymentPlans[activeHotID] = activeHot;
   orphanSnapshot.masterAuthority.deploymentPlans[successorHotID] = successorHot;
   // A retained fleet is full inventory: machine 1 also needs its ordinary
   // canonical survivor while the orphan itself remains proof-only.
@@ -649,6 +658,34 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   };
   addOrphanSuccessorRuntime(orphanSuccessorClient, 2, 1791000000501LL);
   addOrphanSuccessorRuntime(orphanSuccessorPeer, 3, 1791000000502LL);
+  // Followers may retain stale planned/scheduled lineage rows. They are
+  // removed only because they are non-ready; a healthy unknown row is denied.
+  auto addStaleLineageRuntime = [&](const DeploymentPlan& plan,
+                                    const ContainerParameters& parameters,
+                                    uint32_t machine, int64_t created) {
+    NeuronContainerBootstrap bootstrap = {};
+    assert(prodigyBuildRetainedContainerBootstrap(plan, parameters, machine,
+        orphanSnapshot.brainConfig.datacenterFragment, created, bootstrap, &failure));
+    BrainReplicatedContainerRuntimeState runtime = {};
+    runtime.machineUUID = machine; runtime.plan = bootstrap.plan;
+    runtime.plan.state = ContainerState::scheduled; runtime.plan.runtimeReady = false;
+    orphanSnapshot.masterAuthority.containerRuntimeStates.push_back(std::move(runtime));
+  };
+  addStaleLineageRuntime(activeHot, orphan.parameters, 3, 1791000000503LL);
+  const ContainerParameters staleOldClient = parametersFor(activeHot, 0x5303, 1, 63, true);
+  addStaleLineageRuntime(activeHot, staleOldClient, 1, 1791000000504LL);
+  const ContainerParameters staleSuccessor = parametersFor(successorHot, 0x5304, 1, 64, false);
+  addStaleLineageRuntime(successorHot, staleSuccessor, 1, 1791000000505LL);
+  orphan.successorBootstraps.clear();
+  for (const BrainReplicatedContainerRuntimeState& state : orphanSnapshot.masterAuthority.containerRuntimeStates) {
+    if (state.plan.config.deploymentID() != successorHotID ||
+        state.plan.state != ContainerState::healthy || !state.plan.runtimeReady) continue;
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan = state.plan;
+    bootstrap.metricPolicy = prodigyNeuronMetricPolicyForDeployment(successorHot);
+    String serialized = {}; BitseryEngine::serialize(serialized, bootstrap);
+    orphan.successorBootstraps.push_back({state.machineUUID, std::move(serialized)});
+  }
   Request localOrphanRequest = {};
   localOrphanRequest.clusterUUID = orphanSnapshot.brainConfig.clusterUUID;
   localOrphanRequest.bundleSHA = bundle;
@@ -657,6 +694,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   const String localRrf9 = encodeOrphanedStatefulPredecessorRequest(
       localOrphanRequest, MothershipTidesMigration::Plan{}, orphan);
   auto orphanWitnessSnapshot = orphanSnapshot;
+  orphanWitnessSnapshot.masterAuthority.deploymentPlans.erase(activeHotID);
   orphanWitnessSnapshot.masterAuthority.containerRuntimeStates.clear();
   assert(mothershipPrepareRetainedRecoverySnapshot(
       orphanWitnessSnapshot, localOrphanRequest.plans, localOrphanRequest.machines, bundle, &failure));
@@ -676,6 +714,19 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   String orphanWitnessBytes = {};
   BitseryEngine::serialize(orphanWitnessBytes, orphanWitnesses);
   MothershipTidesMigration::durable(orphanRequestPath + ".witnesses", orphanWitnessBytes);
+  // A follower may retain the proof-only plan, but it must be byte-for-byte
+  // the same deployment authority sealed in the request.
+  auto mismatchedActivePlan = orphanSnapshot;
+  mismatchedActivePlan.masterAuthority.deploymentPlans[activeHotID].stateful.allMasters = true;
+  const auto mismatchedStatePath = (orphanRoot / "mismatched-active-plan" / "state.new10").string();
+  std::filesystem::create_directories(std::filesystem::path(mismatchedStatePath).parent_path());
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(mismatchedStatePath));
+    assert(store.saveBrainSnapshot(mismatchedActivePlan, &failure));
+  }
+  std::filesystem::create_directories(mismatchedStatePath + ".secrets");
+  assert(!prepareLocal(orphanRequestPath.c_str(), mismatchedStatePath.c_str(), false, &failure));
+  assert(failure == "orphaned stateful predecessor retained active plan differs from sealed authority"_ctv);
   assert(prepareLocal(orphanRequestPath.c_str(), orphanStatePath.c_str(), false, &failure));
   assert(prepareLocal(orphanRequestPath.c_str(), orphanStatePath.c_str(), true, &failure));
   ProdigyPersistentBrainSnapshot orphanAfter = {};
@@ -683,8 +734,35 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(orphanAfter.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.size() == 1 &&
       mothershipRetainedRecoveryPartialHandoffEqual(
           orphanAfter.masterAuthority.runtimeState.materializedStatefulRecoveryOperations[0], partial));
-  for (const BrainReplicatedContainerRuntimeState& state : orphanAfter.masterAuthority.containerRuntimeStates)
-    assert(state.plan.uuid != orphan.parameters.uuid);
+  uint32_t retainedSuccessors = 0;
+  for (const BrainReplicatedContainerRuntimeState& state : orphanAfter.masterAuthority.containerRuntimeStates) {
+    assert(state.plan.uuid != orphan.parameters.uuid && state.plan.uuid != staleOldClient.uuid &&
+        state.plan.uuid != staleSuccessor.uuid);
+    if (state.plan.config.deploymentID() == successorHotID) {
+      ++retainedSuccessors;
+      assert(state.plan.state == ContainerState::scheduled && !state.plan.runtimeReady);
+    }
+  }
+  assert(retainedSuccessors == 2 && orphanAfter.masterAuthority.deploymentPlans.find(activeHotID) ==
+      orphanAfter.masterAuthority.deploymentPlans.end());
+
+  // An unknown healthy lineage row is not projection material and must abort
+  // preparation before it changes the copied authority.
+  auto unknownHealthySnapshot = orphanSnapshot;
+  // Mutate the unique stale successor rather than append a duplicate UUID;
+  // snapshot-side credential validation must remain valid to reach RRF9.
+  auto& unknownHealthy = unknownHealthySnapshot.masterAuthority.containerRuntimeStates.back();
+  unknownHealthy.plan.state = ContainerState::healthy;
+  unknownHealthy.plan.runtimeReady = true;
+  const auto unknownStatePath = (orphanRoot / "unknown-healthy" / "state.new10").string();
+  std::filesystem::create_directories(std::filesystem::path(unknownStatePath).parent_path());
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(unknownStatePath));
+    assert(store.saveBrainSnapshot(unknownHealthySnapshot, &failure));
+  }
+  std::filesystem::create_directories(unknownStatePath + ".secrets");
+  assert(!prepareLocal(orphanRequestPath.c_str(), unknownStatePath.c_str(), false, &failure));
+  assert(failure == "orphaned stateful predecessor retains an unknown healthy or ready lineage record"_ctv);
   std::filesystem::remove_all(orphanRoot);
   const auto statePath = (root / "state.new10").string();
   const auto requestPath = (root / "request").string();
@@ -1579,6 +1657,14 @@ int main()
   rejectedBeforeAdmission.workerExpectedBundleSHA256=request.bundleSHA;
   rejectedBeforeAdmission.workerFailure.assign("current master authority is not durably acknowledged by every registered peer"_ctv);
   assert(mothershipRetainedRecoveryCanReplaceUpdate(rejectedBeforeAdmissionSnapshot,request.bundleSHA,{}));
+  String rejectedCandidateBlob = "rejected-pre-admission-candidate"_ctv, rejectedCandidateSHA = {};
+  assert(prodigyComputeSHA256Hex(rejectedCandidateBlob, rejectedCandidateSHA));
+  auto differentRejectedCandidate = rejectedBeforeAdmissionSnapshot;
+  differentRejectedCandidate.masterAuthority.runtimeState.updateSelf.bundleBlob = rejectedCandidateBlob;
+  differentRejectedCandidate.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256 = rejectedCandidateSHA;
+  assert(!mothershipRetainedRecoveryCanReplaceUpdate(differentRejectedCandidate, request.bundleSHA, {}));
+  assert(mothershipRetainedRecoveryCanReplaceUpdate(
+      differentRejectedCandidate, request.bundleSHA, {}, {}, rejectedCandidateSHA));
 
   auto wrongRejectedDigest=rejectedBeforeAdmissionSnapshot;
   wrongRejectedDigest.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256.assign(std::string(64,'e').c_str());
