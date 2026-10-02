@@ -7,7 +7,7 @@ container_artifact="${3:-}"
 mode="${4:-standard}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/../../.." && pwd -P)"
-harness="${script_dir}/prodigy_dev_netns_harness.sh"
+launcher="${script_dir}/prodigy_dev_test_cluster.sh"
 
 if [[ ! -x "${prodigy_bin}" || ! -x "${mothership_bin}" || ! -r "${container_artifact}" ]]
 then
@@ -83,6 +83,10 @@ jq -n \
          sTilKillable:30
       },
       useHostNetworkNamespace:$useHostNetworkNamespace,
+      apiCredentials:{
+         applicationID:"${application:PingPongSmoke}",
+         requiredCredentialNames:[]
+      },
       minimumSubscriberCapacity:1024,
       isStateful:false,
       stateless:{
@@ -102,7 +106,7 @@ jq -n \
    }
 ' > "${plan}"
 
-"${harness}" "${prodigy_bin}" \
+"${launcher}" "${prodigy_bin}" \
    --mothership-bin="${mothership_bin}" \
    --machines=2 \
    --brains=1 \
