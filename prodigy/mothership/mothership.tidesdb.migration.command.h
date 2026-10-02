@@ -182,14 +182,24 @@ public:
   ~Execution() { for (int fd : databaseLocks) ::close(fd); if(lockFD>=0) ::close(lockFD); }
   std::string tool(uint128_t machine, const char *name) const { return (machine ? remoteRuntime : localRuntime)+"/tools/"+name; }
   std::string environment(uint128_t machine) const { return "LD_LIBRARY_PATH="+quote((machine ? remoteRuntime : localRuntime)+"/lib")+" "; }
-  bool command(uint128_t machine, const std::string& command, String *failure=nullptr, String *output=nullptr) {
+  bool command(uint128_t machine, const std::string& command, String *failure=nullptr, String *output=nullptr, int timeoutMs=600000) {
     if (!machine) return prodigyRunLocalShellCommand(text("set -euo pipefail; "+command), failure);
     auto found=machines.find(machine); if(found==machines.end()) { if(failure) failure->assign("migration machine is not registered"_ctv); return false; }
     const auto& ssh=found->second->registered.ssh; LIBSSH2_SESSION *session=nullptr; int fd=-1;
     const Vault::SSHKeyPackage *package=ssh.privateKeyPath.empty() ? &cluster.bootstrapSshKeyPackage : nullptr;
     if(!prodigyConnectBlockingSSHSession(ssh.address,ssh.port,ssh.hostPublicKeyOpenSSH,ssh.user,ssh.privateKeyPath,package,session,fd,failure)) return false;
     const std::string guarded="set -euo pipefail; test \"$(cat /etc/machine-id)\" = "+quote(found->second->linuxID)+"; "+command;
-    bool okay=prodigyRunBlockingSSHCommand(session,fd,text(guarded),output,failure,600000); prodigyCloseBlockingSSHSession(session,fd); return okay;
+    // Connection/authentication retains its existing bounded socket-connect
+    // behavior; this deadline covers the authenticated SSH command through
+    // channel teardown and session disconnect.
+    const ProdigySSHDeadline deadline=prodigySSHDeadlineAfter(timeoutMs);
+    bool okay=prodigyRunBlockingSSHCommandUntil(session,fd,text(guarded),output,failure,deadline);
+    String closeFailure;
+    if(!prodigyCloseBlockingSSHSessionUntil(session,fd,deadline,&closeFailure) && okay) {
+      if(failure) failure->assign(closeFailure);
+      return false;
+    }
+    return okay;
   }
   void run(uint128_t machine,const std::string& cmd) { String failure; if(!command(machine,cmd,&failure)) throw std::runtime_error("Mothership migration command failed: "+str(failure)); }
   void upload(Machine& machine,const std::string& from,const std::string& to) {

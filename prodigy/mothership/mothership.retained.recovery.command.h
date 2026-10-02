@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+
 // Explicit retained-fleet repair. Reuses the migration owner's SSH authority,
 // bundle installation, fences, receipt, atomic renames and activation boundary.
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
@@ -538,8 +540,21 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                   prodigyIsSHA256HexDigest(manifest.request.interruptedBundleSHA),"invalid mixed predecessor mapping");
         }
         for(const auto& r:manifest.records) {
-          String encoded,why,bytes;
-          require(e.command(r.machine,"test \"$(sha256sum "+quote(r.paramsPath)+" | cut -d' ' -f1)\" = "+quote(r.paramsSHA)+"; base64 -w0 "+quote(r.paramsPath),&why,&encoded),"retained parameters read failed");
+          String encoded,why,bytes,machine,container,diagnostic,phase;
+          machine.snprintf<"{itoh}"_ctv>(r.machine);container.snprintf<"{itoh}"_ctv>(r.container);
+          const bool readParameters=e.command(r.machine,"test \"$(sha256sum "+quote(r.paramsPath)+" | cut -d' ' -f1)\" = "+quote(r.paramsSHA)+"; base64 -w0 "+quote(r.paramsPath),&why,&encoded,30'000);
+          // `encoded` is a credential-bearing parameters blob.  The generic
+          // command owner includes stdout in some failures, so preserve only a
+          // transport phase here rather than relaying that output into logs.
+          if(std::strstr(why.c_str(),"timed out waiting for ssh io") != nullptr) phase.assign("ssh io timed out"_ctv);
+          else if(std::strstr(why.c_str(),"timed out while trying to wait for eof") != nullptr) phase.assign("ssh eof wait timed out"_ctv);
+          else if(std::strstr(why.c_str(),"timed out while closing ssh session") != nullptr) phase.assign("ssh session close timed out"_ctv);
+          else if(std::strstr(why.c_str(),"failed to execute remote command") != nullptr) phase.assign("ssh exec failed"_ctv);
+          else if(std::strstr(why.c_str(),"failed to read remote command") != nullptr) phase.assign("ssh command read failed"_ctv);
+          else if(std::strstr(why.c_str(),"timed out") != nullptr) phase.assign("ssh command timed out"_ctv);
+          else phase.assign("remote parameters command failed"_ctv);
+          diagnostic.snprintf<"retained parameters read failed machine {} container {}: {}"_ctv>(machine,container,phase);
+          require(readParameters,str(diagnostic).c_str());
           require(Base64::decode(encoded,bytes),"retained parameters encoding invalid");ContainerParameters params;
           require(ProdigyWire::deserializeStartupContainerParameters(bytes,params) && params.uuid==r.container,"retained parameters identity invalid");
           auto deployment=manifest.request.plans.find(params.deploymentID);require(deployment!=manifest.request.plans.end(),"retained deployment absent from authority");

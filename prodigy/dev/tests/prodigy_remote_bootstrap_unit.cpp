@@ -242,6 +242,62 @@ static uint16_t reserveLoopbackPort(void)
   return port;
 }
 
+class ScopedSilentTCPPeer {
+public:
+  uint16_t port = 0;
+  pid_t pid = -1;
+
+  ScopedSilentTCPPeer()
+  {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0)
+    {
+      return;
+    }
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 || ::listen(listener, 1) != 0)
+    {
+      ::close(listener);
+      return;
+    }
+    socklen_t addressSize = sizeof(address);
+    if (::getsockname(listener, reinterpret_cast<sockaddr *>(&address), &addressSize) != 0)
+    {
+      ::close(listener);
+      return;
+    }
+    port = ntohs(address.sin_port);
+    pid = ::fork();
+    if (pid == 0)
+    {
+      int peer = ::accept(listener, nullptr, nullptr);
+      if (peer >= 0)
+      {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        ::close(peer);
+      }
+      ::close(listener);
+      _exit(0);
+    }
+    ::close(listener);
+    if (pid < 0)
+    {
+      port = 0;
+    }
+  }
+
+  ~ScopedSilentTCPPeer()
+  {
+    if (pid > 0)
+    {
+      (void)::kill(pid, SIGTERM);
+      (void)::waitpid(pid, nullptr, 0);
+    }
+  }
+};
+
 static bool waitForLoopbackPort(uint16_t port, int timeoutMs)
 {
   auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -526,6 +582,30 @@ int main(void)
   }
   String failure;
 
+  {
+    ScopedSilentTCPPeer silentPeer = {};
+    LIBSSH2_SESSION *session = nullptr;
+    int fd = -1;
+    const auto started = std::chrono::steady_clock::now();
+    suite.expect(
+        silentPeer.port != 0 &&
+            prodigyConnectBlockingSSHSession(
+                "127.0.0.1"_ctv,
+                silentPeer.port,
+                "unused"_ctv,
+                "root"_ctv,
+                "unused"_ctv,
+                session,
+                fd,
+                &failure,
+                200) == false,
+        "blocking_ssh_setup_deadline_rejects_silent_banner");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    suite.expect(elapsed < 500, "blocking_ssh_setup_deadline_bounds_silent_banner");
+    suite.expect(session == nullptr && fd == -1, "blocking_ssh_setup_deadline_closes_silent_peer");
+    suite.expect(stringContains(failure, "timed out"), "blocking_ssh_setup_deadline_reports_timeout");
+  }
+
   String resolvedBootstrapUser = {};
   prodigyResolveBootstrapSSHUser(""_ctv, resolvedBootstrapUser);
   suite.expect(resolvedBootstrapUser.equals("root"_ctv), "bootstrap_ssh_user_defaults_to_root");
@@ -628,6 +708,32 @@ int main(void)
       suite.expect(failure.size() == 0, "blocking_ssh_session_accepts_pinned_host_key_clears_failure");
       if (session != nullptr)
       {
+        const auto stalledCommandStarted = std::chrono::steady_clock::now();
+        suite.expect(prodigyRunBlockingSSHCommand(session, fd,
+                         "trap '' HUP; sleep 2"_ctv,
+                         nullptr, &failure, 300) == false,
+                     "blocking_ssh_command_deadline_cancels_stalled_eof");
+        const auto stalledCommandElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - stalledCommandStarted).count();
+        suite.expect(stalledCommandElapsed < 500,
+                     "blocking_ssh_command_deadline_includes_channel_teardown");
+        suite.expect(stringContains(failure, "timed out"),
+                     "blocking_ssh_command_deadline_reports_timeout_phase");
+        suite.expect(session == nullptr && fd == -1,
+                     "blocking_ssh_command_deadline_terminally_discards_ambiguous_session");
+        suite.expect(prodigyRunBlockingSSHCommand(session, fd, "true"_ctv,
+                         nullptr, &failure, 300) == false,
+                     "blocking_ssh_command_cleanup_rejects_discarded_session");
+        suite.expect(
+            prodigyConnectBlockingSSHSession(
+                "127.0.0.1"_ctv,
+                sshd.port,
+                sshd.hostPublicKeyOpenSSH,
+                "root"_ctv,
+                prodigyTestClientSSHPrivateKeyPath(),
+                session,
+                fd,
+                &failure),
+            "blocking_ssh_command_reconnects_after_deadline");
         suite.expect(prodigyRunBlockingSSHCommand(session, fd,
                          "printf 'owned cleanup failure' >&2; exit 7"_ctv,
                          nullptr, &failure, 5'000) == false,

@@ -4,6 +4,7 @@
 #include <libssh2/libssh2_sftp.h>
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
@@ -48,21 +49,27 @@ static inline bool prodigyEnsureLibssh2(void)
   return initialized;
 }
 
-static inline void prodigyCloseBlockingSSHSession(LIBSSH2_SESSION *& session, int& fd)
-{
-  if (session != nullptr)
-  {
-    (void)libssh2_session_disconnect(session, "Normal Shutdown");
-    libssh2_session_free(session);
-    session = nullptr;
-  }
+using ProdigySSHDeadline = std::chrono::steady_clock::time_point;
 
-  if (fd >= 0)
-  {
-    ::close(fd);
-    fd = -1;
-  }
+static inline ProdigySSHDeadline prodigySSHDeadlineAfter(int timeoutMs)
+{
+  return std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs < 0 ? 0 : timeoutMs);
 }
+
+static inline bool prodigySSHDeadlineRemaining(ProdigySSHDeadline deadline, int& remainingMs)
+{
+  const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+  if (remaining <= 0)
+  {
+    remainingMs = 0;
+    return false;
+  }
+  remainingMs = remaining > INT_MAX ? INT_MAX : int(remaining);
+  return true;
+}
+
+static inline void prodigyCloseBlockingSSHSession(LIBSSH2_SESSION *& session, int& fd);
+static inline bool prodigyCloseBlockingSSHSessionUntil(LIBSSH2_SESSION *& session, int& fd, ProdigySSHDeadline deadline, String *failure = nullptr);
 
 static inline bool prodigyOpenNumericConnectedSocket(const String& address, uint16_t port, int& fdOut)
 {
@@ -171,14 +178,19 @@ static inline bool prodigyConnectBlockingSSHSession(
     const Vault::SSHKeyPackage *sshKeyPackage,
     LIBSSH2_SESSION *& session,
     int& fd,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    int setupTimeoutMs = 10'000)
 {
   session = nullptr;
   fd = -1;
+  if (failure)
+  {
+    failure->clear();
+  }
 
   if (prodigyEnsureLibssh2() == false)
   {
-    if (failure)
+    if (failure && failure->size() == 0)
     {
       failure->assign("failed to initialize libssh2"_ctv);
     }
@@ -207,6 +219,20 @@ static inline bool prodigyConnectBlockingSSHSession(
   }
 
   libssh2_session_set_blocking(session, 1);
+  const ProdigySSHDeadline setupDeadline = prodigySSHDeadlineAfter(setupTimeoutMs);
+  auto applySetupTimeout = [&]() -> bool {
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(setupDeadline, remainingMs) == false)
+    {
+      if (failure && failure->size() == 0)
+      {
+        failure->assign("ssh setup timed out"_ctv);
+      }
+      return false;
+    }
+    libssh2_session_set_timeout(session, long(remainingMs));
+    return true;
+  };
   if (libssh2_session_method_pref(session, LIBSSH2_METHOD_HOSTKEY, "ssh-ed25519") != 0)
   {
     if (failure)
@@ -217,13 +243,22 @@ static inline bool prodigyConnectBlockingSSHSession(
     return false;
   }
 
-  if (libssh2_session_handshake(session, fd) != 0)
+  const bool setupReadyForHandshake = applySetupTimeout();
+  const int handshakeResult = setupReadyForHandshake ? libssh2_session_handshake(session, fd) : LIBSSH2_ERROR_TIMEOUT;
+  if (handshakeResult != 0)
   {
-    if (failure)
+    if (failure && failure->size() == 0)
     {
-      failure->assign("ssh handshake failed"_ctv);
+      if (handshakeResult == LIBSSH2_ERROR_TIMEOUT)
+      {
+        failure->assign("ssh setup timed out"_ctv);
+      }
+      else
+      {
+        failure->assign("ssh handshake failed"_ctv);
+      }
     }
-    prodigyCloseBlockingSSHSession(session, fd);
+    (void)prodigyCloseBlockingSSHSessionUntil(session, fd, setupDeadline, nullptr);
     return false;
   }
 
@@ -243,11 +278,11 @@ static inline bool prodigyConnectBlockingSSHSession(
     if (Vault::validateSSHKeyPackageEd25519(keyPackage, failure) == false)
     {
       keyPackage.clear();
-      prodigyCloseBlockingSSHSession(session, fd);
+      (void)prodigyCloseBlockingSSHSessionUntil(session, fd, setupDeadline, nullptr);
       return false;
     }
 
-    if (libssh2_userauth_publickey_frommemory(
+    if (applySetupTimeout() == false || libssh2_userauth_publickey_frommemory(
             session,
             sshUserText.c_str(),
             sshUserText.size(),
@@ -257,12 +292,12 @@ static inline bool prodigyConnectBlockingSSHSession(
             keyPackage.privateKeyOpenSSH.size(),
             nullptr) != 0)
     {
-      if (failure)
+      if (failure && failure->size() == 0)
       {
         failure->assign("ssh public key auth failed"_ctv);
       }
       keyPackage.clear();
-      prodigyCloseBlockingSSHSession(session, fd);
+      (void)prodigyCloseBlockingSSHSessionUntil(session, fd, setupDeadline, nullptr);
       return false;
     }
 
@@ -272,17 +307,18 @@ static inline bool prodigyConnectBlockingSSHSession(
   {
     String sshPrivateKeyPathText = {};
     sshPrivateKeyPathText.assign(sshPrivateKeyPath);
-    if (libssh2_userauth_publickey_fromfile(session, sshUserText.c_str(), nullptr, sshPrivateKeyPathText.c_str(), nullptr) != 0)
+    if (applySetupTimeout() == false || libssh2_userauth_publickey_fromfile(session, sshUserText.c_str(), nullptr, sshPrivateKeyPathText.c_str(), nullptr) != 0)
     {
-      if (failure)
+      if (failure && failure->size() == 0)
       {
         failure->assign("ssh public key auth failed"_ctv);
       }
-      prodigyCloseBlockingSSHSession(session, fd);
+      (void)prodigyCloseBlockingSSHSessionUntil(session, fd, setupDeadline, nullptr);
       return false;
     }
   }
 
+  libssh2_session_set_timeout(session, 0);
   if (failure)
   {
     failure->clear();
@@ -298,14 +334,15 @@ static inline bool prodigyConnectBlockingSSHSession(
     const String& sshPrivateKeyPath,
     LIBSSH2_SESSION *& session,
     int& fd,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    int setupTimeoutMs = 10'000)
 {
-  return prodigyConnectBlockingSSHSession(sshAddress, sshPort, sshHostPublicKeyOpenSSH, sshUser, sshPrivateKeyPath, nullptr, session, fd, failure);
+  return prodigyConnectBlockingSSHSession(sshAddress, sshPort, sshHostPublicKeyOpenSSH, sshUser, sshPrivateKeyPath, nullptr, session, fd, failure, setupTimeoutMs);
 }
 
-static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd, const String& command, String *output, String *failure, int timeoutMs = 120'000);
+static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *& session, int& fd, const String& command, String *output, String *failure, int timeoutMs = 120'000);
 
-static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd, const String& command, String *failure = nullptr, int timeoutMs = 120'000)
+static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *& session, int& fd, const String& command, String *failure = nullptr, int timeoutMs = 120'000)
 {
   return prodigyRunBlockingSSHCommand(session, fd, command, nullptr, failure, timeoutMs);
 }
@@ -339,7 +376,66 @@ static inline bool prodigyWaitForBlockingSSHSessionIO(LIBSSH2_SESSION *session, 
   return (::poll(&descriptor, 1, timeoutMs) > 0);
 }
 
-static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int fd, LIBSSH2_CHANNEL *channel, const String& command, int timeoutMs, String *failure = nullptr)
+static inline bool prodigyCloseBlockingSSHSessionUntil(LIBSSH2_SESSION *& session, int& fd, ProdigySSHDeadline deadline, String *failure)
+{
+  if (session == nullptr)
+  {
+    if (fd >= 0)
+    {
+      ::close(fd);
+      fd = -1;
+    }
+    return true;
+  }
+
+  libssh2_session_set_blocking(session, 0);
+  bool closedCleanly = true;
+  while (true)
+  {
+    int rc = libssh2_session_disconnect(session, "Normal Shutdown");
+    if (rc == 0)
+    {
+      break;
+    }
+    if (rc != LIBSSH2_ERROR_EAGAIN)
+    {
+      closedCleanly = false;
+      break;
+    }
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false || prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
+    {
+      closedCleanly = false;
+      break;
+    }
+  }
+
+  // Do not restore blocking mode here: session_free may also need network I/O.
+  // Closing the descriptor first makes the bounded-failure path terminal instead
+  // of allowing libssh2 teardown to wait for a peer indefinitely.
+  if (fd >= 0)
+  {
+    ::close(fd);
+    fd = -1;
+  }
+  (void)libssh2_session_free(session);
+  session = nullptr;
+
+  if (!closedCleanly && failure)
+  {
+    failure->assign("timed out while closing ssh session"_ctv);
+  }
+  return closedCleanly;
+}
+
+static inline void prodigyCloseBlockingSSHSession(LIBSSH2_SESSION *& session, int& fd)
+{
+  // Call sites without an operation deadline still must not let best-effort
+  // SSH shutdown hold a worker forever.
+  (void)prodigyCloseBlockingSSHSessionUntil(session, fd, prodigySSHDeadlineAfter(1'000), nullptr);
+}
+
+static inline bool prodigyCloseBlockingSSHChannelUntil(LIBSSH2_SESSION *session, int fd, LIBSSH2_CHANNEL *channel, const String& command, ProdigySSHDeadline deadline, String *failure = nullptr)
 {
   if (channel == nullptr)
   {
@@ -351,8 +447,6 @@ static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int 
   }
 
   libssh2_session_set_blocking(session, 0);
-
-  int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(timeoutMs);
 
   auto awaitChannelOp = [&](auto&& operation, const char *phase) -> bool {
     String phaseText = {};
@@ -378,8 +472,8 @@ static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int 
         return false;
       }
 
-      int64_t nowMs = Time::now<TimeResolution::ms>();
-      if (nowMs >= deadlineMs)
+      int remainingMs = 0;
+      if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false)
       {
         if (failure)
         {
@@ -388,7 +482,6 @@ static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int 
         return false;
       }
 
-      int remainingMs = int(deadlineMs - nowMs);
       if (prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
       {
         if (failure)
@@ -422,7 +515,47 @@ static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int 
   return ok;
 }
 
-static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd, const String& command, String *output, String *failure, int timeoutMs)
+static inline bool prodigyCloseBlockingSSHChannel(LIBSSH2_SESSION *session, int fd, LIBSSH2_CHANNEL *channel, const String& command, int timeoutMs, String *failure = nullptr)
+{
+  return prodigyCloseBlockingSSHChannelUntil(session, fd, channel, command, prodigySSHDeadlineAfter(timeoutMs), failure);
+}
+
+static inline bool prodigyFreeBlockingSSHChannelUntil(LIBSSH2_SESSION *session, int fd, LIBSSH2_CHANNEL *& channel, ProdigySSHDeadline deadline)
+{
+  if (channel == nullptr)
+  {
+    return true;
+  }
+
+  libssh2_session_set_blocking(session, 0);
+  while (true)
+  {
+    int rc = libssh2_channel_free(channel);
+    if (rc == 0)
+    {
+      channel = nullptr;
+      libssh2_session_set_blocking(session, 1);
+      return true;
+    }
+    if (rc != LIBSSH2_ERROR_EAGAIN)
+    {
+      break;
+    }
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false || prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
+    {
+      break;
+    }
+  }
+
+  // Restore blocking mode without another blocking libssh2 operation.
+  // Session teardown remains bounded separately, so a peer that fails to
+  // acknowledge its channel close cannot hold this worker here.
+  libssh2_session_set_blocking(session, 1);
+  return false;
+}
+
+static inline bool prodigyRunBlockingSSHCommandUntil(LIBSSH2_SESSION *& session, int& fd, const String& command, String *output, String *failure, ProdigySSHDeadline deadline)
 {
   String commandText = {};
   commandText.assign(command);
@@ -430,32 +563,87 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
   {
     output->clear();
   }
-
-  LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
-  if (channel == nullptr)
+  if (session == nullptr || fd < 0)
   {
     if (failure)
     {
-      failure->assign("failed to open ssh exec channel"_ctv);
+      failure->assign("ssh session is unavailable"_ctv);
     }
-    return false;
-  }
-
-  if (libssh2_channel_exec(channel, commandText.c_str()) != 0)
-  {
-    if (failure)
-    {
-      failure->snprintf<"failed to execute remote command {}"_ctv>(command);
-    }
-    libssh2_channel_free(channel);
     return false;
   }
 
   libssh2_session_set_blocking(session, 0);
+  LIBSSH2_CHANNEL *channel = nullptr;
+  while ((channel = libssh2_channel_open_session(session)) == nullptr)
+  {
+    if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN)
+    {
+      if (failure)
+      {
+        failure->assign("failed to open ssh exec channel"_ctv);
+      }
+      libssh2_session_set_blocking(session, 1);
+      return false;
+    }
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false || prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
+    {
+      if (failure)
+      {
+        failure->assign("timed out while opening ssh exec channel"_ctv);
+      }
+      // libssh2 may retain an unfinished channel-open operation after EAGAIN.
+      // It is not safe to offer this session for reuse once its open budget is
+      // exhausted.
+      (void)prodigyCloseBlockingSSHSessionUntil(session, fd, deadline, nullptr);
+      return false;
+    }
+  }
+
+  while (true)
+  {
+    const int rc = libssh2_channel_exec(channel, commandText.c_str());
+    if (rc == 0)
+    {
+      break;
+    }
+    if (rc != LIBSSH2_ERROR_EAGAIN)
+    {
+      if (failure)
+      {
+        failure->snprintf<"failed to execute remote command {}"_ctv>(command);
+      }
+      if (prodigyFreeBlockingSSHChannelUntil(session, fd, channel, deadline) == false)
+      {
+        (void)prodigyCloseBlockingSSHSessionUntil(session, fd, deadline, nullptr);
+      }
+      return false;
+    }
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false || prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
+    {
+      if (failure)
+      {
+        failure->snprintf<"timed out while executing remote command {}"_ctv>(command);
+      }
+      if (prodigyFreeBlockingSSHChannelUntil(session, fd, channel, deadline) == false)
+      {
+        (void)prodigyCloseBlockingSSHSessionUntil(session, fd, deadline, nullptr);
+      }
+      return false;
+    }
+  }
 
   char scratch[1024];
   String stderrOutput = {};
-  int64_t deadlineMs = Time::now<TimeResolution::ms>() + int64_t(timeoutMs);
+  auto discardIncompleteChannel = [&]() {
+    const bool closeOk = prodigyCloseBlockingSSHChannelUntil(session, fd, channel, command, deadline, nullptr);
+    const bool freeOk = prodigyFreeBlockingSSHChannelUntil(session, fd, channel, deadline);
+    if (closeOk == false || freeOk == false)
+    {
+      (void)prodigyCloseBlockingSSHSessionUntil(session, fd, deadline, nullptr);
+    }
+  };
   while (true)
   {
     bool progressed = false;
@@ -471,6 +659,16 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
         }
 
         progressed = true;
+        int remainingMs = 0;
+        if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false)
+        {
+          if (failure)
+          {
+            failure->snprintf<"remote command timed out while reading stdout: {}"_ctv>(command);
+          }
+          discardIncompleteChannel();
+          return false;
+        }
         continue;
       }
 
@@ -485,8 +683,7 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
         {
           failure->snprintf<"failed to read remote command stdout: {}"_ctv>(command);
         }
-        (void)prodigyCloseBlockingSSHChannel(session, fd, channel, command, timeoutMs, nullptr);
-        libssh2_channel_free(channel);
+        discardIncompleteChannel();
         return false;
       }
 
@@ -500,6 +697,16 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
       {
         stderrOutput.append(reinterpret_cast<const uint8_t *>(scratch), uint64_t(readBytes));
         progressed = true;
+        int remainingMs = 0;
+        if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false)
+        {
+          if (failure)
+          {
+            failure->snprintf<"remote command timed out while reading stderr: {}"_ctv>(command);
+          }
+          discardIncompleteChannel();
+          return false;
+        }
         continue;
       }
 
@@ -514,8 +721,7 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
         {
           failure->snprintf<"failed to read remote command stderr: {}"_ctv>(command);
         }
-        (void)prodigyCloseBlockingSSHChannel(session, fd, channel, command, timeoutMs, nullptr);
-        libssh2_channel_free(channel);
+        discardIncompleteChannel();
         return false;
       }
 
@@ -532,36 +738,38 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
       continue;
     }
 
-    int64_t nowMs = Time::now<TimeResolution::ms>();
-    if (nowMs >= deadlineMs)
+    int remainingMs = 0;
+    if (prodigySSHDeadlineRemaining(deadline, remainingMs) == false)
     {
       if (failure)
       {
-        failure->snprintf<"remote command timed out after {itoa}ms: {}"_ctv>(uint64_t(timeoutMs), command);
+        failure->snprintf<"remote command timed out: {}"_ctv>(command);
       }
-      (void)prodigyCloseBlockingSSHChannel(session, fd, channel, command, timeoutMs, nullptr);
-      libssh2_channel_free(channel);
+      discardIncompleteChannel();
       return false;
     }
 
-    int remainingMs = int(deadlineMs - nowMs);
     if (prodigyWaitForBlockingSSHSessionIO(session, fd, remainingMs) == false)
     {
       if (failure)
       {
-        failure->snprintf<"remote command timed out after {itoa}ms waiting for ssh io: {}"_ctv>(uint64_t(timeoutMs), command);
+        failure->snprintf<"remote command timed out waiting for ssh io: {}"_ctv>(command);
       }
-      (void)prodigyCloseBlockingSSHChannel(session, fd, channel, command, timeoutMs, nullptr);
-      libssh2_channel_free(channel);
+      discardIncompleteChannel();
       return false;
     }
   }
 
-  bool closeOk = prodigyCloseBlockingSSHChannel(session, fd, channel, command, timeoutMs, failure);
+  bool closeOk = prodigyCloseBlockingSSHChannelUntil(session, fd, channel, command, deadline, failure);
   int exitStatus = libssh2_channel_get_exit_status(channel);
-  libssh2_channel_free(channel);
-  if (closeOk == false)
+  bool freeOk = prodigyFreeBlockingSSHChannelUntil(session, fd, channel, deadline);
+  if (closeOk == false || freeOk == false)
   {
+    (void)prodigyCloseBlockingSSHSessionUntil(session, fd, deadline, nullptr);
+    if (freeOk == false && failure)
+    {
+      failure->assign("timed out while freeing ssh channel"_ctv);
+    }
     return false;
   }
 
@@ -591,6 +799,11 @@ static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *session, int fd
     failure->clear();
   }
   return true;
+}
+
+static inline bool prodigyRunBlockingSSHCommand(LIBSSH2_SESSION *& session, int& fd, const String& command, String *output, String *failure, int timeoutMs)
+{
+  return prodigyRunBlockingSSHCommandUntil(session, fd, command, output, failure, prodigySSHDeadlineAfter(timeoutMs));
 }
 
 class ProdigyRemoteMachineResources {

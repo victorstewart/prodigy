@@ -3333,6 +3333,25 @@ private:
     }
   }
 
+  uint32_t recoveredStatefulShardGroupCount(void) const
+  {
+    uint32_t recovered = 0;
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->machine == nullptr ||
+          container->deploymentID != plan.config.deploymentID() ||
+          container->isStateful == false ||
+          (container->state != ContainerState::scheduled && container->state != ContainerState::healthy &&
+           container->state != ContainerState::crashedRestarting) ||
+          container->shardGroup == UINT32_MAX)
+      {
+        continue;
+      }
+      recovered = std::max(recovered, container->shardGroup + 1);
+    }
+    return recovered;
+  }
+
   void calculateTargets(void)
   {
     if (plan.isStateful)
@@ -3340,6 +3359,14 @@ private:
       if (previous)
       {
         nShardGroups = previous->nShardGroups;
+        if (nShardGroups == 0)
+        {
+          // A cold retained recovery can restore the successor's canonical
+          // runtime inventory after its empty predecessor.  Do not invent a
+          // topology from an empty predecessor; recover it only from the
+          // authenticated container shard groups already owned here.
+          nShardGroups = recoveredStatefulShardGroupCount();
+        }
       }
       else
       {

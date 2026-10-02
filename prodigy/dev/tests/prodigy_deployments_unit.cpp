@@ -1191,12 +1191,173 @@ static void testInplacePairingOrder(TestSuite& suite)
   }
 }
 
+static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestSuite& suite)
+{
+  ScopedFreshRing ring;
+  TestBrain *brain = new TestBrain();
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = brain;
+  brain->brainConfig.runtimeEnvironment.test.enabled = true;
+  brain->brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
+
+  Rack racks[3] = {};
+  Machine machines[3] = {};
+  ScopedSocketPair sockets[3] = {};
+  bool machinesReady = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].uuid = 19'209'001 + index;
+    brain->racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    machinesReady = sockets[index].create(suite, "recovered_stateful_target_creates_control_socket") && machinesReady;
+    if (machinesReady)
+    {
+      String slug = {};
+      slug.snprintf<"recovered-stateful-{itoa}"_ctv>(uint64_t(index));
+      machinesReady = seedSchedulableMachine(*brain, racks[index], machines[index], uint128_t(0x19209001 + index),
+                                             0x0a000191 + index, slug, sockets[index]) && machinesReady;
+    }
+  }
+  suite.expect(machinesReady, "recovered_stateful_target_arms_control_streams");
+
+  // A completed successor owns and culls its predecessor.  Keep the fixture
+  // predecessor on that same ownership model so resuming the scheduler cannot
+  // delete a stack object.
+  ApplicationDeployment *predecessor = new ApplicationDeployment();
+  seedCommonPlan(*predecessor, true);
+  predecessor->plan.config.applicationID = 19'209;
+  predecessor->plan.config.versionID = 1;
+  predecessor->plan.config.type = ApplicationType::stateful;
+  predecessor->plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  predecessor->plan.stateful.clientPrefix = (uint64_t(19'209) << 48) | (uint64_t(1) << 40);
+  predecessor->plan.stateful.siblingPrefix = (uint64_t(19'209) << 48) | (uint64_t(2) << 40);
+  predecessor->plan.stateful.cousinPrefix = (uint64_t(19'209) << 48) | (uint64_t(3) << 40);
+  predecessor->plan.stateful.seedingPrefix = (uint64_t(19'209) << 48) | (uint64_t(4) << 40);
+  predecessor->plan.stateful.shardingPrefix = (uint64_t(19'209) << 48) | (uint64_t(5) << 40);
+  predecessor->plan.stateful.allMasters = true;
+  predecessor->plan.stateful.allowUpdateInPlace = true;
+  predecessor->nShardGroups = 0;
+
+  ApplicationDeployment successor = {};
+  successor.plan = predecessor->plan;
+  successor.plan.config.versionID = 2;
+  successor.previous = predecessor;
+  predecessor->next = &successor;
+  const uint64_t predecessorDeploymentID = predecessor->plan.config.deploymentID();
+  brain->deployments.insert_or_assign(predecessorDeploymentID, predecessor);
+  brain->deployments.insert_or_assign(successor.plan.config.deploymentID(), &successor);
+
+  ContainerView retained[2] = {};
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    retained[index].uuid = uint128_t(0x19209101 + index);
+    retained[index].deploymentID = successor.plan.config.deploymentID();
+    retained[index].applicationID = successor.plan.config.applicationID;
+    retained[index].machine = &machines[index];
+    retained[index].lifetime = ApplicationLifetime::base;
+    retained[index].isStateful = true;
+    // This matches the retained Hot cohort: one replica had completed its
+    // readiness transition while its peer was still scheduled when the new
+    // master rebuilt the target.
+    retained[index].state = index == 0 ? ContainerState::healthy : ContainerState::scheduled;
+    retained[index].runtimeReady = true;
+    retained[index].shardGroup = 0;
+    successor.containers.insert(&retained[index]);
+    successor.containersByShardGroup.insert(0, &retained[index]);
+    successor.countPerMachine[&machines[index]] = 1;
+    successor.countPerRack[&racks[index]] = 1;
+    successor.racksByShardGroup[0].insert(&racks[index]);
+    brain->containers.insert_or_assign(retained[index].uuid, &retained[index]);
+    machines[index].upsertContainerIndexEntry(retained[index].deploymentID, &retained[index]);
+  }
+
+  if (machinesReady)
+  {
+    successor.recoverAfterReboot();
+  }
+
+  ContainerView *replacement = nullptr;
+  for (ContainerView *container : successor.containers)
+    if (container != &retained[0] && container != &retained[1]) replacement = container;
+  const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(successor.plan.stateful, successor.plan.config.applicationID, 0);
+  suite.expect(successor.nShardGroups == 1 && successor.nTarget() == 3 && successor.nDeployed() == 3 && successor.nHealthy() == 1,
+               "recovered_stateful_target_rehydrates_one_shard_and_schedules_missing_replica");
+  suite.expect(replacement != nullptr && replacement->machine == &machines[2] &&
+                   replacement->shardGroup == 0 && replacement->subscriptions.contains(roles.seeding),
+               "recovered_stateful_target_seeds_missing_replica_on_remaining_rack");
+  suite.expect(predecessor->containers.empty() && predecessor->nShardGroups == 0 && predecessor->next == &successor &&
+                   successor.previous == predecessor && retained[0].state == ContainerState::healthy && retained[1].state == ContainerState::scheduled,
+               "recovered_stateful_target_preserves_empty_predecessor_and_canonical_replicas");
+
+  if (replacement)
+  {
+    // Releasing the health waiter resumes the scheduler.  The normal running
+    // transition is permitted to cull its heap-owned predecessor; remove its
+    // stale test index first, as production cull replication owns that index.
+    brain->deployments.erase(predecessorDeploymentID);
+    successor.containerIsHealthy(&retained[1]);
+    successor.containerIsHealthy(replacement);
+    successor.destructContainer(replacement);
+    successor.containerDestroyed(replacement);
+  }
+  suite.expect(successor.previous == nullptr && successor.waitingOnContainers.empty() && successor.schedulingStack.execution == nullptr,
+               "recovered_stateful_target_cleans_pending_scheduler_before_stack_views_die");
+
+  // An empty recovered inventory must not invent a stateful topology merely
+  // because a predecessor's retained reconstruction was empty.  Marking all
+  // machines unavailable also proves this public recovery path does not queue
+  // a spin while no canonical successor replica has been restored.
+  for (Machine& machine : machines)
+  {
+    machine.runtimeReady = false;
+    machine.state = MachineState::neuronRebooting;
+  }
+  ApplicationDeployment emptyPredecessor = {};
+  emptyPredecessor.plan = successor.plan;
+  emptyPredecessor.plan.config.versionID = 3;
+  emptyPredecessor.nShardGroups = 0;
+  ApplicationDeployment emptySuccessor = {};
+  emptySuccessor.plan = emptyPredecessor.plan;
+  emptySuccessor.plan.config.versionID = 4;
+  emptySuccessor.previous = &emptyPredecessor;
+  emptyPredecessor.next = &emptySuccessor;
+  brain->deployments.insert_or_assign(emptyPredecessor.plan.config.deploymentID(), &emptyPredecessor);
+  brain->deployments.insert_or_assign(emptySuccessor.plan.config.deploymentID(), &emptySuccessor);
+  emptySuccessor.recoverAfterReboot();
+  suite.expect(emptySuccessor.nShardGroups == 0 && emptySuccessor.nTarget() == 0 &&
+                   emptySuccessor.containers.empty() && emptySuccessor.toSchedule.empty() &&
+                   emptySuccessor.waitingOnContainers.empty() && emptySuccessor.schedulingStack.execution == nullptr,
+               "recovered_stateful_target_empty_inventory_keeps_zero_topology_without_available_machines");
+  brain->deployments.erase(emptyPredecessor.plan.config.deploymentID());
+  brain->deployments.erase(emptySuccessor.plan.config.deploymentID());
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    successor.containers.erase(&retained[index]);
+    while (successor.containersByShardGroup.eraseEntry(0, &retained[index])) {}
+    brain->containers.erase(retained[index].uuid);
+    machines[index].removeContainerIndexEntry(retained[index].deploymentID, &retained[index]);
+  }
+  brain->deployments.erase(successor.plan.config.deploymentID());
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].machines.erase(&machines[index]);
+    brain->machines.erase(&machines[index]);
+    brain->racks.erase(racks[index].uuid);
+  }
+  thisBrain = savedBrain;
+  delete brain;
+}
+
 int main(void)
 {
   TestSuite suite;
   if (std::getenv("PRODIGY_TEST_INPLACE_PAIRING_ONLY") != nullptr)
   {
     testInplacePairingOrder(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_RECOVERED_STATEFUL_TARGET_ONLY") != nullptr)
+  {
+    testRecoveredStatefulSuccessorTarget(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 

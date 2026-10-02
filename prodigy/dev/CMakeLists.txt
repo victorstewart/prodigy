@@ -2126,6 +2126,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_deployments_unit>
    )
    set_tests_properties(prodigy_durable_replacement_pairing_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_recovered_stateful_target_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_RECOVERED_STATEFUL_TARGET_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_recovered_stateful_target_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_remote_bootstrap_unit
