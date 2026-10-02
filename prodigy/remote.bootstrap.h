@@ -728,14 +728,18 @@ static inline bool prodigyRunBlockingSSHCommandUntil(LIBSSH2_SESSION *& session,
       break;
     }
 
+    // Reading stderr may consume socket packets that queue stdout. Drain
+    // those channel buffers before considering EOF or polling the socket;
+    // buffered bytes need no new socket activity to become readable.
+    // extended=1 checks both stdout and stderr in the pinned libssh2 owner.
+    if (progressed || libssh2_poll_channel_read(channel, 1) > 0)
+    {
+      continue;
+    }
+
     if (libssh2_channel_eof(channel))
     {
       break;
-    }
-
-    if (progressed)
-    {
-      continue;
     }
 
     int remainingMs = 0;

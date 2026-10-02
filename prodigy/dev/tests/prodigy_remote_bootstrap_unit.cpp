@@ -744,6 +744,15 @@ int main(void)
                          nullptr, &failure, 5'000),
                      "blocking_ssh_command_succeeds_after_failure");
         suite.expect(failure.size() == 0, "blocking_ssh_command_success_clears_failure");
+        String mixedStreamOutput = {};
+        suite.expect(prodigyRunBlockingSSHCommand(session, fd,
+                         "head -c 10036 /dev/zero | tr '\\0' x; printf 'mixed-stream-sentinel' >&2"_ctv,
+                         &mixedStreamOutput, &failure, 5'000),
+                     "blocking_ssh_command_drains_buffered_stdout_after_stderr");
+        suite.expect(mixedStreamOutput.size() == 10036,
+                     "blocking_ssh_command_preserves_large_mixed_stream_stdout");
+        suite.expect(failure.size() == 0,
+                     "blocking_ssh_command_large_mixed_stream_clears_failure");
       }
       prodigyCloseBlockingSSHSession(session, fd);
     }
