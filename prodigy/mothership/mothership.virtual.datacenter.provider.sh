@@ -256,12 +256,24 @@ prepare_cgroup_scope()
    )
 }
 
+valid_retained_cgroup_root()
+{
+   local retained_cgroup_root="$1"
+   local runtime_identity="$2"
+   local canonical=""
+   [[ "${runtime_identity}" =~ ^[0-9]+$ ]] || return 1
+   canonical="$(realpath -m -- "${retained_cgroup_root}")" || return 1
+   [[ "${canonical}" == "${retained_cgroup_root}" ]] || return 1
+   [[ "${retained_cgroup_root}" == "/sys/fs/cgroup/prodigy-vdc-${runtime_identity}" ||
+      "${retained_cgroup_root}" == /sys/fs/cgroup/*/prodigy-vdc-"${runtime_identity}" ]]
+}
+
 restore_cgroup_scope_if_idle()
 {
    if [[ -n "${1:-}" ]]
    then
       cgroup_scope="$1"
-      [[ "${cgroup_scope}" == /sys/fs/cgroup/* && -d "${cgroup_scope}" ]] || return 1
+      [[ ( "${cgroup_scope}" == /sys/fs/cgroup || "${cgroup_scope}" == /sys/fs/cgroup/* ) && -d "${cgroup_scope}" ]] || return 1
       cgroup_control="${cgroup_scope}/prodigy-vdc-control"
       cgroup_lock="/run/prodigy-vdc-cgroup-$(stat -Lc %i "${cgroup_scope}").lock"
    else
@@ -558,7 +570,7 @@ stop_datacenter()
          echo "cannot resolve retained provider cgroup owner" >&2
          return 1
       fi
-      [[ "${retained_cgroup_root}" == /sys/fs/cgroup/*/prodigy-vdc-${runtime_identity} && "$(realpath -m -- "${retained_cgroup_root}")" == "${retained_cgroup_root}" ]] || return 1
+      valid_retained_cgroup_root "${retained_cgroup_root}" "${runtime_identity}" || return 1
       retained_scope="${retained_cgroup_root%/prodigy-vdc-${runtime_identity}}"
    fi
    if provider_process "${provider_pid}" "${workspace}"

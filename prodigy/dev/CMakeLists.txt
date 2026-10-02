@@ -1833,6 +1833,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_dev_netns_harness_cleanup_unit PROPERTIES TIMEOUT 30)
    add_test(
+      NAME prodigy_virtual_datacenter_cgroup_root_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_cgroup_root_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
+   )
+   set_tests_properties(prodigy_virtual_datacenter_cgroup_root_unit PROPERTIES TIMEOUT 15)
+   add_test(
       NAME prodigy_virtual_datacenter_bounded_log_unit
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_bounded_log_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
    )
