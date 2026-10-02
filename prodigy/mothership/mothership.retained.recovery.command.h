@@ -411,7 +411,7 @@ print('pinned stateless extras retired')
 )PY";
   if(mode==InventoryMode::retireConflictingClient) {
     String target;target.snprintf<"{itoh}"_ctv>(retiredConflictingClientUUID);
-    code+=R"PY(target=str(int("0x)PY"+str(target)+R"PY(",16))
+    code+=R"PY(target=str(int(")PY"+str(target)+R"PY(",16))
 matches=[r for r in records if str(int(r['uuid'],16))==target]
 assert len(matches)==1 and matches[0]['canonical'],'sealed conflicting-client target differs'
 r=matches[0];base=pathlib.Path('/proc')/str(r['pid'])
@@ -440,12 +440,12 @@ print('sealed conflicting client retired')
 // after the target process has exited; it never names or touches storage.
 inline std::string derivedConflictingClientManifestProgram(const std::string& manifestPath,uint128_t targetUUID) {
   String target;target.snprintf<"{itoh}"_ctv>(targetUUID);
-  std::string code="import json\nm=json.load(open("+quote(manifestPath)+"))\nt='0x"+str(target)+"'\nfound=[]\nfor machine in m['machines']:\n for record in machine['records']:\n  if int(record['uuid'],16)==int(t,16):found.append(record)\nassert len(found)==1 and found[0]['canonical']\nassert m['canonicalContainerCount']>0\nfound[0]['canonical']=False\nm['canonicalContainerCount']-=1\nprint(json.dumps(m,sort_keys=True,separators=(',',':')))\n";
+  std::string code="import json\nm=json.load(open("+quote(manifestPath)+"))\nt='"+str(target)+"'\nfound=[]\nfor machine in m['machines']:\n for record in machine['records']:\n  if int(record['uuid'],16)==int(t,16):found.append(record)\nassert len(found)==1 and found[0]['canonical']\nassert m['canonicalContainerCount']>0\nfound[0]['canonical']=False\nm['canonicalContainerCount']-=1\nprint(json.dumps(m,sort_keys=True,separators=(',',':')))\n";
   return "python3 -c "+quote(code);
 }
 inline std::string conflictingClientStorageProgram(const std::string& manifestPath,uint128_t targetUUID,bool afterExit) {
   String target;target.snprintf<"{itoh}"_ctv>(targetUUID);
-  std::string code="import json,os,pathlib\nm=json.load(open("+quote(manifestPath)+"))\nt=int('0x"+str(target)+"',16)\nr=[r for x in m['machines'] for r in x['records'] if int(r['uuid'],16)==t]\nassert len(r)==1\nr=r[0];host=pathlib.Path('/containers/storage')/str(t);kv=host/'kvdb'\nh=host.stat();k=kv.stat();assert host.is_dir() and kv.is_dir()\n";
+  std::string code="import json,os,pathlib\nm=json.load(open("+quote(manifestPath)+"))\nt=int('"+str(target)+"',16)\nr=[r for x in m['machines'] for r in x['records'] if int(r['uuid'],16)==t]\nassert len(r)==1\nr=r[0];host=pathlib.Path('/containers/storage')/str(t);kv=host/'kvdb'\nh=host.stat();k=kv.stat();assert host.is_dir() and kv.is_dir()\n";
   if(!afterExit) code+="p=pathlib.Path('/proc')/str(r['pid'])/'root'/'storage';s=p.stat();q=(p/'kvdb').stat();assert (s.st_dev,s.st_ino)==(h.st_dev,h.st_ino) and (q.st_dev,q.st_ino)==(k.st_dev,k.st_ino)\n";
   code+="print(f'{h.st_dev}:{h.st_ino} {k.st_dev}:{k.st_ino} {host}')\n";
   return "python3 -c "+quote(code);
@@ -693,7 +693,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         String output,why;
         const std::string command="LD_LIBRARY_PATH="+quote(e.remoteRuntime+"/lib")+" "+quote(e.remoteRuntime+"/tools/mothership")+
           " verifyRetiredConflictingClientLocal "+quote(e.remoteRoot+"/recovery.request.original")+" "+quote(e.remoteRoot+"/state.copy10")+
-          " "+quote("0x"+str(targetText))+" "+quote(e.plan.oldBundleSHA);
+          " "+quote(str(targetText))+" "+quote(e.plan.oldBundleSHA);
         if (!e.command(e.plan.machines[index].uuid,command,&why,&output,30'000)) {
           String host;host.snprintf<"{itoh}"_ctv>(e.plan.machines[index].uuid);
           String diagnostic;diagnostic.snprintf<"conflicting-client private-copy validation failed machine {}: {}"_ctv>(host,why);

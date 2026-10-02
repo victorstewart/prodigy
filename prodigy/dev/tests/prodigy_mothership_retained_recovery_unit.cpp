@@ -392,6 +392,13 @@ static int retainedPrecheckpointFailures(void)
 
 static void assertSchema4ConflictingClientRetirement(void)
 {
+  const uint128_t formatterTarget=(uint128_t(0x4fbeb7f9454a068aULL)<<64)|uint128_t(0x1eea562809529ff6ULL);
+  String targetArgument={};targetArgument.snprintf<"{itoh}"_ctv>(formatterTarget);
+  assert(MothershipTidesMigration::uuid(MothershipTidesMigration::str(targetArgument))==formatterTarget);
+  bool duplicatePrefixRejected=false;
+  try { (void)MothershipTidesMigration::uuid("0x"+MothershipTidesMigration::str(targetArgument)); }
+  catch(const std::exception&) { duplicatePrefixRejected=true; }
+  assert(duplicatePrefixRejected);
   const String current=MothershipTidesMigration::text(std::string(64,'a')),
       previous=MothershipTidesMigration::text(std::string(64,'b')),
       interrupted=MothershipTidesMigration::text(std::string(64,'c'));
@@ -766,6 +773,15 @@ int main()
   // Exercise the actual private-copy save and independent reopen/readback.
   const auto root=std::filesystem::current_path()/".run"/("retained-recovery-"+std::to_string(::getpid()));
   assert(!std::filesystem::exists(root));std::filesystem::create_directories(root);
+  const uint128_t formattedTarget=(uint128_t(0x4fbeb7f9454a068aULL)<<64)|uint128_t(0x1eea562809529ff6ULL);
+  const auto prefixManifest=(root/"prefix-manifest.json").string(), prefixDerived=(root/"prefix-derived.json").string();
+  { std::ofstream output(prefixManifest); assert(output); output << "{\"canonicalContainerCount\":1,\"machines\":[{\"records\":[{\"uuid\":\"0x4fbeb7f9454a068a1eea562809529ff6\",\"canonical\":true}]}]}"; }
+  const auto derivedPrefixCommand=derivedConflictingClientManifestProgram(prefixManifest,formattedTarget);
+  const auto retiredPrefixCommand=inventoryProgram(prefixManifest,inventoryMachine,InventoryMode::retireConflictingClient,formattedTarget);
+  const auto storagePrefixCommand=conflictingClientStorageProgram(prefixManifest,formattedTarget,true);
+  assert(derivedPrefixCommand.find("0x0x")==std::string::npos && retiredPrefixCommand.find("0x0x")==std::string::npos && storagePrefixCommand.find("0x0x")==std::string::npos);
+  String prefixFailure; assert(prodigyRunLocalShellCommand(text(derivedPrefixCommand+" > "+quote(prefixDerived)),&prefixFailure));
+  const auto derivedPrefix=MothershipTidesMigration::read(prefixDerived); assert(derivedPrefix.find("\"canonical\":false")!=std::string::npos && derivedPrefix.find("\"canonicalContainerCount\":0")!=std::string::npos);
   const auto statePath=(root/"state.new10").string(), requestPath=(root/"request").string();
   snapshot.brainConfig.clusterUUID=1;snapshot.brainConfig.datacenterFragment=7;
   DeploymentPlan deployment = {};deployment.config.type=ApplicationType::stateless;deployment.config.applicationID=77;deployment.config.versionID=9;
