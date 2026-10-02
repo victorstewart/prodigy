@@ -7268,6 +7268,29 @@ private:
       {
         return false;
       }
+      if (environment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        if (mothershipRunProviderHostJob(
+                hostRuntime,
+                environment,
+                MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+                "schema cpu capability inference",
+                failure,
+                [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+                  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                        inferClusterMachineSchemaCpuCapabilities(provider, coro, cluster, capabilities, jobFailure);
+                      }))
+                  {
+                    co_await coro->suspendAtIndex(suspendIndex);
+                  }
+                  completed = jobFailure.empty();
+                }) == false)
+        {
+          return false;
+        }
+        publishClusterMachineSchemaCpuCapabilities(cluster, capabilities);
+        return true;
+      }
       std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
       if (provider == nullptr)
       {
@@ -7305,6 +7328,24 @@ private:
     if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, environment, &failure) == false)
     {
       return false;
+    }
+    if (environment.kind == ProdigyEnvironmentKind::vultr)
+    {
+      return mothershipRunProviderHostJob(
+          hostRuntime,
+          environment,
+          MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+          "create preflight",
+          failure,
+          [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  preflightClusterProviderCreate(provider, coro, preflight, jobFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            completed = jobFailure.empty();
+          });
     }
     std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
     if (provider == nullptr)
@@ -7383,14 +7424,34 @@ private:
     }
     else
     {
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
-      if (provider == nullptr)
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
-        failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
-        return false;
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "machine destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderMachines(coro, provider, cloudIDs, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
       }
-      provider->configureRuntimeEnvironment(runtimeEnvironment);
-      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      else
+      {
+        std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+        if (provider == nullptr)
+        {
+          failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
+          return false;
+        }
+        provider->configureRuntimeEnvironment(runtimeEnvironment);
+        destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      }
     }
 
     destroyedCloudMachines = destroyed ? uint32_t(createdMachines.size()) : 0;
@@ -8522,6 +8583,34 @@ private:
         return tagged;
       }
 
+      if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const bool tagged = mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            tagRuntimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "cloud machine tagging",
+            tagFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              provider.configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage,
+                                                   cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
+              completed = true;
+              for (const ClusterMachine& machine : machines)
+              {
+                completed = false;
+                if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                      prodigyEnsureCloudMachineTagged(coro, provider, cluster.clusterUUID, machine, completed, &jobFailure);
+                    }))
+                {
+                  co_await coro->suspendAtIndex(suspendIndex);
+                }
+                if (completed == false || jobFailure.empty() == false) co_return;
+              }
+            });
+        if (tagged == false && failure) failure->assign(tagFailure);
+        return tagged;
+      }
+
       std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment, {});
       if (provider == nullptr)
       {
@@ -8897,6 +8986,40 @@ private:
         return false;
       }
 
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const bool provisioned = mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() +
+                std::chrono::milliseconds(prodigyMachineProvisioningTimeoutMs),
+            "seed provisioning",
+            localFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipProvisionCreatedSeedMachine(coro,
+                                                          cluster,
+                                                          instruction,
+                                                          provider,
+                                                          seedMachine,
+                                                          completed,
+                                                          &progressPrinter,
+                                                          timingAttribution,
+                                                          &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        if (provisioned == false)
+        {
+          if (failure) failure->assign(localFailure);
+          return false;
+        }
+        if (failure) failure->clear();
+        return true;
+      }
+
       std::unique_ptr<BrainIaaS> provider =
           prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
       if (provider == nullptr)
@@ -9021,6 +9144,57 @@ private:
         {
           failure->clear();
         }
+        return true;
+      }
+
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const MultiCurlClient::TimePoint cleanupDeadline =
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+        (void)mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            runtimeEnvironment,
+            cleanupDeadline - std::chrono::minutes(3),
+            "cluster cleanup",
+            destroyClusterFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderClusterMachines(coro, provider, clusterUUIDTagValue,
+                                                             destroyedClusterMachines, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        Vector<String> seedCloudIDs = {};
+        seedCloudIDs.push_back(seedMachine.cloud.cloudID);
+        if (mothershipRunProviderHostJob(
+                owner->hostRuntime,
+                runtimeEnvironment,
+                cleanupDeadline,
+                "seed machine destroy",
+                localFailure,
+                [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+                  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                        mothershipDestroyProviderMachines(coro, provider, seedCloudIDs, completed, &jobFailure);
+                      }))
+                  {
+                    co_await coro->suspendAtIndex(suspendIndex);
+                  }
+                }) == false)
+        {
+          if (failure)
+          {
+            if (localFailure.empty() == false && destroyClusterFailure.empty() == false)
+            {
+              localFailure.append("; bulk cleanup also failed: "_ctv);
+              localFailure.append(destroyClusterFailure);
+            }
+            failure->assign(localFailure.empty() ? destroyClusterFailure : localFailure);
+          }
+          return false;
+        }
+        if (failure) failure->clear();
         return true;
       }
 
@@ -9164,6 +9338,17 @@ private:
             {
               failure->assign(tagFailure);
             }
+            finalizeTiming();
+            return false;
+          }
+        }
+        else if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+        {
+          Vector<ClusterMachine> seedMachines = {};
+          seedMachines.push_back(seedMachine);
+          if (ensureCloudMachinesTaggedLocally(cluster, seedMachines, &tagFailure) == false)
+          {
+            if (failure) failure->assign(tagFailure);
             finalizeTiming();
             return false;
           }
@@ -14443,6 +14628,31 @@ private:
     cloudIDs.clear();
     failure.clear();
     bytell_hash_set<Machine *> machines = {};
+    if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+    {
+      const bool listed = mothershipRunProviderHostJob(
+          hostRuntime,
+          runtimeEnvironment,
+          MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+          "machine inventory",
+          failure,
+          [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  provider.getMachines(coro, metro, machines, jobFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            completed = jobFailure.empty();
+          });
+      for (Machine *machine : machines)
+      {
+        if (machine != nullptr && machine->cloudID.size() > 0) cloudIDs.push_back(machine->cloudID);
+        delete machine;
+      }
+      machines.clear();
+      return listed;
+    }
     if (runtimeEnvironment.kind != ProdigyEnvironmentKind::gcp)
     {
       blockingProvider.getMachines(nullptr, metro, machines, failure);
@@ -14847,7 +15057,27 @@ private:
     }
     else
     {
-      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "machine destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& jobProvider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderMachines(coro, jobProvider, cloudIDs, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+      }
+      else
+      {
+        destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      }
     }
     if (destroyed == false)
     {
@@ -15036,19 +15266,40 @@ private:
     }
     else
     {
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
-      if (provider == nullptr)
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
-        failure.assign("failed to construct provider iaas"_ctv);
+        completed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "cluster destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& jobProvider, bool& jobCompleted, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderClusterMachines(coro, jobProvider, clusterUUID, destroyed,
+                                                             jobCompleted, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
       }
       else
       {
-        provider->configureRuntimeEnvironment(runtimeEnvironment);
-        completed = mothershipDestroyProviderClusterMachinesInline(
-            *provider,
-            clusterUUID,
-            destroyed,
-            &failure);
+        std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+        if (provider == nullptr)
+        {
+          failure.assign("failed to construct provider iaas"_ctv);
+        }
+        else
+        {
+          provider->configureRuntimeEnvironment(runtimeEnvironment);
+          completed = mothershipDestroyProviderClusterMachinesInline(
+              *provider,
+              clusterUUID,
+              destroyed,
+              &failure);
+        }
       }
     }
     if (completed == false)

@@ -7,6 +7,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <prodigy/iaas/vultr/vultr.http.h>
+#include <prodigy/mothership/mothership.gcp.host.operations.h>
 #include <prodigy/mothership/mothership.ring.runtime.h>
 
 class TestSuite
@@ -141,23 +143,62 @@ static bool runActualRuntimeScenario(void)
     bool inlineRan = false;
     bool inlineOnWorker = false;
     bool servicesInjected = false;
+    bool vultrTransportAvailable = false;
     DeferredRingWake deferred = {};
+    DeferredRingWake adapterFirst = {};
+    DeferredRingWake adapterSecond = {};
+    bool adapterFinishedFirst = false;
+    bool adapterFinishedSecond = false;
     {
       MothershipHostRingRuntime runtime;
       inlineRan = runtime.run([&](ProdigyProviderServices services, CoroutineStack *) -> void {
         servicesInjected = bool(services.http);
         inlineOnWorker = std::this_thread::get_id() != mainThread;
       });
+      String credential = "unit-test-vultr-credential"_ctv;
+      bool vultrRan = runtime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+        VultrHttpTransport transport(services.http, services.delay,
+                                     MultiCurlClient::Clock::now() + std::chrono::seconds(1), credential);
+        vultrTransportAvailable = coro != nullptr && transport.available();
+      });
+      ProdigyRuntimeEnvironmentConfig vultrEnvironment = {};
+      vultrEnvironment.kind = ProdigyEnvironmentKind::vultr;
+      vultrEnvironment.providerCredentialMaterial.assign(credential);
+      String adapterFailure = {};
+      bool adapterRan = mothershipRunProviderHostJob(
+          runtime,
+          vultrEnvironment,
+          MultiCurlClient::Clock::now() + std::chrono::seconds(1),
+          "deferred adapter sequence",
+          adapterFailure,
+          [&](CoroutineStack *coro, BrainIaaS&, bool& completed, String&) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  adapterFirst.begin(coro);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            adapterFinishedFirst = adapterFirst.fired;
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  adapterSecond.begin(coro);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            adapterFinishedSecond = adapterSecond.fired;
+            completed = adapterFinishedFirst && adapterFinishedSecond;
+          });
       bool deferredRan = runtime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
         servicesInjected = servicesInjected && bool(services.http);
         deferred.begin(coro);
       });
-      if (inlineRan == false || deferredRan == false)
+      if (inlineRan == false || vultrRan == false || adapterRan == false || deferredRan == false)
       {
         _exit(3);
       }
     }
-    _exit(inlineOnWorker && servicesInjected && deferred.fired &&
+    _exit(inlineOnWorker && servicesInjected && vultrTransportAvailable &&
+                  adapterFinishedFirst && adapterFinishedSecond && deferred.fired &&
                   deferred.callbackThread != mainThread
               ? 0
               : 4);
