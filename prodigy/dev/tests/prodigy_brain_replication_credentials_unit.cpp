@@ -1242,6 +1242,10 @@ public:
   Vector<Wormhole> lastRefreshedWormholesForTest = {};
   uint128_t lastSyncedContainerUUIDForTest = 0;
   uint128_t lastPoppedContainerUUIDForTest = 0;
+  String containerArtifactStoreRootForTest = {};
+  uint32_t receivedContainerArtifactCompletionsForTest = 0;
+  bool receivedContainerArtifactAdoptedForTest = false;
+  bool receivedContainerArtifactSourceCurrentForTest = false;
 
   TestNeuron()
   {
@@ -1358,6 +1362,35 @@ public:
     brain->isFixedFile = true;
     brain->fslot = 1;
     brain->connected = connected;
+  }
+
+  String containerArtifactStoreRoot(void) const override
+  {
+    return containerArtifactStoreRootForTest.size() ? containerArtifactStoreRootForTest : Neuron::containerArtifactStoreRoot();
+  }
+
+  bool startContainerArtifactIOForTest(const String& storeRoot)
+  {
+    containerArtifactStoreRootForTest = storeRoot;
+    artifactIO = ProdigyArtifactIO::startOwned();
+    return artifactIO != nullptr;
+  }
+
+  ProdigyArtifactIO *containerArtifactIOForTest(void)
+  {
+    return artifactIO.get();
+  }
+
+  void resetContainerArtifactIOForTest(void)
+  {
+    artifactIO.reset();
+  }
+
+  void receivedContainerArtifactFinished(uint64_t, bool adopted, bool sourceCurrent) override
+  {
+    receivedContainerArtifactCompletionsForTest += 1;
+    receivedContainerArtifactAdoptedForTest = adopted;
+    receivedContainerArtifactSourceCurrentForTest = sourceCurrent;
   }
 
   void seedStaleBrainStreamForTest(void)
@@ -2150,6 +2183,61 @@ static bool quiesceArtifactIOForTest(ProdigyArtifactIO *artifactIO)
 {
   if (artifactIO == nullptr) return true;
   ArtifactIOExecQuiesceWaiter waiter(artifactIO);
+  return waiter.wait();
+}
+
+class ArtifactIOCompletionWaiter final : public TimeoutDispatcher {
+public:
+  std::function<bool()> done = {};
+  TimeoutPacket tick = {};
+  TimeoutPacket deadline = {};
+  bool completed = false;
+  bool timedOut = false;
+
+  explicit ArtifactIOCompletionWaiter(std::function<bool()> completion) : done(std::move(completion))
+  {
+    tick.dispatcher = this;
+    deadline.dispatcher = this;
+  }
+
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    if (packet == &deadline)
+    {
+      timedOut = true;
+      Ring::exit = true;
+      return;
+    }
+    if (done())
+    {
+      completed = true;
+      Ring::exit = true;
+      return;
+    }
+    tick.clear();
+    tick.setTimeoutMs(5);
+    Ring::queueTimeout(&tick);
+  }
+
+  bool wait(void)
+  {
+    if (done()) return true;
+    tick.setTimeoutMs(5);
+    deadline.setTimeoutMs(1500);
+    Ring::queueTimeout(&tick);
+    Ring::queueTimeout(&deadline);
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    tick.clear();
+    deadline.clear();
+    return completed && timedOut == false;
+  }
+};
+
+static bool pumpArtifactIOForTest(const std::function<bool()>& done)
+{
+  ArtifactIOCompletionWaiter waiter(done);
   return waiter.wait();
 }
 
@@ -4863,6 +4951,9 @@ static void testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(
 
   ApplicationDeployment deployment;
   seedDeployRequestPlan(deployment.plan, 62'004);
+  // Async provisioning revalidates the owning deployment after its durable
+  // journal receipt, just as it does in the live scheduler.
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   MachineTicket ticket;
   brain.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 8);
 
@@ -4885,12 +4976,14 @@ static void testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(
   restored.brainConfig.clusterUUID = brain.brainConfig.clusterUUID;
   restored.brainConfig.configBySlug.insert_or_assign(machineConfig.slug, machineConfig);
   restored.masterAuthorityRuntimeState = std::move(restoredState);
+  restored.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   restoredIaaS.observedBrain = &restored;
   restoredIaaS.provisioningSettled = false;
 
   restored.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 1);
   suite.expect(restoredIaaS.spinCalls == 1, "autonomous_provisioning_restart_reconciles_once");
-  suite.expect(restoredIaaS.provisioningOperationIDs.size() == 1 &&
+  suite.expect(iaas.provisioningOperationIDs.size() == 1 &&
+                   restoredIaaS.provisioningOperationIDs.size() == 1 &&
                    restoredIaaS.provisioningOperationIDs[0] == iaas.provisioningOperationIDs[0],
                "autonomous_provisioning_restart_reuses_operation_id");
   suite.expect(restored.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.size() == 1 &&
@@ -4901,6 +4994,8 @@ static void testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(
   restored.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 1);
   suite.expect(restored.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.empty(), "autonomous_provisioning_proven_compensation_clears_journal");
 
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  restored.deployments.erase(deployment.plan.config.deploymentID());
   delete brain.mesh;
   brain.mesh = nullptr;
   delete restored.mesh;
@@ -8084,12 +8179,30 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
 
 static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
+  ScopedSocketPair followerSockets = {};
   ResumableAddMachinesBrain brain;
   NoopBrainIaaS iaas;
   Mothership mothership;
+  if (suite.require(mothershipSockets.create(suite, "mothership_machine_schema_mutations_creates_mothership_socket"),
+                    "mothership_machine_schema_mutations_requires_mothership_socket") == false ||
+      suite.require(followerSockets.create(suite, "mothership_machine_schema_mutations_creates_follower_socket"),
+                    "mothership_machine_schema_mutations_requires_follower_socket") == false)
+  {
+    return;
+  }
+
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_machine_schema_mutations_adopts_mothership_socket") == false ||
+      suite.require(brain.activateMothershipConnection(&mothership), "mothership_machine_schema_mutations_activates_mothership") == false)
+  {
+    return;
+  }
   brain.nBrains = 2;
   brain.authoritativeTopology.version = 9;
   brain.authoritativeTopology.machines.push_back(ClusterMachine {});
@@ -8102,7 +8215,11 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
 
   BrainView follower = {};
   follower.isFixedFile = true;
-  follower.fslot = 31;
+  follower.fslot = followerSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(follower.fslot >= 0, "mothership_machine_schema_mutations_adopts_follower_socket") == false)
+  {
+    return;
+  }
   follower.connected = true;
   brain.brains.insert(&follower);
 
@@ -8132,6 +8249,17 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
 
   String messageBuffer = {};
 
+  auto completeMutation = [&](const char *name) -> bool {
+    if (suite.require(brain.pendingRuntimePersistence.size() == 1, name) == false)
+    {
+      return false;
+    }
+
+    brain.finishRuntimePersistence(true);
+    brain.holdRuntimePersistence = false;
+    return suite.require(mothership.wBuffer.size() >= sizeof(Message), "mothership_machine_schema_mutations_emits_durable_response");
+  };
+
   {
     UpsertMachineSchemas request = {};
     ProdigyManagedMachineSchemaPatch patch = {};
@@ -8153,7 +8281,12 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
     Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::upsertMachineSchemas, serializedRequest);
+    brain.holdRuntimePersistence = true;
     brain.mothershipHandler(&mothership, message);
+    if (completeMutation("mothership_upsert_machine_schemas_waits_for_runtime_state_receipt") == false)
+    {
+      return;
+    }
 
     Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
     String serializedResponse = {};
@@ -8190,7 +8323,12 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
     Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::deltaMachineBudget, serializedRequest);
+    brain.holdRuntimePersistence = true;
     brain.mothershipHandler(&mothership, message);
+    if (completeMutation("mothership_delta_machine_budget_waits_for_runtime_state_receipt") == false)
+    {
+      return;
+    }
 
     Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
     String serializedResponse = {};
@@ -8220,7 +8358,12 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
     Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::deleteMachineSchema, serializedRequest);
+    brain.holdRuntimePersistence = true;
     brain.mothershipHandler(&mothership, message);
+    if (completeMutation("mothership_delete_machine_schema_waits_for_runtime_state_receipt") == false)
+    {
+      return;
+    }
 
     Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
     String serializedResponse = {};
@@ -8580,7 +8723,17 @@ static void testOSUpdateSchedulerGatesTargetVMsConcurrencyAndReimages(TestSuite&
 static void testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(TestSuite& suite)
 {
   ScopedFreshRing scopedRing = {};
+  ScopedSocketPair peerSockets = {};
   ResumableAddMachinesBrain brain;
+  TestNeuron selfNeuron = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &selfNeuron;
+  if (suite.require(peerSockets.create(suite, "os_update_local_master_handoff_creates_peer_socket"),
+                    "os_update_local_master_handoff_requires_peer_socket") == false)
+  {
+    thisNeuron = previousNeuron;
+    return;
+  }
   brain.weAreMaster = true;
   brain.noMasterYet = false;
   brain.hasCompletedInitialMasterElection = true;
@@ -8594,6 +8747,7 @@ static void testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(TestSuite& suite)
   Machine peerMachine = {};
   seedOSUpdateMachine(brain, self, "self"_ctv, MachineConfig::MachineKind::bareMetal, 0x7301, "22.04"_ctv, true);
   seedOSUpdateMachine(brain, peerMachine, "peer"_ctv, MachineConfig::MachineKind::bareMetal, 0x7302, "24.04"_ctv);
+  selfNeuron.uuid = self.uuid;
   peerMachine.runtimeReady = true;
 
   BrainView peer = {};
@@ -8604,7 +8758,12 @@ static void testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(TestSuite& suite)
   peer.registrationFresh = true;
   peer.connected = true;
   peer.isFixedFile = true;
-  peer.fslot = 21;
+  peer.fslot = peerSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(peer.fslot >= 0, "os_update_local_master_handoff_adopts_peer_socket") == false)
+  {
+    thisNeuron = previousNeuron;
+    return;
+  }
   peerMachine.brain = &peer;
   brain.brains.insert(&peer);
 
@@ -8627,6 +8786,7 @@ static void testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(TestSuite& suite)
   brain.neurons.erase(&self.neuron);
   brain.machinesByUUID.erase(self.uuid);
   brain.machines.erase(&self);
+  thisNeuron = previousNeuron;
 }
 
 static void testOSUpdateLocalMasterDefersWithoutUpdatedHandoffPeer(TestSuite& suite)
@@ -9192,17 +9352,34 @@ static void testNeuronOSUpdateParsingAndDispatch(TestSuite& suite)
 
 static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite)
 {
-  ResumableAddMachinesBrain brain;
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
+  AsyncQueuedAddMachinesBrain brain;
   AutoProvisionBrainIaaS iaas;
   Mothership mothership;
+  if (suite.require(mothershipSockets.create(suite, "mothership_managed_schema_actions_creates_mothership_socket"),
+                    "mothership_managed_schema_actions_requires_mothership_socket") == false)
+  {
+    return;
+  }
   brain.iaas = &iaas;
+  iaas.observedBrain = &brain;
+  iaas.observedAsyncQueuedMachines = &brain.asyncQueuedMachines;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
   brain.nBrains = 1;
   brain.brainConfig.clusterUUID = 0x4401;
   brain.brainConfig.bootstrapSshUser = "root"_ctv;
   brain.brainConfig.bootstrapSshPrivateKeyPath = "/tmp/test-key"_ctv;
+  brain.brainConfig.controlSocketPath = "/run/prodigy/control.sock"_ctv;
   brain.brainConfig.requiredBrainCount = 1;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_managed_schema_actions_adopts_mothership_socket") == false ||
+      suite.require(brain.activateMothershipConnection(&mothership), "mothership_managed_schema_actions_activates_mothership") == false)
+  {
+    return;
+  }
   MachineConfig workerConfig = {};
   workerConfig.slug = "aws-worker-vm"_ctv;
   workerConfig.kind = MachineConfig::MachineKind::vm;
@@ -9269,6 +9446,21 @@ static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite
     return true;
   };
 
+  auto completeManagedBootstrap = [&]() -> bool {
+    if (suite.require(brain.asyncQueuedMachines.size() == 1 && brain.pendingBootstrap != nullptr &&
+                          brain.pendingBootstrap->tasks.size() == 1,
+                      "mothership_upsert_machine_schemas_queues_async_bootstrap") == false)
+    {
+      return false;
+    }
+    ProdigyRemoteBootstrapCoordinator *coordinator = brain.pendingBootstrap;
+    ProdigyRemoteBootstrapCoordinator::Task *task = coordinator->tasks[0];
+    task->complete(true, String(), false);
+    coordinator->closeHandler(task);
+    return suite.require(mothership.wBuffer.size() >= sizeof(Message),
+                         "mothership_upsert_machine_schemas_emits_response_after_bootstrap_receipt");
+  };
+
   {
     iaas.observedBrain = &brain;
     iaas.snapshotsToReturn.push_back(makeMachineSnapshot("aws-worker-vm"_ctv, "10.0.0.20"_ctv, "i-worker-0"_ctv, 0x5001));
@@ -9295,6 +9487,11 @@ static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite
     Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::upsertMachineSchemas, serializedRequest);
     brain.mothershipHandler(&mothership, message);
 
+    if (completeManagedBootstrap() == false)
+    {
+      return;
+    }
+
     Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
     String serializedResponse = {};
     uint8_t *responseArgs = responseMessage->args;
@@ -9306,6 +9503,10 @@ static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite
     suite.expect(response.created == 1, "mothership_upsert_machine_schemas_reports_created");
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
     suite.expect(response.hasTimingAttribution, "mothership_upsert_machine_schemas_reports_timing_attribution");
+    suite.expect(response.timingAttribution.providerWaitNs > 0,
+                 "mothership_upsert_machine_schemas_preserves_provider_wait_through_async_reconcile");
+    suite.expect(response.timingAttribution.runtimeOwnedNs > 0,
+                 "mothership_upsert_machine_schemas_reports_runtime_work_separately");
 #endif
     suite.expect(response.hasTopology, "mothership_upsert_machine_schemas_returns_topology");
     suite.expect(response.topology.version == 10, "mothership_upsert_machine_schemas_returns_updated_topology_version");
@@ -9317,10 +9518,8 @@ static void testMachineSchemaMutationsDriveManagedBudgetActions(TestSuite& suite
     suite.expect(iaas.acceptedCallbacks == 1, "mothership_upsert_machine_schemas_reports_create_acceptance");
     suite.expect(iaas.provisionedCallbacks == 1, "mothership_upsert_machine_schemas_reports_ready_machine");
     suite.expect(iaas.sawPendingOperationDuringSpin, "mothership_upsert_machine_schemas_journals_before_spin_returns");
-    suite.expect(iaas.sawBootstrapDuringSpin, "mothership_upsert_machine_schemas_bootstraps_before_spin_returns");
-    suite.expect(brain.bootstrappedMachines.size() == 1, "mothership_upsert_machine_schemas_bootstraps_created_machine");
-    suite.expect(brain.blockingBootstrapCallsWithBundleCache == 1, "mothership_upsert_machine_schemas_reuses_bundle_cache_for_blocking_bootstrap");
-    suite.expect(brain.blockingBootstrapCallsWithoutBundleCache == 0, "mothership_upsert_machine_schemas_avoids_uncached_blocking_bootstrap");
+    suite.expect(iaas.sawBootstrapDuringSpin, "mothership_upsert_machine_schemas_queues_bootstrap_before_spin_returns");
+    suite.expect(brain.asyncQueuedMachines.size() == 1, "mothership_upsert_machine_schemas_bootstraps_created_machine");
     suite.expect(brain.authoritativeTopology.version == 10, "mothership_upsert_machine_schemas_persists_updated_topology_version");
     suite.expect(brain.authoritativeTopology.machines.size() == 2, "mothership_upsert_machine_schemas_persists_created_machine");
 
@@ -11851,7 +12050,9 @@ static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(T
       echoFrames += 1;
     }
   });
-  suite.expect(receiver.persistCalls == persistAfterRecoveredCommand && echoFrames == 1 &&
+  // The duplicate must not re-elect, but its durable acknowledgement is a
+  // separate local-state receipt and therefore legitimately persists once.
+  suite.expect(receiver.persistCalls == persistAfterRecoveredCommand + 1 && echoFrames == 1 &&
                    designatedPeer.isMasterBrain,
                "update_self_relinquish_duplicate_command_replies_without_repeating_election");
 
@@ -11864,6 +12065,12 @@ static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(T
 static void testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
+
+  TestNeuron local = {};
+  local.uuid = 0x5400;
+  local.private4.v4 = 0x0a000054;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &local;
 
   TestBrain brain = {};
   brain.weAreMaster = true;
@@ -11895,6 +12102,7 @@ static void testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(TestSuite& su
   suite.expect(brain.transitionToNewBundleCalls == 1, "update_self_final_relinquish_transitions_once");
 
   brain.brains.erase(&designatedPeer);
+  thisNeuron = previousNeuron;
 }
 
 static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suite)
@@ -13260,12 +13468,26 @@ static void testReconcileManagedMachineSchemasSkipsEmptySchemaState(TestSuite& s
 
 static void testImportedTlsFactoryValidationRejectsBrokenPem(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
   TestBrain brain;
   Mothership mothership;
   NoopBrainIaaS iaas;
+  if (suite.require(mothershipSockets.create(suite, "mothership_upsert_tls_invalid_creates_socket"),
+                    "mothership_upsert_tls_invalid_requires_socket") == false)
+  {
+    return;
+  }
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_upsert_tls_invalid_adopts_socket") == false ||
+      suite.require(brain.activateMothershipConnection(&mothership), "mothership_upsert_tls_invalid_activates_mothership") == false)
+  {
+    return;
+  }
 
   TlsVaultFactoryUpsertRequest request = {};
   request.applicationID = 60'001;
@@ -13283,6 +13505,12 @@ static void testImportedTlsFactoryValidationRejectsBrokenPem(TestSuite& suite)
   Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::upsertTlsVaultFactory, serializedRequest);
   brain.mothershipHandler(&mothership, message);
 
+  if (suite.require(mothership.wBuffer.size() >= sizeof(Message),
+                    "mothership_upsert_tls_invalid_emits_response") == false)
+  {
+    return;
+  }
+
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
   String serializedResponse;
   uint8_t *responseArgs = responseMessage->args;
@@ -13298,12 +13526,26 @@ static void testImportedTlsFactoryValidationRejectsBrokenPem(TestSuite& suite)
 
 static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
   TestBrain brain;
   Mothership mothership;
   NoopBrainIaaS iaas;
+  if (suite.require(mothershipSockets.create(suite, "mothership_upsert_tls_valid_creates_socket"),
+                    "mothership_upsert_tls_valid_requires_socket") == false)
+  {
+    return;
+  }
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_upsert_tls_valid_adopts_socket") == false ||
+      suite.require(brain.activateMothershipConnection(&mothership), "mothership_upsert_tls_valid_activates_mothership") == false)
+  {
+    return;
+  }
 
   ApplicationTlsVaultFactory generated = {};
   String failure = {};
@@ -13326,6 +13568,12 @@ static void testImportedTlsFactoryEnablesBundleBuild(TestSuite& suite)
   String messageBuffer;
   Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::upsertTlsVaultFactory, serializedRequest);
   brain.mothershipHandler(&mothership, message);
+
+  if (suite.require(mothership.wBuffer.size() >= sizeof(Message),
+                    "mothership_upsert_tls_valid_emits_durable_response") == false)
+  {
+    return;
+  }
 
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
   String serializedResponse;
@@ -14354,12 +14602,29 @@ static void testCertificateLifecycleSchedulers(TestSuite& suite)
 
 static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
+  ScopedSocketPair ambiguousMothershipSockets = {};
   TestBrain brain;
   Mothership mothership;
   NoopBrainIaaS iaas;
+  if (suite.require(mothershipSockets.create(suite, "mothership_register_routable_prefix_creates_socket"),
+                    "mothership_register_routable_prefix_requires_socket") == false ||
+      suite.require(ambiguousMothershipSockets.create(suite, "mothership_register_routable_prefix_ambiguous_creates_socket"),
+                    "mothership_register_routable_prefix_ambiguous_requires_socket") == false)
+  {
+    return;
+  }
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_register_routable_prefix_adopts_socket") == false ||
+      suite.require(brain.activateMothershipConnection(&mothership), "mothership_register_routable_prefix_activates_mothership") == false)
+  {
+    return;
+  }
 
   Machine machine = {};
   machine.uuid = uint128_t(0x3355);
@@ -14379,6 +14644,12 @@ static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& 
   String messageBuffer = {};
   Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
   brain.mothershipHandler(&mothership, message);
+
+  if (suite.require(mothership.wBuffer.size() >= sizeof(Message),
+                    "mothership_register_routable_prefix_emits_response") == false)
+  {
+    return;
+  }
 
   Message *responseMessage = reinterpret_cast<Message *>(mothership.wBuffer.data());
   String serializedResponse = {};
@@ -14403,6 +14674,13 @@ static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& 
   Machine other = {};
   other.uuid = uint128_t(0x3356);
   ambiguousBrain.weAreMaster = true;
+  ambiguousMothership.isFixedFile = true;
+  ambiguousMothership.fslot = ambiguousMothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(ambiguousMothership.fslot >= 0, "mothership_register_routable_prefix_ambiguous_adopts_socket") == false ||
+      suite.require(ambiguousBrain.activateMothershipConnection(&ambiguousMothership), "mothership_register_routable_prefix_ambiguous_activates_mothership") == false)
+  {
+    return;
+  }
   ambiguousBrain.machines.insert(&machine);
   ambiguousBrain.machines.insert(&other);
   ambiguousBrain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
@@ -14411,6 +14689,12 @@ static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& 
   String ambiguousBuffer = {};
   Message *ambiguousMessage = buildMothershipMessage(ambiguousBuffer, MothershipTopic::registerRoutableSubnet, serializedRequest);
   ambiguousBrain.mothershipHandler(&ambiguousMothership, ambiguousMessage);
+
+  if (suite.require(ambiguousMothership.wBuffer.size() >= sizeof(Message),
+                    "mothership_register_routable_prefix_ambiguous_emits_response") == false)
+  {
+    return;
+  }
 
   responseMessage = reinterpret_cast<Message *>(ambiguousMothership.wBuffer.data());
   responseArgs = responseMessage->args;
@@ -14552,13 +14836,20 @@ static DistributableExternalSubnet makeElasticAuditPrefix(uint128_t uuid,
 
 static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& suite)
 {
+  ScopedFreshRing ring = {};
+  ScopedSocketPair currentSockets = {}, rogueSockets = {}, followerSockets = {};
+  if (!currentSockets.create(suite, "combined_authority_current_peer_socket") ||
+      !rogueSockets.create(suite, "combined_authority_rogue_peer_socket") ||
+      !followerSockets.create(suite, "combined_authority_follower_peer_socket")) return;
   TestBrain follower;
   ElasticPrefixBrainIaaS followerIaaS;
   follower.iaas = &followerIaaS;
   BrainView currentMaster;
   BrainView rogue;
-  authorizeMasterPeerForTest(follower, currentMaster, 75, uint128_t(0x7501), 7501);
-  authorizeMasterPeerForTest(follower, rogue, 76, uint128_t(0x7502), 7502);
+  authorizeMasterPeerForTest(follower, currentMaster, currentSockets.adoptLeftIntoFixedFileSlot(), uint128_t(0x7501), 7501);
+  authorizeMasterPeerForTest(follower, rogue, rogueSockets.adoptLeftIntoFixedFileSlot(), uint128_t(0x7502), 7502);
+  follower.brains.insert(&currentMaster);
+  follower.brains.insert(&rogue);
   currentMaster.existingMasterUUID = rogue.uuid;
   rogue.isMasterBrain = false;
   rogue.existingMasterUUID = currentMaster.uuid;
@@ -14630,6 +14921,10 @@ static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& sui
   String expectedDigest;
   suite.require(prodigyComputeSHA256Hex(serialized, expectedDigest),
                 "master_authority_transition_ack_digest_fixture");
+  if (!decodedAck || follower.clusterOwnershipCalls != 3 || follower.persistCalls != 2)
+    dprintf(STDERR_FILENO, "combined authority receipt: ownership=%u persists=%u ack=%d bytes=%llu\n",
+            follower.clusterOwnershipCalls, follower.persistCalls, int(decodedAck),
+            (unsigned long long)currentMaster.wBuffer.size());
   suite.expect(follower.clusterOwnershipCalls == 3 && follower.persistCalls == 2 &&
                    follower.brainConfig.clusterUUID == transition.brainConfig.clusterUUID &&
                    follower.masterAuthorityRuntimeState.generation == 1 && decodedAck &&
@@ -14648,7 +14943,7 @@ static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& sui
   BrainView followerPeer;
   followerPeer.connected = true;
   followerPeer.isFixedFile = true;
-  followerPeer.fslot = 77;
+  followerPeer.fslot = followerSockets.adoptLeftIntoFixedFileSlot();
   followerPeer.registrationFresh = true;
   followerPeer.uuid = uint128_t(0x7507);
   followerPeer.boottimens = 7507;
@@ -14687,6 +14982,9 @@ static void testCombinedMasterAuthorityAuthorizationAndAckBinding(TestSuite& sui
                        .acknowledgedElasticOperationIDs.contains(1),
                "master_authority_ack_accepts_exact_digest_during_registration_convergence");
   thisNeuron = previousNeuron;
+  follower.brains.erase(&currentMaster);
+  follower.brains.erase(&rogue);
+
 }
 
 static void testOrdinaryUpgradeAuthorityAdmission(TestSuite& suite)
@@ -18100,6 +18398,7 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       suite.expect(acceptedFslot >= 0, "neuron_accept_handler_active_brain_adopts_fixed_slot");
 
       TestNeuron neuron = {};
+      neuron.setInstalledBundleDigestForTest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       neuron.seedRegistrationState(13'579, "6.9.1-test"_ctv, true);
       neuron.seedBrainStreamForTest(true);
       NeuronBrainControlStream *existing = neuron.brainStreamForTest();
@@ -18128,6 +18427,7 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       suite.expect(acceptedFslot >= 0, "neuron_accept_handler_replaces_stale_brain_registration_only_adopts_fixed_slot");
 
       TestNeuron neuron = {};
+      neuron.setInstalledBundleDigestForTest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       neuron.seedRegistrationState(13'579, "6.9.1-test"_ctv, true);
       neuron.seedStaleBrainStreamForTest();
 
@@ -18176,6 +18476,7 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       suite.expect(acceptedFslot >= 0, "neuron_accept_handler_replaces_stale_brain_adopts_fixed_slot");
 
       TestNeuron neuron = {};
+      neuron.setInstalledBundleDigestForTest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       neuron.seedRegistrationState(13'579, "6.9.1-test"_ctv, true);
       neuron.seedStaleBrainStreamForTest();
       neuron.queueContainerDownloadRequestForTest(uint64_t(0xA114));
@@ -18235,6 +18536,7 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       suite.expect(acceptedFslot >= 0, "neuron_accept_handler_replaces_disconnected_raw_active_brain_adopts_fixed_slot");
 
       TestNeuron neuron = {};
+      neuron.setInstalledBundleDigestForTest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       neuron.seedRegistrationState(13'579, "6.9.1-test"_ctv, true);
       neuron.seedBrainStreamForTest(false);
       suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(neuron.brainStreamForTest()), "neuron_accept_handler_replaces_disconnected_raw_active_brain_seed_is_raw_active");
@@ -18316,6 +18618,7 @@ static void testNeuronAcceptHandlerBrainControlPaths(TestSuite& suite)
       suite.expect(acceptedFslot >= 0, "neuron_accept_handler_replays_healthy_containers_adopts_fixed_slot");
 
       TestNeuron neuron = {};
+      neuron.setInstalledBundleDigestForTest("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       neuron.seedRegistrationState(24'680, "6.10.0-test"_ctv, true);
       neuron.seedStaleBrainStreamForTest();
 
@@ -20520,9 +20823,18 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
   }
 
   {
+    ScopedAsyncMothershipRing scopedRing = {};
     BrainContainerFixture fixture(suite, "neuron_recv_wormholes_active", uint128_t(0x7026));
     if (fixture.ready)
     {
+      // BrainContainerFixture owns the fresh Ring for its sockets. Rebind the
+      // existing test dispatcher so the Switchboard's receipt-gated refresh
+      // runs through the real Ring completion path.
+      Ring::lifecycler = &scopedRing.dispatcher;
+      // This fixture's eventfd is an outbox sentinel, not a socket registered
+      // with io_uring. Keep its queued state while the Ring delivers the
+      // routing receipt, as the other fake fixed-slot outboxes do.
+      fixture.container.pendingSend = true;
       fixture.brain.neuron.ensureSwitchboardForTest();
 
       Wormhole wormhole = {};
@@ -20565,7 +20877,13 @@ static void testNeuronRecvDispatchesPairingAndCredentialMessages(TestSuite& suit
       suite.expect(
           fixture.brain.neuron.lastRefreshedWormholesForTest.size() == 1 && equalSerializedObjects(fixture.brain.neuron.lastRefreshedWormholesForTest[0], wormhole),
           "neuron_recv_wormholes_active_tracks_refreshed_wormholes");
-      suite.expect(fixture.container.pendingSend, "neuron_recv_wormholes_active_queues_container_send");
+
+      for (uint32_t attempt = 0; attempt < 200 && fixture.container.wBuffer.empty(); ++attempt)
+      {
+        scopedRing.runFor(10);
+      }
+      suite.expect(fixture.container.pendingSend && fixture.container.wBuffer.empty() == false,
+                   "neuron_recv_wormholes_active_queues_container_send");
 
       bool sawWormholesRefresh = false;
       forEachMessageInBuffer(fixture.container.wBuffer, [&](Message *frame) {
@@ -21590,29 +21908,95 @@ static void testNeuronContainerHandlerForwardsStatisticsToBrain(TestSuite& suite
   suite.expect(sawMemoryMetric, "neuron_container_statistics_forwards_memory_metric");
 }
 
+static bool loadDiscombobulatorAppArtifactFixture(String& blob, String& failure)
+{
+  blob.clear();
+  failure.clear();
+  const char *path = ::getenv("PRODIGY_TEST_APP_ARTIFACT");
+  if (path == nullptr || path[0] == '\0') path = PRODIGY_TEST_APP_ARTIFACT;
+  if (path == nullptr || path[0] == '\0')
+  {
+    failure.assign("missing Discombobulator app artifact fixture"_ctv);
+    return false;
+  }
+  Filesystem::openReadAtClose(-1, String(path), blob);
+  String header = {};
+  String headerText = prodigyDiscombobulatorBlobHeaderText();
+  if (blob.size() <= headerText.size())
+  {
+    failure.assign("truncated Discombobulator app artifact fixture"_ctv);
+    return false;
+  }
+  header.assign(blob.substr(0, headerText.size(), Copy::yes));
+  return prodigyValidateDiscombobulatorBlobHeaderText(header, &failure);
+}
+
 static void testNeuronHandlerStoresRequestedContainerBlob(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair brainSockets = {};
+  struct ScopedArtifactStore final {
+    String root = {};
+    ScopedArtifactStore()
+    {
+      char pattern[] = "/tmp/prodigy-neuron-artifact-XXXXXX";
+      if (char *created = ::mkdtemp(pattern)) root.assign(created);
+    }
+    ~ScopedArtifactStore()
+    {
+      if (root.size())
+      {
+        std::error_code error = {};
+        std::filesystem::remove_all(std::filesystem::path(root.c_str()), error);
+      }
+    }
+    bool valid(void) const { return root.size() > 0; }
+  } store = {};
   TestNeuron neuron = {};
-
+  String containerBlob = {};
+  String fixtureFailure = {};
   const uint64_t deploymentID = 0x6201200000000001ull;
-  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
-  containerBlob.append("unit-test-container-blob"_ctv);
-  ContainerStore::destroy(deploymentID);
+
+  const bool fixtureLoaded = loadDiscombobulatorAppArtifactFixture(containerBlob, fixtureFailure);
+  suite.require(fixtureLoaded, "neuron_request_container_blob_loads_real_discombobulator_artifact");
+  suite.require(store.valid(), "neuron_request_container_blob_creates_private_store");
+  suite.require(brainSockets.create(suite, "neuron_request_container_blob_creates_brain_control_socket"),
+                "neuron_request_container_blob_requires_brain_control_socket");
+  if (!fixtureLoaded || !store.valid() || brainSockets.left < 0) return;
+
+  String storeRoot = {};
+  storeRoot.assign(store.root);
+  neuron.seedBrainStreamForTest(true);
+  neuron.brainStreamForTest()->fslot = brainSockets.adoptLeftIntoFixedFileSlot();
+  neuron.brainStreamForTest()->pendingSend = true; // Keep callback-produced frames in the fixture outbox.
+  suite.require(neuron.brainStreamForTest()->fslot >= 0,
+                "neuron_request_container_blob_adopts_brain_control_socket");
+  if (neuron.brainStreamForTest()->fslot < 0) return;
+  suite.require(neuron.startContainerArtifactIOForTest(storeRoot),
+                "neuron_request_container_blob_starts_artifact_worker");
+  if (neuron.containerArtifactIOForTest() == nullptr) return;
 
   String buffer = {};
   Message *message = buildNeuronMessage(buffer, NeuronTopic::requestContainerBlob, deploymentID, containerBlob);
   neuron.neuronHandler(message);
+  suite.expect(pumpArtifactIOForTest([&] { return neuron.receivedContainerArtifactCompletionsForTest == 1; }),
+               "neuron_request_container_blob_pumps_until_durable_artifact_publication");
+  suite.expect(neuron.receivedContainerArtifactAdoptedForTest && neuron.receivedContainerArtifactSourceCurrentForTest,
+               "neuron_request_container_blob_adopts_current_artifact_after_durable_publication");
+  suite.expect(quiesceArtifactIOForTest(neuron.containerArtifactIOForTest()),
+               "neuron_request_container_blob_quiesces_after_durable_artifact_publication");
+  neuron.resetContainerArtifactIOForTest();
 
   String storedBlob = {};
-  ContainerStore::get(deploymentID, storedBlob);
-  suite.expect(storedBlob.equals(containerBlob), "neuron_request_container_blob_stores_blob");
-
-  ContainerStore::destroy(deploymentID);
+  Filesystem::openReadAtClose(-1, ContainerStore::pathForContainerImage(deploymentID, &storeRoot), storedBlob);
+  suite.expect(storedBlob.equals(containerBlob), "neuron_request_container_blob_stores_real_artifact");
 
   String missingBuffer = {};
   Message *missingMessage = buildNeuronMessage(missingBuffer, NeuronTopic::requestContainerBlob, deploymentID, String());
   neuron.neuronHandler(missingMessage);
-  suite.expect(ContainerStore::contains(deploymentID) == false, "neuron_request_container_blob_skips_empty_payload");
+  suite.expect(Ring::socketIsClosing(neuron.brainStreamForTest()),
+               "neuron_request_container_blob_missing_payload_fails_closed");
+  Ring::shutdownForExec();
 }
 
 static void testContainerStoreEvictsExternallyRemovedCachedImage(TestSuite& suite)
@@ -23016,6 +23400,8 @@ static void testCanaryRollbackPersistsTerminalApplicationReport(TestSuite& suite
   TestBrain restored = {};
   restored.iaas = &iaas;
   suite.expect(restored.applyPersistentMasterAuthorityPackage(package), "canary_terminal_report_restore_package_applies");
+  // Restore establishes durable state; serving reports also requires election.
+  restored.weAreMaster = true;
   thisBrain = &restored;
 
   ApplicationStatusReport restartedReport = {};
@@ -25207,27 +25593,57 @@ static void testBrainNeuronHandlerProcessesKillContainerAckAndDrainsMachine(Test
 
 static void testBrainNeuronHandlerQueuesRequestedContainerBlob(TestSuite& suite)
 {
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair neuronSockets = {};
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
 
   const uint64_t deploymentID = 0x6202500000000001ull;
-  String containerBlob = prodigyDiscombobulatorBlobHeaderText();
-  containerBlob.append("brain-side-container-blob"_ctv);
+  String containerBlob = {};
+  String fixtureFailure = {};
+  const bool fixtureLoaded = loadDiscombobulatorAppArtifactFixture(containerBlob, fixtureFailure);
+  suite.require(fixtureLoaded, "brain_neuron_request_container_blob_loads_real_discombobulator_artifact");
+  suite.require(neuronSockets.create(suite, "brain_neuron_request_container_blob_creates_neuron_control_socket"),
+                "brain_neuron_request_container_blob_requires_neuron_control_socket");
+  if (!fixtureLoaded || neuronSockets.left < 0) return;
   String storeFailure = {};
   ContainerStore::destroy(deploymentID);
   suite.expect(
       ContainerStore::store(deploymentID, containerBlob, nullptr, nullptr, nullptr, nullptr, &storeFailure),
-      "brain_neuron_request_container_blob_store_fixture");
+      "brain_neuron_request_container_blob_stores_real_artifact_fixture");
+
+  ApplicationDeployment deployment = {};
+  seedDeployRequestPlan(deployment.plan, 62'025);
+  deployment.plan.config.containerBlobBytes = containerBlob.size();
+  suite.expect(prodigyComputeSHA256Hex(containerBlob, deployment.plan.config.containerBlobSHA256),
+               "brain_neuron_request_container_blob_hashes_expected_artifact");
+  brain.deployments.insert_or_assign(deploymentID, &deployment);
+  brain.deploymentPlans.insert_or_assign(deploymentID, deployment.plan);
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5211);
   machine.neuron.machine = &machine;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = neuronSockets.adoptLeftIntoFixedFileSlot();
+  machine.neuron.connected = true;
+  machine.neuron.pendingSend = true; // Preserve the completed artifact frame for inspection.
+  suite.require(machine.neuron.fslot >= 0,
+                "brain_neuron_request_container_blob_adopts_neuron_control_socket");
+  if (machine.neuron.fslot < 0) return;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
 
   String buffer = {};
   Message *message = buildNeuronMessage(buffer, NeuronTopic::requestContainerBlob, deploymentID);
   brain.neuronHandler(&machine.neuron, message);
+  suite.expect(pumpArtifactIOForTest([&] { return machine.neuron.wBuffer.size() > 0; }),
+               "brain_neuron_request_container_blob_pumps_until_durable_artifact_read");
+  suite.expect(brain.artifactIO != nullptr && quiesceArtifactIOForTest(brain.artifactIO.get()),
+               "brain_neuron_request_container_blob_quiesces_after_durable_artifact_read");
+  brain.artifactIO.reset();
 
   uint32_t blobFrames = 0;
   uint64_t observedDeploymentID = 0;
@@ -25249,11 +25665,23 @@ static void testBrainNeuronHandlerQueuesRequestedContainerBlob(TestSuite& suite)
   suite.expect(observedBlob.equals(containerBlob), "brain_neuron_request_container_blob_preserves_blob_payload");
 
   ContainerStore::destroy(deploymentID);
+  machine.neuron.wBuffer.clear();
 
-  const uint64_t missingDeploymentID = deploymentID + 1;
+  const uint64_t missingDeploymentID = deploymentID;
   String missingBuffer = {};
   Message *missingMessage = buildNeuronMessage(missingBuffer, NeuronTopic::requestContainerBlob, missingDeploymentID);
   brain.neuronHandler(&machine.neuron, missingMessage);
+  auto missingArtifactCloseObserved = [&] {
+    // queueCloseDirect invalidates a fixed slot before its close CQE arrives, so
+    // observing only the transient Ring closing flag can miss a completed close.
+    return Ring::socketIsClosing(&machine.neuron) ||
+           (!machine.neuron.isFixedFile && machine.neuron.fslot < 0);
+  };
+  suite.expect(pumpArtifactIOForTest(missingArtifactCloseObserved),
+               "brain_neuron_request_container_blob_pumps_until_missing_artifact_rejection");
+  suite.expect(brain.artifactIO != nullptr && quiesceArtifactIOForTest(brain.artifactIO.get()),
+               "brain_neuron_request_container_blob_quiesces_after_missing_artifact_rejection");
+  brain.artifactIO.reset();
 
   bool sawMissingResponse = false;
   forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *frame) {
@@ -25269,7 +25697,15 @@ static void testBrainNeuronHandlerQueuesRequestedContainerBlob(TestSuite& suite)
     Message::extractToStringView(args, frameBlob);
     sawMissingResponse = sawMissingResponse || (frameDeploymentID == missingDeploymentID && frameBlob.size() == 0);
   });
-  suite.expect(sawMissingResponse, "brain_neuron_request_container_blob_missing_emits_empty_payload");
+  suite.expect(sawMissingResponse == false && missingArtifactCloseObserved(),
+               "brain_neuron_request_container_blob_missing_artifact_fails_closed_without_empty_payload");
+
+  brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+  brain.deploymentPlans.erase(deploymentID);
+  brain.deployments.erase(deploymentID);
+  Ring::shutdownForExec();
 }
 
 static void testBrainNeuronHandlerOwnsRegistrationKernelString(TestSuite& suite)
@@ -27289,10 +27725,13 @@ static void testAllMachineRecoveryWitnessRetainsReplicationAcknowledgement(TestS
 
 static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(TestSuite& suite)
 {
-  TestBrain brain = {};
+  ScopedRing scopedRing = {};
+  ResumableAddMachinesBrain brain = {};
   TrackingBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
+  brain.nBrains = 1;
+  brain.holdRuntimePersistence = true;
 
   uint128_t rackUUID = uint128_t(0x62026);
   uint128_t machineUUID = uint128_t(0x5212);
@@ -27312,6 +27751,13 @@ static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(
   brain.machines.insert(machine);
   brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
   brain.neurons.insert(&machine->neuron);
+  ClusterMachine topologyMachine = {};
+  topologyMachine.uuid = machineUUID;
+  topologyMachine.source = ClusterMachineSource::created;
+  topologyMachine.backing = ClusterMachineBacking::cloud;
+  topologyMachine.hasCloud = true;
+  topologyMachine.cloud.cloudID.assign("cloud-5212"_ctv);
+  brain.authoritativeTopology.machines.push_back(std::move(topologyMachine));
 
   String buffer = {};
   Message *message = buildNeuronMessage(buffer, NeuronTopic::hardwareFailure, "nvme unreachable"_ctv);
@@ -27324,6 +27770,31 @@ static void testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(
   suite.expect(iaas.lastReportedHardwareFailureUUID == machineUUID, "brain_neuron_hardware_failure_preserves_report_uuid");
   suite.expect(iaas.lastHardwareFailureReport == "nvme unreachable"_ctv, "brain_neuron_hardware_failure_preserves_report_text");
   suite.expect(iaas.lastHardwareFailureReport.isInvariant() == false, "brain_neuron_hardware_failure_owns_report_text");
+  suite.expect(iaas.destroyCalls == 0 && brain.machineRetirementPersistencePending &&
+                   brain.pendingRuntimePersistence.size() == 1,
+               "brain_neuron_hardware_failure_waits_for_retirement_journal_receipt");
+  brain.finishRuntimePersistence(true);
+  suite.expect(iaas.destroyCalls == 0 && brain.machineRetirementPersistencePending &&
+                   brain.pendingRuntimePersistence.size() == 1,
+               "brain_neuron_hardware_failure_waits_for_topology_removal_receipt");
+  brain.finishRuntimePersistence(true);
+  brain.closeHandler(&machine->neuron);
+  // Closing supplies the last evacuation observation.  The retirement owner
+  // then durably authorizes evacuation, destroys the provider machine, and
+  // durably settles that result.  Advance only its actual pending receipts,
+  // re-entering the same owner when it schedules the next phase.
+  auto hardwareRetirementComplete = [&] {
+    return brain.findMachineByUUIDForTest(machineUUID) == nullptr &&
+           iaas.destroyCalls == 1 && brain.retiringMachinesByNeuron.empty() &&
+           brain.retiredMachineIdentities.empty();
+  };
+  for (uint32_t receipts = 0; receipts < 8 && !hardwareRetirementComplete(); ++receipts)
+  {
+    if (brain.pendingRuntimePersistence.empty()) brain.reapRetiringMachines();
+    else brain.finishRuntimePersistence(true);
+  }
+  suite.expect(hardwareRetirementComplete(),
+               "brain_neuron_hardware_failure_settles_durable_retirement");
   suite.expect(iaas.destroyCalls == 1, "brain_neuron_hardware_failure_decommissions_machine");
   suite.expect(iaas.lastDestroyedCloudID == "cloud-5212"_ctv, "brain_neuron_hardware_failure_preserves_destroy_cloud_id");
   suite.expect(brain.findMachineByUUIDForTest(machineUUID) == nullptr, "brain_neuron_hardware_failure_removes_machine_from_cluster");
@@ -27394,10 +27865,12 @@ static void testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachin
 {
   ScopedRing scopedRing = {};
 
-  TestBrain brain = {};
+  ResumableAddMachinesBrain brain = {};
   TrackingBrainIaaS iaas = {};
   brain.iaas = &iaas;
-  brain.weAreMaster = false;
+  brain.weAreMaster = true;
+  brain.nBrains = 1;
+  brain.holdRuntimePersistence = true;
 
   uint128_t rackUUID = uint128_t(0x62027);
   uint128_t machineUUID = uint128_t(0x5215);
@@ -27417,6 +27890,13 @@ static void testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachin
   brain.machines.insert(machine);
   brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
   brain.neurons.insert(&machine->neuron);
+  ClusterMachine topologyMachine = {};
+  topologyMachine.uuid = machineUUID;
+  topologyMachine.source = ClusterMachineSource::created;
+  topologyMachine.backing = ClusterMachineBacking::cloud;
+  topologyMachine.hasCloud = true;
+  topologyMachine.cloud.cloudID.assign("cloud-5215"_ctv);
+  brain.authoritativeTopology.machines.push_back(std::move(topologyMachine));
 
   TimeoutPacket *packet = new TimeoutPacket();
   packet->flags = uint64_t(BrainTimeoutFlags::hardRebootedMachine);
@@ -27429,6 +27909,27 @@ static void testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachin
 
   suite.expect(iaas.reportHardwareFailureCalls == 1, "cluster_health_hard_reboot_timeout_reports_hardware_failure");
   suite.expect(iaas.lastReportedHardwareFailureUUID == machineUUID, "cluster_health_hard_reboot_timeout_preserves_failure_uuid");
+  suite.expect(iaas.destroyCalls == 0 && brain.machineRetirementPersistencePending &&
+                   brain.pendingRuntimePersistence.size() == 1,
+               "cluster_health_hard_reboot_timeout_waits_for_retirement_journal_receipt");
+  brain.finishRuntimePersistence(true);
+  suite.expect(iaas.destroyCalls == 0 && brain.machineRetirementPersistencePending &&
+                   brain.pendingRuntimePersistence.size() == 1,
+               "cluster_health_hard_reboot_timeout_waits_for_topology_removal_receipt");
+  brain.finishRuntimePersistence(true);
+  brain.closeHandler(&machine->neuron);
+  auto hardRebootRetirementComplete = [&] {
+    return brain.findMachineByUUIDForTest(machineUUID) == nullptr &&
+           iaas.destroyCalls == 1 && brain.retiringMachinesByNeuron.empty() &&
+           brain.retiredMachineIdentities.empty();
+  };
+  for (uint32_t receipts = 0; receipts < 8 && !hardRebootRetirementComplete(); ++receipts)
+  {
+    if (brain.pendingRuntimePersistence.empty()) brain.reapRetiringMachines();
+    else brain.finishRuntimePersistence(true);
+  }
+  suite.expect(hardRebootRetirementComplete(),
+               "cluster_health_hard_reboot_timeout_settles_durable_retirement");
   suite.expect(iaas.destroyCalls == 1, "cluster_health_hard_reboot_timeout_decommissions_machine");
   suite.expect(iaas.lastDestroyedCloudID == "cloud-5215"_ctv, "cluster_health_hard_reboot_timeout_preserves_destroy_cloud_id");
   suite.expect(brain.findMachineByUUIDForTest(machineUUID) == nullptr, "cluster_health_hard_reboot_timeout_removes_machine");
@@ -28224,7 +28725,15 @@ static bool issueDeploymentLifecycleOperationForTest(TestBrain& brain,
 
 static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
 {
+  ScopedFreshRing ring = {};
+  ScopedSocketPair controlSockets = {};
   TestBrain brain = {};
+  Mothership mothership = {};
+  if (!controlSockets.create(suite, "deployment_lifecycle_control_socket")) return;
+  mothership.isFixedFile = true;
+  mothership.fslot = controlSockets.adoptLeftIntoFixedFileSlot();
+  if (!suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                     "deployment_lifecycle_active_control_connection")) return;
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
@@ -28296,7 +28805,6 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
   request.successorVersionID = 202;
   request.operationID.assign("123e4567-e89b-42d3-a456-426614174010"_ctv);
   request.successorBlobSHA256 = successor->plan.config.containerBlobSHA256;
-  Mothership mothership = {};
   auto issue = [&](RecoverMaterializedStatefulDeployment input) {
     RecoverMaterializedStatefulDeployment response = {};
     suite.expect(issueDeploymentLifecycleOperationForTest<MothershipTopic::recoverMaterializedStatefulDeployment>(
@@ -28403,6 +28911,11 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
   corrected.state = DeploymentState::waitingToDeploy;
   corrected.previous = successor;
   successor->next = &corrected;
+  // The durable promotion owner resolves each link through the canonical
+  // deployment index.  Register the admitted replacement before exercising
+  // its failed receipt, while leaving the failed successor as the app head
+  // until spinApplication performs the ordinary admission handoff below.
+  brain.deployments.insert_or_assign(corrected.plan.config.deploymentID(), &corrected);
   brain.persistSucceeds = false;
   suite.expect(!brain.promoteRetainedStorageRecoverySuccessor(
                    brain.masterAuthorityRuntimeState.materializedStatefulRecoveryRetries.front(), &corrected) &&
@@ -28627,7 +29140,15 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
 
 static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
 {
+  ScopedFreshRing ring = {};
+  ScopedSocketPair controlSockets = {};
   TestBrain brain = {};
+  Mothership mothership = {};
+  if (!controlSockets.create(suite, "deployment_lifecycle_control_socket")) return;
+  mothership.isFixedFile = true;
+  mothership.fslot = controlSockets.adoptLeftIntoFixedFileSlot();
+  if (!suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                     "deployment_lifecycle_active_control_connection")) return;
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
   brain.weAreMaster = true;
@@ -28931,7 +29452,6 @@ static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
   request.operationID.assign("123e4567-e89b-42d3-a456-426614174000"_ctv);
   request.reason.assign("bounded test repair"_ctv);
 
-  Mothership mothership = {};
   // Exercise the real Mothership admission path for a recovered NONE owner.
   // A durable-write failure must leave it NONE; the separate predicate test
   // above proves the accepted-record recovery transition.
@@ -29624,6 +30144,12 @@ int main(void)
     testContainerNeuronListenerContract(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-artifact-transfer") == 0)
+  {
+    testNeuronHandlerStoresRequestedContainerBlob(suite);
+    testBrainNeuronHandlerQueuesRequestedContainerBlob(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-spin-invalid-plan") == 0)
   {
     ScopedRing ring = {};
@@ -29639,6 +30165,45 @@ int main(void)
     testMothershipConfigureAppliesClusterUUID(suite);
     testMothershipConfigureOwnsMachineConfigsForManagedSchemas(suite);
     testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-machine-schema-mutations") == 0)
+  {
+    testMachineSchemaMutationsQueueRuntimeStateReplication(suite);
+    testMachineSchemaMutationsDriveManagedBudgetActions(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-os-update-handoff") == 0)
+  {
+    testOSUpdateLocalMasterHandsOffBeforeSelfUpdate(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-neuron-recv-wormholes") == 0)
+  {
+    testNeuronRecvDispatchesPairingAndCredentialMessages(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "update-self-relinquish") == 0)
+  {
+    testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
+    testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "imported-tls-factory") == 0)
+  {
+    testImportedTlsFactoryValidationRejectsBrokenPem(suite);
+    testImportedTlsFactoryEnablesBundleBuild(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "neuron-accept-control") == 0)
+  {
+    testNeuronAcceptHandlerBrainControlPaths(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "retirement-durability") == 0)
+  {
+    testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
+    testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachine(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 

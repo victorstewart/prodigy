@@ -20988,7 +20988,7 @@ protected:
     const uint64_t epoch = masterAuthorityEpoch;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
     reconcileManagedMachineSchemasAsync([this, lifetime, epoch, completion = std::move(completion)]
-        (bool durable, String failure, ClusterTopology) {
+        (bool durable, String failure, ClusterTopology, ProdigyTimingAttribution) {
       if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
       if (!durable) basics_log("selfElectAsMaster managed machine schema reconcile failed reason=%s\n", failure.c_str());
       if (completion) completion(durable);
@@ -30918,38 +30918,52 @@ public:
     return true;
   }
 
-  void reconcileManagedMachineSchemasAsync(std::function<void(bool, String, ClusterTopology)> completion)
+  void reconcileManagedMachineSchemasAsync(
+      std::function<void(bool, String, ClusterTopology, ProdigyTimingAttribution)> completion)
   {
+    const uint64_t startedNs = Time::now<TimeResolution::ns>();
+    auto finish = [startedNs, completion = std::move(completion)]
+        (bool success, String failure, ClusterTopology topology, uint64_t providerWaitNs = 0) mutable {
+      ProdigyTimingAttribution timing = {};
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+      prodigyFinalizeTimingAttribution(Time::now<TimeResolution::ns>() - startedNs, providerWaitNs, timing);
+#else
+      (void)startedNs;
+      (void)providerWaitNs;
+#endif
+      completion(success, std::move(failure), std::move(topology), timing);
+    };
     String failure = {};
     ClusterTopology currentTopology = {};
     if (!weAreMaster || masterAuthorityRuntimeState.machineSchemas.empty())
     {
       if (!loadOrPersistAuthoritativeClusterTopology(currentTopology))
         failure.assign("authoritative cluster topology unavailable after machine schema reconcile"_ctv);
-      completion(failure.empty(), std::move(failure), std::move(currentTopology));
+      finish(failure.empty(), std::move(failure), std::move(currentTopology));
       return;
     }
     if (!loadOrPersistAuthoritativeClusterTopology(currentTopology))
     {
-      completion(false, "authoritative cluster topology unavailable"_ctv, {});
+      finish(false, "authoritative cluster topology unavailable"_ctv, {});
       return;
     }
     AddMachines request = {};
     ManagedAddMachinesWork work = {};
     if (!buildManagedMachineSchemaRequest(currentTopology, request, work, &failure))
     {
-      completion(false, std::move(failure), {});
+      finish(false, std::move(failure), {});
       return;
     }
     if (work.createdMachines.empty() && request.removedMachines.empty())
     {
-      completion(true, {}, std::move(currentTopology));
+      finish(true, {}, std::move(currentTopology));
       return;
     }
     addMachines(nullptr, std::move(request), std::move(work), nullptr,
-        [completion = std::move(completion), currentTopology = std::move(currentTopology)](AddMachines response) mutable {
-          completion(response.success, std::move(response.failure),
-                     response.hasTopology ? std::move(response.topology) : std::move(currentTopology));
+        [finish = std::move(finish), currentTopology = std::move(currentTopology)](AddMachines response) mutable {
+          finish(response.success, std::move(response.failure),
+                 response.hasTopology ? std::move(response.topology) : std::move(currentTopology),
+                 response.hasTimingAttribution ? response.timingAttribution.providerWaitNs : 0);
         });
   }
 
@@ -30960,16 +30974,18 @@ public:
   {
     // Compatibility is for synchronous tests only. Live callers use the
     // owning completion API above and never lend a stack response object.
-    auto receipt = std::make_shared<std::tuple<bool, String, ClusterTopology>>();
-    reconcileManagedMachineSchemasAsync([receipt](bool success, String asyncFailure, ClusterTopology topology) {
+    auto receipt = std::make_shared<std::tuple<bool, String, ClusterTopology, ProdigyTimingAttribution>>();
+    reconcileManagedMachineSchemasAsync([receipt](bool success, String asyncFailure, ClusterTopology topology,
+                                                  ProdigyTimingAttribution timing) {
       std::get<0>(*receipt) = success;
       std::get<1>(*receipt) = std::move(asyncFailure);
       std::get<2>(*receipt) = std::move(topology);
+      std::get<3>(*receipt) = timing;
     });
     if (failure) *failure = std::get<1>(*receipt);
     if (reconciledTopology) *reconciledTopology = std::get<2>(*receipt);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
-    if (timingAttribution) *timingAttribution = {};
+    if (timingAttribution) *timingAttribution = std::get<3>(*receipt);
 #else
     (void)timingAttribution;
 #endif
@@ -32174,7 +32190,8 @@ public:
     {
       auto managedResult = co_await ProdigyHostCompletion<std::tuple<bool, String, ClusterTopology>>(
           [this](auto completion) {
-            reconcileManagedMachineSchemasAsync([completion = std::move(completion)](bool success, String failure, ClusterTopology topology) mutable {
+            reconcileManagedMachineSchemasAsync([completion = std::move(completion)]
+                (bool success, String failure, ClusterTopology topology, ProdigyTimingAttribution) mutable {
               completion(std::make_tuple(success, std::move(failure), std::move(topology)));
             });
           });
@@ -33106,17 +33123,29 @@ public:
   void completeMachineSchemaMutation(Mothership *stream, MothershipTopic topic, Response response,
                                       Vector<ProdigyManagedMachineSchema> previousSchemas)
   {
+    const uint64_t startedNs = Time::now<TimeResolution::ns>();
     const uint64_t epoch = masterAuthorityEpoch;
     const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
     const uint64_t incarnation = stream->connectionIncarnation;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-    auto reply = [this, lifetime, epoch, stream, incarnation, topic, response = std::move(response)]
-        (bool success, String failure, ClusterTopology topology) mutable {
+    auto reply = [this, lifetime, epoch, stream, incarnation, topic, startedNs, response = std::move(response)]
+        (bool success, String failure, ClusterTopology topology, ProdigyTimingAttribution timing) mutable {
       if (lifetime.expired() || masterAuthorityEpoch != epoch) return;
       response.success = success;
       response.failure = std::move(failure);
       response.hasTopology = success;
       response.topology = std::move(topology);
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+      if constexpr (std::is_same_v<Response, UpsertMachineSchemas>)
+      {
+        response.hasTimingAttribution = true;
+        prodigyFinalizeTimingAttribution(Time::now<TimeResolution::ns>() - startedNs,
+                                         timing.providerWaitNs, response.timingAttribution);
+      }
+#else
+      (void)startedNs;
+      (void)timing;
+#endif
       if (success) armMachineUpdateTimerIfNeeded();
       if (!activeMotherships.contains(stream) || stream->connectionIncarnation != incarnation || !streamIsActive(stream)) return;
       String payload;
@@ -33134,7 +33163,7 @@ public:
           syncManagedMachineSchemaConfigs(masterAuthorityRuntimeState.machineSchemas, previousSchemas);
           masterAuthorityRuntimeState.machineSchemas = std::move(previousSchemas);
         }
-        reply(false, "failed to persist machine schema mutation"_ctv, {});
+        reply(false, "failed to persist machine schema mutation"_ctv, {}, {});
         return;
       }
       reconcileManagedMachineSchemasAsync(std::move(reply));
