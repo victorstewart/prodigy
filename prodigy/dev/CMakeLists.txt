@@ -1542,6 +1542,11 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
+      NAME prodigy_dev_scaler_report_parser_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_scaler_report_parser_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness.sh
+   )
+
+   add_test(
       NAME prodigy_dev_autoscale_runtime_matrix
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_autoscale_runtime_matrix.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_pingpong_container
    )

@@ -738,9 +738,9 @@ scaler_satisfied()
          name = $0
          sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
       }
-      /^[[:space:]]*value:/ && name == wanted {
+      /^[[:space:]]*(nvalue|value):/ && name == wanted {
          value = $0
-         sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
+         sub(/^[[:space:]]*(nvalue|value):[[:space:]]*/, "", value)
          if ((value + 0) >= (minimum + 0)) found = 1
       }
       END { exit(found ? 0 : 1) }
