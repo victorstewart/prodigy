@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -343,11 +344,34 @@ private:
   static bool storeSystemBlobWithKey(const String& sha256, uint64_t bytes, const String& blob, String *failureReport, const String *storeRoot)
   {
     String root = storeRoot ? *storeRoot : String("/containers/system-store"_ctv);
+    std::error_code createError = {};
+    std::filesystem::create_directories(std::filesystem::path(root.c_str()), createError);
+    if (createError)
+    {
+      if (failureReport)
+      {
+        String errorText = {};
+        errorText.assign(createError.message().c_str());
+        failureReport->snprintf<"failed to create system container store {} error={}"_ctv>(root, errorText);
+      }
+      return false;
+    }
+
     String path = pathForSystemArtifactWithinRoot(root, sha256);
     String parent = {};
     prodigyDirname(path, parent);
-    (void)Filesystem::createDirectoryAt(-1, root, 0755);
-    (void)Filesystem::createDirectoryAt(-1, parent, 0755);
+    createError.clear();
+    std::filesystem::create_directories(std::filesystem::path(parent.c_str()), createError);
+    if (createError)
+    {
+      if (failureReport)
+      {
+        String errorText = {};
+        errorText.assign(createError.message().c_str());
+        failureReport->snprintf<"failed to create system container artifact directory {} error={}"_ctv>(parent, errorText);
+      }
+      return false;
+    }
     return atomicWriteFile(path, blob, failureReport);
   }
 

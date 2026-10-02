@@ -1246,6 +1246,7 @@ public:
   uint32_t receivedContainerArtifactCompletionsForTest = 0;
   bool receivedContainerArtifactAdoptedForTest = false;
   bool receivedContainerArtifactSourceCurrentForTest = false;
+  uint32_t cancelledRestartTimeoutsForTest = 0;
 
   TestNeuron()
   {
@@ -1277,6 +1278,16 @@ public:
     {
       containerByPid.erase(container->pid);
     }
+  }
+
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != nullptr && result == -ECANCELED &&
+        NeuronTimeoutFlags(packet->flags) == NeuronTimeoutFlags::restartContainer)
+    {
+      cancelledRestartTimeoutsForTest += 1;
+    }
+    Neuron::timeoutHandler(packet, result);
   }
 
   bool liveContainerInventoryComplete(String& failure) const override
@@ -7152,9 +7163,29 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   suite.require(auth.configured(), "mothership_tunnel_provider_reconcile_auth_fixture_configured");
 
+  ScopedTempDir freshSystemStore = {};
+  suite.require(freshSystemStore.valid(), "mothership_tunnel_provider_reconcile_creates_fresh_system_store_fixture");
+  if (freshSystemStore.valid())
+  {
+    std::filesystem::path rootPath = freshSystemStore.path / "fresh" / "nested" / "system-store";
+    String freshStoreRoot = {};
+    freshStoreRoot.assign(rootPath.c_str());
+    String freshStoreFailure = {};
+    suite.expect(ContainerStore::systemStore(artifactSha256, blob.size(), blob, &freshStoreFailure, &freshStoreRoot),
+                 "mothership_tunnel_provider_reconcile_stores_real_fixture_in_fresh_nested_store");
+    String freshLoadedBlob = {};
+    suite.expect(ContainerStore::systemLoadVerified(artifactSha256, blob.size(), freshLoadedBlob, &freshStoreFailure, &freshStoreRoot) &&
+                     freshLoadedBlob.equal(blob),
+                 "mothership_tunnel_provider_reconcile_loads_real_fixture_from_fresh_nested_store");
+  }
+
   String storeFailure = {};
-  suite.require(ContainerStore::systemStore(artifactSha256, blob.size(), blob, &storeFailure),
-                "mothership_tunnel_provider_reconcile_stores_real_fixture");
+  const bool stored = ContainerStore::systemStore(artifactSha256, blob.size(), blob, &storeFailure);
+  suite.require(stored, "mothership_tunnel_provider_reconcile_stores_real_fixture");
+  if (stored == false)
+  {
+    dprintf(STDERR_FILENO, "mothership_tunnel_provider_reconcile store failure: %s\n", storeFailure.c_str());
+  }
   MothershipTunnelProviderDesiredState desired = makeTunnelProviderDesiredState(config, auth);
   suite.require(brain.applyMothershipTunnelProviderDesiredState(desired, false, &failure),
                 "mothership_tunnel_provider_reconcile_configure");
@@ -22170,15 +22201,25 @@ static void testNeuronStateUploadSkipsExistingLiveContainer(TestSuite& suite)
 
 static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite& suite)
 {
-  ScopedRing scopedRing = {};
+  ScopedAsyncMothershipRing scopedRing = {};
 
   TestNeuron neuron = {};
   neuron.seedBrainStreamForTest(false);
+  RingDispatcher::installMultiplexee(&neuron, &neuron);
 
   Container *container = new Container();
+  // Container has a user-provided socket constructor, so initialize the
+  // aggregate plan explicitly before this fake runtime container is retired.
+  container->plan = ContainerPlan{};
   container->plan.uuid = uint128_t(0x5103);
   container->plan.config.applicationID = 62'012;
   container->plan.config.versionID = 11;
+  container->plan.config.cpuMode = ApplicationCPUMode::shared;
+  container->plan.config.nLogicalCores = 1;
+  container->plan.config.sharedCPUMillis = 1'000;
+  container->plan.config.sTilKillable = 30;
+  container->plan.lifetime = ApplicationLifetime::base;
+  container->plan.state = ContainerState::scheduled;
   container->pid = 4242;
   neuron.containers.insert_or_assign(container->plan.uuid, container);
 
@@ -22223,23 +22264,41 @@ static void testNeuronHandlerKillContainerStopsContainerAndEchoesBrain(TestSuite
   suite.expect(container->pendingKillAckToBrain, "neuron_kill_container_marks_pending_brain_ack");
   suite.expect(echoFrames == 0, "neuron_kill_container_defers_brain_ack_until_destroy");
   suite.expect(echoedContainerUUID == 0, "neuron_kill_container_no_immediate_brain_ack_uuid");
+  suite.expect(container->plan.usesSharedCPUs() && container->plan.logicalCores() == 1,
+               "neuron_kill_container_fixture_has_bounded_shared_cpu_plan");
 
-  thisNeuron = previousNeuron;
+  container->disableKillSwitch();
+  scopedRing.runFor(10);
+  suite.expect(container->killSwitch == nullptr,
+               "neuron_kill_container_drains_kill_switch_cancellation_before_owner_destroy");
+
   neuron.containers.erase(container->plan.uuid);
+  RingDispatcher::eraseMultiplexee(&neuron);
+  thisNeuron = previousNeuron;
   delete container;
 }
 
 static void testNeuronHandlerKillContainerCancelsPendingRestart(TestSuite& suite)
 {
-  ScopedRing scopedRing = {};
+  ScopedAsyncMothershipRing scopedRing = {};
 
   TestNeuron neuron = {};
   neuron.seedBrainStreamForTest(false);
+  RingDispatcher::installMultiplexee(&neuron, &neuron);
 
   Container *container = new Container();
+  // See the stop test above: new Container() does not value-initialize this
+  // member after Container gained its explicit socket constructor.
+  container->plan = ContainerPlan{};
   container->plan.uuid = uint128_t(0x5104);
   container->plan.config.applicationID = 62'012;
   container->plan.config.versionID = 12;
+  container->plan.config.cpuMode = ApplicationCPUMode::shared;
+  container->plan.config.nLogicalCores = 1;
+  container->plan.config.sharedCPUMillis = 1'000;
+  container->plan.config.sTilKillable = 30;
+  container->plan.lifetime = ApplicationLifetime::base;
+  container->plan.state = ContainerState::scheduled;
   container->pid = -1;
   container->restartTimer = new TimeoutPacket();
   container->restartTimer->identifier = container->plan.uuid;
@@ -22248,6 +22307,8 @@ static void testNeuronHandlerKillContainerCancelsPendingRestart(TestSuite& suite
   container->restartTimer->setTimeoutMs(30'000);
   Ring::queueTimeout(container->restartTimer);
   neuron.containers.insert_or_assign(container->plan.uuid, container);
+  suite.expect(container->plan.usesSharedCPUs() && container->plan.logicalCores() == 1,
+               "neuron_kill_container_pending_restart_fixture_has_bounded_shared_cpu_plan");
 
   NeuronBase *previousNeuron = thisNeuron;
   thisNeuron = &neuron;
@@ -22273,6 +22334,15 @@ static void testNeuronHandlerKillContainerCancelsPendingRestart(TestSuite& suite
   suite.expect(echoFrames == 1 && echoedContainerUUID == uint128_t(0x5104),
                "neuron_kill_container_pending_restart_acknowledges_immediately");
 
+  for (uint32_t attempt = 0;
+       attempt < 200 && neuron.cancelledRestartTimeoutsForTest == 0;
+       ++attempt)
+  {
+    scopedRing.runFor(10);
+  }
+  suite.expect(neuron.cancelledRestartTimeoutsForTest == 1,
+               "neuron_kill_container_pending_restart_drains_cancel_before_owner_destroy");
+  RingDispatcher::eraseMultiplexee(&neuron);
   thisNeuron = previousNeuron;
 }
 
