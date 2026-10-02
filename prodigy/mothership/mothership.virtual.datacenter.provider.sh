@@ -1197,7 +1197,7 @@ start_initial_runtime()
       do
          sleep 0.05
       done
-      [[ "$(<"${members_provisioned_path}")" == "members" ]]
+      [[ "$(<"${members_provisioned_path}")" == "members" ]] || return 1
       for index in $(seq 2 "${machine_count}")
       do
          start_machine "${index}"

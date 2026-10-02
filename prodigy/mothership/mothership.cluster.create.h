@@ -1062,6 +1062,26 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   {
     ClusterTopology expandedTopology = {};
     String localFailure = {};
+    // The bootstrap input may still contain a zero UUID: only the configured
+    // seed can report the identity actually installed in its TLS/boot state.
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+    uint64_t seedFetchStartNs = Time::now<TimeResolution::ns>();
+#endif
+    if (hooks.fetchSeedTopology(cluster, currentTopology, &localFailure) == false)
+    {
+      return failWithCleanup(localFailure);
+    }
+    if (currentTopology.machines.size() != 1 || currentTopology.machines[0].uuid == 0 ||
+        currentTopology.machines[0].isBrain == false)
+    {
+      return failWithCleanup("test cluster configured seed has no unique Brain identity"_ctv);
+    }
+    ProdigyTimingAttribution seedFetchTiming = {};
+#if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
+    prodigyFinalizeTimingAttribution(Time::now<TimeResolution::ns>() - seedFetchStartNs, 0, seedFetchTiming);
+#endif
+    mothershipAccumulateClusterCreateTimingStage(timingSummary, &MothershipClusterCreateTimingSummary::fetchSeedTopology,
+                                               seedFetchTiming);
     ProdigyTimingAttribution stageTiming = {};
     if (hooks.addTestClusterMembers(cluster, currentTopology, config.runtimeEnvironment, expandedTopology, &stageTiming, &localFailure) == false)
     {

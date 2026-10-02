@@ -286,6 +286,7 @@ public:
   bool testMemberAdmissionSawConfiguredSeed = false;
   bool testMemberAdmissionSawConfiguredRuntimeEnvironment = false;
   ClusterTopology testMemberAdmissionSeedTopology = {};
+  uint32_t testMemberAdmissionFetchTopologyCalls = 0;
   uint32_t fetchTopologyCalls = 0;
   uint32_t addMachinesCalls = 0;
   uint32_t upsertMachineSchemasCalls = 0;
@@ -464,6 +465,7 @@ public:
     testMemberAdmissionSawConfiguredSeed = configureCalls == 1;
     testMemberAdmissionSawConfiguredRuntimeEnvironment = runtimeEnvironment.test.enabled;
     testMemberAdmissionSeedTopology = seedTopology;
+    testMemberAdmissionFetchTopologyCalls = fetchTopologyCalls;
     topology = finalTopology.machines.empty() ? fetchedTopology : finalTopology;
     if (timingAttribution != nullptr) *timingAttribution = addMachinesTiming;
     if (failApplyAddMachines)
@@ -1113,6 +1115,14 @@ int main(void)
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:10::a"_ctv, true, ClusterMachineSource::adopted));
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:10::b"_ctv, true, ClusterMachineSource::adopted));
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:10::c"_ctv, false, ClusterMachineSource::adopted));
+    hooks.fetchedTopology.machines[0].uuid = 0x551;
+    hooks.fetchedTopology.machines[1].uuid = 0x552;
+    hooks.fetchedTopology.machines[2].uuid = 0x553;
+    ClusterTopology configuredSeedTopology = {};
+    configuredSeedTopology.version = hooks.fetchedTopology.version;
+    configuredSeedTopology.machines.push_back(hooks.fetchedTopology.machines[0]);
+    hooks.fetchedTopologySequence.push_back(configuredSeedTopology);
+    hooks.fetchedTopologySequence.push_back(hooks.fetchedTopology);
 
     String failure = {};
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
@@ -1123,13 +1133,17 @@ int main(void)
     suite.expect(hooks.localBootstrapCalls == 0, "create_test_no_local_seed_bootstrap");
     suite.expect(hooks.remoteBootstrapCalls == 1, "create_test_bootstraps_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_configures_cluster");
-    suite.expect(hooks.fetchTopologyCalls == 1, "create_test_fetches_topology");
+    suite.expect(hooks.fetchTopologyCalls == 2, "create_test_fetches_authoritative_seed_then_full_topology");
     suite.expect(hooks.addTestMembersCalls == 1, "create_test_admits_members_after_seed_configuration");
     suite.expect(hooks.testMemberAdmissionSawConfiguredSeed, "create_test_member_admission_observes_configured_seed");
     suite.expect(hooks.testMemberAdmissionSawConfiguredRuntimeEnvironment,
                  "create_test_member_admission_receives_configured_runtime_environment");
     suite.expect(hooks.testMemberAdmissionSeedTopology.machines.size() == 1,
                  "create_test_member_admission_receives_actual_single_seed_topology");
+    suite.expect(hooks.testMemberAdmissionFetchTopologyCalls == 1 &&
+                     hooks.testMemberAdmissionSeedTopology == configuredSeedTopology &&
+                     hooks.testMemberAdmissionSeedTopology.machines[0].uuid == 0x551,
+                 "create_test_member_admission_uses_fetched_authoritative_seed_identity");
     suite.expect(cluster.topology == hooks.fetchedTopology, "create_test_topology_persisted");
     suite.expect(cluster.environmentConfigured, "create_test_environment_configured");
     suite.expect(hooks.lastConfig.sharedCPUOvercommitPermille == 1500, "create_test_config_shared_cpu_overcommit");
@@ -1139,6 +1153,7 @@ int main(void)
     suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::createSeed,
                                                         ClusterCreateCall::remoteBootstrap,
                                                         ClusterCreateCall::configure,
+                                                        ClusterCreateCall::fetchTopology,
                                                         ClusterCreateCall::fetchTopology}),
                  "create_test_call_sequence");
   }
@@ -1158,10 +1173,12 @@ int main(void)
     ClusterTopology partialTopology = {};
     partialTopology.version = 1;
     partialTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:20::a"_ctv, true, ClusterMachineSource::adopted));
+    partialTopology.machines[0].uuid = 0x561;
     ClusterTopology finalTopology = partialTopology;
     finalTopology.version = 2;
     finalTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:20::b"_ctv, true, ClusterMachineSource::adopted));
     finalTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:20::c"_ctv, false, ClusterMachineSource::adopted));
+    hooks.fetchedTopologySequence.push_back(partialTopology);
     hooks.fetchedTopologySequence.push_back(partialTopology);
     hooks.fetchedTopologySequence.push_back(finalTopology);
 
@@ -1169,14 +1186,15 @@ int main(void)
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
     suite.expect(ok, "create_test_topology_retry_ok");
     suite.expect(failure.size() == 0, "create_test_topology_retry_no_failure");
-    suite.expect(hooks.fetchTopologyCalls == 2, "create_test_topology_retry_fetches_until_ready");
+    suite.expect(hooks.fetchTopologyCalls == 3, "create_test_topology_retry_fetches_authoritative_seed_then_until_ready");
     suite.expect(cluster.topology == finalTopology, "create_test_topology_retry_persists_final_topology");
-    suite.expect(hooks.callSequence.size() == 5, "create_test_topology_retry_call_count");
+    suite.expect(hooks.callSequence.size() == 6, "create_test_topology_retry_call_count");
     suite.expect(hooks.callSequence[0] == ClusterCreateCall::createSeed, "create_test_topology_retry_creates_provider_seed_first");
     suite.expect(hooks.callSequence[1] == ClusterCreateCall::remoteBootstrap, "create_test_topology_retry_bootstraps_provider_seed");
     suite.expect(hooks.callSequence[2] == ClusterCreateCall::configure, "create_test_topology_retry_configures_before_fetch");
     suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_first_fetch");
     suite.expect(hooks.callSequence[4] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_second_fetch");
+    suite.expect(hooks.callSequence[5] == ClusterCreateCall::fetchTopology, "create_test_topology_retry_third_fetch");
   }
 
   {
@@ -1196,6 +1214,12 @@ int main(void)
     unreadyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::a"_ctv, true, ClusterMachineSource::adopted));
     unreadyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::b"_ctv, true, ClusterMachineSource::adopted));
     unreadyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::c"_ctv, false, ClusterMachineSource::adopted));
+    unreadyTopology.machines[0].uuid = 0x571;
+    unreadyTopology.machines[1].uuid = 0x572;
+    unreadyTopology.machines[2].uuid = 0x573;
+    ClusterTopology configuredSeedTopology = {};
+    configuredSeedTopology.version = unreadyTopology.version;
+    configuredSeedTopology.machines.push_back(unreadyTopology.machines[0]);
     for (ClusterMachine& machine : unreadyTopology.machines)
     {
       machine.totalLogicalCores = 0;
@@ -1211,6 +1235,10 @@ int main(void)
     readyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::a"_ctv, true, ClusterMachineSource::adopted));
     readyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::b"_ctv, true, ClusterMachineSource::adopted));
     readyTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:21::c"_ctv, false, ClusterMachineSource::adopted));
+    readyTopology.machines[0].uuid = 0x571;
+    readyTopology.machines[1].uuid = 0x572;
+    readyTopology.machines[2].uuid = 0x573;
+    hooks.fetchedTopologySequence.push_back(configuredSeedTopology);
     hooks.fetchedTopologySequence.push_back(unreadyTopology);
     hooks.fetchedTopologySequence.push_back(readyTopology);
 
@@ -1218,14 +1246,37 @@ int main(void)
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
     suite.expect(ok, "create_test_resource_readiness_retry_ok");
     suite.expect(failure.size() == 0, "create_test_resource_readiness_retry_no_failure");
-    suite.expect(hooks.fetchTopologyCalls == 2, "create_test_resource_readiness_retry_fetches_until_ready");
+    suite.expect(hooks.fetchTopologyCalls == 3, "create_test_resource_readiness_retry_fetches_authoritative_seed_then_until_ready");
     suite.expect(cluster.topology == readyTopology, "create_test_resource_readiness_retry_persists_ready_topology");
-    suite.expect(hooks.callSequence.size() == 5, "create_test_resource_readiness_retry_call_count");
+    suite.expect(hooks.callSequence.size() == 6, "create_test_resource_readiness_retry_call_count");
     suite.expect(hooks.callSequence[0] == ClusterCreateCall::createSeed, "create_test_resource_readiness_retry_creates_provider_seed_first");
     suite.expect(hooks.callSequence[1] == ClusterCreateCall::remoteBootstrap, "create_test_resource_readiness_retry_bootstraps_provider_seed");
     suite.expect(hooks.callSequence[2] == ClusterCreateCall::configure, "create_test_resource_readiness_retry_configures_before_fetch");
     suite.expect(hooks.callSequence[3] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_first_fetch");
     suite.expect(hooks.callSequence[4] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_second_fetch");
+    suite.expect(hooks.callSequence[5] == ClusterCreateCall::fetchTopology, "create_test_resource_readiness_retry_third_fetch");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "test-zero-authoritative-seed"_ctv;
+    cluster.clusterUUID = 0x7780;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.nBrains = 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/test-zero-authoritative-seed"_ctv;
+    cluster.test.machineCount = 2;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/test-zero-authoritative-seed.sock"_ctv));
+
+    FakeClusterCreateHooks hooks = {};
+    hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:24::a"_ctv, true, ClusterMachineSource::adopted));
+    String failure = {};
+    bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
+    suite.expect(ok == false && failure.equals("test cluster configured seed has no unique Brain identity"_ctv),
+                 "create_test_zero_authoritative_seed_rejects_before_member_admission");
+    suite.expect(hooks.configureCalls == 1 && hooks.fetchTopologyCalls == 1 && hooks.addTestMembersCalls == 0 &&
+                     hooks.destroyCreatedSeedCalls == 1,
+                 "create_test_zero_authoritative_seed_cleans_provider_seed_without_member_bootstrap");
   }
 
   {
@@ -1286,12 +1337,15 @@ int main(void)
     cluster.controls.push_back(makeUnixControl("/run/prodigy/test-member-admission-failure.sock"_ctv));
 
     FakeClusterCreateHooks hooks = {};
+    hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:23::a"_ctv, true, ClusterMachineSource::adopted));
+    hooks.fetchedTopology.machines[0].uuid = 0x7779;
     hooks.failApplyAddMachines = true;
     String failure = {};
     bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
     suite.expect(ok == false && failure.equals("apply test members failed"_ctv), "create_test_member_admission_failure_propagates");
-    suite.expect(hooks.configureCalls == 1 && hooks.addTestMembersCalls == 1 && hooks.fetchTopologyCalls == 0,
-                 "create_test_member_admission_failure_stops_before_topology_fetch");
+    suite.expect(hooks.configureCalls == 1 && hooks.addTestMembersCalls == 1 && hooks.fetchTopologyCalls == 1 &&
+                     hooks.testMemberAdmissionFetchTopologyCalls == 1,
+                 "create_test_member_admission_failure_fetches_authoritative_seed_before_admission");
     suite.expect(hooks.destroyCreatedSeedCalls == 1, "create_test_member_admission_failure_cleans_provider_seed");
   }
 
@@ -1333,6 +1387,12 @@ int main(void)
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "10.44.0.2"_ctv, true, ClusterMachineSource::adopted));
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "10.44.0.3"_ctv, true, ClusterMachineSource::adopted));
     hooks.fetchedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "10.44.0.4"_ctv, false, ClusterMachineSource::adopted));
+    hooks.fetchedTopology.machines[0].uuid = 0x581;
+    ClusterTopology configuredSeedTopology = {};
+    configuredSeedTopology.version = hooks.fetchedTopology.version;
+    configuredSeedTopology.machines.push_back(hooks.fetchedTopology.machines[0]);
+    hooks.fetchedTopologySequence.push_back(configuredSeedTopology);
+    hooks.fetchedTopologySequence.push_back(hooks.fetchedTopology);
 
     bool changed = false;
     String failure = {};
@@ -1343,7 +1403,7 @@ int main(void)
     suite.expect(hooks.destroyCreatedSeedCalls == 1, "create_test_resize_restart_destroys_provider_seed");
     suite.expect(hooks.createSeedCalls == 1, "create_test_resize_restart_creates_provider_seed");
     suite.expect(hooks.configureCalls == 1, "create_test_resize_restart_configures_cluster");
-    suite.expect(hooks.fetchTopologyCalls == 1, "create_test_resize_restart_fetches_topology");
+    suite.expect(hooks.fetchTopologyCalls == 2, "create_test_resize_restart_fetches_seed_then_topology");
     suite.expect(hooks.lastConfig.dnsProvider == "cloudflare"_ctv, "create_test_resize_restart_preserves_dns_provider");
     suite.expect(hooks.lastConfig.dnsCredential.name == desiredCluster.dnsProviderCredentialName, "create_test_resize_restart_preserves_dns_credential_name");
     suite.expect(hooks.lastConfig.dnsCredential.material == dnsCredential.material, "create_test_resize_restart_preserves_dns_credential_material");
@@ -1352,6 +1412,7 @@ int main(void)
                                                         ClusterCreateCall::createSeed,
                                                         ClusterCreateCall::remoteBootstrap,
                                                         ClusterCreateCall::configure,
+                                                        ClusterCreateCall::fetchTopology,
                                                         ClusterCreateCall::fetchTopology}),
                  "create_test_resize_restart_call_sequence");
   }
