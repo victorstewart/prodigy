@@ -509,6 +509,10 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(decodeRequest(MothershipTidesMigration::str(rrf8), decodedRequest, &decodedProof,
       nullptr, &decodedEmpty, &decodedCold, &decodedPartial) &&
       partialHandoffsEqual(decodedPartial, partial));
+  // A prior sealed RRF8 may carry its own cold source. It is historical proof
+  // for RRF9 and must not be rejected merely because it is not a plain request.
+  assert(decodedEmpty != 0 && !decodedCold.states.empty() &&
+      partialHandoffsEqual(decodedPartial, partial));
   decodedPartial = partial;
   assert(decodeRequest(MothershipTidesMigration::str(rrf7), decodedRequest, &decodedProof,
       nullptr, &decodedEmpty, &decodedCold, &decodedPartial) && decodedPartial.operationID.empty());
@@ -534,10 +538,154 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(!decodeRequest(MothershipTidesMigration::str(malformedPartialFrame), decodedRequest,
       &decodedProof, nullptr, &decodedEmpty, &decodedCold, &decodedPartial));
 
+  // RRF9 is deliberately a normal canonical request plus the one stale,
+  // non-client predecessor parameter record.  It cannot carry a cold source,
+  // a second partial-handoff envelope, or an invented active deployment plan.
+  MothershipRetainedRecoveryOrphanedStatefulPredecessor orphan = {};
+  orphan.operation = partial;
+  orphan.machineUUID = 3;
+  orphan.priorRequestSHA256 = MothershipTidesMigration::text(std::string(64, 'a'));
+  orphan.priorManifestSHA256 = MothershipTidesMigration::text(std::string(64, 'b'));
+  for (const ContainerParameters& parameters : machines[2].parameters)
+    if (parameters.deploymentID == activeHotID && parameters.statefulMeshRoles.client == 0)
+      orphan.parameters = parameters;
+  assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(orphan));
+  assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(partialPrepared, orphan, &failure));
+  assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorParametersMatchHistorical(
+      orphan.parameters, orphan.parameters));
+  auto wrongHistoricalParameters = orphan.parameters;
+  ++wrongHistoricalParameters.storageMB;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorParametersMatchHistorical(
+      orphan.parameters, wrongHistoricalParameters));
+  Request orphanRequest = request;
+  orphanRequest.plans.erase(activeHotID);
+  const String rrf9 = encodeOrphanedStatefulPredecessorRequest(
+      orphanRequest, MothershipTidesMigration::Plan{}, orphan);
+  MothershipRetainedRecoveryOrphanedStatefulPredecessor decodedOrphan = {};
+  assert(decodeRequest(MothershipTidesMigration::str(rrf9), decodedRequest, &decodedProof,
+      nullptr, &decodedEmpty, &decodedCold, &decodedPartial, &decodedOrphan) &&
+      decodedRequest.plans.find(activeHotID) == decodedRequest.plans.end() &&
+      decodedRequest.plans.find(successorHotID) != decodedRequest.plans.end() &&
+      decodedOrphan.machineUUID == orphan.machineUUID &&
+      decodedOrphan.parameters.uuid == orphan.parameters.uuid &&
+      mothershipRetainedRecoveryPartialHandoffEqual(decodedOrphan.operation, orphan.operation));
+  auto malformedOrphan = orphan;
+  malformedOrphan.parameters.statefulMeshRoles.client = 1;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(malformedOrphan));
+  malformedOrphan = orphan;
+  malformedOrphan.operation.completed = true;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(malformedOrphan));
+  auto missingOrphanOperation = partialPrepared;
+  missingOrphanOperation.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.clear();
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+      missingOrphanOperation, orphan, &failure));
+  auto missingOrphanRuntime = partialPrepared;
+  missingOrphanRuntime.masterAuthority.containerRuntimeStates.erase(
+      std::remove_if(missingOrphanRuntime.masterAuthority.containerRuntimeStates.begin(),
+          missingOrphanRuntime.masterAuthority.containerRuntimeStates.end(), [&](const auto& state) {
+            return state.plan.uuid == orphan.parameters.uuid;
+          }), missingOrphanRuntime.masterAuthority.containerRuntimeStates.end());
+  assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+      missingOrphanRuntime, orphan, &failure));
+  assert(mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+      missingOrphanRuntime, orphan, &failure, true));
+  auto wrongOrphanRuntime = partialPrepared;
+  for (auto& state : wrongOrphanRuntime.masterAuthority.containerRuntimeStates)
+    if (state.plan.uuid == orphan.parameters.uuid) state.machineUUID = 1;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+      wrongOrphanRuntime, orphan, &failure));
+  wrongOrphanRuntime = partialPrepared;
+  for (auto& state : wrongOrphanRuntime.masterAuthority.containerRuntimeStates)
+    if (state.plan.uuid == orphan.parameters.uuid) ++state.plan.statefulTopology.workerCount;
+  assert(!mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+      wrongOrphanRuntime, orphan, &failure));
+
   const auto root = std::filesystem::current_path() / ".run" /
       ("retained-cold-canonical-" + std::to_string(::getpid()));
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
+
+  // Exercise the command-local RRF9 projection.  Its request deliberately
+  // has no active deployment plan: only the exact durable operation and the
+  // sealed non-client predecessor parameters authorize removing that stale
+  // runtime entry while the two successor members remain canonical.
+  auto orphanSnapshot = source;
+  orphanSnapshot.masterAuthority.deploymentPlans.clear();
+  orphanSnapshot.masterAuthority.deploymentPlans[successorHotID] = successorHot;
+  // A retained fleet is full inventory: machine 1 also needs its ordinary
+  // canonical survivor while the orphan itself remains proof-only.
+  DeploymentPlan orphanCompanion = {};
+  for (const auto& [deploymentID, plan] : approved)
+    if (!plan.isStateful) { orphanCompanion = plan; break; }
+  assert(orphanCompanion.config.deploymentID() != 0);
+  orphanSnapshot.masterAuthority.deploymentPlans[orphanCompanion.config.deploymentID()] = orphanCompanion;
+  orphanSnapshot.masterAuthority.runtimeState = {};
+  orphanSnapshot.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.push_back(partial);
+  orphanSnapshot.masterAuthority.containerRuntimeStates.clear();
+  Vector<MothershipRetainedRecoveryMachineInput> orphanMachines = {};
+  for (uint32_t index = 1; index <= 3; ++index) {
+    MothershipRetainedRecoveryMachineInput machine = {};
+    machine.machineUUID = index; machine.machineFragment = index;
+    orphanMachines.push_back(std::move(machine));
+  }
+  const ContainerParameters orphanCompanionParameters =
+      parametersFor(orphanCompanion, 0x5300, 1, 60, false);
+  orphanMachines[0].parameters.push_back(orphanCompanionParameters);
+  orphanMachines[0].observedCreatedAtMs.push_back(1791000000500LL);
+  const ContainerParameters orphanSuccessorClient=parametersFor(successorHot, 0x5301, 2, 61, true);
+  const ContainerParameters orphanSuccessorPeer=parametersFor(successorHot, 0x5302, 3, 62, false);
+  orphanMachines[1].parameters.push_back(orphanSuccessorClient);
+  orphanMachines[1].observedCreatedAtMs.push_back(1791000000501LL);
+  orphanMachines[2].parameters.push_back(orphanSuccessorPeer);
+  orphanMachines[2].observedCreatedAtMs.push_back(1791000000502LL);
+  auto addOrphanSuccessorRuntime = [&](const ContainerParameters& parameters, uint32_t machine, int64_t created) {
+    NeuronContainerBootstrap bootstrap = {};
+    assert(prodigyBuildRetainedContainerBootstrap(successorHot, parameters, machine,
+        orphanSnapshot.brainConfig.datacenterFragment, created, bootstrap, &failure));
+    BrainReplicatedContainerRuntimeState runtime = {};
+    runtime.machineUUID = machine; runtime.plan = bootstrap.plan;
+    runtime.plan.state = ContainerState::healthy; runtime.plan.runtimeReady = true;
+    orphanSnapshot.masterAuthority.containerRuntimeStates.push_back(std::move(runtime));
+  };
+  addOrphanSuccessorRuntime(orphanSuccessorClient, 2, 1791000000501LL);
+  addOrphanSuccessorRuntime(orphanSuccessorPeer, 3, 1791000000502LL);
+  Request localOrphanRequest = {};
+  localOrphanRequest.clusterUUID = orphanSnapshot.brainConfig.clusterUUID;
+  localOrphanRequest.bundleSHA = bundle;
+  localOrphanRequest.plans = orphanSnapshot.masterAuthority.deploymentPlans;
+  localOrphanRequest.machines = orphanMachines;
+  const String localRrf9 = encodeOrphanedStatefulPredecessorRequest(
+      localOrphanRequest, MothershipTidesMigration::Plan{}, orphan);
+  auto orphanWitnessSnapshot = orphanSnapshot;
+  orphanWitnessSnapshot.masterAuthority.containerRuntimeStates.clear();
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      orphanWitnessSnapshot, localOrphanRequest.plans, localOrphanRequest.machines, bundle, &failure));
+  const auto orphanRoot = root / "orphaned-stateful-predecessor";
+  std::filesystem::create_directories(orphanRoot);
+  const auto orphanStatePath = (orphanRoot / "state.new10").string();
+  const auto orphanRequestPath = (orphanRoot / "request").string();
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(orphanStatePath));
+    assert(store.saveBrainSnapshot(orphanSnapshot, &failure));
+  }
+  std::filesystem::create_directories(orphanStatePath + ".secrets");
+  MothershipTidesMigration::durable(orphanRequestPath, localRrf9);
+  WitnessSet orphanWitnesses = {};
+  orphanWitnesses.requestSHA = MothershipTidesMigration::text(MothershipTidesMigration::digest(orphanRequestPath));
+  orphanWitnesses.witnesses = orphanWitnessSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  String orphanWitnessBytes = {};
+  BitseryEngine::serialize(orphanWitnessBytes, orphanWitnesses);
+  MothershipTidesMigration::durable(orphanRequestPath + ".witnesses", orphanWitnessBytes);
+  assert(prepareLocal(orphanRequestPath.c_str(), orphanStatePath.c_str(), false, &failure));
+  assert(prepareLocal(orphanRequestPath.c_str(), orphanStatePath.c_str(), true, &failure));
+  ProdigyPersistentBrainSnapshot orphanAfter = {};
+  loadSnapshot(orphanStatePath, orphanAfter);
+  assert(orphanAfter.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.size() == 1 &&
+      mothershipRetainedRecoveryPartialHandoffEqual(
+          orphanAfter.masterAuthority.runtimeState.materializedStatefulRecoveryOperations[0], partial));
+  for (const BrainReplicatedContainerRuntimeState& state : orphanAfter.masterAuthority.containerRuntimeStates)
+    assert(state.plan.uuid != orphan.parameters.uuid);
+  std::filesystem::remove_all(orphanRoot);
   const auto statePath = (root / "state.new10").string();
   const auto requestPath = (root / "request").string();
   {

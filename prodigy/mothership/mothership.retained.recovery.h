@@ -83,6 +83,150 @@ static inline bool mothershipRetainedRecoveryPartialHandoffEqual(
          lhs.completed == rhs.completed && lhs.updatedAtMs == rhs.updatedAtMs;
 }
 
+// A deployed predecessor can outlive its deployment record after an accepted
+// materialized handoff.  This descriptor does not create a replacement: it
+// binds the one process that an already-started handoff may retire before the
+// ordinary retained recovery resumes the surviving successor cohort.
+struct MothershipRetainedRecoveryOrphanedStatefulPredecessor {
+  ProdigyMaterializedStatefulRecoveryOperation operation;
+  uint128_t machineUUID = 0;
+  ContainerParameters parameters = {};
+  // Immutable proof-only source. The prior request supplies the culled
+  // deployment plan solely to normalize and bind this live predecessor; it is
+  // never merged into the current recovery authority.
+  String priorRequestSHA256 = {};
+  String priorManifestSHA256 = {};
+};
+
+static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(
+    const MothershipRetainedRecoveryOrphanedStatefulPredecessor& orphan)
+{
+  return prodigyCanonicalOperationUUID(orphan.operation.operationID) &&
+         orphan.operation.activeDeploymentID != 0 && orphan.operation.successorDeploymentID != 0 &&
+         orphan.operation.activeDeploymentID != orphan.operation.successorDeploymentID &&
+         prodigyIsSHA256HexDigest(orphan.operation.successorBlobSHA256) &&
+         orphan.operation.accepted && orphan.operation.started && !orphan.operation.completed &&
+         orphan.operation.updatedAtMs > 0 && orphan.machineUUID != 0 && orphan.parameters.uuid != 0 &&
+         prodigyIsSHA256HexDigest(orphan.priorRequestSHA256) &&
+         prodigyIsSHA256HexDigest(orphan.priorManifestSHA256) &&
+         orphan.parameters.deploymentID == orphan.operation.activeDeploymentID &&
+         orphan.parameters.statefulMeshRoles.client == 0 &&
+         orphan.parameters.statefulTopology.shardGroup == 0 &&
+         orphan.parameters.statefulTopology.bridgeMode == StatefulTopologyBridgeMode::none;
+}
+
+// A retained process can refresh credentials, CPU reservation, and dynamic mesh
+// edges after the historical request was sealed.  These fields bind its durable
+// stateful identity without treating those live observations as new authority.
+static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorParametersMatchHistorical(
+    const ContainerParameters& observed, const ContainerParameters& historical)
+{
+  return observed.uuid == historical.uuid &&
+         observed.deploymentID == historical.deploymentID &&
+         observed.memoryMB == historical.memoryMB &&
+         observed.storageMB == historical.storageMB &&
+         observed.nLogicalCores == historical.nLogicalCores &&
+         observed.private6.network.is6 == historical.private6.network.is6 &&
+         observed.private6.cidr == historical.private6.cidr &&
+         std::memcmp(observed.private6.network.v6, historical.private6.network.v6,
+                     sizeof(observed.private6.network.v6)) == 0 &&
+         observed.statefulMeshRoles.client == historical.statefulMeshRoles.client &&
+         observed.statefulMeshRoles.sibling == historical.statefulMeshRoles.sibling &&
+         observed.statefulMeshRoles.cousin == historical.statefulMeshRoles.cousin &&
+         observed.statefulMeshRoles.seeding == historical.statefulMeshRoles.seeding &&
+         observed.statefulMeshRoles.sharding == historical.statefulMeshRoles.sharding &&
+         observed.statefulMeshRoles.topologyBridge == historical.statefulMeshRoles.topologyBridge &&
+         observed.statefulTopology.shardGroup == historical.statefulTopology.shardGroup &&
+         observed.statefulTopology.topologyEpoch == historical.statefulTopology.topologyEpoch &&
+         observed.statefulTopology.workerCount == historical.statefulTopology.workerCount &&
+         observed.statefulTopology.sourceEpoch == historical.statefulTopology.sourceEpoch &&
+         observed.statefulTopology.targetEpoch == historical.statefulTopology.targetEpoch &&
+         observed.statefulTopology.servingMode == historical.statefulTopology.servingMode &&
+         observed.statefulTopology.bridgeMode == historical.statefulTopology.bridgeMode;
+}
+
+static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorMatchesSnapshot(
+    const ProdigyPersistentBrainSnapshot& snapshot,
+    const MothershipRetainedRecoveryOrphanedStatefulPredecessor& orphan,
+    String *failure = nullptr,
+    bool requireAbsent = false)
+{
+  if (failure) failure->clear();
+  if (!mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(orphan)) {
+    if (failure) failure->assign("invalid orphaned stateful predecessor descriptor"_ctv);
+    return false;
+  }
+  uint32_t matchingOperations = 0;
+  for (const ProdigyMaterializedStatefulRecoveryOperation& current :
+       snapshot.masterAuthority.runtimeState.materializedStatefulRecoveryOperations) {
+    if (current.operationID.equals(orphan.operation.operationID)) {
+      if (!mothershipRetainedRecoveryPartialHandoffEqual(current, orphan.operation)) {
+        if (failure) failure->assign("orphaned stateful predecessor operation differs from durable authority"_ctv);
+        return false;
+      }
+      ++matchingOperations;
+    } else if (current.activeDeploymentID == orphan.operation.activeDeploymentID ||
+               current.successorDeploymentID == orphan.operation.activeDeploymentID ||
+               current.activeDeploymentID == orphan.operation.successorDeploymentID ||
+               current.successorDeploymentID == orphan.operation.successorDeploymentID) {
+      if (failure) failure->assign("orphaned stateful predecessor operation collides with durable authority"_ctv);
+      return false;
+    }
+  }
+  if (matchingOperations != 1) {
+    if (failure) failure->assign("orphaned stateful predecessor operation is absent or duplicated"_ctv);
+    return false;
+  }
+  for (const ProdigyMaterializedStatefulRecoveryRetry& retry :
+       snapshot.masterAuthority.runtimeState.materializedStatefulRecoveryRetries) {
+    if (retry.operationID.equals(orphan.operation.operationID) ||
+        retry.activeDeploymentID == orphan.operation.activeDeploymentID ||
+        retry.failedSuccessorDeploymentID == orphan.operation.successorDeploymentID ||
+        retry.replacementSuccessorDeploymentID == orphan.operation.successorDeploymentID) {
+      if (failure) failure->assign("orphaned stateful predecessor collides with durable recovery retry"_ctv);
+      return false;
+    }
+  }
+  uint32_t matchingRuntimeStates = 0;
+  for (const BrainReplicatedContainerRuntimeState& state : snapshot.masterAuthority.containerRuntimeStates) {
+    if (state.plan.uuid != orphan.parameters.uuid) continue;
+    ++matchingRuntimeStates;
+    if (state.machineUUID != orphan.machineUUID ||
+        state.plan.config.deploymentID() != orphan.operation.activeDeploymentID || !state.plan.isStateful ||
+        state.plan.lifetime != ApplicationLifetime::base || state.plan.shardGroup != 0 ||
+        state.plan.statefulMeshRoles.client != 0 ||
+        state.plan.statefulMeshRoles.sibling != orphan.parameters.statefulMeshRoles.sibling ||
+        state.plan.statefulMeshRoles.cousin != orphan.parameters.statefulMeshRoles.cousin ||
+        state.plan.statefulMeshRoles.seeding != orphan.parameters.statefulMeshRoles.seeding ||
+        state.plan.statefulMeshRoles.sharding != orphan.parameters.statefulMeshRoles.sharding ||
+        state.plan.statefulMeshRoles.topologyBridge != orphan.parameters.statefulMeshRoles.topologyBridge ||
+        state.plan.statefulTopology.shardGroup != orphan.parameters.statefulTopology.shardGroup ||
+        state.plan.statefulTopology.topologyEpoch != orphan.parameters.statefulTopology.topologyEpoch ||
+        state.plan.statefulTopology.workerCount != orphan.parameters.statefulTopology.workerCount ||
+        state.plan.statefulTopology.sourceEpoch != orphan.parameters.statefulTopology.sourceEpoch ||
+        state.plan.statefulTopology.targetEpoch != orphan.parameters.statefulTopology.targetEpoch ||
+        state.plan.statefulTopology.servingMode != orphan.parameters.statefulTopology.servingMode ||
+        state.plan.statefulTopology.bridgeMode != orphan.parameters.statefulTopology.bridgeMode ||
+        state.plan.addresses.empty() ||
+        state.plan.addresses[0].network.is6 != orphan.parameters.private6.network.is6 ||
+        state.plan.addresses[0].cidr != orphan.parameters.private6.cidr ||
+        std::memcmp(state.plan.addresses[0].network.v6, orphan.parameters.private6.network.v6,
+                    sizeof(orphan.parameters.private6.network.v6)) != 0) {
+      if (failure) failure->assign("orphaned stateful predecessor runtime identity differs from durable authority"_ctv);
+      return false;
+    }
+  }
+  // A deployment that has been culled from authority is intentionally omitted
+  // by the ordinary runtime capture owner. The sealed predecessor request is
+  // authoritative in that case. A retained runtime record, if present, is an
+  // additional identity check; an already-prepared retry requires it absent.
+  if (matchingRuntimeStates > 1 || (requireAbsent && matchingRuntimeStates != 0)) {
+    if (failure) failure->assign("orphaned stateful predecessor runtime identity is duplicated or unexpectedly retained"_ctv);
+    return false;
+  }
+  return true;
+}
+
 // A fenced retained process may have advanced its in-memory lifecycle after the
 // sealed parameters were captured.  Those observations are not recovery
 // authority: only a scheduled or healthy process is admissible, and its
