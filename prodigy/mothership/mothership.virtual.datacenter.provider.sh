@@ -133,7 +133,7 @@ output = open(path, "ab", buffering=0)
 first = open(first_path, "ab", buffering=0) if first_size < first_bytes else None
 try:
     while True:
-        chunk = sys.stdin.buffer.read(1024 * 1024)
+        chunk = os.read(sys.stdin.fileno(), 1024 * 1024)
         if not chunk:
             break
         if first is not None:
