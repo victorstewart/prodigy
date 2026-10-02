@@ -4128,6 +4128,39 @@ static void testRecoveredIndexedSuccessorWaitsForDurableReplication(TestSuite& s
                    brain.deploymentsWaitingForDNS.contains(successorPlan.config.deploymentID()) == false,
                "recovered_indexed_successor_final_ack_resumes_without_unrelated_event");
 
+  // A full snapshot can be backpressured while a prior ArtifactIO completion
+  // owns the byte lease. Keep one heartbeat-owned continuation until the
+  // writer admits it; this must not submit snapshots while capacity is full.
+  successor->state = DeploymentState::none;
+  successor->stateChangedAtMs = 0;
+  const uint32_t deferredPersistenceCalls = brain.persistCalls;
+  brain.updateSelfPersistenceBackpressureResponses = 3;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(successor->state == DeploymentState::none &&
+                   brain.recoveryPersistenceRetryPending && brain.persistCalls == deferredPersistenceCalls,
+               "recovered_indexed_successor_backpressure_arms_coalesced_retry_without_submission");
+  brain.retryDeferredRecoveryPersistence();
+  brain.retryDeferredRecoveryPersistence();
+  suite.expect(successor->state == DeploymentState::none && brain.recoveryPersistenceRetryPending &&
+                   brain.persistCalls == deferredPersistenceCalls,
+               "recovered_indexed_successor_backpressure_retries_without_polling_persistence");
+  brain.retryDeferredRecoveryPersistence();
+  suite.expect(successor->state == DeploymentState::waitingToDeploy &&
+                   brain.recoveryPersistenceRetryPending == false && brain.persistCalls == deferredPersistenceCalls + 1,
+               "recovered_indexed_successor_deferred_retry_persists_after_capacity_releases");
+
+  successor->state = DeploymentState::none;
+  successor->stateChangedAtMs = 0;
+  brain.rejectUpdateSelfPersistenceAdmission = true;
+  brain.recoverDeploymentsAfterNeuronState();
+  brain.retryDeferredRecoveryPersistence();
+  suite.expect(successor->state == DeploymentState::none && brain.recoveryPersistenceRetryPending == false &&
+                   brain.persistCalls == deferredPersistenceCalls + 1,
+               "recovered_indexed_successor_permanent_rejection_does_not_submit_or_retry");
+  brain.rejectUpdateSelfPersistenceAdmission = false;
+  // Restore the established fixture state used by the idempotency tail below.
+  successor->state = DeploymentState::waitingToDeploy;
+
   const uint32_t persistCalls = brain.persistCalls;
   brain.brainHandler(&followerB, buildBrainMessage(echoBuffer, BrainTopic::replicateDeployment, successorPlan.config.deploymentID()));
   brain.recoverDeploymentsAfterNeuronState();

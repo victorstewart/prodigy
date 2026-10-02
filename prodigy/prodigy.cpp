@@ -52,6 +52,20 @@ static bool prodigySubmitLiveBootState(ProdigyPersistentBootState bootState, uin
   return admitted;
 }
 
+static const char *prodigyArtifactIOAdmissionName(ProdigyArtifactIO::Admission admission)
+{
+  switch (admission)
+  {
+    case ProdigyArtifactIO::Admission::admitted: return "admitted";
+    case ProdigyArtifactIO::Admission::oversize: return "oversize";
+    case ProdigyArtifactIO::Admission::stopping: return "stopping";
+    case ProdigyArtifactIO::Admission::jobCapacity: return "job-capacity";
+    case ProdigyArtifactIO::Admission::byteCapacity: return "byte-capacity";
+    case ProdigyArtifactIO::Admission::submissionRejected: return "submission-rejected";
+  }
+  return "unknown";
+}
+
 static bool prodigyRuntimeTraceEnabled(void)
 {
   const char *value = std::getenv("PRODIGY_RUNTIME_TRACE");
@@ -1372,6 +1386,9 @@ public:
     const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
     if (!retainedBytes || !ensurePersistentWriter())
     {
+      std::fprintf(stderr, "ProdigyBrain snapshot admission rejected: %s\n",
+                   !retainedBytes ? "snapshot accounting exceeded its bound" : "persistent writer unavailable");
+      std::fflush(stderr);
       return UpdateSelfPersistenceAdmission::rejected;
     }
     const ProdigyArtifactIO::Admission admission = persistentWriter->admission(retainedBytes);
@@ -1384,6 +1401,9 @@ public:
     {
       return UpdateSelfPersistenceAdmission::backpressured;
     }
+    std::fprintf(stderr, "ProdigyBrain snapshot admission rejected: admission=%s retainedBytes=%llu\n",
+                 prodigyArtifactIOAdmissionName(admission), static_cast<unsigned long long>(retainedBytes));
+    std::fflush(stderr);
     return UpdateSelfPersistenceAdmission::rejected;
   }
 
@@ -1419,6 +1439,7 @@ public:
     }
     auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const ProdigyArtifactIO::Admission admission = persistentWriter->admission(retainedBytes);
     const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
         [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
           if (lifetime.expired()) return;
@@ -1439,7 +1460,9 @@ public:
         });
     if (!admitted)
     {
-      std::fprintf(stderr, "ProdigyBrain snapshot persistence rejected: writer did not admit request\n");
+      std::fprintf(stderr,
+                   "ProdigyBrain snapshot persistence rejected: writer did not admit request admission=%s retainedBytes=%llu\n",
+                   prodigyArtifactIOAdmissionName(admission), static_cast<unsigned long long>(retainedBytes));
       std::fflush(stderr);
       if (*callback) (*callback)(false);
     }

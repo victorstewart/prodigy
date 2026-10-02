@@ -12610,6 +12610,11 @@ public:
   // Recovery already has one retry owner. Hold that owner at a durable
   // boundary and re-enter it from the receipt instead of retaining iterators.
   bool recoveryPersistencePending = false;
+  // A bounded persistence admission can occur while an ArtifactIO completion
+  // still owns the last byte lease.  The heartbeat owns one coalesced retry
+  // and retains it only while the writer reports backpressure; a permanent
+  // rejection stays fenced.
+  bool recoveryPersistenceRetryPending = false;
   bytell_hash_set<String> pendingMaterializedRecoveryPersistence;
   struct PersistenceDispatchResult
   {
@@ -12958,6 +12963,29 @@ public:
     return true;
   }
 
+  void retryDeferredRecoveryPersistence(void)
+  {
+    if (recoveryPersistenceRetryPending == false || recoveryPersistencePending ||
+        weAreMaster == false || ignited == false)
+    {
+      return;
+    }
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission == UpdateSelfPersistenceAdmission::backpressured)
+    {
+      return;
+    }
+    // This is called from the peer-heartbeat turn, after ArtifactIO has
+    // released any completion-held admission lease. A permanent writer
+    // rejection cannot retain a polling continuation.
+    recoveryPersistenceRetryPending = false;
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      return;
+    }
+    recoverDeploymentsAfterNeuronState();
+  }
+
   void recoverDeploymentsAfterNeuronState(void)
   {
     if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() || weAreMaster == false || ignited == false ||
@@ -13239,6 +13267,14 @@ public:
           deploymentsWaitingForDNS.insert(head->plan.config.deploymentID());
           continue;
         }
+        const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+        if (admission != UpdateSelfPersistenceAdmission::admitted)
+        {
+          recoveryPersistenceRetryPending = admission == UpdateSelfPersistenceAdmission::backpressured;
+          // The generic normalizer is serial at its durable boundary. Do not
+          // let a later indexed head overwrite this head's continuation.
+          return;
+        }
         const int64_t stateChangedAtMs = head->stateChangedAtMs;
         head->state = DeploymentState::waitingToDeploy;
         head->stateChangedAtMs = Time::now<TimeResolution::ms>();
@@ -13265,6 +13301,7 @@ public:
             return;
           }
           receipt->durable = true;
+          recoveryPersistenceRetryPending = false;
           deploymentsWaitingForDNS.erase(deploymentID);
           if (receipt->returned) recoverDeploymentsAfterNeuronState();
         });
@@ -14879,6 +14916,7 @@ public:
     // Retry before appending heartbeats, so an already queued control frame
     // suppresses duplicate authority work without starving it behind this tick.
     retryMasterAuthorityRuntimeStatePersistence();
+    retryDeferredRecoveryPersistence();
     queueMasterAuthorityRuntimeStateReplication(true);
     for (BrainView *peer : brains)
     {

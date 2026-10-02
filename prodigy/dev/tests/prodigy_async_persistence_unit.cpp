@@ -648,6 +648,45 @@ int main()
     }
   }
 
+  // A failed boot/local-state commit is the same durable fence as a failed
+  // snapshot. These paths normally report only through their caller's bool,
+  // so prove the writer rejects every later request after either receipt.
+  for (bool localState : {false, true})
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    bool completed = false;
+    bool durable = true;
+    suite.expect(io != nullptr, "async_persistence_starts_boot_local_failure_writer");
+    if (io)
+    {
+      ProdigyPersistentStateWriter writer(store, *io, [](auto&, auto& request) {
+        request.result.failure.assign("injected boot-or-local persistence failure"_ctv);
+      });
+      const bool admitted = localState
+          ? writer.submitLocalBrainState({}, bootRequestBytes, [&](auto&& result) {
+              completed = true; durable = result.durable; Ring::exit = true;
+            })
+          : writer.submitBootState(bootState("failed-boot"), bootRequestBytes, [&](auto&& result) {
+              completed = true; durable = result.durable; Ring::exit = true;
+            });
+      ring.armDeadline(1000);
+      Ring::start();
+      const bool laterRejected = localState
+          ? writer.submitBootState(bootState("after-local-failure"), bootRequestBytes, [](auto&&) {}) == false
+          : writer.submitLocalBrainState({}, bootRequestBytes, [](auto&&) {}) == false;
+      suite.expect(!ring.timedOut && admitted && completed && !durable &&
+                       writer.admission(bootRequestBytes) == ProdigyArtifactIO::Admission::submissionRejected &&
+                       laterRejected && writer.drainForExec(),
+                   localState ? "async_persistence_local_failure_latches_all_future_admission" :
+                                "async_persistence_boot_failure_latches_all_future_admission");
+      io->stop();
+      ring.drainStoppedIO();
+    }
+  }
+
   // Existing ArtifactIO pressure is a clean admission failure: it must not
   // run the request, invoke its completion, or poison later writer admission.
   {

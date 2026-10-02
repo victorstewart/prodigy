@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -317,6 +318,13 @@ private:
   bool commitFailureLatched = false;
   std::atomic<bool> workerFailureLatched = false;
 
+  static const char *requestKind(const Request& request)
+  {
+    if (request.writeSnapshot) return "snapshot";
+    if (request.writeLocalState) return "local-state";
+    return "boot-state";
+  }
+
   static bool commitFailed(const Request& request)
   {
     if (request.writeSnapshot) return !request.result.snapshotDurable || !request.result.bootStateDurable;
@@ -349,7 +357,24 @@ private:
   void finish(const std::shared_ptr<Request>& request, bool workerFailed)
   {
     if (workerFailed) request->result.failure.assign("persistent state worker failed"_ctv);
-    if (workerFailed || commitFailed(*request)) commitFailureLatched = true;
+    const bool failed = workerFailed || commitFailed(*request);
+    if (failed)
+    {
+      const bool reportFailure = commitFailureLatched == false;
+      commitFailureLatched = true;
+      if (reportFailure)
+      {
+        // Every request kind uses this one durable fence.  Report the first
+        // committed failure here so boot/local-state callers cannot fail
+        // silently and later snapshots retain a concrete cause.
+        std::fprintf(stderr,
+                     "Prodigy persistent writer latched failure kind=%s sequence=%llu workerFailed=%d snapshotDurable=%d bootStateDurable=%d durable=%d failure=%s\n",
+                     requestKind(*request), static_cast<unsigned long long>(request->result.sequence), int(workerFailed),
+                     int(request->result.snapshotDurable), int(request->result.bootStateDurable), int(request->result.durable),
+                     request->result.failure.c_str());
+        std::fflush(stderr);
+      }
+    }
     // ArtifactIO retains the request's byte lease through this callback.
     // Exec drain must also continue counting the callback's live request.
     request->completion(std::move(request->result));
