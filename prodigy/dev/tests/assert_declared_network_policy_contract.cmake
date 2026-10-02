@@ -99,7 +99,6 @@ string(FIND "${_containers}" "bool waitForHostNetkitUdevInitialization" _contain
 string(FIND "${_containers}" "\"--initialized=yes\"" _container_udev_wait_initialized)
 string(FIND "${_containers}" "\"--timeout=5\"" _container_udev_wait_timeout)
 string(FIND "${_containers}" "if (waitForHostNetkitUdevInitialization(failureReport) == false)" _container_udev_wait_applied)
-string(FIND "${_containers}" "netdevs.getInfo();\n    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)" _container_ipv4_source_validation_restore)
 string(FIND "${_containers}" "host.bringUp();\n    peer.bringUp();\n\n    if (applyHostNetkitIPv4SourceValidationPolicy(failureReport) == false)" _container_ipv4_source_validation_setup)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
 string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
@@ -109,10 +108,41 @@ if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _public_ingr
    _container_ipv4_accept_local_policy EQUAL -1 OR _container_udev_wait_owner EQUAL -1 OR
    _container_udev_wait_initialized EQUAL -1 OR _container_udev_wait_timeout EQUAL -1 OR
    _container_udev_wait_applied EQUAL -1 OR
-   _container_ipv4_source_validation_restore EQUAL -1 OR _container_ipv4_source_validation_setup EQUAL -1 OR
+   _container_ipv4_source_validation_setup EQUAL -1 OR
    _local_route_forwarding EQUAL -1 OR
    _primary_subnet_sync_count LESS 2)
    message(FATAL_ERROR "same-machine L3 netkit traffic must use host /128 routing")
+endif()
+
+# Restore uses the asynchronous netlink owner. Check its ordering independently
+# from initial setup so an obsolete synchronous spelling cannot hide a missing
+# acknowledgement, source-validation step, or readiness barrier.
+string(FIND "${_containers}" "ProdigyHostTask<bool> restoreNetworkAsync(" _restore_start)
+string(FIND "${_containers}" "  bool setupNetwork(" _restore_end)
+if(_restore_start EQUAL -1 OR _restore_end LESS_EQUAL _restore_start)
+   message(FATAL_ERROR "retained network restoration must have one asynchronous owner")
+endif()
+math(EXPR _restore_length "${_restore_end} - ${_restore_start}")
+string(SUBSTRING "${_containers}" ${_restore_start} ${_restore_length} _restore)
+foreach(_required IN ITEMS
+   "netdevs.getInfoAsync(complete)"
+   "netdevs.peer.flushAsync(complete)"
+   "netdevs.host.flushAsync(complete)"
+   "if (configured < 0)"
+   "if (!isCurrent()) co_return false;"
+   "if (applyHostNetkitIPv4SourceValidationValues(failureReport) == false) co_return false;")
+   string(FIND "${_restore}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "retained network restoration contract missing: ${_required}")
+   endif()
+endforeach()
+string(FIND "${_restore}" "const int configured = co_await" _restore_configured)
+string(FIND "${_restore}" "udevadm wait --initialized=yes --timeout=5" _restore_udev)
+string(FIND "${_restore}" "applyHostNetkitIPv4SourceValidationValues(failureReport)" _restore_policy)
+string(FIND "${_restore}" "co_return finishNetworkRestore(failureReport);" _restore_publish)
+if(_restore_configured EQUAL -1 OR _restore_udev LESS_EQUAL _restore_configured OR
+   _restore_policy LESS_EQUAL _restore_udev OR _restore_publish LESS_EQUAL _restore_policy)
+   message(FATAL_ERROR "retained network restoration must await netlink and udev, apply IPv4 source validation, then publish readiness")
 endif()
 
 file(GLOB_RECURSE _ebpf_sources
@@ -152,8 +182,11 @@ foreach(_source IN ITEMS
    "${PRODIGY_ROOT}/prodigy/brain/mesh.h"
    "${PRODIGY_ROOT}/prodigy/neuron/neuron.h")
    file(READ "${_source}" _contents)
-   if(_contents MATCHES "std::fprintf\\(stderr" OR _contents MATCHES "std::fflush\\(stderr")
-      message(FATAL_ERROR "${_source}: production diagnostics must use the PRODIGY_DEBUG compile-time gate")
+   # Operational failures must remain visible in release builds. Only debug
+   # tracing belongs behind the compile-time gate; banning every stderr call
+   # also rejects the bounded artifact/recovery failure diagnostics.
+   if(_contents MATCHES "std::fprintf\\([ \t\r\n]*stderr,[ \t\r\n]*\"prodigy debug")
+      message(FATAL_ERROR "${_source}: debug tracing must use the PRODIGY_DEBUG compile-time gate")
    endif()
 endforeach()
 

@@ -1829,6 +1829,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_test_cluster_darwin_route_unit PROPERTIES TIMEOUT 15)
    add_test(
+      NAME prodigy_dev_netns_harness_cleanup_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness_cleanup_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness.sh
+   )
+   set_tests_properties(prodigy_dev_netns_harness_cleanup_unit PROPERTIES TIMEOUT 30)
+   add_test(
       NAME prodigy_virtual_datacenter_bounded_log_unit
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_virtual_datacenter_bounded_log_unit.sh ${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh
    )
@@ -2266,5 +2271,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
          NAME prodigy_ci_runner_help
          COMMAND ${CMAKE_BINARY_DIR}/prodigy_ci --help
       )
+      add_test(
+         NAME prodigy_ci_runner_unit
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_ci_runner_unit.py
+                 ${RUSTC_EXECUTABLE} ${PRODIGY_CI_RS} ${CMAKE_COMMAND}
+      )
+      set_tests_properties(prodigy_ci_runner_unit PROPERTIES TIMEOUT 240)
    endif()
 endif()
