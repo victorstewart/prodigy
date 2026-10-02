@@ -124,6 +124,8 @@ public:
   String forcedSelfElectionManagedSchemaReconcileFailure = {};
   bool exitRingAfterMachineRetirement = false;
   uint32_t machineRetirementCloseCallbacks = 0;
+  bool exitRingAfterMothershipClose = false;
+  uint32_t mothershipCloseCallbacks = 0;
   uint32_t machineRetirementFenceFailuresRemaining = 0;
   uint32_t machineRetirementFenceCreateCalls = 0;
   bool overrideRetirementTopology = false;
@@ -298,11 +300,21 @@ public:
   {
     const bool completingMachineRetirement =
         retiringMachinesByNeuron.contains(static_cast<NeuronView *>(socket));
+    const bool completingMothershipClose =
+        closingMotherships.contains(static_cast<Mothership *>(socket));
     Brain::closeHandler(socket);
     if (completingMachineRetirement)
     {
       ++machineRetirementCloseCallbacks;
       if (exitRingAfterMachineRetirement)
+      {
+        Ring::exit = true;
+      }
+    }
+    if (completingMothershipClose)
+    {
+      ++mothershipCloseCallbacks;
+      if (exitRingAfterMothershipClose)
       {
         Ring::exit = true;
       }
@@ -7308,6 +7320,13 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_consistent_self_master_claim_keeps_self_master");
     suite.expect(brain.masterQuorumDegraded == false, "registration_consistent_self_master_claim_clears_quorum_degraded");
     suite.expect(brain.persistCalls == 1, "registration_consistent_self_master_claim_skips_extra_persist");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_consistent_self_master_claim_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_consistent_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(peer);
     delete peer;
@@ -7401,6 +7420,13 @@ int main(void)
 
     suite.expect(brain.weAreMaster, "registration_conflicting_self_master_claim_keeps_self_master");
     suite.expect(brain.masterQuorumDegraded, "registration_conflicting_self_master_claim_preserves_quorum_degraded");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_conflicting_self_master_claim_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_conflicting_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(conflictingPeer);
     brain.brains.erase(peer);
@@ -7485,6 +7511,13 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_majority_override_ignores_stale_candidate_claim_keeps_self_master");
     suite.expect(candidate->isMasterBrain == false, "registration_majority_override_ignores_stale_candidate_claim_does_not_elect_candidate");
     suite.expect(brain.persistCalls == 1, "registration_majority_override_ignores_stale_candidate_claim_skips_extra_persist");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_majority_override_ignores_stale_candidate_claim_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_majority_override_ignores_stale_candidate_claim_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(candidate);
     brain.brains.erase(peer);
@@ -7526,6 +7559,13 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_non_majority_override_keeps_self_master");
     suite.expect(candidate->isMasterBrain == false, "registration_non_majority_override_does_not_elect_candidate");
     suite.expect(brain.persistCalls == 1, "registration_non_majority_override_skips_extra_persist");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_non_majority_override_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_non_majority_override_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(candidate);
     brain.brains.erase(peer);
@@ -10593,10 +10633,24 @@ int main(void)
       suite.expect(retiredStream->isFixedFile == false, "brain_destroy_idle_mothership_stream_relinquishes_fixed_file_state");
       suite.expect(retiredStream->fslot == -1, "brain_destroy_idle_mothership_stream_clears_fixed_slot");
 
-      brain.closingMotherships.erase(retiredStream);
-      Ring::shutdownForExec();
-      scopedRing.created = false;
-      delete retiredStream;
+      RingInterface *previousInterfacer = Ring::interfacer;
+      auto previousLifecycler = Ring::lifecycler;
+      Ring::interfacer = &brain;
+      Ring::lifecycler = nullptr;
+      RingExitDeadline closeDeadline(40);
+      brain.exitRingAfterMothershipClose = true;
+      closeDeadline.arm();
+      Ring::exit = false;
+      Ring::start();
+      Ring::exit = false;
+      closeDeadline.packet.clear();
+      brain.exitRingAfterMothershipClose = false;
+      Ring::interfacer = previousInterfacer;
+      Ring::lifecycler = previousLifecycler;
+
+      suite.expect(closeDeadline.fired == false && brain.mothershipCloseCallbacks == 1 &&
+                       brain.closingMotherships.empty(),
+                   "brain_destroy_idle_mothership_stream_waits_for_close_completion");
 
       ::close(fds[1]);
       fds[0] = -1;
