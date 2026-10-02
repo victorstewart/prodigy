@@ -1012,7 +1012,7 @@ int main(void)
     };
 
     ClusterTopology topology = {};
-    topology.machines.push_back(makeSharedSlirpBrain(0x201, "2001:db8:101::10"));
+    topology.machines.push_back(makeSharedSlirpBrain(0x101, "2001:db8:101::10"));
     topology.machines.push_back(makeSharedSlirpBrain(neuron.uuid, "2001:db8:102::10"));
     topology.machines.push_back(makeSharedSlirpBrain(0x301, "2001:db8:102::11"));
 
@@ -1537,6 +1537,7 @@ int main(void)
                                                                                         {"2001:db8::10", 64}
     }));
     brain.storedTopology.machines.push_back(makeMultihomedBrainMachine(0x555, {
+                                                                                  {"fd00:10::29", 64},
                                                                                   {"2001:db8::29", 64}
     }));
 
@@ -1545,6 +1546,14 @@ int main(void)
     suite.expect(peer != nullptr, "restore_master_candidate_peer_present");
     if (peer != nullptr)
     {
+      // The persisted topology is the authority for a known Brain UUID.  Make
+      // the runtime peer stale, then reconcile it using the commissioned set;
+      // peer registration must not expand the topology with ambient addresses.
+      peer->peerAddresses.clear();
+      peer->peerAddresses.push_back(ClusterMachinePeerAddress {"fd00:10::28"_ctv, 64});
+      peer->peerAddress = IPAddress("fd00:10::28", true);
+      peer->peerAddressText.assign("fd00:10::28"_ctv);
+
       Vector<ClusterMachinePeerAddress> publishedCandidates;
       ClusterMachinePeerAddress privateCandidate = {};
       privateCandidate.address.assign("fd00:10::29"_ctv);
@@ -1554,14 +1563,23 @@ int main(void)
       publicCandidate.address.assign("2001:db8::29"_ctv);
       publicCandidate.cidr = 64;
       publishedCandidates.push_back(publicCandidate);
+      ClusterMachinePeerAddress ambientCandidate = {};
+      ambientCandidate.address.assign("2001:db8::77"_ctv);
+      ambientCandidate.cidr = 64;
+      publishedCandidates.push_back(ambientCandidate);
 
       suite.expect(brain.updateBrainPeerAddressCandidates(peer, publishedCandidates), "update_peer_candidates_master_applies");
       suite.expect(peer->peerAddresses.size() == 2, "update_peer_candidates_master_runtime_count");
       suite.expect(peer->peerAddressText == "fd00:10::29"_ctv, "update_peer_candidates_master_runtime_prefers_private");
       suite.expect(brain.storedTopology.version == 10, "update_peer_candidates_master_persists_version");
-      suite.expect(brain.storedTopology.machines[1].addresses.privateAddresses.size() == 1 && brain.storedTopology.machines[1].addresses.publicAddresses.size() == 1, "update_peer_candidates_master_persists_count");
-      suite.expect(brain.storedTopology.machines[1].addresses.privateAddresses[0].address == "fd00:10::29"_ctv, "update_peer_candidates_master_persists_private_first");
-      suite.expect(brain.storedTopology.machines[1].addresses.publicAddresses[0].address == "2001:db8::29"_ctv, "update_peer_candidates_master_persists_public_fallback");
+      const bool persistedAddresses = brain.storedTopology.machines.size() > 1 &&
+          brain.storedTopology.machines[1].addresses.privateAddresses.size() == 1 &&
+          brain.storedTopology.machines[1].addresses.publicAddresses.size() == 1;
+      suite.expect(persistedAddresses, "update_peer_candidates_master_persists_count");
+      suite.expect(persistedAddresses && brain.storedTopology.machines[1].addresses.privateAddresses[0].address == "fd00:10::29"_ctv,
+                   "update_peer_candidates_master_persists_private_first");
+      suite.expect(persistedAddresses && brain.storedTopology.machines[1].addresses.publicAddresses[0].address == "2001:db8::29"_ctv,
+                   "update_peer_candidates_master_persists_public_fallback");
     }
   }
 
@@ -1573,15 +1591,23 @@ int main(void)
     brain.storedTopology.version = 11;
     ClusterMachine ignoredNonBrain = makeBrainMachine("fd00:10::70"_ctv, false, 0x660);
     ignoredNonBrain.isBrain = false;
-    ClusterMachine identityMatch = makeBrainMachine("fd00:10::71"_ctv, false, 0);
+    constexpr uint128_t identityMatchUUID = 0x661;
+    ClusterMachine identityMatch = makeMultihomedBrainMachine(identityMatchUUID, {
+        {"fd00:10::72", 64},
+        {"2001:db8::72", 64}
+    });
     identityMatch.cloud.cloudID = "brain-identity"_ctv;
     brain.storedTopology.machines.push_back(ignoredNonBrain);
     brain.storedTopology.machines.push_back(identityMatch);
 
     BrainView peer = {};
     Machine runtimeMachine = {};
+    runtimeMachine.uuid = identityMatchUUID;
     runtimeMachine.cloudID = "brain-identity"_ctv;
     peer.machine = &runtimeMachine;
+    peer.peerAddresses.push_back(ClusterMachinePeerAddress {"fd00:10::71"_ctv, 64});
+    peer.peerAddress = IPAddress("fd00:10::71", true);
+    peer.peerAddressText.assign("fd00:10::71"_ctv);
 
     Vector<ClusterMachinePeerAddress> publishedCandidates = {};
     publishedCandidates.push_back(ClusterMachinePeerAddress {"fd00:10::72"_ctv, 64});
@@ -1589,9 +1615,13 @@ int main(void)
 
     suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates), "update_peer_candidates_master_matches_machine_identity");
     suite.expect(brain.storedTopology.version == 12, "update_peer_candidates_master_identity_match_persists_version");
-    suite.expect(brain.storedTopology.machines[1].addresses.privateAddresses.size() == 1, "update_peer_candidates_master_identity_match_persists_private_candidate");
-    suite.expect(brain.storedTopology.machines[1].addresses.privateAddresses[0].address == "fd00:10::72"_ctv, "update_peer_candidates_master_identity_match_rewrites_private_candidate");
-    suite.expect(brain.storedTopology.machines[1].addresses.publicAddresses.size() == 1, "update_peer_candidates_master_identity_match_persists_public_candidate");
+    const bool identityMatchAddresses = brain.storedTopology.machines.size() > 1 &&
+        brain.storedTopology.machines[1].addresses.privateAddresses.size() == 1 &&
+        brain.storedTopology.machines[1].addresses.publicAddresses.size() == 1;
+    suite.expect(identityMatchAddresses, "update_peer_candidates_master_identity_match_persists_private_candidate");
+    suite.expect(identityMatchAddresses && brain.storedTopology.machines[1].addresses.privateAddresses[0].address == "fd00:10::72"_ctv,
+                 "update_peer_candidates_master_identity_match_rewrites_private_candidate");
+    suite.expect(identityMatchAddresses, "update_peer_candidates_master_identity_match_persists_public_candidate");
   }
 
   {
@@ -1613,11 +1643,13 @@ int main(void)
     const uint128_t updatedUUID = 0x8a02;
     const uint128_t thirdUUID = 0x8a03;
     brain.storedTopology.machines.push_back(makeSharedNatBrain(firstUUID, "fd72:6e61:6d65:1::10"));
-    brain.storedTopology.machines.push_back(makeSharedNatBrain(updatedUUID, "fd72:6e61:6d65:2::10"));
+    brain.storedTopology.machines.push_back(makeSharedNatBrain(updatedUUID, "fd72:6e61:6d65:2::20"));
     brain.storedTopology.machines.push_back(makeSharedNatBrain(thirdUUID, "fd72:6e61:6d65:3::10"));
 
     BrainView updatedPeer = {};
     updatedPeer.uuid = updatedUUID;
+    updatedPeer.peerAddresses.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
+    updatedPeer.peerAddresses.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::10"_ctv, 64});
     Vector<ClusterMachinePeerAddress> publishedCandidates = {};
     publishedCandidates.push_back(ClusterMachinePeerAddress {"10.0.2.15"_ctv, 24});
     publishedCandidates.push_back(ClusterMachinePeerAddress {"fd72:6e61:6d65:2::20"_ctv, 64});
@@ -1647,18 +1679,26 @@ int main(void)
     brain.haveStoredTopology = true;
     brain.storedTopology.version = 4;
     brain.storedTopology.machines.push_back(makeMultihomedBrainMachine(0x777, {
+                                                                                  {"fd00:10::81", 64},
                                                                                   {"2001:db8::81", 64}
     }));
 
     BrainView peer = {};
+    peer.uuid = 0x777;
+    peer.peerAddresses.push_back(ClusterMachinePeerAddress {"2001:db8::80"_ctv, 64});
+    peer.peerAddress = IPAddress("2001:db8::80", true);
+    peer.peerAddressText.assign("2001:db8::80"_ctv);
     Vector<ClusterMachinePeerAddress> publishedCandidates = {};
     publishedCandidates.push_back(ClusterMachinePeerAddress {"2001:db8::81"_ctv, 64});
     publishedCandidates.push_back(ClusterMachinePeerAddress {"fd00:10::81"_ctv, 64});
 
     suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates), "update_peer_candidates_master_matches_candidate_address");
     suite.expect(brain.storedTopology.version == 5, "update_peer_candidates_master_candidate_match_persists_version");
-    suite.expect(brain.storedTopology.machines[0].addresses.privateAddresses.size() == 1, "update_peer_candidates_master_candidate_match_adds_private_address");
-    suite.expect(brain.storedTopology.machines[0].addresses.privateAddresses[0].address == "fd00:10::81"_ctv, "update_peer_candidates_master_candidate_match_reorders_private_first");
+    const bool candidateMatchAddresses = brain.storedTopology.machines.size() == 1 &&
+        brain.storedTopology.machines[0].addresses.privateAddresses.size() == 1;
+    suite.expect(candidateMatchAddresses, "update_peer_candidates_master_candidate_match_adds_private_address");
+    suite.expect(candidateMatchAddresses && brain.storedTopology.machines[0].addresses.privateAddresses[0].address == "fd00:10::81"_ctv,
+                 "update_peer_candidates_master_candidate_match_reorders_private_first");
   }
 
   {
@@ -1673,7 +1713,7 @@ int main(void)
     Vector<ClusterMachinePeerAddress> publishedCandidates = {};
     publishedCandidates.push_back(ClusterMachinePeerAddress {"fd00:10::91"_ctv, 64});
 
-    suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates), "update_peer_candidates_master_returns_true_when_topology_has_no_match");
+    suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates) == false, "update_peer_candidates_master_rejects_unknown_topology_identity");
     suite.expect(brain.storedTopology.version == 6, "update_peer_candidates_master_no_match_preserves_version");
   }
 
@@ -1685,15 +1725,18 @@ int main(void)
     brain.persistTopologyShouldFail = true;
     brain.storedTopology.version = 8;
     brain.storedTopology.machines.push_back(makeMultihomedBrainMachine(0x888, {
+                                                                                  {"fd00:10::88", 64},
                                                                                   {"2001:db8::88", 64}
     }));
 
     BrainView peer = {};
+    peer.uuid = 0x888;
+    peer.peerAddresses.push_back(ClusterMachinePeerAddress {"fd00:10::87"_ctv, 64});
     Vector<ClusterMachinePeerAddress> publishedCandidates = {};
     publishedCandidates.push_back(ClusterMachinePeerAddress {"2001:db8::88"_ctv, 64});
     publishedCandidates.push_back(ClusterMachinePeerAddress {"fd00:10::88"_ctv, 64});
 
-    suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates) == false, "update_peer_candidates_master_propagates_persist_failure");
+    suite.expect(brain.updateBrainPeerAddressCandidates(&peer, publishedCandidates), "update_peer_candidates_master_queues_persist_failure");
     suite.expect(brain.storedTopology.version == 8, "update_peer_candidates_master_persist_failure_keeps_stored_version");
   }
 
