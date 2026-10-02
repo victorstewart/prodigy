@@ -2132,6 +2132,18 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_deployments_unit>
    )
    set_tests_properties(prodigy_recovered_stateful_target_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_materialized_stateful_recovery_initial_health_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_materialized_stateful_recovery_initial_health_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_materialized_stateful_recovery_historical_cull_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=materialized-recovery-historical-cull
+              $<TARGET_FILE:prodigy_runtime_persistence_unit>
+   )
+   set_tests_properties(prodigy_materialized_stateful_recovery_historical_cull_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_remote_bootstrap_unit

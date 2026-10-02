@@ -12843,6 +12843,58 @@ public:
     return receipt->completed && receipt->durable;
   }
 
+  // The durable recovery operation can authorize retiring exactly one older
+  // restored NONE plan ahead of its active materialized cohort.  The active
+  // deployment owner performs the structural validation; Brain performs the
+  // existing index, artifact, and replication cleanup only after that durable
+  // acceptance.  Do not call this from ordinary admission or before commit.
+  bool cullMaterializedStatefulRecoveryHistoricalPredecessor(ApplicationDeployment *active,
+                                                              ApplicationDeployment *successor,
+                                                              uint64_t activeDeploymentID,
+                                                              uint64_t successorDeploymentID)
+  {
+    // Preserve the established partial/decommissioning resume path when there
+    // is no historical record to normalize.
+    if (active != nullptr && active->previous == nullptr)
+    {
+      return true;
+    }
+    const bool acceptedOperationIsDurable =
+        masterAuthorityRuntimeStateDurable &&
+        std::any_of(masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.begin(),
+                    masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.end(),
+                    [activeDeploymentID, successorDeploymentID](const ProdigyMaterializedStatefulRecoveryOperation& operation) {
+                      return operation.accepted && operation.started && operation.completed == false &&
+                             operation.activeDeploymentID == activeDeploymentID &&
+                             operation.successorDeploymentID == successorDeploymentID;
+                    });
+    if (acceptedOperationIsDurable == false || active == nullptr || successor == nullptr ||
+        active->plan.config.deploymentID() != activeDeploymentID ||
+        successor->plan.config.deploymentID() != successorDeploymentID ||
+        active->next != successor || successor->previous != active)
+    {
+      return false;
+    }
+    ApplicationDeployment *historical = active->previous;
+    const uint64_t historicalID = historical->plan.config.deploymentID();
+    auto found = deployments.find(historicalID);
+    if (found == deployments.end() || found->second != historical ||
+        active->materializedStatefulRecoveryHistoricalPredecessorIsEmpty() == false)
+    {
+      return false;
+    }
+    if (active->detachMaterializedStatefulRecoveryHistoricalPredecessor() != historical)
+    {
+      return false;
+    }
+    deployments.erase(found);
+    releaseRoutableResourceLeasesForDeployment(historicalID);
+    ContainerStore::destroy(historicalID);
+    queueBrainReplication(BrainTopic::cullDeployment, historicalID);
+    delete historical;
+    return true;
+  }
+
   void recoverDeploymentsAfterNeuronState(void)
   {
     if (recoveryPersistencePending || !pendingMaterializedRecoveryPersistence.empty() || weAreMaster == false || ignited == false ||
@@ -13028,6 +13080,26 @@ public:
           deploymentDNSReady(operation.activeDeploymentID) == false)
       {
         continue;
+      }
+      // An accepted operation is durable across restart.  Normalize its sole
+      // empty historical predecessor before the successor's strict serial
+      // handoff checks inspect `previous->previous`.
+      if (cullMaterializedStatefulRecoveryHistoricalPredecessor(
+              active->second, head, operation.activeDeploymentID, operation.successorDeploymentID) == false)
+      {
+        continue;
+      }
+      const bool parkedInitialHealthWait = active->second->materializedStatefulInitialHealthWaitCanPark();
+      if (parkedInitialHealthWait)
+      {
+        active->second->parkMaterializedStatefulInitialHealthWait();
+        // Only a just-parked initial cohort must satisfy this NONE-state
+        // barrier.  An already-started partial handoff retains its existing
+        // DECOMMISSIONING/two-owner resume path below.
+        if (active->second->recoveredMaterializedStatefulRollForwardIsSafe() == false)
+        {
+          continue;
+        }
       }
       head->materializedStatefulRecoveryOwnsTransition = true;
       head->resumeMaterializedStatefulRecovery();
@@ -36364,7 +36436,15 @@ public:
                   auto successor = deployments.find(successorID);
                   if (active == deployments.end() || successor == deployments.end() || !active->second || !successor->second ||
                       active->second->next != successor->second || successor->second->previous != active->second) return;
-                  if (initialHealthWaitParkable) active->second->parkMaterializedStatefulInitialHealthWait();
+                  // The recovery operation is now durable.  Retire only a
+                  // structurally empty historical predecessor before parking
+                  // the initial health wait; a nonempty chain remains held.
+                  if (!cullMaterializedStatefulRecoveryHistoricalPredecessor(
+                          active->second, successor->second, activeID, successorID)) return;
+                  if (initialHealthWaitParkable)
+                  {
+                    active->second->parkMaterializedStatefulInitialHealthWait();
+                  }
                   if (!active->second->recoveredMaterializedStatefulRollForwardIsSafe()) return;
                   successor->second->materializedStatefulRecoveryOwnsTransition = true;
                   successor->second->resumeMaterializedStatefulRecovery();

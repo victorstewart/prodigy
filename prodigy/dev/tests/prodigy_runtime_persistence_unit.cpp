@@ -697,6 +697,58 @@ static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
   havePersistedBrainSnapshot = false;
 }
 
+static void testDurableMaterializedRecoveryHistoricalCull(TestSuite& suite)
+{
+  ProdigyHostControlNetwork network;
+  ProdigyBrain brain(network, {});
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+
+  constexpr uint16_t applicationID = 64001;
+  auto *historical = new ApplicationDeployment();
+  auto *active = new ApplicationDeployment();
+  auto *successor = new ApplicationDeployment();
+  active->plan.config.applicationID = applicationID;
+  active->plan.config.versionID = 680001;
+  successor->plan = active->plan;
+  successor->plan.config.versionID = 680002;
+  historical->plan = active->plan;
+  historical->plan.config.versionID = 678302;
+  historical->state = DeploymentState::none;
+  historical->next = active;
+  active->previous = historical;
+  active->next = successor;
+  successor->previous = active;
+
+  const uint64_t historicalID = historical->plan.config.deploymentID();
+  const uint64_t activeID = active->plan.config.deploymentID();
+  const uint64_t successorID = successor->plan.config.deploymentID();
+  brain.deployments.insert_or_assign(historicalID, historical);
+  brain.deployments.insert_or_assign(activeID, active);
+  brain.deployments.insert_or_assign(successorID, successor);
+  ProdigyMaterializedStatefulRecoveryOperation operation = {};
+  operation.activeDeploymentID = activeID;
+  operation.successorDeploymentID = successorID;
+  operation.accepted = operation.started = true;
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(operation);
+
+  suite.expect(brain.cullMaterializedStatefulRecoveryHistoricalPredecessor(active, successor, activeID, successorID) == false &&
+                   active->previous == historical && brain.deployments.contains(historicalID),
+               "materialized_recovery_historical_cull_requires_durable_operation");
+  brain.masterAuthorityRuntimeStateDurable = true;
+  suite.expect(brain.cullMaterializedStatefulRecoveryHistoricalPredecessor(active, successor, activeID, successorID) &&
+                   active->previous == nullptr && brain.deployments.contains(historicalID) == false,
+               "materialized_recovery_historical_cull_detaches_empty_predecessor_after_durability");
+  suite.expect(brain.cullMaterializedStatefulRecoveryHistoricalPredecessor(active, successor, activeID, successorID),
+               "materialized_recovery_historical_cull_is_idempotent_after_restart");
+
+  brain.deployments.erase(activeID);
+  brain.deployments.erase(successorID);
+  delete successor;
+  delete active;
+  thisBrain = savedBrain;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -705,6 +757,12 @@ int main(void)
   {
     testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
     std::printf("REENTRANT_UPDATE_PERSISTENCE_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "materialized-recovery-historical-cull") == 0)
+  {
+    testDurableMaterializedRecoveryHistoricalCull(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
@@ -718,5 +776,6 @@ int main(void)
   testRuntimeAwareBrainActivatesOnlyTheAsyncPersistenceOwner(suite);
   testRuntimeAwareNeuronActivatesOnlyTheAsyncPersistenceOwner(suite);
   testBootPersistenceAdmissionRejectionHasNoReceipt(suite);
+  testDurableMaterializedRecoveryHistoricalCull(suite);
   return suite.failed == 0 ? 0 : 1;
 }

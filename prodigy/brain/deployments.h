@@ -10240,13 +10240,46 @@ public:
            successor.stateful.allMasters == active.stateful.allMasters;
   }
 
+  // A restored deployment chain can retain one older, already-empty NONE
+  // record ahead of the active materialized cohort.  It owns neither process
+  // nor scheduler state and is detached by Brain only after the recovery
+  // operation is durable; accepting any materialized ancestor would orphan a
+  // container owner when the active cohort is later culled.
+  bool materializedStatefulRecoveryHistoricalPredecessorIsEmpty(void) const
+  {
+    return previous == nullptr ||
+           (previous->previous == nullptr && previous->next == this &&
+            previous->state == DeploymentState::none &&
+            previous->plan.config.applicationID == plan.config.applicationID &&
+            previous->lifecycleIsUnmaterialized());
+  }
+
+  // Call only from the durable recovery-acceptance continuation.  Brain owns
+  // erasing, culling, and deleting the returned historical record so the
+  // unlink cannot outrun its replicated durable operation.
+  ApplicationDeployment *detachMaterializedStatefulRecoveryHistoricalPredecessor(void)
+  {
+    if (previous == nullptr)
+    {
+      return nullptr;
+    }
+    if (materializedStatefulRecoveryHistoricalPredecessorIsEmpty() == false)
+    {
+      return nullptr;
+    }
+    ApplicationDeployment *historical = previous;
+    previous = nullptr;
+    historical->next = nullptr;
+    return historical;
+  }
+
   // Shared structural guard for the only retained-storage recovery path.
   // It deliberately excludes mutable scheduler state; the two callers below
   // own their distinct NONE and sole-initial-health-wait lifecycle barriers.
   bool materializedStatefulRecoveryCohortAndSuccessorAreCompatible(void)
   {
     if (plan.isStateful == false || plan.config.type != ApplicationType::stateful ||
-        previous != nullptr || next == nullptr || nShardGroups != 1 ||
+        materializedStatefulRecoveryHistoricalPredecessorIsEmpty() == false || next == nullptr || nShardGroups != 1 ||
         nTarget() != 3 || nDeployed() != nTarget() || containers.size() != nTarget() ||
         nHealthy() >= nTarget())
     {
