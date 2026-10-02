@@ -1358,6 +1358,46 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   delete brain;
 }
 
+static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
+{
+  ApplicationDeployment deployment = {};
+  seedCommonPlan(deployment, true);
+  deployment.plan.config.applicationID = 19'210;
+  deployment.plan.config.versionID = 1;
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.plan.stateful.allMasters = false;
+
+  ContainerView master = {};
+  master.deploymentID = deployment.plan.config.deploymentID();
+  master.isStateful = true;
+  master.lifetime = ApplicationLifetime::base;
+  master.shardGroup = 0;
+  master.state = ContainerState::healthy;
+  master.runtimeReady = true;
+  deployment.containers.insert(&master);
+  deployment.masterForShardGroup.insert_or_assign(0, &master);
+  suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::seeding,
+               "recovered_stateful_quorum_uses_live_canonical_master_for_seeding");
+
+  deployment.masterForShardGroup.clear();
+  suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::genesis,
+               "fresh_stateful_deployment_without_master_remains_genesis");
+
+  deployment.masterForShardGroup.insert_or_assign(0, nullptr);
+  suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::genesis,
+               "null_recovered_stateful_master_remains_genesis");
+
+  master.deploymentID += 1;
+  deployment.masterForShardGroup.insert_or_assign(0, &master);
+  suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::genesis,
+               "stale_recovered_stateful_master_remains_genesis");
+  master.deploymentID = deployment.plan.config.deploymentID();
+  deployment.containers.clear();
+  suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::genesis,
+               "removed_recovered_stateful_master_remains_genesis");
+  deployment.masterForShardGroup.clear();
+}
+
 static void testMaterializedStatefulRecoveryInitialHealth(TestSuite& suite)
 {
     ScopedFreshRing ring;
@@ -2016,6 +2056,7 @@ int main(void)
   {
     testRecoveredStatefulSuccessorTarget(suite, true);
     testRecoveredStatefulSuccessorTarget(suite, false);
+    testRecoveredStatefulQuorumDataStrategy(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY") != nullptr)
@@ -2040,6 +2081,53 @@ int main(void)
     suite.expect(writeFileFixture(artifact / "rootfs" / "keep", "retained-rootfs") &&
                      writeFileFixture(sentinel, "retained-database"),
                  "cold_restart_retained_fixture_has_rootfs_and_storage");
+
+    // Process-present re-adoption must record an existing direct backend
+    // without altering it, so a later observed crash-backoff replacement has
+    // ownership evidence after the original process exits.
+    Container observed = {};
+    observed.plan.uuid = uint128_t(0xC021);
+    observed.plan.config.applicationID = 77;
+    observed.plan.config.versionID = 9;
+    observed.plan.config.type = ApplicationType::stateful;
+    observed.plan.config.storageMB = 64;
+    observed.name.assignItoa(observed.plan.uuid);
+    String observedStoragePath = {};
+    prodigyContainerStorageRootPathForName(observed.name, observedStoragePath);
+    const auto observedStorage = filesystemPathFromString(observedStoragePath);
+    suite.expect(!std::filesystem::exists(observedStorage), "observed_storage_hydration_fixture_is_fresh");
+    if (!std::filesystem::exists(observedStorage))
+    {
+      suite.expect(writeFileFixture(observedStorage / "kvdb" / "sentinel", "retained-database"),
+                   "observed_storage_hydration_fixture_created");
+      String hydrationFailure = {};
+      suite.expect(ContainerManager::hydrateObservedContainerStorageBackend(&observed, &hydrationFailure) &&
+                       observed.storageUsesLoopFilesystem == false &&
+                       observed.storageRootPath.equals(observedStoragePath) &&
+                       observed.storagePayloadPath.equals(observedStoragePath) &&
+                       std::filesystem::exists(observedStorage / "kvdb" / "sentinel"),
+                   "observed_direct_storage_hydration_preserves_backend");
+      ContainerPlan replacement = observed.plan;
+      replacement.uuid = uint128_t(0xC022);
+      String selectedPayload = {}, selectionFailure = {};
+      struct stat selectedIdentity = {};
+      bool renameLoopArtifacts = false;
+      suite.expect(ContainerManager::selectObservedCrashBackoffStorage(
+                       &observed, replacement, selectedPayload, selectedIdentity, renameLoopArtifacts,
+                       &selectionFailure) &&
+                       selectedPayload.equals(observedStoragePath) && renameLoopArtifacts == false,
+                   "observed_direct_storage_hydration_admits_crash_backoff_selection");
+      std::filesystem::remove_all(observedStorage);
+    }
+    Container missingObserved = observed;
+    missingObserved.plan.uuid = uint128_t(0xC023);
+    missingObserved.name.assignItoa(missingObserved.plan.uuid);
+    missingObserved.storageRootPath.clear();
+    missingObserved.storagePayloadPath.clear();
+    String missingHydrationFailure = {};
+    suite.expect(!ContainerManager::hydrateObservedContainerStorageBackend(&missingObserved, &missingHydrationFailure) &&
+                     missingObserved.storageRootPath.empty() && missingObserved.storagePayloadPath.empty(),
+                 "observed_missing_storage_hydration_rejected_without_path_inference");
 
     NeuronBase *savedNeuron = thisNeuron;
     const bool savedAutoDestroy = ContainerStore::autoDestroy;

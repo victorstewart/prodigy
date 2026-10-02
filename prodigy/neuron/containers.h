@@ -8160,6 +8160,77 @@ public:
     return ready;
   }
 
+  // A process-present state upload re-adopts the existing container rather
+  // than creating its storage again.  Record only an already canonical,
+  // complete backend so a later crash-backoff handoff has the same ownership
+  // evidence as a locally created Container.  This deliberately performs no
+  // mkdir, chown, mount, quota, or rename operation.
+  static bool hydrateObservedContainerStorageBackend(Container *container, String *failureReport = nullptr)
+  {
+    auto fail = [&](const char *message) {
+      if (failureReport) failureReport->assign(message);
+      return false;
+    };
+    if (container == nullptr) return fail("observed container storage owner is unavailable");
+    if (container->plan.config.storageMB == 0) return true;
+
+    String expectedName = {};
+    expectedName.assignItoa(container->plan.uuid);
+    if (container->name.size() == 0 || container->name.equals(expectedName) == false)
+      return fail("observed container storage name is not canonical");
+
+    String root = {};
+    prodigyContainerStorageRootPathForName(container->name, root);
+    Vector<ProdigyContainerStorageDevicePlan> devicePlans = {};
+    if (collectEligibleStorageDevicePlans(container->name, container->plan.config.storageMB, devicePlans) == false)
+      return fail("observed container storage devices cannot be resolved");
+
+    struct stat rootIdentity = {};
+    const auto rootPath = prodigyFilesystemPathFromString(root);
+    if (lstat(rootPath.c_str(), &rootIdentity) != 0 || S_ISDIR(rootIdentity.st_mode) == false)
+      return fail("observed container storage root is unavailable");
+
+    if (devicePlans.empty())
+    {
+      container->storageRootPath = root;
+      container->storagePayloadPath = root;
+      container->storageUsesLoopFilesystem = false;
+      container->storageLoopDevices.clear();
+      return true;
+    }
+
+    Vector<Container::StorageLoopDevice> loopDevices = {};
+    fillStorageLoopDevicesFromPlans(devicePlans, loopDevices);
+    String payload = {};
+    prodigyContainerStoragePayloadPathForName(container->name, payload);
+    struct stat payloadIdentity = {};
+    const auto payloadPath = prodigyFilesystemPathFromString(payload);
+    if (lstat(payloadPath.c_str(), &payloadIdentity) != 0 || S_ISDIR(payloadIdentity.st_mode) == false)
+      return fail("observed container loop storage payload is unavailable");
+    Vector<String> configuredMountPaths = {};
+    collectConfiguredContainerStorageMountPaths(configuredMountPaths);
+    for (const Container::StorageLoopDevice& device : loopDevices)
+    {
+      bool configured = false;
+      for (const String& mountPath : configuredMountPaths)
+      {
+        String backing = {};
+        prodigyContainerStorageBackingFilePathForMount(mountPath, container->name, backing);
+        configured |= device.backingFilePath.equals(backing);
+      }
+      struct stat backingIdentity = {};
+      const auto backingPath = prodigyFilesystemPathFromString(device.backingFilePath);
+      if (device.backingFilePath.empty() || device.sizeMB == 0 || configured == false ||
+          lstat(backingPath.c_str(), &backingIdentity) != 0 || S_ISREG(backingIdentity.st_mode) == false)
+        return fail("observed container loop storage backing is unavailable");
+    }
+    container->storageRootPath = std::move(root);
+    container->storagePayloadPath = std::move(payload);
+    container->storageUsesLoopFilesystem = true;
+    container->storageLoopDevices = std::move(loopDevices);
+    return true;
+  }
+
   static bool prepareContainerStorage(Container *container, String *failureReport = nullptr,
                                       bool requireExistingBackend = false)
   {

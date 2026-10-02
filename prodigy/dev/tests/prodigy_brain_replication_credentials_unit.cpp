@@ -22334,15 +22334,25 @@ static uint32_t countQueuedSpinContainers(NeuronView& neuron)
 static void testContainerLaunchWaitsForDurableRuntimeInventory(TestSuite& suite)
 {
   // Exercise ordinary launch, rejected persistence, lost authority, cancellation,
-  // and an autoscale launch while the existing deployment remains running.
-  for (uint32_t scenario = 0; scenario < 5; ++scenario)
+  // an autoscale launch, and capacity-only persistence deferral.
+  for (uint32_t scenario = 0; scenario < 9; ++scenario)
   {
     ScopedRing ring = {};
     TestBrain brain = {};
     NoopBrainIaaS iaas = {};
     brain.iaas = &iaas;
     brain.weAreMaster = true;
-    brain.holdRuntimePersistence = true;
+    brain.holdRuntimePersistence = scenario != 5 && scenario != 6 && scenario != 7;
+    if (scenario == 5 || scenario == 6)
+    {
+      // One preflight happens during scheduling, then three existing
+      // heartbeat turns observe the same full ArtifactIO capacity.
+      brain.updateSelfPersistenceBackpressureResponses = scenario == 5 ? 4 : 2;
+    }
+    if (scenario == 7)
+    {
+      brain.rejectUpdateSelfPersistenceAdmission = true;
+    }
     BrainBase *previousBrain = thisBrain;
     thisBrain = &brain;
 
@@ -22379,19 +22389,75 @@ static void testContainerLaunchWaitsForDurableRuntimeInventory(TestSuite& suite)
     brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
     brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
     deployment.toSchedule.push_back(deployment.planStatelessConstruction(&machine, ApplicationLifetime::base));
+    const uint32_t persistenceCallsBeforeSchedule = brain.persistCalls;
     deployment.schedule();
 
     ContainerView *pending = deployment.containers.empty() ? nullptr : *deployment.containers.begin();
     ProdigyPersistentMasterAuthorityPackage package = {};
     brain.capturePersistentMasterAuthorityPackage(package);
-    suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && pending != nullptr &&
-                     package.containerRuntimeStates.size() == 1 &&
-                     package.containerRuntimeStates[0].plan.uuid == pending->uuid,
-                 "container_launch_holds_spin_until_runtime_inventory_receipt");
+    if (scenario != 7)
+    {
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && pending != nullptr &&
+                       package.containerRuntimeStates.size() == 1 &&
+                       package.containerRuntimeStates[0].plan.uuid == pending->uuid,
+                   "container_launch_holds_spin_until_runtime_inventory_receipt");
+    }
     if (scenario == 2) ++brain.masterAuthorityEpoch;
     if (scenario == 3) deployment.operatorCancellationOwnsTransition = true;
-    brain.finishRuntimePersistence(scenario != 1);
-    if (scenario == 0 || scenario == 4)
+    if (scenario == 8)
+    {
+      // A false durable receipt remains terminal even if a concurrent
+      // ArtifactIO request makes the next preflight report backpressure.
+      brain.updateSelfPersistenceBackpressureResponses = 1;
+    }
+    if (scenario != 5 && scenario != 6 && scenario != 7)
+    {
+      brain.finishRuntimePersistence(scenario != 1 && scenario != 8);
+    }
+    if (scenario == 5)
+    {
+      const uint32_t persistenceCallsBeforeRetry = brain.persistCalls;
+      brain.retryDeferredPersistenceBackpressureContinuations();
+      brain.retryDeferredPersistenceBackpressureContinuations();
+      brain.retryDeferredPersistenceBackpressureContinuations();
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && brain.persistCalls == persistenceCallsBeforeRetry &&
+                       deployment.state == DeploymentState::deploying && deployment.containers.contains(pending),
+                   "container_launch_backpressure_keeps_one_scheduled_owner_without_persisting");
+      brain.retryDeferredPersistenceBackpressureContinuations();
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 1 && brain.persistCalls == persistenceCallsBeforeRetry + 1 &&
+                       deployment.state == DeploymentState::deploying,
+                   "container_launch_backpressure_retries_once_after_capacity_releases");
+    }
+    else if (scenario == 6)
+    {
+      const uint32_t persistenceCallsBeforeCancellation = brain.persistCalls;
+      deployment.operatorCancellationOwnsTransition = true;
+      brain.retryDeferredPersistenceBackpressureContinuations();
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && brain.persistCalls == persistenceCallsBeforeCancellation &&
+                       deployment.state == DeploymentState::deploying && deployment.containers.contains(pending),
+                   "container_launch_backpressure_cancellation_discards_deferred_spin_without_submission");
+      deployment.operatorCancellationOwnsTransition = false;
+    }
+    else if (scenario == 7)
+    {
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0,
+                   "container_launch_permanent_admission_rejection_emits_no_spin");
+      // The rejected launch never submits a launch snapshot.  The one
+      // persistence call below is the ordinary terminal-failure record.
+      suite.expect(brain.persistCalls == persistenceCallsBeforeSchedule + 1,
+                   "container_launch_permanent_admission_rejection_persists_only_terminal_failure");
+      suite.expect(deployment.state == DeploymentState::failed,
+                   "container_launch_permanent_admission_rejection_marks_failed");
+      suite.expect(deployment.containers.empty(),
+                   "container_launch_permanent_admission_rejection_releases_scheduled_container");
+    }
+    else if (scenario == 8)
+    {
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && deployment.state == DeploymentState::failed &&
+                       deployment.containers.empty(),
+                   "container_launch_failed_receipt_is_terminal_despite_new_backpressure");
+    }
+    else if (scenario == 0 || scenario == 4)
     {
       suite.expect(countQueuedSpinContainers(machine.neuron) == 1,
                    scenario == 0 ? "container_launch_dispatches_spin_after_runtime_inventory_receipt" :
@@ -28161,6 +28227,178 @@ static void testMaterializedStatefulRecoveryAdmission(TestSuite& suite)
   thisBrain = savedBrain;
 }
 
+static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.ignited = true;
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+
+  constexpr uint16_t applicationID = 63'113;
+  ApplicationDeployment *head = new ApplicationDeployment();
+  head->plan = makeDeploymentPlan(applicationID, 204);
+  head->plan.isStateful = true;
+  head->plan.config.type = ApplicationType::stateful;
+  head->plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  head->plan.config.containerBlobSHA256.assign("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv);
+  head->plan.canaryCount = 0;
+  head->plan.stateful.allMasters = false;
+  head->plan.stateful.allowUpdateInPlace = true;
+  head->plan.stateful.clientPrefix = (uint64_t(applicationID) << 48) | (uint64_t(1) << 40);
+  head->plan.stateful.siblingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(2) << 40);
+  head->plan.stateful.cousinPrefix = (uint64_t(applicationID) << 48) | (uint64_t(3) << 40);
+  head->plan.stateful.seedingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(4) << 40);
+  head->plan.stateful.shardingPrefix = (uint64_t(applicationID) << 48) | (uint64_t(5) << 40);
+  head->state = DeploymentState::none;
+
+  Rack racks[3] = {};
+  Machine machines[3] = {};
+  ScopedSocketPair sockets[3] = {};
+  bool machinesReady = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].uuid = 0x631130 + index;
+    brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    machinesReady = sockets[index].create(suite, "orphaned_materialized_head_creates_control_socket") && machinesReady;
+    Machine& machine = machines[index];
+    machine.uuid = uint128_t(0x631140 + index);
+    machine.private4 = 0x0a631140 + index;
+    machine.rack = &racks[index];
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = true;
+    machine.hardware.inventoryComplete = true;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    machine.hardware.cpu.logicalCores = machine.ownedLogicalCores = machine.totalLogicalCores = machine.nLogicalCores_available = 8;
+    machine.hardware.memory.totalMB = machine.ownedMemoryMB = machine.totalMemoryMB = machine.memoryMB_available = 8192;
+    machine.ownedStorageMB = machine.totalStorageMB = machine.storageMB_available = 4096;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = sockets[index].adoptLeftIntoFixedFileSlot();
+    machine.neuron.connected = machine.neuron.fslot >= 0;
+    machine.runtimeReady = machine.neuron.connected;
+    racks[index].machines.insert(&machine);
+    brain.machines.insert(&machine);
+    machinesReady = machine.neuron.connected && machinesReady;
+  }
+  suite.require(machinesReady, "orphaned_materialized_head_arms_three_control_streams");
+
+  const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(head->plan.stateful, applicationID, 0);
+  ContainerView retained[2] = {};
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    retained[index].uuid = uint128_t(0x631150 + index);
+    retained[index].deploymentID = head->plan.config.deploymentID();
+    retained[index].applicationID = applicationID;
+    retained[index].machine = &machines[index];
+    retained[index].lifetime = ApplicationLifetime::base;
+    retained[index].isStateful = true;
+    retained[index].shardGroup = 0;
+    retained[index].state = ContainerState::healthy;
+    retained[index].runtimeReady = true;
+    retained[index].explicitStatefulMeshRoles = roles;
+    if (index == 1) retained[index].explicitStatefulMeshRoles.client = 0;
+    head->containers.insert(&retained[index]);
+    head->containersByShardGroup.insert(0, &retained[index]);
+    head->countPerMachine[&machines[index]] = 1;
+    head->countPerRack[&racks[index]] = 1;
+    head->racksByShardGroup[0].insert(&racks[index]);
+    brain.containers.insert_or_assign(retained[index].uuid, &retained[index]);
+    machines[index].upsertContainerIndexEntry(retained[index].deploymentID, &retained[index]);
+  }
+  brain.deployments.insert_or_assign(head->plan.config.deploymentID(), head);
+  brain.deploymentsByApp.insert_or_assign(applicationID, head);
+  ProdigyMaterializedStatefulRecoveryOperation operation = {};
+  operation.operationID.assign("123e4567-e89b-42d3-a456-426614174012"_ctv);
+  operation.activeDeploymentID = head->plan.config.deploymentID() - 1;
+  operation.successorDeploymentID = head->plan.config.deploymentID();
+  operation.successorBlobSHA256 = head->plan.config.containerBlobSHA256;
+  operation.accepted = operation.started = true;
+  brain.masterAuthorityRuntimeState.materializedStatefulRecoveryOperations.push_back(operation);
+
+  // Each rejected shape must remain held by the accepted-operation owner;
+  // only the exact two-healthy canonical cohort below may enter the ordinary
+  // recovered scheduler.
+  head->materializedStatefulRecoveryHealthFailed = true;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_failed_barrier_remains_held");
+  head->materializedStatefulRecoveryHealthFailed = false;
+  retained[1].explicitStatefulMeshRoles.client = roles.client;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_duplicate_client_remains_held");
+  retained[1].explicitStatefulMeshRoles.client = 0;
+  retained[1].state = ContainerState::scheduled;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_one_healthy_remains_held");
+  retained[1].state = ContainerState::healthy;
+  head->nSuspended = 1;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_pending_scheduler_remains_held");
+  head->nSuspended = 0;
+  ApplicationDeployment historical = {};
+  historical.next = head;
+  head->previous = &historical;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_predecessor_remains_held");
+  head->previous = nullptr;
+  historical.next = nullptr;
+
+  ApplicationDeployment queuedSuccessor = {};
+  head->next = &queuedSuccessor;
+  queuedSuccessor.previous = head;
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 2,
+               "orphaned_materialized_head_queued_successor_remains_held");
+  head->next = nullptr;
+  queuedSuccessor.previous = nullptr;
+
+  if (machinesReady)
+  {
+    brain.recoverDeploymentsAfterNeuronState();
+  }
+  ContainerView *replacement = nullptr;
+  for (ContainerView *container : head->containers)
+    if (container != &retained[0] && container != &retained[1]) replacement = container;
+  suite.expect(replacement != nullptr && head->previous == nullptr && head->nShardGroups == 1 &&
+                   head->nTarget() == 3 && head->nDeployed() == 3 && head->nHealthy() == 2 &&
+                   head->waitingOnContainers.size() == 1 && replacement->shardGroup == 0,
+               "orphaned_materialized_head_schedules_exactly_one_replacement");
+  suite.expect(replacement != nullptr && replacement->subscriptions.contains(roles.seeding),
+               "orphaned_materialized_head_replacement_uses_seeding_strategy");
+  suite.expect(head->masterForShardGroup[0] == &retained[0],
+               "orphaned_materialized_head_preserves_client_master");
+  brain.recoverDeploymentsAfterNeuronState();
+  suite.expect(head->containers.size() == 3 && head->waitingOnContainers.size() == 1,
+               "orphaned_materialized_head_repeat_recovery_does_not_double_launch");
+
+  if (replacement)
+  {
+    head->containerIsHealthy(replacement);
+    head->destructContainer(replacement);
+    head->containerDestroyed(replacement);
+  }
+  brain.containers.clear();
+  brain.deployments.clear();
+  brain.deploymentsByApp.clear();
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].machines.erase(&machines[index]);
+    brain.machines.erase(&machines[index]);
+    brain.racks.erase(racks[index].uuid);
+  }
+  delete head;
+  thisBrain = savedBrain;
+}
+
 static void testBoundedOperatorDeploymentCancellation(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -29570,10 +29808,21 @@ int main(void)
     }
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "orphaned-materialized-head") == 0)
+  {
+    testOrphanedMaterializedStatefulHeadRecovery(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? 0 : 1;
+  }
   if (std::getenv("PRODIGY_TEST_OPERATOR_CANCELLATION_ONLY") != nullptr)
   {
     testBoundedOperatorDeploymentCancellation(suite);
     testMaterializedStatefulRecoveryAdmission(suite);
+    testOrphanedMaterializedStatefulHeadRecovery(suite);
     if (createdRing)
     {
       Ring::shutdownForExec();
@@ -29811,6 +30060,7 @@ int main(void)
   testSpinApplicationRejectsMaterializedFailedPredecessor(suite);
   testBoundedOperatorDeploymentCancellation(suite);
   testMaterializedStatefulRecoveryAdmission(suite);
+  testOrphanedMaterializedStatefulHeadRecovery(suite);
   testBrainNeuronStateUploadRestoresOnlyActiveMeshServices(suite);
   testBrainNeuronStateUploadRuntimeReadyFalseClearsStatefulTopologyBarrier(suite);
   testBrainNeuronStateUploadRequiresMatchingAssignedFragmentForMachineRuntimeReady(suite);

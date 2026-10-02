@@ -22,6 +22,7 @@
 #include <prodigy/brain/metrics.h>
 #include <prodigy/transport.artifact.h>
 #include <prodigy/artifact.io.h>
+#include <functional>
 #include <memory>
 #include <networking/reconnector.h>
 
@@ -301,6 +302,21 @@ public:
 
 class BrainBase : public RingMultiplexer {
 public:
+
+  enum class UpdateSelfPersistenceAdmission : uint8_t { admitted, backpressured, rejected };
+
+  // Brain owns the Ring turn following ArtifactIO completion.  Callers use
+  // this only for an explicit capacity miss; a rejected write is terminal.
+  virtual bool deferPersistenceBackpressureContinuation(std::function<void()> continuation)
+  {
+    (void)continuation;
+    return false;
+  }
+
+  virtual UpdateSelfPersistenceAdmission updateSelfPersistenceAdmission(void)
+  {
+    return UpdateSelfPersistenceAdmission::admitted;
+  }
 
   std::unique_ptr<ProdigyArtifactIO> artifactIO;
 

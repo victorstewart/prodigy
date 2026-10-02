@@ -13160,6 +13160,52 @@ public:
         {
           head->recoverAfterReboot();
         }
+        // A reboot can reconstruct an accepted handoff after the old owner
+        // was culled but before the final replacement became healthy.  Its
+        // durable operation is still the authority for this exact successor;
+        // let the ordinary recovered-deployment scheduler fill only that one
+        // missing base replica.  Do not use this for a failed or overlapping
+        // head: those retain their existing materialized-recovery barriers.
+        else if (head->previous == nullptr && head->next == nullptr && head->state == DeploymentState::none &&
+                 head->plan.isStateful && head->plan.config.type == ApplicationType::stateful &&
+                 head->plan.stateful.allMasters == false &&
+                 head->materializedStatefulRecoveryOwnsTransition == false &&
+                 head->materializedStatefulRecoveryHealthFailed == false &&
+                 head->waitingOnCompactions == false && head->canaryStack == nullptr &&
+                 head->currentlyExecutingWork == nullptr && head->schedulingStack.execution == nullptr &&
+                 head->retiredSchedulingExecution == nullptr && head->consumingSchedulingExecution == false &&
+                 head->schedulingStack.waiters.empty() && head->toSchedule.empty() &&
+                 head->waitingOnContainers.empty() && head->nSuspended == 0 &&
+                 head->containers.size() == 2 &&
+                 deploymentReplicationAcknowledgedByAuthoritativePeers(head))
+        {
+          uint32_t clientMasters = 0;
+          bool canonicalCohort = true;
+          for (ContainerView *container : head->containers)
+          {
+            if (container == nullptr || container->machine == nullptr ||
+                container->deploymentID != operation.successorDeploymentID ||
+                container->isStateful == false || container->lifetime != ApplicationLifetime::base ||
+                container->shardGroup != 0 || container->state != ContainerState::healthy ||
+                container->runtimeReady == false || container->plannedWork != nullptr)
+            {
+              canonicalCohort = false;
+              break;
+            }
+            clientMasters += container->effectiveStatefulMeshRoles(head->plan).client != 0;
+          }
+          if (canonicalCohort && clientMasters == 1)
+          {
+            // The recovered owner initializes a missing target from the
+            // canonical cohort.  Accept only that fresh count or its exact
+            // one-shard, three-replica result.
+            if (head->nShardGroups <= 1 && head->desiredReplicaCountForShardGroup(0) == 3 &&
+                (head->nTarget() == 0 || head->nTarget() == 3))
+            {
+              head->recoverAfterReboot();
+            }
+          }
+        }
         if (head->previous == nullptr && head->state == DeploymentState::running)
         {
           operation.completed = true;
@@ -14917,6 +14963,7 @@ public:
     // suppresses duplicate authority work without starving it behind this tick.
     retryMasterAuthorityRuntimeStatePersistence();
     retryDeferredRecoveryPersistence();
+    retryDeferredPersistenceBackpressureContinuations();
     queueMasterAuthorityRuntimeStateReplication(true);
     for (BrainView *peer : brains)
     {
@@ -27539,14 +27586,31 @@ public:
   // All bundle progress in one receipt batch must be durable before a peer
   // command or local exec can consume it. A failed batch remains fenced until
   // recovery restores the durable coordinator state.
-  enum class UpdateSelfPersistenceAdmission : uint8_t { admitted, backpressured, rejected };
 
-  // Production can preflight an ArtifactIO byte/job-capacity miss before it
-  // detaches a large authority snapshot. Base and focused test owners have no
-  // separate queue and therefore admit immediately.
-  virtual UpdateSelfPersistenceAdmission updateSelfPersistenceAdmission(void)
+  Vector<std::function<void()>> deferredPersistenceBackpressureContinuations;
+
+  bool deferPersistenceBackpressureContinuation(std::function<void()> continuation) override
   {
-    return UpdateSelfPersistenceAdmission::admitted;
+    if (!continuation)
+    {
+      return false;
+    }
+    deferredPersistenceBackpressureContinuations.push_back(std::move(continuation));
+    return true;
+  }
+
+  void retryDeferredPersistenceBackpressureContinuations(void)
+  {
+    if (deferredPersistenceBackpressureContinuations.empty())
+    {
+      return;
+    }
+    Vector<std::function<void()>> continuations = std::move(deferredPersistenceBackpressureContinuations);
+    deferredPersistenceBackpressureContinuations.clear();
+    for (auto& continuation : continuations)
+    {
+      continuation();
+    }
   }
 
   static constexpr uint32_t maximumUpdateSelfPersistenceBackpressureDeferrals = 20;

@@ -1409,6 +1409,187 @@ private:
   TimeoutPacket shardTimer;
   TimeoutPacket autoscaleTimer;
   TimeoutPacket statefulWorkerTopologyRollbackTimer;
+  bool durableContainerLaunchPersistenceContinuationQueued = false;
+
+  // A scheduled container already owns its placement reservation.  When the
+  // shared persistence writer is temporarily at capacity, retain only the
+  // existing launch request and retry it from Brain's existing post-completion
+  // heartbeat owner.
+  // The request is discarded as soon as its scheduled owner is no longer
+  // current; it never becomes a second deployment state machine.
+  struct DeferredDurableContainerSpin {
+    Machine *machine = nullptr;
+    uint128_t containerUUID = 0;
+    uint128_t replaceContainerUUID = 0;
+    String bootstrap = {};
+    bool retainedStorageRecoveryLaunch = false;
+    String retainedSourceBootstrap = {};
+    uint64_t deploymentID = 0;
+    uint64_t authorityEpoch = 0;
+  };
+  Vector<DeferredDurableContainerSpin> deferredDurableContainerSpins;
+
+  static void releaseDurableContainerSpinReplacementWaiter(
+      BrainBase *brain,
+      uint64_t deploymentID,
+      uint128_t replaceContainerUUID)
+  {
+    if (brain == nullptr || replaceContainerUUID == 0)
+    {
+      return;
+    }
+    auto replacingIt = brain->containers.find(replaceContainerUUID);
+    if (replacingIt != brain->containers.end() && replacingIt->second != nullptr &&
+        replacingIt->second->destructionWaiterDeploymentID == deploymentID)
+    {
+      replacingIt->second->destructionWaiterDeploymentID = 0;
+    }
+  }
+
+  ContainerView *currentDurableContainerSpin(
+      BrainBase *brain,
+      const DeferredDurableContainerSpin& deferred)
+  {
+    if (brain == nullptr || brain->canControlNeurons() == false ||
+        brain->containerLaunchAuthorityEpoch() != deferred.authorityEpoch ||
+        deferred.machine == nullptr || brain->machines.contains(deferred.machine) == false)
+    {
+      return nullptr;
+    }
+    auto deploymentIt = brain->deployments.find(deferred.deploymentID);
+    if (deploymentIt == brain->deployments.end() || deploymentIt->second != this ||
+        state == DeploymentState::failed || operatorCancellationOwnsTransition)
+    {
+      return nullptr;
+    }
+    auto containerIt = brain->containers.find(deferred.containerUUID);
+    if (containerIt == brain->containers.end() || containerIt->second == nullptr ||
+        containerIt->second->machine != deferred.machine ||
+        containerIt->second->deploymentID != deferred.deploymentID ||
+        containerIt->second->state != ContainerState::scheduled)
+    {
+      return nullptr;
+    }
+    return containerIt->second;
+  }
+
+  void failDurableContainerSpinPersistence(
+      BrainBase *brain,
+      const DeferredDurableContainerSpin& deferred,
+      ContainerView *container)
+  {
+    releaseDurableContainerSpinReplacementWaiter(brain, deferred.deploymentID, deferred.replaceContainerUUID);
+    if (brain == nullptr || container == nullptr || state == DeploymentState::failed)
+    {
+      return;
+    }
+    state = DeploymentState::failed;
+    stateChangedAtMs = Time::now<TimeResolution::ms>();
+    waitingOnContainers.erase(container);
+    // No spin frame was sent, so release this local reservation through the
+    // ordinary owner instead of leaving the scheduler suspended on a process
+    // that cannot exist.
+    releaseContainerPlacementCounts(container);
+    destructContainer(container, false);
+    containerDestroyed(container);
+    brain->deploymentFailed(
+        this,
+        plan.config.applicationID,
+        deferred.deploymentID,
+        "container launch record was not durably persisted"_ctv,
+        generateReport());
+    if (waitingOnContainers.empty() && schedulingStack.execution)
+    {
+      consumeSchedulingExecution();
+    }
+  }
+
+  void armDurableContainerLaunchPersistenceContinuation(void)
+  {
+    if (durableContainerLaunchPersistenceContinuationQueued || deferredDurableContainerSpins.empty())
+    {
+      return;
+    }
+    BrainBase *brain = thisBrain;
+    if (brain == nullptr)
+    {
+      return;
+    }
+    const uint64_t deploymentID = plan.config.deploymentID();
+    const std::weak_ptr<uint8_t> lifetime = brain->persistenceLifetime;
+    durableContainerLaunchPersistenceContinuationQueued = true;
+    if (brain->deferPersistenceBackpressureContinuation(
+            [brain, lifetime, deploymentID] {
+              if (lifetime.expired())
+              {
+                return;
+              }
+              auto deploymentIt = brain->deployments.find(deploymentID);
+              if (deploymentIt != brain->deployments.end() && deploymentIt->second != nullptr)
+              {
+                deploymentIt->second->retryDeferredDurableContainerSpins();
+              }
+    }) == false)
+    {
+      durableContainerLaunchPersistenceContinuationQueued = false;
+      DeferredDurableContainerSpin rejected = std::move(deferredDurableContainerSpins.back());
+      deferredDurableContainerSpins.pop_back();
+      failDurableContainerSpinPersistence(brain, rejected, currentDurableContainerSpin(brain, rejected));
+    }
+  }
+
+  void deferDurableContainerSpinForPersistence(DeferredDurableContainerSpin&& deferred)
+  {
+    for (const DeferredDurableContainerSpin& pending : deferredDurableContainerSpins)
+    {
+      if (pending.containerUUID == deferred.containerUUID)
+      {
+        return;
+      }
+    }
+    deferredDurableContainerSpins.push_back(std::move(deferred));
+    armDurableContainerLaunchPersistenceContinuation();
+  }
+
+  void retryDeferredDurableContainerSpins(void)
+  {
+    durableContainerLaunchPersistenceContinuationQueued = false;
+    for (size_t index = 0; index < deferredDurableContainerSpins.size();)
+    {
+      DeferredDurableContainerSpin& deferred = deferredDurableContainerSpins[index];
+      BrainBase *brain = thisBrain;
+      ContainerView *container = currentDurableContainerSpin(brain, deferred);
+      if (container == nullptr)
+      {
+        releaseDurableContainerSpinReplacementWaiter(brain, deferred.deploymentID, deferred.replaceContainerUUID);
+        deferredDurableContainerSpins.erase(deferredDurableContainerSpins.begin() + index);
+        continue;
+      }
+
+      const BrainBase::UpdateSelfPersistenceAdmission admission = brain->updateSelfPersistenceAdmission();
+      if (admission == BrainBase::UpdateSelfPersistenceAdmission::backpressured)
+      {
+        ++index;
+        continue;
+      }
+
+      DeferredDurableContainerSpin retry = std::move(deferred);
+      deferredDurableContainerSpins.erase(deferredDurableContainerSpins.begin() + index);
+      if (admission == BrainBase::UpdateSelfPersistenceAdmission::rejected)
+      {
+        failDurableContainerSpinPersistence(brain, retry, container);
+        continue;
+      }
+      queueDurableContainerSpin(
+          retry.machine,
+          retry.containerUUID,
+          retry.replaceContainerUUID,
+          std::move(retry.bootstrap),
+          retry.retainedStorageRecoveryLaunch,
+          std::move(retry.retainedSourceBootstrap));
+    }
+    armDurableContainerLaunchPersistenceContinuation();
+  }
 
   uint64_t configuredAutoscalePeriodSeconds(void) const
   {
@@ -3706,7 +3887,30 @@ public:
       return DataStrategy::seeding;
     }
 
-    return (previous ? DataStrategy::seeding : DataStrategy::genesis);
+    if (previous)
+    {
+      return DataStrategy::seeding;
+    }
+
+    // A predecessor-free deployment normally begins from genesis.  Recovery
+    // can instead reconstruct a canonical healthy client for this shard after
+    // an accepted handoff's predecessor was already culled.  Seed only from
+    // that exact live owner; a null or stale transient master entry must not
+    // change fresh deployment semantics.
+    auto master = masterForShardGroup.find(shardGroup);
+    if (master != masterForShardGroup.end())
+    {
+      ContainerView *container = master->second;
+      if (container != nullptr && containers.contains(container) &&
+          container->deploymentID == plan.config.deploymentID() &&
+          container->isStateful && container->shardGroup == shardGroup &&
+          container->lifetime == ApplicationLifetime::base &&
+          container->state == ContainerState::healthy && container->runtimeReady)
+      {
+        return DataStrategy::seeding;
+      }
+    }
+    return DataStrategy::genesis;
   }
 
   uint32_t currentServingStatefulTopologyEpochForLockedShardGroups(uint32_t fallbackWorkerCount) const
@@ -5049,86 +5253,69 @@ private:
     {
       return;
     }
+    DeferredDurableContainerSpin deferred = {
+        .machine = machine,
+        .containerUUID = containerUUID,
+        .replaceContainerUUID = replaceContainerUUID,
+        .bootstrap = std::move(bootstrap),
+        .retainedStorageRecoveryLaunch = retainedStorageRecoveryLaunch,
+        .retainedSourceBootstrap = std::move(retainedSourceBootstrap),
+        .deploymentID = deploymentID,
+        .authorityEpoch = authorityEpoch};
+
+    // A capacity miss has no side effects.  Preserve the scheduled owner and
+    // retry it from the deployment's existing Ring dispatcher after the
+    // current ArtifactIO completion has released its lease.  A rejected
+    // admission is terminal and must not retain a polling continuation.
+    const BrainBase::UpdateSelfPersistenceAdmission admission = brain->updateSelfPersistenceAdmission();
+    if (admission == BrainBase::UpdateSelfPersistenceAdmission::backpressured)
+    {
+      deferDurableContainerSpinForPersistence(std::move(deferred));
+      return;
+    }
+    if (admission == BrainBase::UpdateSelfPersistenceAdmission::rejected)
+    {
+      failDurableContainerSpinPersistence(brain, deferred, currentDurableContainerSpin(brain, deferred));
+      return;
+    }
+
     const std::weak_ptr<uint8_t> lifetime = brain->persistenceLifetime;
     brain->persistLocalRuntimeStateAsync(
-        [brain, lifetime, this, machine, deploymentID, authorityEpoch, containerUUID, replaceContainerUUID,
-         bootstrap = std::move(bootstrap), retainedStorageRecoveryLaunch,
-         retainedSourceBootstrap = std::move(retainedSourceBootstrap)](bool durable) mutable {
+        [brain, lifetime, this, deferred = std::move(deferred)](bool durable) mutable {
           if (lifetime.expired())
           {
             return;
           }
-          if (brain->canControlNeurons() == false ||
-              brain->containerLaunchAuthorityEpoch() != authorityEpoch ||
-              brain->machines.contains(machine) == false)
-          {
-            return;
-          }
-          auto deploymentIt = brain->deployments.find(deploymentID);
+          // The callback retains only a raw deployment identity.  Prove the
+          // Brain still indexes this exact owner before any member access.
+          auto deploymentIt = brain->deployments.find(deferred.deploymentID);
           if (deploymentIt == brain->deployments.end() || deploymentIt->second != this)
           {
+            ApplicationDeployment::releaseDurableContainerSpinReplacementWaiter(
+                brain, deferred.deploymentID, deferred.replaceContainerUUID);
             return;
           }
-          auto releaseReplacementWaiter = [&] {
-            if (replaceContainerUUID == 0)
-            {
-              return;
-            }
-            auto replacingIt = brain->containers.find(replaceContainerUUID);
-            if (replacingIt != brain->containers.end() && replacingIt->second != nullptr &&
-                replacingIt->second->destructionWaiterDeploymentID == deploymentID)
-            {
-              replacingIt->second->destructionWaiterDeploymentID = 0;
-            }
-          };
-          if (state == DeploymentState::failed || operatorCancellationOwnsTransition)
+          ContainerView *container = currentDurableContainerSpin(brain, deferred);
+          if (container == nullptr)
           {
-            releaseReplacementWaiter();
-            return;
-          }
-          auto containerIt = brain->containers.find(containerUUID);
-          if (containerIt == brain->containers.end() || containerIt->second == nullptr ||
-              containerIt->second->machine != machine ||
-              containerIt->second->deploymentID != deploymentID ||
-              containerIt->second->state != ContainerState::scheduled)
-          {
-            releaseReplacementWaiter();
+            releaseDurableContainerSpinReplacementWaiter(brain, deferred.deploymentID, deferred.replaceContainerUUID);
             return;
           }
           if (durable == false)
           {
-            releaseReplacementWaiter();
-            if (state != DeploymentState::failed)
-            {
-              state = DeploymentState::failed;
-              stateChangedAtMs = Time::now<TimeResolution::ms>();
-              waitingOnContainers.erase(containerIt->second);
-              // No spin frame was sent, so release this local reservation
-              // through the ordinary owner instead of leaving the scheduler
-              // suspended on a process that cannot exist.
-              releaseContainerPlacementCounts(containerIt->second);
-              destructContainer(containerIt->second, false);
-              containerDestroyed(containerIt->second);
-              brain->deploymentFailed(
-                  this,
-                  plan.config.applicationID,
-                  deploymentID,
-                  "container launch record was not durably persisted"_ctv,
-                  generateReport());
-              if (waitingOnContainers.empty() && schedulingStack.execution)
-              {
-                consumeSchedulingExecution();
-              }
-            }
+            // Admission is preflighted before submission.  A false callback
+            // is a failed durable receipt, even when another request happens
+            // to fill the shared writer by the time it returns.
+            failDurableContainerSpinPersistence(brain, deferred, container);
             return;
           }
-          if (replaceContainerUUID != 0)
+          if (deferred.replaceContainerUUID != 0)
           {
             // Keep the predecessor in the durable record until this exact
             // receipt has committed.  If the Brain dies here, replay can
             // still adopt the surviving predecessor instead of discovering
             // an unowned cgroup.
-            auto replacingIt = brain->containers.find(replaceContainerUUID);
+            auto replacingIt = brain->containers.find(deferred.replaceContainerUUID);
             if (replacingIt != brain->containers.end() && replacingIt->second != nullptr)
             {
               ContainerView *replacing = replacingIt->second;
@@ -5141,15 +5328,15 @@ private:
               owner->destructContainer(replacing, false);
             }
           }
-          brain->replicateContainerRuntimeStateToFollowers(containerIt->second);
-          if (retainedStorageRecoveryLaunch)
+          brain->replicateContainerRuntimeStateToFollowers(container);
+          if (deferred.retainedStorageRecoveryLaunch)
           {
-            queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID,
-                      bootstrap, retainedSourceBootstrap);
+            queueSend(deferred.machine, NeuronTopic::spinContainer, deferred.replaceContainerUUID,
+                      deferred.bootstrap, deferred.retainedSourceBootstrap);
           }
           else
           {
-            queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, bootstrap);
+            queueSend(deferred.machine, NeuronTopic::spinContainer, deferred.replaceContainerUUID, deferred.bootstrap);
           }
         });
   }

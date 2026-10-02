@@ -4969,6 +4969,17 @@ public:
               // in the future if we ever need to run multiple processes inside a container,
               // then we'd need to check /proc/{pid}/status and line NSpid: 12345 1 to get the pid mapping to select pid 1
               container->pid = restoredPID;
+              String storageHydrationFailure = {};
+              if (ContainerManager::hydrateObservedContainerStorageBackend(container, &storageHydrationFailure) == false)
+              {
+                // Keep the observed process under its normal lifecycle owner.
+                // The backend fields remain empty, so a later crash-backoff
+                // replacement safely refuses an unproven storage handoff.
+                std::fprintf(stderr,
+                             "restoreContainer retained storage backend unavailable uuid=%llu reason=%s\n",
+                             (unsigned long long)container->plan.uuid,
+                             storageHydrationFailure.c_str());
+              }
               container->pidfd = syscall(SYS_pidfd_open, container->pid, 0);
               container->nonChildPidfdLiveness = false;
               if (container->pidfd >= 0)
