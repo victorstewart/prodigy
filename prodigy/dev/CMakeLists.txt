@@ -564,6 +564,7 @@ add_executable(prodigy_bootstrap_config_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/p
 add_executable(prodigy_persistent_state_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_persistent_state_unit.cpp)
 add_executable(prodigy_async_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_async_persistence_unit.cpp)
 add_executable(prodigy_brain_async_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_async_authority_unit.cpp)
+add_executable(prodigy_brain_retirement_authority_ack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_retirement_authority_ack_unit.cpp)
 add_executable(prodigy_runtime_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_persistence_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE})
 add_executable(prodigy_runtime_environment_bgp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_runtime_environment_bgp_unit.cpp ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_transport_tls_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_tls_unit.cpp)
@@ -667,6 +668,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_persistent_state_unit
    prodigy_async_persistence_unit
    prodigy_brain_async_authority_unit
+   prodigy_brain_retirement_authority_ack_unit
    prodigy_runtime_environment_bgp_unit
    prodigy_runtime_persistence_unit
    prodigy_transport_tls_unit
@@ -924,6 +926,7 @@ target_compile_options(prodigy_bootstrap_config_unit PUBLIC -O2)
 target_compile_options(prodigy_persistent_state_unit PUBLIC -O2)
 target_compile_options(prodigy_async_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_async_authority_unit PUBLIC -O2)
+target_compile_options(prodigy_brain_retirement_authority_ack_unit PUBLIC -O2)
 target_compile_options(prodigy_runtime_environment_bgp_unit PUBLIC -O2)
 target_compile_options(prodigy_runtime_persistence_unit PUBLIC -O2)
 target_compile_options(prodigy_transport_tls_unit PUBLIC -O2)
@@ -1908,6 +1911,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_async_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit
    )
+   add_test(NAME prodigy_brain_retirement_authority_ack_unit
+      COMMAND $<TARGET_FILE:prodigy_brain_retirement_authority_ack_unit>)
+   set_tests_properties(prodigy_brain_retirement_authority_ack_unit PROPERTIES TIMEOUT 30)
    add_test(
       NAME prodigy_brain_async_authority_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_brain_async_authority_unit
