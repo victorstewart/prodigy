@@ -63,6 +63,33 @@ struct Schema6EmptyInventoryRequest {
 template<typename S> void serialize(S&& s, Schema6EmptyInventoryRequest& r) {
   s.object(r.request); s.value16b(r.emptyRetainedInventoryMachineUUID);
 }
+// RRF7 carries only runtime records recovered from a separately sealed,
+// stopped authority snapshot.  The request is private, but its source and the
+// selected credential-bearing records are both SHA-bound before it can fence a
+// fleet.  Remote prepare never invents ContainerParameters for this path.
+struct ColdCanonicalSource {
+  String sourceStatePath;
+  String sourceSnapshotSHA256;
+  String selectedStatesSHA256;
+  Vector<uint128_t> requestedContainerUUIDs;
+  // The exact credential-bearing state payload is hashed before it enters the
+  // outer request.  Never derive this binding by reserializing decoded maps.
+  String serializedStates;
+  Vector<BrainReplicatedContainerRuntimeState> states;
+};
+template<typename S> void serialize(S&& s, ColdCanonicalSource& source) {
+  s.text1b(source.sourceStatePath, UINT32_MAX); s.text1b(source.sourceSnapshotSHA256, 64);
+  s.text1b(source.selectedStatesSHA256, 64); s.object(source.requestedContainerUUIDs);
+  s.text1b(source.serializedStates, UINT32_MAX);
+}
+inline String coldCanonicalPayloadDigest(const String& payload);
+struct Schema7ColdCanonicalSourceRequest {
+  Schema6EmptyInventoryRequest request;
+  ColdCanonicalSource source;
+};
+template<typename S> void serialize(S&& s, Schema7ColdCanonicalSourceRequest& r) {
+  s.object(r.request); s.object(r.source);
+}
 inline String encodeRequest(const Request& request,const Plan& plan,uint128_t emptyRetainedInventoryMachineUUID = 0) {
   String bytes;
   if (emptyRetainedInventoryMachineUUID != 0) {
@@ -100,9 +127,51 @@ inline String encodeRetiredConflictingClientRequest(const Request& request,
   String bytes; BitseryEngine::serialize(bytes,wrapped); require(!bytes.empty(),"retired request serialization is empty");
   String framed={}; framed.append("RRF5",4); framed.append(bytes.data(),bytes.size()); return framed;
 }
+inline String encodeColdCanonicalSourceRequest(const Request& request, const Plan& plan,
+                                               uint128_t emptyRetainedInventoryMachineUUID,
+                                               const ColdCanonicalSource& source) {
+  require(plan.schemaVersion != 4 && request.interruptedBundleSHA.empty() &&
+              emptyRetainedInventoryMachineUUID != 0 && source.states.empty() == false &&
+              source.requestedContainerUUIDs.empty() == false &&
+              prodigyIsSHA256HexDigest(source.sourceSnapshotSHA256) &&
+              prodigyIsSHA256HexDigest(source.selectedStatesSHA256),
+          "invalid cold canonical source request");
+  Schema7ColdCanonicalSourceRequest wrapped; wrapped.request.request.request=request;
+  wrapped.request.emptyRetainedInventoryMachineUUID=emptyRetainedInventoryMachineUUID;
+  wrapped.source=source;
+  String bytes; BitseryEngine::serialize(bytes,wrapped);
+  require(!bytes.empty(),"cold canonical source request serialization is empty");
+  String framed={}; framed.append("RRF7",4); framed.append(bytes.data(),bytes.size()); return framed;
+}
 inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof,
                           uint128_t *retiredConflictingClientUUID = nullptr,
-                          uint128_t *emptyRetainedInventoryMachineUUID = nullptr) {
+                          uint128_t *emptyRetainedInventoryMachineUUID = nullptr,
+                          ColdCanonicalSource *coldCanonicalSource = nullptr) {
+  if (raw.size()>=4 && raw.compare(0,4,"RRF7")==0) {
+    Schema7ColdCanonicalSourceRequest wrapped;
+    if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
+        wrapped.request.emptyRetainedInventoryMachineUUID == 0 ||
+        wrapped.request.request.proof.canonicalContainerCount != 0 ||
+        wrapped.request.request.proof.staleCoordinatorCanonicalContainerCount != 0 ||
+        wrapped.request.request.proof.interruptedExpectedEchos != 0 ||
+        wrapped.request.request.proof.staleExcludedContainerUUID != 0 ||
+        wrapped.source.serializedStates.empty() || wrapped.source.requestedContainerUUIDs.empty() ||
+        !prodigyIsSHA256HexDigest(wrapped.source.sourceSnapshotSHA256) ||
+        !prodigyIsSHA256HexDigest(wrapped.source.selectedStatesSHA256) ||
+        coldCanonicalPayloadDigest(wrapped.source.serializedStates)!=wrapped.source.selectedStatesSHA256 ||
+        !BitseryEngine::deserializeSafe(wrapped.source.serializedStates,wrapped.source.states) ||
+        wrapped.source.states.size()!=wrapped.source.requestedContainerUUIDs.size()) return false;
+    for (uint32_t index=0;index<wrapped.source.requestedContainerUUIDs.size();++index) {
+      if (wrapped.source.requestedContainerUUIDs[index]==0 ||
+          (index && wrapped.source.requestedContainerUUIDs[index-1]>=wrapped.source.requestedContainerUUIDs[index]) ||
+          wrapped.source.states[index].machineUUID!=wrapped.request.emptyRetainedInventoryMachineUUID ||
+          wrapped.source.states[index].plan.uuid!=wrapped.source.requestedContainerUUIDs[index]) return false;
+    }
+    request=std::move(wrapped.request.request.request); if(proof)*proof=wrapped.request.request.proof;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=wrapped.request.emptyRetainedInventoryMachineUUID;
+    if(coldCanonicalSource)*coldCanonicalSource=std::move(wrapped.source); return true;
+  }
   if (raw.size()>=4 && raw.compare(0,4,"RRF6")==0) {
     Schema6EmptyInventoryRequest wrapped;
     if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
@@ -114,6 +183,7 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
     request=std::move(wrapped.request.request); if(proof)*proof=wrapped.request.proof;
     if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
     if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=wrapped.emptyRetainedInventoryMachineUUID;
+    if(coldCanonicalSource)*coldCanonicalSource={};
     return true;
   }
   if (raw.size()>=4 && raw.compare(0,4,"RRF5")==0) {
@@ -125,7 +195,7 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
       return false;
     request=std::move(wrapped.request.request); if(proof)*proof=wrapped.request.proof;
     if(retiredConflictingClientUUID)*retiredConflictingClientUUID=wrapped.retiredConflictingClientUUID;
-    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; if(coldCanonicalSource)*coldCanonicalSource={}; return true;
   }
   if (raw.size()>=4 && raw.compare(0,4,"RRF4")==0) {
     Schema4Request wrapped;
@@ -136,11 +206,11 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
         wrapped.proof.canonicalContainerCount>256 || wrapped.proof.interruptedExpectedEchos==0 || wrapped.proof.staleExcludedContainerUUID==0) return false;
     request=std::move(wrapped.request); if(proof)*proof=wrapped.proof;
     if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
-    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; if(coldCanonicalSource)*coldCanonicalSource={}; return true;
   }
   if (!BitseryEngine::deserializeSafe(text(raw),request)) return false;
   if(proof)*proof={}; if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
-  if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
+  if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; if(coldCanonicalSource)*coldCanonicalSource={}; return true;
 }
 // The seed generates these bytes once. Every Brain must receive identical
 // witness strings, even when unordered maps decode in a different order.
@@ -176,7 +246,89 @@ struct Manifest {
   uint32_t canonicalContainerCount = 23;
   uint128_t emptyRetainedInventoryMachineUUID = 0;
   std::vector<Record> records;
+  struct ColdCanonicalSourceInput {
+    std::string statePath;
+    String aggregateSHA256;
+    Vector<uint128_t> requestedContainerUUIDs;
+    struct StorageMetadata {
+      uint128_t containerUUID = 0;
+      String rootfsMetadata;
+      String storageMetadata;
+    };
+    Vector<StorageMetadata> storage;
+  } coldCanonicalSource;
 };
+inline bool coldCanonicalMetadata(const String& value) {
+  if (value.size() <= 4) return false;
+  for (uint32_t index=0;index<value.size();++index) {
+    const char character=value[index];
+    if (!((character >= '0' && character <= '9') ||
+          (character >= 'a' && character <= 'f') || character == ':')) return false;
+  }
+  return true;
+}
+inline bool coldCanonicalUUIDsAreStrictlySorted(const Vector<uint128_t>& values) {
+  for (uint32_t index=0;index<values.size();++index)
+    if (values[index] == 0 || (index && values[index-1] >= values[index])) return false;
+  return true;
+}
+inline bool coldCanonicalUUIDsEqual(const Vector<uint128_t>& lhs,const Vector<uint128_t>& rhs) {
+  if (lhs.size()!=rhs.size()) return false;
+  for (uint32_t index=0;index<lhs.size();++index) if (lhs[index]!=rhs[index]) return false;
+  return true;
+}
+inline String coldCanonicalStateAggregateDigest(const std::string& statePath) {
+  const fs::path state(statePath), parent=state.parent_path();
+  require(fs::is_directory(state) && fs::is_directory(state.string()+".secrets") &&
+              !fs::is_symlink(state) && !fs::is_symlink(state.string()+".secrets"),
+          "cold canonical source state and secrets are unavailable");
+  std::vector<fs::path> files;
+  String manifest = {};
+  for (const fs::path& root : {state,fs::path(state.string()+".secrets")}) {
+    std::vector<fs::path> rootFiles;
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+      require(!entry.is_symlink(),"cold canonical source contains a symlink");
+      if (entry.is_regular_file()) rootFiles.push_back(entry.path());
+      else require(entry.is_directory(),"cold canonical source contains a non-regular entry");
+    }
+    std::sort(rootFiles.begin(),rootFiles.end());
+    for (const fs::path& file : rootFiles) {
+      files.push_back(file);
+      struct stat metadata = {};
+      require(::lstat(file.c_str(),&metadata)==0 && S_ISREG(metadata.st_mode) &&
+                  metadata.st_nlink==1 && metadata.st_uid==::geteuid(),
+              "cold canonical source file is not regular and owned");
+      String fileDigest = {}, failure = {};
+      require(prodigyComputeFileSHA256Hex(text(file.string()),fileDigest,&failure),
+              "cold canonical source file digest failed");
+      const std::string relative=fs::relative(file,parent).string();
+      manifest.append(relative.data(),relative.size()); manifest.append("  ",2);
+      manifest.append(fileDigest.data(),fileDigest.size()); manifest.append("\n",1);
+    }
+  }
+  require(!files.empty(),"cold canonical source has no files");
+  String digest = {}, failure = {};
+  require(prodigyComputeSHA256Hex(manifest,digest,&failure),"cold canonical source aggregate digest failed");
+  return digest;
+}
+
+inline String coldCanonicalPayloadDigest(const String& payload) {
+  String digest = {}, failure = {};
+  require(!payload.empty() && prodigyComputeSHA256Hex(payload,digest,&failure),
+          "cold canonical runtime-state digest failed");
+  return digest;
+}
+inline String coldCanonicalRuntimeStatesDigest(const Vector<BrainReplicatedContainerRuntimeState>& input,
+                                               String *serializedPayload = nullptr) {
+  Vector<BrainReplicatedContainerRuntimeState> states=input;
+  std::sort(states.begin(),states.end(),[](const auto& lhs,const auto& rhs) {
+    return lhs.plan.uuid == rhs.plan.uuid ? lhs.machineUUID < rhs.machineUUID : lhs.plan.uuid < rhs.plan.uuid;
+  });
+  String serialized = {};
+  BitseryEngine::serialize(serialized,states);
+  if (serializedPayload) *serializedPayload=serialized;
+  return coldCanonicalPayloadDigest(serialized);
+}
 inline void privateFile(const std::string& path, uint64_t maximum=UINT32_MAX) {
   struct stat st{};
   require(::lstat(path.c_str(),&st)==0 && S_ISREG(st.st_mode) && !(st.st_mode&0077) && st.st_nlink==1 && st.st_uid==::geteuid() && st.st_size>0 && uint64_t(st.st_size)<=maximum,"recovery input must be a private owned regular file");
@@ -187,7 +339,8 @@ inline uint64_t number(simdjson::dom::element e,const char *key) {
 inline Manifest parseManifest(const std::string& path,const Plan& p) {
   privateFile(path,1024*1024); simdjson::dom::parser parser; simdjson::dom::element doc;
   auto raw=read(path); require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery manifest JSON");
-  require(number(doc,"schemaVersion")==1 && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
+  const uint64_t schemaVersion=number(doc,"schemaVersion");
+  require((schemaVersion==1 || schemaVersion==2) && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
   Manifest m; m.request.clusterUUID=p.clusterUUID; m.request.bundleSHA=text(field(doc,"bundleSHA256"));
   simdjson::dom::element declaredCanonicalCount;
   const bool hasDeclaredCanonicalCount=doc["canonicalContainerCount"].get(declaredCanonicalCount)==simdjson::SUCCESS;
@@ -235,12 +388,130 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     m.request.machines.push_back(std::move(machine));
   }
   require(seenMachines.size()==3 && canonical==m.canonicalContainerCount,"recovery canonical inventory differs from sealed three-host declaration");
+  if (schemaVersion == 2) {
+    require(m.emptyRetainedInventoryMachineUUID != 0 && p.schemaVersion != 4,
+            "cold canonical source requires a uniform empty retained machine");
+    simdjson::dom::element cold;
+    require(doc["coldCanonicalSource"].get(cold)==simdjson::SUCCESS,"cold canonical source is missing");
+    m.coldCanonicalSource.statePath=field(cold,"sourceStatePath"); pathCheck(m.coldCanonicalSource.statePath);
+    require(m.coldCanonicalSource.statePath.ends_with("/state.copy10") &&
+                m.coldCanonicalSource.statePath.starts_with("/root/nametag/.run/"),
+            "cold canonical source path is not a task-owned stopped state copy");
+    m.coldCanonicalSource.aggregateSHA256=text(field(cold,"sourceStateAggregateSHA256"));
+    require(prodigyIsSHA256HexDigest(m.coldCanonicalSource.aggregateSHA256),"cold canonical source aggregate digest is invalid");
+    simdjson::dom::array requested;
+    require(cold["requestedContainerUUIDs"].get_array().get(requested)==simdjson::SUCCESS,
+            "cold canonical source requested UUIDs are missing");
+    for (auto item : requested) {
+      std::string_view value;
+      require(item.get_string().get(value)==simdjson::SUCCESS,"cold canonical source UUID is invalid");
+      m.coldCanonicalSource.requestedContainerUUIDs.push_back(uuid(std::string(value)));
+    }
+    require(coldCanonicalUUIDsAreStrictlySorted(m.coldCanonicalSource.requestedContainerUUIDs),
+            "cold canonical source UUIDs are not sorted and unique");
+    simdjson::dom::array storage;
+    require(cold["storage"].get_array().get(storage)==simdjson::SUCCESS,"cold canonical source storage metadata is missing");
+    for (auto item : storage) {
+      Manifest::ColdCanonicalSourceInput::StorageMetadata entry = {};
+      entry.containerUUID=uuid(field(item,"containerUUID"));
+      entry.rootfsMetadata=text(field(item,"rootfsMetadata")); entry.storageMetadata=text(field(item,"storageMetadata"));
+      require(coldCanonicalMetadata(entry.rootfsMetadata) && coldCanonicalMetadata(entry.storageMetadata),
+              "cold canonical source storage metadata is invalid");
+      m.coldCanonicalSource.storage.push_back(std::move(entry));
+    }
+    std::sort(m.coldCanonicalSource.storage.begin(),m.coldCanonicalSource.storage.end(),[](const auto& lhs,const auto& rhs) {
+      return lhs.containerUUID<rhs.containerUUID;
+    });
+    require(m.coldCanonicalSource.storage.size()==m.coldCanonicalSource.requestedContainerUUIDs.size(),
+            "cold canonical source storage metadata count differs");
+    for(uint32_t index=0;index<m.coldCanonicalSource.storage.size();++index)
+      require(m.coldCanonicalSource.storage[index].containerUUID==m.coldCanonicalSource.requestedContainerUUIDs[index],
+              "cold canonical source storage UUID set differs");
+  }
   return m;
 }
 inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot) {
   require(fs::is_directory(path) && fs::is_directory(path+".secrets") && !fs::is_symlink(path) && !fs::is_symlink(path+".secrets"),"paired private recovery databases absent");
   ProdigyPersistentStateStore store(text(path)); String failure;
   require(store.loadBrainSnapshot(snapshot,&failure),"private recovery snapshot unreadable");
+}
+inline ColdCanonicalSource deriveColdCanonicalSource(const Manifest& manifest, uint128_t emptyMachineUUID,
+                                                      const ProdigyPersistentBrainSnapshot *approvedSnapshot = nullptr,
+                                                      const std::string& extractionPath = {}) {
+  require(manifest.coldCanonicalSource.requestedContainerUUIDs.empty()==false &&
+              manifest.emptyRetainedInventoryMachineUUID==emptyMachineUUID,
+          "cold canonical source is not bound to the empty retained machine");
+  require(!extractionPath.empty(),"cold canonical source requires a private extraction copy");
+  ProdigyPersistentBrainSnapshot source={};
+  loadSnapshot(extractionPath,source);
+  require(source.brainConfig.clusterUUID==manifest.request.clusterUUID && source.topology.machines.size()==3,
+          "cold canonical source cluster or topology differs");
+  for (const MothershipRetainedRecoveryMachineInput& expected : manifest.request.machines) {
+    bool found=false;
+    for (const ClusterMachine& observed : source.topology.machines) found|=observed.uuid==expected.machineUUID;
+    require(found,"cold canonical source topology machine differs");
+  }
+  ColdCanonicalSource result={}; result.sourceStatePath.assign(manifest.coldCanonicalSource.statePath.c_str());
+  result.sourceSnapshotSHA256.assign(manifest.coldCanonicalSource.aggregateSHA256);
+  result.requestedContainerUUIDs=manifest.coldCanonicalSource.requestedContainerUUIDs;
+  for (uint128_t requested : result.requestedContainerUUIDs) {
+    const BrainReplicatedContainerRuntimeState *found=nullptr;
+    for (const BrainReplicatedContainerRuntimeState& candidate : source.masterAuthority.containerRuntimeStates) {
+      if (candidate.plan.uuid!=requested) continue;
+      require(candidate.machineUUID==emptyMachineUUID && found==nullptr,
+              "cold canonical source runtime identity is duplicated or belongs to another machine");
+      found=&candidate;
+    }
+    require(found!=nullptr,"cold canonical source requested runtime is absent");
+    if (approvedSnapshot) {
+      const uint64_t deploymentID=found->plan.config.deploymentID();
+      auto sourcePlan=source.masterAuthority.deploymentPlans.find(deploymentID);
+      auto approvedPlan=approvedSnapshot->masterAuthority.deploymentPlans.find(deploymentID);
+      require(sourcePlan!=source.masterAuthority.deploymentPlans.end() &&
+                  approvedPlan!=approvedSnapshot->masterAuthority.deploymentPlans.end() &&
+                  mothershipRetainedRecoveryPlansEqual(sourcePlan->second,approvedPlan->second),
+              "cold canonical source deployment plan differs from stopped authority");
+    }
+    result.states.push_back(*found);
+  }
+  result.selectedStatesSHA256=coldCanonicalRuntimeStatesDigest(result.states,&result.serializedStates);
+  return result;
+}
+inline std::string coldCanonicalStorageProgram(const Manifest::ColdCanonicalSourceInput& source) {
+  std::string entries="[";
+  for (uint32_t index=0;index<source.storage.size();++index) {
+    if (index) entries+=",";
+    String uuidText={}; uuidText.snprintf<"{itoh}"_ctv>(source.storage[index].containerUUID);
+    entries+="("+quote(str(uuidText))+","+quote(str(source.storage[index].rootfsMetadata))+","+
+        quote(str(source.storage[index].storageMetadata))+")";
+  }
+  entries+="]";
+  return "python3 -c "+quote(
+      "import os,stat,sys\nentries="+entries+"\n"
+      "for value,expected_root,expected_storage in entries:\n"
+      "  name=str(int(value,16)); root='/containers/'+name+'/rootfs'; storage='/containers/storage/'+name\n"
+      "  def metadata(path):\n"
+      "    item=os.lstat(path); assert stat.S_ISDIR(item.st_mode) and not stat.S_ISLNK(item.st_mode); return f'{os.major(item.st_dev)}:{os.minor(item.st_dev)}:{item.st_ino}'\n"
+      "  assert metadata(root)==expected_root and metadata(storage)==expected_storage\n"
+      "print('cold-canonical-storage=verified')\n");
+}
+inline std::string coldCanonicalExtractionProgram(const std::string& sourcePath,const std::string& extractionPath) {
+  const auto parent=fs::path(extractionPath).parent_path().string();
+  return "set -eu; umask 077; test -d "+quote(sourcePath)+"; test -d "+quote(sourcePath+".secrets")+
+      "; test ! -L "+quote(sourcePath)+"; test ! -L "+quote(sourcePath+".secrets")+
+      "; mkdir -p "+quote(parent)+"; test ! -e "+quote(extractionPath+".partial")+
+      "; test ! -e "+quote(extractionPath+".secrets.partial")+
+      "; rm -rf -- "+quote(extractionPath)+" "+quote(extractionPath+".secrets")+
+      "; cp -a --reflink=auto -- "+quote(sourcePath)+" "+quote(extractionPath+".partial")+
+      "; cp -a --reflink=auto -- "+quote(sourcePath+".secrets")+" "+quote(extractionPath+".secrets.partial")+
+      "; chmod -R go-rwx -- "+quote(extractionPath+".partial")+" "+quote(extractionPath+".secrets.partial")+
+      "; mv -T -- "+quote(extractionPath+".partial")+" "+quote(extractionPath)+
+      "; mv -T -- "+quote(extractionPath+".secrets.partial")+" "+quote(extractionPath+".secrets")+
+      "; sync -f "+quote(parent);
+}
+inline std::string coldCanonicalExtractionCleanupProgram(const std::string& extractionPath) {
+  return "set -eu; rm -rf -- "+quote(extractionPath)+" "+quote(extractionPath+".secrets")+
+      "; test ! -e "+quote(extractionPath)+"; test ! -e "+quote(extractionPath+".secrets");
 }
 // Read-only companion to the retirement action.  It deliberately opens only
 // the stopped copy and returns a compact coordinator kind; Mothership gathers
@@ -277,7 +548,15 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
     Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
-    require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,&emptyRetainedInventoryMachineUUID),"recovery request decode failed");
+    ColdCanonicalSource coldCanonicalSource = {};
+    require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,
+                          &emptyRetainedInventoryMachineUUID,&coldCanonicalSource),"recovery request decode failed");
+    require(coldCanonicalSource.states.empty() ||
+                (emptyRetainedInventoryMachineUUID != 0 && retiredConflictingClientUUID == 0 &&
+                 coldCanonicalUUIDsAreStrictlySorted(coldCanonicalSource.requestedContainerUUIDs) &&
+                 coldCanonicalSource.states.size()==coldCanonicalSource.requestedContainerUUIDs.size() &&
+                 coldCanonicalPayloadDigest(coldCanonicalSource.serializedStates)==coldCanonicalSource.selectedStatesSHA256),
+            "cold canonical source request is inconsistent");
     require(emptyRetainedInventoryMachineUUID == 0 || request.interruptedBundleSHA.empty(),
             "empty retained inventory cannot reinterpret an interrupted handoff");
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
@@ -385,7 +664,7 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     } else {
       require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                         request.bundleSHA,&why,previousBundleSHA256,{},0,nullptr,false,true,
-                                                        emptyRetainedInventoryMachineUUID),str(why).c_str());
+                                                        emptyRetainedInventoryMachineUUID,coldCanonicalSource.states),str(why).c_str());
     }
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
@@ -872,6 +1151,68 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       for(auto& m:e.plan.machines)e.upload(m,manifestPath,e.remoteRoot+"/retained-manifest.json");
       verify();e.receipt.phase=MothershipTidesDBMigrationPhase::preflighted;e.persist(e.receipt,nullptr);
     }
+    ColdCanonicalSource coldCanonicalSource = {};
+    String coldCanonicalBinding = {};
+    const auto coldCanonicalAuthorityPath=e.plan.operationRoot+"/cold-canonical-source-authority";
+    const auto coldCanonicalPayloadPath=e.plan.operationRoot+"/cold-canonical-source.payload";
+    const auto coldCanonicalExtractionPath=e.plan.operationRoot+"/cold-canonical-extraction/state.copy10";
+    auto validateColdCanonicalSource=[&]() {
+      if (manifest.coldCanonicalSource.requestedContainerUUIDs.empty()) return;
+      // The historical source is mode-preserved evidence and TidesDB's normal
+      // reader can rotate its logs. Hash it first, then decode only a private,
+      // disposable reflink copy. The original is never opened by this action.
+      require(coldCanonicalStateAggregateDigest(manifest.coldCanonicalSource.statePath)==
+                  manifest.coldCanonicalSource.aggregateSHA256,
+              "cold canonical source aggregate differs from its sealed manifest");
+      coldCanonicalSource = {};
+      coldCanonicalSource.sourceStatePath.assign(manifest.coldCanonicalSource.statePath.c_str());
+      coldCanonicalSource.sourceSnapshotSHA256=manifest.coldCanonicalSource.aggregateSHA256;
+      coldCanonicalSource.requestedContainerUUIDs=manifest.coldCanonicalSource.requestedContainerUUIDs;
+      if (!fs::exists(coldCanonicalPayloadPath)) {
+        e.run(manifest.emptyRetainedInventoryMachineUUID,
+              coldCanonicalExtractionProgram(manifest.coldCanonicalSource.statePath,coldCanonicalExtractionPath));
+        try {
+          require(coldCanonicalStateAggregateDigest(coldCanonicalExtractionPath)==
+                      manifest.coldCanonicalSource.aggregateSHA256,
+                  "cold canonical extraction differs from its sealed source");
+          ColdCanonicalSource extracted=deriveColdCanonicalSource(manifest,manifest.emptyRetainedInventoryMachineUUID,
+                                                                  nullptr,coldCanonicalExtractionPath);
+          e.run(manifest.emptyRetainedInventoryMachineUUID,
+                coldCanonicalExtractionCleanupProgram(coldCanonicalExtractionPath));
+          durable(coldCanonicalPayloadPath,extracted.serializedStates);
+        } catch (...) {
+          String ignored = {};
+          (void)e.command(manifest.emptyRetainedInventoryMachineUUID,
+                          coldCanonicalExtractionCleanupProgram(coldCanonicalExtractionPath),&ignored);
+          throw;
+        }
+      }
+      privateFile(coldCanonicalPayloadPath);
+      coldCanonicalSource.serializedStates=text(read(coldCanonicalPayloadPath));
+      coldCanonicalSource.selectedStatesSHA256=coldCanonicalPayloadDigest(coldCanonicalSource.serializedStates);
+      require(BitseryEngine::deserializeSafe(coldCanonicalSource.serializedStates,coldCanonicalSource.states) &&
+                  coldCanonicalSource.states.size()==coldCanonicalSource.requestedContainerUUIDs.size(),
+              "cold canonical payload is not a valid selected runtime set");
+      for (uint32_t index=0;index<coldCanonicalSource.states.size();++index)
+        require(coldCanonicalSource.states[index].machineUUID==manifest.emptyRetainedInventoryMachineUUID &&
+                    coldCanonicalSource.states[index].plan.uuid==coldCanonicalSource.requestedContainerUUIDs[index],
+                "cold canonical payload identity differs from sealed source");
+      String storageFailure = {};
+      require(e.command(manifest.emptyRetainedInventoryMachineUUID,
+                        coldCanonicalStorageProgram(manifest.coldCanonicalSource),&storageFailure,nullptr,30'000),
+              "cold canonical source storage or rootfs metadata differs");
+      coldCanonicalBinding=text(e.plan.planSHA+"\n"+manifestSHA+"\n"+
+                                str(coldCanonicalSource.sourceSnapshotSHA256)+"\n"+
+                                str(coldCanonicalSource.selectedStatesSHA256)+"\n");
+      for (uint128_t uuid : coldCanonicalSource.requestedContainerUUIDs) {
+        String encoded = {}; encoded.snprintf<"{itoh}"_ctv>(uuid);
+        coldCanonicalBinding.append(encoded.data(),encoded.size()); coldCanonicalBinding.append("\n",1);
+      }
+      if (!fs::exists(coldCanonicalAuthorityPath)) durable(coldCanonicalAuthorityPath,coldCanonicalBinding);
+      else { privateFile(coldCanonicalAuthorityPath,4096); require(read(coldCanonicalAuthorityPath)==str(coldCanonicalBinding),
+                                                                     "cold canonical source authority differs"); }
+    };
+    validateColdCanonicalSource();
     const auto retiredMarker=e.plan.operationRoot+"/extras-retired";
     const bool extrasRetired=fs::exists(retiredMarker);
     if(extrasRetired) { privateFile(retiredMarker,4096); require(read(retiredMarker)==manifestSHA,"retired inventory marker differs"); }
@@ -908,6 +1249,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","retained recovery must run on selected seed");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);
         require(seed.brainConfig.clusterUUID==e.plan.clusterUUID,"seed authority cluster mismatch");manifest.request.plans=seed.masterAuthority.deploymentPlans;
+        validateColdCanonicalSource();
         // Schema-v2 also represents a uniform executable temporarily installed
         // below a root other than systemd's registered service root. That uses
         // the normal retained-snapshot predicate, which still validates any
@@ -949,15 +1291,41 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
-        String bytes=encodeRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID); if(!requestAlreadySealed)durable(requestPath,bytes);
-        durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(requestPath)+"\n"));
+        String bytes=manifest.coldCanonicalSource.requestedContainerUUIDs.empty() ?
+            encodeRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID) :
+            encodeColdCanonicalSourceRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID,coldCanonicalSource);
+        if(!requestAlreadySealed) durable(requestPath,bytes);
+        Request sealedRequest = {}; MothershipRetainedRecoveryMixedProof sealedProof = {};
+        uint128_t sealedRetired=0, sealedEmptyMachine=0; ColdCanonicalSource sealedColdSource = {};
+        require(decodeRequest(read(requestPath),sealedRequest,&sealedProof,&sealedRetired,&sealedEmptyMachine,&sealedColdSource) &&
+                    sealedRequest.clusterUUID==manifest.request.clusterUUID && sealedRetired==0 &&
+                    sealedEmptyMachine==manifest.emptyRetainedInventoryMachineUUID,
+                "sealed recovery request differs from cold canonical authority");
+        if (!manifest.coldCanonicalSource.requestedContainerUUIDs.empty())
+          require(sealedColdSource.sourceSnapshotSHA256==coldCanonicalSource.sourceSnapshotSHA256 &&
+                      sealedColdSource.selectedStatesSHA256==coldCanonicalSource.selectedStatesSHA256 &&
+                      coldCanonicalUUIDsEqual(sealedColdSource.requestedContainerUUIDs,coldCanonicalSource.requestedContainerUUIDs) &&
+                      sealedColdSource.serializedStates==coldCanonicalSource.serializedStates &&
+                      coldCanonicalPayloadDigest(sealedColdSource.serializedStates)==coldCanonicalSource.selectedStatesSHA256,
+                  "sealed cold canonical source differs from preflight authority");
+        const auto requestDigest=digest(requestPath);
+        durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+requestDigest+"\n"));
+        if (!manifest.coldCanonicalSource.requestedContainerUUIDs.empty()) {
+          const auto requestAuthority=e.plan.operationRoot+"/cold-canonical-request-authority";
+          const String binding=text(str(coldCanonicalBinding)+requestDigest+"\n");
+          if (!fs::exists(requestAuthority)) durable(requestAuthority,binding);
+          else { privateFile(requestAuthority,4096); require(read(requestAuthority)==str(binding),
+                                                              "cold canonical request authority differs"); }
+        }
       }
       }
       const auto witnessPath=requestPath+".witnesses";
       if(!fs::exists(witnessPath)) {
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
         Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
-        require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,&emptyRetainedInventoryMachineUUID),"sealed request unreadable");
+        ColdCanonicalSource coldCanonicalSource = {};
+        require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,
+                              &emptyRetainedInventoryMachineUUID,&coldCanonicalSource),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
         if (retiredConflictingClientUUID != 0) {
           const auto originalRequestPath=e.plan.operationRoot+"/recovery.request"; privateFile(originalRequestPath);
@@ -978,7 +1346,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         } else {
           require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,
                                                             request.bundleSHA,&why,text(e.plan.oldBundleSHA),{},0,nullptr,false,true,
-                                                            emptyRetainedInventoryMachineUUID),str(why).c_str());
+                                                            emptyRetainedInventoryMachineUUID,coldCanonicalSource.states),str(why).c_str());
         }
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);
@@ -1007,6 +1375,15 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       e.receipt.phase=MothershipTidesDBMigrationPhase::swapped;e.persist(e.receipt,nullptr);
     }
     if(!e.receipt.activationBoundaryCrossed) {
+      if (!manifest.coldCanonicalSource.requestedContainerUUIDs.empty()) {
+        require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n",
+                "cold canonical source revalidation requires the selected seed");
+        validateColdCanonicalSource();
+        const auto requestAuthority=e.plan.operationRoot+"/cold-canonical-request-authority";
+        privateFile(requestAuthority,4096);
+        require(read(requestAuthority)==str(coldCanonicalBinding)+digest(requestPath)+"\n",
+                "cold canonical source changed after preparation");
+      }
       verify(extrasRetired?InventoryMode::canonical:InventoryMode::sealed);for(auto& m:e.plan.machines)e.run(m.uuid,"LD_LIBRARY_PATH="+quote(preparationRuntime+"/lib")+" "+quote(preparationRuntime+"/tools/mothership")+" prepareRetainedRecoveryLocal "+quote(e.remoteRoot+"/recovery.request")+" "+quote(e.plan.statePath)+" verify");
       e.installRuntimes();
     }

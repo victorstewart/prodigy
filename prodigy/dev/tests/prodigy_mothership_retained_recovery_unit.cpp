@@ -129,6 +129,264 @@ static void assertRetainedRecoveryObservedLifecycleComparison(void)
   assert(!mothershipRetainedRecoveryBootstrapMatchesObservedLifecycle(changedCredentials, reconstructed));
 }
 
+static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
+{
+  const String bundle = MothershipTidesMigration::text(std::string(64, 'd'));
+  ProdigyPersistentBrainSnapshot source = {};
+  source.brainConfig.clusterUUID = 0x31;
+  source.brainConfig.datacenterFragment = 7;
+  Vector<MothershipRetainedRecoveryMachineInput> machines = {};
+  for (uint32_t index = 1; index <= 3; ++index)
+  {
+    ClusterMachine topology = {};
+    topology.uuid = index;
+    source.topology.machines.push_back(topology);
+    MothershipRetainedRecoveryMachineInput machine = {};
+    machine.machineUUID = index;
+    machine.machineFragment = index;
+    machines.push_back(std::move(machine));
+  }
+  auto statefulPlan = [](uint16_t applicationID) {
+    DeploymentPlan plan = {};
+    plan.config.type = ApplicationType::stateful;
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = 4;
+    plan.config.memoryMB = 128;
+    plan.config.storageMB = 64;
+    plan.config.nLogicalCores = 1;
+    plan.isStateful = true;
+    plan.stateful.clientPrefix = 0x1100000000000000ULL;
+    plan.stateful.siblingPrefix = 0x1200000000000000ULL;
+    plan.stateful.cousinPrefix = 0x1300000000000000ULL;
+    plan.stateful.seedingPrefix = 0x1400000000000000ULL;
+    plan.stateful.shardingPrefix = 0x1500000000000000ULL;
+    plan.stateful.neverShard = true;
+    plan.stateful.allMasters = false;
+    return plan;
+  };
+  auto statelessPlan = [](uint16_t applicationID) {
+    DeploymentPlan plan = {};
+    plan.config.type = ApplicationType::stateless;
+    plan.config.applicationID = applicationID;
+    plan.config.versionID = 4;
+    plan.config.memoryMB = 64;
+    plan.config.storageMB = 32;
+    plan.config.nLogicalCores = 1;
+    return plan;
+  };
+  auto parametersFor = [&](const DeploymentPlan& plan, uint128_t uuid, uint32_t machine,
+                           uint8_t fragment, bool client) {
+    ContainerParameters parameters = {};
+    parameters.uuid = uuid;
+    parameters.deploymentID = plan.config.deploymentID();
+    parameters.memoryMB = plan.config.memoryMB;
+    parameters.storageMB = plan.config.storageMB;
+    parameters.nLogicalCores = applicationSharedCPUCoreHint(plan.config);
+    parameters.cpuMode = plan.config.cpuMode;
+    parameters.requestedCPUMillis = applicationRequestedCPUMillis(plan.config);
+    parameters.private6.network.is6 = true;
+    parameters.private6.cidr = 128;
+    std::memcpy(parameters.private6.network.v6, container_network_subnet6.value, 11);
+    parameters.private6.network.v6[11] = source.brainConfig.datacenterFragment;
+    parameters.private6.network.v6[14] = machine;
+    parameters.private6.network.v6[15] = fragment;
+    if (plan.isStateful)
+    {
+      parameters.statefulMeshRoles = StatefulMeshRoles::forShardGroup(
+          plan.stateful, plan.config.applicationID, 0);
+      if (!client) parameters.statefulMeshRoles.client = 0;
+      parameters.statefulMeshRoles.cousin = 0;
+      parameters.statefulMeshRoles.sharding = 0;
+      parameters.statefulMeshRoles.topologyBridge = 0;
+      parameters.statefulTopology.shardGroup = 0;
+      parameters.statefulTopology.workerCount = 1;
+      parameters.statefulTopology.topologyEpoch = 1;
+      parameters.statefulTopology.sourceEpoch = 1;
+      parameters.statefulTopology.targetEpoch = 1;
+      parameters.statefulTopology.servingMode = StatefulTopologyServingMode::serve;
+      if (client) parameters.advertisesOnPorts[parameters.statefulMeshRoles.client] = uint16_t(12000 + fragment);
+      parameters.advertisesOnPorts[parameters.statefulMeshRoles.sibling] = uint16_t(12100 + fragment);
+      parameters.advertisesOnPorts[parameters.statefulMeshRoles.seeding] = uint16_t(12200 + fragment);
+    }
+    return parameters;
+  };
+
+  Vector<BrainReplicatedContainerRuntimeState> coldStates = {};
+  for (uint32_t deploymentIndex = 0; deploymentIndex < 4; ++deploymentIndex)
+  {
+    DeploymentPlan plan = statefulPlan(uint16_t(91 + deploymentIndex));
+    const uint64_t deploymentID = plan.config.deploymentID();
+    source.masterAuthority.deploymentPlans[deploymentID] = plan;
+    for (uint32_t machine = 2; machine <= 3; ++machine)
+    {
+      const uint8_t fragment = uint8_t(deploymentIndex + 1);
+      machines[machine - 1].parameters.push_back(parametersFor(
+          plan, 0x1000 + deploymentIndex * 0x10 + machine, machine, fragment, false));
+      machines[machine - 1].observedCreatedAtMs.push_back(1791000000000LL + deploymentIndex * 10 + machine);
+    }
+    ContainerParameters original = parametersFor(
+        plan, 0x2000 + deploymentIndex, 1, uint8_t(deploymentIndex + 1), true);
+    NeuronContainerBootstrap coldBootstrap = {};
+    String failure = {};
+    assert(prodigyBuildRetainedContainerBootstrap(
+        plan, original, 1, source.brainConfig.datacenterFragment,
+        1791000000100LL + deploymentIndex, coldBootstrap, &failure));
+    BrainReplicatedContainerRuntimeState cold = {};
+    cold.machineUUID = 1;
+    cold.plan = coldBootstrap.plan;
+    cold.plan.state = ContainerState::healthy;
+    cold.plan.runtimeReady = true;
+    // ContainerPlan owns service maps; retain a nested map through RRF7 rather
+    // than asserting against ContainerParameters-only transport fields.
+    const uint64_t nestedService = 0x5100 + deploymentIndex;
+    cold.plan.subscriptions.emplace(nestedService, Subscription(
+        nestedService, ContainerState::scheduled, ContainerState::destroying,
+        SubscriptionNature::any));
+    coldStates.push_back(std::move(cold));
+  }
+  // Five ordinary survivors make the observed inventory exactly 13 records.
+  for (uint32_t index = 0; index < 5; ++index)
+  {
+    DeploymentPlan plan = statelessPlan(uint16_t(201 + index));
+    source.masterAuthority.deploymentPlans[plan.config.deploymentID()] = plan;
+    const uint32_t machine = index < 3 ? 2 : 3;
+    const uint8_t fragment = uint8_t(5 + (index < 3 ? index : index - 3));
+    machines[machine - 1].parameters.push_back(parametersFor(plan, 0x3000 + index, machine, fragment, false));
+    machines[machine - 1].observedCreatedAtMs.push_back(1791000000200LL + index);
+  }
+  assert(machines[1].parameters.size() + machines[2].parameters.size() == 13);
+  bytell_hash_map<uint64_t, DeploymentPlan> approved = source.masterAuthority.deploymentPlans;
+
+  // A stale, unobserved nuc1 stateless owner must not survive as a scheduled
+  // replay when the sealed cold source selects only these four client masters.
+  BrainReplicatedContainerRuntimeState staleStateless = {};
+  staleStateless.machineUUID = 1;
+  staleStateless.plan.uuid = 0x9ff;
+  source.masterAuthority.containerRuntimeStates.push_back(staleStateless);
+
+  String failure = {};
+  auto valid = source;
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      valid, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates));
+  assert(valid.masterAuthority.containerRuntimeStates.size() == 4);
+  assert(valid.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size() == 3);
+  const auto& witness = valid.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0];
+  assert(witness.machineUUID == 1 && witness.containerBootstraps.size() == 4);
+  bytell_hash_set<uint64_t> coldDeployments = {};
+  for (const String& serialized : witness.containerBootstraps)
+  {
+    NeuronContainerBootstrap replay = {};
+    assert(BitseryEngine::deserializeSafe(serialized, replay) &&
+        replay.plan.state == ContainerState::scheduled && replay.plan.runtimeReady == false &&
+        replay.plan.statefulMeshRoles.client != 0);
+    coldDeployments.insert(replay.plan.config.deploymentID());
+  }
+  assert(coldDeployments.size() == 4);
+
+  auto wrongMachine = coldStates;
+  wrongMachine[0].machineUUID = 2;
+  auto wrongMachineSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongMachineSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, wrongMachine));
+  auto wrongPlan = coldStates;
+  ++wrongPlan[0].plan.config.memoryMB;
+  auto wrongPlanSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongPlanSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, wrongPlan));
+  auto missingClient = coldStates;
+  missingClient[0].plan.statefulMeshRoles.client = 0;
+  auto missingClientSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      missingClientSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, missingClient));
+  auto wrongUUID = coldStates;
+  wrongUUID[0].plan.uuid = 0;
+  auto wrongUUIDSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongUUIDSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, wrongUUID));
+  auto collisionMachines = machines;
+  collisionMachines[1].parameters[0].uuid = coldStates[0].plan.uuid;
+  auto collisionSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      collisionSnapshot, approved, collisionMachines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates));
+
+  // RRF7 binds its original selected-state bytes rather than reserializing
+  // unordered maps after decode. Exercise both private-copy persistence and
+  // idempotent re-entry through the command-local prepare owner.
+  using namespace MothershipRetainedRecovery;
+  Request request = {};
+  request.clusterUUID = source.brainConfig.clusterUUID;
+  request.bundleSHA = bundle;
+  request.plans = approved;
+  request.machines = machines;
+  ColdCanonicalSource coldSource = {};
+  coldSource.sourceStatePath = "/root/nametag/.run/fixture/state.copy10"_ctv;
+  coldSource.sourceSnapshotSHA256 = MothershipTidesMigration::text(std::string(64, 'e'));
+  for (const BrainReplicatedContainerRuntimeState& cold : coldStates)
+    coldSource.requestedContainerUUIDs.push_back(cold.plan.uuid);
+  coldSource.states = coldStates;
+  coldSource.selectedStatesSHA256 = coldCanonicalRuntimeStatesDigest(
+      coldSource.states, &coldSource.serializedStates);
+  const String rrf7 = encodeColdCanonicalSourceRequest(request, MothershipTidesMigration::Plan{}, 1, coldSource);
+  Request decodedRequest = {};
+  MothershipRetainedRecoveryMixedProof decodedProof = {};
+  uint128_t decodedEmpty = 0;
+  ColdCanonicalSource decodedCold = {};
+  assert(decodeRequest(MothershipTidesMigration::str(rrf7), decodedRequest, &decodedProof,
+      nullptr, &decodedEmpty, &decodedCold) && decodedEmpty == 1 &&
+      coldCanonicalUUIDsEqual(decodedCold.requestedContainerUUIDs, coldSource.requestedContainerUUIDs) &&
+      decodedCold.serializedStates == coldSource.serializedStates &&
+      decodedCold.states.size() == coldStates.size() &&
+      decodedCold.states[0].plan.subscriptions.size() ==
+          coldStates[0].plan.subscriptions.size() &&
+      decodedCold.states[0].plan.subscriptions.find(0x5100) !=
+          decodedCold.states[0].plan.subscriptions.end() &&
+      decodedCold.states[0].plan.subscriptions.find(0x5100)->second.nature ==
+          SubscriptionNature::any);
+  auto tamperedCold = coldSource;
+  tamperedCold.serializedStates[tamperedCold.serializedStates.size() - 1] ^= 1;
+  const String tampered = encodeColdCanonicalSourceRequest(request, MothershipTidesMigration::Plan{}, 1, tamperedCold);
+  assert(!decodeRequest(MothershipTidesMigration::str(tampered), decodedRequest, &decodedProof,
+      nullptr, &decodedEmpty, &decodedCold));
+
+  const auto root = std::filesystem::current_path() / ".run" /
+      ("retained-cold-canonical-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+  const auto statePath = (root / "state.new10").string();
+  const auto requestPath = (root / "request").string();
+  {
+    ProdigyPersistentStateStore store(MothershipTidesMigration::text(statePath));
+    assert(store.saveBrainSnapshot(source, &failure));
+  }
+  std::filesystem::create_directories(statePath + ".secrets");
+  const String aggregateBefore = coldCanonicalStateAggregateDigest(statePath);
+  const auto inspectionRoot = root / "inspection";
+  std::filesystem::create_directories(inspectionRoot);
+  const auto inspectionState = (inspectionRoot / "state.new10").string();
+  std::filesystem::copy(statePath, inspectionState, std::filesystem::copy_options::recursive);
+  std::filesystem::copy(statePath + ".secrets", inspectionState + ".secrets",
+      std::filesystem::copy_options::recursive);
+  assert(coldCanonicalStateAggregateDigest(inspectionState) == aggregateBefore);
+  ProdigyPersistentBrainSnapshot readOnlySource = {};
+  loadSnapshot(inspectionState, readOnlySource);
+  std::filesystem::remove_all(inspectionRoot);
+  assert(coldCanonicalStateAggregateDigest(statePath) == aggregateBefore);
+  MothershipTidesMigration::durable(requestPath, rrf7);
+  WitnessSet sealed = {};
+  sealed.requestSHA = MothershipTidesMigration::text(MothershipTidesMigration::digest(requestPath));
+  sealed.witnesses = valid.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  String witnessBytes = {};
+  BitseryEngine::serialize(witnessBytes, sealed);
+  MothershipTidesMigration::durable(requestPath + ".witnesses", witnessBytes);
+  assert(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure));
+  ProdigyPersistentBrainSnapshot persisted = {};
+  loadSnapshot(statePath, persisted);
+  assert(prodigyPersistentBrainSnapshotsEqual(valid, persisted));
+  assert(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure));
+  assert(prepareLocal(requestPath.c_str(), statePath.c_str(), true, &failure));
+  std::filesystem::remove_all(root);
+}
+
 static DeploymentPlan retainedRecoveryCidFixturePlan(void)
 {
   DeploymentPlan plan = {};
@@ -569,7 +827,15 @@ static void assertSchema4ConflictingClientRetirement(void)
 
 int main()
 {
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "retained-cold-canonical") == 0)
+  {
+    assertEmptyMachineColdCanonicalRuntimeRecovery();
+    std::printf("RETAINED_COLD_CANONICAL_RESULT failed_assertions=0\n");
+    return 0;
+  }
   assertRetainedRecoveryObservedLifecycleComparison();
+  assertEmptyMachineColdCanonicalRuntimeRecovery();
   const bool runtimeCidDriftAccepted = retainedRecoveryAllowsRuntimeCidDrift();
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "retained-precheckpoint") == 0)

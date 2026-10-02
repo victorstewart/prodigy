@@ -303,7 +303,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     const MothershipRetainedRecoveryMixedProof *retirementProof = nullptr,
     bool retainRetiredConflictingClientForCoordinatorProof = false,
     bool validateCoordinator = true,
-    uint128_t emptyRetainedInventoryMachineUUID = 0)
+    uint128_t emptyRetainedInventoryMachineUUID = 0,
+    const Vector<BrainReplicatedContainerRuntimeState>& coldCanonicalRuntimeStates = {})
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -467,10 +468,125 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     witnesses.push_back(std::move(witness));
   }
   if ((emptyRetainedInventoryMachineUUID != 0 && emptyMachineInputs != 1) ||
-      (emptyRetainedInventoryMachineUUID == 0 && emptyMachineInputs != 0))
+      (emptyRetainedInventoryMachineUUID == 0 && emptyMachineInputs != 0) ||
+      (coldCanonicalRuntimeStates.empty() == false &&
+       (emptyRetainedInventoryMachineUUID == 0 || retiringConflictingClient)))
   {
     if (failure) failure->assign("invalid sealed empty retained inventory machine"_ctv);
     return false;
+  }
+
+  // An empty observed inventory is never permission to invent a replacement.
+  // The command owner may provide only full canonical records decoded from its
+  // adjacent sealed stopped snapshot.  This pure owner binds those records to
+  // the one explicitly empty machine, then rebuilds ordinary state-upload
+  // bootstraps and leaves the existing cardinality proof authoritative.
+  Vector<BrainReplicatedContainerRuntimeState> coldStatesToPersist = {};
+  if (coldCanonicalRuntimeStates.empty() == false)
+  {
+    ProdigyPersistentUpdateSelfMachineRecoveryWitness *emptyWitness = nullptr;
+    uint32_t emptyMachineFragment = 0;
+    for (ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness : witnesses)
+    {
+      if (witness.machineUUID == emptyRetainedInventoryMachineUUID)
+      {
+        emptyWitness = &witness;
+        break;
+      }
+    }
+    for (const MothershipRetainedRecoveryMachineInput& machine : machines)
+    {
+      if (machine.machineUUID == emptyRetainedInventoryMachineUUID)
+      {
+        emptyMachineFragment = machine.machineFragment;
+        break;
+      }
+    }
+    if (emptyWitness == nullptr || emptyMachineFragment == 0 ||
+        emptyWitness->containerBootstraps.empty() == false)
+    {
+      if (failure) failure->assign("cold canonical recovery does not bind one empty machine"_ctv);
+      return false;
+    }
+
+    bytell_hash_set<uint8_t> selectedContainerFragments = {};
+    for (const BrainReplicatedContainerRuntimeState& cold : coldCanonicalRuntimeStates)
+    {
+      const ContainerPlan& plan = cold.plan;
+      const uint64_t deploymentID = plan.config.deploymentID();
+      if (cold.machineUUID != emptyRetainedInventoryMachineUUID ||
+          plan.uuid == 0 || deploymentID == 0 || plan.isStateful == false ||
+          plan.fragment == 0 || !selectedContainerFragments.insert(plan.fragment).second ||
+          plan.nShardGroups != 1 || plan.shardGroup != 0 ||
+          plan.addresses.size() != 1 || plan.addresses[0].network.is6 == false ||
+          plan.addresses[0].cidr != 128 ||
+          std::memcmp(plan.addresses[0].network.v6, container_network_subnet6.value, 11) != 0 ||
+          plan.addresses[0].network.v6[11] != snapshot.brainConfig.datacenterFragment ||
+          plan.addresses[0].network.v6[12] != uint8_t((emptyMachineFragment >> 16) & 0xffu) ||
+          plan.addresses[0].network.v6[13] != uint8_t((emptyMachineFragment >> 8) & 0xffu) ||
+          plan.addresses[0].network.v6[14] != uint8_t(emptyMachineFragment & 0xffu) ||
+          plan.addresses[0].network.v6[15] != plan.fragment ||
+          seenContainers.insert(plan.uuid).second == false)
+      {
+        if (failure) failure->assign("cold canonical runtime identity is invalid or collides with retained inventory"_ctv);
+        return false;
+      }
+      auto approved = approvedPlans.find(deploymentID);
+      auto existing = snapshot.masterAuthority.deploymentPlans.find(deploymentID);
+      if (approved == approvedPlans.end() || existing == snapshot.masterAuthority.deploymentPlans.end() ||
+          mothershipRetainedRecoveryPlansEqual(existing->second, approved->second) == false ||
+          existing->second.isStateful == false || existing->second.stateful.allMasters)
+      {
+        if (failure) failure->assign("cold canonical runtime deployment is not an approved non-all-master stateful plan"_ctv);
+        return false;
+      }
+      ApplicationConfig leftConfig = plan.config, rightConfig = existing->second.config;
+      String serializedLeft = {}, serializedRight = {};
+      BitseryEngine::serialize(serializedLeft, leftConfig);
+      BitseryEngine::serialize(serializedRight, rightConfig);
+      const StatefulMeshRoles expectedRoles = StatefulMeshRoles::forShardGroup(
+          existing->second.stateful, existing->second.config.applicationID, 0);
+      if (serializedLeft != serializedRight || plan.statefulMeshRoles.client == 0 ||
+          plan.statefulMeshRoles.client != expectedRoles.client ||
+          plan.statefulMeshRoles.sibling != expectedRoles.sibling ||
+          plan.statefulMeshRoles.seeding != expectedRoles.seeding ||
+          plan.statefulMeshRoles.cousin != 0 || plan.statefulMeshRoles.sharding != 0 ||
+          plan.statefulMeshRoles.topologyBridge != 0 ||
+          plan.networkAccess != existing->second.networkAccess || plan.useHostNetworkNamespace ||
+          plan.lifetime != ApplicationLifetime::base ||
+          plan.statefulTopology.configured() == false || plan.statefulTopology.operationID != 0 ||
+          plan.statefulTopology.bridgeMode != StatefulTopologyBridgeMode::none ||
+          plan.statefulTopology.shardGroup != 0 || plan.statefulTopology.workerCount !=
+              prodigyStatefulWorkerCountForLogicalCores(existing->second.config.nLogicalCores))
+      {
+        if (failure) failure->assign("cold canonical runtime plan differs from approved stateful authority"_ctv);
+        return false;
+      }
+      for (const BrainReplicatedContainerRuntimeState& current : snapshot.masterAuthority.containerRuntimeStates)
+      {
+        if (current.plan.uuid != plan.uuid) continue;
+        // The selected stopped source is authoritative only for the declared
+        // empty machine. A live peer may never be replaced by this path.
+        if (current.machineUUID != emptyRetainedInventoryMachineUUID)
+        {
+          if (failure) failure->assign("cold canonical runtime conflicts with persistent authority"_ctv);
+          return false;
+        }
+      }
+      NeuronContainerBootstrap bootstrap = {};
+      bootstrap.plan = plan;
+      // State upload owns readiness. A cold canonical record must not claim a
+      // serving process before the restored Neuron has recreated it.
+      bootstrap.plan.state = ContainerState::scheduled;
+      bootstrap.plan.runtimeReady = false;
+      bootstrap.metricPolicy = prodigyNeuronMetricPolicyForDeployment(existing->second);
+      String serializedBootstrap = {};
+      BitseryEngine::serialize(serializedBootstrap, bootstrap);
+      emptyWitness->containerBootstraps.push_back(std::move(serializedBootstrap));
+      ++statefulReplicas[deploymentID];
+      ++statefulClientMasters[deploymentID];
+      coldStatesToPersist.push_back(cold);
+    }
   }
   for (const auto& [id, count] : statefulReplicas) {
     const auto& deployment = approvedPlans.find(id)->second;
@@ -496,6 +612,28 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       return false;
     }
   }
+  if (coldCanonicalRuntimeStates.empty() == false)
+  {
+    // The explicit cold source is a complete authority only for its named
+    // empty machine. Drop any old records for that machine before inserting
+    // the selected set; otherwise an unobserved stateless scheduled record
+    // would survive state upload and be replayed as a phantom launch.
+    auto& runtimeStates = snapshot.masterAuthority.containerRuntimeStates;
+    runtimeStates.erase(std::remove_if(runtimeStates.begin(), runtimeStates.end(),
+        [emptyRetainedInventoryMachineUUID](const BrainReplicatedContainerRuntimeState& state) {
+          return state.machineUUID == emptyRetainedInventoryMachineUUID;
+        }), runtimeStates.end());
+    for (const BrainReplicatedContainerRuntimeState& cold : coldStatesToPersist)
+    {
+      runtimeStates.push_back(cold);
+    }
+  }
+  std::sort(snapshot.masterAuthority.containerRuntimeStates.begin(),
+            snapshot.masterAuthority.containerRuntimeStates.end(),
+            [](const BrainReplicatedContainerRuntimeState& lhs,
+               const BrainReplicatedContainerRuntimeState& rhs) {
+              return lhs.plan.uuid < rhs.plan.uuid;
+            });
   std::sort(witnesses.begin(), witnesses.end(), [](const auto& lhs, const auto& rhs) {
     return lhs.machineUUID < rhs.machineUUID;
   });
