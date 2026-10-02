@@ -2166,6 +2166,16 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
    )
    set_tests_properties(prodigy_container_crash_recovery_unit PROPERTIES TIMEOUT 30)
+   foreach(scenario IN ITEMS api-credential-policy api-credential-expiry-notification
+      durable-container-launch duplicate-inventory-recovery persisted-inventory-runtime)
+      string(REPLACE "-" "_" scenario_name "${scenario}")
+      add_test(
+         NAME prodigy_${scenario_name}_unit
+         COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=${scenario}
+                 $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+      )
+      set_tests_properties(prodigy_${scenario_name}_unit PROPERTIES TIMEOUT 30)
+   endforeach()
    add_test(
       NAME prodigy_predecessor_cgroup_drain_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CGROUP_DRAIN_ONLY=1
