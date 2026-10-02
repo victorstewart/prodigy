@@ -21893,6 +21893,7 @@ static void testBrainContainerHealthyReplicatesRuntimeStateToFollowers(TestSuite
 
 static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSuite& suite)
 {
+  ScopedRing scopedRing = {};
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
@@ -22091,6 +22092,7 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
 
 static void testBrainReplicatedContainerRuntimeStateWaitsForDeployment(TestSuite& suite)
 {
+  ScopedRing scopedRing = {};
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
   brain.iaas = &iaas;
@@ -22131,6 +22133,7 @@ static void testBrainReplicatedContainerRuntimeStateWaitsForDeployment(TestSuite
   seed.machine = &machine;
   seed.lifetime = ApplicationLifetime::base;
   seed.state = ContainerState::healthy;
+  seed.runtimeReady = true;
   seed.fragment = 10;
   seed.createdAtMs = 123'462;
 
@@ -22166,6 +22169,213 @@ static void testBrainReplicatedContainerRuntimeStateWaitsForDeployment(TestSuite
   brain.machinesByUUID.erase(machine.uuid);
   brain.machines.erase(&machine);
   thisBrain = previousBrain;
+}
+
+static void testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(TestSuite& suite)
+{
+  TestBrain source = {};
+  NoopBrainIaaS sourceIaaS = {};
+  source.iaas = &sourceIaaS;
+
+  Machine sourceMachine = {};
+  sourceMachine.uuid = uint128_t(0x5210);
+  sourceMachine.private4 = 0x0A00002D;
+  sourceMachine.fragment = 0x1237;
+  source.machines.insert(&sourceMachine);
+  source.machinesByUUID.insert_or_assign(sourceMachine.uuid, &sourceMachine);
+
+  ApplicationDeployment sourceDeployment = {};
+  sourceDeployment.plan = makeDeploymentPlan(62'025, 1);
+  source.deployments.insert_or_assign(sourceDeployment.plan.config.deploymentID(), &sourceDeployment);
+
+  ContainerView sourceContainer = {};
+  sourceContainer.uuid = uint128_t(0x5211);
+  sourceContainer.deploymentID = sourceDeployment.plan.config.deploymentID();
+  sourceContainer.applicationID = sourceDeployment.plan.config.applicationID;
+  sourceContainer.machine = &sourceMachine;
+  sourceContainer.lifetime = ApplicationLifetime::base;
+  sourceContainer.state = ContainerState::scheduled;
+  sourceContainer.fragment = 11;
+  sourceContainer.createdAtMs = 123'463;
+  sourceContainer.runtime_nLogicalCores = 2;
+  sourceContainer.runtime_memoryMB = 768;
+  sourceContainer.runtime_storageMB = 2048;
+  sourceContainer.hasCredentialBundle = true;
+  ApiCredential runtimeCredential = {};
+  runtimeCredential.name.assign("runtime-inventory"_ctv);
+  runtimeCredential.material.assign("runtime-inventory-secret"_ctv);
+  sourceContainer.credentialBundle.apiCredentials.push_back(std::move(runtimeCredential));
+  sourceDeployment.containers.insert(&sourceContainer);
+  sourceMachine.upsertContainerIndexEntry(sourceContainer.deploymentID, &sourceContainer);
+  source.containers.insert_or_assign(sourceContainer.uuid, &sourceContainer);
+
+  ProdigyPersistentMasterAuthorityPackage package = {};
+  source.capturePersistentMasterAuthorityPackage(package);
+  suite.expect(package.containerRuntimeStates.size() == 1 &&
+                   package.containerRuntimeStates[0].plan.uuid == sourceContainer.uuid &&
+                   package.containerRuntimeStates[0].plan.credentialBundle.apiCredentials.size() == 1 &&
+                   package.containerRuntimeStates[0].plan.credentialBundle.apiCredentials[0].material.equals("runtime-inventory-secret"_ctv),
+               "persistent_runtime_inventory_captures_exact_pre_spin_record");
+
+  TestBrain restored = {};
+  NoopBrainIaaS restoredIaaS = {};
+  restored.iaas = &restoredIaaS;
+  suite.require(restored.applyPersistentMasterAuthorityPackage(package),
+                "persistent_runtime_inventory_package_applies_before_replay");
+  auto pending = restored.pendingReplicatedContainerRuntimeStates.find(sourceDeployment.plan.config.deploymentID());
+  suite.expect(pending != restored.pendingReplicatedContainerRuntimeStates.end() && pending->second.size() == 1,
+               "persistent_runtime_inventory_defers_until_deployment_and_machine_exist");
+  ProdigyPersistentMasterAuthorityPackage deferredPackage = {};
+  restored.capturePersistentMasterAuthorityPackage(deferredPackage);
+  suite.expect(deferredPackage.containerRuntimeStates.size() == 1 &&
+                   deferredPackage.containerRuntimeStates[0].plan.uuid == sourceContainer.uuid,
+               "persistent_runtime_inventory_recaptures_deferred_record_before_machine_rebuild");
+
+  Machine restoredMachine = {};
+  restoredMachine.uuid = sourceMachine.uuid;
+  restoredMachine.private4 = sourceMachine.private4;
+  restoredMachine.fragment = sourceMachine.fragment;
+  restored.machines.insert(&restoredMachine);
+  restored.machinesByUUID.insert_or_assign(restoredMachine.uuid, &restoredMachine);
+  ApplicationDeployment restoredDeployment = {};
+  restoredDeployment.plan = sourceDeployment.plan;
+  restored.deployments.insert_or_assign(restoredDeployment.plan.config.deploymentID(), &restoredDeployment);
+  restored.applyPendingReplicatedContainerRuntimeStates(restoredDeployment.plan.config.deploymentID());
+
+  auto restoredContainer = restored.containers.find(sourceContainer.uuid);
+  suite.expect(restoredContainer != restored.containers.end() && restoredContainer->second != nullptr &&
+                   restoredContainer->second->machine == &restoredMachine &&
+                   restoredContainer->second->state == ContainerState::scheduled &&
+                   restoredContainer->second->credentialBundle.apiCredentials.size() == 1 &&
+                   restoredContainer->second->credentialBundle.apiCredentials[0].material.equals("runtime-inventory-secret"_ctv),
+               "persistent_runtime_inventory_rebuilds_canonical_view_before_neuron_upload");
+
+  if (restoredContainer != restored.containers.end())
+  {
+    ContainerView *container = restoredContainer->second;
+    restoredDeployment.containers.erase(container);
+    restoredMachine.removeContainerIndexEntry(container->deploymentID, container);
+    restored.containers.erase(restoredContainer);
+    delete container;
+  }
+  restored.deployments.erase(restoredDeployment.plan.config.deploymentID());
+  restored.machinesByUUID.erase(restoredMachine.uuid);
+  restored.machines.erase(&restoredMachine);
+  source.containers.erase(sourceContainer.uuid);
+  sourceMachine.removeContainerIndexEntry(sourceContainer.deploymentID, &sourceContainer);
+  sourceDeployment.containers.erase(&sourceContainer);
+  source.deployments.erase(sourceDeployment.plan.config.deploymentID());
+  source.machinesByUUID.erase(sourceMachine.uuid);
+  source.machines.erase(&sourceMachine);
+}
+
+static uint32_t countQueuedSpinContainers(NeuronView& neuron)
+{
+  uint32_t count = 0;
+  forEachMessageInBuffer(neuron.wBuffer, [&](Message *message) {
+    if (NeuronTopic(message->topic) == NeuronTopic::spinContainer) ++count;
+  });
+  return count;
+}
+
+static void testContainerLaunchWaitsForDurableRuntimeInventory(TestSuite& suite)
+{
+  // Exercise ordinary launch, rejected persistence, lost authority, cancellation,
+  // and an autoscale launch while the existing deployment remains running.
+  for (uint32_t scenario = 0; scenario < 5; ++scenario)
+  {
+    ScopedRing ring = {};
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.holdRuntimePersistence = true;
+    BrainBase *previousBrain = thisBrain;
+    thisBrain = &brain;
+
+    Rack rack = {};
+    rack.uuid = 62'027 + scenario;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x5215 + scenario);
+    machine.private4 = 0x0A00002E + scenario;
+    machine.fragment = 0x1239 + scenario;
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.hardware.cpu.architecture = nametagCurrentBuildMachineArchitecture();
+    machine.hardware.cpu.logicalCores = 4;
+    machine.hardware.memory.totalMB = 8192;
+    machine.nLogicalCores_available = 4;
+    machine.memoryMB_available = 8192;
+    machine.storageMB_available = 8192;
+    machine.neuron.machine = &machine;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 52;
+    machine.neuron.connected = true;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+
+    ApplicationDeployment deployment = {};
+    deployment.plan = makeDeploymentPlan(uint16_t(rack.uuid), 1);
+    deployment.plan.stateless.nBase = 1;
+    deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+    deployment.plan.stateless.maxPerRackRatio = 1.0f;
+    deployment.plan.canaryCount = 0;
+    deployment.state = scenario == 4 ? DeploymentState::running : DeploymentState::deploying;
+    deployment.nTargetBase = 1;
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+    brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+    deployment.toSchedule.push_back(deployment.planStatelessConstruction(&machine, ApplicationLifetime::base));
+    deployment.schedule();
+
+    ContainerView *pending = deployment.containers.empty() ? nullptr : *deployment.containers.begin();
+    ProdigyPersistentMasterAuthorityPackage package = {};
+    brain.capturePersistentMasterAuthorityPackage(package);
+    suite.expect(countQueuedSpinContainers(machine.neuron) == 0 && pending != nullptr &&
+                     package.containerRuntimeStates.size() == 1 &&
+                     package.containerRuntimeStates[0].plan.uuid == pending->uuid,
+                 "container_launch_holds_spin_until_runtime_inventory_receipt");
+    if (scenario == 2) ++brain.masterAuthorityEpoch;
+    if (scenario == 3) deployment.operatorCancellationOwnsTransition = true;
+    brain.finishRuntimePersistence(scenario != 1);
+    if (scenario == 0 || scenario == 4)
+    {
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 1,
+                   scenario == 0 ? "container_launch_dispatches_spin_after_runtime_inventory_receipt" :
+                                   "running_deployment_autoscale_dispatches_after_runtime_inventory_receipt");
+    }
+    else
+    {
+      suite.expect(countQueuedSpinContainers(machine.neuron) == 0,
+                   "container_launch_rejected_stale_or_cancelled_receipt_emits_no_spin");
+      if (scenario == 1)
+      {
+        suite.expect(deployment.state == DeploymentState::failed &&
+                         deployment.containers.empty() && deployment.waitingOnContainers.empty() &&
+                         deployment.nDeployed() == 0 && deployment.countPerMachine[&machine] == 0 &&
+                         deployment.countPerRack[&rack] == 0,
+                     "container_launch_rejected_receipt_releases_reservation");
+      }
+    }
+
+    deployment.operatorCancellationOwnsTransition = false;
+    deployment.state = DeploymentState::failed;
+    deployment.waitingOnContainers.clear();
+    deployment.resumeFailedCanaryRollbackAfterContainerCleanup();
+    for (ContainerView *container : deployment.containers)
+    {
+      machine.removeContainerIndexEntry(container->deploymentID, container);
+      brain.containers.erase(container->uuid);
+      delete container;
+    }
+    deployment.containers.clear();
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+    brain.neurons.erase(&machine.neuron);
+    brain.machinesByUUID.erase(machine.uuid);
+    brain.machines.erase(&machine);
+    thisBrain = previousBrain;
+  }
 }
 
 static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(TestSuite& suite)
@@ -25512,6 +25722,14 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
   // all-machine update must replace it with fresh post-exec attestations before
   // a follower runtime report can trigger stateless deficit recovery.
   brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+  ContainerPlan authenticatedRetainedPlan = retained.generatePlan(deployment.plan);
+  String authenticatedRetainedUpload = {};
+  BitseryEngine::serialize(authenticatedRetainedUpload, authenticatedRetainedPlan);
+  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(
+      machine.uuid, Vector<String> {std::move(authenticatedRetainedUpload)});
+  machine.runtimeReady = true;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
   brain.updateSelfWorkerExpectedBundleSHA256 =
       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
   suite.require(brain.prepareLocalBundleExecRecovery(),
@@ -25520,6 +25738,7 @@ static void testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(Tes
                    brain.persistedMachineInventoryUploaded.empty() &&
                    brain.updateSelfMachineRecoveryWitnesses.size() == 1,
                "persisted_inventory_runtime_active_coordinator_starts_fresh_inventory_barrier");
+  machine.runtimeReady = false;
 
   BrainReplicatedContainerRuntimeState runtime = {};
   runtime.machineUUID = machine.uuid;
@@ -28924,6 +29143,23 @@ int main(void)
     testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "crash-recovery") == 0)
+  {
+    testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
+    testContainerLaunchWaitsForDurableRuntimeInventory(suite);
+    testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
+    testBrainReplicatedContainerRuntimeStateWaitsForDeployment(suite);
+    testLocalBundleRecoveryWaitsForCapturedInventory(suite);
+    testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "durable-container-launch") == 0)
+  {
+    testContainerLaunchWaitsForDurableRuntimeInventory(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
       only != nullptr && strcmp(only, "local-bundle-recovery-ordering") == 0)
@@ -29351,6 +29587,8 @@ int main(void)
   testBrainContainerHealthyReplicatesRuntimeStateToFollowers(suite);
   testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(suite);
   testBrainReplicatedContainerRuntimeStateWaitsForDeployment(suite);
+  testPersistentRuntimeInventoryRestoresBeforeNeuronReplay(suite);
+  testContainerLaunchWaitsForDurableRuntimeInventory(suite);
   testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
   testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);

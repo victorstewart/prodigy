@@ -7648,114 +7648,18 @@ public:
   }
 };
 
+class BrainReplicatedContainerRuntimeState;
+
+template <typename S>
+static void prodigySerializeMasterAuthorityRuntimeState(
+    S&& serializer,
+    ProdigyMasterAuthorityRuntimeState& state,
+    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates);
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
-  constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 4;
-  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
-  bool hasMaterializedStatefulRecoveryOperations = false;
-  bool hasApiCredentialExpiryNotices = false;
-  bool hasAllMachineRecoveryWitnesses = false;
-  bool hasMaterializedStatefulRecoveryRetries = false;
-
-  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
-  {
-    hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
-    hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
-    hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
-    hasMaterializedStatefulRecoveryRetries = state.materializedStatefulRecoveryRetries.empty() == false;
-    // Version-four framing is cumulative: emit the earlier optional fields
-    // (empty when unused) so a version-three reader has an unambiguous tail.
-    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries)
-    {
-      hasMaterializedStatefulRecoveryOperations = true;
-      hasApiCredentialExpiryNotices = true;
-      hasAllMachineRecoveryWitnesses = true;
-    }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries)
-    {
-      uint64_t marker = versionMarker;
-      serializer.value8b(marker);
-
-      uint64_t version = hasMaterializedStatefulRecoveryRetries ? 4 :
-                         (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1));
-      serializer.value8b(version);
-    }
-    serializer.value8b(state.generation);
-  }
-  else
-  {
-    serializer.value8b(state.generation);
-    if (state.generation == versionMarker)
-    {
-      uint64_t version = 0;
-      serializer.value8b(version);
-      serializer.value8b(state.generation);
-      if ((version < 1 || version > explicitVersion) || state.generation == versionMarker)
-      {
-        serializer.adapter().error(bitsery::ReaderError::InvalidData);
-        return;
-      }
-      hasMaterializedStatefulRecoveryOperations = true;
-      hasApiCredentialExpiryNotices = version >= 2;
-      hasAllMachineRecoveryWitnesses = version >= 3;
-      hasMaterializedStatefulRecoveryRetries = version >= 4;
-    }
-  }
-
-  serializer.value1b(state.hasCompletedInitialMasterElection);
-  serializer.object(state.transportTLSAuthority);
-  serializer.value8b(state.nextMintedClientTlsGeneration);
-  serializer.value8b(state.nextTlsResumptionGeneration);
-  serializer.value8b(state.nextPendingAddMachinesOperationID);
-  serializer.value8b(state.nextPendingElasticAddressOperationID);
-  serializer.value8b(state.nextDNSIntentRevision);
-  serializer.object(state.tlsResumptionSnapshotsByWormhole);
-  serializer.object(state.pendingAddMachinesOperations);
-  serializer.object(state.pendingAutonomousProvisioningOperations);
-  serializer.object(state.pendingElasticAddressAssignments);
-  serializer.object(state.pendingElasticAddressReleases);
-  serializer.object(state.statefulWorkerTopologyUpgradeOperations);
-  serializer.object(state.deferredStatefulScaleIntents);
-  if (hasApiCredentialExpiryNotices)
-  {
-    serializer.object(state.materializedStatefulRecoveryOperations);
-    serializer.object(state.apiCredentialExpiryNotices);
-  }
-  else if (hasMaterializedStatefulRecoveryOperations)
-  {
-    serializer.object(state.materializedStatefulRecoveryOperations);
-    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false) state.apiCredentialExpiryNotices.clear();
-  }
-  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
-  {
-    state.materializedStatefulRecoveryOperations.clear();
-    state.apiCredentialExpiryNotices.clear();
-  }
-  if (hasMaterializedStatefulRecoveryRetries)
-  {
-    serializer.object(state.materializedStatefulRecoveryRetries);
-  }
-  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
-  {
-    state.materializedStatefulRecoveryRetries.clear();
-  }
-  serializer.object(state.machineSchemas);
-  serializer.object(state.routableResourceLeases);
-  serializer.object(state.publicTlsCertificates);
-  serializer.object(state.privateTlsVaultLifecycles);
-  serializer.object(state.taskExecutions);
-  serializer.object(state.mothershipTunnelProviderDesiredState);
-  serializer.object(state.updateSelf);
-  if (hasAllMachineRecoveryWitnesses)
-  {
-    serializer.object(state.updateSelf.machineRecoveryWitnesses);
-  }
-  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
-  {
-    state.updateSelf.machineRecoveryWitnesses.clear();
-  }
+  prodigySerializeMasterAuthorityRuntimeState(serializer, state, nullptr);
 }
 
 class ProdigyMasterAuthorityStateTransitionAck {
@@ -8596,6 +8500,140 @@ static void serialize(S&& serializer, BrainReplicatedContainerRuntimeState& stat
   serializer.value1b(state.wormholeRuntimeFailureSuppressedReady);
 }
 
+// Package-only version-five framing keeps its optional container view inside the
+// final runtime-state field, so legacy package records retain their exact outer
+// boundary before metric samples.
+template <typename S>
+static void prodigySerializeMasterAuthorityRuntimeState(
+    S&& serializer,
+    ProdigyMasterAuthorityRuntimeState& state,
+    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates)
+{
+  constexpr uint64_t versionMarker = UINT64_MAX;
+  constexpr uint64_t explicitVersion = 5;
+  using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+  bool hasMaterializedStatefulRecoveryOperations = false;
+  bool hasApiCredentialExpiryNotices = false;
+  bool hasAllMachineRecoveryWitnesses = false;
+  bool hasMaterializedStatefulRecoveryRetries = false;
+  bool hasContainerRuntimeStates = false;
+
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    hasMaterializedStatefulRecoveryOperations = state.materializedStatefulRecoveryOperations.empty() == false;
+    hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
+    hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
+    hasMaterializedStatefulRecoveryRetries = state.materializedStatefulRecoveryRetries.empty() == false;
+    hasContainerRuntimeStates = containerRuntimeStates != nullptr && containerRuntimeStates->empty() == false;
+    // Version-four framing is cumulative: emit the earlier optional fields
+    // (empty when unused) so a version-three reader has an unambiguous tail.
+    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates)
+    {
+      hasMaterializedStatefulRecoveryOperations = true;
+      hasApiCredentialExpiryNotices = true;
+      hasAllMachineRecoveryWitnesses = true;
+      hasMaterializedStatefulRecoveryRetries = true;
+    }
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates)
+    {
+      uint64_t marker = versionMarker;
+      serializer.value8b(marker);
+
+      uint64_t version = hasContainerRuntimeStates ? 5 :
+                         (hasMaterializedStatefulRecoveryRetries ? 4 :
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)));
+      serializer.value8b(version);
+    }
+    serializer.value8b(state.generation);
+  }
+  else
+  {
+    serializer.value8b(state.generation);
+    if (state.generation == versionMarker)
+    {
+      uint64_t version = 0;
+      serializer.value8b(version);
+      serializer.value8b(state.generation);
+      if ((version < 1 || version > explicitVersion) ||
+          (version >= 5 && containerRuntimeStates == nullptr) ||
+          state.generation == versionMarker)
+      {
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+        return;
+      }
+      hasMaterializedStatefulRecoveryOperations = true;
+      hasApiCredentialExpiryNotices = version >= 2;
+      hasAllMachineRecoveryWitnesses = version >= 3;
+      hasMaterializedStatefulRecoveryRetries = version >= 4;
+      hasContainerRuntimeStates = version >= 5;
+    }
+  }
+
+  serializer.value1b(state.hasCompletedInitialMasterElection);
+  serializer.object(state.transportTLSAuthority);
+  serializer.value8b(state.nextMintedClientTlsGeneration);
+  serializer.value8b(state.nextTlsResumptionGeneration);
+  serializer.value8b(state.nextPendingAddMachinesOperationID);
+  serializer.value8b(state.nextPendingElasticAddressOperationID);
+  serializer.value8b(state.nextDNSIntentRevision);
+  serializer.object(state.tlsResumptionSnapshotsByWormhole);
+  serializer.object(state.pendingAddMachinesOperations);
+  serializer.object(state.pendingAutonomousProvisioningOperations);
+  serializer.object(state.pendingElasticAddressAssignments);
+  serializer.object(state.pendingElasticAddressReleases);
+  serializer.object(state.statefulWorkerTopologyUpgradeOperations);
+  serializer.object(state.deferredStatefulScaleIntents);
+  if (hasApiCredentialExpiryNotices)
+  {
+    serializer.object(state.materializedStatefulRecoveryOperations);
+    serializer.object(state.apiCredentialExpiryNotices);
+  }
+  else if (hasMaterializedStatefulRecoveryOperations)
+  {
+    serializer.object(state.materializedStatefulRecoveryOperations);
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false) state.apiCredentialExpiryNotices.clear();
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.materializedStatefulRecoveryOperations.clear();
+    state.apiCredentialExpiryNotices.clear();
+  }
+  if (hasMaterializedStatefulRecoveryRetries)
+  {
+    serializer.object(state.materializedStatefulRecoveryRetries);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.materializedStatefulRecoveryRetries.clear();
+  }
+  serializer.object(state.machineSchemas);
+  serializer.object(state.routableResourceLeases);
+  serializer.object(state.publicTlsCertificates);
+  serializer.object(state.privateTlsVaultLifecycles);
+  serializer.object(state.taskExecutions);
+  serializer.object(state.mothershipTunnelProviderDesiredState);
+  serializer.object(state.updateSelf);
+  if (hasAllMachineRecoveryWitnesses)
+  {
+    serializer.object(state.updateSelf.machineRecoveryWitnesses);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.updateSelf.machineRecoveryWitnesses.clear();
+  }
+  if (hasContainerRuntimeStates)
+  {
+    serializer.container(*containerRuntimeStates, 4096);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    if (containerRuntimeStates != nullptr)
+    {
+      containerRuntimeStates->clear();
+    }
+  }
+}
+
 class DeploymentPlan {
 public:
 
@@ -8888,6 +8926,10 @@ public:
   bytell_hash_map<uint16_t, String> reservedApplicationNamesByID;
   Vector<ApplicationServiceIdentity> reservedApplicationServices;
   uint16_t nextReservableApplicationID = 1;
+  // Full authoritative live container views are captured by Brain for crash recovery.
+  // Snapshot persistence retains only their identities publicly; full records
+  // live in the paired private sidecar.
+  Vector<BrainReplicatedContainerRuntimeState> containerRuntimeStates;
   bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
   bytell_hash_map<uint64_t, FailedDeploymentRecord> failedDeployments;
   ProdigyMasterAuthorityRuntimeState runtimeState;
@@ -9050,7 +9092,8 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
   serializer.value2b(package.nextReservableApplicationID);
   serializer.object(package.deploymentPlans);
   serializer.object(package.failedDeployments);
-  serializer.object(package.runtimeState);
+  prodigySerializeMasterAuthorityRuntimeState(
+      serializer, package.runtimeState, &package.containerRuntimeStates);
 }
 
 class ContainerParameters { // startup payload for container launch; stateful mesh and topology metadata use the full serializer path

@@ -71,8 +71,8 @@ inline Plan parse(const char *file) {
   require(st.st_size > 0 && st.st_size <= 65536, "migration plan size invalid");
   simdjson::dom::parser parser; simdjson::dom::element doc;
   const auto contents = read(file); require(parser.parse(contents).get(doc) == simdjson::SUCCESS, "migration plan JSON invalid");
-  uint64_t version = 0; require(doc["schemaVersion"].get_uint64().get(version) == simdjson::SUCCESS && (version == 1 || version == 2), "unsupported migration plan");
-  if (version == 2) { bool retained=false; require(doc["retainedRecoveryMode"].get_bool().get(retained) == simdjson::SUCCESS && retained, "mixed predecessors require retained recovery"); }
+  uint64_t version = 0; require(doc["schemaVersion"].get_uint64().get(version) == simdjson::SUCCESS && (version == 1 || version == 2 || version == 3), "unsupported migration plan");
+  if (version >= 2) { bool retained=false; require(doc["retainedRecoveryMode"].get_bool().get(retained) == simdjson::SUCCESS && retained, "installed predecessor observations require retained recovery"); }
   Plan p; p.identity = field(doc, "clusterUUID"); p.clusterUUID = uuid(p.identity); p.operationID = uuid(field(doc,"operationID"));
   p.operationRoot=field(doc,"operationRoot"); p.registryRoot=field(doc,"registryRoot"); p.bundle=field(doc,"bundlePath");
   p.runtimeRoot=field(doc,"runtimeRoot"); p.statePath=field(doc,"statePath"); p.secretsPath=field(doc,"secretsPath");
@@ -83,7 +83,7 @@ inline Plan parse(const char *file) {
   require(p.statePath != p.secretsPath && p.runtimeRoot != p.operationRoot, "overlapping migration paths");
   simdjson::dom::array machines; require(doc["machines"].get_array().get(machines) == simdjson::SUCCESS, "migration machines missing");
   for (auto value : machines) { Machine m; m.uuid=uuid(field(value,"machineUUID")); m.linuxID=field(value,"linuxMachineID"); m.address=field(value,"sshAddress");
-    if (version == 2) { m.runtimeRoot=field(value,"installedRuntimeRoot"); m.installedRuntimeSHA=field(value,"installedRuntimeSHA256"); m.installedBundleSHA=field(value,"installedBundleSHA256"); pathCheck(m.runtimeRoot); }
+    if (version >= 2) { m.runtimeRoot=field(value,"installedRuntimeRoot"); m.installedRuntimeSHA=field(value,"installedRuntimeSHA256"); m.installedBundleSHA=field(value,"installedBundleSHA256"); pathCheck(m.runtimeRoot); }
     else { m.runtimeRoot=p.runtimeRoot; m.installedRuntimeSHA=p.oldRuntimeSHA; m.installedBundleSHA=p.oldBundleSHA; }
     require(prodigyIsSHA256HexDigest(text(m.installedRuntimeSHA)) && prodigyIsSHA256HexDigest(text(m.installedBundleSHA)), "invalid installed runtime identity");
     require(m.linuxID.size()==32 && m.linuxID.find_first_not_of("0123456789abcdef")==std::string::npos, "invalid Linux machine identity");
@@ -115,6 +115,19 @@ inline Plan parse(const char *file) {
     // case; a same-root uniform plan must still prove two actual predecessors.
     if (servicePredecessorObservedAtDifferentRoot) used.emplace(p.oldRuntimeSHA,p.oldBundleSHA);
     require(used.size()==2 && used.contains({p.oldRuntimeSHA,p.oldBundleSHA}), "mixed recovery requires both predecessor identities"); p.mixedPredecessors=true;
+  }
+  if (version == 3) {
+    // Schema three describes one logical predecessor installed under different
+    // per-host roots.  The existing preflight checks both this observed root
+    // and the service root on every host before any lifecycle change.
+    bool splitRoot=false;
+    for (const auto& machine : p.machines) {
+      require(machine.installedRuntimeSHA==p.oldRuntimeSHA && machine.installedBundleSHA==p.oldBundleSHA,
+              "per-host installed roots must retain the logical predecessor identity");
+      splitRoot |= machine.runtimeRoot != p.runtimeRoot;
+    }
+    require(splitRoot, "per-host recovery requires a split installed runtime root");
+    p.retainedRecovery=true;
   }
   return p;
 }
@@ -547,6 +560,7 @@ inline bool run(const char *planPath, bool rollback, String *failure) {
   try {
     Plan plan=parse(planPath);
     require(!plan.mixedPredecessors,"mixed predecessors require the retained recovery command");
+    require(!plan.retainedRecovery,"per-host installed roots require the retained recovery command");
     Execution execution(std::move(plan)); if(rollback) execution.rollback(); else execution.execute(); return true;
   }
   catch(const std::exception& error) { if(failure) failure->assign(error.what()); return false; }

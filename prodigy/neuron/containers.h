@@ -9513,6 +9513,67 @@ public:
     return true;
   }
 
+  // The leader can have exited while a descendant is still releasing its
+  // cgroup membership.  Keep the final empty-cgroup guard authoritative, but
+  // give that membership a short Ring-driven drain window before rejecting a
+  // storage handoff.
+  static void waitForPredecessorCgroupDrain(Container *predecessor,
+                                            CoroutineStack *coro,
+                                            bool& drained,
+                                            String *failureReport = nullptr,
+                                            uint64_t maximumWaitUs = 1'000'000,
+                                            uint64_t pollWaitUs = 20'000)
+  {
+    drained = false;
+    if (predecessor == nullptr || predecessor->cgroup < 0 || coro == nullptr ||
+        maximumWaitUs == 0 || pollWaitUs == 0)
+    {
+      if (failureReport) failureReport->assign("legacy storage handoff requires a cgroup drain owner"_ctv);
+      co_return;
+    }
+
+    uint64_t waitedUs = 0;
+    for (;;)
+    {
+      String events = {};
+      Filesystem::openReadAtClose(predecessor->cgroup, "cgroup.events"_ctv, events);
+      std::string_view observed(reinterpret_cast<const char *>(events.data()), events.size());
+      if (observed.find("populated 0\n") != std::string_view::npos)
+      {
+        drained = true;
+        co_return;
+      }
+      if (observed.find("populated 1\n") == std::string_view::npos)
+      {
+        if (failureReport) failureReport->assign("legacy storage handoff could not read predecessor cgroup state"_ctv);
+        co_return;
+      }
+      if (waitedUs >= maximumWaitUs)
+      {
+        if (failureReport) failureReport->assign("legacy storage handoff predecessor cgroup did not drain before deadline"_ctv);
+        co_return;
+      }
+
+      const uint64_t delayUs = std::min(pollWaitUs, maximumWaitUs - waitedUs);
+      ProdigyHostDelayOperation delay(*coro);
+      if (delay.scheduleUs(delayUs) == false)
+      {
+        if (failureReport) failureReport->assign("legacy storage handoff could not schedule cgroup drain wait"_ctv);
+        co_return;
+      }
+      if (delay.mustSuspend())
+      {
+        co_await coro->suspend();
+      }
+      if (delay.takeCompletion() == false)
+      {
+        if (failureReport) failureReport->assign("legacy storage handoff cgroup drain wait was canceled"_ctv);
+        co_return;
+      }
+      waitedUs += delayUs;
+    }
+  }
+
   // Mark before cancelling: a timeout or close CQE already queued must see
   // that the replacement owns retirement and must not restart the old process.
   static bool claimCrashBackoffReplacementPredecessor(Container *predecessor, const ContainerPlan& successor,
@@ -12780,9 +12841,28 @@ public:
           delete coro;
         }
 
+        bool cgroupDrained = legacySource.size() == 0;
+        String cgroupDrainFailure = {};
+        if (cgroupDrained == false)
+        {
+          CoroutineStack *coro = new CoroutineStack();
+          if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                waitForPredecessorCgroupDrain(old, coro, cgroupDrained, &cgroupDrainFailure);
+              }))
+          {
+            co_await coro->suspendAtIndex(suspendIndex);
+          }
+          delete coro;
+        }
+
         String handoffFailure;
-        bool staged = legacySource.size() == 0 ||
-                      stageQuiescedLegacyStorage(old, plan, legacySource, legacyIdentity, stagedLegacyPayload, &handoffFailure);
+        bool staged = cgroupDrained && (legacySource.size() == 0 ||
+                      stageQuiescedLegacyStorage(old, plan, legacySource, legacyIdentity, stagedLegacyPayload, &handoffFailure));
+        if (cgroupDrained == false)
+        {
+          handoffFailure.assign(cgroupDrainFailure.size() > 0 ? cgroupDrainFailure :
+                                "legacy storage handoff requires an empty predecessor cgroup"_ctv);
+        }
 #if PRODIGY_DEBUG
         appendContainerTrace(old, "legacy-stage replacement=%llu successor=%llu sourceSelected=%d staged=%d payloadPresent=%d reason=%s\n",
                              (unsigned long long)replaceContainerUUID, (unsigned long long)plan.uuid,

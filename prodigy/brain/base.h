@@ -652,6 +652,14 @@ public:
     return true;
   }
 
+  // Receipts that can launch a process must be bound to the authority that
+  // requested them.  Startup/test owners have one stable authority; Brain
+  // overrides this with its elected master epoch.
+  virtual uint64_t containerLaunchAuthorityEpoch(void) const
+  {
+    return canControlNeurons() ? 1 : 0;
+  }
+
   virtual bool workerBundleUpgradeTransitionPending(const Machine *machine) const
   {
     (void)machine;

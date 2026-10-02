@@ -531,6 +531,38 @@ int main()
     fs::remove_all(directory);
   }
 
+  // Version three is the retained-only form for a uniform logical
+  // predecessor whose actual executable root differs by host.  It is kept
+  // separate from version two: there is no second predecessor identity.
+  {
+    fs::create_directories(".run");
+    char directory[]=".run/retained-split-root-plan-unit-XXXXXX";
+    assert(::mkdtemp(directory));
+    const std::string path=std::string(directory)+"/plan.json";
+    const std::string oldRuntime(64,'a'), oldBundle(64,'b');
+    auto planJSON=[&](bool retained=true) {
+      return std::string("{\"schemaVersion\":3,\"retainedRecoveryMode\":")+(retained?"true":"false")+
+        ",\"clusterUUID\":\"0x7\",\"operationID\":\"0x8\",\"operationRoot\":\"/private/operation\",\"registryRoot\":\"/private/registry\",\"bundlePath\":\"/private/successor.bundle\",\"runtimeRoot\":\"/root/prodigy-nuc-20260914\",\"statePath\":\"/var/lib/prodigy/state\",\"secretsPath\":\"/var/lib/prodigy/secrets\",\"expectedOldRuntimeSHA256\":\""+oldRuntime+"\",\"expectedOldBundleSHA256\":\""+oldBundle+"\",\"machines\":["
+        "{\"machineUUID\":\"0x1\",\"linuxMachineID\":\"11111111111111111111111111111111\",\"sshAddress\":\"fd72::1\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+oldRuntime+"\",\"installedBundleSHA256\":\""+oldBundle+"\"},"
+        "{\"machineUUID\":\"0x2\",\"linuxMachineID\":\"22222222222222222222222222222222\",\"sshAddress\":\"fd72::2\",\"installedRuntimeRoot\":\"/root/prodigy\",\"installedRuntimeSHA256\":\""+oldRuntime+"\",\"installedBundleSHA256\":\""+oldBundle+"\"},"
+        "{\"machineUUID\":\"0x3\",\"linuxMachineID\":\"33333333333333333333333333333333\",\"sshAddress\":\"fd72::3\",\"installedRuntimeRoot\":\"/root/prodigy-nuc-20260914\",\"installedRuntimeSHA256\":\""+oldRuntime+"\",\"installedBundleSHA256\":\""+oldBundle+"\"}]}";
+    };
+    auto writePlan=[&](const std::string& value) { durable(path,text(value)); assert(::chmod(path.c_str(),0600)==0); };
+    auto rejects=[&](const std::string& value) { writePlan(value); bool rejected=false; try {(void)MothershipTidesMigration::parse(path.c_str());} catch(const std::exception&) {rejected=true;} assert(rejected); };
+    writePlan(planJSON()); const auto parsed=MothershipTidesMigration::parse(path.c_str());
+    assert(parsed.retainedRecovery && !parsed.mixedPredecessors && parsed.approvedPredecessors.empty());
+    assert(parsed.machines[0].runtimeRoot=="/root/prodigy" && parsed.machines[2].runtimeRoot=="/root/prodigy-nuc-20260914");
+    String genericFailure;
+    assert(!MothershipTidesMigration::run(path.c_str(),false,&genericFailure));
+    assert(genericFailure=="per-host installed roots require the retained recovery command"_ctv);
+    auto runtimeMismatch=planJSON(); runtimeMismatch.replace(runtimeMismatch.find("\"installedRuntimeSHA256\":\""+oldRuntime),std::string("\"installedRuntimeSHA256\":\"").size()+oldRuntime.size(),"\"installedRuntimeSHA256\":\""+std::string(64,'c')); rejects(runtimeMismatch);
+    auto bundleMismatch=planJSON(); bundleMismatch.replace(bundleMismatch.find("\"installedBundleSHA256\":\""+oldBundle),std::string("\"installedBundleSHA256\":\"").size()+oldBundle.size(),"\"installedBundleSHA256\":\""+std::string(64,'d')); rejects(bundleMismatch);
+    rejects(planJSON(false));
+    auto unsafeRoot=planJSON(); unsafeRoot.replace(unsafeRoot.find("\"installedRuntimeRoot\":\"/root/prodigy\""),std::strlen("\"installedRuntimeRoot\":\"/root/prodigy\""),"\"installedRuntimeRoot\":\"/root/../unsafe\""); rejects(unsafeRoot);
+    auto missingRoot=planJSON(); const std::string rootField="\"installedRuntimeRoot\":\"/root/prodigy\","; missingRoot.erase(missingRoot.find(rootField),rootField.size()); rejects(missingRoot);
+    fs::remove_all(directory);
+  }
+
   Request request;request.clusterUUID=1;
   String interruptedBundle = "retained-recovery-interrupted-update-bundle"_ctv;
   assert(prodigyComputeSHA256Hex(interruptedBundle,request.bundleSHA));

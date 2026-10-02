@@ -140,6 +140,12 @@ private:
   alignas(64) bytell_hash_map<uint64_t, std::priority_queue<SomeEntry, Vector<SomeEntry>, SomeMaxCmp>> someMaxHeaps;
   alignas(64) bytell_hash_map<uint64_t, uint32_t> someHeapEpochs;
 
+  bool pairingExcludedByReplacementWaiter(MeshNode *advertiser, MeshNode *subscriber) const
+  {
+    return advertiser != nullptr && subscriber != nullptr &&
+           (advertiser->excludesPairingWith(subscriber) || subscriber->excludesPairingWith(advertiser));
+  }
+
   static bool vectorHasNode(const Vector<MeshNode *>& nodes, MeshNode *node)
   {
     for (MeshNode *entry : nodes)
@@ -216,7 +222,7 @@ private:
   }
 
   template <typename Fn>
-  void forEachAdvertiserForSubscription(uint64_t subscriptionService, Fn&& fn)
+  void forEachAdvertiserForSubscription(uint64_t subscriptionService, MeshNode *subscriber, Fn&& fn)
   {
     if (MeshServices::isPrefix(subscriptionService))
     {
@@ -229,7 +235,10 @@ private:
 
         for (MeshNode *advertiser : advertisers)
         {
-          fn(advertisedService, advertiser);
+          if (pairingExcludedByReplacementWaiter(advertiser, subscriber) == false)
+          {
+            fn(advertisedService, advertiser);
+          }
         }
       }
 
@@ -240,7 +249,10 @@ private:
     {
       for (MeshNode *advertiser : it->second)
       {
-        fn(subscriptionService, advertiser);
+        if (pairingExcludedByReplacementWaiter(advertiser, subscriber) == false)
+        {
+          fn(subscriptionService, advertiser);
+        }
       }
     }
   }
@@ -272,7 +284,7 @@ private:
     bool found = false;
     int32_t bestCapacity = 0;
 
-    forEachAdvertiserForSubscription(subscriptionService, [&](uint64_t matchedService, MeshNode *candidate) -> void {
+    forEachAdvertiserForSubscription(subscriptionService, subscriber, [&](uint64_t matchedService, MeshNode *candidate) -> void {
       if (candidate == subscriber)
       {
         return;
@@ -534,6 +546,30 @@ private:
     return nullptr;
   }
 
+  MeshNode *pickLeastLoadedSomeForAdvertiser(uint64_t service, MeshNode *advertiser)
+  {
+    auto sit = someCounts.find(service);
+    if (sit == someCounts.end())
+    {
+      return nullptr;
+    }
+    MeshNode *best = nullptr;
+    uint32_t bestCount = 0;
+    for (const auto& [candidate, count] : sit->second)
+    {
+      if (pairingExcludedByReplacementWaiter(advertiser, candidate))
+      {
+        continue;
+      }
+      if (best == nullptr || count < bestCount || (count == bestCount && candidate < best))
+      {
+        best = candidate;
+        bestCount = count;
+      }
+    }
+    return best;
+  }
+
   MeshNode *pickMostLoadedSome(uint64_t service)
   {
     auto hit = someMaxHeaps.find(service);
@@ -593,7 +629,7 @@ private:
 
   void createPairing(MeshNode *advertiser, MeshNode *subscriber, uint64_t service, bool notifyAdvertiser, bool notifySubscriber)
   {
-    if (advertiser == subscriber)
+    if (advertiser == subscriber || pairingExcludedByReplacementWaiter(advertiser, subscriber))
     {
       return;
     }
@@ -1051,7 +1087,7 @@ public:
             break;
           }
 
-          forEachAdvertiserForSubscription(service, [&](uint64_t matchedService, MeshNode *advertiser) -> void {
+          forEachAdvertiserForSubscription(service, subscriber, [&](uint64_t matchedService, MeshNode *advertiser) -> void {
             createPairing(advertiser, subscriber, matchedService, true /* notifyAdvertiser */, true /* notifySubscriber */);
           });
           break;
@@ -1085,7 +1121,7 @@ public:
     if (auto someIt = someSubscribers.find(service); someIt != someSubscribers.end())
     {
       (void)someIt;
-      MeshNode *bestSub = pickLeastLoadedSome(service);
+      MeshNode *bestSub = pickLeastLoadedSomeForAdvertiser(service, advertiser);
       if (bestSub)
       {
         createPairing(advertiser, bestSub, service, true /* notifyAdvertiser */, true /* notifySubscriber */);
@@ -1222,6 +1258,10 @@ public:
 
               bytell_hash_set<MeshNode *>& donorSet = donor->subscribedTo.entriesFor(service);
               auto advIt = donorSet.begin();
+              while (advIt != donorSet.end() && pairingExcludedByReplacementWaiter(*advIt, subscriber))
+              {
+                ++advIt;
+              }
               if (advIt == donorSet.end())
               {
                 break;
@@ -1237,8 +1277,12 @@ public:
           }
           else if (trackedSubscriber && subscriber->subscribedTo.countEntriesFor(service) == 0 && advertisers.size() > 0)
           {
-            MeshNode *advertiser = advertisers.front();
-            createPairing(advertiser, subscriber, service, true /* notifyAdvertiser */, notifySubscriber);
+            uint64_t matchedService = 0;
+            MeshNode *advertiser = nullptr;
+            if (pickBestAnyAdvertiser(service, subscriber, matchedService, advertiser))
+            {
+              createPairing(advertiser, subscriber, matchedService, true /* notifyAdvertiser */, notifySubscriber);
+            }
           }
 
           if (trackedSubscriber == false)
@@ -1251,7 +1295,7 @@ public:
         {
           allSubscribers.insert(service, subscriber);
 
-          forEachAdvertiserForSubscription(service, [&](uint64_t matchedService, MeshNode *advertiser) -> void {
+          forEachAdvertiserForSubscription(service, subscriber, [&](uint64_t matchedService, MeshNode *advertiser) -> void {
             createPairing(advertiser, subscriber, matchedService, true /* notifyAdvertiser */, notifySubscriber);
           });
 
@@ -1396,7 +1440,7 @@ public:
 
     if (auto someIt = someSubscribers.find(service); someIt != someSubscribers.end()) // some subscribers split the advertisers equally
     {
-      MeshNode *bestSub = pickLeastLoadedSome(service);
+      MeshNode *bestSub = pickLeastLoadedSomeForAdvertiser(service, advertiser);
       if (bestSub)
       {
         createPairing(advertiser, bestSub, service, notifyAdvertiser, true /* notifySubscriber */);

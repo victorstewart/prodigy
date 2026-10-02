@@ -10,7 +10,9 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <signal.h>
 #include <string_view>
 #include <sys/stat.h>
@@ -33,6 +35,9 @@ public:
   String lastFailureMessage = {};
   const Machine *pendingBundleTransitionMachine = nullptr;
   bool credentialLaunchAvailable = true;
+  bool holdRuntimePersistence = false;
+  bool persistSucceeds = true;
+  std::deque<PersistenceCompletion> pendingRuntimePersistence;
 
   bool deploymentApiCredentialsAvailableForLaunch(const DeploymentPlan&, String *failure = nullptr) const override
   {
@@ -85,6 +90,46 @@ public:
     (void)deployment;
     (void)lifetime;
     (void)nMore;
+  }
+
+  bool persistLocalRuntimeState(void) override
+  {
+    return persistSucceeds;
+  }
+
+  void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+  {
+    const bool result = persistLocalRuntimeState();
+    if (completion == nullptr)
+    {
+      return;
+    }
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto guarded = [lifetime, completion = std::move(completion)](bool durable) mutable {
+      if (lifetime.expired() == false)
+      {
+        completion(durable);
+      }
+    };
+    if (holdRuntimePersistence)
+    {
+      pendingRuntimePersistence.push_back(std::move(guarded));
+    }
+    else
+    {
+      guarded(result);
+    }
+  }
+
+  void finishRuntimePersistence(bool durable)
+  {
+    if (pendingRuntimePersistence.empty())
+    {
+      return;
+    }
+    auto completion = std::move(pendingRuntimePersistence.front());
+    pendingRuntimePersistence.pop_front();
+    completion(durable);
   }
 };
 
@@ -273,6 +318,8 @@ static bool stringContains(const String& haystack, const char *needle)
   return haystackView.find(needle) != std::string_view::npos;
 }
 
+static bool writeFileFixture(const std::filesystem::path& path, const char *payloadText);
+
 template <class Operation>
 static bool runDNSProviderOperation(Operation&& operation)
 {
@@ -299,6 +346,76 @@ static bool runDNSProviderOperation(Operation&& operation)
   Ring::exit = false;
   Ring::shuttingDown = false;
   return complete && success;
+}
+
+class CgroupFixtureEvent final : public TimeoutDispatcher {
+public:
+
+  TimeoutPacket packet = {};
+  std::filesystem::path eventsPath;
+  bool wrote = false;
+
+  explicit CgroupFixtureEvent(const std::filesystem::path& requestedEventsPath)
+      : eventsPath(requestedEventsPath)
+  {}
+
+  void arm(uint64_t delayUs)
+  {
+    packet.clear();
+    packet.setTimeoutUs(delayUs);
+    packet.dispatcher = this;
+    Ring::queueTimeout(&packet);
+  }
+
+  void dispatchTimeout(TimeoutPacket *completedPacket) override
+  {
+    if (completedPacket == &packet)
+    {
+      wrote = writeFileFixture(eventsPath, "populated 0\nfrozen 0\n");
+    }
+  }
+};
+
+static bool runPredecessorCgroupDrainWait(Container *predecessor,
+                                           String& failure,
+                                           uint64_t maximumWaitUs,
+                                           uint64_t pollWaitUs,
+                                           const std::function<void()>& beforeStart = {})
+{
+  RingDispatcher dispatcher;
+  Ring::interfacer = &dispatcher;
+  Ring::lifecycler = &dispatcher;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  ScopedFreshRing ring = {};
+  if (beforeStart)
+  {
+    beforeStart();
+  }
+
+  CoroutineStack coroutine = {};
+  bool complete = false;
+  bool drained = false;
+  [&]() -> void {
+    if (uint32_t suspendIndex = coroutine.nextSuspendIndex(); coroutine.didSuspend([&](void) -> void {
+          ContainerManager::waitForPredecessorCgroupDrain(predecessor, &coroutine, drained, &failure,
+                                                           maximumWaitUs, pollWaitUs);
+        }))
+    {
+      co_await coroutine.suspendAtIndex(suspendIndex);
+    }
+    complete = true;
+    Ring::exit = true;
+  }();
+  if (complete == false)
+  {
+    Ring::start();
+  }
+  Ring::interfacer = nullptr;
+  Ring::lifecycler = nullptr;
+  Ring::exit = false;
+  Ring::shuttingDown = false;
+  return complete && drained;
 }
 
 template <class Provider>
@@ -812,9 +929,277 @@ static void testStorageParentTraversal(TestSuite& suite)
   }
 }
 
+static void testInplacePairingOrder(TestSuite& suite)
+{
+  // An in-place successor must not serialize the replaced local sibling into
+  // its bootstrap pairing set while the durable receipt is pending. It may
+  // retain still-live remote siblings.
+  for (bool durableReceipt : {false, true})
+  {
+  ScopedFreshRing ring;
+  TestBrain brain = {};
+  brain.holdRuntimePersistence = true;
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack localRack = {};
+  localRack.uuid = 19'208'001;
+  Rack remoteRack = {};
+  remoteRack.uuid = 19'208'002;
+  ScopedSocketPair localSocket = {};
+  ScopedSocketPair remoteSocket = {};
+  Machine localMachine = {};
+  Machine remoteMachine = {};
+  bool controlReady =
+      localSocket.create(suite, "inplace_pairing_order_creates_local_control_socket") &&
+      remoteSocket.create(suite, "inplace_pairing_order_creates_remote_control_socket") &&
+      seedSchedulableMachine(brain, localRack, localMachine, uint128_t(0x19208001), 0x0a000181, "inplace-local"_ctv, localSocket) &&
+      seedSchedulableMachine(brain, remoteRack, remoteMachine, uint128_t(0x19208002), 0x0a000182, "inplace-remote"_ctv, remoteSocket);
+  suite.expect(controlReady, "inplace_pairing_order_arms_control_streams");
+
+  ApplicationDeployment previous = {};
+  seedCommonPlan(previous, true);
+  previous.plan.config.applicationID = 19'208;
+  previous.plan.config.versionID = 1;
+  previous.plan.config.type = ApplicationType::stateful;
+  previous.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  previous.plan.stateful.siblingPrefix = (uint64_t(19'208) << 48) | (uint64_t(2) << 40);
+  previous.plan.stateful.allMasters = false;
+  previous.plan.stateful.neverShard = false;
+  previous.plan.stateful.allowUpdateInPlace = true;
+  previous.state = DeploymentState::running;
+  previous.nDeployedBase = 2;
+  previous.nHealthyBase = 2;
+
+  ApplicationDeployment successor = {};
+  successor.plan = previous.plan;
+  successor.plan.config.versionID = 2;
+  successor.state = DeploymentState::deploying;
+  successor.previous = &previous;
+  previous.next = &successor;
+  brain.deployments.insert_or_assign(previous.plan.config.deploymentID(), &previous);
+  brain.deployments.insert_or_assign(successor.plan.config.deploymentID(), &successor);
+
+  const uint64_t siblingService = StatefulMeshRoles::forShardGroup(previous.plan.stateful, previous.plan.config.applicationID, 0).sibling;
+  ContainerView oldLocal = {};
+  ContainerView oldRemote = {};
+  auto seedOldSibling = [&](ContainerView& container, Machine& machine, uint128_t uuid, uint128_t address, uint16_t port) {
+    container.uuid = uuid;
+    container.deploymentID = previous.plan.config.deploymentID();
+    container.applicationID = previous.plan.config.applicationID;
+    container.machine = &machine;
+    container.lifetime = ApplicationLifetime::base;
+    container.isStateful = true;
+    container.shardGroup = 0;
+    container.state = ContainerState::healthy;
+    container.runtimeReady = true;
+    container.meshAddress = address;
+    container.advertisements.emplace(siblingService, Advertisement(siblingService, ContainerState::scheduled, ContainerState::destroying, port));
+    container.advertisingOnPorts.insert(port);
+    previous.containers.insert(&container);
+    previous.containersByShardGroup.insert(0, &container);
+    previous.countPerMachine[&machine] = 1;
+    previous.countPerRack[machine.rack] = 1;
+    brain.containers.insert_or_assign(container.uuid, &container);
+    machine.upsertContainerIndexEntry(container.deploymentID, &container);
+    brain.mesh->advertise(siblingService, &container, port, false);
+  };
+  seedOldSibling(oldLocal, localMachine, uint128_t(0x19208101), uint128_t(0x19208101), 31'001);
+  seedOldSibling(oldRemote, remoteMachine, uint128_t(0x19208102), uint128_t(0x19208102), 31'002);
+
+  successor.scheduleStatefulUpdateInPlace(&oldLocal);
+  StatefulWork *work = std::get_if<StatefulWork>(successor.toSchedule[0]);
+  ContainerView *green = work ? work->container : nullptr;
+  if (controlReady)
+  {
+    successor.schedule(nullptr);
+  }
+
+  suite.expect(green != nullptr && brain.pendingRuntimePersistence.size() == 1 &&
+                   oldLocal.state == ContainerState::healthy && brain.containers.contains(oldLocal.uuid),
+               "inplace_pairing_order_holds_healthy_predecessor_until_durable_receipt");
+  suite.expect(green != nullptr && green->subscribedTo.hasEntryFor(siblingService, &oldLocal) == false,
+               "inplace_pairing_order_excludes_local_sibling_while_receipt_pending");
+  suite.expect(green != nullptr && green->subscribedTo.hasEntryFor(siblingService, &oldRemote),
+               "inplace_pairing_order_preserves_live_remote_sibling_pairing");
+  ContainerPlan capturedSuccessor = green ? green->generatePlan(successor.plan, successor.nShardGroups) : ContainerPlan {};
+  bool capturedOldLocal = false;
+  bool capturedRemote = false;
+  for (const auto& [service, pairings] : capturedSuccessor.subscriptionPairings)
+  {
+    (void)service;
+    for (const SubscriptionPairing& pairing : pairings)
+    {
+      capturedOldLocal |= pairing.address == oldLocal.pairingAddress();
+      capturedRemote |= pairing.address == oldRemote.pairingAddress();
+    }
+  }
+  suite.expect(green != nullptr && capturedOldLocal == false && capturedRemote,
+               "inplace_pairing_order_pending_canonical_capture_excludes_local_and_retains_remote");
+
+  brain.finishRuntimePersistence(durableReceipt);
+  brain.holdRuntimePersistence = false;
+
+  suite.expect(
+      durableReceipt ? (oldLocal.state == ContainerState::destroying && brain.containers.contains(oldLocal.uuid) &&
+                        previous.containers.contains(&oldLocal) == false &&
+                        brain.mesh->isAdvertising(siblingService, &oldLocal) == false &&
+                        oldLocal.destructionWaiterDeploymentID == successor.plan.config.deploymentID())
+                     : (oldLocal.state == ContainerState::healthy && brain.containers.contains(oldLocal.uuid) &&
+                        oldLocal.destructionWaiterDeploymentID == 0 && brain.mesh->isAdvertising(siblingService, &oldLocal)),
+      durableReceipt ? "inplace_pairing_order_success_receipt_retires_predecessor"
+                     : "inplace_pairing_order_failed_receipt_preserves_predecessor_mesh");
+
+  NeuronContainerBootstrap bootstrap = {};
+  uint128_t queuedReplacement = 0;
+  bool decodedSpin = false;
+  uint8_t *cursor = localMachine.neuron.wBuffer.data();
+  uint8_t *terminal = cursor + localMachine.neuron.wBuffer.size();
+  while (cursor < terminal)
+  {
+    Message *message = reinterpret_cast<Message *>(cursor);
+    if (message->size == 0)
+    {
+      break;
+    }
+    if (NeuronTopic(message->topic) == NeuronTopic::spinContainer)
+    {
+      uint8_t *args = message->args;
+      String serialized = {};
+      Message::extractArg<ArgumentNature::fixed>(args, queuedReplacement);
+      Message::extractToStringView(args, serialized);
+      decodedSpin = BitseryEngine::deserializeSafe(serialized, bootstrap);
+      break;
+    }
+    cursor += message->size;
+  }
+  bool serializedOldLocal = false;
+  bool serializedRemote = false;
+  for (const auto& [service, pairings] : bootstrap.plan.subscriptionPairings)
+  {
+    (void)service;
+    for (const SubscriptionPairing& pairing : pairings)
+    {
+      serializedOldLocal |= pairing.address == oldLocal.pairingAddress();
+      serializedRemote |= pairing.address == oldRemote.pairingAddress();
+    }
+  }
+  suite.expect(durableReceipt ? (decodedSpin && queuedReplacement == oldLocal.uuid) : !decodedSpin,
+               durableReceipt ? "inplace_pairing_order_success_receipt_emits_replacement_spin"
+                              : "inplace_pairing_order_failed_receipt_emits_no_spin");
+  suite.expect(durableReceipt ? (decodedSpin && serializedOldLocal == false && serializedRemote) : true,
+               "inplace_pairing_order_bootstrap_serializes_only_live_remote_sibling");
+
+  // Complete the scheduler before destroying stack-owned fixture containers.
+  successor.previous = nullptr;
+  if (green && durableReceipt)
+  {
+    successor.containerIsHealthy(green);
+    brain.mesh->stopAllSubscriptions(green);
+    brain.mesh->stopAllAdvertisments(green);
+    successor.containers.erase(green);
+    while (successor.containersByShardGroup.eraseEntry(green->shardGroup, green)) {}
+    brain.containers.erase(green->uuid);
+    localMachine.removeContainerIndexEntry(green->deploymentID, green);
+    delete green;
+  }
+  brain.mesh->stopAllSubscriptions(&oldLocal);
+  brain.mesh->stopAllAdvertisments(&oldLocal);
+  brain.mesh->stopAllSubscriptions(&oldRemote);
+  brain.mesh->stopAllAdvertisments(&oldRemote);
+  previous.containers.erase(&oldLocal);
+  previous.containers.erase(&oldRemote);
+  while (previous.containersByShardGroup.eraseEntry(0, &oldLocal)) {}
+  while (previous.containersByShardGroup.eraseEntry(0, &oldRemote)) {}
+  brain.containers.erase(oldLocal.uuid);
+  brain.containers.erase(oldRemote.uuid);
+  localMachine.removeContainerIndexEntry(oldLocal.deploymentID, &oldLocal);
+  remoteMachine.removeContainerIndexEntry(oldRemote.deploymentID, &oldRemote);
+  localRack.machines.erase(&localMachine);
+  remoteRack.machines.erase(&remoteMachine);
+  brain.machines.erase(&localMachine);
+  brain.machines.erase(&remoteMachine);
+  brain.racks.erase(localRack.uuid);
+  brain.racks.erase(remoteRack.uuid);
+  brain.deployments.erase(previous.plan.config.deploymentID());
+  brain.deployments.erase(successor.plan.config.deploymentID());
+  thisBrain = savedBrain;
+  }
+
+  // Selection must skip the reserved same-host predecessor, rather than
+  // selecting it and silently dropping the pairing.  Cover the two chooser
+  // paths used by ordinary service definitions.
+  {
+    Mesh mesh = {};
+    Machine localMachine = {};
+    Machine remoteMachine = {};
+    constexpr uint64_t anyService = 0x19208201;
+    PairingCountingContainerView localAdvertiser = {};
+    PairingCountingContainerView remoteAdvertiser = {};
+    PairingCountingContainerView successorSubscriber = {};
+    localAdvertiser.machine = &localMachine;
+    localAdvertiser.deploymentID = 19'208'001;
+    localAdvertiser.destructionWaiterDeploymentID = 19'208'002;
+    localAdvertiser.state = ContainerState::healthy;
+    localAdvertiser.runtimeReady = true;
+    localAdvertiser.advertisements.emplace(anyService, Advertisement(anyService, ContainerState::scheduled, ContainerState::destroying, 31'003));
+    remoteAdvertiser.machine = &remoteMachine;
+    remoteAdvertiser.deploymentID = 19'208'001;
+    remoteAdvertiser.state = ContainerState::healthy;
+    remoteAdvertiser.runtimeReady = true;
+    remoteAdvertiser.advertisements.emplace(anyService, Advertisement(anyService, ContainerState::scheduled, ContainerState::destroying, 31'004));
+    successorSubscriber.machine = &localMachine;
+    successorSubscriber.deploymentID = 19'208'002;
+    successorSubscriber.state = ContainerState::scheduled;
+    successorSubscriber.subscriptions.emplace(anyService, Subscription(anyService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    mesh.advertise(anyService, &localAdvertiser, 31'003, false);
+    mesh.advertise(anyService, &remoteAdvertiser, 31'004, false);
+    mesh.subscribe(anyService, &successorSubscriber, SubscriptionNature::any, false);
+    suite.expect(successorSubscriber.subscribedTo.hasEntryFor(anyService, &localAdvertiser) == false &&
+                     successorSubscriber.subscribedTo.hasEntryFor(anyService, &remoteAdvertiser),
+                 "inplace_pairing_order_any_selection_skips_reserved_local_predecessor");
+  }
+
+  {
+    Mesh mesh = {};
+    Machine localMachine = {};
+    Machine remoteMachine = {};
+    constexpr uint64_t someService = 0x19208202;
+    PairingCountingContainerView reservedLocalSubscriber = {};
+    PairingCountingContainerView remoteSubscriber = {};
+    PairingCountingContainerView successorAdvertiser = {};
+    reservedLocalSubscriber.machine = &localMachine;
+    reservedLocalSubscriber.deploymentID = 19'208'001;
+    reservedLocalSubscriber.destructionWaiterDeploymentID = 19'208'002;
+    reservedLocalSubscriber.state = ContainerState::healthy;
+    remoteSubscriber.machine = &remoteMachine;
+    remoteSubscriber.deploymentID = 19'208'001;
+    remoteSubscriber.state = ContainerState::healthy;
+    successorAdvertiser.machine = &localMachine;
+    successorAdvertiser.deploymentID = 19'208'002;
+    successorAdvertiser.state = ContainerState::scheduled;
+    successorAdvertiser.runtimeReady = true;
+    successorAdvertiser.advertisements.emplace(someService, Advertisement(someService, ContainerState::scheduled, ContainerState::destroying, 31'005));
+    reservedLocalSubscriber.subscriptions.emplace(someService, Subscription(someService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::exclusiveSome));
+    remoteSubscriber.subscriptions.emplace(someService, Subscription(someService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::exclusiveSome));
+    mesh.subscribe(someService, &reservedLocalSubscriber, SubscriptionNature::exclusiveSome, false);
+    mesh.subscribe(someService, &remoteSubscriber, SubscriptionNature::exclusiveSome, false);
+    mesh.advertise(someService, &successorAdvertiser, 31'005, false);
+    suite.expect(successorAdvertiser.advertisingTo.hasEntryFor(someService, &reservedLocalSubscriber) == false &&
+                     successorAdvertiser.advertisingTo.hasEntryFor(someService, &remoteSubscriber),
+                 "inplace_pairing_order_some_selection_skips_reserved_local_predecessor");
+  }
+}
+
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_INPLACE_PAIRING_ONLY") != nullptr)
+  {
+    testInplacePairingOrder(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
   // Exercise the CLI's parser directly; this path needs no runtime resources.
   {
     auto parse = [](const char *input, DeploymentPlan& plan, String& failure) {
@@ -1062,10 +1447,12 @@ int main(void)
     dprintf(STDOUT_FILENO, "storage_handoff_focused failed=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
-  if (getenv("PRODIGY_TEST_STORAGE_REFLINK_ONLY") != nullptr)
+  if (getenv("PRODIGY_TEST_STORAGE_REFLINK_ONLY") != nullptr ||
+      getenv("PRODIGY_TEST_CGROUP_DRAIN_ONLY") != nullptr)
   {
-    // Ordinary file operations only, rooted in this worktree's .run. No Ring,
-    // runtime roots, mounts, BPF, namespace or cgroup operations are invoked.
+    // File fixtures and Ring timers are rooted in this worktree's .run. No
+    // runtime roots, mounts, BPF, namespace or real cgroup operations are invoked.
+    std::filesystem::create_directories(".run");
     TemporaryDirectory fixture;
     suite.expect(fixture.create(".run"), "reflink_fixture_created");
     if (fixture.path.size() == 0) return EXIT_FAILURE;
@@ -1099,6 +1486,39 @@ int main(void)
     successor.config.runAsID = 1000;
     uint32_t mappedBase = 0, mappedID = 0;
     suite.expect(prodigyDeriveContainerHostIDs(successor, mappedBase, mappedID), "reflink_successor_mapping_valid");
+    String drainFailure = {};
+    suite.expect(runPredecessorCgroupDrainWait(&predecessor, drainFailure, 1'000, 100) && drainFailure.empty(),
+                 "reflink_cgroup_drain_immediate_empty_succeeds");
+    CgroupFixtureEvent cgroupExit(cgroup / "cgroup.events");
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 1\nfrozen 0\n"),
+                 "reflink_cgroup_drain_populated_fixture_created");
+    drainFailure.clear();
+    suite.expect(runPredecessorCgroupDrainWait(&predecessor, drainFailure, 50'000, 5'000,
+                                                [&] { cgroupExit.arm(1'000); }) &&
+                     cgroupExit.wrote && drainFailure.empty(),
+                 "reflink_cgroup_drain_waits_for_ring_observed_exit");
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 1\nfrozen 0\n"),
+                 "reflink_cgroup_drain_timeout_fixture_created");
+    drainFailure.clear();
+    suite.expect(!runPredecessorCgroupDrainWait(&predecessor, drainFailure, 1'000, 500) &&
+                     stringContains(drainFailure, "did not drain") &&
+                     !std::filesystem::exists(root / "handoffs"),
+                 "reflink_cgroup_drain_timeout_preserves_uncaptured_storage");
+    std::filesystem::remove(cgroup / "cgroup.events");
+    drainFailure.clear();
+    suite.expect(!runPredecessorCgroupDrainWait(&predecessor, drainFailure, 1'000, 100) &&
+                     stringContains(drainFailure, "could not read") &&
+                     !std::filesystem::exists(root / "handoffs"),
+                 "reflink_cgroup_drain_read_failure_preserves_uncaptured_storage");
+    suite.expect(writeFileFixture(cgroup / "cgroup.events", "populated 0\nfrozen 0\n"),
+                 "reflink_cgroup_drain_fixture_restored");
+    if (getenv("PRODIGY_TEST_CGROUP_DRAIN_ONLY") != nullptr)
+    {
+      close(predecessor.cgroup);
+      predecessor.cgroup = -1;
+      dprintf(STDOUT_FILENO, "cgroup_drain_focused failed=%d\n", suite.failed);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     struct stat identity = {};
     suite.expect(stat(source.c_str(), &identity) == 0, "reflink_source_identity_observed");
     String sourcePath, handoffRoot, staged, failure;
@@ -11231,167 +11651,7 @@ int main(void)
     thisBrain = savedBrain;
   }
 
-  {
-    // An in-place successor must not serialize the replaced local sibling into
-    // its bootstrap pairing set. It may retain still-live remote siblings.
-    ScopedFreshRing ring;
-    TestBrain brain = {};
-    BrainBase *savedBrain = thisBrain;
-    thisBrain = &brain;
-
-    Rack localRack = {};
-    localRack.uuid = 19'208'001;
-    Rack remoteRack = {};
-    remoteRack.uuid = 19'208'002;
-    ScopedSocketPair localSocket = {};
-    ScopedSocketPair remoteSocket = {};
-    Machine localMachine = {};
-    Machine remoteMachine = {};
-    bool controlReady =
-        localSocket.create(suite, "inplace_pairing_order_creates_local_control_socket") &&
-        remoteSocket.create(suite, "inplace_pairing_order_creates_remote_control_socket") &&
-        seedSchedulableMachine(brain, localRack, localMachine, uint128_t(0x19208001), 0x0a000181, "inplace-local"_ctv, localSocket) &&
-        seedSchedulableMachine(brain, remoteRack, remoteMachine, uint128_t(0x19208002), 0x0a000182, "inplace-remote"_ctv, remoteSocket);
-    suite.expect(controlReady, "inplace_pairing_order_arms_control_streams");
-
-    ApplicationDeployment previous = {};
-    seedCommonPlan(previous, true);
-    previous.plan.config.applicationID = 19'208;
-    previous.plan.config.versionID = 1;
-    previous.plan.config.type = ApplicationType::stateful;
-    previous.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
-    previous.plan.stateful.siblingPrefix = (uint64_t(19'208) << 48) | (uint64_t(2) << 40);
-    previous.plan.stateful.allMasters = false;
-    previous.plan.stateful.neverShard = false;
-    previous.plan.stateful.allowUpdateInPlace = true;
-    previous.state = DeploymentState::running;
-    previous.nDeployedBase = 2;
-    previous.nHealthyBase = 2;
-
-    ApplicationDeployment successor = {};
-    successor.plan = previous.plan;
-    successor.plan.config.versionID = 2;
-    successor.state = DeploymentState::deploying;
-    successor.previous = &previous;
-    previous.next = &successor;
-    brain.deployments.insert_or_assign(previous.plan.config.deploymentID(), &previous);
-    brain.deployments.insert_or_assign(successor.plan.config.deploymentID(), &successor);
-
-    const uint64_t siblingService = StatefulMeshRoles::forShardGroup(previous.plan.stateful, previous.plan.config.applicationID, 0).sibling;
-    ContainerView oldLocal = {};
-    ContainerView oldRemote = {};
-    auto seedOldSibling = [&](ContainerView& container, Machine& machine, uint128_t uuid, uint128_t address, uint16_t port) {
-      container.uuid = uuid;
-      container.deploymentID = previous.plan.config.deploymentID();
-      container.applicationID = previous.plan.config.applicationID;
-      container.machine = &machine;
-      container.lifetime = ApplicationLifetime::base;
-      container.isStateful = true;
-      container.shardGroup = 0;
-      container.state = ContainerState::healthy;
-      container.runtimeReady = true;
-      container.meshAddress = address;
-      container.advertisements.emplace(siblingService, Advertisement(siblingService, ContainerState::scheduled, ContainerState::destroying, port));
-      container.advertisingOnPorts.insert(port);
-      previous.containers.insert(&container);
-      previous.containersByShardGroup.insert(0, &container);
-      previous.countPerMachine[&machine] = 1;
-      previous.countPerRack[machine.rack] = 1;
-      brain.containers.insert_or_assign(container.uuid, &container);
-      machine.upsertContainerIndexEntry(container.deploymentID, &container);
-      brain.mesh->advertise(siblingService, &container, port, false);
-    };
-    seedOldSibling(oldLocal, localMachine, uint128_t(0x19208101), uint128_t(0x19208101), 31'001);
-    seedOldSibling(oldRemote, remoteMachine, uint128_t(0x19208102), uint128_t(0x19208102), 31'002);
-
-    successor.scheduleStatefulUpdateInPlace(&oldLocal);
-    StatefulWork *work = std::get_if<StatefulWork>(successor.toSchedule[0]);
-    ContainerView *green = work ? work->container : nullptr;
-    if (controlReady)
-    {
-      successor.schedule(nullptr);
-    }
-
-    suite.expect(green != nullptr && oldLocal.state == ContainerState::destroying,
-                 "inplace_pairing_order_retires_local_predecessor_before_successor_bootstrap");
-    suite.expect(green != nullptr && green->subscribedTo.hasEntryFor(siblingService, &oldLocal) == false,
-                 "inplace_pairing_order_excludes_retired_local_sibling_from_successor_pairings");
-    suite.expect(green != nullptr && green->subscribedTo.hasEntryFor(siblingService, &oldRemote),
-                 "inplace_pairing_order_preserves_live_remote_sibling_pairing");
-    NeuronContainerBootstrap bootstrap = {};
-    uint128_t queuedReplacement = 0;
-    bool decodedSpin = false;
-    uint8_t *cursor = localMachine.neuron.wBuffer.data();
-    uint8_t *terminal = cursor + localMachine.neuron.wBuffer.size();
-    while (cursor < terminal)
-    {
-      Message *message = reinterpret_cast<Message *>(cursor);
-      if (message->size == 0)
-      {
-        break;
-      }
-      if (NeuronTopic(message->topic) == NeuronTopic::spinContainer)
-      {
-        uint8_t *args = message->args;
-        String serialized = {};
-        Message::extractArg<ArgumentNature::fixed>(args, queuedReplacement);
-        Message::extractToStringView(args, serialized);
-        decodedSpin = BitseryEngine::deserializeSafe(serialized, bootstrap);
-        break;
-      }
-      cursor += message->size;
-    }
-    bool serializedOldLocal = false;
-    bool serializedRemote = false;
-    for (const auto& [service, pairings] : bootstrap.plan.subscriptionPairings)
-    {
-      (void)service;
-      for (const SubscriptionPairing& pairing : pairings)
-      {
-        serializedOldLocal |= pairing.address == oldLocal.pairingAddress();
-        serializedRemote |= pairing.address == oldRemote.pairingAddress();
-      }
-    }
-    suite.expect(decodedSpin && queuedReplacement == oldLocal.uuid,
-                 "inplace_pairing_order_preserves_replacement_spin_transport");
-    suite.expect(decodedSpin && serializedOldLocal == false && serializedRemote,
-                 "inplace_pairing_order_bootstrap_serializes_only_live_remote_sibling");
-
-    // Complete the scheduler before destroying stack-owned fixture containers.
-    successor.previous = nullptr;
-    if (green)
-    {
-      successor.containerIsHealthy(green);
-      brain.mesh->stopAllSubscriptions(green);
-      brain.mesh->stopAllAdvertisments(green);
-      successor.containers.erase(green);
-      while (successor.containersByShardGroup.eraseEntry(green->shardGroup, green)) {}
-      brain.containers.erase(green->uuid);
-      localMachine.removeContainerIndexEntry(green->deploymentID, green);
-      delete green;
-    }
-    brain.mesh->stopAllSubscriptions(&oldLocal);
-    brain.mesh->stopAllAdvertisments(&oldLocal);
-    brain.mesh->stopAllSubscriptions(&oldRemote);
-    brain.mesh->stopAllAdvertisments(&oldRemote);
-    previous.containers.erase(&oldLocal);
-    previous.containers.erase(&oldRemote);
-    while (previous.containersByShardGroup.eraseEntry(0, &oldLocal)) {}
-    while (previous.containersByShardGroup.eraseEntry(0, &oldRemote)) {}
-    brain.containers.erase(oldLocal.uuid);
-    brain.containers.erase(oldRemote.uuid);
-    localMachine.removeContainerIndexEntry(oldLocal.deploymentID, &oldLocal);
-    remoteMachine.removeContainerIndexEntry(oldRemote.deploymentID, &oldRemote);
-    localRack.machines.erase(&localMachine);
-    remoteRack.machines.erase(&remoteMachine);
-    brain.machines.erase(&localMachine);
-    brain.machines.erase(&remoteMachine);
-    brain.racks.erase(localRack.uuid);
-    brain.racks.erase(remoteRack.uuid);
-    brain.deployments.erase(previous.plan.config.deploymentID());
-    brain.deployments.erase(successor.plan.config.deploymentID());
-    thisBrain = savedBrain;
-  }
+  testInplacePairingOrder(suite);
 
   for (bool renewAfterEntryFailure : {false, true})
   {

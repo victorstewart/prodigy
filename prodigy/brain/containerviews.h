@@ -251,7 +251,24 @@ public:
     return canProxySendToNeuron() &&
            (state == ContainerState::scheduled ||
             state == ContainerState::healthy ||
-            state == ContainerState::crashedRestarting);
+           state == ContainerState::crashedRestarting);
+  }
+
+  uint64_t pairingDeploymentID(void) const override
+  {
+    return deploymentID;
+  }
+
+  const void *pairingMachineIdentity(void) const override
+  {
+    return machine;
+  }
+
+  bool excludesPairingWith(const MeshNode *peer) const override
+  {
+    return peer != nullptr && machine != nullptr && destructionWaiterDeploymentID != 0 &&
+           destructionWaiterDeploymentID == peer->pairingDeploymentID() &&
+           machine == peer->pairingMachineIdentity();
   }
 
   void clearStatefulTopologyCutoverBarrier(void)

@@ -2109,6 +2109,25 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
 
    add_test(
+      NAME prodigy_container_crash_recovery_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=crash-recovery
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_container_crash_recovery_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_predecessor_cgroup_drain_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CGROUP_DRAIN_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_predecessor_cgroup_drain_unit PROPERTIES TIMEOUT 10)
+   add_test(
+      NAME prodigy_durable_replacement_pairing_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_INPLACE_PAIRING_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_durable_replacement_pairing_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
       NAME prodigy_remote_bootstrap_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_remote_bootstrap_unit
    )

@@ -6800,6 +6800,46 @@ public:
     package.runtimeState.nextTlsResumptionGeneration = (nextTlsResumptionGeneration == 0) ? 1 : nextTlsResumptionGeneration;
     package.runtimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
     package.runtimeState.updateSelf = capturePersistentUpdateSelfState();
+
+    // A Neuron process can outlive a Brain restart.  Capture the canonical
+    // launch record before its state upload becomes the only recovery source:
+    // a fresh Neuron refuses to upload a populated cgroup that is not already
+    // indexed by Brain, which otherwise makes recovery permanently stall.
+    package.containerRuntimeStates.clear();
+    package.containerRuntimeStates.reserve(containers.size());
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      BrainReplicatedContainerRuntimeState state = {};
+      if (captureReplicatedContainerRuntimeState(container, state))
+      {
+        package.containerRuntimeStates.push_back(std::move(state));
+      }
+    }
+    // Package application happens before deployment and machine objects are
+    // rebuilt.  Keep deferred canonical records in the next snapshot too, so
+    // an intervening writer receipt cannot erase the only recovery identity.
+    bytell_hash_set<uint128_t> capturedUUIDs = {};
+    for (const BrainReplicatedContainerRuntimeState& state : package.containerRuntimeStates)
+    {
+      capturedUUIDs.insert(state.plan.uuid);
+    }
+    for (const auto& [deploymentID, pending] : pendingReplicatedContainerRuntimeStates)
+    {
+      (void)deploymentID;
+      for (const BrainReplicatedContainerRuntimeState& state : pending)
+      {
+        if (state.plan.uuid != 0 && capturedUUIDs.insert(state.plan.uuid).second)
+        {
+          package.containerRuntimeStates.push_back(state);
+        }
+      }
+    }
+    std::sort(package.containerRuntimeStates.begin(), package.containerRuntimeStates.end(),
+              [](const BrainReplicatedContainerRuntimeState& lhs,
+                 const BrainReplicatedContainerRuntimeState& rhs) {
+                return lhs.plan.uuid < rhs.plan.uuid;
+              });
   }
 
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
@@ -6834,6 +6874,14 @@ public:
     nextReservableApplicationID = (package.nextReservableApplicationID == 0) ? 1 : package.nextReservableApplicationID;
     deploymentPlans = package.deploymentPlans;
     failedDeployments = package.failedDeployments;
+    pendingReplicatedContainerRuntimeStates.clear();
+    for (const BrainReplicatedContainerRuntimeState& state : package.containerRuntimeStates)
+    {
+      // Deployment and machine objects are rebuilt after the persistent
+      // authority package.  Retain the exact canonical record through that
+      // reconstruction and let the existing apply owner validate/index it.
+      pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
+    }
     masterAuthorityRuntimeState = std::move(restoredRuntimeState);
     if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
     {
@@ -8028,7 +8076,7 @@ public:
     }
   }
 
-  bool captureReplicatedContainerRuntimeState(ContainerView *container, BrainReplicatedContainerRuntimeState& state)
+  bool captureReplicatedContainerRuntimeState(ContainerView *container, BrainReplicatedContainerRuntimeState& state) const
   {
     if (container == nullptr || container->machine == nullptr)
     {
@@ -23309,6 +23357,11 @@ public:
   bool canControlNeurons(void) const override
   {
     return weAreMaster;
+  }
+
+  uint64_t containerLaunchAuthorityEpoch(void) const override
+  {
+    return isActiveMaster() ? masterAuthorityEpoch : 0;
   }
 
 protected:

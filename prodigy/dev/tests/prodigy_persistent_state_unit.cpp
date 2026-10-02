@@ -276,7 +276,7 @@ static bool equalMetricSamples(const Vector<ProdigyMetricSample>& lhs, const Vec
 
 static bool equalMasterAuthorityPackages(const ProdigyPersistentMasterAuthorityPackage& lhs, const ProdigyPersistentMasterAuthorityPackage& rhs)
 {
-  if (equalMapBySerializedValue(lhs.tlsVaultFactoriesByApp, rhs.tlsVaultFactoriesByApp) == false || equalMapBySerializedValue(lhs.apiCredentialSetsByApp, rhs.apiCredentialSetsByApp) == false || lhs.reservedApplicationIDsByName.size() != rhs.reservedApplicationIDsByName.size() || lhs.reservedApplicationNamesByID.size() != rhs.reservedApplicationNamesByID.size() || lhs.reservedApplicationServices.size() != rhs.reservedApplicationServices.size() || lhs.nextReservableApplicationID != rhs.nextReservableApplicationID || equalMapBySerializedValue(lhs.deploymentPlans, rhs.deploymentPlans) == false || equalMapBySerializedValue(lhs.failedDeployments, rhs.failedDeployments) == false || lhs.runtimeState != rhs.runtimeState)
+  if (equalMapBySerializedValue(lhs.tlsVaultFactoriesByApp, rhs.tlsVaultFactoriesByApp) == false || equalMapBySerializedValue(lhs.apiCredentialSetsByApp, rhs.apiCredentialSetsByApp) == false || lhs.reservedApplicationIDsByName.size() != rhs.reservedApplicationIDsByName.size() || lhs.reservedApplicationNamesByID.size() != rhs.reservedApplicationNamesByID.size() || lhs.reservedApplicationServices.size() != rhs.reservedApplicationServices.size() || lhs.nextReservableApplicationID != rhs.nextReservableApplicationID || equalMapBySerializedValue(lhs.deploymentPlans, rhs.deploymentPlans) == false || equalMapBySerializedValue(lhs.failedDeployments, rhs.failedDeployments) == false || lhs.containerRuntimeStates.size() != rhs.containerRuntimeStates.size() || lhs.runtimeState != rhs.runtimeState)
   {
     return false;
   }
@@ -302,6 +302,15 @@ static bool equalMasterAuthorityPackages(const ProdigyPersistentMasterAuthorityP
   for (uint32_t index = 0; index < lhs.reservedApplicationServices.size(); ++index)
   {
     if (equalSerializedObjects(lhs.reservedApplicationServices[index], rhs.reservedApplicationServices[index]) == false)
+    {
+      return false;
+    }
+  }
+
+  for (uint32_t index = 0; index < lhs.containerRuntimeStates.size(); ++index)
+  {
+    if (prodigyPersistentContainerRuntimeStateEqual(
+            lhs.containerRuntimeStates[index], rhs.containerRuntimeStates[index]) == false)
     {
       return false;
     }
@@ -678,6 +687,11 @@ public:
   ProdigyMasterAuthorityRuntimeState state;
 };
 
+class LegacyPersistentMasterAuthorityPackageWire {
+public:
+  ProdigyPersistentMasterAuthorityPackage package;
+};
+
 template <bool includesMaterializedStatefulRecoveryOperations, typename S>
 static void serializeLegacyRuntimeStateFields(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
@@ -724,6 +738,29 @@ static void serialize(S&& serializer, VersionOneRuntimeStateWire& wire)
   serializer.value8b(marker);
   serializer.value8b(version);
   serializeLegacyRuntimeStateFields<true>(serializer, wire.state);
+}
+
+template <typename S>
+static void serialize(S&& serializer, LegacyPersistentMasterAuthorityPackageWire& wire)
+{
+  auto& package = wire.package;
+  serializer.object(package.tlsVaultFactoriesByApp);
+  serializer.object(package.apiCredentialSetsByApp);
+  prodigySerializePersistentMapAsEntries(
+      serializer, package.reservedApplicationIDsByName,
+      [](S& serializer, String& key) { serializer.text1b(key, UINT32_MAX); },
+      [](S& serializer, uint16_t& value) { serializer.value2b(value); },
+      [](const String& lhs, const String& rhs) { return prodigyPersistentStringComesBefore(lhs, rhs); });
+  prodigySerializePersistentMapAsEntries(
+      serializer, package.reservedApplicationNamesByID,
+      [](S& serializer, uint16_t& key) { serializer.value2b(key); },
+      [](S& serializer, String& value) { serializer.text1b(value, UINT32_MAX); },
+      [](const uint16_t& lhs, const uint16_t& rhs) { return lhs < rhs; });
+  serializer.object(package.reservedApplicationServices);
+  serializer.value2b(package.nextReservableApplicationID);
+  serializer.object(package.deploymentPlans);
+  serializer.object(package.failedDeployments);
+  serializer.object(package.runtimeState);
 }
 
 static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
@@ -860,6 +897,23 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   suite.expect(BitseryEngine::deserializeSafe(retryBytes, retryDecoded) && retryDecoded == retryState,
                "master_authority_runtime_state_roundtrips_v4_retained_storage_retry");
 
+  ProdigyPersistentMasterAuthorityPackage v5Package = {};
+  v5Package.runtimeState.generation = 23;
+  BrainReplicatedContainerRuntimeState v5Runtime = {};
+  v5Runtime.machineUUID = 0x111;
+  v5Runtime.plan.uuid = 0x222;
+  v5Package.containerRuntimeStates.push_back(v5Runtime);
+  String v5PackageBytes = {};
+  BitseryEngine::serialize(v5PackageBytes, v5Package);
+  ProdigyPersistentMasterAuthorityPackage v5Decoded = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(v5PackageBytes, v5Decoded) &&
+          v5Decoded.runtimeState.generation == v5Package.runtimeState.generation &&
+          v5Decoded.runtimeState.materializedStatefulRecoveryRetries.empty() &&
+          v5Decoded.containerRuntimeStates.size() == 1 &&
+          equalSerializedObjects(v5Decoded.containerRuntimeStates[0], v5Runtime),
+      "persistent_master_authority_package_roundtrips_v5_container_state_with_empty_retry_tail");
+
   String truncated = bothBytes;
   truncated.resize(8);
   ProdigyMasterAuthorityRuntimeState malformed = {};
@@ -872,6 +926,20 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,
                "master_authority_runtime_state_rejects_unknown_version_marker");
+
+  LegacyPersistentMasterAuthorityPackageWire legacyPackage = {};
+  legacyPackage.package.nextReservableApplicationID = 37;
+  legacyPackage.package.runtimeState.generation = 21;
+  legacyPackage.package.runtimeState.hasCompletedInitialMasterElection = true;
+  String legacyPackageBytes = {};
+  BitseryEngine::serialize(legacyPackageBytes, legacyPackage);
+  ProdigyPersistentMasterAuthorityPackage decodedLegacyPackage = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(legacyPackageBytes, decodedLegacyPackage) &&
+          decodedLegacyPackage.nextReservableApplicationID == 37 &&
+          decodedLegacyPackage.runtimeState.generation == 21 &&
+          decodedLegacyPackage.containerRuntimeStates.empty(),
+      "persistent_master_authority_package_reads_pre_container_runtime_state_format");
 }
 
 static int runPersistentUpdateBundleSnapshotMeasurement(TestSuite& suite, const char *bundlePath)
@@ -1476,6 +1544,42 @@ int main(void)
   String retainedBootstrapBytes = {};
   BitseryEngine::serialize(retainedBootstrapBytes, retainedBootstrap);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.push_back(retainedBootstrapBytes);
+
+  String runtimeContainerCredentialNeedle = {};
+  runtimeContainerCredentialNeedle.assign("runtime-container-api-secret"_ctv);
+  BrainReplicatedContainerRuntimeState runtimeContainerState = {};
+  runtimeContainerState.machineUUID = 0x9010AA;
+  runtimeContainerState.machinePrivate4 = 0x0A000011;
+  runtimeContainerState.plan = retainedBootstrap.plan;
+  runtimeContainerState.plan.uuid = 0x901235;
+  runtimeContainerState.plan.credentialBundle.apiCredentials[0].material = runtimeContainerCredentialNeedle;
+  SubscriptionPairing runtimeSubscriptionPairing = {};
+  runtimeSubscriptionPairing.secret = (uint128_t(0x70616972696e672d) << 64) | uint128_t(0x7365637265742d31);
+  runtimeSubscriptionPairing.address = uint128_t(0x111);
+  runtimeSubscriptionPairing.service = 0x222;
+  runtimeSubscriptionPairing.port = 443;
+  runtimeContainerState.plan.subscriptionPairings.insert(0x333, runtimeSubscriptionPairing);
+  for (uint64_t service = 1; service <= 16; ++service)
+  {
+    SubscriptionPairing pairing = {};
+    pairing.secret = service + 0x1000;
+    pairing.address = service + 0x2000;
+    pairing.service = service + 0x3000;
+    pairing.port = uint16_t(4000 + service);
+    runtimeContainerState.plan.subscriptionPairings.insert(service, pairing);
+  }
+  String runtimePairingSecretNeedle = {};
+  runtimePairingSecretNeedle.assign(reinterpret_cast<const char *>(&runtimeSubscriptionPairing.secret), sizeof(runtimeSubscriptionPairing.secret));
+  runtimeContainerState.runtimeLogicalCores = 3;
+  runtimeContainerState.runtimeMemoryMB = 1536;
+  runtimeContainerState.runtimeStorageMB = 384;
+  runtimeContainerState.wormholeRuntimeRevision.assign("runtime-plan-r7"_ctv);
+  runtimeContainerState.wormholeRuntimeDesired.assign("serve"_ctv);
+  runtimeContainerState.wormholeRuntimePendingMachines.push_back(0x0A000012);
+  runtimeContainerState.wormholeRuntimeFailedMachines.push_back(0x0A000013);
+  runtimeContainerState.wormholeRuntimeFailure.assign("previous retry completed"_ctv);
+  runtimeContainerState.wormholeRuntimeFailureSuppressedReady = true;
+  storedSnapshot.masterAuthority.containerRuntimeStates.push_back(runtimeContainerState);
   for (uint128_t machineUUID : {uint128_t(0x901001), uint128_t(0x901002), uint128_t(0x901003)})
   {
     ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
@@ -1641,6 +1745,27 @@ int main(void)
 
   ProdigyPersistentBrainSnapshot expectedManagedSnapshot = storedSnapshot;
   prodigyStripManagedCloudBootstrapCredentials(expectedManagedSnapshot.brainConfig.runtimeEnvironment);
+
+  // Hash-table iteration order is not a persistence identity.  The full
+  // runtime plan carries the same unordered pairing owner as retained
+  // bootstraps, so equality must remain stable after a decoded reordering.
+  ProdigyPersistentBrainSnapshot reorderedRuntimeSnapshot = expectedManagedSnapshot;
+  auto& reorderedPairings = reorderedRuntimeSnapshot.masterAuthority.containerRuntimeStates[0].plan.subscriptionPairings;
+  Vector<std::pair<uint64_t, Vector<SubscriptionPairing>>> pairingEntries = {};
+  for (const auto& [service, pairings] : reorderedPairings)
+  {
+    pairingEntries.emplace_back(service, pairings);
+  }
+  reorderedPairings.clear();
+  for (auto iterator = pairingEntries.rbegin(); iterator != pairingEntries.rend(); ++iterator)
+  {
+    for (const SubscriptionPairing& pairing : iterator->second)
+    {
+      reorderedPairings.insert(iterator->first, pairing);
+    }
+  }
+  suite.expect(prodigyPersistentBrainSnapshotsEqual(expectedManagedSnapshot, reorderedRuntimeSnapshot),
+               "persistent_snapshot_runtime_pairings_roundtrip_equality_is_order_independent");
 
   ProdigyPersistentBrainSnapshot captureRichSnapshot = storedSnapshot;
   MachineToolCapture hardwareCapture = {};
@@ -1822,21 +1947,80 @@ int main(void)
                      extractedSecrets.machineRecoveryWitnesses ==
                          expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
                  "extract_snapshot_secrets_moves_all_machine_recovery_inventory_to_private_sidecar");
+    suite.expect(
+        publicSnapshot.masterAuthority.containerRuntimeStates.size() == 1 &&
+            publicSnapshot.masterAuthority.containerRuntimeStates[0].machineUUID ==
+                expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0].machineUUID &&
+            publicSnapshot.masterAuthority.containerRuntimeStates[0].plan.uuid ==
+                expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0].plan.uuid &&
+            publicSnapshot.masterAuthority.containerRuntimeStates[0].plan.hasCredentialBundle == false &&
+            publicSnapshot.masterAuthority.containerRuntimeStates[0].plan.subscriptionPairings.size() == 0,
+        "extract_snapshot_secrets_leaves_runtime_container_identity_placeholder");
+    suite.expect(
+        extractedSecrets.containerRuntimeStateSecrets.size() == 1 &&
+            extractedSecrets.containerRuntimeStateSecrets[0].machineUUID ==
+                expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0].machineUUID &&
+            extractedSecrets.containerRuntimeStateSecrets[0].containerUUID ==
+                expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0].plan.uuid &&
+            prodigyPersistentContainerRuntimeStateEqual(
+                extractedSecrets.containerRuntimeStateSecrets[0].runtimeState,
+                expectedManagedSnapshot.masterAuthority.containerRuntimeStates[0]),
+        "extract_snapshot_secrets_moves_full_runtime_container_record_to_private_sidecar");
+    {
+      ProdigyPersistentBrainSnapshot restoredPublic = publicSnapshot;
+      String restoreFailure = {};
+      suite.expect(
+          prodigyApplyPersistentBrainSnapshotSecrets(restoredPublic, extractedSecrets, &restoreFailure) &&
+              equalBrainSnapshots(restoredPublic, expectedManagedSnapshot),
+          "apply_snapshot_secrets_restores_full_runtime_container_record_once");
+
+      ProdigyPersistentBrainSnapshotSecrets missingRuntimeSecret = extractedSecrets;
+      missingRuntimeSecret.containerRuntimeStateSecrets.clear();
+      restoredPublic = publicSnapshot;
+      restoreFailure.clear();
+      suite.expect(
+          prodigyApplyPersistentBrainSnapshotSecrets(restoredPublic, missingRuntimeSecret, &restoreFailure) == false &&
+              restoreFailure.equals("persistent brain snapshot runtime record has no unique private sidecar"_ctv),
+          "apply_snapshot_secrets_rejects_runtime_container_record_without_sidecar");
+
+      ProdigyPersistentBrainSnapshotSecrets duplicateRuntimeSecret = extractedSecrets;
+      duplicateRuntimeSecret.containerRuntimeStateSecrets.push_back(
+          duplicateRuntimeSecret.containerRuntimeStateSecrets[0]);
+      restoredPublic = publicSnapshot;
+      restoreFailure.clear();
+      suite.expect(
+          prodigyApplyPersistentBrainSnapshotSecrets(restoredPublic, duplicateRuntimeSecret, &restoreFailure) == false &&
+              restoreFailure.equals("persistent brain snapshot duplicate container runtime secret"_ctv),
+          "apply_snapshot_secrets_rejects_duplicate_runtime_container_sidecar");
+
+      ProdigyPersistentBrainSnapshotSecrets mismatchedRuntimeIdentity = extractedSecrets;
+      ++mismatchedRuntimeIdentity.containerRuntimeStateSecrets[0].runtimeState.plan.uuid;
+      restoredPublic = publicSnapshot;
+      restoreFailure.clear();
+      suite.expect(
+          prodigyApplyPersistentBrainSnapshotSecrets(restoredPublic, mismatchedRuntimeIdentity, &restoreFailure) == false &&
+              restoreFailure.equals("persistent brain snapshot runtime record sidecar identity differs"_ctv),
+          "apply_snapshot_secrets_rejects_runtime_container_sidecar_identity_mismatch");
+    }
     {
       ProdigyPersistentBrainSnapshotSecrets legacySecrets = extractedSecrets;
       legacySecrets.localContainerBootstraps.clear();
       legacySecrets.machineRecoveryWitnesses.clear();
-      String legacyRecord = {}, emptyLocalExtension = {}, emptyWitnessExtension = {};
+      legacySecrets.containerRuntimeStateSecrets.clear();
+      String legacyRecord = {}, emptyLocalExtension = {}, emptyWitnessExtension = {}, emptyRuntimeContainerExtension = {};
       BitseryEngine::serialize(legacyRecord, legacySecrets);
       BitseryEngine::serialize(emptyLocalExtension, legacySecrets.localContainerBootstraps);
       BitseryEngine::serialize(emptyWitnessExtension, legacySecrets.machineRecoveryWitnesses);
-      legacyRecord.resize(legacyRecord.size() - emptyLocalExtension.size() - emptyWitnessExtension.size());
+      BitseryEngine::serialize(emptyRuntimeContainerExtension, legacySecrets.containerRuntimeStateSecrets);
+      legacyRecord.resize(legacyRecord.size() - emptyLocalExtension.size() - emptyWitnessExtension.size() - emptyRuntimeContainerExtension.size());
       ProdigyPersistentBrainSnapshotSecrets decodedLegacy = {};
       suite.expect(BitseryEngine::deserializeSafe(legacyRecord, decodedLegacy) &&
                        decodedLegacy.localContainerBootstraps.empty() &&
-                       decodedLegacy.machineRecoveryWitnesses.empty(),
+                       decodedLegacy.machineRecoveryWitnesses.empty() &&
+                       decodedLegacy.containerRuntimeStateSecrets.empty(),
                    "legacy_snapshot_secret_record_decodes_without_inventory_extensions");
       ProdigyPersistentBrainSnapshot legacyPublic = publicSnapshot;
+      legacyPublic.masterAuthority.containerRuntimeStates.clear();
       legacyPublic.masterAuthority.runtimeState.updateSelf.localContainerBootstraps =
           expectedManagedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps;
       String legacyFailure = {};
@@ -2053,6 +2237,15 @@ int main(void)
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
                  "load_snapshot_restores_all_machine_private_inventory");
+    suite.expect(
+        loadedSnapshot.masterAuthority.containerRuntimeStates.size() == 1 &&
+            prodigyPersistentContainerRuntimeStateEqual(
+                loadedSnapshot.masterAuthority.containerRuntimeStates[0],
+                storedSnapshot.masterAuthority.containerRuntimeStates[0]) &&
+            loadedSnapshot.masterAuthority.containerRuntimeStates[0].plan.credentialBundle.apiCredentials.size() == 1 &&
+            loadedSnapshot.masterAuthority.containerRuntimeStates[0].plan.credentialBundle.apiCredentials[0].material.equals(
+                runtimeContainerCredentialNeedle),
+        "load_snapshot_restores_full_runtime_container_plan_and_private_credentials");
     ProdigyPersistentBrainSnapshot legacyFullSnapshot = storedSnapshot;
     legacyFullSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.clear();
     String legacyFullSnapshotBytes = {};
@@ -2324,6 +2517,14 @@ int main(void)
     suite.expect(storedSnapshotRecord.state.masterAuthority.runtimeState.updateSelf.localContainerBootstraps.empty() &&
                      stringContains(rawPublicSnapshotRecord, retainedCredential.material) == false,
                  "raw_public_snapshot_record_scrubs_retained_container_credentials");
+    suite.expect(
+        storedSnapshotRecord.state.masterAuthority.containerRuntimeStates.size() == 1 &&
+            storedSnapshotRecord.state.masterAuthority.containerRuntimeStates[0].machineUUID == runtimeContainerState.machineUUID &&
+            storedSnapshotRecord.state.masterAuthority.containerRuntimeStates[0].plan.uuid == runtimeContainerState.plan.uuid &&
+            storedSnapshotRecord.state.masterAuthority.containerRuntimeStates[0].plan.subscriptionPairings.size() == 0 &&
+            stringContains(rawPublicSnapshotRecord, runtimeContainerCredentialNeedle) == false &&
+            stringContains(rawPublicSnapshotRecord, runtimePairingSecretNeedle) == false,
+        "raw_public_snapshot_record_keeps_only_runtime_container_identity");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH) == false, "raw_public_snapshot_record_scrubs_bootstrap_host_private_key");
     suite.expect(stringContains(rawPublicSnapshotRecord, storedCredential.material) == false, "raw_public_snapshot_record_scrubs_api_credential_material");
@@ -2357,6 +2558,10 @@ int main(void)
     suite.expect(readRawTidesDBRecord(secretsDBPath, "brain"_ctv, snapshotSecretKey, rawSnapshotSecretRecord, &failure), "read_raw_snapshot_secret_record");
     suite.expect(stringContains(rawSnapshotSecretRecord, retainedCredential.material),
                  "raw_snapshot_secret_record_keeps_retained_container_credentials");
+    suite.expect(stringContains(rawSnapshotSecretRecord, runtimeContainerCredentialNeedle),
+                 "raw_snapshot_secret_record_keeps_runtime_container_plan_credentials");
+    suite.expect(stringContains(rawSnapshotSecretRecord, runtimePairingSecretNeedle),
+                 "raw_snapshot_secret_record_keeps_runtime_container_pairing_secret");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH), "raw_snapshot_secret_record_keeps_bootstrap_host_private_key");
     suite.expect(stringContains(rawSnapshotSecretRecord, storedCredential.material), "raw_snapshot_secret_record_keeps_api_credential_material");

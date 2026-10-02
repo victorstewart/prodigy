@@ -2231,6 +2231,30 @@ public:
   }
 };
 
+// Runtime plans include transport pairings and CID keys as well as credentials.
+// Keep each complete runtime record private; the public placeholder retains
+// only the stable machine/container identity used for one-to-one restoration.
+class ProdigyPersistentContainerRuntimeStateSecrets {
+public:
+
+  uint128_t machineUUID = 0;
+  uint128_t containerUUID = 0;
+  BrainReplicatedContainerRuntimeState runtimeState;
+
+  void clear(void)
+  {
+    runtimeState = {};
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentContainerRuntimeStateSecrets& secrets)
+{
+  serializer.value16b(secrets.machineUUID);
+  serializer.value16b(secrets.containerUUID);
+  serializer.object(secrets.runtimeState);
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentPendingAddMachinesOperationSecrets& secrets)
 {
@@ -2256,10 +2280,11 @@ public:
   // Keep the exact replay payload in the existing private snapshot sidecar.
   Vector<String> localContainerBootstraps;
   Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> machineRecoveryWitnesses;
+  Vector<ProdigyPersistentContainerRuntimeStateSecrets> containerRuntimeStateSecrets;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty() && containerRuntimeStateSecrets.empty();
   }
 
   void clear(void)
@@ -2315,6 +2340,11 @@ public:
       witness.containerBootstraps.clear();
     }
     machineRecoveryWitnesses.clear();
+    for (auto& runtimeStateSecrets : containerRuntimeStateSecrets)
+    {
+      runtimeStateSecrets.clear();
+    }
+    containerRuntimeStateSecrets.clear();
   }
 };
 
@@ -2349,6 +2379,14 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   else if (serializer.adapter().isCompletedSuccessfully() == false)
   {
     serializer.object(secrets.machineRecoveryWitnesses);
+  }
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    serializer.object(secrets.containerRuntimeStateSecrets);
+  }
+  else if (serializer.adapter().isCompletedSuccessfully() == false)
+  {
+    serializer.object(secrets.containerRuntimeStateSecrets);
   }
 }
 
@@ -2413,6 +2451,18 @@ static inline void prodigyExtractPersistentBrainSnapshotSecrets(
   secrets.machineRecoveryWitnesses =
       std::move(publicSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses);
   publicSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.clear();
+
+  for (BrainReplicatedContainerRuntimeState& runtimeState : publicSnapshot.masterAuthority.containerRuntimeStates)
+  {
+    ProdigyPersistentContainerRuntimeStateSecrets runtimeStateSecrets = {};
+    runtimeStateSecrets.machineUUID = runtimeState.machineUUID;
+    runtimeStateSecrets.containerUUID = runtimeState.plan.uuid;
+    runtimeStateSecrets.runtimeState = std::move(runtimeState);
+    runtimeState = {};
+    runtimeState.machineUUID = runtimeStateSecrets.machineUUID;
+    runtimeState.plan.uuid = runtimeStateSecrets.containerUUID;
+    secrets.containerRuntimeStateSecrets.push_back(std::move(runtimeStateSecrets));
+  }
 
   secrets.bootstrapSshPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH;
   secrets.bootstrapSshHostPrivateKeyOpenSSH = publicSnapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH;
@@ -2537,6 +2587,75 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   if (secrets.machineRecoveryWitnesses.empty() == false)
   {
     snapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses = secrets.machineRecoveryWitnesses;
+  }
+
+  for (uint32_t left = 0; left < secrets.containerRuntimeStateSecrets.size(); ++left)
+  {
+    for (uint32_t right = 0; right < left; ++right)
+    {
+      if (secrets.containerRuntimeStateSecrets[left].machineUUID ==
+              secrets.containerRuntimeStateSecrets[right].machineUUID &&
+          secrets.containerRuntimeStateSecrets[left].containerUUID ==
+              secrets.containerRuntimeStateSecrets[right].containerUUID)
+      {
+        if (failure)
+        {
+          failure->assign("persistent brain snapshot duplicate container runtime secret"_ctv);
+        }
+        return false;
+      }
+    }
+  }
+
+  for (const BrainReplicatedContainerRuntimeState& runtimeState : snapshot.masterAuthority.containerRuntimeStates)
+  {
+    uint32_t matches = 0;
+    for (const auto& runtimeStateSecrets : secrets.containerRuntimeStateSecrets)
+    {
+      matches += runtimeState.machineUUID == runtimeStateSecrets.machineUUID &&
+                 runtimeState.plan.uuid == runtimeStateSecrets.containerUUID;
+    }
+    if (matches != 1)
+    {
+      if (failure)
+      {
+        failure->assign("persistent brain snapshot runtime record has no unique private sidecar"_ctv);
+      }
+      return false;
+    }
+  }
+
+  for (const auto& runtimeStateSecrets : secrets.containerRuntimeStateSecrets)
+  {
+    BrainReplicatedContainerRuntimeState *matched = nullptr;
+    for (BrainReplicatedContainerRuntimeState& runtimeState : snapshot.masterAuthority.containerRuntimeStates)
+    {
+      if (runtimeState.machineUUID == runtimeStateSecrets.machineUUID &&
+          runtimeState.plan.uuid == runtimeStateSecrets.containerUUID)
+      {
+        if (matched != nullptr)
+        {
+          if (failure)
+          {
+            failure->assign("persistent brain snapshot container runtime secret is ambiguous"_ctv);
+          }
+          return false;
+        }
+        matched = &runtimeState;
+      }
+    }
+
+    if (matched == nullptr ||
+        runtimeStateSecrets.runtimeState.machineUUID != runtimeStateSecrets.machineUUID ||
+        runtimeStateSecrets.runtimeState.plan.uuid != runtimeStateSecrets.containerUUID)
+    {
+      if (failure)
+      {
+        failure->assign("persistent brain snapshot runtime record sidecar identity differs"_ctv);
+      }
+      return false;
+    }
+    *matched = runtimeStateSecrets.runtimeState;
   }
 
   for (const auto& [applicationID, factorySecrets] : secrets.tlsVaultFactorySecretsByApp)
@@ -2815,6 +2934,25 @@ static bool prodigyPersistentRetainedBootstrapEqual(
   return prodigyPersistentSerializedEqual(lhsCopy, rhsCopy);
 }
 
+static bool prodigyPersistentContainerRuntimeStateEqual(
+    const BrainReplicatedContainerRuntimeState& lhs,
+    const BrainReplicatedContainerRuntimeState& rhs)
+{
+  NeuronContainerBootstrap lhsBootstrap = {}, rhsBootstrap = {};
+  lhsBootstrap.plan = lhs.plan;
+  rhsBootstrap.plan = rhs.plan;
+  if (prodigyPersistentRetainedBootstrapEqual(lhsBootstrap, rhsBootstrap) == false)
+  {
+    return false;
+  }
+
+  auto lhsCopy = lhs;
+  auto rhsCopy = rhs;
+  lhsCopy.plan = {};
+  rhsCopy.plan = {};
+  return prodigyPersistentSerializedEqual(lhsCopy, rhsCopy);
+}
+
 static bool prodigyPersistentBrainSnapshotsEqual(
     const ProdigyPersistentBrainSnapshot& lhs,
     const ProdigyPersistentBrainSnapshot& rhs)
@@ -2829,9 +2967,20 @@ static bool prodigyPersistentBrainSnapshotsEqual(
       prodigyPersistentMapEqual(lhsAuthority.reservedApplicationNamesByID, rhsAuthority.reservedApplicationNamesByID) == false ||
       prodigyPersistentMapEqual(lhsAuthority.deploymentPlans, rhsAuthority.deploymentPlans) == false ||
       prodigyPersistentMapEqual(lhsAuthority.failedDeployments, rhsAuthority.failedDeployments) == false ||
+      lhsAuthority.containerRuntimeStates.size() != rhsAuthority.containerRuntimeStates.size() ||
       lhsAuthority.runtimeState != rhsAuthority.runtimeState)
   {
     return false;
+  }
+
+  for (uint32_t index = 0; index < lhsAuthority.containerRuntimeStates.size(); ++index)
+  {
+    if (prodigyPersistentContainerRuntimeStateEqual(
+            lhsAuthority.containerRuntimeStates[index],
+            rhsAuthority.containerRuntimeStates[index]) == false)
+    {
+      return false;
+    }
   }
 
   ProdigyPersistentBrainSnapshot lhsCopy = lhs;
@@ -2846,6 +2995,7 @@ static bool prodigyPersistentBrainSnapshotsEqual(
   lhsCopy.masterAuthority.reservedApplicationNamesByID.clear();
   lhsCopy.masterAuthority.deploymentPlans.clear();
   lhsCopy.masterAuthority.failedDeployments.clear();
+  lhsCopy.masterAuthority.containerRuntimeStates.clear();
   lhsCopy.masterAuthority.runtimeState = {};
   rhsCopy.masterAuthority.tlsVaultFactoriesByApp.clear();
   rhsCopy.masterAuthority.apiCredentialSetsByApp.clear();
@@ -2853,6 +3003,7 @@ static bool prodigyPersistentBrainSnapshotsEqual(
   rhsCopy.masterAuthority.reservedApplicationNamesByID.clear();
   rhsCopy.masterAuthority.deploymentPlans.clear();
   rhsCopy.masterAuthority.failedDeployments.clear();
+  rhsCopy.masterAuthority.containerRuntimeStates.clear();
   rhsCopy.masterAuthority.runtimeState = {};
   return prodigyPersistentSerializedEqual(lhsCopy, rhsCopy);
 }

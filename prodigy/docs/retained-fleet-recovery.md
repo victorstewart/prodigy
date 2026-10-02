@@ -19,6 +19,13 @@ currently installed v10 runtime. Use a new operation ID and operation root.
 Run on the selected seed with the normal commissioned registry and outer
 Mothership client lock; no other Mothership process may own that registry.
 
+When every host runs the same predecessor binary and bundle but some running
+executables reside outside the registered service root, use schema 3. Each
+machine must name `installedRuntimeRoot`, `installedRuntimeSHA256`, and
+`installedBundleSHA256`. Every hash pair must equal the plan's expected old
+pair. Mothership verifies both the observed executable path and the registered
+service root before fencing; this schema is accepted only by retained recovery.
+
 The private manifest binds cluster and successor bundle, and exactly three
 machine entries. Each machine has `machineUUID`, `machineFragment`, and `records`.
 Each process record has hexadecimal `uuid`, numeric `pid`, decimal-string `start`

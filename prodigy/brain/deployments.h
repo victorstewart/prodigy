@@ -4999,6 +4999,134 @@ private:
     Ring::queueSend(&machine->neuron);
   }
 
+  void queueDurableContainerSpin(
+      Machine *machine,
+      uint128_t containerUUID,
+      uint128_t replaceContainerUUID,
+      String bootstrap,
+      bool retainedStorageRecoveryLaunch,
+      String retainedSourceBootstrap = {})
+  {
+    // The Neuron can keep a launched process alive across a Brain restart.
+    // Do not make that process the only copy of its launch identity: persist
+    // the canonical view first, then use the existing runtime-state fan-out
+    // before dispatching the spin frame.
+    BrainBase *brain = thisBrain;
+    if (brain == nullptr || machine == nullptr)
+    {
+      return;
+    }
+    const uint64_t deploymentID = plan.config.deploymentID();
+    const uint64_t authorityEpoch = brain->containerLaunchAuthorityEpoch();
+    if (authorityEpoch == 0)
+    {
+      return;
+    }
+    const std::weak_ptr<uint8_t> lifetime = brain->persistenceLifetime;
+    brain->persistLocalRuntimeStateAsync(
+        [brain, lifetime, this, machine, deploymentID, authorityEpoch, containerUUID, replaceContainerUUID,
+         bootstrap = std::move(bootstrap), retainedStorageRecoveryLaunch,
+         retainedSourceBootstrap = std::move(retainedSourceBootstrap)](bool durable) mutable {
+          if (lifetime.expired())
+          {
+            return;
+          }
+          if (brain->canControlNeurons() == false ||
+              brain->containerLaunchAuthorityEpoch() != authorityEpoch ||
+              brain->machines.contains(machine) == false)
+          {
+            return;
+          }
+          auto deploymentIt = brain->deployments.find(deploymentID);
+          if (deploymentIt == brain->deployments.end() || deploymentIt->second != this)
+          {
+            return;
+          }
+          auto releaseReplacementWaiter = [&] {
+            if (replaceContainerUUID == 0)
+            {
+              return;
+            }
+            auto replacingIt = brain->containers.find(replaceContainerUUID);
+            if (replacingIt != brain->containers.end() && replacingIt->second != nullptr &&
+                replacingIt->second->destructionWaiterDeploymentID == deploymentID)
+            {
+              replacingIt->second->destructionWaiterDeploymentID = 0;
+            }
+          };
+          if (state == DeploymentState::failed || operatorCancellationOwnsTransition)
+          {
+            releaseReplacementWaiter();
+            return;
+          }
+          auto containerIt = brain->containers.find(containerUUID);
+          if (containerIt == brain->containers.end() || containerIt->second == nullptr ||
+              containerIt->second->machine != machine ||
+              containerIt->second->deploymentID != deploymentID ||
+              containerIt->second->state != ContainerState::scheduled)
+          {
+            releaseReplacementWaiter();
+            return;
+          }
+          if (durable == false)
+          {
+            releaseReplacementWaiter();
+            if (state != DeploymentState::failed)
+            {
+              state = DeploymentState::failed;
+              stateChangedAtMs = Time::now<TimeResolution::ms>();
+              waitingOnContainers.erase(containerIt->second);
+              // No spin frame was sent, so release this local reservation
+              // through the ordinary owner instead of leaving the scheduler
+              // suspended on a process that cannot exist.
+              releaseContainerPlacementCounts(containerIt->second);
+              destructContainer(containerIt->second, false);
+              containerDestroyed(containerIt->second);
+              brain->deploymentFailed(
+                  this,
+                  plan.config.applicationID,
+                  deploymentID,
+                  "container launch record was not durably persisted"_ctv,
+                  generateReport());
+              if (waitingOnContainers.empty() && schedulingStack.execution)
+              {
+                consumeSchedulingExecution();
+              }
+            }
+            return;
+          }
+          if (replaceContainerUUID != 0)
+          {
+            // Keep the predecessor in the durable record until this exact
+            // receipt has committed.  If the Brain dies here, replay can
+            // still adopt the surviving predecessor instead of discovering
+            // an unowned cgroup.
+            auto replacingIt = brain->containers.find(replaceContainerUUID);
+            if (replacingIt != brain->containers.end() && replacingIt->second != nullptr)
+            {
+              ContainerView *replacing = replacingIt->second;
+              ApplicationDeployment *owner = containerDeploymentOwner(replacing);
+              owner->releaseContainerPlacementCounts(replacing);
+              if (replacing->state == ContainerState::healthy)
+              {
+                replacing->state = ContainerState::aboutToDestroy;
+              }
+              owner->destructContainer(replacing, false);
+            }
+          }
+          brain->replicateContainerRuntimeStateToFollowers(containerIt->second);
+          if (retainedStorageRecoveryLaunch)
+          {
+            queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID,
+                      bootstrap, retainedSourceBootstrap);
+          }
+          else
+          {
+            queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, bootstrap);
+          }
+        });
+  }
+
   Vector<ScalerState> lastScalerStates;
 
   static bool autoscaleTraceEnabled(void)
@@ -8818,18 +8946,11 @@ public:
             if (replacingContainer)
             {
               replaceContainerUUID = replacingContainer->uuid;
-
-              // Allocate the successor fragment before releasing its predecessor.
-              // Retire the predecessor's mesh edges before successor setup so the
-              // bootstrap snapshot cannot retain a same-host stale peer. The real
-              // replacement kill still happens through spinContainer below.
-              ApplicationDeployment *destructionOwner = containerDeploymentOwner(replacingContainer);
-              destructionOwner->releaseContainerPlacementCounts(replacingContainer);
-              if (replacingContainer->state == ContainerState::healthy)
-              {
-                replacingContainer->state = ContainerState::aboutToDestroy;
-              }
-              destructionOwner->destructContainer(replacingContainer, false);
+              // The existing destruction waiter is the durable owner for an
+              // in-place replacement.  Mark it before services are built so
+              // Mesh excludes only this same-host predecessor until the
+              // replacement receipt either retires or releases it.
+              replacingContainer->destructionWaiterDeploymentID = plan.config.deploymentID();
             }
 
             setupContainerServices(container);
@@ -8868,11 +8989,29 @@ public:
               // descriptor; Neuron derives its own canonical paths.
               String retainedSourceBuffer = {};
               BitseryEngine::serialize(retainedSourceBuffer, retainedStorageRecoverySource);
-              queueSend(machine, NeuronTopic::spinContainer, retainedStorageRecoverySource.sourceContainerUUID, buffer, retainedSourceBuffer);
+              queueDurableContainerSpin(
+                  machine,
+                  container->uuid,
+                  retainedStorageRecoverySource.sourceContainerUUID,
+                  std::move(buffer),
+                  true,
+                  std::move(retainedSourceBuffer));
             }
             else
             {
-              queueSend(machine, NeuronTopic::spinContainer, replaceContainerUUID, buffer);
+              queueDurableContainerSpin(
+                  machine,
+                  container->uuid,
+                  replaceContainerUUID,
+                  std::move(buffer),
+                  false);
+            }
+
+            if (state == DeploymentState::failed)
+            {
+              cancelDeploymentWork(currentlyExecutingWork);
+              credentialLaunchFailed = true;
+              break;
             }
 
 #if PRODIGY_DEBUG
