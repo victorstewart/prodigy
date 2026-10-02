@@ -17430,6 +17430,20 @@ static void testNeuronInitialFramesDoNotRequireHardwareProfile(TestSuite& suite)
   suite.expect(hardwareFrames == 0, "neuron_initial_frames_skip_missing_hardware_profile");
 }
 
+static void testNeuronBaseInitializesLocalContainerSubnet(TestSuite& suite)
+{
+  alignas(TestNeuron) unsigned char storage[sizeof(TestNeuron)];
+  std::memset(storage, 0xa5, sizeof(storage));
+  TestNeuron *neuron = new (storage) TestNeuron;
+
+  suite.expect(neuron->lcsubnet6.dpfx == 0 && neuron->lcsubnet6.mpfx[0] == 0 &&
+                   neuron->lcsubnet6.mpfx[1] == 0 && neuron->lcsubnet6.mpfx[2] == 0 &&
+                   neuron->haveFragments() == false,
+               "neuron_base_initializes_local_container_subnet");
+
+  neuron->~TestNeuron();
+}
+
 static void testNeuronRegistrationBootTimeUsesEpochMs(TestSuite& suite)
 {
   int64_t beforeMs = Time::now<TimeResolution::ms>();
@@ -29136,6 +29150,11 @@ int main(void)
 {
   TestSuite suite;
 
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "neuron-local-subnet-initialization") == 0)
+  {
+    testNeuronBaseInitializesLocalContainerSubnet(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-routable") == 0)
   {
     testAsyncStaticRoutableRegistryPersistenceGates(suite);
@@ -29724,6 +29743,7 @@ int main(void)
   testApplicationReservationValidationFailures(suite);
   testPersistentReservedServiceCaptureAndRestore(suite);
   testMothershipReserveServiceTopic(suite);
+  testNeuronBaseInitializesLocalContainerSubnet(suite);
   testNeuronInitialFramesDoNotRequireHardwareProfile(suite);
   testNeuronRegistrationBootTimeUsesEpochMs(suite);
   testNeuronInitialFramesDeferAdoptedHardwareProfileUntilBrainStreamReady(suite);

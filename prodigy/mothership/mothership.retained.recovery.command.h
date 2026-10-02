@@ -51,8 +51,31 @@ struct Schema4RetiredConflictingClientRequest {
 template<typename S> void serialize(S&& s, Schema4RetiredConflictingClientRequest& r) {
   s.object(r.request); s.value16b(r.retiredConflictingClientUUID);
 }
-inline String encodeRequest(const Request& request,const Plan& plan) {
+// A fresh recovery may explicitly retain an authenticated Brain whose host
+// rebooted before any application container could be reconstructed.  Keep the
+// established request bytes intact: this envelope binds that exceptional
+// machine identity to a uniform fresh request and never carries a stale
+// schema-four coordinator proof.
+struct Schema6EmptyInventoryRequest {
+  Schema4Request request;
+  uint128_t emptyRetainedInventoryMachineUUID = 0;
+};
+template<typename S> void serialize(S&& s, Schema6EmptyInventoryRequest& r) {
+  s.object(r.request); s.value16b(r.emptyRetainedInventoryMachineUUID);
+}
+inline String encodeRequest(const Request& request,const Plan& plan,uint128_t emptyRetainedInventoryMachineUUID = 0) {
   String bytes;
+  if (emptyRetainedInventoryMachineUUID != 0) {
+    Schema6EmptyInventoryRequest wrapped; wrapped.request.request=request;
+    require(plan.schemaVersion != 4 && request.interruptedBundleSHA.empty(),
+            "empty retained inventory requires a uniform fresh recovery plan");
+    wrapped.emptyRetainedInventoryMachineUUID=emptyRetainedInventoryMachineUUID;
+    BitseryEngine::serialize(bytes,wrapped);
+    require(!bytes.empty(),"empty-inventory request serialization is empty");
+    String framed={}; framed.append("RRF6",4); framed.append(bytes.data(),bytes.size());
+    require(framed.size()==4+bytes.size(),"empty-inventory request framing is incomplete");
+    return framed;
+  }
   if (plan.schemaVersion == 4) {
     Schema4Request wrapped; wrapped.request=request;
     wrapped.proof.canonicalContainerCount=plan.sealedCanonicalContainerCount;
@@ -78,7 +101,21 @@ inline String encodeRetiredConflictingClientRequest(const Request& request,
   String framed={}; framed.append("RRF5",4); framed.append(bytes.data(),bytes.size()); return framed;
 }
 inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof,
-                          uint128_t *retiredConflictingClientUUID = nullptr) {
+                          uint128_t *retiredConflictingClientUUID = nullptr,
+                          uint128_t *emptyRetainedInventoryMachineUUID = nullptr) {
+  if (raw.size()>=4 && raw.compare(0,4,"RRF6")==0) {
+    Schema6EmptyInventoryRequest wrapped;
+    if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
+        wrapped.emptyRetainedInventoryMachineUUID == 0 ||
+        wrapped.request.proof.canonicalContainerCount != 0 ||
+        wrapped.request.proof.staleCoordinatorCanonicalContainerCount != 0 ||
+        wrapped.request.proof.interruptedExpectedEchos != 0 ||
+        wrapped.request.proof.staleExcludedContainerUUID != 0) return false;
+    request=std::move(wrapped.request.request); if(proof)*proof=wrapped.request.proof;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=wrapped.emptyRetainedInventoryMachineUUID;
+    return true;
+  }
   if (raw.size()>=4 && raw.compare(0,4,"RRF5")==0) {
     Schema4RetiredConflictingClientRequest wrapped;
     if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
@@ -87,7 +124,8 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
         wrapped.request.proof.canonicalContainerCount != wrapped.request.proof.staleCoordinatorCanonicalContainerCount + 1)
       return false;
     request=std::move(wrapped.request.request); if(proof)*proof=wrapped.request.proof;
-    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=wrapped.retiredConflictingClientUUID; return true;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=wrapped.retiredConflictingClientUUID;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
   }
   if (raw.size()>=4 && raw.compare(0,4,"RRF4")==0) {
     Schema4Request wrapped;
@@ -97,10 +135,12 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
         wrapped.proof.staleCoordinatorCanonicalContainerCount>=wrapped.proof.canonicalContainerCount ||
         wrapped.proof.canonicalContainerCount>256 || wrapped.proof.interruptedExpectedEchos==0 || wrapped.proof.staleExcludedContainerUUID==0) return false;
     request=std::move(wrapped.request); if(proof)*proof=wrapped.proof;
-    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0; return true;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
+    if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
   }
   if (!BitseryEngine::deserializeSafe(text(raw),request)) return false;
-  if(proof)*proof={}; if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0; return true;
+  if(proof)*proof={}; if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0;
+  if(emptyRetainedInventoryMachineUUID)*emptyRetainedInventoryMachineUUID=0; return true;
 }
 // The seed generates these bytes once. Every Brain must receive identical
 // witness strings, even when unordered maps decode in a different order.
@@ -134,6 +174,7 @@ struct Record {
 struct Manifest {
   Request request;
   uint32_t canonicalContainerCount = 23;
+  uint128_t emptyRetainedInventoryMachineUUID = 0;
   std::vector<Record> records;
 };
 inline void privateFile(const std::string& path, uint64_t maximum=UINT32_MAX) {
@@ -148,12 +189,17 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
   auto raw=read(path); require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery manifest JSON");
   require(number(doc,"schemaVersion")==1 && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
   Manifest m; m.request.clusterUUID=p.clusterUUID; m.request.bundleSHA=text(field(doc,"bundleSHA256"));
-  if (p.schemaVersion >= 4) {
-    const uint64_t canonicalCount=number(doc,"canonicalContainerCount");
+  simdjson::dom::element declaredCanonicalCount;
+  const bool hasDeclaredCanonicalCount=doc["canonicalContainerCount"].get(declaredCanonicalCount)==simdjson::SUCCESS;
+  if (hasDeclaredCanonicalCount || p.schemaVersion >= 4) {
+    uint64_t canonicalCount=0;
+    require(hasDeclaredCanonicalCount && declaredCanonicalCount.get_uint64().get(canonicalCount)==simdjson::SUCCESS,
+            "invalid declared canonical inventory count");
     require(canonicalCount<=256,"declared canonical inventory count overflow");
     m.canonicalContainerCount=uint32_t(canonicalCount);
     require(m.canonicalContainerCount>0 && m.canonicalContainerCount<=256,"invalid declared canonical inventory count");
-    require(m.canonicalContainerCount==p.sealedCanonicalContainerCount,"recovery manifest count differs from sealed plan");
+    if (p.schemaVersion >= 4)
+      require(m.canonicalContainerCount==p.sealedCanonicalContainerCount,"recovery manifest count differs from sealed plan");
   }
 
   require(prodigyIsSHA256HexDigest(m.request.bundleSHA),"invalid recovery bundle digest");
@@ -165,16 +211,27 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     require(seenMachines.insert(machine.machineUUID).second,"duplicate recovery machine");
     bool selected=false; for(const auto& expected:p.machines) selected|=expected.uuid==machine.machineUUID;
     require(selected,"unregistered recovery machine");
+    simdjson::dom::element emptyInventory;
+    const bool hasEmptyInventory=item["emptyRetainedInventory"].get(emptyInventory)==simdjson::SUCCESS;
+    bool declaredEmptyInventory=false;
+    if (hasEmptyInventory)
+      require(emptyInventory.get_bool().get(declaredEmptyInventory)==simdjson::SUCCESS,
+              "empty retained inventory declaration is not boolean");
     simdjson::dom::array records; require(item["records"].get_array().get(records)==simdjson::SUCCESS,"recovery process records missing");
-    std::set<uint64_t> pids;
+    std::set<uint64_t> pids; uint32_t machineRecords=0;
     for(auto entry:records) {
       Record r; r.machine=machine.machineUUID;r.container=uuid(field(entry,"uuid"));r.pid=number(entry,"pid");r.created=number(entry,"createdAtMs");r.start=field(entry,"start");
       r.executableSHA=field(entry,"exeSHA256");r.paramsSHA=field(entry,"paramsSHA256");r.paramsPath=field(entry,"paramsPath");pathCheck(r.paramsPath);
       require(entry["canonical"].get_bool().get(r.canonical)==simdjson::SUCCESS,"missing canonical recovery membership");
       require(r.pid>1 && r.pid<=INT_MAX && r.created>0 && r.created<=INT64_MAX && r.start.find_first_not_of("0123456789")==std::string::npos &&
           prodigyIsSHA256HexDigest(text(r.executableSHA)) && prodigyIsSHA256HexDigest(text(r.paramsSHA)) && pids.insert(r.pid).second && seenContainers.insert(r.container).second,"invalid or duplicated recovery process identity");
-      canonical+=r.canonical; m.records.push_back(std::move(r));
+      canonical+=r.canonical; ++machineRecords; m.records.push_back(std::move(r));
     }
+    if (declaredEmptyInventory) {
+      require(machineRecords==0 && m.emptyRetainedInventoryMachineUUID==0,
+              "empty retained inventory declaration is invalid");
+      m.emptyRetainedInventoryMachineUUID=machine.machineUUID;
+    } else require(machineRecords!=0,"retained recovery machine has no sealed process inventory");
     m.request.machines.push_back(std::move(machine));
   }
   require(seenMachines.size()==3 && canonical==m.canonicalContainerCount,"recovery canonical inventory differs from sealed three-host declaration");
@@ -219,8 +276,10 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     privateFile(requestPath); const std::string path=statePath;pathCheck(path);
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
-    Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0;
-    require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID),"recovery request decode failed");
+    Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
+    require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,&emptyRetainedInventoryMachineUUID),"recovery request decode failed");
+    require(emptyRetainedInventoryMachineUUID == 0 || request.interruptedBundleSHA.empty(),
+            "empty retained inventory cannot reinterpret an interrupted handoff");
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
     require(!proof.canonicalContainerCount || proof.validFor(before),"recovery request proof differs from frozen topology");
     const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
@@ -244,7 +303,8 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
         for(const auto& state:expected.masterAuthority.containerRuntimeStates)
           require(state.plan.uuid!=retiredConflictingClientUUID,"prepared retired recovery retains its canonical runtime target");
         require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
-                request.bundleSHA,&why,previousBundleSHA256,request.interruptedBundleSHA,0,nullptr,false,false),str(why).c_str());
+                request.bundleSHA,&why,previousBundleSHA256,request.interruptedBundleSHA,0,nullptr,false,false,
+                emptyRetainedInventoryMachineUUID),str(why).c_str());
       } else {
       // RRF5 never stands alone: the adjacent immutable RRF4 source is
       // uploaded with it and is revalidated against this private copy before
@@ -299,7 +359,8 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
         require(request.mixedSuccessorMachineUUIDs[i]!=0 && (!i || request.mixedSuccessorMachineUUIDs[i-1]<request.mixedSuccessorMachineUUIDs[i]),"invalid sealed mixed handoff");
       if (!mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                      request.bundleSHA,&why,previousBundleSHA256,
-                                                     request.interruptedBundleSHA)) {
+                                                     request.interruptedBundleSHA,0,nullptr,false,true,
+                                                     emptyRetainedInventoryMachineUUID)) {
         // A successor can retain the sealed interrupted envelope or a later
         // pre-exec echo collection with the known earlier digest failure.
         // Both forms prove the same inventory before the old coordinator's
@@ -323,7 +384,8 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
       }
     } else {
       require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
-                                                        request.bundleSHA,&why,previousBundleSHA256),str(why).c_str());
+                                                        request.bundleSHA,&why,previousBundleSHA256,{},0,nullptr,false,true,
+                                                        emptyRetainedInventoryMachineUUID),str(why).c_str());
     }
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
@@ -606,6 +668,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     require(digest(manifestPath)==manifestSHA,"retained manifest digest mismatch");
     Manifest manifest=parseManifest(manifestPath,plan);
     Execution e(std::move(plan));e.initialize();
+    require(manifest.emptyRetainedInventoryMachineUUID == 0 || !e.plan.mixedPredecessors,
+            "empty retained inventory requires a uniform fresh recovery plan");
     require(manifest.request.bundleSHA==e.receipt.approvedBundleSHA256,"retained manifest bundle mismatch");
     // The same outer Mothership client lock excludes registry writers. Reading
     // the existing v10 registry uses its normal owner, never the v9 exporter.
@@ -885,15 +949,15 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
-        String bytes=encodeRequest(manifest.request,e.plan); if(!requestAlreadySealed)durable(requestPath,bytes);
+        String bytes=encodeRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID); if(!requestAlreadySealed)durable(requestPath,bytes);
         durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(requestPath)+"\n"));
       }
       }
       const auto witnessPath=requestPath+".witnesses";
       if(!fs::exists(witnessPath)) {
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
-        Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0;
-        require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID),"sealed request unreadable");
+        Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
+        require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,&emptyRetainedInventoryMachineUUID),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
         if (retiredConflictingClientUUID != 0) {
           const auto originalRequestPath=e.plan.operationRoot+"/recovery.request"; privateFile(originalRequestPath);
@@ -913,7 +977,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                       request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,&why),str(why).c_str());
         } else {
           require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,
-                                                            request.bundleSHA,&why,text(e.plan.oldBundleSHA)),str(why).c_str());
+                                                            request.bundleSHA,&why,text(e.plan.oldBundleSHA),{},0,nullptr,false,true,
+                                                            emptyRetainedInventoryMachineUUID),str(why).c_str());
         }
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);

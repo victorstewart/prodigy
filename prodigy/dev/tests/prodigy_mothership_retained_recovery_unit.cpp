@@ -662,6 +662,16 @@ int main()
       const auto manifest=parseManifest(path,plan);
       assert(manifest.records.size()==count);
     }
+    // A fresh uniform recovery can declare the actual surviving count without
+    // borrowing a historical schema-four coordinator proof.  Only one named
+    // registered machine may have an empty process set.
+    const auto emptyManifest=std::string("{\"schemaVersion\":1,\"clusterUUID\":\"0x7\",\"bundleSHA256\":\"")+std::string(64,'a')+
+      "\",\"canonicalContainerCount\":2,\"machines\":[{\"machineUUID\":\"0x1\",\"machineFragment\":1,\"emptyRetainedInventory\":true,\"records\":[]},{\"machineUUID\":\"0x2\",\"machineFragment\":2,\"records\":[{\"uuid\":\"0x65\",\"pid\":201,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\""+std::string(64,'b')+"\",\"paramsSHA256\":\""+std::string(64,'c')+"\",\"paramsPath\":\"/private/params2\",\"canonical\":true}]},{\"machineUUID\":\"0x3\",\"machineFragment\":3,\"records\":[{\"uuid\":\"0x66\",\"pid\":202,\"createdAtMs\":1,\"start\":\"1\",\"exeSHA256\":\""+std::string(64,'b')+"\",\"paramsSHA256\":\""+std::string(64,'c')+"\",\"paramsPath\":\"/private/params3\",\"canonical\":true}]}]}";
+    durable(path,text(emptyManifest)); const auto emptyParsed=parseManifest(path,plan);
+    assert(emptyParsed.canonicalContainerCount==2 && emptyParsed.records.size()==2 && emptyParsed.emptyRetainedInventoryMachineUUID==1);
+    auto rejectsEmptyManifest=[&](std::string value) { durable(path,text(value)); bool rejected=false; try {(void)parseManifest(path,plan);} catch(const std::exception&) {rejected=true;} assert(rejected); };
+    auto badEmptyType=emptyManifest; badEmptyType.replace(badEmptyType.find("\"emptyRetainedInventory\":true"),std::strlen("\"emptyRetainedInventory\":true"),"\"emptyRetainedInventory\":1"); rejectsEmptyManifest(std::move(badEmptyType));
+    auto unsealedEmpty=emptyManifest; unsealedEmpty.erase(unsealedEmpty.find("\"emptyRetainedInventory\":true,"),std::strlen("\"emptyRetainedInventory\":true,")); rejectsEmptyManifest(std::move(unsealedEmpty));
     fs::remove_all(directory);
   }
 
@@ -875,6 +885,44 @@ int main()
 
   assertRetainedRecoveryRuntimeCidDriftPreservesLocalPlan(
       snapshot, request.plans, request.machines, request.bundleSHA, deploymentID);
+
+  // A registered Brain can reboot after its service state is durable but
+  // before it reconstructs a single retained application process.  The
+  // request must name exactly that empty machine; its two surviving peers
+  // still supply the normal stateful-role proof.
+  auto zeroInventoryRequest=request;
+  zeroInventoryRequest.machines[0].parameters.clear();
+  zeroInventoryRequest.machines[0].observedCreatedAtMs.clear();
+  auto zeroInventorySnapshot=snapshot;
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      zeroInventorySnapshot,zeroInventoryRequest.plans,zeroInventoryRequest.machines,request.bundleSHA,&failure,
+      {},{},0,nullptr,false,true,zeroInventoryRequest.machines[0].machineUUID));
+  assert(zeroInventorySnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses.size()==3);
+  assert(zeroInventorySnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps.empty());
+  auto unsealedZeroInventory=snapshot;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      unsealedZeroInventory,zeroInventoryRequest.plans,zeroInventoryRequest.machines,request.bundleSHA,&failure));
+  auto wrongZeroInventory=snapshot;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongZeroInventory,zeroInventoryRequest.plans,zeroInventoryRequest.machines,request.bundleSHA,&failure,
+      {},{},0,nullptr,false,true,zeroInventoryRequest.machines[1].machineUUID));
+  Plan uniformFreshPlan={}; uniformFreshPlan.schemaVersion=3;
+  const String zeroInventoryBytes=encodeRequest(
+      zeroInventoryRequest,uniformFreshPlan,zeroInventoryRequest.machines[0].machineUUID);
+  Request decodedZeroInventory={}; MothershipRetainedRecoveryMixedProof decodedZeroProof={};
+  uint128_t decodedZeroMachine=0;
+  assert(zeroInventoryBytes.size()>4 && decodeRequest(MothershipTidesMigration::str(zeroInventoryBytes),decodedZeroInventory,
+      &decodedZeroProof,nullptr,&decodedZeroMachine));
+  assert(decodedZeroMachine==zeroInventoryRequest.machines[0].machineUUID && decodedZeroProof.canonicalContainerCount==0 &&
+         decodedZeroInventory.machines[0].parameters.empty());
+  Schema6EmptyInventoryRequest inventedProof={}; inventedProof.request.request=zeroInventoryRequest;
+  inventedProof.request.proof.canonicalContainerCount=2; inventedProof.request.proof.staleCoordinatorCanonicalContainerCount=1;
+  inventedProof.request.proof.interruptedExpectedEchos=1; inventedProof.request.proof.staleExcludedContainerUUID=99;
+  inventedProof.emptyRetainedInventoryMachineUUID=zeroInventoryRequest.machines[0].machineUUID;
+  String inventedProofBytes={}; BitseryEngine::serialize(inventedProofBytes,inventedProof);
+  String inventedProofFrame={}; inventedProofFrame.append("RRF6",4); inventedProofFrame.append(inventedProofBytes.data(),inventedProofBytes.size());
+  assert(!decodeRequest(MothershipTidesMigration::str(inventedProofFrame),decodedZeroInventory,
+      &decodedZeroProof,nullptr,&decodedZeroMachine));
 
   // A normal update that stopped while merely collecting bundle echoes may be
   // replaced.  Both a complete and lagging echo set are pre-exec states.

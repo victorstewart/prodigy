@@ -302,7 +302,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     uint128_t retiredConflictingClientUUID = 0,
     const MothershipRetainedRecoveryMixedProof *retirementProof = nullptr,
     bool retainRetiredConflictingClientForCoordinatorProof = false,
-    bool validateCoordinator = true)
+    bool validateCoordinator = true,
+    uint128_t emptyRetainedInventoryMachineUUID = 0)
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -362,16 +363,21 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   uint32_t fullRetiredCohort = 0, retainedRetiredCohort = 0, fullRetiredCohortClients = 0, retainedRetiredCohortClients = 0;
   bytell_hash_set<uint128_t> retiredCohortMachines = {};
   uint32_t fullRecords = 0, retainedRecords = 0;
+  uint32_t emptyMachineInputs = 0;
   for (const MothershipRetainedRecoveryMachineInput& machine : machines)
   {
+    const bool explicitlyEmpty = machine.machineUUID == emptyRetainedInventoryMachineUUID;
     if (machine.machineUUID == 0 || machine.machineFragment == 0 || machine.machineFragment > 0xffffff ||
         !seenFragments.insert(machine.machineFragment).second ||
-        machine.parameters.empty() || machine.parameters.size() != machine.observedCreatedAtMs.size() ||
+        machine.parameters.size() != machine.observedCreatedAtMs.size() ||
+        (machine.parameters.empty() && !explicitlyEmpty) ||
+        (!machine.parameters.empty() && explicitlyEmpty) ||
         seenMachines.insert(machine.machineUUID).second == false)
     {
       if (failure) failure->assign("invalid or duplicate retained recovery machine input"_ctv);
       return false;
     }
+    emptyMachineInputs += explicitlyEmpty;
     bool topologyMachine = false;
     for (const ClusterMachine& candidate : snapshot.topology.machines)
       if (candidate.uuid == machine.machineUUID) topologyMachine = true;
@@ -459,6 +465,12 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       witness.containerBootstraps.push_back(std::move(serialized));
     }
     witnesses.push_back(std::move(witness));
+  }
+  if ((emptyRetainedInventoryMachineUUID != 0 && emptyMachineInputs != 1) ||
+      (emptyRetainedInventoryMachineUUID == 0 && emptyMachineInputs != 0))
+  {
+    if (failure) failure->assign("invalid sealed empty retained inventory machine"_ctv);
+    return false;
   }
   for (const auto& [id, count] : statefulReplicas) {
     const auto& deployment = approvedPlans.find(id)->second;

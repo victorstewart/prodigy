@@ -2023,6 +2023,71 @@ int main(void)
     testMaterializedStatefulRecoveryInitialHealth(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (std::getenv("PRODIGY_TEST_COLD_RESTART_STORAGE_ONLY") != nullptr)
+  {
+    // This invokes the real restart owner without cgroup privileges.  The
+    // cold preparation fails before any host cgroup operation, and verifies
+    // that the failure path leaves the reboot-retained rootfs and direct
+    // storage untouched.
+    std::filesystem::create_directories(".run");
+    TemporaryDirectory fixture;
+    suite.expect(fixture.create(".run"), "cold_restart_fixture_created");
+    if (fixture.path.size() == 0) return EXIT_FAILURE;
+    const auto root = std::filesystem::canonical(filesystemPathFromString(fixture.path));
+    const auto artifact = root / "retained-artifact";
+    const auto storage = root / "retained-storage";
+    const auto sentinel = storage / "kvdb" / "sentinel";
+    suite.expect(writeFileFixture(artifact / "rootfs" / "keep", "retained-rootfs") &&
+                     writeFileFixture(sentinel, "retained-database"),
+                 "cold_restart_retained_fixture_has_rootfs_and_storage");
+
+    NeuronBase *savedNeuron = thisNeuron;
+    const bool savedAutoDestroy = ContainerStore::autoDestroy;
+    thisNeuron = nullptr;
+    ContainerStore::autoDestroy = false;
+    Container *container = new Container();
+    container->plan.uuid = uint128_t(0xC01D);
+    container->plan.config.applicationID = 77;
+    container->plan.config.versionID = 9;
+    container->plan.config.type = ApplicationType::stateful;
+    container->plan.config.storageMB = 64;
+    container->name.assign("cold-retained"_ctv);
+    container->artifactRootPath.assign(artifact.c_str());
+    container->rootfsPath.assign((artifact / "rootfs").c_str());
+    container->storageRootPath.assign(storage.c_str());
+    container->storagePayloadPath.assign(storage.c_str());
+    container->cgroup = -1;
+    ContainerRegistry::retain(container->plan.config.deploymentID());
+    ContainerManager::restartContainer(container);
+    suite.expect(std::filesystem::exists(artifact / "rootfs" / "keep") &&
+                     std::filesystem::exists(sentinel),
+                 "cold_restart_missing_cgroup_failure_retains_existing_rootfs_and_storage");
+
+    // Allocation can reject an isolated cold restart before it fills the new
+    // container's lcores array.  Its zero-initialized entries must not release
+    // CPU zero from an already running owner during the shared cleanup path.
+    TestNeuron allocationNeuron = {};
+    allocationNeuron.lcoreCount = 4;
+    allocationNeuron.lcores[0] = 17;
+    thisNeuron = &allocationNeuron;
+    Container *unallocated = new Container();
+    unallocated->plan.uuid = uint128_t(0xC01E);
+    unallocated->plan.config.applicationID = 77;
+    unallocated->plan.config.versionID = 9;
+    unallocated->plan.config.type = ApplicationType::stateful;
+    unallocated->plan.config.cpuMode = ApplicationCPUMode::isolated;
+    unallocated->plan.config.nLogicalCores = 8;
+    unallocated->deleteStorageOnCleanUp = false;
+    ContainerRegistry::retain(unallocated->plan.config.deploymentID());
+    ContainerManager::cleanupContainerAfterFailedCreate(unallocated, true, false);
+    suite.expect(allocationNeuron.lcores[0] == 17,
+                 "cold_restart_unallocated_isolated_cores_do_not_clear_existing_cpu_owner");
+
+    thisNeuron = savedNeuron;
+    ContainerStore::autoDestroy = savedAutoDestroy;
+    dprintf(STDOUT_FILENO, "cold_restart_storage_focused failed=%d\n", suite.failed);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   // Exercise the CLI's parser directly; this path needs no runtime resources.
   {

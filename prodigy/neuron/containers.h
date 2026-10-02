@@ -8160,7 +8160,8 @@ public:
     return ready;
   }
 
-  static bool prepareContainerStorage(Container *container, String *failureReport = nullptr)
+  static bool prepareContainerStorage(Container *container, String *failureReport = nullptr,
+                                      bool requireExistingBackend = false)
   {
     if (container == nullptr || container->plan.config.storageMB == 0)
     {
@@ -8200,7 +8201,20 @@ public:
 
     if (devicePlans.size() == 0)
     {
-      Filesystem::createDirectoryAt(-1, container->storageRootPath);
+      struct stat metadata = {};
+      if (requireExistingBackend &&
+          (lstat(container->storageRootPath.c_str(), &metadata) != 0 || !S_ISDIR(metadata.st_mode)))
+      {
+        if (failureReport)
+        {
+          failureReport->assign("retained direct storage is unavailable"_ctv);
+        }
+        return false;
+      }
+      if (requireExistingBackend == false)
+      {
+        Filesystem::createDirectoryAt(-1, container->storageRootPath);
+      }
       if (chown(container->storageRootPath.c_str(), uid_t(container->executionHostID), gid_t(container->executionHostID)) != 0)
       {
         basics_log("createContainer storage chown failed uuid=%llu path=%s executionHostID=%u errno=%d(%s)\n",
@@ -8225,6 +8239,15 @@ public:
       if (failureReport)
       {
         failureReport->assign("partial storage backing set exists"_ctv);
+      }
+      return false;
+    }
+
+    if (requireExistingBackend && allBackingExists == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("retained loop storage backing is unavailable"_ctv);
       }
       return false;
     }
@@ -9989,7 +10012,8 @@ public:
     queueQuarantinedContainerNetworkRetry();
   }
 
-  static void cleanupContainerAfterFailedCreate(Container *container)
+  static void cleanupContainerAfterFailedCreate(Container *container, bool preserveExistingArtifactRoot = false,
+                                                bool releaseAllocatedCores = true)
   {
     if (container == nullptr)
     {
@@ -10008,7 +10032,7 @@ public:
     }
     container->resourceDeltaMode = Container::ResourceDeltaMode::none;
 
-    if (container->plan.usesIsolatedCPUs())
+    if (releaseAllocatedCores && thisNeuron != nullptr && container->plan.usesIsolatedCPUs())
     {
       for (uint16_t index = 0; index < container->plan.logicalCores(); index++)
       {
@@ -10064,7 +10088,8 @@ public:
     String failedArtifactRootPath = {};
     failedArtifactRootPath.assign(container->artifactRootPath);
     String artifactCleanupFailure = {};
-    if (cleanupFailedCreateArtifactRoot(container, &artifactCleanupFailure) == false)
+    if (preserveExistingArtifactRoot == false &&
+        cleanupFailedCreateArtifactRoot(container, &artifactCleanupFailure) == false)
     {
       basics_log("cleanupContainerAfterFailedCreate artifact cleanup failed uuid=%llu artifactRoot=%s reason=%s\n",
                  (unsigned long long)container->plan.uuid,
@@ -12982,11 +13007,75 @@ public:
     }
   }
 
+  static bool prepareColdRestartContainer(Container *container, bool *isolatedCoresAllocated,
+                                          String *failureReport = nullptr)
+  {
+    if (isolatedCoresAllocated)
+    {
+      *isolatedCoresAllocated = false;
+    }
+    if (container == nullptr)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("cold restart container is unavailable"_ctv);
+      }
+      return false;
+    }
+
+    // A machine reboot leaves the artifact and stateful storage on disk but
+    // removes the cgroup which normally owns a restart.  Every failure below
+    // must retain those pre-existing paths for the next authoritative upload.
+    container->deleteStorageOnCleanUp = false;
+
+    if (ensureRootCgroupReady(failureReport) == false)
+    {
+      return false;
+    }
+
+    if (container->plan.usesIsolatedCPUs() && allocateCores(container) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("insufficient isolated cores for cold restart"_ctv);
+      }
+      return false;
+    }
+    if (container->plan.usesIsolatedCPUs() && isolatedCoresAllocated)
+    {
+      *isolatedCoresAllocated = true;
+    }
+
+    String cgroupFailure = {};
+    container->cgroup = create_cgroupv2(container, &cgroupFailure);
+    if (container->cgroup < 0)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(cgroupFailure.size() > 0 ? cgroupFailure : "cold restart cgroup creation failed"_ctv);
+      }
+      return false;
+    }
+
+    String storageFailure = {};
+    if (prepareContainerStorage(container, &storageFailure, true) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign(storageFailure.size() > 0 ? storageFailure : "retained storage preparation failed"_ctv);
+      }
+      return false;
+    }
+    return true;
+  }
+
   static void restartContainer(Container *container)
   {
     // Keep the active pairing snapshot in the restart payload. The old
     // process is gone, but the replacement needs those pairings to rejoin the
     // mesh and reach runtime readiness before it can signal healthy again.
+    const bool coldRestart = container->cgroup < 0;
+    bool coldRestartCoresAllocated = false;
     container->plan.prepareForRestartSchedule();
 
     if (container->pidfd > 0)
@@ -12998,11 +13087,28 @@ public:
 
     if (container->cleanupNetwork() == false)
     {
-      destroyContainer(container);
+      if (coldRestart)
+      {
+        container->deleteStorageOnCleanUp = false;
+        cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);
+      }
+      else
+      {
+        destroyContainer(container);
+      }
       return;
     }
 
     String failureReport;
+    if (coldRestart && prepareColdRestartContainer(container, &coldRestartCoresAllocated, &failureReport) == false)
+    {
+      std::fprintf(stderr,
+                   "restartContainer cold preparation failed uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   failureReport.c_str());
+      cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);
+      return;
+    }
     if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
     {
       thisNeuron->openWhiteholesForLocalContainer(container->plan.fragment, container->plan.whiteholes);
@@ -13018,13 +13124,35 @@ public:
       {
         thisNeuron->closeWhiteholesForLocalContainer(container->plan.fragment);
       }
-      basics_log("restartContainer start failed uuid=%llu reason=%s\n",
-                 (unsigned long long)container->plan.uuid,
-                 failureReport.c_str());
-      destroyContainer(container);
+      if (coldRestart)
+      {
+        std::fprintf(stderr,
+                     "restartContainer cold start failed uuid=%llu reason=%s\n",
+                     (unsigned long long)container->plan.uuid,
+                     failureReport.c_str());
+      }
+      else
+      {
+        basics_log("restartContainer start failed uuid=%llu reason=%s\n",
+                   (unsigned long long)container->plan.uuid,
+                   failureReport.c_str());
+      }
+      if (coldRestart)
+      {
+        cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);
+      }
+      else
+      {
+        destroyContainer(container);
+      }
     }
     else
     {
+      if (coldRestart)
+      {
+        // Subsequent ordinary lifecycle teardown owns the recovered backend.
+        container->deleteStorageOnCleanUp = true;
+      }
       container->failedArtifactsPreserved = false;
       container->failedArtifactsObservedAtMs = 0;
     }

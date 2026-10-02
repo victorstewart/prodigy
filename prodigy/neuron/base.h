@@ -57,7 +57,7 @@ public:
   ProdigyContainerDeviceMapCoordinator containerDeviceMaps;
   TimeoutPacket containerNetworkCleanupTick;
   bool containerNetworkCleanupTickQueued = false;
-  struct local_container_subnet6 lcsubnet6;
+  struct local_container_subnet6 lcsubnet6 = {};
 
   String metro;
   IPAddress private4;
