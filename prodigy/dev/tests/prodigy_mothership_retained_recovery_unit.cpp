@@ -1580,6 +1580,9 @@ int main()
   predecessorPlan.statePath="/var/lib/prodigy/state"; successorPlan.statePath=predecessorPlan.statePath; predecessorPlan.secretsPath="/var/lib/prodigy/secrets"; successorPlan.secretsPath=predecessorPlan.secretsPath;
   predecessorPlan.oldRuntimeSHA=std::string(64,'a'); successorPlan.oldRuntimeSHA=predecessorPlan.oldRuntimeSHA; predecessorPlan.oldBundleSHA=std::string(64,'b'); successorPlan.oldBundleSHA=predecessorPlan.oldBundleSHA;
   MothershipTidesMigration::Machine plannedMachine = {}; plannedMachine.uuid=3; plannedMachine.linuxID="0123456789abcdef0123456789abcdef"; plannedMachine.address="fd72::1"; plannedMachine.runtimeRoot="/root/observed-prodigy"; plannedMachine.installedRuntimeSHA=std::string(64,'a'); plannedMachine.installedBundleSHA=std::string(64,'b'); predecessorPlan.machines.push_back(plannedMachine); successorPlan.machines.push_back(plannedMachine);
+  // Keep the A→B→C transition realistic: schema-one records all three
+  // uniform predecessor machine identities before containment.
+  for(uint32_t index=4;index<=5;++index) { auto machine=plannedMachine; machine.uuid=index; machine.address="fd72::"+std::to_string(index); predecessorPlan.machines.push_back(machine); successorPlan.machines.push_back(machine); }
   assert(samePlanTarget(predecessorPlan,successorPlan)); successorPlan.operationRoot=predecessorPlan.operationRoot;
   assert(!samePlanTarget(predecessorPlan,successorPlan));
   successorPlan.operationRoot="/root/new";
@@ -1600,7 +1603,15 @@ int main()
   containedReceipt.approvedBundleSHA256=text(std::string(64,'d'));
   successorPlan.oldRuntimeSHA=std::string(64,'c');
   successorPlan.oldBundleSHA=std::string(64,'d');
+  // Containment moves every uniform installed identity A to receipt B; a
+  // successor C records B both at the plan and per-machine identity level.
+  for(auto& machine:successorPlan.machines) { machine.installedRuntimeSHA=successorPlan.oldRuntimeSHA; machine.installedBundleSHA=successorPlan.oldBundleSHA; }
   assert(sameContainedSuccessorTarget(predecessorPlan,containedReceipt,successorPlan));
+  successorPlan.machines[1].installedBundleSHA=std::string(64,'b');
+  assert(!sameContainedSuccessorTarget(predecessorPlan,containedReceipt,successorPlan));
+  successorPlan.machines[1].installedBundleSHA=successorPlan.oldBundleSHA;
+  auto nonuniformPredecessor=predecessorPlan; nonuniformPredecessor.machines[2].installedRuntimeSHA=std::string(64,'e');
+  assert(!sameContainedSuccessorTarget(nonuniformPredecessor,containedReceipt,successorPlan));
   successorPlan.oldBundleSHA=std::string(64,'e');
   assert(!sameContainedSuccessorTarget(predecessorPlan,containedReceipt,successorPlan));
   successorPlan.oldBundleSHA=std::string(64,'d');

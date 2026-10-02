@@ -1255,9 +1255,20 @@ inline bool sameContainedSuccessorTarget(const Plan& predecessor,const Mothershi
   // to reinterpret it as a mixed handoff.
   if(predecessor.mixedPredecessors || successor.mixedPredecessors)return false;
   if(successor.oldRuntimeSHA!=str(receipt.newRuntimeSHA256) || successor.oldBundleSHA!=str(receipt.approvedBundleSHA256))return false;
+  // A schema-one predecessor records the runtime observed before containment
+  // on every machine.  The contained successor instead records the receipt's
+  // one installed identity on every machine; project that factual transition
+  // before applying the complete immutable target comparison.
+  for(const auto& machine:predecessor.machines)
+    if(machine.installedRuntimeSHA!=predecessor.oldRuntimeSHA || machine.installedBundleSHA!=predecessor.oldBundleSHA)
+      return false;
   Plan current=predecessor;
   current.oldRuntimeSHA=successor.oldRuntimeSHA;
   current.oldBundleSHA=successor.oldBundleSHA;
+  for(auto& machine:current.machines) {
+    machine.installedRuntimeSHA=successor.oldRuntimeSHA;
+    machine.installedBundleSHA=successor.oldBundleSHA;
+  }
   return samePlanTarget(current,successor);
 }
 inline void requirePreactivation(Execution& e,const Execution *successor=nullptr) {
