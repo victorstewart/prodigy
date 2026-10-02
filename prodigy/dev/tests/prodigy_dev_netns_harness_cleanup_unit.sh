@@ -51,6 +51,21 @@ operation="${1:-}"
 echo "${operation}" >> "${MOCK_EVENTS}"
 case "${operation}" in
    createCluster)
+      create_name="$(jq -r .name <<< "${2:-}")"
+      case "${MOCK_SCENARIO}" in
+         partial-create)
+            echo "createCluster success=0 created=1 name=${create_name} failure=mocked"
+            exit 23
+            ;;
+         partial-other-name)
+            echo "createCluster success=0 created=1 name=other-harness failure=mocked"
+            exit 23
+            ;;
+         partial-not-created)
+            echo "createCluster success=0 created=0 name=${create_name} failure=mocked"
+            exit 23
+            ;;
+      esac
       mkdir -p "${MOCK_WORKSPACE}"
       for index in 1 2 3
       do
@@ -146,7 +161,7 @@ run_case()
       cat "${output}" >&2
       fail "${name}: cleanup did not preserve evidence"
    }
-   [[ -r "${case_tmpdir}/create.log" && -r "${case_tmpdir}/remove.log" ]] || fail "${name}: create/remove evidence missing"
+   [[ -r "${case_tmpdir}/create.log" ]] || fail "${name}: create evidence missing"
    printf '%s\t%s\t%s\n' "${status}" "${case_tmpdir}" "${output}"
 }
 
@@ -175,5 +190,32 @@ expect_case command_failure 1 'removeCluster exited with status 42' normal comma
 expect_case missing_receipt 1 'removeCluster did not report exact success receipt' normal missing-receipt 0 0
 expect_case original_failure 1 'cluster has no single reported master' original-failure command-failure 0 0
 expect_case original_signal 143 'removeCluster exited with status 42' signal command-failure 1 0
+
+expect_partial_create_case()
+{
+   local name="$1"
+   local scenario="$2"
+   local expect_remove="$3"
+   local result status tmpdir output
+   result="$(run_case "${name}" "${scenario}" success 0 0)"
+   IFS=$'\t' read -r status tmpdir output <<< "${result}"
+   [[ "${status}" == 1 ]] || {
+      cat "${output}" >&2
+      fail "${name}: expected original create failure status 1, got ${status}"
+   }
+   grep -Fq 'Mothership could not create the test cluster' "${output}" || fail "${name}: missing create failure"
+   if [[ "${expect_remove}" == 1 ]]
+   then
+      [[ -s "${tmpdir}/remove.log" ]] || fail "${name}: partial create did not retain removal receipt"
+      grep -Fxq removeCluster "${work_root}/${name}.events" || fail "${name}: partial create did not invoke removeCluster"
+   else
+      [[ ! -e "${tmpdir}/remove.log" ]] || fail "${name}: non-owned or uncreated receipt invoked removeCluster"
+      ! grep -Fxq removeCluster "${work_root}/${name}.events" || fail "${name}: non-owned or uncreated receipt invoked removeCluster"
+   fi
+}
+
+expect_partial_create_case partial_create partial-create 1
+expect_partial_create_case partial_other_name partial-other-name 0
+expect_partial_create_case partial_not_created partial-not-created 0
 
 echo 'PASS: netns harness cleanup receipts preserve primary status and evidence'

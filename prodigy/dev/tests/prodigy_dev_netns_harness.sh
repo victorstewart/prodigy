@@ -332,6 +332,10 @@ create_request="$(jq -nc \
 
 if ! "${mothership_bin}" createCluster "${create_request}" >"${create_log}" 2>&1
 then
+   if rg -q "^createCluster success=0 created=1 name=${cluster_name} failure=" "${create_log}"
+   then
+      cluster_created=1
+   fi
    sed -n '1,260p' "${create_log}" >&2
    fail "Mothership could not create the test cluster"
 fi
