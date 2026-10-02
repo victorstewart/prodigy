@@ -10279,24 +10279,6 @@ public:
     recoverAfterReboot();
   }
 
-  static bool materializedStatefulRecoveryPlansAreCompatible(const DeploymentPlan& active, const DeploymentPlan& successor)
-  {
-    return active.isStateful && successor.isStateful &&
-           active.config.type == ApplicationType::stateful && successor.config.type == ApplicationType::stateful &&
-           active.config.applicationID == successor.config.applicationID &&
-           successor.stateful.allowUpdateInPlace && successor.canaryCount == 0 &&
-           successor.config.nLogicalCores == active.config.nLogicalCores &&
-           successor.config.totalMemoryMB() == active.config.totalMemoryMB() &&
-           successor.config.totalStorageMB() == active.config.totalStorageMB() &&
-           successor.stateful.clientPrefix == active.stateful.clientPrefix &&
-           successor.stateful.siblingPrefix == active.stateful.siblingPrefix &&
-           successor.stateful.cousinPrefix == active.stateful.cousinPrefix &&
-           successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
-           successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
-           successor.stateful.seedingAlways == active.stateful.seedingAlways &&
-           successor.stateful.allMasters == active.stateful.allMasters;
-  }
-
   // A restored deployment chain can retain one older, already-empty NONE
   // record ahead of the active materialized cohort.  It owns neither process
   // nor scheduler state and is detached by Brain only after the recovery
@@ -10343,7 +10325,7 @@ public:
       return false;
     }
     if (next->previous != this || next->next != nullptr ||
-        materializedStatefulRecoveryPlansAreCompatible(plan, next->plan) == false ||
+        prodigyMaterializedStatefulRecoveryPlansAreCompatible(plan, next->plan) == false ||
         next->state != DeploymentState::waitingToDeploy || next->lifecycleIsUnmaterialized() == false)
     {
       return false;

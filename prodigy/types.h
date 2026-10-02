@@ -8711,6 +8711,29 @@ static void serialize(S&& serializer, DeploymentPlan& plan)
   serializer.object(plan.apiCredentialPolicy);
 }
 
+// The materialized recovery owner and the sealed retained-recovery preparer
+// must admit the same in-place stateful lineage.  Keep the compatibility
+// invariant with the durable plan type instead of duplicating it at either
+// lifecycle boundary.
+static inline bool prodigyMaterializedStatefulRecoveryPlansAreCompatible(
+    const DeploymentPlan& active, const DeploymentPlan& successor)
+{
+  return active.isStateful && successor.isStateful &&
+         active.config.type == ApplicationType::stateful && successor.config.type == ApplicationType::stateful &&
+         active.config.applicationID == successor.config.applicationID &&
+         successor.stateful.allowUpdateInPlace && successor.canaryCount == 0 &&
+         successor.config.nLogicalCores == active.config.nLogicalCores &&
+         successor.config.totalMemoryMB() == active.config.totalMemoryMB() &&
+         successor.config.totalStorageMB() == active.config.totalStorageMB() &&
+         successor.stateful.clientPrefix == active.stateful.clientPrefix &&
+         successor.stateful.siblingPrefix == active.stateful.siblingPrefix &&
+         successor.stateful.cousinPrefix == active.stateful.cousinPrefix &&
+         successor.stateful.seedingPrefix == active.stateful.seedingPrefix &&
+         successor.stateful.shardingPrefix == active.stateful.shardingPrefix &&
+         successor.stateful.seedingAlways == active.stateful.seedingAlways &&
+         successor.stateful.allMasters == active.stateful.allMasters;
+}
+
 class FailedDeploymentRecordPayload {
 public:
 

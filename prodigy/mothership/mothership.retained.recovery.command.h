@@ -143,10 +143,53 @@ inline String encodeColdCanonicalSourceRequest(const Request& request, const Pla
   require(!bytes.empty(),"cold canonical source request serialization is empty");
   String framed={}; framed.append("RRF7",4); framed.append(bytes.data(),bytes.size()); return framed;
 }
+// A partial application handoff reuses the existing durable recovery owner.
+// Its explicit descriptor is sealed with the complete observed inventory; the
+// pure preparation owner must prove the exact two-old/one-new cohort.
+struct Schema8PartialHandoffRequest {
+  String coldRequest;
+  ProdigyMaterializedStatefulRecoveryOperation operation;
+};
+template<typename S> void serialize(S&& s, Schema8PartialHandoffRequest& r) {
+  s.text1b(r.coldRequest, UINT32_MAX); s.object(r.operation);
+}
+inline bool partialHandoffEnvelopeValid(const ProdigyMaterializedStatefulRecoveryOperation& operation) {
+  return prodigyCanonicalOperationUUID(operation.operationID) && operation.activeDeploymentID != 0 &&
+      operation.successorDeploymentID != 0 && operation.activeDeploymentID != operation.successorDeploymentID &&
+      prodigyIsSHA256HexDigest(operation.successorBlobSHA256) && operation.accepted && operation.started &&
+      !operation.completed && operation.updatedAtMs > 0;
+}
+inline bool partialHandoffsEqual(const ProdigyMaterializedStatefulRecoveryOperation& lhs,
+                                 const ProdigyMaterializedStatefulRecoveryOperation& rhs) {
+  return mothershipRetainedRecoveryPartialHandoffEqual(lhs,rhs);
+}
+inline String encodePartialHandoffRequest(const Request& request, const Plan& plan,
+                                          uint128_t emptyMachine, const ColdCanonicalSource& source,
+                                          const ProdigyMaterializedStatefulRecoveryOperation& operation) {
+  require(partialHandoffEnvelopeValid(operation),"invalid partial handoff descriptor");
+  Schema8PartialHandoffRequest wrapped;
+  wrapped.coldRequest=encodeColdCanonicalSourceRequest(request,plan,emptyMachine,source);
+  wrapped.operation=operation;
+  String bytes; BitseryEngine::serialize(bytes,wrapped);
+  require(!bytes.empty(),"partial handoff serialization is empty");
+  String framed; framed.append("RRF8",4); framed.append(bytes.data(),bytes.size()); return framed;
+}
 inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof,
                           uint128_t *retiredConflictingClientUUID = nullptr,
                           uint128_t *emptyRetainedInventoryMachineUUID = nullptr,
-                          ColdCanonicalSource *coldCanonicalSource = nullptr) {
+                          ColdCanonicalSource *coldCanonicalSource = nullptr,
+                          ProdigyMaterializedStatefulRecoveryOperation *partialHandoff = nullptr) {
+  if(partialHandoff)*partialHandoff={};
+  if (raw.size()>=4 && raw.compare(0,4,"RRF8")==0) {
+    Schema8PartialHandoffRequest wrapped;
+    if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
+        !partialHandoffEnvelopeValid(wrapped.operation) || wrapped.coldRequest.size()<4 ||
+        std::memcmp(wrapped.coldRequest.data(),"RRF7",4)!=0 ||
+        !decodeRequest(str(wrapped.coldRequest),request,proof,retiredConflictingClientUUID,
+                       emptyRetainedInventoryMachineUUID,coldCanonicalSource)) return false;
+    if(partialHandoff)*partialHandoff=std::move(wrapped.operation);
+    return true;
+  }
   if (raw.size()>=4 && raw.compare(0,4,"RRF7")==0) {
     Schema7ColdCanonicalSourceRequest wrapped;
     if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
@@ -257,6 +300,7 @@ struct Manifest {
     };
     Vector<StorageMetadata> storage;
   } coldCanonicalSource;
+  ProdigyMaterializedStatefulRecoveryOperation partialHandoff;
 };
 inline bool coldCanonicalMetadata(const String& value) {
   if (value.size() <= 4) return false;
@@ -340,7 +384,7 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
   privateFile(path,1024*1024); simdjson::dom::parser parser; simdjson::dom::element doc;
   auto raw=read(path); require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery manifest JSON");
   const uint64_t schemaVersion=number(doc,"schemaVersion");
-  require((schemaVersion==1 || schemaVersion==2) && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
+  require((schemaVersion==1 || schemaVersion==2 || schemaVersion==3) && uuid(field(doc,"clusterUUID"))==p.clusterUUID,"recovery manifest cluster mismatch");
   Manifest m; m.request.clusterUUID=p.clusterUUID; m.request.bundleSHA=text(field(doc,"bundleSHA256"));
   simdjson::dom::element declaredCanonicalCount;
   const bool hasDeclaredCanonicalCount=doc["canonicalContainerCount"].get(declaredCanonicalCount)==simdjson::SUCCESS;
@@ -388,7 +432,7 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     m.request.machines.push_back(std::move(machine));
   }
   require(seenMachines.size()==3 && canonical==m.canonicalContainerCount,"recovery canonical inventory differs from sealed three-host declaration");
-  if (schemaVersion == 2) {
+  if (schemaVersion >= 2) {
     require(m.emptyRetainedInventoryMachineUUID != 0 && p.schemaVersion != 4,
             "cold canonical source requires a uniform empty retained machine");
     simdjson::dom::element cold;
@@ -427,6 +471,23 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
     for(uint32_t index=0;index<m.coldCanonicalSource.storage.size();++index)
       require(m.coldCanonicalSource.storage[index].containerUUID==m.coldCanonicalSource.requestedContainerUUIDs[index],
               "cold canonical source storage UUID set differs");
+  }
+  simdjson::dom::element handoff;
+  const bool hasHandoff=doc["partialStatefulHandoff"].get(handoff)==simdjson::SUCCESS;
+  require(hasHandoff==(schemaVersion==3),"partial handoff requires its explicit manifest schema");
+  if (hasHandoff) {
+    auto& operation=m.partialHandoff;
+    operation.operationID=text(field(handoff,"operationID"));
+    operation.activeDeploymentID=number(handoff,"activeDeploymentID");
+    operation.successorDeploymentID=number(handoff,"successorDeploymentID");
+    operation.successorBlobSHA256=text(field(handoff,"successorBlobSHA256"));
+    const uint64_t updated=number(handoff,"updatedAtMs");
+    require(updated>0 && updated<=INT64_MAX,"invalid partial handoff timestamp");
+    operation.updatedAtMs=int64_t(updated); operation.accepted=true; operation.started=true;
+    require(partialHandoffEnvelopeValid(operation),"invalid partial handoff authority");
+    std::string identity=str(operation.operationID);
+    identity.erase(std::remove(identity.begin(),identity.end(),'-'),identity.end());
+    require(uuid("0x"+identity)==p.operationID,"partial handoff operation differs from sealed migration identity");
   }
   return m;
 }
@@ -549,8 +610,9 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
     Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
     ColdCanonicalSource coldCanonicalSource = {};
+    ProdigyMaterializedStatefulRecoveryOperation partialHandoff = {};
     require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,
-                          &emptyRetainedInventoryMachineUUID,&coldCanonicalSource),"recovery request decode failed");
+                          &emptyRetainedInventoryMachineUUID,&coldCanonicalSource,&partialHandoff),"recovery request decode failed");
     require(coldCanonicalSource.states.empty() ||
                 (emptyRetainedInventoryMachineUUID != 0 && retiredConflictingClientUUID == 0 &&
                  coldCanonicalUUIDsAreStrictlySorted(coldCanonicalSource.requestedContainerUUIDs) &&
@@ -664,7 +726,8 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     } else {
       require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
                                                         request.bundleSHA,&why,previousBundleSHA256,{},0,nullptr,false,true,
-                                                        emptyRetainedInventoryMachineUUID,coldCanonicalSource.states),str(why).c_str());
+                                                        emptyRetainedInventoryMachineUUID,coldCanonicalSource.states,
+                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff),str(why).c_str());
     }
     require(witnessesEquivalent(expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,sealed.witnesses),"sealed witnesses differ from validated retained fleet");
     expected.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses=sealed.witnesses;
@@ -1291,13 +1354,17 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
           if(!r.canonical) {require(!deployment->second.isStateful && deployment->second.config.type==ApplicationType::stateless,"extra retirement would affect a stateful container");continue;}
           for(auto& m:manifest.request.machines)if(m.machineUUID==r.machine) {m.parameters.push_back(std::move(params));m.observedCreatedAtMs.push_back(r.created);}
         }
-        String bytes=manifest.coldCanonicalSource.requestedContainerUUIDs.empty() ?
+        String bytes=!manifest.partialHandoff.operationID.empty() ?
+            encodePartialHandoffRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID,coldCanonicalSource,manifest.partialHandoff) :
+            manifest.coldCanonicalSource.requestedContainerUUIDs.empty() ?
             encodeRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID) :
             encodeColdCanonicalSourceRequest(manifest.request,e.plan,manifest.emptyRetainedInventoryMachineUUID,coldCanonicalSource);
         if(!requestAlreadySealed) durable(requestPath,bytes);
         Request sealedRequest = {}; MothershipRetainedRecoveryMixedProof sealedProof = {};
         uint128_t sealedRetired=0, sealedEmptyMachine=0; ColdCanonicalSource sealedColdSource = {};
-        require(decodeRequest(read(requestPath),sealedRequest,&sealedProof,&sealedRetired,&sealedEmptyMachine,&sealedColdSource) &&
+        ProdigyMaterializedStatefulRecoveryOperation sealedPartialHandoff = {};
+        require(decodeRequest(read(requestPath),sealedRequest,&sealedProof,&sealedRetired,&sealedEmptyMachine,&sealedColdSource,&sealedPartialHandoff) &&
+                    partialHandoffsEqual(sealedPartialHandoff,manifest.partialHandoff) &&
                     sealedRequest.clusterUUID==manifest.request.clusterUUID && sealedRetired==0 &&
                     sealedEmptyMachine==manifest.emptyRetainedInventoryMachineUUID,
                 "sealed recovery request differs from cold canonical authority");
@@ -1324,8 +1391,9 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
         Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0, emptyRetainedInventoryMachineUUID=0;
         ColdCanonicalSource coldCanonicalSource = {};
+        ProdigyMaterializedStatefulRecoveryOperation partialHandoff = {};
         require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID,
-                              &emptyRetainedInventoryMachineUUID,&coldCanonicalSource),"sealed request unreadable");
+                              &emptyRetainedInventoryMachineUUID,&coldCanonicalSource,&partialHandoff),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
         if (retiredConflictingClientUUID != 0) {
           const auto originalRequestPath=e.plan.operationRoot+"/recovery.request"; privateFile(originalRequestPath);
@@ -1346,7 +1414,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         } else {
           require(mothershipPrepareRetainedRecoverySnapshot(seed,request.plans,request.machines,
                                                             request.bundleSHA,&why,text(e.plan.oldBundleSHA),{},0,nullptr,false,true,
-                                                            emptyRetainedInventoryMachineUUID,coldCanonicalSource.states),str(why).c_str());
+                                                            emptyRetainedInventoryMachineUUID,coldCanonicalSource.states,
+                                                        partialHandoff.operationID.empty()?nullptr:&partialHandoff),str(why).c_str());
         }
         WitnessSet sealed;sealed.requestSHA=text(digest(requestPath));sealed.witnesses=seed.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
         String bytes;BitseryEngine::serialize(bytes,sealed);durable(witnessPath,bytes);

@@ -12858,7 +12858,7 @@ public:
         !head->containers.empty() || active->containers.size() != 2 ||
         !head->plan.config.containerBlobSHA256.equals(retry.replacementSuccessorBlobSHA256) ||
         !failed->plan.config.containerBlobSHA256.equals(retry.failedSuccessorBlobSHA256) ||
-        !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan) ||
+        !prodigyMaterializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan) ||
         (!failed->containers.empty() && !failed->canDiscardUnlaunchedMaterializedRecoveryViews())) return false;
     const auto before = masterAuthorityRuntimeState;
     const bool wasDurable = masterAuthorityRuntimeStateDurable;
@@ -13075,7 +13075,7 @@ public:
         active->next = head;
       }
       if (head->previous != active || active->next != head ||
-          !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan)) continue;
+          !prodigyMaterializedStatefulRecoveryPlansAreCompatible(active->plan, head->plan)) continue;
       head->materializedStatefulRecoveryOwnsTransition = true;
       if (retry.phase == ProdigyMaterializedStatefulRecoveryRetryPhase::storageLaunchHealthy)
       {
@@ -36028,7 +36028,7 @@ public:
               (recoveryRetryAdmission->replacementSuccessorBlobSHA256.equals(trustedContainerBlobSHA256) == false ||
                !deployments.contains(recoveryRetryAdmission->activeDeploymentID) ||
                !deployments.at(recoveryRetryAdmission->activeDeploymentID) ||
-               !ApplicationDeployment::materializedStatefulRecoveryPlansAreCompatible(
+               !prodigyMaterializedStatefulRecoveryPlansAreCompatible(
                    deployments.at(recoveryRetryAdmission->activeDeploymentID)->plan, deployment->plan)))
           {
             rejectInvalidPlan("invalid plan: materialized stateful recovery retry target does not match its durable authorization"_ctv);

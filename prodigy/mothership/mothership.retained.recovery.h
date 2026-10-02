@@ -71,6 +71,18 @@ static inline uint32_t mothershipRetainedRecoveryWitnessContainerCount(
   uint32_t count=0; for (const auto& witness:witnesses) count+=witness.containerBootstraps.size(); return count;
 }
 
+static inline bool mothershipRetainedRecoveryPartialHandoffEqual(
+    const ProdigyMaterializedStatefulRecoveryOperation& lhs,
+    const ProdigyMaterializedStatefulRecoveryOperation& rhs)
+{
+  return lhs.operationID.equals(rhs.operationID) &&
+         lhs.activeDeploymentID == rhs.activeDeploymentID &&
+         lhs.successorDeploymentID == rhs.successorDeploymentID &&
+         lhs.successorBlobSHA256.equals(rhs.successorBlobSHA256) &&
+         lhs.accepted == rhs.accepted && lhs.started == rhs.started &&
+         lhs.completed == rhs.completed && lhs.updatedAtMs == rhs.updatedAtMs;
+}
+
 // A fenced retained process may have advanced its in-memory lifecycle after the
 // sealed parameters were captured.  Those observations are not recovery
 // authority: only a scheduled or healthy process is admissible, and its
@@ -304,7 +316,8 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     bool retainRetiredConflictingClientForCoordinatorProof = false,
     bool validateCoordinator = true,
     uint128_t emptyRetainedInventoryMachineUUID = 0,
-    const Vector<BrainReplicatedContainerRuntimeState>& coldCanonicalRuntimeStates = {})
+    const Vector<BrainReplicatedContainerRuntimeState>& coldCanonicalRuntimeStates = {},
+    const ProdigyMaterializedStatefulRecoveryOperation *partialHandoff = nullptr)
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -347,6 +360,12 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   bytell_hash_set<uint32_t> seenFragments = {};
   bytell_hash_map<uint64_t,uint32_t> statefulReplicas, statefulClientMasters;
   bytell_hash_map<uint64_t,uint32_t> fullStatefulReplicas, fullStatefulClientMasters;
+  struct ObservedStatefulBootstrap {
+    uint64_t deploymentID = 0;
+    uint128_t machineUUID = 0;
+    NeuronContainerBootstrap bootstrap;
+  };
+  Vector<ObservedStatefulBootstrap> observedStatefulBootstraps = {};
   uint64_t retiredDeploymentID = 0;
   uint32_t retiredShardGroup = 0;
   uint64_t retiredClientRole = 0;
@@ -432,6 +451,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       if (existing->second.isStateful) {
         ++fullStatefulReplicas[parameters.deploymentID];
         if (bootstrap.plan.statefulMeshRoles.client != 0) ++fullStatefulClientMasters[parameters.deploymentID];
+        observedStatefulBootstraps.push_back({parameters.deploymentID, machine.machineUUID, bootstrap});
       }
       const bool retiredCohort = retiringConflictingClient && parameters.deploymentID == retiredDeploymentID &&
           parameters.statefulTopology.shardGroup == retiredShardGroup;
@@ -595,9 +615,65 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       coldStatesToPersist.push_back(cold);
     }
   }
+  bool sealedPartialHandoff = false;
+  bool partialHandoffAlreadyDurable = false;
+  if (partialHandoff != nullptr)
+  {
+    const uint64_t activeID = partialHandoff->activeDeploymentID;
+    const uint64_t successorID = partialHandoff->successorDeploymentID;
+    auto active = approvedPlans.find(activeID);
+    auto successor = approvedPlans.find(successorID);
+    if (retiringConflictingClient || activeID == 0 || successorID == 0 || activeID >= successorID ||
+        prodigyCanonicalOperationUUID(partialHandoff->operationID) == false ||
+        prodigyIsSHA256HexDigest(partialHandoff->successorBlobSHA256) == false ||
+        partialHandoff->accepted == false || partialHandoff->started == false || partialHandoff->completed ||
+        partialHandoff->updatedAtMs <= 0 || active == approvedPlans.end() || successor == approvedPlans.end() ||
+        active->second.stateful.allMasters || successor->second.stateful.allMasters ||
+        prodigyMaterializedStatefulRecoveryPlansAreCompatible(active->second, successor->second) == false ||
+        successor->second.config.containerBlobSHA256.equals(partialHandoff->successorBlobSHA256) == false ||
+        statefulReplicas[activeID] != 2 || statefulClientMasters[activeID] != 1 ||
+        statefulReplicas[successorID] != 1 || statefulClientMasters[successorID] != 0)
+    {
+      if (failure) failure->assign("sealed partial materialized handoff is not an exact 2+1 stateful lineage"_ctv);
+      return false;
+    }
+    for (const ProdigyMaterializedStatefulRecoveryOperation& current : runtime.materializedStatefulRecoveryOperations)
+    {
+      if (mothershipRetainedRecoveryPartialHandoffEqual(current, *partialHandoff))
+      {
+        if (partialHandoffAlreadyDurable)
+        {
+          if (failure) failure->assign("sealed partial materialized handoff is duplicated in durable recovery authority"_ctv);
+          return false;
+        }
+        partialHandoffAlreadyDurable = true;
+        continue;
+      }
+      if (current.operationID.equals(partialHandoff->operationID) ||
+          current.activeDeploymentID == activeID || current.activeDeploymentID == successorID ||
+          current.successorDeploymentID == activeID || current.successorDeploymentID == successorID)
+      {
+        if (failure) failure->assign("sealed partial materialized handoff collides with durable recovery authority"_ctv);
+        return false;
+      }
+    }
+    for (const ProdigyMaterializedStatefulRecoveryRetry& current : runtime.materializedStatefulRecoveryRetries)
+    {
+      if (current.operationID.equals(partialHandoff->operationID) ||
+          current.activeDeploymentID == activeID || current.activeDeploymentID == successorID ||
+          current.failedSuccessorDeploymentID == activeID || current.failedSuccessorDeploymentID == successorID ||
+          current.replacementSuccessorDeploymentID == activeID || current.replacementSuccessorDeploymentID == successorID)
+      {
+        if (failure) failure->assign("sealed partial materialized handoff collides with durable recovery retry"_ctv);
+        return false;
+      }
+    }
+    sealedPartialHandoff = true;
+  }
   for (const auto& [id, count] : statefulReplicas) {
     const auto& deployment = approvedPlans.find(id)->second;
     if (retiringConflictingClient && retainRetiredConflictingClientForCoordinatorProof && id == retiredDeploymentID) continue;
+    if (sealedPartialHandoff && id == partialHandoff->successorDeploymentID) continue;
     const uint32_t expected = deployment.stateful.allMasters ? count : 1;
     if (statefulClientMasters[id] != expected) {
       if (failure) failure->assign("retained stateful inventory has missing or conflicting client masters"_ctv);
@@ -634,6 +710,99 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     {
       runtimeStates.push_back(cold);
     }
+  }
+  if (sealedPartialHandoff)
+  {
+    const uint64_t activeID = partialHandoff->activeDeploymentID;
+    const uint64_t successorID = partialHandoff->successorDeploymentID;
+    Vector<ObservedStatefulBootstrap> lineage = {};
+    for (const ObservedStatefulBootstrap& observed : observedStatefulBootstraps)
+      if (observed.deploymentID == activeID || observed.deploymentID == successorID)
+      {
+        const ContainerPlan& plan = observed.bootstrap.plan;
+        if (plan.nShardGroups != 1 || plan.shardGroup != 0 ||
+            plan.lifetime != ApplicationLifetime::base)
+        {
+          if (failure) failure->assign("sealed partial materialized handoff observed lineage is not one base shard"_ctv);
+          return false;
+        }
+        lineage.push_back(observed);
+      }
+    if (lineage.size() != 3)
+    {
+      if (failure) failure->assign("sealed partial materialized handoff has incomplete observed lineage"_ctv);
+      return false;
+    }
+    auto observedFor = [&](uint128_t uuid) -> const ObservedStatefulBootstrap * {
+      for (const ObservedStatefulBootstrap& observed : lineage)
+        if (observed.bootstrap.plan.uuid == uuid) return &observed;
+      return nullptr;
+    };
+    // The sealed parameters are the authority for a partially completed
+    // handoff.  A stopped Brain may retain an older scheduler projection
+    // (notably a zero shard-count) for the same process, so it cannot be
+    // compared as a complete bootstrap.  Bind the durable record only to its
+    // immutable identity and declared network/configuration before replacing
+    // it with the reconstructed scheduled bootstrap below.
+    auto persistedIdentityMatchesObserved = [](const BrainReplicatedContainerRuntimeState& persisted,
+                                                const ObservedStatefulBootstrap& observed) {
+      if (persisted.machineUUID != observed.machineUUID ||
+          persisted.plan.uuid != observed.bootstrap.plan.uuid ||
+          persisted.plan.config.deploymentID() != observed.deploymentID ||
+          persisted.plan.isStateful == false ||
+          persisted.plan.statefulMeshRoles.client != observed.bootstrap.plan.statefulMeshRoles.client)
+        return false;
+      String persistedConfig = {}, observedConfig = {};
+      ApplicationConfig left = persisted.plan.config, right = observed.bootstrap.plan.config;
+      BitseryEngine::serialize(persistedConfig, left);
+      BitseryEngine::serialize(observedConfig, right);
+      if (persistedConfig != observedConfig) return false;
+      String persistedAddresses = {}, observedAddresses = {};
+      auto leftAddresses = persisted.plan.addresses, rightAddresses = observed.bootstrap.plan.addresses;
+      BitseryEngine::serialize(persistedAddresses, leftAddresses);
+      BitseryEngine::serialize(observedAddresses, rightAddresses);
+      return persistedAddresses == observedAddresses;
+    };
+    auto& runtimeStates = snapshot.masterAuthority.containerRuntimeStates;
+    for (const BrainReplicatedContainerRuntimeState& state : runtimeStates)
+    {
+      const uint64_t deploymentID = state.plan.config.deploymentID();
+      if (deploymentID != activeID && deploymentID != successorID) continue;
+      const ObservedStatefulBootstrap *observed = observedFor(state.plan.uuid);
+      if (observed == nullptr)
+      {
+        if (state.plan.state != ContainerState::planned)
+        {
+          if (failure) failure->assign("sealed partial materialized handoff has an unobserved materialized runtime record"_ctv);
+          return false;
+        }
+        continue;
+      }
+      if (persistedIdentityMatchesObserved(state, *observed) == false)
+      {
+        if (failure) failure->assign("sealed partial materialized handoff runtime record differs from observed authority"_ctv);
+        return false;
+      }
+    }
+    runtimeStates.erase(std::remove_if(runtimeStates.begin(), runtimeStates.end(),
+        [activeID, successorID](const BrainReplicatedContainerRuntimeState& state) {
+          const uint64_t deploymentID = state.plan.config.deploymentID();
+          return deploymentID == activeID || deploymentID == successorID;
+        }), runtimeStates.end());
+    for (const ObservedStatefulBootstrap& observed : lineage)
+    {
+      BrainReplicatedContainerRuntimeState canonical = {};
+      canonical.machineUUID = observed.machineUUID;
+      canonical.plan = observed.bootstrap.plan;
+      canonical.plan.state = ContainerState::scheduled;
+      canonical.plan.runtimeReady = false;
+      canonical.runtimeLogicalCores = uint16_t(applicationSharedCPUCoreHint(canonical.plan.config));
+      canonical.runtimeMemoryMB = canonical.plan.config.totalMemoryMB();
+      canonical.runtimeStorageMB = canonical.plan.config.totalStorageMB();
+      runtimeStates.push_back(std::move(canonical));
+    }
+    if (partialHandoffAlreadyDurable == false)
+      runtime.materializedStatefulRecoveryOperations.push_back(*partialHandoff);
   }
   std::sort(snapshot.masterAuthority.containerRuntimeStates.begin(),
             snapshot.masterAuthority.containerRuntimeStates.end(),

@@ -252,8 +252,9 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
         SubscriptionNature::any));
     coldStates.push_back(std::move(cold));
   }
-  // Five ordinary survivors make the observed inventory exactly 13 records.
-  for (uint32_t index = 0; index < 5; ++index)
+  // Two stateless survivors join the four two-member stateful cohorts below.
+  // The partial Hot handoff added later brings the live record count to 13.
+  for (uint32_t index = 0; index < 2; ++index)
   {
     DeploymentPlan plan = statelessPlan(uint16_t(201 + index));
     source.masterAuthority.deploymentPlans[plan.config.deploymentID()] = plan;
@@ -262,7 +263,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
     machines[machine - 1].parameters.push_back(parametersFor(plan, 0x3000 + index, machine, fragment, false));
     machines[machine - 1].observedCreatedAtMs.push_back(1791000000200LL + index);
   }
-  assert(machines[1].parameters.size() + machines[2].parameters.size() == 13);
+  assert(machines[1].parameters.size() + machines[2].parameters.size() == 10);
   bytell_hash_map<uint64_t, DeploymentPlan> approved = source.masterAuthority.deploymentPlans;
 
   // A stale, unobserved nuc1 stateless owner must not survive as a scheduled
@@ -322,6 +323,147 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(!mothershipPrepareRetainedRecoverySnapshot(
       collisionSnapshot, approved, collisionMachines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates));
 
+  // A failed in-place stateful rollout can have two retained predecessor
+  // members and one live, non-client successor. It is not an ordinary
+  // zero-client deployment: the existing materialized-recovery owner resumes
+  // this exact 2+1 lineage only after its operation is durable.
+  DeploymentPlan activeHot = statefulPlan(303, false);
+  activeHot.config.versionID = 40;
+  DeploymentPlan successorHot = activeHot;
+  successorHot.config.versionID = 41;
+  successorHot.stateful.allowUpdateInPlace = true;
+  successorHot.config.containerBlobSHA256 = MothershipTidesMigration::text(std::string(64, 'a'));
+  const uint64_t activeHotID = activeHot.config.deploymentID();
+  const uint64_t successorHotID = successorHot.config.deploymentID();
+  source.masterAuthority.deploymentPlans[activeHotID] = activeHot;
+  source.masterAuthority.deploymentPlans[successorHotID] = successorHot;
+  machines[1].parameters.push_back(parametersFor(activeHot, 0x5101, 2, 50, true));
+  machines[1].observedCreatedAtMs.push_back(1791000000401LL);
+  machines[2].parameters.push_back(parametersFor(activeHot, 0x5102, 3, 50, false));
+  machines[2].observedCreatedAtMs.push_back(1791000000402LL);
+  // The observed running successor shares nuc2 with one predecessor member;
+  // the real resume owner deliberately permits this 2+1 placement.
+  machines[1].parameters.push_back(parametersFor(successorHot, 0x5103, 2, 51, false));
+  machines[1].observedCreatedAtMs.push_back(1791000000403LL);
+  assert(machines[1].parameters.size() + machines[2].parameters.size() == 13);
+  approved = source.masterAuthority.deploymentPlans;
+
+  // These planner-only successor records were retained by a stopped Brain but
+  // are absent from the sealed live inventory. The partial-handoff path must
+  // remove only these planned ghosts, never a materialized unknown process.
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    const uint32_t machine = 2 + index;
+    ContainerParameters staleParameters = parametersFor(
+        successorHot, 0x5201 + index, machine, uint8_t(52 + index), false);
+    NeuronContainerBootstrap staleBootstrap = {};
+    assert(prodigyBuildRetainedContainerBootstrap(
+        successorHot, staleParameters, machine, source.brainConfig.datacenterFragment,
+        1791000000410LL + index, staleBootstrap, &failure));
+    BrainReplicatedContainerRuntimeState stale = {};
+    stale.machineUUID = machine;
+    stale.plan = staleBootstrap.plan;
+    stale.plan.state = ContainerState::planned;
+    stale.plan.runtimeReady = false;
+    source.masterAuthority.containerRuntimeStates.push_back(std::move(stale));
+  }
+  ProdigyMaterializedStatefulRecoveryOperation partial = {};
+  partial.operationID = "123e4567-e89b-42d3-a456-426614174099"_ctv;
+  partial.activeDeploymentID = activeHotID;
+  partial.successorDeploymentID = successorHotID;
+  partial.successorBlobSHA256 = successorHot.config.containerBlobSHA256;
+  partial.accepted = partial.started = true;
+  partial.updatedAtMs = 1791000000420LL;
+
+  auto withoutPartial = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      withoutPartial, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates));
+  auto partialPrepared = source;
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      partialPrepared, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  assert(partialPrepared.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.size() == 1);
+  assert(partialPrepared.masterAuthority.runtimeState.materializedStatefulRecoveryOperations[0].operationID.equals(partial.operationID));
+  uint32_t canonicalActive = 0, canonicalSuccessor = 0;
+  for (const BrainReplicatedContainerRuntimeState& state : partialPrepared.masterAuthority.containerRuntimeStates)
+  {
+    if (state.plan.config.deploymentID() == activeHotID) ++canonicalActive;
+    if (state.plan.config.deploymentID() == successorHotID) ++canonicalSuccessor;
+    if (state.plan.config.deploymentID() == activeHotID || state.plan.config.deploymentID() == successorHotID)
+      assert(state.plan.state == ContainerState::scheduled && state.plan.runtimeReady == false);
+  }
+  assert(canonicalActive == 2 && canonicalSuccessor == 1);
+
+  // Re-entering against the already prepared authority is idempotent: the
+  // exact operation is retained once and the canonical 2+1 inventory stays
+  // unchanged.  prepareLocal clears the sealed envelope and rolls back its
+  // staging generation before it calls the pure helper on an already-prepared
+  // snapshot; mirror that boundary here rather than asking the helper to
+  // accept a live coordinator envelope.
+  auto normalizeAlreadyPreparedForPureHelper = [](ProdigyPersistentBrainSnapshot& snapshot) {
+    snapshot.masterAuthority.runtimeState.updateSelf = {};
+    assert(snapshot.masterAuthority.runtimeState.generation > 0);
+    --snapshot.masterAuthority.runtimeState.generation;
+  };
+  auto alreadyPrepared = partialPrepared;
+  normalizeAlreadyPreparedForPureHelper(alreadyPrepared);
+  assert(mothershipPrepareRetainedRecoverySnapshot(
+      alreadyPrepared, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  assert(alreadyPrepared.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.size() == 1);
+  auto duplicatedOperation = partialPrepared;
+  normalizeAlreadyPreparedForPureHelper(duplicatedOperation);
+  duplicatedOperation.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.push_back(partial);
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      duplicatedOperation, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+
+  auto completed = partial;
+  completed.completed = true;
+  auto completedSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      completedSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &completed));
+  auto wrongBlob = partial;
+  wrongBlob.successorBlobSHA256 = MothershipTidesMigration::text(std::string(64, 'b'));
+  auto wrongBlobSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongBlobSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &wrongBlob));
+  auto wrongRoleMachines = machines;
+  wrongRoleMachines[1].parameters.back().statefulMeshRoles.client =
+      StatefulMeshRoles::forShardGroup(successorHot.stateful, successorHot.config.applicationID, 0).client;
+  auto wrongRoleSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongRoleSnapshot, approved, wrongRoleMachines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  auto extraMachines = machines;
+  extraMachines[1].parameters.push_back(parametersFor(successorHot, 0x5104, 2, 54, false));
+  extraMachines[1].observedCreatedAtMs.push_back(1791000000404LL);
+  auto extraSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      extraSnapshot, approved, extraMachines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  auto collidingOperation = source;
+  auto otherOperation = partial;
+  otherOperation.operationID = "123e4567-e89b-42d3-a456-426614174098"_ctv;
+  collidingOperation.masterAuthority.runtimeState.materializedStatefulRecoveryOperations.push_back(otherOperation);
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      collidingOperation, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  auto collidingRetry = source;
+  ProdigyMaterializedStatefulRecoveryRetry retry = {};
+  retry.operationID = partial.operationID;
+  collidingRetry.masterAuthority.runtimeState.materializedStatefulRecoveryRetries.push_back(retry);
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      collidingRetry, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  auto materializedGhost = source;
+  for (BrainReplicatedContainerRuntimeState& state : materializedGhost.masterAuthority.containerRuntimeStates)
+  {
+    if (state.plan.config.deploymentID() == successorHotID)
+    {
+      state.plan.state = ContainerState::healthy;
+      break;
+    }
+  }
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      materializedGhost, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+  auto nullFailureGhost = materializedGhost;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      nullFailureGhost, approved, machines, bundle, nullptr, {}, {}, 0, nullptr, false, true, 1, coldStates, &partial));
+
   // RRF7 binds its original selected-state bytes rather than reserializing
   // unordered maps after decode. Exercise both private-copy persistence and
   // idempotent re-entry through the command-local prepare owner.
@@ -361,6 +503,37 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   assert(!decodeRequest(MothershipTidesMigration::str(tampered), decodedRequest, &decodedProof,
       nullptr, &decodedEmpty, &decodedCold));
 
+  const String rrf8 = encodePartialHandoffRequest(
+      request, MothershipTidesMigration::Plan{}, 1, coldSource, partial);
+  ProdigyMaterializedStatefulRecoveryOperation decodedPartial = {};
+  assert(decodeRequest(MothershipTidesMigration::str(rrf8), decodedRequest, &decodedProof,
+      nullptr, &decodedEmpty, &decodedCold, &decodedPartial) &&
+      partialHandoffsEqual(decodedPartial, partial));
+  decodedPartial = partial;
+  assert(decodeRequest(MothershipTidesMigration::str(rrf7), decodedRequest, &decodedProof,
+      nullptr, &decodedEmpty, &decodedCold, &decodedPartial) && decodedPartial.operationID.empty());
+
+  Schema8PartialHandoffRequest malformedPartial = {};
+  malformedPartial.coldRequest = rrf7;
+  malformedPartial.operation = partial;
+  malformedPartial.operation.completed = true;
+  String malformedPartialBytes = {};
+  BitseryEngine::serialize(malformedPartialBytes, malformedPartial);
+  String malformedPartialFrame = {};
+  malformedPartialFrame.append("RRF8", 4);
+  malformedPartialFrame.append(malformedPartialBytes.data(), malformedPartialBytes.size());
+  assert(!decodeRequest(MothershipTidesMigration::str(malformedPartialFrame), decodedRequest,
+      &decodedProof, nullptr, &decodedEmpty, &decodedCold, &decodedPartial));
+  malformedPartial.operation = partial;
+  malformedPartial.coldRequest[0] = 'X';
+  malformedPartialBytes.clear();
+  BitseryEngine::serialize(malformedPartialBytes, malformedPartial);
+  malformedPartialFrame.clear();
+  malformedPartialFrame.append("RRF8", 4);
+  malformedPartialFrame.append(malformedPartialBytes.data(), malformedPartialBytes.size());
+  assert(!decodeRequest(MothershipTidesMigration::str(malformedPartialFrame), decodedRequest,
+      &decodedProof, nullptr, &decodedEmpty, &decodedCold, &decodedPartial));
+
   const auto root = std::filesystem::current_path() / ".run" /
       ("retained-cold-canonical-" + std::to_string(::getpid()));
   std::filesystem::remove_all(root);
@@ -384,17 +557,17 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   loadSnapshot(inspectionState, readOnlySource);
   std::filesystem::remove_all(inspectionRoot);
   assert(coldCanonicalStateAggregateDigest(statePath) == aggregateBefore);
-  MothershipTidesMigration::durable(requestPath, rrf7);
+  MothershipTidesMigration::durable(requestPath, rrf8);
   WitnessSet sealed = {};
   sealed.requestSHA = MothershipTidesMigration::text(MothershipTidesMigration::digest(requestPath));
-  sealed.witnesses = valid.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  sealed.witnesses = partialPrepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
   String witnessBytes = {};
   BitseryEngine::serialize(witnessBytes, sealed);
   MothershipTidesMigration::durable(requestPath + ".witnesses", witnessBytes);
   assert(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure));
   ProdigyPersistentBrainSnapshot persisted = {};
   loadSnapshot(statePath, persisted);
-  assert(prodigyPersistentBrainSnapshotsEqual(valid, persisted));
+  assert(prodigyPersistentBrainSnapshotsEqual(partialPrepared, persisted));
   assert(prepareLocal(requestPath.c_str(), statePath.c_str(), false, &failure));
   assert(prepareLocal(requestPath.c_str(), statePath.c_str(), true, &failure));
   std::filesystem::remove_all(root);
