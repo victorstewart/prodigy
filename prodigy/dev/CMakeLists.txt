@@ -2130,6 +2130,25 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
 
    add_test(
+      NAME prodigy_authority_persistence_retry_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=authority-persistence-retry
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_authority_persistence_retry_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_async_tls_publication_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-tls
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   add_test(
+      NAME prodigy_tls_resumption_ack_stability_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_TLS_RESUMPTION_ACK_STABILITY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_async_tls_publication_unit prodigy_tls_resumption_ack_stability_unit
+      PROPERTIES TIMEOUT 30)
+
+   add_test(
       NAME prodigy_container_crash_recovery_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=crash-recovery
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>

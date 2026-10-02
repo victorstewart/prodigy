@@ -15122,6 +15122,13 @@ static void testMasterAuthorityPersistenceRetryAfterRejectedReceipt(TestSuite& s
     });
     return count;
   };
+  auto credentialRefreshFrames = [](NeuronView& neuron) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(neuron.wBuffer, [&](Message *message) {
+      if (NeuronTopic(message->topic) == NeuronTopic::refreshContainerCredentials) ++count;
+    });
+    return count;
+  };
 
   TestBrain noted = {};
   configureMaster(noted, 41);
@@ -15183,6 +15190,69 @@ static void testMasterAuthorityPersistenceRetryAfterRejectedReceipt(TestSuite& s
                    noted.durableMasterAuthorityRuntimeStateGeneration == newestGeneration &&
                    authorityFrames(peer) == 1,
                "authority_persistence_newest_retry_publishes_once_after_durable_receipt");
+
+  // A rejected authority write must not leak a staged resumption epoch to a
+  // live Neuron.  The heartbeat retry makes the authority durable first; the
+  // normal lifecycle re-observation can then publish the current epoch once.
+  TestBrain tlsRetry = {};
+  configureMaster(tlsRetry, 71);
+  tlsRetry.holdRuntimePersistence = true;
+  tlsRetry.persistSucceeds = false;
+  Machine tlsMachine = {};
+  tlsMachine.uuid = uint128_t(0x76'2003);
+  tlsMachine.neuron.isFixedFile = true;
+  tlsMachine.neuron.fslot = 77;
+  ApplicationDeployment tlsDeployment = {};
+  DeploymentPlan tlsPlan = makeDeploymentPlan(56'203, 1);
+  tlsPlan.wormholes.push_back(makeTlsResumptionTestWormhole());
+  tlsDeployment.plan = tlsPlan;
+  ContainerView tlsContainer = {};
+  tlsContainer.uuid = uint128_t(0x76'2004);
+  tlsContainer.machine = &tlsMachine;
+  tlsContainer.deploymentID = tlsPlan.config.deploymentID();
+  tlsContainer.state = ContainerState::healthy;
+  tlsDeployment.containers.insert(&tlsContainer);
+  tlsRetry.deployments.insert_or_assign(tlsPlan.config.deploymentID(), &tlsDeployment);
+  tlsRetry.containers.insert_or_assign(tlsContainer.uuid, &tlsContainer);
+
+  String tlsFailure = {};
+  TlsResumptionSnapshot *stagedSnapshot = tlsRetry.beginTlsResumptionAcceptOnlyRollout(
+      tlsPlan, tlsPlan.wormholes[0], 1'700'300'000'000, true, &tlsFailure);
+  const uint64_t stagedGeneration = stagedSnapshot ? stagedSnapshot->generation : 0;
+  suite.require(stagedSnapshot != nullptr && tlsFailure.empty() &&
+                    tlsRetry.pendingRuntimePersistence.size() == 2 && tlsMachine.neuron.wBuffer.empty(),
+                "authority_persistence_tls_rollout_holds_live_publication_for_receipt");
+  // Snapshot creation first persists the changed authority state; the rollout
+  // then adds its own durable-publication completion. Reject both receipts.
+  tlsRetry.finishRuntimePersistence(false);
+  tlsRetry.finishRuntimePersistence(false);
+  suite.expect(tlsRetry.masterAuthorityRuntimeStateDurable == false && tlsMachine.neuron.wBuffer.empty(),
+               "authority_persistence_tls_rejected_receipt_never_publishes_staged_epoch");
+
+  tlsRetry.persistSucceeds = true;
+  tlsRetry.lastBrainPeerHeartbeatTickMs = 0;
+  tlsRetry.runBrainPeerHeartbeatTick();
+  suite.require(tlsRetry.pendingRuntimePersistence.size() == 1 && tlsMachine.neuron.wBuffer.empty(),
+                "authority_persistence_tls_retry_keeps_live_publication_closed_until_durable");
+  tlsRetry.finishRuntimePersistence(true);
+  suite.expect(tlsRetry.masterAuthorityRuntimeStateDurable && tlsMachine.neuron.wBuffer.empty(),
+               "authority_persistence_tls_retry_durability_precedes_lifecycle_publication");
+
+  TlsResumptionSnapshot *durableSnapshot = tlsRetry.beginTlsResumptionAcceptOnlyRollout(
+      tlsPlan, tlsPlan.wormholes[0], 1'700'300'000'001, true, &tlsFailure);
+  uint128_t publishedContainerUUID = 0;
+  CredentialDelta publishedDelta = {};
+  suite.expect(durableSnapshot != nullptr && tlsFailure.empty() &&
+                   durableSnapshot->generation == stagedGeneration &&
+                   credentialRefreshFrames(tlsMachine.neuron) == 1 &&
+                   extractQueuedCredentialDelta(tlsMachine, publishedContainerUUID, publishedDelta) &&
+                   publishedContainerUUID == tlsContainer.uuid &&
+                   publishedDelta.updatedResumptionSnapshots.size() == 1 &&
+                   publishedDelta.updatedResumptionSnapshots[0].generation == stagedGeneration,
+               "authority_persistence_tls_durable_retry_allows_exact_live_epoch_publication");
+  tlsRetry.containers.erase(tlsContainer.uuid);
+  tlsRetry.deployments.erase(tlsPlan.config.deploymentID());
+  tlsDeployment.containers.erase(&tlsContainer);
 
   TestBrain committed = {};
   configureMaster(committed, 51);
