@@ -41,6 +41,16 @@ template<typename S> void serialize(S&& s, Schema4Request& r) {
   s.value4b(r.proof.staleCoordinatorCanonicalContainerCount);
   s.value4b(r.proof.interruptedExpectedEchos); s.value16b(r.proof.staleExcludedContainerUUID);
 }
+// The original schema-four request is immutable evidence.  A retirement never
+// rewrites it: this separately framed envelope records exactly which sealed
+// record was excluded after the stopped-process proof completed.
+struct Schema4RetiredConflictingClientRequest {
+  Schema4Request request;
+  uint128_t retiredConflictingClientUUID = 0;
+};
+template<typename S> void serialize(S&& s, Schema4RetiredConflictingClientRequest& r) {
+  s.object(r.request); s.value16b(r.retiredConflictingClientUUID);
+}
 inline String encodeRequest(const Request& request,const Plan& plan) {
   String bytes;
   if (plan.schemaVersion == 4) {
@@ -57,7 +67,28 @@ inline String encodeRequest(const Request& request,const Plan& plan) {
   }
   Request copy=request; BitseryEngine::serialize(bytes,copy); return bytes;
 }
-inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof) {
+inline String encodeRetiredConflictingClientRequest(const Request& request,
+                                                    const MothershipRetainedRecoveryMixedProof& proof,
+                                                    uint128_t retiredConflictingClientUUID) {
+  require(retiredConflictingClientUUID != 0 && proof.staleExcludedContainerUUID == retiredConflictingClientUUID,
+          "invalid retired conflicting-client request");
+  Schema4RetiredConflictingClientRequest wrapped; wrapped.request.request=request;
+  wrapped.request.proof=proof; wrapped.retiredConflictingClientUUID=retiredConflictingClientUUID;
+  String bytes; BitseryEngine::serialize(bytes,wrapped); require(!bytes.empty(),"retired request serialization is empty");
+  String framed={}; framed.append("RRF5",4); framed.append(bytes.data(),bytes.size()); return framed;
+}
+inline bool decodeRequest(const std::string& raw,Request& request,MothershipRetainedRecoveryMixedProof *proof,
+                          uint128_t *retiredConflictingClientUUID = nullptr) {
+  if (raw.size()>=4 && raw.compare(0,4,"RRF5")==0) {
+    Schema4RetiredConflictingClientRequest wrapped;
+    if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
+        wrapped.retiredConflictingClientUUID == 0 ||
+        wrapped.request.proof.staleExcludedContainerUUID != wrapped.retiredConflictingClientUUID ||
+        wrapped.request.proof.canonicalContainerCount != wrapped.request.proof.staleCoordinatorCanonicalContainerCount + 1)
+      return false;
+    request=std::move(wrapped.request.request); if(proof)*proof=wrapped.request.proof;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=wrapped.retiredConflictingClientUUID; return true;
+  }
   if (raw.size()>=4 && raw.compare(0,4,"RRF4")==0) {
     Schema4Request wrapped;
     if (!BitseryEngine::deserializeSafe(text(raw.substr(4)),wrapped) ||
@@ -65,10 +96,11 @@ inline bool decodeRequest(const std::string& raw,Request& request,MothershipReta
         wrapped.proof.staleCoordinatorCanonicalContainerCount==0 ||
         wrapped.proof.staleCoordinatorCanonicalContainerCount>=wrapped.proof.canonicalContainerCount ||
         wrapped.proof.canonicalContainerCount>256 || wrapped.proof.interruptedExpectedEchos==0 || wrapped.proof.staleExcludedContainerUUID==0) return false;
-    request=std::move(wrapped.request); if(proof)*proof=wrapped.proof; return true;
+    request=std::move(wrapped.request); if(proof)*proof=wrapped.proof;
+    if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0; return true;
   }
   if (!BitseryEngine::deserializeSafe(text(raw),request)) return false;
-  if(proof)*proof={}; return true;
+  if(proof)*proof={}; if(retiredConflictingClientUUID)*retiredConflictingClientUUID=0; return true;
 }
 // The seed generates these bytes once. Every Brain must receive identical
 // witness strings, even when unordered maps decode in a different order.
@@ -153,14 +185,42 @@ inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot&
   ProdigyPersistentStateStore store(text(path)); String failure;
   require(store.loadBrainSnapshot(snapshot,&failure),"private recovery snapshot unreadable");
 }
+// Read-only companion to the retirement action.  It deliberately opens only
+// the stopped copy and returns a compact coordinator kind; Mothership gathers
+// all three kinds before it writes a retirement-started marker or signals a
+// PID.  No state-store save path is reachable here.
+inline bool verifyRetiredConflictingClientLocal(const char *requestPath,const char *statePath,
+                                                uint128_t target,const String& previousBundleSHA256,
+                                                String *kind,String *failure) {
+  try {
+    privateFile(requestPath); const std::string path=statePath; pathCheck(path);
+    require(path.ends_with("/state.copy10"),"retirement verifier refuses a non-private state copy");
+    Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t encodedTarget=0;
+    require(decodeRequest(read(requestPath),request,&proof,&encodedTarget) && encodedTarget==0 && target!=0 &&
+            proof.staleExcludedContainerUUID==target && proof.canonicalContainerCount==24 &&
+            proof.staleCoordinatorCanonicalContainerCount==23,"retirement verifier request differs from sealed proof");
+    ProdigyPersistentBrainSnapshot snapshot;loadSnapshot(path,snapshot);
+    require(proof.validFor(snapshot),"retirement verifier snapshot differs from frozen topology");
+    const auto& update=snapshot.masterAuthority.runtimeState.updateSelf;
+    const uint32_t count=mothershipRetainedRecoveryWitnessContainerCount(update.machineRecoveryWitnesses);
+    if(count==proof.staleCoordinatorCanonicalContainerCount) kind->assign("stale23"_ctv);
+    else if(count==proof.canonicalContainerCount && update.state==0 && update.expectedEchos==0) kind->assign("dormant24"_ctv);
+    else if(count==proof.canonicalContainerCount && update.expectedEchos==proof.interruptedExpectedEchos) kind->assign("interrupted24"_ctv);
+    else throw std::runtime_error("retirement verifier found an unrecognized coordinator");
+    String why; require(mothershipPrepareRetiredConflictingClientSchema4Snapshot(snapshot,request.plans,request.machines,
+        request.bundleSHA,previousBundleSHA256,request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,
+        proof,target,&why),str(why).c_str());
+    return true;
+  } catch(const std::exception& error) { if(failure)failure->assign(error.what()); return false; }
+}
 // Only the staged Mothership invokes this against its private paired copy.
 inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure,const String& previousBundleSHA256={}) {
   try {
     privateFile(requestPath); const std::string path=statePath;pathCheck(path);
     require(path.ends_with("/state.new10") || (verifyOnly && path=="/var/lib/prodigy/state"),"recovery suboperation refuses an unowned database path");
     require(::getenv("PRODIGY_STATE_SECRETS_DB")==nullptr,"recovery refuses a secrets-path override");
-    Request request; MothershipRetainedRecoveryMixedProof proof;
-    require(decodeRequest(read(requestPath),request,&proof),"recovery request decode failed");
+    Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0;
+    require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID),"recovery request decode failed");
     ProdigyPersistentBrainSnapshot before;loadSnapshot(path,before);require(before.brainConfig.clusterUUID==request.clusterUUID,"recovery request targets another cluster");
     require(!proof.canonicalContainerCount || proof.validFor(before),"recovery request proof differs from frozen topology");
     const auto witnessPath=std::string(requestPath)+".witnesses";privateFile(witnessPath);
@@ -170,13 +230,68 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
     const bool alreadyPrepared=mothershipRetainedRecoveryEnvelopeMatches(before.masterAuthority.runtimeState.updateSelf,request.bundleSHA);
     require(!verifyOnly || alreadyPrepared,"recovery snapshot is not prepared");
     auto expected=before;
-    if(alreadyPrepared) {
+    if(alreadyPrepared && retiredConflictingClientUUID == 0) {
       expected.masterAuthority.runtimeState.updateSelf={};
       require(expected.masterAuthority.runtimeState.generation>0,"recovery generation missing"); --expected.masterAuthority.runtimeState.generation;
     }
     String why;
     const bool mixed = !request.interruptedBundleSHA.empty();
-    if (mixed) {
+    if (retiredConflictingClientUUID != 0) {
+      if (alreadyPrepared) {
+        expected.masterAuthority.runtimeState.updateSelf={};
+        require(expected.masterAuthority.runtimeState.generation>0,"retired recovery generation missing");
+        --expected.masterAuthority.runtimeState.generation;
+        for(const auto& state:expected.masterAuthority.containerRuntimeStates)
+          require(state.plan.uuid!=retiredConflictingClientUUID,"prepared retired recovery retains its canonical runtime target");
+        require(mothershipPrepareRetainedRecoverySnapshot(expected,request.plans,request.machines,
+                request.bundleSHA,&why,previousBundleSHA256,request.interruptedBundleSHA,0,nullptr,false,false),str(why).c_str());
+      } else {
+      // RRF5 never stands alone: the adjacent immutable RRF4 source is
+      // uploaded with it and is revalidated against this private copy before
+      // the selected 23-record envelope is admitted.
+      const std::string originalPath=std::string(requestPath)+".original"; privateFile(originalPath);
+      Request original; MothershipRetainedRecoveryMixedProof originalProof; uint128_t originalRetired=0;
+      require(decodeRequest(read(originalPath),original,&originalProof,&originalRetired) && originalRetired==0 &&
+              originalProof.staleExcludedContainerUUID==retiredConflictingClientUUID &&
+              originalProof.canonicalContainerCount==proof.canonicalContainerCount &&
+              originalProof.staleCoordinatorCanonicalContainerCount==proof.staleCoordinatorCanonicalContainerCount &&
+              original.machines.size()==3,"retired recovery source request differs");
+      require(original.clusterUUID==request.clusterUUID && original.bundleSHA==request.bundleSHA &&
+              original.interruptedBundleSHA==request.interruptedBundleSHA && original.plans.size()==request.plans.size() &&
+              original.machines.size()==request.machines.size(),
+              "retired recovery projection changes the sealed request authority");
+      uint32_t projectedTargetCount=0;
+      for(uint32_t machineIndex=0;machineIndex<original.machines.size();++machineIndex) {
+        const auto& full=original.machines[machineIndex]; const auto& projected=request.machines[machineIndex];
+        uint32_t targetCount=0; for(const auto& parameters:full.parameters) targetCount+=parameters.uuid==retiredConflictingClientUUID;
+        require(full.machineUUID==projected.machineUUID && full.machineFragment==projected.machineFragment &&
+                full.parameters.size()==projected.parameters.size()+targetCount &&
+                full.observedCreatedAtMs.size()==full.parameters.size() &&
+                projected.observedCreatedAtMs.size()==projected.parameters.size(),"retired recovery projection changes a machine inventory");
+        projectedTargetCount+=targetCount;
+        uint32_t projectedIndex=0;
+        for(uint32_t fullIndex=0;fullIndex<full.parameters.size();++fullIndex) {
+          if(full.parameters[fullIndex].uuid==retiredConflictingClientUUID) continue;
+          require(projectedIndex<projected.parameters.size(),"retired recovery projection truncates a machine inventory");
+          const auto plan=original.plans.find(full.parameters[fullIndex].deploymentID);
+          require(plan!=original.plans.end() && projected.parameters[projectedIndex].deploymentID==plan->first,
+                  "retired recovery projection changes deployment authority");
+          NeuronContainerBootstrap left={},right={}; String leftFailure={},rightFailure={};
+          require(prodigyBuildRetainedContainerBootstrap(plan->second,full.parameters[fullIndex],full.machineFragment,
+                  before.brainConfig.datacenterFragment,full.observedCreatedAtMs[fullIndex],left,&leftFailure) &&
+                  prodigyBuildRetainedContainerBootstrap(plan->second,projected.parameters[projectedIndex],projected.machineFragment,
+                  before.brainConfig.datacenterFragment,projected.observedCreatedAtMs[projectedIndex],right,&rightFailure) &&
+                  prodigyPersistentRetainedBootstrapEqual(left,right) && full.observedCreatedAtMs[fullIndex]==projected.observedCreatedAtMs[projectedIndex++],
+                  "retired recovery projection changes a retained container");
+        }
+        require(projectedIndex==projected.parameters.size(),"retired recovery projection contains an unknown container");
+      }
+      require(projectedTargetCount==1,"retired recovery projection omits a different container");
+      require(mothershipPrepareRetiredConflictingClientSchema4Snapshot(expected,original.plans,original.machines,
+              request.bundleSHA,previousBundleSHA256,original.interruptedBundleSHA,
+              original.mixedSuccessorMachineUUIDs,originalProof,retiredConflictingClientUUID,&why),str(why).c_str());
+      }
+    } else if (mixed) {
       require(prodigyIsSHA256HexDigest(request.interruptedBundleSHA) &&
               (proof.canonicalContainerCount ? request.mixedSuccessorMachineUUIDs.size()==1 : request.mixedSuccessorMachineUUIDs.size()==2),
               "invalid sealed mixed handoff");
@@ -227,8 +342,11 @@ inline bool prepareLocal(const char *requestPath,const char *statePath,bool veri
 
 // Python is only an identity observer / pidfd transport launched by Mothership.
 // It cannot choose a process or delete a directory: every identity is sealed.
-enum class InventoryMode { sealed, canonical, remaining, retire };
-inline std::string inventoryProgram(const std::string& manifestPath,const MothershipTidesMigration::Machine& machine,InventoryMode mode) {
+enum class InventoryMode { sealed, canonical, remaining, retire, retireConflictingClient };
+inline std::string inventoryProgram(const std::string& manifestPath,const MothershipTidesMigration::Machine& machine,
+                                    InventoryMode mode,uint128_t retiredConflictingClientUUID=0) {
+  require(mode != InventoryMode::retireConflictingClient || retiredConflictingClientUUID != 0,
+          "missing sealed conflicting-client retirement UUID");
   String machineID;machineID.snprintf<"{itoh}"_ctv>(machine.uuid);
   std::string code="import json,os,pathlib,hashlib,signal,time\nm=json.load(open("+quote(manifestPath)+"))\nselected=[x for x in m['machines'] if int(x['machineUUID'],16)==int("+quote(str(machineID))+",16)]\nassert len(selected)==1\nrecords=selected[0]['records']\ncanonical_only="+std::string(mode==InventoryMode::canonical?"True":"False")+"\n";
   code+=R"PY(def sha(p):
@@ -261,7 +379,7 @@ for r in records:
  if (not canonical_only or r['canonical']):verify(r)
 print('retained inventory verified',len(expected))
 )PY";
-  else code+=R"PY(expected={(str(int(r['uuid'],16)),r['pid']) for r in records}
+  else if(mode!=InventoryMode::retireConflictingClient) code+=R"PY(expected={(str(int(r['uuid'],16)),r['pid']) for r in records}
 canonical={(str(int(r['uuid'],16)),r['pid']) for r in records if r['canonical']}
 actual=set()
 for leaf in pathlib.Path('/sys/fs/cgroup/containers.slice').glob('*.slice/leaf'):
@@ -291,6 +409,45 @@ for r in records:
  finally:os.close(fd)
 print('pinned stateless extras retired')
 )PY";
+  if(mode==InventoryMode::retireConflictingClient) {
+    String target;target.snprintf<"{itoh}"_ctv>(retiredConflictingClientUUID);
+    code+=R"PY(target=str(int("0x)PY"+str(target)+R"PY(",16))
+matches=[r for r in records if str(int(r['uuid'],16))==target]
+assert len(matches)==1 and matches[0]['canonical'],'sealed conflicting-client target differs'
+r=matches[0];base=pathlib.Path('/proc')/str(r['pid'])
+if base.exists():
+ fd=os.pidfd_open(r['pid'],0)
+ try:
+  verify(r); signal.pidfd_send_signal(fd,signal.SIGTERM)
+  for _ in range(50):
+   if not base.exists():break
+   time.sleep(.1)
+  if base.exists():
+   verify(r); signal.pidfd_send_signal(fd,signal.SIGKILL)
+   for _ in range(50):
+    if not base.exists():break
+    time.sleep(.1)
+  assert not base.exists(),'retired conflicting client did not exit'
+ finally:os.close(fd)
+assert not base.exists(),'retired conflicting client PID changed'
+print('sealed conflicting client retired')
+)PY";
+  }
+  return "python3 -c "+quote(code);
+}
+// The immutable manifest remains the authority for identity checks.  The
+// derived manifest is a bounded receipt: it changes exactly one canonical bit
+// after the target process has exited; it never names or touches storage.
+inline std::string derivedConflictingClientManifestProgram(const std::string& manifestPath,uint128_t targetUUID) {
+  String target;target.snprintf<"{itoh}"_ctv>(targetUUID);
+  std::string code="import json\nm=json.load(open("+quote(manifestPath)+"))\nt='0x"+str(target)+"'\nfound=[]\nfor machine in m['machines']:\n for record in machine['records']:\n  if int(record['uuid'],16)==int(t,16):found.append(record)\nassert len(found)==1 and found[0]['canonical']\nassert m['canonicalContainerCount']>0\nfound[0]['canonical']=False\nm['canonicalContainerCount']-=1\nprint(json.dumps(m,sort_keys=True,separators=(',',':')))\n";
+  return "python3 -c "+quote(code);
+}
+inline std::string conflictingClientStorageProgram(const std::string& manifestPath,uint128_t targetUUID,bool afterExit) {
+  String target;target.snprintf<"{itoh}"_ctv>(targetUUID);
+  std::string code="import json,os,pathlib\nm=json.load(open("+quote(manifestPath)+"))\nt=int('0x"+str(target)+"',16)\nr=[r for x in m['machines'] for r in x['records'] if int(r['uuid'],16)==t]\nassert len(r)==1\nr=r[0];host=pathlib.Path('/containers/storage')/str(t);kv=host/'kvdb'\nh=host.stat();k=kv.stat();assert host.is_dir() and kv.is_dir()\n";
+  if(!afterExit) code+="p=pathlib.Path('/proc')/str(r['pid'])/'root'/'storage';s=p.stat();q=(p/'kvdb').stat();assert (s.st_dev,s.st_ino)==(h.st_dev,h.st_ino) and (q.st_dev,q.st_ino)==(k.st_dev,k.st_ino)\n";
+  code+="print(f'{h.st_dev}:{h.st_ino} {k.st_dev}:{k.st_ino} {host}')\n";
   return "python3 -c "+quote(code);
 }
 inline bool sameRecordIdentity(const Manifest& left,const Manifest& right) {
@@ -441,7 +598,7 @@ inline void resumeCompacted(Execution& e,const char *repairBundle) {
 }
 inline bool runFile(const char *file,const char *action,String *failure=nullptr,const char *repairBundle=nullptr,const char *successorFile=nullptr) {
   try {
-    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0 || std::strcmp(action,"compact-contained")==0 || std::strcmp(action,"resume-compacted")==0,"invalid retained recovery action");
+    require(std::strcmp(action,"recover")==0 || std::strcmp(action,"prepare")==0 || std::strcmp(action,"retire-extras")==0 || std::strcmp(action,"retire-extras-preactivation")==0 || std::strcmp(action,"check-conflicting-client-preactivation")==0 || std::strcmp(action,"retire-conflicting-client-preactivation")==0 || std::strcmp(action,"supersede-preactivation")==0 || std::strcmp(action,"contain-active")==0 || std::strcmp(action,"compact-contained")==0 || std::strcmp(action,"resume-compacted")==0,"invalid retained recovery action");
     Plan plan=parse(file);plan.retainedRecovery=true;
     simdjson::dom::parser parser;simdjson::dom::element doc;auto raw=read(file);require(parser.parse(raw).get(doc)==simdjson::SUCCESS,"invalid recovery plan");
     bool mode=false;require(doc["retainedRecoveryMode"].get_bool().get(mode)==simdjson::SUCCESS && mode,"explicit retained recovery mode required");
@@ -457,7 +614,13 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
     require(e.cluster.clusterUUID==e.plan.clusterUUID && e.cluster.nBrains==3 && e.cluster.machines.size()==3 && str(e.cluster.remoteProdigyPath)==e.plan.runtimeRoot,"retained cluster authority differs");
     for(auto& m:e.plan.machines) {resolveRegisteredMachine(e.cluster,m);e.machines.emplace(m.uuid,&m);}
     e.buildArtifactManifest();
-    auto verify=[&](InventoryMode mode=InventoryMode::sealed) {for(auto& m:e.plan.machines)e.run(m.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.json",m,mode));};
+    const auto conflictingRetiredMarker=e.plan.operationRoot+"/conflicting-client-retired";
+    const bool conflictingClientRetired=fs::exists(conflictingRetiredMarker);
+    if(conflictingClientRetired) privateFile(conflictingRetiredMarker,4096);
+    auto verify=[&](InventoryMode mode=InventoryMode::sealed) {
+      const bool derived=conflictingClientRetired && mode==InventoryMode::sealed;
+      for(auto& m:e.plan.machines)e.run(m.uuid,inventoryProgram(e.remoteRoot+(derived?"/retained-manifest.retired-conflicting-client.json":"/retained-manifest.json"),m,derived?InventoryMode::canonical:mode));
+    };
     const auto containment=e.plan.operationRoot+"/activation-contained";
     if(std::strcmp(action,"contain-active")==0) {
       require(e.receipt.activationBoundaryCrossed && e.receipt.phase==MothershipTidesDBMigrationPhase::completed,"containment requires a completed activated operation");
@@ -501,6 +664,104 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       if(!fs::exists(started)) { verify(InventoryMode::sealed); durable(started,text(e.plan.planSHA+"\n"+manifestSHA+"\n")); }
       else require(read(started)==e.plan.planSHA+"\n"+manifestSHA+"\n","extra retirement marker differs");
       verify(InventoryMode::remaining); verify(InventoryMode::retire); verify(InventoryMode::canonical); e.acceptStoppedContainerBaseline(); durable(fs::path(e.plan.operationRoot)/"extras-retired",text(manifestSHA)); return true;
+    }
+    if(std::strcmp(action,"check-conflicting-client-preactivation")==0 || std::strcmp(action,"retire-conflicting-client-preactivation")==0) {
+      const bool readOnlyCheck=std::strcmp(action,"check-conflicting-client-preactivation")==0;
+      require(e.plan.schemaVersion==4 && e.plan.sealedCanonicalContainerCount==24 &&
+              e.plan.staleCoordinatorCanonicalContainerCount==23 &&
+              e.plan.staleExcludedContainerUUID!=0 &&
+              e.receipt.phase<=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,
+              "conflicting-client retirement requires the sealed schema-four preactivation inventory");
+      const auto originalRequestPath=e.plan.operationRoot+"/recovery.request";
+      const auto derivedRequestPath=e.plan.operationRoot+"/recovery.request.retired-conflicting-client";
+      const auto derivedManifestPath=e.plan.operationRoot+"/retained-manifest.retired-conflicting-client.json";
+      const auto started=e.plan.operationRoot+"/conflicting-client-retirement-started";
+      const auto completed=e.plan.operationRoot+"/conflicting-client-retired";
+      const auto authority=e.plan.operationRoot+"/conflicting-client-retirement-authority";
+      privateFile(originalRequestPath); Request original; MothershipRetainedRecoveryMixedProof proof; uint128_t encodedTarget=0;
+      require(decodeRequest(read(originalRequestPath),original,&proof,&encodedTarget) && encodedTarget==0 &&
+              proof.canonicalContainerCount==24 && proof.staleCoordinatorCanonicalContainerCount==23 &&
+              proof.staleExcludedContainerUUID==e.plan.staleExcludedContainerUUID,
+              "immutable schema-four recovery request differs from sealed retirement proof");
+      require(original.machines.size()==3 && original.mixedSuccessorMachineUUIDs.size()==1,
+              "immutable schema-four recovery request has no sealed mixed predecessor proof");
+      const uint128_t target=e.plan.staleExcludedContainerUUID;
+      String targetText;targetText.snprintf<"{itoh}"_ctv>(target);
+      for(auto& machine:e.plan.machines)e.upload(machine,originalRequestPath,e.remoteRoot+"/recovery.request.original");
+      uint32_t stale23=0, full24=0;
+      for(uint32_t index=0;index<e.plan.machines.size();++index) {
+        String output,why;
+        const std::string command="LD_LIBRARY_PATH="+quote(e.remoteRuntime+"/lib")+" "+quote(e.remoteRuntime+"/tools/mothership")+
+          " verifyRetiredConflictingClientLocal "+quote(e.remoteRoot+"/recovery.request.original")+" "+quote(e.remoteRoot+"/state.copy10")+
+          " "+quote("0x"+str(targetText))+" "+quote(e.plan.oldBundleSHA);
+        if (!e.command(e.plan.machines[index].uuid,command,&why,&output,30'000)) {
+          String host;host.snprintf<"{itoh}"_ctv>(e.plan.machines[index].uuid);
+          String diagnostic;diagnostic.snprintf<"conflicting-client private-copy validation failed machine {}: {}"_ctv>(host,why);
+          require(false,str(diagnostic).c_str());
+        }
+        const auto report=str(output);
+        if(report.find("kind=stale23")!=std::string::npos) ++stale23;
+        if(report.find("kind=dormant24")!=std::string::npos || report.find("kind=interrupted24")!=std::string::npos) ++full24;
+        if(index==0) require(report.find("kind=dormant24")!=std::string::npos || report.find("kind=interrupted24")!=std::string::npos,
+                              "selected seed does not retain the full schema-four coordinator proof");
+      }
+      require(stale23>=1 && full24>=1,"all three private recovery copies do not prove the sealed stale23/full24 transition");
+      if(readOnlyCheck) return true;
+      if(!fs::exists(completed)) {
+        require(!fs::exists(started) || fs::is_regular_file(started),"conflicting-client retirement checkpoint is unsafe");
+        // Validate the full sealed 24-record request and its stale 23-witness
+        // proof before touching one PID.  This copies only the stopped seed
+        // authority; it does not write a database or alter a container mount.
+        Request derived=original; uint32_t removed=0;
+        for(auto& machine:derived.machines) {
+          Vector<ContainerParameters> parameters; Vector<int64_t> created;
+          for(uint32_t index=0;index<machine.parameters.size();++index) {
+            if(machine.parameters[index].uuid==target) {++removed;continue;}
+            parameters.push_back(std::move(machine.parameters[index])); created.push_back(machine.observedCreatedAtMs[index]);
+          }
+          machine.parameters=std::move(parameters); machine.observedCreatedAtMs=std::move(created);
+        }
+        require(removed==1,"sealed conflicting-client target is absent from immutable request");
+        if(!fs::exists(derivedRequestPath)) durable(derivedRequestPath,encodeRetiredConflictingClientRequest(derived,proof,target));
+        String generated,whyRemote;
+        require(e.command(e.plan.machines[0].uuid,derivedConflictingClientManifestProgram(manifestPath,target),&whyRemote,&generated,30'000),
+                "unable to derive sealed conflicting-client manifest");
+        require(!generated.empty(),"derived conflicting-client manifest is empty");
+        if(!fs::exists(derivedManifestPath)) durable(derivedManifestPath,generated);
+        privateFile(derivedManifestPath,1024*1024);
+        const auto targetRecord=std::find_if(manifest.records.begin(),manifest.records.end(),[&](const auto& record){return record.container==target;});
+        require(targetRecord!=manifest.records.end(),"sealed conflicting-client target is absent from manifest");
+        const auto storageReceipt=e.plan.operationRoot+"/conflicting-client-retired-storage";
+        if(!fs::exists(storageReceipt)) {
+          String storage,storageFailure;
+          require(e.command(targetRecord->machine,conflictingClientStorageProgram(e.remoteRoot+"/retained-manifest.json",target,false),&storageFailure,&storage,30'000),
+                  "conflicting-client storage mount proof failed");
+          durable(storageReceipt,storage);
+        }
+        privateFile(storageReceipt,4096);
+        const String marker=text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(originalRequestPath)+"\n"+digest(derivedManifestPath)+"\n"+digest(derivedRequestPath)+"\n"+str(targetText)+"\n");
+        const bool newlyStarted=!fs::exists(started);
+        if(!newlyStarted) { privateFile(started,4096); require(read(started)==str(marker),"conflicting-client retirement start differs"); }
+        else durable(started,marker);
+        for(auto& machine:e.plan.machines)e.upload(machine,derivedManifestPath,e.remoteRoot+"/retained-manifest.retired-conflicting-client.json");
+        if(newlyStarted) verify(InventoryMode::sealed);
+        for(auto& machine:e.plan.machines) if(machine.uuid==targetRecord->machine)
+          e.run(machine.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.json",machine,InventoryMode::retireConflictingClient,target));
+        String afterStorage,afterStorageFailure;
+        require(e.command(targetRecord->machine,conflictingClientStorageProgram(e.remoteRoot+"/retained-manifest.json",target,true),&afterStorageFailure,&afterStorage,30'000) &&
+                str(afterStorage)==read(storageReceipt),"conflicting-client storage changed during PID retirement");
+        for(auto& machine:e.plan.machines)e.run(machine.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.retired-conflicting-client.json",machine,InventoryMode::canonical));
+        // pidfd retirement leaves /containers/storage and its mounts alone.
+        e.acceptStoppedContainerBaseline(); durable(authority,marker); durable(completed,marker); return true;
+      }
+      privateFile(completed,4096); require(fs::exists(derivedManifestPath) && fs::exists(derivedRequestPath),"completed conflicting-client retirement artifacts absent");
+      privateFile(derivedManifestPath,1024*1024); privateFile(derivedRequestPath,1024*1024);
+      const String marker=text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(originalRequestPath)+"\n"+digest(derivedManifestPath)+"\n"+digest(derivedRequestPath)+"\n"+str(targetText)+"\n");
+      require(read(completed)==str(marker),"completed conflicting-client retirement differs");
+      privateFile(authority,4096); require(read(authority)==str(marker),"conflicting-client retirement authority differs");
+      for(auto& machine:e.plan.machines)e.upload(machine,derivedManifestPath,e.remoteRoot+"/retained-manifest.retired-conflicting-client.json");
+      for(auto& machine:e.plan.machines)e.run(machine.uuid,inventoryProgram(e.remoteRoot+"/retained-manifest.retired-conflicting-client.json",machine,InventoryMode::canonical));
+      return true;
     }
     if(std::strcmp(action,"supersede-preactivation")==0) {
       require(successorFile && !repairBundle,"supersession requires exactly a successor retained plan");
@@ -566,8 +827,12 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       require(e.receipt.phase>=MothershipTidesDBMigrationPhase::writersQuiesced && !e.receipt.activationBoundaryCrossed,"repair tools require a fenced pre-activation recovery");
       preparationRuntime=stageRepairTools(e,repairBundle);
     }
-    const auto requestPath=e.plan.operationRoot+"/recovery.request", authorityPath=e.plan.operationRoot+"/stateless-extras-authority";
+    const auto requestPath=e.plan.operationRoot+(conflictingClientRetired?"/recovery.request.retired-conflicting-client":"/recovery.request");
+    const auto authorityPath=e.plan.operationRoot+(conflictingClientRetired?"/conflicting-client-retirement-authority":"/stateless-extras-authority");
     if(e.receipt.phase<MothershipTidesDBMigrationPhase::validated || !fs::exists(authorityPath)) {
+      if(conflictingClientRetired) {
+        privateFile(requestPath); privateFile(authorityPath,4096);
+      } else {
       for(auto& db:e.receipt.databases) {
         String why;if(!e.exists(db,db.copiedV9Path))require(e.copySource(db,&why),"retained v10 copy failed");
         if(!e.exists(db,db.preparedV10Path)) e.run(db.machineUUID,"test ! -e "+quote(str(db.preparedV10Path)+".partial")+"; cp -a --reflink=auto "+quote(str(db.copiedV9Path))+" "+quote(str(db.preparedV10Path)+".partial")+"; sync -f "+quote(str(db.preparedV10Path)+".partial")+"; mv -T "+quote(str(db.preparedV10Path)+".partial")+" "+quote(str(db.preparedV10Path))+"; sync -f "+quote(e.remoteRoot));
@@ -623,13 +888,23 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         String bytes=encodeRequest(manifest.request,e.plan); if(!requestAlreadySealed)durable(requestPath,bytes);
         durable(authorityPath,text(e.plan.planSHA+"\n"+manifestSHA+"\n"+digest(requestPath)+"\n"));
       }
+      }
       const auto witnessPath=requestPath+".witnesses";
       if(!fs::exists(witnessPath)) {
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n","witness sealing requires the selected seed");
-        Request request; MothershipRetainedRecoveryMixedProof proof;
-        require(decodeRequest(read(requestPath),request,&proof),"sealed request unreadable");
+        Request request; MothershipRetainedRecoveryMixedProof proof; uint128_t retiredConflictingClientUUID=0;
+        require(decodeRequest(read(requestPath),request,&proof,&retiredConflictingClientUUID),"sealed request unreadable");
         ProdigyPersistentBrainSnapshot seed;loadSnapshot(e.remoteRoot+"/state.copy10",seed);String why;
-        if (!request.interruptedBundleSHA.empty()) {
+        if (retiredConflictingClientUUID != 0) {
+          const auto originalRequestPath=e.plan.operationRoot+"/recovery.request"; privateFile(originalRequestPath);
+          Request original; MothershipRetainedRecoveryMixedProof originalProof; uint128_t originalRetired=0;
+          require(decodeRequest(read(originalRequestPath),original,&originalProof,&originalRetired) && originalRetired==0 &&
+                  originalProof.staleExcludedContainerUUID==retiredConflictingClientUUID,
+                  "retired witness source differs from immutable request");
+          require(mothershipPrepareRetiredConflictingClientSchema4Snapshot(seed,original.plans,original.machines,
+                  request.bundleSHA,text(e.plan.oldBundleSHA),original.interruptedBundleSHA,
+                  original.mixedSuccessorMachineUUIDs,originalProof,retiredConflictingClientUUID,&why),str(why).c_str());
+        } else if (!request.interruptedBundleSHA.empty()) {
           if (proof.canonicalContainerCount) require(mothershipPrepareRetainedRecoverySchema4Snapshot(
                       seed,request.plans,request.machines,request.bundleSHA,text(e.plan.oldBundleSHA),
                       request.interruptedBundleSHA,request.mixedSuccessorMachineUUIDs,proof,&why),str(why).c_str());
@@ -645,6 +920,7 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
       }
       for(auto& m:e.plan.machines) {
         e.upload(m,requestPath,e.remoteRoot+"/recovery.request");
+        if(conflictingClientRetired)e.upload(m,e.plan.operationRoot+"/recovery.request",e.remoteRoot+"/recovery.request.original");
         e.upload(m,witnessPath,e.remoteRoot+"/recovery.request.witnesses");
         const auto marker=e.remoteRoot+"/prepared.request.sha256",requestSHA=digest(requestPath);
         std::string cmd="test \"$(systemctl show -p MainPID --value prodigy)\" = 0; ";

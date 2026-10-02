@@ -10084,6 +10084,25 @@ private:
     basics_log("prepareRetainedRecoveryLocal success=1\n");
   }
 
+  void runVerifyRetiredConflictingClientLocal(int argc, char *argv[])
+  {
+    String failure, previousBundleSHA, kind;
+    uint128_t target = 0;
+    if (argc == 4) previousBundleSHA.assign(argv[3]);
+    if (argc != 4 || !prodigyIsSHA256HexDigest(previousBundleSHA))
+    {
+      basics_log("verifyRetiredConflictingClientLocal success=0 failure=invalid arguments\n"); exit(EXIT_FAILURE);
+    }
+    try { target=MothershipTidesMigration::uuid(argv[2]); }
+    catch (...) { basics_log("verifyRetiredConflictingClientLocal success=0 failure=invalid target\n"); exit(EXIT_FAILURE); }
+    if (!MothershipRetainedRecovery::verifyRetiredConflictingClientLocal(argv[0],argv[1],target,previousBundleSHA,&kind,&failure))
+    {
+      basics_log("verifyRetiredConflictingClientLocal success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE);
+    }
+    std::printf("retained-conflicting-client-kind=%s\n",kind.c_str()); std::fflush(stdout);
+    basics_log("verifyRetiredConflictingClientLocal success=1 kind=%s\n",kind.c_str());
+  }
+
   void runMigrateTidesDB9To10(int argc, char *argv[])
   {
     if (argc < 1 || argc > 2 || (argc == 2 && std::strcmp(argv[1], "rollback") != 0))
@@ -19075,6 +19094,7 @@ public:
         {"upsertDNSBinding",                &Mothership::runUpsertDNSBinding               },
         {"upsertMachineSchemas",            &Mothership::runUpsertMachineSchemas           },
         {"upsertTlsVaultFactory",           &Mothership::runUpsertTlsVaultFactory          },
+        {"verifyRetiredConflictingClientLocal", &Mothership::runVerifyRetiredConflictingClientLocal},
     };
 
     static_assert([] {

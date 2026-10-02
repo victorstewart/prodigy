@@ -6347,6 +6347,55 @@ public:
     }
   }
 
+  // The master map is transient. Reconstruct its exact state from the
+  // recovered canonical containers before the ordinary deficit scheduler can
+  // create another replica. A recovered non-all-masters shard with one client
+  // must retain that client; otherwise scheduling a missing peer advertises a
+  // second client service.
+  bool rebuildRecoveredStatefulShardMasters(void)
+  {
+    if (plan.isStateful == false || plan.stateful.allMasters)
+    {
+      return true;
+    }
+
+    masterForShardGroup.clear();
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
+          container->isStateful == false)
+      {
+        basics_log("deployment recoverAfterReboot cannot reconstruct stateful master deploymentID=%llu appID=%u\n",
+                   (unsigned long long)plan.config.deploymentID(), unsigned(plan.config.applicationID));
+        return false;
+      }
+      switch (container->state)
+      {
+        case ContainerState::scheduled:
+        case ContainerState::healthy:
+        case ContainerState::crashedRestarting:
+          break;
+        default:
+          continue;
+      }
+
+      if (container->effectiveStatefulMeshRoles(plan).client == 0)
+      {
+        continue;
+      }
+      if (masterForShardGroup.contains(container->shardGroup))
+      {
+        basics_log("deployment recoverAfterReboot found conflicting stateful client masters deploymentID=%llu appID=%u shardGroup=%u\n",
+                   (unsigned long long)plan.config.deploymentID(), unsigned(plan.config.applicationID),
+                   unsigned(container->shardGroup));
+        return false;
+      }
+      masterForShardGroup.insert_or_assign(container->shardGroup, container);
+    }
+
+    return true;
+  }
+
   void rebuildRecoveredContainerCounts(void)
   {
     // Rebuild deployed/healthy counters from recovered runtime state so
@@ -6462,6 +6511,14 @@ public:
       PRODIGY_DEBUG_FLUSH();
 #endif
       nSuspended = 0;
+    }
+
+    // This must precede resuming an already-queued work item: that path skips
+    // the recovered-count rebuild below and otherwise constructs a client role
+    // from an empty transient master map.
+    if (rebuildRecoveredStatefulShardMasters() == false)
+    {
+      return;
     }
 
     if (toSchedule.size() > 0)

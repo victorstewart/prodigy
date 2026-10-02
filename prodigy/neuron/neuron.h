@@ -4308,14 +4308,20 @@ public:
     }
 
     String failure = {};
-    if (prodigyInstallBundleToRoot(prodigyStagedBundlePath(), "/root/prodigy"_ctv, &failure) == false)
+    String installRoot = {};
+    if (prodigyResolveCurrentInstallRoot(installRoot, &failure) == false)
+    {
+      basics_log("neuron transitionToNewBundle current install root resolution failed: %s\n", failure.c_str());
+      _exit(EXIT_FAILURE);
+    }
+    if (prodigyInstallBundleToRoot(prodigyStagedBundlePath(), installRoot, &failure) == false)
     {
       basics_log("neuron transitionToNewBundle install failed: %s\n", failure.c_str());
       _exit(EXIT_FAILURE);
     }
 
     ProdigyInstallRootPaths paths = {};
-    prodigyBuildInstallRootPaths("/root/prodigy"_ctv, paths);
+    prodigyBuildInstallRootPaths(installRoot, paths);
     String libraryDirectory = {};
     libraryDirectory.assign(paths.libraryDirectory);
     (void)setenv("LD_LIBRARY_PATH", libraryDirectory.c_str(), 1);

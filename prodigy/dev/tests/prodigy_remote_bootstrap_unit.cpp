@@ -876,6 +876,53 @@ int main(void)
   suite.expect(plan.ssh.hostPublicKeyOpenSSH.equals(request.bootstrapSshHostKeyPackage.publicKeyOpenSSH), "plan_carries_ssh_host_public_key");
   String localExecutablePath = {};
   suite.expect(prodigyResolveCurrentExecutablePath(localExecutablePath), "resolve_current_executable_path");
+
+  {
+    String installRoot = {};
+    suite.expect(prodigyExecutableInstallRootPathIsValid("/opt/prodigy-root/prodigy"_ctv, installRoot, &failure), "current_install_root_path_accepts_absolute_prodigy");
+    expectStringEqual(suite, installRoot, "/opt/prodigy-root"_ctv, "current_install_root_path_preserves_parent");
+    suite.expect(prodigyExecutableInstallRootPathIsValid("/opt/prodigy-root/prodigy (deleted)"_ctv, installRoot, &failure) == false, "current_install_root_path_rejects_deleted_executable");
+    suite.expect(prodigyExecutableInstallRootPathIsValid("/opt/../prodigy/prodigy"_ctv, installRoot, &failure) == false, "current_install_root_path_rejects_parent_component");
+    suite.expect(prodigyExecutableInstallRootPathIsValid("/prodigy"_ctv, installRoot, &failure) == false, "current_install_root_path_rejects_root_binary");
+    suite.expect(prodigyExecutableInstallRootPathIsValid("/opt/prodigy-root/not-prodigy"_ctv, installRoot, &failure) == false, "current_install_root_path_rejects_unexpected_basename");
+
+    char installRootScratch[] = "/tmp/prodigy-current-install-root-XXXXXX";
+    char *installRootRaw = ::mkdtemp(installRootScratch);
+    suite.expect(installRootRaw != nullptr, "current_install_root_mkdtemp_created");
+    if (installRootRaw != nullptr)
+    {
+      String root = {};
+      root.assign(installRootRaw);
+      String binaryPath = {};
+      binaryPath.snprintf<"{}/prodigy"_ctv>(root);
+      int binaryFD = ::open(binaryPath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0700);
+      suite.expect(binaryFD >= 0, "current_install_root_regular_binary_created");
+      if (binaryFD >= 0) (void)::close(binaryFD);
+      suite.expect(prodigyResolveInstallRootForExecutable(binaryPath, installRoot, &failure) == false, "current_install_root_rejects_missing_bundle");
+      String bundlePath = {};
+      bundlePath.snprintf<"{}/prodigy.bundle.tar.zst"_ctv>(root);
+      int bundleFD = ::open(bundlePath.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      suite.expect(bundleFD >= 0, "current_install_root_bundle_created");
+      if (bundleFD >= 0) (void)::close(bundleFD);
+      String bundleSHA256Path = {};
+      bundleSHA256Path.snprintf<"{}.sha256"_ctv>(bundlePath);
+      int bundleSHA256FD = ::open(bundleSHA256Path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      suite.expect(bundleSHA256FD >= 0, "current_install_root_bundle_sidecar_created");
+      if (bundleSHA256FD >= 0) (void)::close(bundleSHA256FD);
+      suite.expect(prodigyResolveInstallRootForExecutable(binaryPath, installRoot, &failure), "current_install_root_resolves_regular_binary");
+      expectStringEqual(suite, installRoot, root, "current_install_root_resolves_regular_binary_parent");
+
+      String symlinkRoot = {};
+      symlinkRoot.snprintf<"{}-symlink"_ctv>(root);
+      suite.expect(::symlink(root.c_str(), symlinkRoot.c_str()) == 0, "current_install_root_symlink_created");
+      String symlinkBinaryPath = {};
+      symlinkBinaryPath.snprintf<"{}/prodigy"_ctv>(symlinkRoot);
+      suite.expect(prodigyResolveInstallRootForExecutable(symlinkBinaryPath, installRoot, &failure) == false, "current_install_root_rejects_symlink_root");
+      std::filesystem::remove_all(std::filesystem::path(installRootRaw));
+      (void)::unlink(symlinkRoot.c_str());
+    }
+  }
+
   String expectedLocalBundlePath = {};
   suite.expect(prodigyResolvePreferredBootstrapBundleArtifact(localExecutablePath, request.architecture, request.remoteProdigyPath, expectedLocalBundlePath, &failure), "resolve_expected_local_bundle_path");
   suite.expect(failure.size() == 0, "resolve_expected_local_bundle_path_clears_failure");

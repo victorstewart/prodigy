@@ -22,7 +22,7 @@ static inline bool prodigyResolveCurrentExecutablePath(String& executablePath)
 {
   char path[PATH_MAX] = {};
   ssize_t result = readlink("/proc/self/exe", path, sizeof(path) - 1);
-  if (result <= 0)
+  if (result <= 0 || uint64_t(result) >= sizeof(path) - 1)
   {
     return false;
   }
@@ -30,6 +30,97 @@ static inline bool prodigyResolveCurrentExecutablePath(String& executablePath)
   path[result] = '\0';
   executablePath.assign(path);
   return true;
+}
+
+static inline bool prodigyExecutableInstallRootPathIsValid(const String& executablePath, String& installRoot, String *failure = nullptr)
+{
+  installRoot.clear();
+  if (failure) failure->clear();
+
+  const String deletedSuffix = " (deleted)"_ctv;
+  if (executablePath.size() == 0 || executablePath[0] != '/' ||
+      (executablePath.size() >= deletedSuffix.size() &&
+       std::memcmp(executablePath.data() + executablePath.size() - deletedSuffix.size(), deletedSuffix.data(), size_t(deletedSuffix.size())) == 0))
+  {
+    if (failure) failure->assign("current prodigy executable path is not an installed absolute path"_ctv);
+    return false;
+  }
+
+  int64_t slash = -1;
+  for (int64_t index = int64_t(executablePath.size()) - 1; index >= 0; --index)
+  {
+    if (executablePath[uint64_t(index)] == '/')
+    {
+      slash = index;
+      break;
+    }
+  }
+  if (slash <= 0 || uint64_t(slash + 1) + uint64_t("prodigy"_ctv.size()) != executablePath.size() ||
+      std::memcmp(executablePath.data() + slash + 1, "prodigy"_ctv.data(), size_t("prodigy"_ctv.size())) != 0)
+  {
+    if (failure) failure->assign("current executable must be a non-root installed prodigy binary"_ctv);
+    return false;
+  }
+
+  for (uint64_t index = 1; index < uint64_t(slash);)
+  {
+    const uint64_t componentStart = index;
+    while (index < uint64_t(slash) && executablePath[index] != '/') ++index;
+    const uint64_t componentBytes = index - componentStart;
+    if (componentBytes == 0 || (componentBytes == 1 && executablePath[componentStart] == '.') ||
+        (componentBytes == 2 && executablePath[componentStart] == '.' && executablePath[componentStart + 1] == '.'))
+    {
+      if (failure) failure->assign("current executable path contains an unsafe install-root component"_ctv);
+      return false;
+    }
+    ++index;
+  }
+
+  installRoot.assign(executablePath.substr(0, uint64_t(slash), Copy::yes));
+  return true;
+}
+
+static inline bool prodigyResolveInstallRootForExecutable(const String& executablePath, String& installRoot, String *failure = nullptr)
+{
+  if (prodigyExecutableInstallRootPathIsValid(executablePath, installRoot, failure) == false)
+  {
+    return false;
+  }
+
+  String executableText = {};
+  executableText.assign(executablePath);
+  String rootText = {};
+  rootText.assign(installRoot);
+  String bundlePath = {};
+  bundlePath.snprintf<"{}/prodigy.bundle.tar.zst"_ctv>(installRoot);
+  String bundleSHA256Path = {};
+  bundleSHA256Path.snprintf<"{}.sha256"_ctv>(bundlePath);
+  struct stat executableMetadata = {};
+  struct stat rootMetadata = {};
+  struct stat bundleMetadata = {};
+  struct stat bundleSHA256Metadata = {};
+  if (::lstat(executableText.c_str(), &executableMetadata) != 0 || S_ISREG(executableMetadata.st_mode) == false ||
+      ::lstat(rootText.c_str(), &rootMetadata) != 0 || S_ISDIR(rootMetadata.st_mode) == false ||
+      ::lstat(bundlePath.c_str(), &bundleMetadata) != 0 || S_ISREG(bundleMetadata.st_mode) == false ||
+      ::lstat(bundleSHA256Path.c_str(), &bundleSHA256Metadata) != 0 || S_ISREG(bundleSHA256Metadata.st_mode) == false)
+  {
+    installRoot.clear();
+    if (failure) failure->assign("current prodigy executable, install root, and installed bundle must be regular non-symlink entries"_ctv);
+    return false;
+  }
+  return true;
+}
+
+static inline bool prodigyResolveCurrentInstallRoot(String& installRoot, String *failure = nullptr)
+{
+  String executablePath = {};
+  if (prodigyResolveCurrentExecutablePath(executablePath) == false)
+  {
+    installRoot.clear();
+    if (failure) failure->assign("unable to resolve current prodigy executable"_ctv);
+    return false;
+  }
+  return prodigyResolveInstallRootForExecutable(executablePath, installRoot, failure);
 }
 
 static inline void prodigyAppendShellSingleQuoted(String& command, const String& value)

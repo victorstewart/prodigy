@@ -26703,15 +26703,21 @@ public:
 
     // should we serialize and save all the container data?
     String failure = {};
+    String installRoot = {};
+    if (prodigyResolveCurrentInstallRoot(installRoot, &failure) == false)
+    {
+      basics_log("transitionToNewBundle current install root resolution failed: %s\n", failure.c_str());
+      _exit(EXIT_FAILURE);
+    }
     String stagedBundlePath = prodigyStagedBundlePath();
-    if (prodigyInstallBundleToRoot(stagedBundlePath, "/root/prodigy"_ctv, &failure) == false)
+    if (prodigyInstallBundleToRoot(stagedBundlePath, installRoot, &failure) == false)
     {
       basics_log("transitionToNewBundle install failed: %s\n", failure.c_str());
       _exit(EXIT_FAILURE);
     }
 
     ProdigyInstallRootPaths installPaths = {};
-    prodigyBuildInstallRootPaths("/root/prodigy"_ctv, installPaths);
+    prodigyBuildInstallRootPaths(installRoot, installPaths);
     String libraryDirectoryText = {};
     libraryDirectoryText.assign(installPaths.libraryDirectory);
     (void)setenv("LD_LIBRARY_PATH", libraryDirectoryText.c_str(), 1);

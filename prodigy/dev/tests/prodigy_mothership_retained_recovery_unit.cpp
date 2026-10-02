@@ -390,6 +390,122 @@ static int retainedPrecheckpointFailures(void)
   return failed;
 }
 
+static void assertSchema4ConflictingClientRetirement(void)
+{
+  const String current=MothershipTidesMigration::text(std::string(64,'a')),
+      previous=MothershipTidesMigration::text(std::string(64,'b')),
+      interrupted=MothershipTidesMigration::text(std::string(64,'c'));
+  DeploymentPlan plan={}; plan.config.type=ApplicationType::stateful; plan.config.applicationID=91; plan.config.versionID=7;
+  plan.config.memoryMB=128; plan.config.storageMB=64; plan.config.nLogicalCores=1; plan.isStateful=true;
+  plan.stateful.clientPrefix=0x1100000000000000ULL; plan.stateful.siblingPrefix=0x1200000000000000ULL;
+  plan.stateful.cousinPrefix=0x1300000000000000ULL; plan.stateful.seedingPrefix=0x1400000000000000ULL;
+  plan.stateful.shardingPrefix=0x1500000000000000ULL; plan.stateful.neverShard=true; plan.stateful.allMasters=false;
+  const uint64_t deploymentID=plan.config.deploymentID(); ProdigyPersistentBrainSnapshot snapshot={};
+  snapshot.brainConfig.clusterUUID=0x71; snapshot.brainConfig.datacenterFragment=7; snapshot.masterAuthority.deploymentPlans[deploymentID]=plan;
+  DeploymentPlan companion={}; companion.config.type=ApplicationType::stateless; companion.config.applicationID=92; companion.config.versionID=7;
+  companion.config.memoryMB=128; companion.config.storageMB=64; companion.config.nLogicalCores=1;
+  const uint64_t companionDeploymentID=companion.config.deploymentID(); snapshot.masterAuthority.deploymentPlans[companionDeploymentID]=companion;
+  bytell_hash_map<uint64_t,DeploymentPlan> approved=snapshot.masterAuthority.deploymentPlans;
+  Vector<MothershipRetainedRecoveryMachineInput> machines={};
+  for(uint32_t index=0;index<3;++index) {
+    ClusterMachine clusterMachine={}; clusterMachine.uuid=index+1; snapshot.topology.machines.push_back(clusterMachine);
+    MothershipRetainedRecoveryMachineInput machine={}; machine.machineUUID=index+1; machine.machineFragment=index+1;
+    ContainerParameters p={}; p.uuid=0x700+index; p.deploymentID=deploymentID; p.memoryMB=128;p.storageMB=64;
+    p.nLogicalCores=applicationSharedCPUCoreHint(plan.config);p.cpuMode=plan.config.cpuMode;p.requestedCPUMillis=applicationRequestedCPUMillis(plan.config);
+    p.private6.network.is6=true;p.private6.cidr=128;std::memcpy(p.private6.network.v6,container_network_subnet6.value,11);
+    p.private6.network.v6[11]=7;p.private6.network.v6[14]=index+1;p.private6.network.v6[15]=1;
+    p.statefulMeshRoles=StatefulMeshRoles::forShardGroup(plan.stateful,plan.config.applicationID,0);
+    p.statefulMeshRoles.cousin=0;p.statefulMeshRoles.sharding=0;p.statefulMeshRoles.topologyBridge=0;
+    if(index==2) p.statefulMeshRoles.client=0;
+    p.statefulTopology.shardGroup=0;p.statefulTopology.workerCount=1;p.statefulTopology.topologyEpoch=1;p.statefulTopology.sourceEpoch=1;p.statefulTopology.targetEpoch=1;p.statefulTopology.servingMode=StatefulTopologyServingMode::serve;
+    p.advertisesOnPorts[p.statefulMeshRoles.sibling]=12001;p.advertisesOnPorts[p.statefulMeshRoles.seeding]=12002;
+    if(p.statefulMeshRoles.client) p.advertisesOnPorts[p.statefulMeshRoles.client]=12003;
+    machine.parameters.push_back(p);machine.observedCreatedAtMs.push_back(1790040000000LL+index);
+    if(index==0) {
+      ContainerParameters extra=p; extra.uuid=0x799; extra.deploymentID=companionDeploymentID;
+      extra.cpuMode=companion.config.cpuMode;extra.requestedCPUMillis=applicationRequestedCPUMillis(companion.config);
+      extra.statefulMeshRoles={};extra.statefulTopology={};extra.advertisesOnPorts.clear();extra.private6.network.v6[15]=2;
+      machine.parameters.push_back(std::move(extra));machine.observedCreatedAtMs.push_back(1790040000100LL);
+    }
+    machines.push_back(std::move(machine));
+  }
+  const MothershipRetainedRecoveryMixedProof proof={4,3,1,0x700}; const Vector<uint128_t> successor={3}; String failure;
+  BrainReplicatedContainerRuntimeState targetRuntime={};targetRuntime.machineUUID=1;targetRuntime.plan.uuid=proof.staleExcludedContainerUUID;
+  snapshot.masterAuthority.containerRuntimeStates.push_back(targetRuntime);
+  // Build the exact full witness as the dormant schema-four form, then prove
+  // only the named duplicate can project it to a strict two-record envelope.
+  auto dormant=snapshot; assert(mothershipPrepareRetainedRecoverySnapshot(dormant,approved,machines,interrupted,&failure,{}, {},proof.staleExcludedContainerUUID,&proof,true,false));
+  dormant.masterAuthority.runtimeState.updateSelf.state=0; dormant.masterAuthority.runtimeState.updateSelf.expectedEchos=0;
+  auto staleInput=dormant;
+  staleInput.masterAuthority.containerRuntimeStates.clear();
+  staleInput.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps.erase(
+      staleInput.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps.begin());
+  // The stale 23-record coordinator belongs to the prior runtime, not the
+  // one-record mixed successor; the existing failed-coordinator predicate
+  // binds its expected digest to `previous`.
+  staleInput.masterAuthority.runtimeState.updateSelf.workerExpectedBundleSHA256=previous;
+  staleInput.masterAuthority.runtimeState.updateSelf.workerFailure="local post-exec bundle digest mismatch"_ctv;
+  auto stale23=staleInput;
+  const bool stalePrepared=mothershipPrepareRetiredConflictingClientSchema4Snapshot(stale23,approved,machines,current,previous,interrupted,successor,proof,proof.staleExcludedContainerUUID,&failure);
+  if(!stalePrepared) std::fprintf(stderr,"schema-four stale23 retirement: %s\n",failure.c_str());
+  assert(stalePrepared);
+  assert(stale23.masterAuthority.containerRuntimeStates.empty() &&
+         mothershipRetainedRecoveryWitnessContainerCount(stale23.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)==3);
+  // Exercise the actual RRF5 local save, reload, and verify path.  The
+  // derived request carries 23 containers, but its adjacent immutable RRF4
+  // source supplies the full 24-record coordinator proof.
+  MothershipRetainedRecovery::Request original={}; original.clusterUUID=snapshot.brainConfig.clusterUUID;
+  original.bundleSHA=current; original.interruptedBundleSHA=interrupted; original.mixedSuccessorMachineUUIDs=successor;
+  original.plans=approved; original.machines=machines;
+  auto projected=original; uint32_t projectedRemoved=0;
+  for(auto& machine:projected.machines) {
+    Vector<ContainerParameters> params; Vector<int64_t> created;
+    for(uint32_t index=0;index<machine.parameters.size();++index) {
+      if(machine.parameters[index].uuid==proof.staleExcludedContainerUUID) {++projectedRemoved;continue;}
+      params.push_back(machine.parameters[index]); created.push_back(machine.observedCreatedAtMs[index]);
+    }
+    machine.parameters=std::move(params); machine.observedCreatedAtMs=std::move(created);
+  }
+  assert(projectedRemoved==1);
+  const auto rrf5Root=std::filesystem::current_path()/".run"/("retired-rrf5-"+std::to_string(::getpid()));
+  std::filesystem::create_directories(rrf5Root);
+  const auto rrf5State=(rrf5Root/"state.new10").string(), rrf5Path=(rrf5Root/"request").string();
+  { ProdigyPersistentStateStore store(MothershipTidesMigration::text(rrf5State)); assert(store.saveBrainSnapshot(staleInput,&failure)); }
+  std::filesystem::create_directories(rrf5State+".secrets");
+  MothershipTidesMigration::Plan rrf5Plan={}; rrf5Plan.schemaVersion=4;
+  rrf5Plan.sealedCanonicalContainerCount=proof.canonicalContainerCount;
+  rrf5Plan.staleCoordinatorCanonicalContainerCount=proof.staleCoordinatorCanonicalContainerCount;
+  rrf5Plan.sealedInterruptedExpectedEchos=proof.interruptedExpectedEchos;
+  rrf5Plan.staleExcludedContainerUUID=proof.staleExcludedContainerUUID;
+  MothershipTidesMigration::durable(rrf5Path+".original",MothershipRetainedRecovery::encodeRequest(original,rrf5Plan));
+  const String rrf5Bytes=MothershipRetainedRecovery::encodeRetiredConflictingClientRequest(projected,proof,proof.staleExcludedContainerUUID);
+  MothershipTidesMigration::durable(rrf5Path,rrf5Bytes);
+  auto sealedSnapshot=staleInput;
+  assert(mothershipPrepareRetiredConflictingClientSchema4Snapshot(sealedSnapshot,approved,machines,current,previous,interrupted,successor,proof,proof.staleExcludedContainerUUID,&failure));
+  MothershipRetainedRecovery::WitnessSet rrf5Witnesses={};rrf5Witnesses.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(rrf5Path));
+  rrf5Witnesses.witnesses=sealedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  String rrf5WitnessBytes={}; BitseryEngine::serialize(rrf5WitnessBytes,rrf5Witnesses); MothershipTidesMigration::durable(rrf5Path+".witnesses",rrf5WitnessBytes);
+  const bool rrf5Prepared=MothershipRetainedRecovery::prepareLocal(rrf5Path.c_str(),rrf5State.c_str(),false,&failure,previous);
+  if(!rrf5Prepared) std::fprintf(stderr,"schema-four RRF5 prepare: %s\n",failure.c_str());
+  assert(rrf5Prepared);
+  const bool rrf5Verified=MothershipRetainedRecovery::prepareLocal(rrf5Path.c_str(),rrf5State.c_str(),true,&failure,previous);
+  if(!rrf5Verified) std::fprintf(stderr,"schema-four RRF5 verify: %s\n",failure.c_str());
+  assert(rrf5Verified);
+  ProdigyPersistentBrainSnapshot rrf5After={};MothershipRetainedRecovery::loadSnapshot(rrf5State,rrf5After);
+  assert(rrf5After.masterAuthority.containerRuntimeStates.empty() &&
+         mothershipRetainedRecoveryWitnessContainerCount(rrf5After.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)==3);
+  std::filesystem::remove_all(rrf5Root);
+  const bool dormantPrepared=mothershipPrepareRetiredConflictingClientSchema4Snapshot(dormant,approved,machines,current,previous,interrupted,successor,proof,proof.staleExcludedContainerUUID,&failure);
+  if(!dormantPrepared) std::fprintf(stderr,"schema-four dormant24 retirement: %s\n",failure.c_str());
+  assert(dormantPrepared);
+  assert(mothershipRetainedRecoveryWitnessContainerCount(dormant.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)==3);
+  assert(dormant.masterAuthority.containerRuntimeStates.empty());
+  auto unknown=snapshot; unknown.masterAuthority.runtimeState.updateSelf.state=99;
+  assert(!mothershipPrepareRetiredConflictingClientSchema4Snapshot(unknown,approved,machines,current,previous,interrupted,successor,proof,proof.staleExcludedContainerUUID,&failure));
+  auto wrong= snapshot;
+  assert(!mothershipPrepareRetiredConflictingClientSchema4Snapshot(wrong,approved,machines,current,previous,interrupted,successor,proof,0,&failure));
+}
+
 int main()
 {
   const bool runtimeCidDriftAccepted = retainedRecoveryAllowsRuntimeCidDrift();
@@ -411,6 +527,7 @@ int main()
   }
   assert(runtimeCidDriftAccepted);
   assert(retainedPrecheckpointFailures() == 0);
+  assertSchema4ConflictingClientRetirement();
   // Recovery must reject malformed input before it opens or mutates a private
   // state copy.  This is the boundary used by the command owner before fence.
   ProdigyPersistentBrainSnapshot snapshot = {};
@@ -974,6 +1091,24 @@ int main()
          schema4DecodedProof.staleCoordinatorCanonicalContainerCount==schema4Proof.staleCoordinatorCanonicalContainerCount &&
          schema4DecodedProof.interruptedExpectedEchos==schema4Proof.interruptedExpectedEchos &&
          schema4DecodedProof.staleExcludedContainerUUID==schema4Proof.staleExcludedContainerUUID);
+  // The retirement envelope is distinct from (and therefore cannot overwrite)
+  // the immutable RRF4 evidence.  It binds the only allowed exclusion in its
+  // own frame; ordinary RRF4 decoding reports no retired target.
+  auto retiredRequest=schema4FileRequest; uint32_t removed=0;
+  for(auto& machine:retiredRequest.machines) {
+    Vector<ContainerParameters> retained; Vector<int64_t> created;
+    for(uint32_t index=0;index<machine.parameters.size();++index) {
+      if(machine.parameters[index].uuid==schema4Proof.staleExcludedContainerUUID) {++removed;continue;}
+      retained.push_back(machine.parameters[index]); created.push_back(machine.observedCreatedAtMs[index]);
+    }
+    machine.parameters=std::move(retained); machine.observedCreatedAtMs=std::move(created);
+  }
+  assert(removed==1);
+  const String retiredBytes=encodeRetiredConflictingClientRequest(retiredRequest,schema4Proof,schema4Proof.staleExcludedContainerUUID);
+  Request retiredDecoded={}; MothershipRetainedRecoveryMixedProof retiredProof={}; uint128_t retiredUUID=0;
+  assert(retiredBytes.size()>4 && decodeRequest(MothershipTidesMigration::str(retiredBytes),retiredDecoded,&retiredProof,&retiredUUID));
+  assert(retiredUUID==schema4Proof.staleExcludedContainerUUID && retiredDecoded.machines.size()==3 &&
+         retiredProof.staleExcludedContainerUUID==schema4Proof.staleExcludedContainerUUID);
   MothershipTidesMigration::durable(schema4RequestPath,schema4Bytes);
   WitnessSet schema4Sealed={}; schema4Sealed.requestSHA=MothershipTidesMigration::text(MothershipTidesMigration::digest(schema4RequestPath));
   schema4Sealed.witnesses=schema4Prepared.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;

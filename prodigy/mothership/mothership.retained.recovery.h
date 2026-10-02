@@ -275,7 +275,11 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     const String& expectedBundleSHA256,
     String *failure = nullptr,
     const String& previousBundleSHA256 = {},
-    const String& interruptedBundleSHA256 = {})
+    const String& interruptedBundleSHA256 = {},
+    uint128_t retiredConflictingClientUUID = 0,
+    const MothershipRetainedRecoveryMixedProof *retirementProof = nullptr,
+    bool retainRetiredConflictingClientForCoordinatorProof = false,
+    bool validateCoordinator = true)
 {
   if (failure) failure->clear();
   if (snapshot.brainConfig.clusterUUID == 0 ||
@@ -289,19 +293,52 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   }
   auto& runtime = snapshot.masterAuthority.runtimeState;
   if (runtime.generation == std::numeric_limits<uint64_t>::max() ||
-      !mothershipRetainedRecoveryCanReplaceUpdate(snapshot, expectedBundleSHA256, previousBundleSHA256,
-                                                   interruptedBundleSHA256))
+      (validateCoordinator && !mothershipRetainedRecoveryCanReplaceUpdate(snapshot, expectedBundleSHA256, previousBundleSHA256,
+                                                                           interruptedBundleSHA256)))
   {
     if (failure) failure->assign("retained recovery refuses an incompatible or exhausted update coordinator"_ctv);
     return false;
   }
 
+  // This exception is deliberately not a generic recovery relaxation.  The
+  // retained-command owner supplies it only after it has fenced and retired
+  // the one schema-four process named by the immutable proof.  We still
+  // reconstruct that record first, so a malformed replacement cannot turn an
+  // arbitrary stateful process into an omitted witness.
+  const bool retiringConflictingClient = retiredConflictingClientUUID != 0;
+  if (retiringConflictingClient &&
+      (retirementProof == nullptr ||
+       retirementProof->staleExcludedContainerUUID != retiredConflictingClientUUID ||
+       retirementProof->canonicalContainerCount != retirementProof->staleCoordinatorCanonicalContainerCount + 1 ||
+       retirementProof->canonicalContainerCount == 0))
+  {
+    if (failure) failure->assign("invalid sealed conflicting-client retirement proof"_ctv);
+    return false;
+  }
   Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> witnesses = {};
   witnesses.reserve(machines.size());
   bytell_hash_set<uint128_t> seenMachines = {};
   bytell_hash_set<uint128_t> seenContainers = {};
   bytell_hash_set<uint32_t> seenFragments = {};
   bytell_hash_map<uint64_t,uint32_t> statefulReplicas, statefulClientMasters;
+  bytell_hash_map<uint64_t,uint32_t> fullStatefulReplicas, fullStatefulClientMasters;
+  uint64_t retiredDeploymentID = 0;
+  uint32_t retiredShardGroup = 0;
+  uint64_t retiredClientRole = 0;
+  for (const auto& machine : machines)
+    for (const auto& parameters : machine.parameters)
+      if (parameters.uuid == retiredConflictingClientUUID) {
+        if (retiredDeploymentID != 0) { if (failure) failure->assign("duplicate sealed conflicting-client target"_ctv); return false; }
+        retiredDeploymentID=parameters.deploymentID; retiredShardGroup=parameters.statefulTopology.shardGroup;
+        retiredClientRole=parameters.statefulMeshRoles.client;
+      }
+  if (retiringConflictingClient && (retiredDeploymentID == 0 || retiredClientRole == 0)) {
+    if (failure) failure->assign("sealed conflicting-client target is absent or has no client role"_ctv);
+    return false;
+  }
+  uint32_t fullRetiredCohort = 0, retainedRetiredCohort = 0, fullRetiredCohortClients = 0, retainedRetiredCohortClients = 0;
+  bytell_hash_set<uint128_t> retiredCohortMachines = {};
+  uint32_t fullRecords = 0, retainedRecords = 0;
   for (const MothershipRetainedRecoveryMachineInput& machine : machines)
   {
     if (machine.machineUUID == 0 || machine.machineFragment == 0 || machine.machineFragment > 0xffffff ||
@@ -326,6 +363,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     for (uint32_t index = 0; index < machine.parameters.size(); ++index)
     {
       const ContainerParameters& parameters = machine.parameters[index];
+      ++fullRecords;
       if (parameters.uuid == 0 || parameters.deploymentID == 0 ||
           seenContainers.insert(parameters.uuid).second == false ||
           !containerFragments.insert(parameters.private6.network.v6[15]).second)
@@ -362,6 +400,34 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
         return false;
       }
       if (existing->second.isStateful) {
+        ++fullStatefulReplicas[parameters.deploymentID];
+        if (bootstrap.plan.statefulMeshRoles.client != 0) ++fullStatefulClientMasters[parameters.deploymentID];
+      }
+      const bool retiredCohort = retiringConflictingClient && parameters.deploymentID == retiredDeploymentID &&
+          parameters.statefulTopology.shardGroup == retiredShardGroup;
+      if (retiredCohort) {
+        ++fullRetiredCohort;
+        if (bootstrap.plan.statefulMeshRoles.client == retiredClientRole) ++fullRetiredCohortClients;
+        retiredCohortMachines.insert(machine.machineUUID);
+      }
+      if (parameters.uuid == retiredConflictingClientUUID) {
+        if (!retiringConflictingClient || !existing->second.isStateful ||
+            existing->second.stateful.allMasters || bootstrap.plan.statefulMeshRoles.client == 0 ||
+            parameters.deploymentID != retiredDeploymentID ||
+            parameters.statefulTopology.shardGroup != retiredShardGroup ||
+            bootstrap.plan.statefulMeshRoles.client != retiredClientRole)
+        {
+          if (failure) failure->assign("sealed conflicting-client retirement target is not one non-all-master client replica"_ctv);
+          return false;
+        }
+        if (!retainRetiredConflictingClientForCoordinatorProof) continue;
+      }
+      ++retainedRecords;
+      if (retiredCohort) {
+        ++retainedRetiredCohort;
+        if (bootstrap.plan.statefulMeshRoles.client == retiredClientRole) ++retainedRetiredCohortClients;
+      }
+      if (existing->second.isStateful) {
         ++statefulReplicas[parameters.deploymentID];
         if (bootstrap.plan.statefulMeshRoles.client != 0) ++statefulClientMasters[parameters.deploymentID];
       }
@@ -373,9 +439,25 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   }
   for (const auto& [id, count] : statefulReplicas) {
     const auto& deployment = approvedPlans.find(id)->second;
+    if (retiringConflictingClient && retainRetiredConflictingClientForCoordinatorProof && id == retiredDeploymentID) continue;
     const uint32_t expected = deployment.stateful.allMasters ? count : 1;
     if (statefulClientMasters[id] != expected) {
       if (failure) failure->assign("retained stateful inventory has missing or conflicting client masters"_ctv);
+      return false;
+    }
+  }
+  if (retiringConflictingClient) {
+    if (retiredDeploymentID == 0 || fullRecords != retirementProof->canonicalContainerCount ||
+        (retainRetiredConflictingClientForCoordinatorProof ? retainedRecords != retirementProof->canonicalContainerCount : retainedRecords != retirementProof->staleCoordinatorCanonicalContainerCount) ||
+        fullStatefulReplicas[retiredDeploymentID] != statefulReplicas[retiredDeploymentID] + (retainRetiredConflictingClientForCoordinatorProof ? 0 : 1) ||
+        fullStatefulClientMasters[retiredDeploymentID] != 2 ||
+        statefulClientMasters[retiredDeploymentID] != (retainRetiredConflictingClientForCoordinatorProof ? 2 : 1) ||
+        statefulReplicas[retiredDeploymentID] == 0 ||
+        fullRetiredCohort != 3 || retainedRetiredCohort != (retainRetiredConflictingClientForCoordinatorProof ? 3 : 2) ||
+        fullRetiredCohortClients != 2 || retainedRetiredCohortClients != (retainRetiredConflictingClientForCoordinatorProof ? 2 : 1) ||
+        retiredCohortMachines.size() != 3)
+    {
+      if (failure) failure->assign("sealed conflicting-client retirement does not reduce exactly one duplicate client master"_ctv);
       return false;
     }
   }
@@ -388,6 +470,7 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
   runtime.updateSelf.machineRecoveryWitnesses = std::move(witnesses);
   return true;
 }
+
 
 // A superseded coordinator may have failed locally before it issued any
 // work. This narrow schema-four proof accepts only its sealed older witness;
@@ -572,6 +655,63 @@ static inline bool mothershipPrepareRetainedRecoverySchema4Snapshot(
   snapshot.masterAuthority.runtimeState.updateSelf={};
   return mothershipPrepareRetainedRecoverySnapshot(snapshot,approvedPlans,machines,expectedBundleSHA256,
                                                    failure,previousBundleSHA256,interruptedBundleSHA256);
+}
+
+// Schema-four conflicting-client retirement is a one-record projection of an
+// otherwise immutable 24-record proof.  First rebuild the complete witness
+// with the only permitted duplicate role, then apply the existing three
+// coordinator predicates to that full witness.  Only after that succeeds do
+// we produce the ordinary strict 23-record envelope.
+static inline bool mothershipPrepareRetiredConflictingClientSchema4Snapshot(
+    ProdigyPersistentBrainSnapshot& snapshot,
+    const bytell_hash_map<uint64_t, DeploymentPlan>& approvedPlans,
+    const Vector<MothershipRetainedRecoveryMachineInput>& fullMachines,
+    const String& expectedBundleSHA256, const String& previousBundleSHA256,
+    const String& interruptedBundleSHA256, const Vector<uint128_t>& successorMachineUUIDs,
+    const MothershipRetainedRecoveryMixedProof& proof, uint128_t retiredConflictingClientUUID,
+    String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  if (!proof.validFor(snapshot) || retiredConflictingClientUUID == 0 ||
+      proof.staleExcludedContainerUUID != retiredConflictingClientUUID) {
+    if (failure) failure->assign("retired conflicting-client proof differs from frozen coordinator"_ctv);
+    return false;
+  }
+  auto fullCurrent=snapshot; fullCurrent.masterAuthority.runtimeState.updateSelf={}; String why;
+  if (!mothershipPrepareRetainedRecoverySnapshot(fullCurrent,approvedPlans,fullMachines,expectedBundleSHA256,&why,
+                                                  {},{},retiredConflictingClientUUID,&proof,true,false)) {
+    if(failure)failure->assign(why); return false;
+  }
+  auto fullInterrupted=snapshot; fullInterrupted.masterAuthority.runtimeState.updateSelf={};
+  if (!mothershipPrepareRetainedRecoverySnapshot(fullInterrupted,approvedPlans,fullMachines,interruptedBundleSHA256,&why,
+                                                  {},{},retiredConflictingClientUUID,&proof,true,false)) {
+    if(failure)failure->assign(why); return false;
+  }
+  const auto& currentWitnesses=fullCurrent.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  const auto& interruptedWitnesses=fullInterrupted.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses;
+  const bool admitted=
+      mothershipRetainedRecoveryCanReplaceMixedInterruptedUpdate(snapshot,expectedBundleSHA256,previousBundleSHA256,
+          interruptedBundleSHA256,interruptedWitnesses,successorMachineUUIDs,&proof) ||
+      mothershipRetainedRecoveryCanReplaceMixedDormantCoordinator(snapshot,interruptedBundleSHA256,proof,interruptedWitnesses) ||
+      mothershipRetainedRecoveryCanReplaceMixedFailedCoordinator(snapshot,previousBundleSHA256,proof,currentWitnesses);
+  if (!admitted) { if(failure)failure->assign("retired conflicting-client proof has no admissible schema-four coordinator"_ctv); return false; }
+  uint128_t retiredMachineUUID=0;
+  for(const auto& machine:fullMachines) for(const auto& parameters:machine.parameters)
+    if(parameters.uuid==retiredConflictingClientUUID) retiredMachineUUID=machine.machineUUID;
+  if(retiredMachineUUID==0) { if(failure)failure->assign("retired conflicting-client target machine is absent"_ctv); return false; }
+  const bool wasStale23=mothershipRetainedRecoveryWitnessContainerCount(
+      snapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)==proof.staleCoordinatorCanonicalContainerCount;
+  auto& runtimeContainers=snapshot.masterAuthority.containerRuntimeStates;
+  const auto previousSize=runtimeContainers.size();
+  runtimeContainers.erase(std::remove_if(runtimeContainers.begin(),runtimeContainers.end(),[&](const auto& state) {
+    return state.plan.uuid==retiredConflictingClientUUID && state.machineUUID==retiredMachineUUID;
+  }),runtimeContainers.end());
+  if (runtimeContainers.size()+1 != previousSize && !(wasStale23 && runtimeContainers.size()==previousSize)) {
+    if(failure)failure->assign("retired conflicting-client runtime identity is absent or duplicated"_ctv); return false;
+  }
+  snapshot.masterAuthority.runtimeState.updateSelf={};
+  return mothershipPrepareRetainedRecoverySnapshot(snapshot,approvedPlans,fullMachines,expectedBundleSHA256,failure,
+      previousBundleSHA256,interruptedBundleSHA256,retiredConflictingClientUUID,&proof,false,false);
 }
 
 // This is intentionally separate from the normal state-store constructor.

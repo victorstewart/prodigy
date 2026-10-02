@@ -1191,7 +1191,7 @@ static void testInplacePairingOrder(TestSuite& suite)
   }
 }
 
-static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestSuite& suite)
+static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestSuite& suite, bool allMasters)
 {
   ScopedFreshRing ring;
   TestBrain *brain = new TestBrain();
@@ -1233,7 +1233,7 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   predecessor->plan.stateful.cousinPrefix = (uint64_t(19'209) << 48) | (uint64_t(3) << 40);
   predecessor->plan.stateful.seedingPrefix = (uint64_t(19'209) << 48) | (uint64_t(4) << 40);
   predecessor->plan.stateful.shardingPrefix = (uint64_t(19'209) << 48) | (uint64_t(5) << 40);
-  predecessor->plan.stateful.allMasters = true;
+  predecessor->plan.stateful.allMasters = allMasters;
   predecessor->plan.stateful.allowUpdateInPlace = true;
   predecessor->nShardGroups = 0;
 
@@ -1246,6 +1246,8 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   brain->deployments.insert_or_assign(predecessorDeploymentID, predecessor);
   brain->deployments.insert_or_assign(successor.plan.config.deploymentID(), &successor);
 
+  const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(
+      successor.plan.stateful, successor.plan.config.applicationID, 0);
   ContainerView retained[2] = {};
   for (uint32_t index = 0; index < 2; ++index)
   {
@@ -1261,6 +1263,14 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
     retained[index].state = index == 0 ? ContainerState::healthy : ContainerState::scheduled;
     retained[index].runtimeReady = true;
     retained[index].shardGroup = 0;
+    if (allMasters == false)
+    {
+      retained[index].explicitStatefulMeshRoles = roles;
+      if (index == 1)
+      {
+        retained[index].explicitStatefulMeshRoles.client = 0;
+      }
+    }
     successor.containers.insert(&retained[index]);
     successor.containersByShardGroup.insert(0, &retained[index]);
     successor.countPerMachine[&machines[index]] = 1;
@@ -1278,12 +1288,13 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   ContainerView *replacement = nullptr;
   for (ContainerView *container : successor.containers)
     if (container != &retained[0] && container != &retained[1]) replacement = container;
-  const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(successor.plan.stateful, successor.plan.config.applicationID, 0);
   suite.expect(successor.nShardGroups == 1 && successor.nTarget() == 3 && successor.nDeployed() == 3 && successor.nHealthy() == 1,
                "recovered_stateful_target_rehydrates_one_shard_and_schedules_missing_replica");
   suite.expect(replacement != nullptr && replacement->machine == &machines[2] &&
-                   replacement->shardGroup == 0 && replacement->subscriptions.contains(roles.seeding),
-               "recovered_stateful_target_seeds_missing_replica_on_remaining_rack");
+                   replacement->shardGroup == 0 && replacement->subscriptions.contains(roles.seeding) &&
+                   replacement->advertisements.contains(roles.client) == allMasters &&
+                   (allMasters || successor.masterForShardGroup[0] == &retained[0]),
+               "recovered_stateful_target_preserves_client_master_assignment");
   suite.expect(predecessor->containers.empty() && predecessor->nShardGroups == 0 && predecessor->next == &successor &&
                    successor.previous == predecessor && retained[0].state == ContainerState::healthy && retained[1].state == ContainerState::scheduled,
                "recovered_stateful_target_preserves_empty_predecessor_and_canonical_replicas");
@@ -2003,7 +2014,8 @@ int main(void)
   }
   if (std::getenv("PRODIGY_TEST_RECOVERED_STATEFUL_TARGET_ONLY") != nullptr)
   {
-    testRecoveredStatefulSuccessorTarget(suite);
+    testRecoveredStatefulSuccessorTarget(suite, true);
+    testRecoveredStatefulSuccessorTarget(suite, false);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY") != nullptr)
