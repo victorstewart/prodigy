@@ -146,7 +146,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
     machine.machineFragment = index;
     machines.push_back(std::move(machine));
   }
-  auto statefulPlan = [](uint16_t applicationID) {
+  auto statefulPlan = [](uint16_t applicationID, bool neverShard) {
     DeploymentPlan plan = {};
     plan.config.type = ApplicationType::stateful;
     plan.config.applicationID = applicationID;
@@ -160,7 +160,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
     plan.stateful.cousinPrefix = 0x1300000000000000ULL;
     plan.stateful.seedingPrefix = 0x1400000000000000ULL;
     plan.stateful.shardingPrefix = 0x1500000000000000ULL;
-    plan.stateful.neverShard = true;
+    plan.stateful.neverShard = neverShard;
     plan.stateful.allMasters = false;
     return plan;
   };
@@ -195,8 +195,11 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
       parameters.statefulMeshRoles = StatefulMeshRoles::forShardGroup(
           plan.stateful, plan.config.applicationID, 0);
       if (!client) parameters.statefulMeshRoles.client = 0;
-      parameters.statefulMeshRoles.cousin = 0;
-      parameters.statefulMeshRoles.sharding = 0;
+      if (plan.stateful.neverShard)
+      {
+        parameters.statefulMeshRoles.cousin = 0;
+        parameters.statefulMeshRoles.sharding = 0;
+      }
       parameters.statefulMeshRoles.topologyBridge = 0;
       parameters.statefulTopology.shardGroup = 0;
       parameters.statefulTopology.workerCount = 1;
@@ -207,6 +210,11 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
       if (client) parameters.advertisesOnPorts[parameters.statefulMeshRoles.client] = uint16_t(12000 + fragment);
       parameters.advertisesOnPorts[parameters.statefulMeshRoles.sibling] = uint16_t(12100 + fragment);
       parameters.advertisesOnPorts[parameters.statefulMeshRoles.seeding] = uint16_t(12200 + fragment);
+      if (!plan.stateful.neverShard)
+      {
+        parameters.advertisesOnPorts[parameters.statefulMeshRoles.cousin] = uint16_t(12300 + fragment);
+        parameters.advertisesOnPorts[parameters.statefulMeshRoles.sharding] = uint16_t(12400 + fragment);
+      }
     }
     return parameters;
   };
@@ -214,7 +222,7 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   Vector<BrainReplicatedContainerRuntimeState> coldStates = {};
   for (uint32_t deploymentIndex = 0; deploymentIndex < 4; ++deploymentIndex)
   {
-    DeploymentPlan plan = statefulPlan(uint16_t(91 + deploymentIndex));
+    DeploymentPlan plan = statefulPlan(uint16_t(91 + deploymentIndex), deploymentIndex >= 2);
     const uint64_t deploymentID = plan.config.deploymentID();
     source.masterAuthority.deploymentPlans[deploymentID] = plan;
     for (uint32_t machine = 2; machine <= 3; ++machine)
@@ -298,6 +306,11 @@ static void assertEmptyMachineColdCanonicalRuntimeRecovery(void)
   auto missingClientSnapshot = source;
   assert(!mothershipPrepareRetainedRecoverySnapshot(
       missingClientSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, missingClient));
+  auto wrongGeneratedRoles = coldStates;
+  wrongGeneratedRoles[0].plan.statefulMeshRoles.cousin = 0;
+  auto wrongGeneratedRolesSnapshot = source;
+  assert(!mothershipPrepareRetainedRecoverySnapshot(
+      wrongGeneratedRolesSnapshot, approved, machines, bundle, &failure, {}, {}, 0, nullptr, false, true, 1, wrongGeneratedRoles));
   auto wrongUUID = coldStates;
   wrongUUID[0].plan.uuid = 0;
   auto wrongUUIDSnapshot = source;

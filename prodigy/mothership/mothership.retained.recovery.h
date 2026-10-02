@@ -544,14 +544,21 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       String serializedLeft = {}, serializedRight = {};
       BitseryEngine::serialize(serializedLeft, leftConfig);
       BitseryEngine::serialize(serializedRight, rightConfig);
-      const StatefulMeshRoles expectedRoles = StatefulMeshRoles::forShardGroup(
+      const StatefulMeshRoles rawRoles = StatefulMeshRoles::forShardGroup(
           existing->second.stateful, existing->second.config.applicationID, 0);
-      if (serializedLeft != serializedRight || plan.statefulMeshRoles.client == 0 ||
+      StatefulMeshRoles expectedRoles = {};
+      if (prodigyRetainedRecoveryGeneratedStatefulRoles(
+              existing->second, plan.statefulTopology,
+              plan.advertisements.contains(rawRoles.client),
+              plan.subscriptionPairings.map.contains(rawRoles.seeding),
+              expectedRoles) == false ||
+          serializedLeft != serializedRight || plan.statefulMeshRoles.client == 0 ||
           plan.statefulMeshRoles.client != expectedRoles.client ||
           plan.statefulMeshRoles.sibling != expectedRoles.sibling ||
           plan.statefulMeshRoles.seeding != expectedRoles.seeding ||
-          plan.statefulMeshRoles.cousin != 0 || plan.statefulMeshRoles.sharding != 0 ||
-          plan.statefulMeshRoles.topologyBridge != 0 ||
+          plan.statefulMeshRoles.cousin != expectedRoles.cousin ||
+          plan.statefulMeshRoles.sharding != expectedRoles.sharding ||
+          plan.statefulMeshRoles.topologyBridge != expectedRoles.topologyBridge ||
           plan.networkAccess != existing->second.networkAccess || plan.useHostNetworkNamespace ||
           plan.lifetime != ApplicationLifetime::base ||
           plan.statefulTopology.configured() == false || plan.statefulTopology.operationID != 0 ||

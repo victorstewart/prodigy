@@ -31,6 +31,67 @@ static inline bool prodigyRetainedRecoveryFail(String *failure, const char *reas
   return false;
 }
 
+// ContainerView keeps a mesh role only if the generated launch services expose
+// it. Keep this projection beside the retained bootstrap builder so every
+// retained authority check validates the same role shape.
+static inline bool prodigyRetainedRecoveryGeneratedStatefulRoles(
+    const DeploymentPlan& deployment,
+    const StatefulTopology& topology,
+    bool advertiseClient,
+    bool seedingData,
+    StatefulMeshRoles& roles,
+    ProdigyContainerServiceDefinitions *definitionsOut = nullptr)
+{
+  roles = deployment.isStateful
+      ? StatefulMeshRoles::forShardGroup(deployment.stateful, deployment.config.applicationID, 0)
+      : StatefulMeshRoles{};
+  ProdigyContainerServiceDefinitionContext context = {};
+  context.isStateful = deployment.isStateful;
+  context.roles = roles;
+  context.topology = topology;
+  context.advertiseClient = advertiseClient;
+  context.seedingAlways = deployment.stateful.seedingAlways;
+  context.dataStrategy = seedingData ? DataStrategy::seeding : DataStrategy::genesis;
+  context.nShardGroups = deployment.isStateful ? 1 : 0;
+  ProdigyContainerServiceDefinitions definitions = {};
+  if (prodigyBuildContainerServiceDefinitions(deployment, context, definitions) == false)
+  {
+    return false;
+  }
+  auto pruneRole = [&](uint64_t& service) -> void {
+    if (service == 0)
+    {
+      return;
+    }
+    for (const Advertisement& advertisement : definitions.advertisements)
+    {
+      if (advertisement.service == service)
+      {
+        return;
+      }
+    }
+    for (const Subscription& subscription : definitions.subscriptions)
+    {
+      if (subscription.service == service)
+      {
+        return;
+      }
+    }
+    service = 0;
+  };
+  pruneRole(roles.client);
+  pruneRole(roles.sibling);
+  pruneRole(roles.cousin);
+  pruneRole(roles.seeding);
+  pruneRole(roles.sharding);
+  pruneRole(roles.topologyBridge);
+  if (definitionsOut)
+  {
+    *definitionsOut = std::move(definitions);
+  }
+  return true;
+}
+
 // The caller establishes canonical base membership and binds parameters to the
 // selected machine before calling this pure reconstruction. observedCreatedAtMs
 // is the recovery observation time; it is deliberately not the original start.
@@ -91,53 +152,19 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
   {
     return prodigyRetainedRecoveryFail(failure, "retained recovery permits only one-shard non-transitioning stateful deployment");
   }
-  ProdigyContainerServiceDefinitionContext serviceContext = {};
-  serviceContext.isStateful = deployment.isStateful;
-  serviceContext.roles = expectedRoles;
-  serviceContext.topology = parameters.statefulTopology;
-  serviceContext.advertiseClient = deployment.isStateful && parameters.advertisesOnPorts.contains(expectedRoles.client);
-  if (deployment.isStateful && deployment.stateful.allMasters && !serviceContext.advertiseClient)
-    return prodigyRetainedRecoveryFail(failure, "retained all-master replica is missing its client service");
-  serviceContext.seedingAlways = deployment.stateful.seedingAlways;
-  serviceContext.dataStrategy = parameters.subscriptionPairings.map.contains(expectedRoles.seeding) ? DataStrategy::seeding : DataStrategy::genesis;
-  serviceContext.nShardGroups = deployment.isStateful ? 1 : 0;
   ProdigyContainerServiceDefinitions definitions = {};
-  if (prodigyBuildContainerServiceDefinitions(deployment, serviceContext, definitions) == false)
+  StatefulMeshRoles expectedRetainedRoles = {};
+  const bool advertiseClient = deployment.isStateful && parameters.advertisesOnPorts.contains(expectedRoles.client);
+  if (deployment.isStateful && deployment.stateful.allMasters && !advertiseClient)
+    return prodigyRetainedRecoveryFail(failure, "retained all-master replica is missing its client service");
+  if (prodigyRetainedRecoveryGeneratedStatefulRoles(
+          deployment, parameters.statefulTopology, advertiseClient,
+          parameters.subscriptionPairings.map.contains(expectedRoles.seeding),
+          expectedRetainedRoles, &definitions) == false)
   {
     return prodigyRetainedRecoveryFail(failure, "retained recovery service definition is ambiguous");
   }
 
-  // ContainerView::generatePlan retains a stateful role only when the final
-  // plan advertises or subscribes to it. In particular neverShard omits the
-  // cousin and sharding services from launch parameters.
-  StatefulMeshRoles expectedRetainedRoles = expectedRoles;
-  auto pruneRole = [&](uint64_t& service) -> void {
-    if (service == 0)
-    {
-      return;
-    }
-    for (const Advertisement& advertisement : definitions.advertisements)
-    {
-      if (advertisement.service == service)
-      {
-        return;
-      }
-    }
-    for (const Subscription& subscription : definitions.subscriptions)
-    {
-      if (subscription.service == service)
-      {
-        return;
-      }
-    }
-    service = 0;
-  };
-  pruneRole(expectedRetainedRoles.client);
-  pruneRole(expectedRetainedRoles.sibling);
-  pruneRole(expectedRetainedRoles.cousin);
-  pruneRole(expectedRetainedRoles.seeding);
-  pruneRole(expectedRetainedRoles.sharding);
-  pruneRole(expectedRetainedRoles.topologyBridge);
   if (deployment.isStateful &&
       (parameters.statefulMeshRoles.client != expectedRetainedRoles.client ||
        parameters.statefulMeshRoles.sibling != expectedRetainedRoles.sibling ||
