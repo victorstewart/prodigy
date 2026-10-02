@@ -2142,6 +2142,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_authority_persistence_retry_unit PROPERTIES TIMEOUT 30)
    add_test(
+      NAME prodigy_async_retirement_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-retirement
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_async_retirement_unit PROPERTIES TIMEOUT 30)
+   add_test(
       NAME prodigy_async_tls_publication_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-tls
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>

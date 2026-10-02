@@ -17494,7 +17494,9 @@ public:
 
     const bool wroteCarrier = writeMachineRetirementJournalCarrier();
     const bool carrierPresent = machineRetirementJournalPresent(masterAuthorityRuntimeState);
-    if (wroteCarrier == false || carrierPresent == false)
+    const bool clearedCarrier = hadPreviousCarrier && wroteCarrier && carrierPresent == false;
+    if (wroteCarrier == false ||
+        (carrierPresent == false && clearedCarrier == false))
     {
       if (hadPreviousCarrier)
       {
