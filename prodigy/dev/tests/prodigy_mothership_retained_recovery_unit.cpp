@@ -1071,6 +1071,33 @@ static int retainedPrecheckpointFailures(void)
       mothershipRetainedRecoveryEnvelopeMatches(
           prepared.masterAuthority.runtimeState.updateSelf, currentDigest),
       "precheckpoint_prior_preparation_advances_generation_and_envelopes");
+
+  // The master may have registered the sealed predecessor bundle before
+  // fencing. Only rebuilt canonical witnesses can bind that registered bit.
+  auto registeredPrevious=prepared;
+  auto& registeredUpdate=registeredPrevious.masterAuthority.runtimeState.updateSelf;
+  const auto rebuiltWitnesses=registeredUpdate.machineRecoveryWitnesses;
+  registeredUpdate={}; registeredUpdate.workerExpectedBundleSHA256=previousDigest;
+  registeredUpdate.machineRecoveryWitnesses=rebuiltWitnesses;
+  for (auto& witness : registeredUpdate.machineRecoveryWitnesses) witness.bundleRegistered=true;
+  expect(!mothershipRetainedRecoveryCanReplaceUpdate(registeredPrevious,currentDigest,previousDigest),
+      "precheckpoint_registered_previous_requires_rebuilt_witness_proof");
+  expect(mothershipRetainedRecoveryCanReplaceUpdate(registeredPrevious,currentDigest,previousDigest,{}, {},&rebuiltWitnesses),
+      "precheckpoint_registered_previous_accepts_exact_rebuilt_witness_proof");
+  auto registeredPrepared=registeredPrevious;
+  expect(mothershipPrepareRetainedRecoverySnapshot(registeredPrepared,request.plans,request.machines,
+      currentDigest,&failure,previousDigest),
+      "precheckpoint_registered_previous_preparation_accepts_exact_rebuilt_witness_proof");
+  auto changedRegisteredBootstrap=registeredPrevious;
+  changedRegisteredBootstrap.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses[0].containerBootstraps[0]="malformed"_ctv;
+  expect(!mothershipPrepareRetainedRecoverySnapshot(changedRegisteredBootstrap,request.plans,request.machines,
+      currentDigest,&failure,previousDigest),
+      "precheckpoint_registered_previous_rejects_bootstrap_mismatch");
+  auto progressedRegistered=registeredPrevious;
+  progressedRegistered.masterAuthority.runtimeState.updateSelf.bundleEchos=1;
+  expect(!mothershipPrepareRetainedRecoverySnapshot(progressedRegistered,request.plans,request.machines,
+      currentDigest,&failure,previousDigest),
+      "precheckpoint_registered_previous_rejects_progress");
   const auto preparedPlan = prepared.masterAuthority.deploymentPlans.find(deploymentID);
   const auto preparedCredentials = prepared.masterAuthority.apiCredentialSetsByApp.find(credentialSet.applicationID);
   const auto priorCredentials = prior.masterAuthority.apiCredentialSetsByApp.find(credentialSet.applicationID);

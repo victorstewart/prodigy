@@ -312,7 +312,8 @@ static inline bool mothershipRetainedRecoveryMixedWitnessesMatch(
 static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
     const ProdigyPersistentBrainSnapshot& snapshot, const String& expectedBundleSHA256,
     const String& previousBundleSHA256 = {}, const String& interruptedBundleSHA256 = {},
-    const String& rejectedCandidateSHA256 = {})
+    const String& rejectedCandidateSHA256 = {},
+    const Vector<ProdigyPersistentUpdateSelfMachineRecoveryWitness> *expectedPreviousEnvelopeWitnesses = nullptr)
 {
   const auto& update = snapshot.masterAuthority.runtimeState.updateSelf;
   if (!update.active()) return true;
@@ -365,6 +366,17 @@ static inline bool mothershipRetainedRecoveryCanReplaceUpdate(
     bool known = false;
     for (const auto& machine : snapshot.topology.machines) known |= machine.uuid == key;
     if (!known) return false;
+  }
+  if (previousEnvelope && expectedPreviousEnvelopeWitnesses != nullptr) {
+    Vector<uint128_t> registeredMachines = {};
+    for (const auto& witness : update.machineRecoveryWitnesses)
+      if (witness.bundleRegistered) registeredMachines.push_back(witness.machineUUID);
+    // Only the copy-built canonical witness set may explain a registered
+    // predecessor envelope.  Do not clear registration bits or relax any
+    // bootstrap, credential, service, or mesh identity comparison.
+    if (!registeredMachines.empty())
+      return mothershipRetainedRecoveryMixedWitnessesMatch(
+          update.machineRecoveryWitnesses,*expectedPreviousEnvelopeWitnesses,registeredMachines,true);
   }
   if (!update.machineRecoveryWitnesses.empty()) {
     if (update.machineRecoveryWitnesses.size() != snapshot.topology.machines.size()) return false;
@@ -494,12 +506,40 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
     return false;
   }
   auto& runtime = snapshot.masterAuthority.runtimeState;
-  if (runtime.generation == std::numeric_limits<uint64_t>::max() ||
-      (validateCoordinator && !mothershipRetainedRecoveryCanReplaceUpdate(snapshot, expectedBundleSHA256, previousBundleSHA256,
-                                                                           interruptedBundleSHA256, rejectedCandidateSHA256)))
+  if (runtime.generation == std::numeric_limits<uint64_t>::max())
   {
     if (failure) failure->assign("retained recovery refuses an incompatible or exhausted update coordinator"_ctv);
     return false;
+  }
+  const bool previousEnvelope = validateCoordinator &&
+      mothershipRetainedRecoveryEnvelopeMatches(runtime.updateSelf,previousBundleSHA256);
+  if (validateCoordinator && !mothershipRetainedRecoveryCanReplaceUpdate(
+          snapshot,expectedBundleSHA256,previousBundleSHA256,interruptedBundleSHA256,rejectedCandidateSHA256))
+  {
+    bool registeredWitness=false;
+    if (previousEnvelope) for (const auto& witness:runtime.updateSelf.machineRecoveryWitnesses)
+      registeredWitness |= witness.bundleRegistered;
+    if (!previousEnvelope || !registeredWitness) {
+      if (failure) failure->assign("retained recovery refuses an incompatible or exhausted update coordinator"_ctv);
+      return false;
+    }
+    // Build and validate the complete new envelope on a copy first. This is
+    // the only path that may admit a registered previous-bundle witness, and
+    // preserves the caller unchanged when any canonical bootstrap differs.
+    ProdigyPersistentBrainSnapshot candidate=snapshot; String candidateFailure={};
+    if (!mothershipPrepareRetainedRecoverySnapshot(candidate,approvedPlans,machines,expectedBundleSHA256,
+            &candidateFailure,previousBundleSHA256,interruptedBundleSHA256,retiredConflictingClientUUID,
+            retirementProof,retainRetiredConflictingClientForCoordinatorProof,false,
+            emptyRetainedInventoryMachineUUID,coldCanonicalRuntimeStates,partialHandoff,rejectedCandidateSHA256) ||
+        !mothershipRetainedRecoveryCanReplaceUpdate(snapshot,expectedBundleSHA256,previousBundleSHA256,
+            interruptedBundleSHA256,rejectedCandidateSHA256,
+            &candidate.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses)) {
+      if (failure) failure->assign(candidateFailure.size()?candidateFailure:
+          String("retained recovery refuses an incompatible registered predecessor envelope"_ctv));
+      return false;
+    }
+    snapshot=std::move(candidate);
+    return true;
   }
 
   // This exception is deliberately not a generic recovery relaxation.  The
