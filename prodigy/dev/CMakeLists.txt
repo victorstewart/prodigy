@@ -434,6 +434,8 @@ set(PRODIGY_PINGPONG_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong.Discom
 set(PRODIGY_PINGPONG_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.DiscombobuFile")
 set(PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-isolation.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.DiscombobuFile")
+set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
 set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 configure_file(
@@ -451,6 +453,11 @@ set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_isolation)
 configure_file(
    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
    "${PRODIGY_PINGPONG_ISOLATION_DISCOMBOBUFILE}"
+   @ONLY
+)
+configure_file(
+   "${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider.DiscombobuFile.in"
+   "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
    @ONLY
 )
 set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_unready)
@@ -877,7 +884,10 @@ target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1 PRODI
 target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_machine_pinger_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
-target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC
+   PRODIGY_DEBUG=1
+   PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT="${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+)
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_container_overlay_sync_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
 target_compile_definitions(prodigy_switchboard_whitehole_unit PUBLIC PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
@@ -1198,6 +1208,27 @@ add_custom_command(
 add_custom_target(prodigy_pingpong_isolation_container_artifact ALL DEPENDS "${PRODIGY_PINGPONG_ISOLATION_CONTAINER_ARTIFACT}")
 
 add_custom_command(
+   OUTPUT "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
+           --context "provider=$<TARGET_FILE_DIR:prodigy_mothership_tunnel_provider>"
+           --output "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+           --kind mothership-tunnel-provider
+   DEPENDS prodigy_mothership_tunnel_provider
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/mothership_tunnel_provider.DiscombobuFile.in"
+           "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building Prodigy Mothership tunnel-provider system container"
+   VERBATIM
+)
+add_custom_target(prodigy_mothership_tunnel_provider_artifact DEPENDS "${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}")
+
+add_custom_command(
    OUTPUT "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
@@ -1293,6 +1324,7 @@ add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha2
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
+add_dependencies(prodigy_brain_replication_credentials_unit prodigy_mothership_tunnel_provider_artifact)
 foreach(_prodigy_artifact_test IN ITEMS
    prodigy_artifact_io_unit
    prodigy_mothership_artifact_responsiveness_unit
@@ -2160,6 +2192,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
    )
    set_tests_properties(prodigy_async_retirement_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_brain_configuration_replication_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=credential-fixture-repairs
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_brain_configuration_replication_unit PROPERTIES TIMEOUT 30)
    add_test(
       NAME prodigy_async_tls_publication_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-tls

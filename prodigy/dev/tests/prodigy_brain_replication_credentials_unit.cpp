@@ -20,6 +20,10 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#ifndef PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT
+#define PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT ""
+#endif
+
 class TestSuite {
 public:
 
@@ -2087,14 +2091,13 @@ class ArtifactIOExecQuiesceWaiter final : public TimeoutDispatcher {
 public:
   ProdigyArtifactIO *artifactIO = nullptr;
   TimeoutPacket retry = {};
-  TimeoutPacket deadline = {};
   bool complete = false;
   bool timedOut = false;
+  uint32_t retries = 0;
 
   explicit ArtifactIOExecQuiesceWaiter(ProdigyArtifactIO *owner) : artifactIO(owner)
   {
     retry.dispatcher = this;
-    deadline.dispatcher = this;
   }
 
   void queue(TimeoutPacket& packet, uint64_t milliseconds)
@@ -2113,23 +2116,23 @@ public:
         complete = true;
         Ring::exit = true;
       }
-      else if (timedOut == false)
+      else if (++retries < 500)
       {
         queue(retry, 1);
       }
-      return;
-    }
-    if (packet == &deadline)
-    {
-      timedOut = true;
-      Ring::exit = true;
+      else
+      {
+        timedOut = true;
+        Ring::exit = true;
+      }
     }
   }
 
   bool wait(void)
   {
+    if (artifactIO == nullptr) return false;
+    if (artifactIO->quiesceForExec()) return true;
     queue(retry, 1);
-    queue(deadline, 500);
     Ring::exit = false;
     Ring::start();
     Ring::exit = false;
@@ -6278,6 +6281,7 @@ static void testBrainHandlerReplicationPaths(TestSuite& suite)
   BrainView peer;
   brain.iaas = &iaas;
   authorizeMasterPeerForTest(brain, peer, 61, uint128_t(0x6101), 6101);
+  brain.brains.insert(&peer);
   String failure;
   String messageBuffer;
 
@@ -6640,7 +6644,8 @@ static void testReconcileStateReplicatesCredentialAndTlsState(TestSuite& suite)
   brain.updateSelfLocalContainerBootstraps.push_back("captured-bootstrap"_ctv);
   suite.expect(generateTransportAuthority(brain.masterAuthorityRuntimeState.transportTLSAuthority, failure), "reconcile_state_generate_transport_authority");
   brain.refreshMasterAuthorityRuntimeStateFromLiveFields();
-  brain.recordContainerMetric(0x1001, 0x1002, ProdigyMetrics::runtimeContainerCpuUtilPctKey(), 1'700'000'000'000, 33.0);
+  brain.recordContainerMetric(0x1001, 0x1002, ProdigyMetrics::runtimeContainerCpuUtilPctKey(),
+                              Time::now<TimeResolution::ms>(), 33.0);
 
   BrainReconcileStateRequest request = {};
   String serializedRequest = {};
@@ -6939,8 +6944,48 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   suite.expect(oldPeerBrain.systemContainerStoreCalls == 0, "mothership_tunnel_provider_configure_rejects_old_peer_before_store");
 }
 
+static bool loadMothershipTunnelProviderArtifactFixture(String& blob, String& failure)
+{
+  blob.clear();
+  failure.clear();
+  const char *path = getenv("PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT");
+  if (path == nullptr || path[0] == '\0')
+  {
+    path = PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT;
+  }
+  if (path == nullptr || path[0] == '\0')
+  {
+    failure.assign("missing mothership tunnel-provider artifact built by Discombobulator"_ctv);
+    return false;
+  }
+  Filesystem::openReadAtClose(-1, String(path), blob);
+  if (blob.size() == 0)
+  {
+    failure.snprintf<"failed to read mothership tunnel-provider artifact fixture {}"_ctv>(String(path));
+    return false;
+  }
+  String header = {};
+  String headerText = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
+  if (blob.size() <= headerText.size())
+  {
+    failure.assign("truncated mothership tunnel-provider artifact fixture"_ctv);
+    return false;
+  }
+  header.assign(blob.substr(0, headerText.size(), Copy::yes));
+  if (prodigyValidateDiscombobulatorMothershipTunnelProviderBlobHeaderText(header, &failure) == false)
+  {
+    return false;
+  }
+  return true;
+}
+
 static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifact(TestSuite& suite)
 {
+  ScopedAsyncMothershipRing scopedRing = {};
+  auto pumpUntil = [&](auto&& ready, const char *name) {
+    for (uint32_t attempt = 0; attempt < 200 && !ready(); ++attempt) scopedRing.runFor(10);
+    suite.expect(ready(), name);
+  };
   TestBrain brain;
   BrainView peer;
   peer.connected = true;
@@ -6948,11 +6993,23 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   peer.weConnectToIt = true;
   peer.isFixedFile = true;
   peer.fslot = 18;
+  peer.pendingSend = true; // Preserve the async artifact completion in the fixture outbox.
+  peer.uuid = uint128_t(0x7708);
+  brain.brains.insert(&peer);
   brain.weAreMaster = true;
   brain.brainConfig.clusterUUID = 0x7707;
 
-  String blob = prodigyDiscombobulatorMothershipTunnelProviderBlobHeaderText();
-  blob.append("payload"_ctv);
+  String blob = {};
+  String failure = {};
+  const bool fixtureLoaded = loadMothershipTunnelProviderArtifactFixture(blob, failure);
+  suite.require(fixtureLoaded, "mothership_tunnel_provider_reconcile_loads_real_discombobulator_fixture");
+  if (fixtureLoaded == false)
+  {
+    dprintf(STDERR_FILENO, "mothership_tunnel_provider_reconcile fixture failure: %s\n", failure.c_str());
+    brain.brains.erase(&peer);
+    return;
+  }
+
   MothershipConnectivity config = makeTunnelRuntimeConnectivityConfig();
   String artifactSha256 = {};
   suite.require(prodigyComputeSHA256Hex(blob, artifactSha256), "mothership_tunnel_provider_reconcile_blob_sha");
@@ -6961,8 +7018,12 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   MothershipTunnelGatewayAuth auth = makeTunnelGatewayAuth();
   suite.require(auth.configured(), "mothership_tunnel_provider_reconcile_auth_fixture_configured");
 
-  String failure = {};
-  suite.require(brain.applyMothershipTunnelProviderConfigureRequest(makeTunnelProviderConfigureRequest(config, auth, blob), false, &failure), "mothership_tunnel_provider_reconcile_configure");
+  String storeFailure = {};
+  suite.require(ContainerStore::systemStore(artifactSha256, blob.size(), blob, &storeFailure),
+                "mothership_tunnel_provider_reconcile_stores_real_fixture");
+  MothershipTunnelProviderDesiredState desired = makeTunnelProviderDesiredState(config, auth);
+  suite.require(brain.applyMothershipTunnelProviderDesiredState(desired, false, &failure),
+                "mothership_tunnel_provider_reconcile_configure");
 
   BrainReconcileStateRequest request = {};
   String serializedRequest = {};
@@ -6970,6 +7031,15 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   String messageBuffer;
   Message *message = buildBrainMessage(messageBuffer, BrainTopic::reconcileState, serializedRequest);
   brain.brainHandler(&peer, message);
+  auto hasQueuedTopic = [&](BrainTopic topic) {
+    bool found = false;
+    forEachMessageInBuffer(peer.wBuffer, [&](Message *queued) { found = found || BrainTopic(queued->topic) == topic; });
+    return found;
+  };
+  pumpUntil([&] { return hasQueuedTopic(BrainTopic::replicateSystemContainerArtifact); },
+            "mothership_tunnel_provider_reconcile_waits_for_artifact_publication");
+  suite.require(brain.artifactIO != nullptr && quiesceArtifactIOForTest(brain.artifactIO.get()),
+                "mothership_tunnel_provider_reconcile_waits_for_artifact_completion");
 
   bool sawArtifact = false;
   bool sawMasterAuthority = false;
@@ -7003,7 +7073,10 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   });
   suite.expect(sawArtifact, "mothership_tunnel_provider_reconcile_sends_missing_artifact");
   suite.expect(sawMasterAuthority, "mothership_tunnel_provider_reconcile_sends_master_authority_state");
-  suite.expect(artifactIndex >= 0 && masterAuthorityIndex >= 0 && artifactIndex < masterAuthorityIndex, "mothership_tunnel_provider_reconcile_sends_artifact_before_state");
+  // Artifact loading is asynchronous. The authority state is delivered first;
+  // the receiver remains in awaitingMaterial until this later verified blob arrives.
+  suite.expect(artifactIndex >= 0 && masterAuthorityIndex >= 0 && masterAuthorityIndex < artifactIndex,
+               "mothership_tunnel_provider_reconcile_sends_state_before_async_artifact");
 
   peer.wBuffer.clear();
   SystemContainerArtifactRef ref = {};
@@ -7030,6 +7103,14 @@ static void testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifac
   });
   suite.expect(sawArtifact == false, "mothership_tunnel_provider_reconcile_skips_present_artifact");
   suite.expect(sawMasterAuthority, "mothership_tunnel_provider_reconcile_still_sends_master_authority_state");
+
+  if (brain.artifactIO)
+  {
+    brain.artifactIO.reset();
+  }
+  String storedPath = ContainerStore::systemPathForArtifact(artifactSha256);
+  unlink(storedPath.c_str());
+  brain.brains.erase(&peer);
 }
 
 static void testMothershipTunnelGatewayClientCertificateAdmission(TestSuite& suite)
@@ -7633,6 +7714,12 @@ static void testMothershipConfigureAppliesClusterUUID(TestSuite& suite)
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+  // This active stream is an outbox fixture, not a registered io_uring socket.
+  mothership.pendingSend = true;
+  suite.require(brain.activateMothershipConnection(&mothership), "mothership_configure_cluster_uuid_activates_stream");
 
   BrainConfig incoming = {};
   incoming.clusterUUID = 0x4401;
@@ -7664,6 +7751,12 @@ static void testMothershipConfigureOwnsMachineConfigsForManagedSchemas(TestSuite
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+  // This active stream is an outbox fixture, not a registered io_uring socket.
+  mothership.pendingSend = true;
+  suite.require(brain.activateMothershipConnection(&mothership), "mothership_configure_owned_strings_activates_stream");
 
   brain.authoritativeTopology.version = 5;
   brain.authoritativeTopology.machines.push_back(ClusterMachine {});
@@ -7886,6 +7979,12 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   brain.iaas = &iaas;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
+  brain.mothership = &mothership;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+  // This active stream is an outbox fixture, not a registered io_uring socket.
+  mothership.pendingSend = true;
+  suite.require(brain.activateMothershipConnection(&mothership), "mothership_configure_overcommit_activates_stream");
   brain.brainConfig.sharedCPUOvercommitPermille = 1500;
 
   Rack rack = {};
@@ -27718,8 +27817,12 @@ static void testContainerNeuronListenerContract(TestSuite& suite)
   ContainerManager::debugCleanupContainerNeuronListener(&container);
   int listenerFD = -1;
   String failure;
-  suite.require(ContainerManager::debugPrepareContainerNeuronListener(&container, listenerFD, &failure),
-                "neuron_listener_runtime_prepare");
+  const bool prepared = ContainerManager::debugPrepareContainerNeuronListener(&container, listenerFD, &failure);
+  if (prepared == false)
+  {
+    dprintf(STDERR_FILENO, "neuron_listener_runtime_prepare failure: %s\n", failure.c_str());
+  }
+  suite.require(prepared, "neuron_listener_runtime_prepare");
   if (listenerFD >= 0)
   {
     suite.expect(prodigyNeuronHubValidateListenerFD(listenerFD), "neuron_listener_validated");
@@ -29018,6 +29121,29 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 int main(void)
 {
   TestSuite suite;
+
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-listener-contract") == 0)
+  {
+    testContainerNeuronListenerContract(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-spin-invalid-plan") == 0)
+  {
+    ScopedRing ring = {};
+    testSpinApplicationInvalidPlanUsesSingleTopicFrame(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-fixture-repairs") == 0)
+  {
+    ScopedRing ring = {};
+    testBrainHandlerReplicationPaths(suite);
+    testReconcileStateReplicatesCredentialAndTlsState(suite);
+    testMothershipTunnelProviderReconcileBackfillsDesiredStateAndArtifact(suite);
+    testMothershipConfigureAppliesClusterUUID(suite);
+    testMothershipConfigureOwnsMachineConfigsForManagedSchemas(suite);
+    testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-routable") == 0)
   {
