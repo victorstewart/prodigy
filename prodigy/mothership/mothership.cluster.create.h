@@ -79,6 +79,64 @@ static inline uint32_t mothershipClusterTopologyMachinesWithReadyResources(const
   return ready;
 }
 
+static inline void mothershipAppendTestClusterTopologyReadinessDiagnostic(const ClusterTopology& topology, String& output)
+{
+  String header = {};
+  header.snprintf<" topologyVersion={itoa}"_ctv>(uint64_t(topology.version));
+  output.append(header);
+  for (uint32_t index = 0; index < topology.machines.size(); ++index)
+  {
+    const ClusterMachine& machine = topology.machines[index];
+    Machine snapshot = prodigyBuildMachineSnapshotFromClusterMachine(machine);
+    bool hardwareReady = prodigyMachineHardwareInventoryReady(snapshot.hardware);
+    uint32_t readyLogicalCores = snapshot.ownedLogicalCores > 0 ? snapshot.ownedLogicalCores : snapshot.totalLogicalCores;
+    uint32_t readyMemoryMB = snapshot.ownedMemoryMB > 0 ? snapshot.ownedMemoryMB : snapshot.totalMemoryMB;
+    uint32_t readyStorageMB = snapshot.ownedStorageMB > 0 ? snapshot.ownedStorageMB : snapshot.totalStorageMB;
+    String uuid = {}; uuid.assignItoh(machine.uuid);
+    String reason = {};
+    if (hardwareReady)
+    {
+      reason.assign("hardware-inventory"_ctv);
+    }
+    else if (readyLogicalCores > 0 && readyMemoryMB > 0 && readyStorageMB > 0)
+    {
+      reason.assign("resource-fallback"_ctv);
+    }
+    else
+    {
+      reason.snprintf<"missing-resource cores={itoa} memory={itoa} storage={itoa}"_ctv>(
+          uint64_t(readyLogicalCores), uint64_t(readyMemoryMB), uint64_t(readyStorageMB));
+    }
+    String diagnostic = {};
+    diagnostic.snprintf<" machine={itoa} uuid={} brain={itoa} ready={itoa} reason={} inventoryComplete={itoa} inventoryCores={itoa} inventoryMemoryMB={itoa} inventoryFailure={} total={itoa}/{itoa}/{itoa} owned={itoa}/{itoa}/{itoa}"_ctv>(
+        uint64_t(index + 1),
+        uuid,
+        uint64_t(machine.isBrain),
+        uint64_t(mothershipClusterMachineReadyResourcesAvailable(machine)),
+        reason,
+        uint64_t(snapshot.hardware.inventoryComplete),
+        uint64_t(snapshot.hardware.cpu.logicalCores),
+        uint64_t(snapshot.hardware.memory.totalMB),
+        snapshot.hardware.inventoryFailure,
+        uint64_t(snapshot.totalLogicalCores),
+        uint64_t(snapshot.totalMemoryMB),
+        uint64_t(snapshot.totalStorageMB),
+        uint64_t(snapshot.ownedLogicalCores),
+        uint64_t(snapshot.ownedMemoryMB),
+        uint64_t(snapshot.ownedStorageMB));
+    output.append(diagnostic);
+    diagnostic.snprintf<" ownershipMode={itoa} caps={itoa}/{itoa}/{itoa} basisPoints={itoa}/{itoa}/{itoa}"_ctv>(
+        uint64_t(machine.ownership.mode),
+        uint64_t(machine.ownership.nLogicalCoresCap),
+        uint64_t(machine.ownership.nMemoryMBCap),
+        uint64_t(machine.ownership.nStorageMBCap),
+        uint64_t(machine.ownership.nLogicalCoresBasisPoints),
+        uint64_t(machine.ownership.nMemoryBasisPoints),
+        uint64_t(machine.ownership.nStorageBasisPoints));
+    output.append(diagnostic);
+  }
+}
+
 static inline bool mothershipTestClusterTopologyReady(const ClusterTopology& topology, uint32_t expectedMachines, uint32_t expectedBrains)
 {
   if (topology.machines.size() != expectedMachines)
@@ -1123,6 +1181,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
           uint64_t(cluster.nBrains),
           uint64_t(clusterTopologyBrainCount(currentTopology)),
           uint64_t(mothershipClusterTopologyMachinesWithReadyResources(currentTopology)));
+      mothershipAppendTestClusterTopologyReadinessDiagnostic(currentTopology, localFailure);
       return failWithCleanup(localFailure);
     }
 

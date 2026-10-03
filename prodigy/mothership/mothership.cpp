@@ -58,6 +58,7 @@
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/types.h>
+#include <switchboard/host.tcx.retention.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
@@ -3904,10 +3905,126 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
   return true;
 }
 
+// The lifecycle owner asks Switchboard to retain its existing resources. It
+// neither attaches a program nor writes a routing map. Namespace entry stays in
+// this bounded child, and the durable recovery record owns the exact identities.
+static bool mothershipVDCRetainFollowerNetworking(MothershipVDCBundleRecovery& operation,
+                                                 bool capture, String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (!operation.testOnlyFollowerReplacement || operation.machineIndex == 0 || operation.machineIndex > 3)
+    return reject("host routing retention requires the admitted test follower");
+  const auto& owner = capture ? operation.worker : operation.adopter;
+  char state = 0;
+  if (!mothershipVDCProcessMatches(owner, &state) || (capture && state != 'T' && state != 't'))
+    return reject("host routing retention namespace owner changed or worker is not stopped");
+  struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } mount, network, input, output;
+  String path = {};
+  path.snprintf<"/proc/{itoa}/ns/mnt"_ctv>(owner.pid);
+  mount.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (capture) path.snprintf<"/proc/{itoa}/ns/net"_ctv>(owner.pid);
+  else path.snprintf<"/proc/{itoa}/root/run/netns/pvd-m{itoa}-{itoa}"_ctv>(owner.pid, uint64_t(operation.machineIndex), operation.runtimeIdentity);
+  network.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  struct stat mountInfo = {}, networkInfo = {};
+  if (mount.fd < 0 || network.fd < 0 || ::fstat(mount.fd, &mountInfo) != 0 || ::fstat(network.fd, &networkInfo) != 0 ||
+      uint64_t(mountInfo.st_ino) != owner.mountNamespace || uint64_t(networkInfo.st_ino) != operation.worker.networkNamespace ||
+      !mothershipVDCProcessMatches(owner))
+    return reject("host routing retention namespace identity mismatch");
+  int descriptors[2];
+  if (::pipe2(descriptors, O_CLOEXEC) != 0) return reject("cannot open host routing retention receipt channel");
+  input.fd = descriptors[0]; output.fd = descriptors[1];
+  struct Receipt { MothershipVDCRetainedTCX links[2]; int result = 1; } receipt = {};
+  pid_t child = ::fork();
+  if (child == 0)
+  {
+    ::close(input.fd);
+    ::signal(SIGALRM, SIG_DFL);
+    ::alarm(10);
+    if (::setns(mount.fd, CLONE_NEWNS) != 0 || ::setns(network.fd, CLONE_NEWNET) != 0) _exit(125);
+    const uint32_t ifindex = ::if_nametoindex("bond0"); // the admitted VDC machine interface
+    String bpffsRoot = {};
+    if (capture) bpffsRoot.assign("/sys/fs/bpf"_ctv);
+    else bpffsRoot.snprintf<"/mnt/prodigy-vdc-{itoa}/machine-bpffs/machine{itoa}"_ctv>(operation.runtimeIdentity, uint64_t(operation.machineIndex));
+    SwitchboardHostTCXRetentionPair pair = {};
+    auto importIdentity = [](const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target) {
+      target.interfaceIndex = source.ifindex;
+      target.direction = source.attachType == uint32_t(BPF_TCX_INGRESS) ? SwitchboardHostTCXDirection::ingress : SwitchboardHostTCXDirection::egress;
+      target.programID = source.programID; target.linkID = source.linkID;
+      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+    };
+    auto exportIdentity = [](const SwitchboardHostTCXRetentionIdentity& source, MothershipVDCRetainedTCX& target) {
+      target.ifindex = source.interfaceIndex;
+      target.attachType = uint32_t(switchboardHostTCXAttachType(source.direction));
+      target.programID = source.programID; target.linkID = source.linkID;
+      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+    };
+    bool okay = false;
+    if (capture)
+      okay = switchboardHostTCXRetainCurrentPair(ifindex, bpffsRoot, pair);
+    else if (operation.version == 4 && operation.retainedTCX[0].attachType == uint32_t(BPF_TCX_INGRESS) &&
+             operation.retainedTCX[1].attachType == uint32_t(BPF_TCX_EGRESS))
+    {
+      importIdentity(operation.retainedTCX[0], pair.ingress);
+      importIdentity(operation.retainedTCX[1], pair.egress);
+      okay = switchboardHostTCXVerifyRetainedPair(ifindex, bpffsRoot, pair);
+    }
+    if (okay)
+    {
+      exportIdentity(pair.ingress, receipt.links[0]);
+      exportIdentity(pair.egress, receipt.links[1]);
+      receipt.result = 0;
+    }
+    ssize_t bytes;
+    do { bytes = ::write(output.fd, &receipt, sizeof(receipt)); } while (bytes < 0 && errno == EINTR);
+    _exit(bytes == sizeof(receipt) && okay ? 0 : 1);
+  }
+  if (child < 0) return reject("cannot launch bounded host routing retention request");
+  ::close(output.fd); output.fd = -1;
+  size_t received = 0;
+  while (received < sizeof(receipt))
+  {
+    ssize_t bytes = ::read(input.fd, reinterpret_cast<char *>(&receipt) + received, sizeof(receipt) - received);
+    if (bytes < 0 && errno == EINTR) continue;
+    if (bytes <= 0) break;
+    received += size_t(bytes);
+  }
+  int status = 0;
+  pid_t waited;
+  do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || received != sizeof(receipt) || receipt.result != 0)
+    return reject("exact host routing link retention failed; follower recovery remains held");
+  if (capture)
+  {
+    operation.version = 4;
+    for (unsigned index = 0; index < 2; ++index) operation.retainedTCX[index] = receipt.links[index];
+  }
+  basics_log("retainedFollowerNetworking verified=1 machineIndex=%u capture=%u ingressLink=%u egressLink=%u flowMap=%u pendingMap=%u\n",
+             operation.machineIndex, unsigned(capture), receipt.links[0].linkID, receipt.links[1].linkID,
+             receipt.links[0].wormholeFlowMapID, receipt.links[0].wormholePendingFlowMapID);
+  return true;
+}
+
+static void mothershipVDCTestFaultAfterRecoveryTransition(MothershipVDCTestRecoveryFaultPhase requested,
+    MothershipVDCTestRecoveryFaultPhase transition, const MothershipVDCBundleRecovery& operation)
+{
+  if (requested != transition) return;
+  String operationText = {}; operationText.assignItoh(operation.operationID);
+  const char *phase = transition == MothershipVDCTestRecoveryFaultPhase::frozen ? "frozen" :
+                      transition == MothershipVDCTestRecoveryFaultPhase::rootInstalled ? "rootInstalled" : "workerReplaced";
+  basics_log("recoverTestClusterFollowerBrain testFault=1 phase=%s operationID=%s machineIndex=%u before_exit=86\n",
+             phase, operationText.c_str(), unsigned(operation.machineIndex));
+  std::fflush(stdout);
+  std::fflush(stderr);
+  _exit(86);
+}
+
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
     const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
     const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA,
-    const MothershipVDCBundleRecovery *followerPreflight, uint128_t *completedOperationID, String *failure)
+    const MothershipVDCBundleRecovery *followerPreflight, MothershipVDCTestRecoveryFaultPhase testFaultAfterPhase,
+    uint128_t *completedOperationID, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
   const bool followerReplacement = followerPreflight != nullptr;
@@ -3919,6 +4036,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     return reject("Brain replacement is unsupported without an authoritative local-container checkpoint");
   if (followerReplacement && expectedIncompleteWorkerSHA.empty() == false)
     return reject("test follower replacement must retain its original boot without an incomplete-update receipt");
+  if (testFaultAfterPhase != MothershipVDCTestRecoveryFaultPhase::none && followerReplacement == false)
+    return reject("test recovery fault injection requires the test-only follower operation");
   if (expectedIncompleteWorkerSHA.empty() == false && ((!followerReplacement && (machineIndex != 1 || cluster.nBrains != 1)) ||
       prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
     return reject("incomplete bundle supersession requires the sole Brain and a distinct expected pending digest");
@@ -4031,6 +4150,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
                                  operation.witnessMachineUUID != followerPreflight->witnessMachineUUID ||
                                  operation.preflightReportSHA256 != followerPreflight->preflightReportSHA256)))
       return reject("provider recovery operation identity mismatch");
+    if (followerReplacement && operation.version < 4 && operation.phase >= MothershipVDCRecoveryPhase::workerKilled)
+      return reject("legacy follower recovery journal has no retained routing identities; cannot attest this retry");
   }
   else
   {
@@ -4186,10 +4307,13 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   };
   if (operation.phase < MothershipVDCRecoveryPhase::committed)
   {
+    const bool transitionsFromAccepted = operation.phase == MothershipVDCRecoveryPhase::accepted;
     if (mothershipVDCSignal(operation.supervisor, SIGSTOP) == false || waitStopped(operation.supervisor) == false)
       return reject("cannot freeze the exact retained provider");
     operation.phase = MothershipVDCRecoveryPhase::frozen;
     if (save() == false) return false;
+    if (transitionsFromAccepted)
+      mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::frozen, operation);
     String currentCgroup = {};
     if (mothershipVDCReadProcessFile(operation.supervisor.pid, "cgroup", currentCgroup) == false || currentCgroup.equals(operation.providerCgroup) == false ||
         executableMatches(operation.worker, operation.oldExecutable) == false)
@@ -4296,6 +4420,14 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   }
   if (operation.phase == MothershipVDCRecoveryPhase::workerStopped)
   {
+    if (followerReplacement)
+    {
+      // Partial pinning before a coordinator crash is safely repeatable while
+      // the exact original worker is stopped. Never kill it until both kernel
+      // references and their durable identity have been established.
+      const bool capture = operation.retainedTCX[0].linkID == 0 && operation.retainedTCX[1].linkID == 0;
+      if (mothershipVDCRetainFollowerNetworking(operation, capture, failure) == false || save() == false) return false;
+    }
     if (mothershipVDCProcessMatches(operation.worker) && mothershipVDCSignal(operation.worker, SIGKILL) == false)
       return reject("cannot stop exact selected worker; recovery remains held");
     for (unsigned i = 0; i < 100 && mothershipVDCProcessMatches(operation.worker); ++i) ::usleep(10000);
@@ -4303,6 +4435,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     operation.phase = MothershipVDCRecoveryPhase::workerKilled;
     if (save() == false) return false;
   }
+  if (followerReplacement && operation.phase >= MothershipVDCRecoveryPhase::workerKilled &&
+      mothershipVDCRetainFollowerNetworking(operation, false, failure) == false) return false;
   if (operation.phase == MothershipVDCRecoveryPhase::workerKilled)
   {
     String installed = {}, previous = {}, staged = {};
@@ -4325,6 +4459,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
         mothershipVDCDurableWrite(directory, "root-installed", directoryName, failure) == false) return false;
     operation.phase = MothershipVDCRecoveryPhase::rootInstalled;
     if (save() == false) return false;
+    mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::rootInstalled, operation);
   }
   if (operation.phase == MothershipVDCRecoveryPhase::rootInstalled)
   {
@@ -4373,8 +4508,12 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     if (replaced == false) return reject("replacement runtime was not observed; provider retains selected machine without cgroup reset");
     operation.phase = MothershipVDCRecoveryPhase::replaced;
     if (save() == false) return false;
+    mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::workerReplaced, operation);
   }
   if (executableMatches(operation.replacement, operation.successorExecutable) == false) return reject("replacement runtime identity no longer matches completed recovery");
+  if (followerReplacement && mothershipVDCRetainFollowerNetworking(operation, false, failure) == false) return false;
+  // Completion is a process/resource retention receipt. Async Neuron adoption,
+  // application health and quorum remain separately observed qualification gates.
   operation.phase = MothershipVDCRecoveryPhase::complete;
   if (save() == false || mothershipVDCDurableWrite(directory, "complete", directoryName, failure) == false) return false;
   if (completedOperationID) *completedOperationID = operation.operationID;
@@ -10808,7 +10947,7 @@ private:
         prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
         prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA) ||
         mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA,
-                                                 nullptr, nullptr, &failure) == false)
+                                                 nullptr, MothershipVDCTestRecoveryFaultPhase::none, nullptr, &failure) == false)
     {
       basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "recovery identity validation failed" : failure.c_str());
       exit(EXIT_FAILURE);
@@ -10822,17 +10961,25 @@ private:
   // an authority quorum after the retained process is replaced.
   void runRecoverTestClusterFollowerBrain(int argc, char *argv[])
   {
-    if (argc != 4)
+    if (argc != 4 && argc != 5)
     {
-      basics_log("recoverTestClusterFollowerBrain expects [name|clusterUUID] [approved bundle] [nonmaster machine index] [exact runtime19b bundle SHA256]\n");
+      basics_log("recoverTestClusterFollowerBrain expects [name|clusterUUID] [approved bundle] [nonmaster machine index] [exact runtime19b bundle SHA256] [optional test fault phase: frozen|rootInstalled|workerReplaced]\n");
       exit(EXIT_FAILURE);
     }
     String identity = {}; identity.assign(argv[0]);
     String input = {}; input.assign(argv[1]);
     String oldSHA = {}; oldSHA.assign(argv[3]);
+    String faultText = {};
+    if (argc == 5) faultText.assign(argv[4]);
+    MothershipVDCTestRecoveryFaultPhase testFaultAfterPhase = MothershipVDCTestRecoveryFaultPhase::none;
     String failure = {};
     MothershipProdigyCluster cluster = {};
     uint64_t index = 0;
+    if (mothershipVDCTestParseRecoveryFaultPhase(faultText, testFaultAfterPhase) == false)
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=invalid test fault phase\n");
+      exit(EXIT_FAILURE);
+    }
     // A completed transaction is queried from its durable owner before a new
     // report is requested.  The selected member now runs the successor, so a
     // second report cannot be expected to reproduce the initial 19b snapshot.
@@ -10859,7 +11006,7 @@ private:
           uint128_t resumedOperationID = 0;
           String noIncompleteBundle = {};
           if (mothershipRecoverVirtualDatacenterBundle(cluster, completedBundle, completedSHA, uint32_t(index), oldSHA, noIncompleteBundle,
-                                                       &completed, &resumedOperationID, &failure) == false)
+                                                       &completed, MothershipVDCTestRecoveryFaultPhase::none, &resumedOperationID, &failure) == false)
           {
             basics_log("recoverTestClusterFollowerBrain accepted=0 resumed=1 failure=%s\n", failure.empty() ? "retained follower recovery could not resume" : failure.c_str());
             exit(EXIT_FAILURE);
@@ -10947,7 +11094,7 @@ private:
     uint128_t operationID = 0;
     String noIncompleteBundle = {};
     if (mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, noIncompleteBundle,
-                                                 &preflight, &operationID, &failure) == false)
+                                                 &preflight, testFaultAfterPhase, &operationID, &failure) == false)
     {
       basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "test follower recovery validation failed" : failure.c_str());
       exit(EXIT_FAILURE);
@@ -20287,8 +20434,8 @@ int main(int argc, char *argv[])
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
-    message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256]\n");
-    message.append("\ttest-only exact-runtime19b three-Brain follower replacement; receipt does not attest application health or quorum\n");
+    message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
+    message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");

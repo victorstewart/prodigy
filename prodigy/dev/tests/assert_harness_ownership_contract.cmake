@@ -115,6 +115,17 @@ foreach(_required IN ITEMS
    endif()
 endforeach()
 
+foreach(_required IN ITEMS
+   "machine_bpffs_root=\"\${filesystem_root}/machine-bpffs\""
+   "mount -t bpf bpf \"\${machine_bpffs}\""
+   "mount --bind \"\${PRODIGY_VDC_MACHINE_BPFFS}\" /sys/fs/bpf"
+   "valid_machine_bpffs \"\${index}\" || failed 1 \"\$LINENO\"")
+   string(FIND "${_provider_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "virtual datacenter must retain a provider-owned bpffs per fake machine: ${_required}")
+   endif()
+endforeach()
+
 foreach(_forbidden IN ITEMS
    "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR="
    "shared-transport-tls"

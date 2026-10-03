@@ -587,6 +587,19 @@ int main(void)
   suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 3, false, true) == false, "recovery_rejects_test_follower_zero_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 1) == false, "recovery_rejects_zero_machine_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 1), "recovery_allows_worker_after_brains");
+  MothershipVDCTestRecoveryFaultPhase testFault = MothershipVDCTestRecoveryFaultPhase::none;
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("frozen"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::frozen,
+               "recovery_accepts_test_fault_at_frozen_transition");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("rootInstalled"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::rootInstalled,
+               "recovery_accepts_test_fault_after_durable_root_install");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("workerReplaced"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::workerReplaced,
+               "recovery_accepts_test_fault_after_durable_replacement");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("committed"_ctv, testFault) == false &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::none,
+               "recovery_rejects_unqualified_test_fault_phase");
 
   Vector<String> providerArguments = {};
   for (const char *argument : {"bash", "/proc/self/fd/7", "--serve", "/tmp/prodigy/vdc-unit", "3", "2", "65495", "0", "42", "4", "8192", "8192", "0", "1024", "/tmp/prodigy-vdc-0x1234/mothership.sock"})
@@ -663,6 +676,21 @@ int main(void)
                  mothershipVDCSameProcess(restored.commissionedBrains[2], recovery.commissionedBrains[2]),
                  "recovery_preserves_test_follower_preflight_and_process_identity");
     recovery.version = 4;
+    recovery.retainedTCX[0] = {7, 46, 123, 456, 800, 801, {1,2,3,4,5,6,7,8}};
+    recovery.retainedTCX[1] = {7, 47, 124, 457, 800, 801, {8,7,6,5,4,3,2,1}};
+    suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) &&
+                 restored.version == 4 && restored.retainedTCX[0].ifindex == 7 &&
+                 restored.retainedTCX[0].attachType == 46 && restored.retainedTCX[0].programID == 123 &&
+                 restored.retainedTCX[0].linkID == 456 && restored.retainedTCX[0].programTag[7] == 8 &&
+                 restored.retainedTCX[0].wormholeFlowMapID == 800 && restored.retainedTCX[1].wormholePendingFlowMapID == 801 &&
+                 restored.retainedTCX[1].linkID == 457 && restored.retainedTCX[1].programTag[7] == 1 &&
+                 mothershipVDCTestFollowerRecoveryMatches(restored, recovery.clusterUUID, 2, recovery.expectedOldBundle, recovery.successorBundle),
+                 "recovery_preserves_exact_retained_tcx_link_identity");
+    recovery.version = 3;
+    suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) &&
+                 restored.retainedTCX[0].linkID == 0 && restored.retainedTCX[1].programID == 0,
+                 "recovery_does_not_invent_retained_links_for_old_journal");
+    recovery.version = 5;
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) == false,
                  "recovery_rejects_unknown_journal_version");
     String path = {}; mothershipVirtualDatacenterPath(directory, "operation", path);

@@ -30,11 +30,19 @@ if [[ "${test_mode}" == provider-handoff || "${test_mode}" == bootstrap-superses
 fi
 if [[ "${test_mode}" == follower-retained ]]; then
    old_runtime_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_RUNTIME_SHA256:-}"
+   follower_fault_after_phase="${PRODIGY_STORAGE_HANDOFF_FAULT_AFTER_PHASE:-}"
    [[ "${old_runtime_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: follower-retained requires sealed old Prodigy executable SHA" >&2; exit 2; }
+   case "${follower_fault_after_phase}" in
+      ""|frozen|rootInstalled|workerReplaced) ;;
+      *) echo "error: follower-retained fault phase must be frozen, rootInstalled, or workerReplaced" >&2; exit 2 ;;
+   esac
    initial_bundle="${PRODIGY_STORAGE_HANDOFF_INITIAL_BUNDLE:-}"
    command -v sha256sum >/dev/null 2>&1 || { echo "error: follower-retained requires sha256sum" >&2; exit 2; }
    [[ -s "${initial_bundle}" && "$(sha256sum "${initial_bundle}" | awk '{print $1}')" == "${old_bundle_sha}" ]] || { echo "error: follower-retained requires the sealed old initial bundle" >&2; exit 2; }
 fi
+[[ "${test_mode}" == follower-retained || -z "${PRODIGY_STORAGE_HANDOFF_FAULT_AFTER_PHASE:-}" ]] || {
+   echo "error: PRODIGY_STORAGE_HANDOFF_FAULT_AFTER_PHASE is follower-retained only" >&2; exit 2;
+}
 if [[ "${test_mode}" == bootstrap-supersession ]]; then
    interrupted_bundle="${PRODIGY_STORAGE_HANDOFF_INTERRUPTED_BUNDLE:-}"
    interrupted_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_INTERRUPTED_BUNDLE_SHA256:-}"
@@ -100,6 +108,8 @@ traffic_log="${tmpdir}/traffic.log"
 cluster_created=0
 archive_workspace=0
 owned_background_pids=()
+follower_traffic_loop_pid=""
+follower_traffic_stop=""
 
 cleanup()
 {
@@ -184,11 +194,92 @@ for node in json.loads(manifest.read_text()).get('nodes', []):
 PY_PROCESS_IDENTITY
    fi
 
+   # The retained-follower sampler owns a timeout-bounded probe subprocess. Ask
+   # it to finish that probe before Mothership removes the cluster; killing only
+   # its shell can leave the client process outside the generic PID cleanup.
+   if [[ -n "${follower_traffic_loop_pid:-}" ]]
+   then
+      [[ -z "${follower_traffic_stop:-}" ]] || : > "${follower_traffic_stop}"
+      wait "${follower_traffic_loop_pid}" >/dev/null 2>&1 || true
+      filtered_background_pids=()
+      for background_pid in "${owned_background_pids[@]}"
+      do
+         [[ "${background_pid}" == "${follower_traffic_loop_pid}" ]] || filtered_background_pids+=("${background_pid}")
+      done
+      owned_background_pids=("${filtered_background_pids[@]}")
+      follower_traffic_loop_pid=""
+   fi
+
    for background_pid in "${owned_background_pids[@]}"
    do
       kill "${background_pid}" >/dev/null 2>&1 || true
       wait "${background_pid}" >/dev/null 2>&1 || true
    done
+
+   # Preserve only BPF object metadata for a failed retained-follower run.
+   # This executes before Mothership owns teardown; every read is namespace
+   # scoped and timeout-bounded, and any diagnostic failure keeps the original
+   # test status and cleanup path intact.
+   if [[ "${test_mode}" == follower-retained && "${status}" -ne 0 && -s "${manifest_path}" ]]
+   then
+      follower_bpf_diagnostics="${tmpdir}/follower-retained-bpf-diagnostics"
+      mkdir -p "${follower_bpf_diagnostics}"
+      timeout 45s bash -s -- "${manifest_path}" "${follower_machine_index:-}" "${follower_bpf_diagnostics}" <<'BASH_FOLLOWER_BPF_DIAGNOSTICS' >/dev/null 2>&1
+set +e
+manifest="$1"
+selected="$2"
+out="$3"
+bpftool_bin="$(command -v bpftool 2>/dev/null || true)"
+python3 - "${manifest}" "${selected}" >"${out}/runtime-pids.tsv" <<'PY_FOLLOWER_BPF_PIDS'
+import json, pathlib, sys
+manifest = pathlib.Path(sys.argv[1])
+selected_index = sys.argv[2]
+for node in json.loads(manifest.read_text()).get('nodes', []):
+    index = str(node.get('index', ''))
+    print('\t'.join((index, str(node.get('pid', '')), 'selected' if index == selected_index else 'other')))
+PY_FOLLOWER_BPF_PIDS
+while IFS=$'\t' read -r index pid role
+do
+    [[ "${index}" =~ ^[0-9]+$ && "${pid}" =~ ^[0-9]+$ ]] || continue
+    prefix="${out}/machine-${index}-${role}"
+    {
+        printf 'machineIndex=%s\nruntimePID=%s\nrole=%s\n' "${index}" "${pid}" "${role}"
+        [[ -d "/proc/${pid}" ]] || { printf 'runtimePresent=0\n'; continue; }
+        printf 'runtimePresent=1\n'
+        tr '\0' '\n' <"/proc/${pid}/environ" 2>/dev/null | \
+            grep -E '^PRODIGY_HOST_(INGRESS|EGRESS)_EBPF=' || true
+    } >"${prefix}.env.txt"
+    grep -F ' /sys/fs/bpf ' "/proc/${pid}/mountinfo" >"${prefix}.bpf-mountinfo.txt" 2>&1 || true
+    if [[ -z "${bpftool_bin}" ]]
+    then
+        printf 'bpftool unavailable on diagnostic host\n' >"${prefix}.bpftool-unavailable.txt"
+        continue
+    fi
+    timeout 5s nsenter -t "${pid}" -m -n -- "${bpftool_bin}" -j map show >"${prefix}.maps.json" 2>&1 || true
+    timeout 5s nsenter -t "${pid}" -m -n -- "${bpftool_bin}" -j prog show >"${prefix}.programs.json" 2>&1 || true
+    timeout 5s nsenter -t "${pid}" -m -n -- "${bpftool_bin}" -j link show >"${prefix}.links.json" 2>&1 || true
+    timeout 5s nsenter -t "${pid}" -m -n -- "${bpftool_bin}" -j net show >"${prefix}.net.json" 2>&1 || true
+    pin_root="/proc/${pid}/root/sys/fs/bpf"
+    pin_count=0
+    if [[ -d "${pin_root}" ]]
+    then
+        while IFS= read -r pin
+        do
+            pin_count=$((pin_count + 1))
+            [[ "${pin_count}" -le 128 ]] || break
+            relative="${pin#${pin_root}}"
+            safe_name="$(printf '%s' "${relative}" | tr '/ ' '__' | tr -cd '[:alnum:]_.-')"
+            [[ -n "${safe_name}" ]] || safe_name="root-${pin_count}"
+            timeout 3s nsenter -t "${pid}" -m -n -- "${bpftool_bin}" -j map show pinned "/sys/fs/bpf${relative}" \
+                >"${prefix}.pinned-map-${pin_count}-${safe_name}.json" 2>&1 || true
+        done < <(find "${pin_root}" -xdev -type f -print 2>/dev/null)
+    fi
+    printf 'pinnedMapMetadataAttempts=%s\n' "${pin_count}" >"${prefix}.pinned-maps.txt"
+done <"${out}/runtime-pids.tsv"
+BASH_FOLLOWER_BPF_DIAGNOSTICS
+      follower_bpf_diagnostic_status=$?
+      printf 'captureExitStatus=%s\n' "${follower_bpf_diagnostic_status}" >"${follower_bpf_diagnostics}/capture-status.txt"
+   fi
 
    if [[ "${cluster_created}" -eq 1 ]]
    then
@@ -231,6 +322,7 @@ initial_healthy=1
 initial_state=running
 recovered_state=running
 handoff_id=""
+fake_ipv4_boundary=false
 if [[ "${is_handoff}" == 1 ]]
 then
    # Match the retained release topology: one controller and three workers.
@@ -265,6 +357,12 @@ then
    is_stateful=true
    handoff_id="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
 fi
+if [[ "${test_mode}" == follower-retained ]]
+then
+   # The registered test-only routable prefix is the sole ingress endpoint for
+   # the retained-follower traffic observation; containers remain non-host-net.
+   fake_ipv4_boundary=true
+fi
 
 read -r -d '' CREATE_REQUEST <<EOF || true
 {
@@ -286,7 +384,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
     "storageDeviceCount": ${storage_devices},
     "storageDeviceMB": 1024,
     "brainBootstrapFamily": "ipv4",
-    "enableFakeIpv4Boundary": false
+    "enableFakeIpv4Boundary": ${fake_ipv4_boundary}
   }
 }
 EOF
@@ -370,6 +468,71 @@ then
       echo "FAIL: declared worker inventory did not become ready before initial deployment" >&2
       exit 1
    }
+fi
+
+follower_wormhole_address=""
+follower_wormhole_prefix_uuid=""
+follower_ingress_machine_index=""
+follower_ingress_machine_uuid=""
+if [[ "${test_mode}" == follower-retained ]]
+then
+   read -r follower_ingress_machine_index follower_ingress_machine_uuid <<EOF
+$(python3 - "${cluster_report_log}" "${manifest_path}" <<'PY_FOLLOWER_INGRESS_MACHINE'
+import json, pathlib, re, sys
+report, manifest = map(pathlib.Path, sys.argv[1:])
+nodes = json.loads(manifest.read_text())['nodes']
+by_address = {node['ipv4']: int(node['index']) for node in nodes}
+blocks = re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)', report.read_text())
+candidates = []
+for block in blocks:
+    identity = re.search(r'(?m)^[ \t]*identity uuid=(0x[0-9a-f]+) .*sshAddress=(\S+)', block)
+    lifecycle = re.search(r'(?m)^[ \t]*lifecycle .*currentMaster=(\d)\b', block)
+    assert identity and lifecycle and identity.group(2) in by_address, 'missing ready machine identity'
+    if lifecycle.group(1) == '0':
+        candidates.append((by_address[identity.group(2)], identity.group(1)))
+assert candidates, 'fixture has no nonmaster ingress machine'
+print(*min(candidates))
+PY_FOLLOWER_INGRESS_MACHINE
+)
+EOF
+   [[ "${follower_ingress_machine_index}" =~ ^[123]$ && "${follower_ingress_machine_uuid}" =~ ^0x[0-9a-fA-F]{1,32}$ ]] || {
+      archive_workspace=1
+      echo "FAIL: retained follower fixture could not bind a nonmaster ingress machine" >&2
+      exit 1
+   }
+   follower_wormhole_register_log="${tmpdir}/follower-wormhole-register.log"
+   follower_wormhole_request="$(printf '{"name":"retained-follower-%s","kind":"BGP","prefix":"198.18.0.1/32","usage":"wormholes","ingressScope":"singleMachine","machineUUID":"%s"}' "${handoff_id}" "${follower_ingress_machine_uuid}")"
+   if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      "${MOTHERSHIP_BIN}" registerRoutableSubnet "${cluster_name}" "${follower_wormhole_request}" \
+      >"${follower_wormhole_register_log}" 2>&1
+   then
+      archive_workspace=1
+      echo "FAIL: retained follower wormhole prefix registration failed" >&2
+      sed -n '1,160p' "${follower_wormhole_register_log}" >&2 || true
+      exit 1
+   fi
+   read -r follower_wormhole_prefix_uuid follower_wormhole_address <<EOF
+$(python3 - "${follower_wormhole_register_log}" <<'PY_FOLLOWER_WORMHOLE_PREFIX'
+import re, sys
+text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+uuid = re.search(r'\buuid=(0x[0-9a-fA-F]+|[0-9a-fA-F]+)', text)
+prefix = re.search(r'\bprefix=([^\s]+)', text)
+if not uuid or not prefix:
+    raise SystemExit(1)
+address = prefix.group(1).split('/', 1)[0]
+if address != '198.18.0.1':
+    raise SystemExit(1)
+print(uuid.group(1), address)
+PY_FOLLOWER_WORMHOLE_PREFIX
+)
+EOF
+   if [[ ! "${follower_wormhole_prefix_uuid}" =~ ^(0x)?[0-9a-fA-F]{1,32}$ || "${follower_wormhole_address}" != 198.18.0.1 ]]
+   then
+      archive_workspace=1
+      echo "FAIL: retained follower wormhole registration returned no exact test prefix" >&2
+      sed -n '1,160p' "${follower_wormhole_register_log}" >&2 || true
+      exit 1
+   fi
 fi
 
 artifact_project_dir="${tmpdir}/storage-artifact"
@@ -470,7 +633,7 @@ EOF
 
 # The typed plan admits exactly one topology owner. The handoff workload must
 # also stay at fixed resources rather than trigger the resize scenario.
-python3 - "${plan_json}" "${test_mode}" <<'PY'
+python3 - "${plan_json}" "${test_mode}" <<'PY_STORAGE_PLAN'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
@@ -481,7 +644,97 @@ else:
     plan.pop('stateful')
 with open(sys.argv[1], 'w') as stream:
     json.dump(plan, stream)
-PY
+PY_STORAGE_PLAN
+
+follower_traffic_application_name=""
+follower_traffic_application_id=""
+follower_traffic_version_id="${version_id}"
+follower_traffic_plan_json=""
+follower_traffic_blob=""
+if [[ "${test_mode}" == follower-retained ]]
+then
+   follower_traffic_application_name="RetainedFollowerTraffic"
+   follower_traffic_reserve_log="${tmpdir}/follower-traffic-reserve-application.log"
+   follower_traffic_reserve_request="$(printf '{"applicationName":"%s","createIfMissing":true}' "${follower_traffic_application_name}")"
+   if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+      "${MOTHERSHIP_BIN}" reserveApplicationID "${cluster_name}" "${follower_traffic_reserve_request}" >"${follower_traffic_reserve_log}" 2>&1
+   then
+      archive_workspace=1
+      echo "FAIL: retained follower traffic application reservation failed" >&2
+      sed -n '1,160p' "${follower_traffic_reserve_log}" >&2 || true
+      exit 1
+   fi
+   follower_traffic_application_id="$(rg -m1 -o 'appID=[1-9][0-9]*' "${follower_traffic_reserve_log}" | sed 's/appID=//')"
+   [[ "${follower_traffic_application_id}" =~ ^[1-9][0-9]*$ ]] || {
+      archive_workspace=1
+      echo "FAIL: retained follower traffic reservation omitted application ID" >&2
+      cat "${follower_traffic_reserve_log}" >&2 || true
+      exit 1
+   }
+   follower_traffic_artifact_dir="${tmpdir}/traffic-artifact"
+   follower_traffic_discombobulator_file="${follower_traffic_artifact_dir}/RetainedTraffic.DiscombobuFile"
+   follower_traffic_blob="${tmpdir}/retained-traffic.container.zst"
+   mkdir -p "${follower_traffic_artifact_dir}"
+   cat > "${follower_traffic_discombobulator_file}" <<EOF
+FROM scratch for ${target_arch}
+COPY {bin} ./$(basename "${PINGPONG_BIN}") /root/retained_traffic_container
+SURVIVE /root/retained_traffic_container
+EOF
+   prodigy_dev_write_common_prodigy_assets "${follower_traffic_discombobulator_file}"
+   cat >> "${follower_traffic_discombobulator_file}" <<'EOF_TRAFFIC_EXECUTE'
+EXECUTE ["/root/retained_traffic_container"]
+EOF_TRAFFIC_EXECUTE
+   if ! prodigy_dev_run_discombobulator_build \
+      "${follower_traffic_artifact_dir}" "${follower_traffic_discombobulator_file}" "${follower_traffic_blob}" \
+      "bin=$(dirname "${PINGPONG_BIN}")" "ebpf=$(dirname "${PRODIGY_BIN}")"
+   then
+      archive_workspace=1
+      echo "FAIL: unable to build retained follower stateless traffic artifact" >&2
+      exit 1
+   fi
+   follower_traffic_plan_json="${tmpdir}/retained-traffic.plan.json"
+   cat > "${follower_traffic_plan_json}" <<EOF
+{
+  "config": {
+    "type": "ApplicationType::stateless",
+    "applicationID": ${follower_traffic_application_id},
+    "versionID": ${follower_traffic_version_id},
+    "architecture": "${target_arch}",
+    "filesystemMB": 64,
+    "storageMB": 64,
+    "memoryMB": 256,
+    "nLogicalCores": 1,
+    "msTilHealthy": 2000,
+    "sTilHealthcheck": 3,
+    "sTilKillable": 30
+  },
+  "apiCredentials": {
+    "applicationID": ${follower_traffic_application_id},
+    "requiredCredentialNames": []
+  },
+  "useHostNetworkNamespace": false,
+  "minimumSubscriberCapacity": 1024,
+  "isStateful": false,
+  "stateless": {
+    "nBase": 1,
+    "maxPerRackRatio": 1.0,
+    "maxPerMachineRatio": 1.0,
+    "moveableDuringCompaction": true
+  },
+  "wormholes": [{
+    "name": "retained-ping",
+    "source": "registeredRoutablePrefix",
+    "routablePrefixUUID": "${follower_wormhole_prefix_uuid}",
+    "externalPort": 19090,
+    "containerPort": 19090,
+    "layer4": "TCP",
+    "isQuic": false
+  }],
+  "moveConstructively": true,
+  "requiresDatacenterUniqueTag": false
+}
+EOF
+fi
 
 if ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
    "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${plan_json}")" "${container_blob}" \
@@ -490,6 +743,16 @@ then
    archive_workspace=1
    echo "FAIL: storage deployment failed"
    sed -n '1,200p' "${deploy_log}" || true
+   exit 1
+fi
+
+if [[ "${test_mode}" == follower-retained ]] && ! env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+   "${MOTHERSHIP_BIN}" deploy "${cluster_name}" "$(cat "${follower_traffic_plan_json}")" "${follower_traffic_blob}" \
+   >"${tmpdir}/follower-traffic-deploy.log" 2>&1
+then
+   archive_workspace=1
+   echo "FAIL: retained follower stateless traffic deployment failed" >&2
+   sed -n '1,200p' "${tmpdir}/follower-traffic-deploy.log" >&2 || true
    exit 1
 fi
 
@@ -540,7 +803,8 @@ for block in re.split(r'(?m)^\s*versionID:\s*', text)[1:]:
     if int(block.splitlines()[0]) != wanted:
         continue
     def field(name):
-        match = re.search(r'(?m)^\s*' + name + r':\s*(\S+)', block)
+        # Stateless reports print isStateful and nTarget on the same line.
+        match = re.search(r'(?:^|\s)' + re.escape(name) + r':\s*(\S+)', block)
         return match[1] if match else None
     ready = (field('state') == 'DeploymentState::' + state and field('nDeployed') == str(count)
              and field('nHealthy') == str(healthy) and field('nCrashes') == '0'
@@ -572,6 +836,29 @@ then
    echo "FAIL: storage deployment never became healthy"
    sed -n '1,240p' "${application_log}" || true
    exit 1
+fi
+
+if [[ "${test_mode}" == follower-retained ]]
+then
+   follower_traffic_healthy=0
+   for _ in $(seq 1 120)
+   do
+      if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" "${follower_traffic_application_name}" \
+         >"${tmpdir}/follower-traffic-before-application.log" 2>&1 &&
+         report_version_ready "${tmpdir}/follower-traffic-before-application.log" "${follower_traffic_version_id}" 1 1 running
+      then
+         follower_traffic_healthy=1
+         break
+      fi
+      sleep 0.5
+   done
+   [[ "${follower_traffic_healthy}" == 1 ]] || {
+      archive_workspace=1
+      echo "FAIL: retained follower stateless traffic deployment never became healthy without crashes" >&2
+      sed -n '1,240p' "${tmpdir}/follower-traffic-before-application.log" >&2 || true
+      exit 1
+   }
 fi
 
 if [[ "${is_handoff}" == 1 ]]
@@ -655,10 +942,14 @@ for node in nodes:
             assert file.stat().st_uid == metadata.st_uid
             assert any(line.split()[4] == '/storage' for line in (child / 'mountinfo').read_text().splitlines())
         starttime = (child / 'stat').read_text().rsplit(') ',1)[1].split()[19]
+        parent_starttime = (parent / 'stat').read_text().rsplit(') ',1)[1].split()[19]
         records.append(dict(machineIndex=node['index'], parentPID=node['pid'], pid=int(pid), starttime=starttime, uuid=uuid,
                             device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid, storageRelativePath=str(storage_relative),
                             networkNamespace=str((child / 'ns/net').readlink()),
                             cgroup=(child / 'cgroup').read_text(),
+                            parentStarttime=parent_starttime,
+                            parentNetworkNamespace=str((parent / 'ns/net').readlink()),
+                            parentCgroup=(parent / 'cgroup').read_text(),
                             runtimeSHA256=observed_runtime,
                             bundleSHA256=observed_bundle if mode == 'follower-retained' else '',
                             applicationSHA256=expected_binary))
@@ -823,9 +1114,9 @@ PY_HANDOFF_WAIT
       exit 0
    fi
    if [[ "${test_mode}" == follower-retained ]]; then
-      # This is deliberately an initial mechanics/storage experiment. It does
-      # not claim uninterrupted traffic, a controller quorum history, or a
-      # production follower-replacement protocol.
+      # This is a bounded mechanics/storage experiment with finite endpoint and
+      # control-socket observations. It does not claim uninterrupted traffic or
+      # a production follower-replacement protocol.
       env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
          timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/follower-before-cluster.log" 2>&1
       follower_machine_index="$(python3 - "${tmpdir}/follower-before-cluster.log" "${tmpdir}/handoff-before.json" "${manifest_path}" <<'PY_FOLLOWER_SELECT'
@@ -856,13 +1147,252 @@ for block in blocks:
 assert candidates and masters == 1, 'fixture needs one master and an observed nonmaster replica'
 print(min(candidates))
 PY_FOLLOWER_SELECT
-)"
+      )"
       [[ "${follower_machine_index}" =~ ^[123]$ ]] || { echo "FAIL: could not select an observed nonmaster fixture replica" >&2; exit 1; }
+      [[ "${follower_machine_index}" == "${follower_ingress_machine_index}" ]] || {
+         archive_workspace=1
+         echo "FAIL: retained follower ingress machine became master before replacement" >&2
+         exit 1
+      }
+      follower_traffic_history="${tmpdir}/follower-traffic-history.jsonl"
+      follower_recovery_windows="${tmpdir}/follower-recovery-windows.jsonl"
+      follower_traffic_phase="${tmpdir}/follower-traffic-phase"
+      follower_traffic_stop="${tmpdir}/follower-traffic-stop"
+      follower_traffic_sampler_active="${tmpdir}/follower-traffic-sampler-active"
+      : > "${follower_traffic_history}"
+      : > "${follower_recovery_windows}"
+      printf 'baseline\n' > "${follower_traffic_phase}"
+      cat > "${tmpdir}/follower-wormhole-coverage.txt" <<EOF
+The 198.18.0.1:19090 probe enters through the registered single-machine
+Switchboard wormhole bound to retained follower ${follower_machine_index}. It
+proves selected-follower ingress and a routed ping/pong request to the separate
+stateless traffic deployment; that application's replica may be scheduled on a
+different fixture machine.
+EOF
+      follower_monotonic_ns()
+      {
+         python3 -c 'import time; print(time.monotonic_ns())'
+      }
+      record_follower_recovery_window()
+      {
+         python3 - "${follower_recovery_windows}" "$1" "$2" "$3" "$4" <<'PY_FOLLOWER_RECOVERY_WINDOW'
+import json, pathlib, sys
+path, name, start, end, status = sys.argv[1:]
+record = dict(name=name, startMonotonicNs=int(start), endMonotonicNs=int(end), exitStatus=int(status))
+with pathlib.Path(path).open('a', encoding='utf-8') as stream:
+    stream.write(json.dumps(record, sort_keys=True) + '\n')
+PY_FOLLOWER_RECOVERY_WINDOW
+      }
+      probe_follower_traffic()
+      {
+         local phase="$1" output="${tmpdir}/follower-traffic-probe-${BASHPID}.log" status start_ns end_ns
+         start_ns="$(follower_monotonic_ns)"
+         [[ "${follower_traffic_sampler_running:-0}" != 1 ]] || : > "${follower_traffic_sampler_active}"
+         set +e
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            timeout 4s "${MOTHERSHIP_BIN}" probeTestCluster "${cluster_name}" \
+            "${follower_wormhole_address}" 19090 ping pong 1500 0 >"${output}" 2>&1
+         status=$?
+         set -e
+         end_ns="$(follower_monotonic_ns)"
+         follower_traffic_last_ok="$(python3 - "${follower_traffic_history}" "${phase}" "${start_ns}" "${end_ns}" "${status}" "${output}" <<'PY_FOLLOWER_TRAFFIC_SAMPLE'
+import json, pathlib, re, sys
+history, phase, start, end, status, output = sys.argv[1:]
+text = pathlib.Path(output).read_text(encoding='utf-8', errors='replace')
+ok = int(status) == 0 and bool(re.search(r'^probeTestCluster success=1\b', text, re.M))
+if ok:
+    classification = 'success'
+elif re.search(r'TidesDB|registry|database.*(?:lock|busy)|(?:lock|busy).*database', text, re.I):
+    classification = 'control'
+else:
+    classification = 'probe'
+record = dict(phase=phase, startMonotonicNs=int(start), endMonotonicNs=int(end),
+              exitStatus=int(status), success=ok, classification=classification, response=text)
+with open(history, 'a', encoding='utf-8') as stream:
+    stream.write(json.dumps(record, sort_keys=True) + '\n')
+print(1 if ok else 0)
+PY_FOLLOWER_TRAFFIC_SAMPLE
+)"
+      }
+      for baseline_probe in $(seq 1 5)
+      do
+         probe_follower_traffic baseline
+         [[ "${follower_traffic_last_ok}" == 1 ]] || {
+            archive_workspace=1
+            echo "FAIL: retained follower baseline wormhole probe ${baseline_probe} failed" >&2
+            cat "${follower_traffic_history}" >&2 || true
+            exit 1
+         }
+      done
+      follower_traffic_loop_pid=""
+      start_follower_traffic_history()
+      {
+         rm -f "${follower_traffic_stop}" "${follower_traffic_sampler_active}"
+         (
+            follower_traffic_sampler_running=1
+            while [[ ! -e "${follower_traffic_stop}" ]]
+            do
+               local_phase="$(cat "${follower_traffic_phase}" 2>/dev/null || printf unknown)"
+               # The marker is written once the sampled interval has started;
+               # overlap is still proven below from measured intervals.
+               probe_follower_traffic "${local_phase}"
+               sleep 0.25
+            done
+         ) &
+         follower_traffic_loop_pid=$!
+         owned_background_pids+=("${follower_traffic_loop_pid}")
+      }
+      stop_follower_traffic_history()
+      {
+         [[ -n "${follower_traffic_loop_pid}" ]] || return 0
+         : > "${follower_traffic_stop}"
+         wait "${follower_traffic_loop_pid}" || true
+         filtered_background_pids=()
+         for background_pid in "${owned_background_pids[@]}"
+         do
+            [[ "${background_pid}" == "${follower_traffic_loop_pid}" ]] || filtered_background_pids+=("${background_pid}")
+         done
+         owned_background_pids=("${filtered_background_pids[@]}")
+         follower_traffic_loop_pid=""
+      }
+      follower_peer_observer_arguments=()
+      if [[ -n "${PRODIGY_STORAGE_HANDOFF_PEER_MEMORY_LAYOUT:-}" ]]; then
+         follower_peer_observer_arguments+=(--peer-memory-layout "${PRODIGY_STORAGE_HANDOFF_PEER_MEMORY_LAYOUT}")
+      fi
+      python3 -B "${SCRIPT_DIR}/prodigy_dev_retained_quorum_observer.py" "${follower_peer_observer_arguments[@]}" \
+         --phase before --manifest "${manifest_path}" \
+         --cluster-report "${tmpdir}/follower-before-cluster.log" \
+         --selected-index "${follower_machine_index}" --evidence-root "${tmpdir}"
+      start_follower_traffic_history
+      for _ in $(seq 1 80)
+      do
+         [[ -e "${follower_traffic_sampler_active}" ]] && break
+         sleep 0.05
+      done
+      [[ -e "${follower_traffic_sampler_active}" ]] || {
+         archive_workspace=1
+         echo "FAIL: retained follower traffic sampler did not begin a recovery probe" >&2
+         exit 1
+      }
+      observe_follower_fault_pause()
+      {
+         python3 - "${manifest_path}" "${tmpdir}/handoff-before.json" "${handoff_id}" \
+            "${follower_machine_index}" "${PINGPONG_BIN}" "${tmpdir}/follower-fault-pause-observation.json" <<'PY_FOLLOWER_FAULT_PAUSE'
+import hashlib, json, pathlib, sys
+manifest = pathlib.Path(sys.argv[1])
+before_path = pathlib.Path(sys.argv[2])
+identity = sys.argv[3]
+selected = int(sys.argv[4])
+executable = pathlib.Path(sys.argv[5])
+output = pathlib.Path(sys.argv[6])
+expected_binary = hashlib.sha256(executable.read_bytes()).hexdigest()
+before = json.loads(before_path.read_text())
+nodes = {int(node['index']): node for node in json.loads(manifest.read_text())['nodes']}
+assert len(before) == 3 and len(nodes) == 3 and {int(record['machineIndex']) for record in before} == {1, 2, 3}, \
+    'fault pause requires the original three-replica snapshot'
+observed = []
+for prior in before:
+    child = pathlib.Path('/proc') / str(prior['pid'])
+    assert child.exists(), 'original application process disappeared during coordinator fault pause'
+    assert (child / 'exe').readlink().name == 'pingpong_container'
+    assert hashlib.sha256((child / 'exe').read_bytes()).hexdigest() == expected_binary
+    starttime = (child / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
+    assert starttime == prior['starttime'], 'application PID was recycled during coordinator fault pause'
+    network_namespace = str((child / 'ns/net').readlink())
+    cgroup = (child / 'cgroup').read_text()
+    assert network_namespace == prior['networkNamespace'] and cgroup == prior['cgroup'], 'application namespace or cgroup changed during coordinator fault pause'
+    storage = child / 'root/storage'
+    metadata = storage.stat()
+    assert (metadata.st_dev, metadata.st_ino) == (prior['device'], prior['inode']), 'application storage owner changed during coordinator fault pause'
+    sparse = storage / 'kvdb/handoff-sparse'
+    with sparse.open('rb') as stream:
+        assert stream.read(32) == identity.encode(), 'application storage identity marker changed during coordinator fault pause'
+        stream.seek(1 << 40); assert stream.read(1) == b'M', 'application storage middle marker changed during coordinator fault pause'
+        stream.seek((1 << 41) - 1); assert stream.read(1) == b'Z', 'application storage tail marker changed during coordinator fault pause'
+    assert sparse.stat().st_size == 1 << 41 and sparse.stat().st_blocks * 512 < 1024 * 1024, 'application sparse storage changed during coordinator fault pause'
+    index = int(prior['machineIndex'])
+    if index != selected:
+        parent = pathlib.Path('/proc') / str(prior['parentPID'])
+        assert parent.exists(), 'unselected Brain process disappeared during coordinator fault pause'
+        parent_starttime = (parent / 'stat').read_text().rsplit(') ', 1)[1].split()[19]
+        assert parent_starttime == prior['parentStarttime']
+        assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == prior['runtimeSHA256']
+        assert str((parent / 'ns/net').readlink()) == prior['parentNetworkNamespace']
+        assert (parent / 'cgroup').read_text() == prior['parentCgroup']
+    observed.append(dict(machineIndex=index, pid=prior['pid'], starttime=starttime,
+                         device=metadata.st_dev, inode=metadata.st_ino,
+                         networkNamespace=network_namespace, cgroup=cgroup))
+output.write_text(json.dumps(observed, indent=2) + '\n')
+print('FOLLOWER_FAULT_PAUSE_PASS replicas=3 selectedMachine=' + str(selected))
+PY_FOLLOWER_FAULT_PAUSE
+      }
+      if [[ -n "${follower_fault_after_phase}" ]]
+      then
+         printf 'fault-command:%s\n' "${follower_fault_after_phase}" > "${follower_traffic_phase}"
+         follower_fault_start_ns="$(follower_monotonic_ns)"
+         set +e
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            "${MOTHERSHIP_BIN}" recoverTestClusterFollowerBrain "${cluster_name}" "${upgrade_bundle}" \
+            "${follower_machine_index}" "${old_bundle_sha}" "${follower_fault_after_phase}" \
+            >"${tmpdir}/follower-fault.log" 2>&1
+         follower_fault_status=$?
+         set -e
+         follower_fault_end_ns="$(follower_monotonic_ns)"
+         record_follower_recovery_window "fault-command:${follower_fault_after_phase}" "${follower_fault_start_ns}" "${follower_fault_end_ns}" "${follower_fault_status}"
+         [[ "${follower_fault_status}" == 86 ]] || {
+            echo "FAIL: follower recovery fault command exited ${follower_fault_status}, expected 86" >&2
+            sed -n '1,160p' "${tmpdir}/follower-fault.log" >&2 || true
+            exit 1
+         }
+         python3 - "${tmpdir}/follower-fault.log" "${tmpdir}/follower-fault-receipt.json" \
+            "${follower_machine_index}" "${follower_fault_after_phase}" <<'PY_FOLLOWER_FAULT_RECEIPT'
+import json, pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+line = next((line for line in text.splitlines() if line.startswith('recoverTestClusterFollowerBrain testFault=')), '')
+fields = dict(re.findall(r'(\w+)=([^\s]*)', line))
+assert fields.get('testFault') == '1' and fields.get('phase') == sys.argv[4], line
+assert fields.get('machineIndex') == sys.argv[3] and fields.get('before_exit') == '86', line
+assert re.fullmatch(r'0x[0-9a-f]{1,32}', fields.get('operationID', '')) and int(fields['operationID'], 16) != 0, line
+pathlib.Path(sys.argv[2]).write_text(json.dumps(dict(operationID=fields['operationID'], machineIndex=fields['machineIndex'], phase=fields['phase']), sort_keys=True) + '\n')
+print('FOLLOWER_FAULT_RECEIPT_PASS', fields['operationID'])
+PY_FOLLOWER_FAULT_RECEIPT
+         printf 'fault-pause:%s\n' "${follower_fault_after_phase}" > "${follower_traffic_phase}"
+         follower_pause_start_ns="$(follower_monotonic_ns)"
+         follower_pause_deadline=$((SECONDS + 3))
+         while (( SECONDS < follower_pause_deadline ))
+         do
+            # The existing sampler is the sole probe client; overlapping probe
+            # CLIs contend for the registry file lock before they send traffic.
+            sleep 0.05
+         done
+         follower_pause_end_ns="$(follower_monotonic_ns)"
+         record_follower_recovery_window "fault-pause:${follower_fault_after_phase}" "${follower_pause_start_ns}" "${follower_pause_end_ns}" 0
+         # Observe the still-running master before any replacement starts.
+         # Retained PIDs alone cannot prove that it still owns their plans.
+         follower_pause_control_socket="$(jq -er '.controlSocketPath | select(type == "string" and length > 0)' "${manifest_path}")"
+         env PRODIGY_MOTHERSHIP_SOCKET="${follower_pause_control_socket}" \
+            timeout 8s "${MOTHERSHIP_BIN}" clusterReport local >"${tmpdir}/follower-pause-cluster.log" 2>&1
+         env PRODIGY_MOTHERSHIP_SOCKET="${follower_pause_control_socket}" \
+            timeout 8s "${MOTHERSHIP_BIN}" applicationReport local Nametag >"${tmpdir}/follower-pause-application.log" 2>&1
+         observe_follower_fault_pause >"${tmpdir}/follower-fault-pause.log" 2>&1 || {
+            echo "FAIL: coordinator fault pause changed a retained application or unselected Brain owner" >&2
+            cat "${tmpdir}/follower-fault-pause.log" >&2 || true
+            exit 1
+         }
+      fi
       for retry in initial retry
       do
+         printf 'resume-%s\n' "${retry}" > "${follower_traffic_phase}"
+         follower_resume_start_ns="$(follower_monotonic_ns)"
+         set +e
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
             "${MOTHERSHIP_BIN}" recoverTestClusterFollowerBrain "${cluster_name}" "${upgrade_bundle}" \
             "${follower_machine_index}" "${old_bundle_sha}" >"${tmpdir}/follower-${retry}.log" 2>&1
+         follower_resume_status=$?
+         set -e
+         follower_resume_end_ns="$(follower_monotonic_ns)"
+         record_follower_recovery_window "resume-${retry}" "${follower_resume_start_ns}" "${follower_resume_end_ns}" "${follower_resume_status}"
+         [[ "${follower_resume_status}" == 0 ]] || exit "${follower_resume_status}"
          python3 - "${tmpdir}/follower-${retry}.log" "${tmpdir}/follower-initial-receipt.json" \
             "${follower_machine_index}" "${old_bundle_sha}" <<'PY_FOLLOWER_RECEIPT'
 import json, pathlib, re, sys
@@ -877,6 +1407,11 @@ assert re.fullmatch(r'0x[0-9a-f]{1,32}', fields.get('operationID', '')) and int(
 receipt = dict(operationID=fields['operationID'], machineIndex=fields['machineIndex'],
                sourceSHA256=fields['sourceSHA256'], successorSHA256=fields['successorSHA256'])
 path = pathlib.Path(sys.argv[2])
+fault_path = path.with_name('follower-fault-receipt.json')
+if fault_path.exists():
+    fault = json.loads(fault_path.read_text())
+    assert receipt['operationID'] == fault['operationID'] and receipt['machineIndex'] == fault['machineIndex'], \
+        'resume changed the durable faulted operation or selected member'
 if path.exists():
     assert json.loads(path.read_text()) == receipt, 'retry changed follower operation/member/target receipt'
 else:
@@ -913,24 +1448,87 @@ assert masters == 1, 'follower fixture does not report exactly one current maste
 print('FOLLOWER_FINAL_REPORT_PASS masters=1')
 PY_FOLLOWER_FINAL
       }
+      # Named reports refresh the registry, which would race the continuous
+      # provider probe's registry lookup. Observe through the exact socket
+      # published by this fixture's Mothership provider instead.
+      follower_control_socket="$(jq -er '.controlSocketPath | select(type == "string" and length > 0)' "${manifest_path}")"
+      [[ -S "${follower_control_socket}" ]] || { echo "FAIL: follower control socket is unavailable" >&2; exit 1; }
       final_ready=0
+      printf 'final-readiness\n' > "${follower_traffic_phase}"
+      follower_final_readiness_start_ns="$(follower_monotonic_ns)"
       follower_ready_deadline=$((SECONDS + 90))
       while (( SECONDS < follower_ready_deadline ))
       do
-         if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-               timeout 15s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/follower-after-cluster.log" 2>&1 &&
-            env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-               timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/follower-after-application.log" 2>&1 &&
+         if env PRODIGY_MOTHERSHIP_SOCKET="${follower_control_socket}" \
+               timeout 15s "${MOTHERSHIP_BIN}" clusterReport local >"${tmpdir}/follower-after-cluster.log" 2>&1 &&
+            env PRODIGY_MOTHERSHIP_SOCKET="${follower_control_socket}" \
+               timeout 8s "${MOTHERSHIP_BIN}" applicationReport local Nametag >"${tmpdir}/follower-after-application.log" 2>&1 &&
+            env PRODIGY_MOTHERSHIP_SOCKET="${follower_control_socket}" \
+               timeout 8s "${MOTHERSHIP_BIN}" applicationReport local "${follower_traffic_application_name}" >"${tmpdir}/follower-traffic-after-application.log" 2>&1 &&
             follower_final_cluster_ready &&
-            report_version_ready "${tmpdir}/follower-after-application.log" "${version_id}" 3 3 running
+            report_version_ready "${tmpdir}/follower-after-application.log" "${version_id}" 3 3 running &&
+            report_version_ready "${tmpdir}/follower-traffic-after-application.log" "${follower_traffic_version_id}" 1 1 running
          then
             final_ready=1
             break
          fi
          sleep 0.5
       done
-      [[ "${final_ready}" == 1 ]] || { echo "FAIL: follower fixture did not recover full three-Brain readiness with three non-crashing replicas" >&2; exit 1; }
-      echo "PASS: initial follower-retained mechanics/storage experiment selectedMachine=${follower_machine_index} replicas=3"
+      follower_final_readiness_end_ns="$(follower_monotonic_ns)"
+      if [[ "${final_ready}" == 1 ]]; then follower_final_readiness_status=0; else follower_final_readiness_status=1; fi
+      record_follower_recovery_window "final-readiness" "${follower_final_readiness_start_ns}" "${follower_final_readiness_end_ns}" "${follower_final_readiness_status}"
+      if [[ "${final_ready}" != 1 ]]; then
+         # Retain an independent control-pair observation even when the selected
+         # runtime or app is unavailable. It cannot turn this failed run green.
+         python3 -B "${SCRIPT_DIR}/prodigy_dev_retained_quorum_observer.py" "${follower_peer_observer_arguments[@]}" \
+            --phase after --manifest "${manifest_path}" \
+            --cluster-report "${tmpdir}/follower-after-cluster.log" \
+            --selected-index "${follower_machine_index}" --evidence-root "${tmpdir}" || true
+         echo "FAIL: follower fixture did not recover full three-Brain readiness with three non-crashing replicas" >&2
+         exit 1
+      fi
+      # Drain the concurrent recovery sampler before the bounded serial dwell.
+      stop_follower_traffic_history
+      printf 'after-ready\n' > "${follower_traffic_phase}"
+      for after_probe in $(seq 1 10)
+      do
+         probe_follower_traffic after-ready
+         [[ "${follower_traffic_last_ok}" == 1 ]] || {
+            archive_workspace=1
+            stop_follower_traffic_history
+            echo "FAIL: retained follower post-ready wormhole probe ${after_probe} failed" >&2
+            cat "${follower_traffic_history}" >&2 || true
+            exit 1
+         }
+         sleep 0.2
+      done
+      stop_follower_traffic_history
+      # Preserve independent surviving-peer evidence even if sampled traffic failed.
+      python3 -B "${SCRIPT_DIR}/prodigy_dev_retained_quorum_observer.py" "${follower_peer_observer_arguments[@]}" \
+         --phase after --manifest "${manifest_path}" \
+         --cluster-report "${tmpdir}/follower-after-cluster.log" \
+         --selected-index "${follower_machine_index}" --evidence-root "${tmpdir}"
+      python3 - "${follower_traffic_history}" "${follower_recovery_windows}" <<'PY_FOLLOWER_TRAFFIC_HISTORY'
+import json, pathlib, sys
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line]
+windows = [json.loads(line) for line in pathlib.Path(sys.argv[2]).read_text().splitlines() if line]
+assert len(records) >= 15, 'traffic history omitted required baseline or post-ready samples'
+assert sum(record['phase'] == 'baseline' and record['success'] for record in records) >= 5, 'traffic history lacks five successful baseline probes'
+assert sum(record['phase'] == 'after-ready' and record['success'] for record in records) >= 10, 'traffic history lacks ten successful post-ready probes'
+assert windows and all(window['endMonotonicNs'] >= window['startMonotonicNs'] for window in windows), 'recovery timing receipt is malformed'
+for window in windows:
+    window['overlappingProbes'] = sum(record['startMonotonicNs'] < window['endMonotonicNs'] and
+                                    record['endMonotonicNs'] > window['startMonotonicNs'] for record in records)
+    window['elapsedMs'] = (window['endMonotonicNs'] - window['startMonotonicNs']) / 1e6
+# A short idempotent RPC can fit between samples. Preserve its measured coverage
+# instead of claiming every command was observed by a concurrent request.
+assert any(window['overlappingProbes'] for window in windows if window['name'] != 'final-readiness'), \
+    'no measured traffic probe overlapped a recovery command'
+pathlib.Path(sys.argv[2]).with_name('follower-recovery-timing.json').write_text(json.dumps(windows, indent=2) + '\n')
+assert all(record['success'] for record in records), 'traffic history contains a failed control-plane or data-plane observation'
+print('FOLLOWER_TRAFFIC_HISTORY_PASS samples=' + str(len(records)))
+PY_FOLLOWER_TRAFFIC_HISTORY
+      echo "PASS: retained follower mechanics/storage experiment with finite zero-failure wormhole traffic history selectedMachine=${follower_machine_index} replicas=3"
       exit 0
    elif [[ "${test_mode}" == provider-handoff ]]; then
       for machine_index in 2 3 4 1; do

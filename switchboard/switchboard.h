@@ -1435,6 +1435,10 @@ private:
     if (!budget.available()) return false;
     const bool rings = kind == RuntimeMap::rings;
     const bool retiringPortals = kind == RuntimeMap::retiredPortals;
+    const char *mapName = kind == RuntimeMap::retiredPortals || kind == RuntimeMap::portals ? "ext_portals" :
+        kind == RuntimeMap::targets ? "wh_targets" :
+        kind == RuntimeMap::egress ? "wh_egress" :
+        kind == RuntimeMap::egress4 ? "wh_egress4" : "cid_rings";
     const size_t keySize = kind == RuntimeMap::targets ? sizeof(switchboard_wormhole_target_key) :
         kind == RuntimeMap::egress ? sizeof(switchboard_wormhole_egress_key) :
         kind == RuntimeMap::egress4 ? sizeof(switchboard_wormhole_egress4_key) :
@@ -1442,17 +1446,27 @@ private:
     const size_t valueSize = kind == RuntimeMap::targets ? sizeof(__u16) :
         kind == RuntimeMap::egress || kind == RuntimeMap::egress4 ? sizeof(switchboard_wormhole_egress_binding) :
         rings ? sizeof(uint32_t) : sizeof(portal_meta);
+    const __u32 expectedMapType = rings ? BPF_MAP_TYPE_ARRAY_OF_MAPS : BPF_MAP_TYPE_HASH;
     bool complete = false;
     auto reconcile = [&](int fd) {
       if (!budget.take()) return;
       bpf_map_info info = {};
       __u32 length = sizeof(info);
-      if (fd < 0 || bpf_map_get_info_by_fd(fd, &info, &length) != 0 || !info.id ||
-          info.key_size != keySize || info.value_size != valueSize ||
-          info.type != (rings ? BPF_MAP_TYPE_ARRAY_OF_MAPS : BPF_MAP_TYPE_HASH))
+      int infoResult = -1;
+      int infoErrno = 0;
+      if (fd >= 0)
       {
-        std::fprintf(stderr, "Switchboard routing map identity/schema failed ifidx=%u kind=%u fd=%d errno=%d\n",
-                   eth.ifidx, unsigned(kind), fd, errno);
+        infoResult = bpf_map_get_info_by_fd(fd, &info, &length);
+        if (infoResult != 0) infoErrno = errno;
+      }
+      const bool schemaMatches = info.id != 0 && info.key_size == keySize && info.value_size == valueSize &&
+                                 info.type == expectedMapType;
+      if (fd < 0 || infoResult != 0 || schemaMatches == false)
+      {
+        std::fprintf(stderr,
+                     "Switchboard routing map identity/schema failed ifidx=%u map=%s expectedKind=%u fd=%d getInfoResult=%d getInfoErrno=%d mapID=%u mapType=%u mapKeySize=%u mapValueSize=%u expectedType=%u expectedKeySize=%u expectedValueSize=%u\n",
+                     eth.ifidx, mapName, unsigned(kind), fd, infoResult, infoErrno, info.id, info.type,
+                     info.key_size, info.value_size, expectedMapType, unsigned(keySize), unsigned(valueSize));
         runtimeRoutingFailed = true;
         return;
       }

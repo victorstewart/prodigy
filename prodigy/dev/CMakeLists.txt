@@ -600,6 +600,8 @@ add_executable(prodigy_container_overlay_sync_unit ${CMAKE_CURRENT_SOURCE_DIR}/t
 add_executable(prodigy_container_device_map_transaction_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_device_map_transaction_unit.cpp)
 add_executable(prodigy_brain_overlay_hosted_ingress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_overlay_hosted_ingress_unit.cpp)
 add_executable(prodigy_switchboard_whitehole_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_whitehole_unit.cpp)
+# Explicit guest-only kernel target; it is not registered in ordinary CTest.
+add_executable(prodigy_switchboard_host_tcx_retention_unit EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_switchboard_host_tcx_retention_unit.cpp)
 add_executable(prodigy_quic_cid_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_quic_cid_unit.cpp)
 add_executable(prodigy_cluster_bootstrap_concurrency_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_bootstrap_concurrency_unit.cpp)
 add_executable(prodigy_brain_reachability_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_reachability_unit.cpp)
@@ -710,6 +712,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_container_device_map_transaction_unit
    prodigy_brain_overlay_hosted_ingress_unit
    prodigy_switchboard_whitehole_unit
+   prodigy_switchboard_host_tcx_retention_unit
    prodigy_quic_cid_unit
    prodigy_cluster_bootstrap_concurrency_unit
    prodigy_brain_reachability_unit
@@ -2387,6 +2390,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    add_test(NAME prodigy_retained_container_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_container_recovery_unit)
    add_test(NAME prodigy_mothership_retained_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_retained_recovery_unit)
+   add_test(NAME prodigy_retained_quorum_observer_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_retained_quorum_observer_unit.py)
    add_test(NAME prodigy_container_retirement_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_retirement_unit)
    add_test(NAME prodigy_stateful_serving_authority_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_stateful_serving_authority_unit)
    add_test(NAME prodigy_stateful_serving_authority_replication_unit

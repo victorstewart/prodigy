@@ -3,10 +3,10 @@ set -Eeuo pipefail
 
 enter_machine()
 {
-   [[ "$#" -eq 12 || "$#" -eq 13 ]]
+   [[ "$#" -eq 13 || "$#" -eq 14 ]]
    local machine_cgroup="$1"
    shift
-   if [[ "$#" -eq 12 ]]
+   if [[ "$#" -eq 13 ]]
    then
       local retained_cgroup_fd="$1"
       shift
@@ -19,7 +19,7 @@ enter_machine()
 }
 run_machine()
 {
-   [[ "$#" -eq 11 ]]
+   [[ "$#" -eq 12 ]]
    local workspace="$1"
    local machine_root="$2"
    local containers_root="$3"
@@ -31,6 +31,11 @@ run_machine()
    local host_netns_inode="$9"
    local brain_count="${10}"
    local fake_ingress="${11}"
+   local machine_bpffs="${12}"
+
+   [[ "${machine_bpffs}" == /mnt/prodigy-vdc-*/machine-bpffs/machine* && -d "${machine_bpffs}" && ! -L "${machine_bpffs}" ]]
+   mountpoint -q "${machine_bpffs}"
+   [[ "$(findmnt -n -o FSTYPE -T "${machine_bpffs}")" == "bpf" ]]
 
    mkdir -p /mnt/prodigy-vdc-workspace /containers /root /sys/fs/cgroup /sys/fs/bpf /var/log/prodigy "${machine_root}/var/log/prodigy"
    mount --bind "${workspace}" /mnt/prodigy-vdc-workspace
@@ -60,6 +65,7 @@ run_machine()
       "PRODIGY_BOOTSTRAP_BRAIN_COUNT=${brain_count}"
       "PRODIGY_CRASH_REPORT_PATH=/root/prodigy-crashreport.txt"
       "PRODIGY_STATE_DB=/containers/prodigy.state"
+      "PRODIGY_VDC_MACHINE_BPFFS=${machine_bpffs}"
    )
    if [[ "${PRODIGY_DEV_CANCEL_TEST_DIR:-}" == "/mnt/prodigy-vdc-workspace/cancel-deployment-test" ]]
    then
@@ -82,7 +88,10 @@ run_machine()
       mkdir -p /sys/fs/cgroup/prodigy-runtime
       printf "%s\n" "$$" > /sys/fs/cgroup/prodigy-runtime/cgroup.procs
       umount /sys/fs/bpf >/dev/null 2>&1 || true
-      mount -t bpf bpf /sys/fs/bpf
+      [[ -d "${PRODIGY_VDC_MACHINE_BPFFS}" && ! -L "${PRODIGY_VDC_MACHINE_BPFFS}" ]]
+      mountpoint -q "${PRODIGY_VDC_MACHINE_BPFFS}"
+      [[ "$(findmnt -n -o FSTYPE -T "${PRODIGY_VDC_MACHINE_BPFFS}")" == "bpf" ]]
+      mount --bind "${PRODIGY_VDC_MACHINE_BPFFS}" /sys/fs/bpf
       exec "$@"
    ' _ /root/prodigy/prodigy --isolated --netdev=bond0 "--boot-json=${boot_json}" "--transport-tls-json-path=${transport_tls_path}"
 }
@@ -730,7 +739,7 @@ then
    exit 2
 fi
 
-required=(btrfs find flock install ip mkfs.btrfs mount mountpoint mv python3 realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
+required=(btrfs find findmnt flock install ip mkfs.btrfs mount mountpoint mv python3 realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
 [[ "${storage_device_count}" -eq 0 ]] || required+=(mkfs.ext4)
 if [[ "${fake_boundary}" == "1" ]]
 then
@@ -764,6 +773,7 @@ public_ingress_mtu=1500
 parent_ns="pvd-p-${runtime_identity}"
 filesystem_root="/mnt/prodigy-vdc-${runtime_identity}"
 filesystem_image="${workspace}/virtual-datacenter.btrfs"
+machine_bpffs_root="${filesystem_root}/machine-bpffs"
 cgroup_scope=""
 cgroup_control=""
 cgroup_lock=""
@@ -801,6 +811,23 @@ atomic_write()
    shift
    printf '%b' "$*" > "${temporary}"
    mv -f "${temporary}" "${path}"
+}
+
+machine_bpffs_path()
+{
+   local index="$1"
+   [[ "${index}" =~ ^[1-9][0-9]*$ && "${index}" -le "${machine_count}" ]]
+   printf '%s/machine%s\n' "${machine_bpffs_root}" "${index}"
+}
+
+valid_machine_bpffs()
+{
+   local index="$1"
+   local path=""
+   path="$(machine_bpffs_path "${index}")" || return 1
+   [[ "${path}" == "${machine_bpffs_root}/machine${index}" && -d "${path}" && ! -L "${path}" ]] || return 1
+   mountpoint -q "${path}" || return 1
+   [[ "$(findmnt -n -o FSTYPE -T "${path}")" == "bpf" ]]
 }
 
 cleanup()
@@ -865,6 +892,11 @@ cleanup()
    do
       mountpoint -q "${storage_mount}" && umount "${storage_mount}" >/dev/null 2>&1 || true
    done
+   for index in $(seq "${machine_count}" -1 1)
+   do
+      machine_bpffs="$(machine_bpffs_path "${index}")" || continue
+      mountpoint -q "${machine_bpffs}" && umount "${machine_bpffs}" >/dev/null 2>&1 || true
+   done
    mountpoint -q "${filesystem_root}" && umount "${filesystem_root}" >/dev/null 2>&1 || true
    rm -rf "${filesystem_root}" >/dev/null 2>&1 || true
    rm -f "${filesystem_image}" "${workspace}"/machine*.storage*.ext4 >/dev/null 2>&1 || true
@@ -904,7 +936,7 @@ machine_storage_bytes=$(( machine_storage_mb * 1048576 ))
 truncate -s "${filesystem_size_bytes}" "${filesystem_image}"
 mkfs.btrfs -f "${filesystem_image}" >/dev/null
 mount -o loop "${filesystem_image}" "${filesystem_root}"
-mkdir -p "${filesystem_root}/machines"
+mkdir -p "${filesystem_root}/machines" "${machine_bpffs_root}"
 btrfs quota enable "${filesystem_root}"
 
 prepare_cgroup_scope
@@ -919,6 +951,10 @@ do
    mkdir -p "${cgroup_root}/machine${index}" "${workspace}/machines/${index}/root"
    btrfs subvolume create "${filesystem_root}/machines/${index}" >/dev/null
    btrfs qgroup limit "${machine_storage_bytes}" "${filesystem_root}/machines/${index}"
+   machine_bpffs="$(machine_bpffs_path "${index}")"
+   mkdir -m 0700 "${machine_bpffs}"
+   mount -t bpf bpf "${machine_bpffs}"
+   valid_machine_bpffs "${index}"
    storage_root="${filesystem_root}/storage/${index}"
    mkdir -p "${storage_root}"
    for device in $(seq 1 "${storage_device_count}")
@@ -1073,15 +1109,17 @@ start_machine()
    local transport_tls_path="${workspace}/transport-tls/${index}.json"
    local log_path="${workspace}/machine${index}.log"
    local fake_ingress=""
+   local machine_bpffs="$(machine_bpffs_path "${index}")"
    [[ "${fake_boundary}" != "1" ]] || fake_ingress="/root/prodigy/host.ingress.router.dev.ebpf.o"
    [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" && -r "${transport_tls_path}" ]]
+   valid_machine_bpffs "${index}"
 
    local -a enter_arguments=( "${machine_cgroup}" )
    if [[ "${index}" -eq "${recovering_machine}" && -n "${PRODIGY_VDC_RECOVERY_CGROUP_FD:-}" ]]
    then
       enter_arguments+=( "${PRODIGY_VDC_RECOVERY_CGROUP_FD}" )
    fi
-   enter_arguments+=( "${workspace}" "${machine_root}" "${containers_root}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${transport_tls_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" )
+   enter_arguments+=( "${workspace}" "${machine_root}" "${containers_root}" "${storage_root}" "${storage_device_count}" "${child_ns}" "${boot_path}" "${transport_tls_path}" "${host_netns_inode}" "${brain_count}" "${fake_ingress}" "${machine_bpffs}" )
    setsid bash "$0" --enter-machine "${enter_arguments[@]}" \
       > >(bash "$0" --bounded-log "${log_path}" 2 67108864 4194304) 2>&1 &
    machine_pids[$((index - 1))]="$!"
@@ -1259,6 +1297,10 @@ else
    do
       child_names+=("pvd-m${index}-${runtime_identity}")
       [[ -d "${cgroup_root}/machine${index}" && -d "${filesystem_root}/machines/${index}" ]] || failed 1 "$LINENO"
+      # The adoption process enters the original provider mount namespace. A
+      # machine's bpffs is a host resource in that namespace, never a worker
+      # process resource; do not publish an adopter that would create new maps.
+      valid_machine_bpffs "${index}" || failed 1 "$LINENO"
       for device in $(seq 1 "${storage_device_count}")
       do
          storage_mounts+=("${filesystem_root}/storage/${index}/${device}")
