@@ -910,9 +910,29 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
       BitseryEngine::deserializeSafe(v5PackageBytes, v5Decoded) &&
           v5Decoded.runtimeState.generation == v5Package.runtimeState.generation &&
           v5Decoded.runtimeState.materializedStatefulRecoveryRetries.empty() &&
+          v5Decoded.runtimeState.deploymentPlacementPolicies.empty() &&
           v5Decoded.containerRuntimeStates.size() == 1 &&
           equalSerializedObjects(v5Decoded.containerRuntimeStates[0], v5Runtime),
       "persistent_master_authority_package_roundtrips_v5_container_state_with_empty_retry_tail");
+
+  ProdigyDeploymentPlacementPolicy placement = {};
+  placement.applicationID = 0x7101;
+  placement.versionID = 9;
+  placement.operationID.assign("00000000-0000-4000-8000-000000000009"_ctv);
+  placement.eligibleMachineUUIDs.push_back(uint128_t(0x101));
+  placement.eligibleMachineUUIDs.push_back(uint128_t(0x202));
+  suite.expect(prodigyDeploymentPlacementPolicyValid(placement),
+               "deployment_placement_policy_accepts_canonical_sorted_record");
+  v5Package.runtimeState.deploymentPlacementPolicies.push_back(placement);
+  String v6PackageBytes = {};
+  BitseryEngine::serialize(v6PackageBytes, v5Package);
+  ProdigyPersistentMasterAuthorityPackage v6Decoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(v6PackageBytes, v6Decoded) &&
+                   v6Decoded.runtimeState.deploymentPlacementPolicies.size() == 1 &&
+                   prodigyDeploymentPlacementPolicyValid(v6Decoded.runtimeState.deploymentPlacementPolicies[0]) &&
+                   v6Decoded.runtimeState.deploymentPlacementPolicies[0].operationID.equals(placement.operationID) &&
+                   v6Decoded.containerRuntimeStates.size() == 1,
+               "persistent_master_authority_package_roundtrips_v6_placement_policy");
 
   String truncated = bothBytes;
   truncated.resize(8);
@@ -921,7 +941,7 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                "master_authority_runtime_state_rejects_truncated_version_marker");
 
   String unknownVersion = bothBytes;
-  uint64_t unsupportedVersion = 5;
+  uint64_t unsupportedVersion = 7;
   memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,

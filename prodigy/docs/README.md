@@ -15,7 +15,7 @@ Use this index to choose a task. The root [README](../../README.md) is the produ
 
 ## Run clusters
 
-- [Private machines](run-clusters/private-machines.md), [cloud](run-clusters/cloud.md), [inspect and update](run-clusters/inspect-and-update.md), and [remove a cluster](run-clusters/remove-cluster.md).
+- [Private machines](run-clusters/private-machines.md), [cloud](run-clusters/cloud.md), [inspect and update](run-clusters/inspect-and-update.md), [release compatibility and live relocation](run-clusters/upgrade-and-relocation.md), and [remove a cluster](run-clusters/remove-cluster.md).
 - [Runtime and operations](runtime.md), [cloud runbooks](runbooks/), and [security](security.md): canonical operating constraints.
 - [DNS and TLS](dns-providers.md): configure names, certificate issuance, and provider credentials.
 

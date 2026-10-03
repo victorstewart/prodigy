@@ -43,6 +43,82 @@ static void serialize(S&& serializer, MothershipProdigyClusterRecordV3& record)
   serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
 }
 
+class MothershipUpgradeRejectedObservation {
+public:
+  uint64_t receiptVersion = 0;
+  String reportSHA256 = {};
+  String plannerInputSHA256 = {};
+  String firstStopGate = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipUpgradeRejectedObservation& observation)
+{
+  serializer.value8b(observation.receiptVersion);
+  serializer.text1b(observation.reportSHA256, UINT32_MAX);
+  serializer.text1b(observation.plannerInputSHA256, UINT32_MAX);
+  serializer.text1b(observation.firstStopGate, UINT32_MAX);
+}
+
+// Version three adds a semantic, generation-fenced observation binding.  The
+// report receipt itself changes on each request, so it remains audit data rather
+// than the authorization identity consumed by updateProdigy.
+class MothershipUpgradeAdmissionRecord {
+public:
+  uint32_t version = 3;
+  uint128_t clusterUUID = 0;
+  uint128_t operationID = 0;
+  // These approved identities never change for a cluster/operation key.
+  String sourceBundleSHA256 = {};
+  String sourceContractSHA256 = {};
+  String sourceReleaseID = {};
+  String sourceProdigySHA256 = {};
+  String sourceMothershipSHA256 = {};
+  String targetBundleSHA256 = {};
+  String targetContractSHA256 = {};
+  // Semantic binding is stable across a fresh report only while authority and
+  // all authenticated peer observations remain equivalent.
+  uint64_t authorityGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  String semanticObservationSHA256 = {};
+  uint8_t approvedPath = 0;
+  // Observation receipt data is deliberately separate from the immutable
+  // request identity, so a fresh retry can replace a rejected observation.
+  uint64_t observationReceiptVersion = 0;
+  String observationReportSHA256 = {};
+  String plannerInputSHA256 = {};
+  bool eligible = false;
+  String firstStopGate = {};
+  Vector<MothershipUpgradeRejectedObservation> rejectedObservations = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
+{
+  serializer.value4b(record.version);
+  serializer.value16b(record.clusterUUID);
+  serializer.value16b(record.operationID);
+  serializer.text1b(record.sourceBundleSHA256, UINT32_MAX);
+  serializer.text1b(record.sourceContractSHA256, UINT32_MAX);
+  serializer.text1b(record.sourceReleaseID, UINT32_MAX);
+  serializer.text1b(record.sourceProdigySHA256, UINT32_MAX);
+  serializer.text1b(record.sourceMothershipSHA256, UINT32_MAX);
+  serializer.text1b(record.targetBundleSHA256, UINT32_MAX);
+  serializer.text1b(record.targetContractSHA256, UINT32_MAX);
+  serializer.value8b(record.authorityGeneration);
+  serializer.value16b(record.masterUUID);
+  serializer.value8b(record.masterBootNs);
+  serializer.text1b(record.semanticObservationSHA256, UINT32_MAX);
+  serializer.value1b(record.approvedPath);
+  serializer.value8b(record.observationReceiptVersion);
+  serializer.text1b(record.observationReportSHA256, UINT32_MAX);
+  serializer.text1b(record.plannerInputSHA256, UINT32_MAX);
+  serializer.value1b(record.eligible);
+  serializer.text1b(record.firstStopGate, UINT32_MAX);
+  serializer.object(record.rejectedObservations);
+}
+
 class MothershipClusterRegistry {
 private:
 
@@ -50,6 +126,7 @@ private:
 
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
+  constexpr static auto upgradeAdmissionsColumnFamily = "upgrade_admissions"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -278,6 +355,78 @@ private:
   static void renderClusterUUIDKey(uint128_t clusterUUID, String& key)
   {
     key.assignItoh(clusterUUID);
+  }
+
+  bool allocateTestDatacenterFragment(MothershipProdigyCluster& cluster, bool preserveExisting, String *failure = nullptr)
+  {
+    if (mothershipClusterUsesVirtualDatacenter(cluster) == false)
+    {
+      return true;
+    }
+
+    bool used[256] = {};
+    Vector<String> serializedClusters = {};
+    if (db.listValues(clustersColumnFamily, serializedClusters, failure) == false)
+    {
+      return false;
+    }
+
+    for (const String& serialized : serializedClusters)
+    {
+      MothershipProdigyCluster existing = {};
+      if (deserializeClusterValue(reinterpret_cast<const uint8_t *>(serialized.data()), serialized.size(), existing) == false)
+      {
+        if (failure) failure->assign("cluster record decode failed while allocating test datacenter fragment"_ctv);
+        return false;
+      }
+      if (mothershipClusterUsesVirtualDatacenter(existing) == false)
+      {
+        continue;
+      }
+      if (existing.clusterUUID == cluster.clusterUUID) continue;
+      const String& existingRoot = existing.test.workspaceRoot;
+      const String& requestedRoot = cluster.test.workspaceRoot;
+      const auto containsWorkspace = [](const String& parent, const String& child) {
+        return child.size() > parent.size() && child[parent.size()] == '/' &&
+               std::memcmp(parent.data(), child.data(), parent.size()) == 0;
+      };
+      if (existingRoot == requestedRoot || containsWorkspace(existingRoot, requestedRoot) ||
+          containsWorkspace(requestedRoot, existingRoot))
+      {
+        if (failure) failure->assign("test workspace overlaps another cluster"_ctv);
+        return false;
+      }
+      used[existing.datacenterFragment] = true;
+      if (cluster.test.enableFakeIpv4Boundary || existing.test.enableFakeIpv4Boundary)
+      {
+        if (failure) failure->assign("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv);
+        return false;
+      }
+    }
+
+    if (preserveExisting)
+    {
+      if (cluster.datacenterFragment == 0 || used[cluster.datacenterFragment])
+      {
+        if (failure) failure->assign("existing test datacenter fragment is invalid or conflicts"_ctv);
+        return false;
+      }
+      if (failure) failure->clear();
+      return true;
+    }
+
+    for (uint16_t candidate = 1; candidate <= UINT8_MAX; ++candidate)
+    {
+      if (used[candidate] == false)
+      {
+        cluster.datacenterFragment = uint8_t(candidate);
+        if (failure) failure->clear();
+        return true;
+      }
+    }
+
+    if (failure) failure->assign("test datacenter fragment capacity exhausted"_ctv);
+    return false;
   }
 
   static uint32_t implicitBrainMachineCapacity(const MothershipProdigyCluster& cluster)
@@ -2008,6 +2157,118 @@ public:
     return db.path();
   }
 
+  static bool upgradeAdmissionRequestIdentityMatches(const MothershipUpgradeAdmissionRecord& lhs,
+                                                     const MothershipUpgradeAdmissionRecord& rhs)
+  {
+    return lhs.version == 3 && rhs.version == 3 && lhs.clusterUUID == rhs.clusterUUID &&
+           lhs.operationID == rhs.operationID && lhs.sourceBundleSHA256 == rhs.sourceBundleSHA256 &&
+           lhs.sourceContractSHA256 == rhs.sourceContractSHA256 && lhs.sourceReleaseID == rhs.sourceReleaseID &&
+           lhs.sourceProdigySHA256 == rhs.sourceProdigySHA256 && lhs.sourceMothershipSHA256 == rhs.sourceMothershipSHA256 &&
+           lhs.targetBundleSHA256 == rhs.targetBundleSHA256 && lhs.targetContractSHA256 == rhs.targetContractSHA256;
+  }
+
+  bool recordUpgradeAdmission(const MothershipUpgradeAdmissionRecord& requested,
+                              MothershipUpgradeAdmissionRecord& recorded,
+                              bool& resumed,
+                              String *failure = nullptr)
+  {
+    resumed = false;
+    recorded = {};
+    if (requested.version != 3 || requested.clusterUUID == 0 || requested.operationID == 0 ||
+        requested.authorityGeneration == 0 || requested.masterUUID == 0 || requested.masterBootNs <= 0 ||
+        requested.observationReceiptVersion == 0 || requested.sourceReleaseID.empty() ||
+        !prodigyIsSHA256HexDigest(requested.sourceBundleSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.sourceContractSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.sourceProdigySHA256) ||
+        !prodigyIsSHA256HexDigest(requested.sourceMothershipSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.targetBundleSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.targetContractSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.semanticObservationSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.observationReportSHA256) ||
+        !prodigyIsSHA256HexDigest(requested.plannerInputSHA256) ||
+        requested.approvedPath > 3 || (requested.eligible && requested.approvedPath == 0))
+    {
+      if (failure) failure->assign("upgrade admission record is invalid"_ctv);
+      return false;
+    }
+    String clusterKey = {}; clusterKey.assignItoh(requested.clusterUUID);
+    String operationKey = {}; operationKey.assignItoh(requested.operationID);
+    String key = {}; key.append(clusterKey); key.append('/'); key.append(operationKey);
+    String encoded = {}, readFailure = {};
+    if (db.read(upgradeAdmissionsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !upgradeAdmissionRequestIdentityMatches(recorded, requested))
+      {
+        if (failure) failure->assign("upgrade admission operation identity conflicts with existing immutable record"_ctv);
+        return false;
+      }
+      if (recorded.observationReceiptVersion == requested.observationReceiptVersion &&
+          recorded.observationReportSHA256 == requested.observationReportSHA256 &&
+          recorded.plannerInputSHA256 == requested.plannerInputSHA256)
+      {
+        resumed = true;
+        if (failure) failure->clear();
+        return true;
+      }
+      MothershipUpgradeAdmissionRecord replacement = requested;
+      replacement.rejectedObservations = recorded.rejectedObservations;
+      if (!recorded.eligible)
+      {
+        MothershipUpgradeRejectedObservation prior = {};
+        prior.receiptVersion = recorded.observationReceiptVersion;
+        prior.reportSHA256 = recorded.observationReportSHA256;
+        prior.plannerInputSHA256 = recorded.plannerInputSHA256;
+        prior.firstStopGate = recorded.firstStopGate;
+        replacement.rejectedObservations.push_back(std::move(prior));
+        constexpr size_t maximumRejectedObservations = 16;
+        if (replacement.rejectedObservations.size() > maximumRejectedObservations)
+          replacement.rejectedObservations.erase(replacement.rejectedObservations.begin());
+      }
+      BitseryEngine::serialize(encoded, replacement);
+      if (!db.write(upgradeAdmissionsColumnFamily, key, encoded, failure)) return false;
+      recorded = std::move(replacement);
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv))
+    {
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    BitseryEngine::serialize(encoded, requested);
+    if (!db.write(upgradeAdmissionsColumnFamily, key, encoded, failure)) return false;
+    recorded = requested;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadUpgradeAdmission(uint128_t clusterUUID,
+                            uint128_t operationID,
+                            MothershipUpgradeAdmissionRecord& record,
+                            String *failure = nullptr)
+  {
+    record = {};
+    if (clusterUUID == 0 || operationID == 0)
+    {
+      if (failure) failure->assign("upgrade admission cluster and operation IDs are required"_ctv);
+      return false;
+    }
+    String clusterKey = {}, operationKey = {}, key = {}, encoded = {};
+    clusterKey.assignItoh(clusterUUID); operationKey.assignItoh(operationID);
+    key.append(clusterKey); key.append('/'); key.append(operationKey);
+    if (!db.read(upgradeAdmissionsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) || record.version != 3 ||
+        record.clusterUUID != clusterUUID || record.operationID != operationID)
+    {
+      record = {};
+      if (failure) failure->assign("upgrade admission record is stale or predates semantic binding; re-plan with a new operation ID"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool clusterExists(const String& name, bool& exists, String *failure = nullptr)
   {
     exists = false;
@@ -2154,12 +2415,30 @@ public:
 
     if (hadExistingCluster && mothershipClusterUsesVirtualDatacenter(stored))
     {
+      // Existing callers carry a synthesized control path.  Validate the rest
+      // of the update normally, then regenerate this derived field below.
       stored.controls.clear();
     }
 
     if (validateClusterForUpsert(stored, stored, failure) == false)
     {
       return false;
+    }
+
+    if (mothershipClusterUsesVirtualDatacenter(stored))
+    {
+      if (hadExistingCluster)
+      {
+        stored.datacenterFragment = existingCluster.datacenterFragment;
+      }
+      if (allocateTestDatacenterFragment(stored, hadExistingCluster, failure) == false)
+      {
+        return false;
+      }
+      // Fragment allocation follows ordinary configuration validation.  It
+      // changes the derived control socket domain, so regenerate controls only
+      // after the final fragment is known.
+      mothershipResolveTestClusterControlRecord(stored.controls, stored);
     }
 
     if (hadExistingCluster && existingCluster.clusterUUID != 0 && stored.clusterUUID != existingCluster.clusterUUID)

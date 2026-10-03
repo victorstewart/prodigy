@@ -42,6 +42,16 @@ public:
   bool connected = false;
   bool hadSuccessfulConnection = false;
   bool artifactCapabilityPending = false;
+  // The peer supplied this only with the registration for ioGeneration, and
+  // Brain retained it only after its ArtifactIO worker proved it equals the
+  // locally measured installed bundle.  It is an active-control-stream
+  // observation, not durable identity or binary attestation.
+  String verifiedInstalledBundleSHA256 = {};
+  uint64_t verifiedInstalledBundleIOGeneration = 0;
+  uint64_t verifiedInstalledBundleAuthorityEpoch = 0;
+  // Monotonically fences asynchronous local-digest checks for repeated
+  // registration frames on one still-live transport generation.
+  uint64_t artifactCapabilityValidationGeneration = 0;
 
   void reset(void) override
   {
@@ -50,6 +60,13 @@ public:
     connected = false;
     hadSuccessfulConnection = false;
     artifactCapabilityPending = false;
+    verifiedInstalledBundleSHA256.clear();
+    verifiedInstalledBundleIOGeneration = 0;
+    verifiedInstalledBundleAuthorityEpoch = 0;
+    if (++artifactCapabilityValidationGeneration == 0)
+    {
+      ++artifactCapabilityValidationGeneration;
+    }
   }
 };
 

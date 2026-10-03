@@ -36,6 +36,12 @@ set(CMAKE_CXX_EXTENSIONS ON)
 
 option(PROJECT_ENABLE_TESTS "Build Prodigy dev tests" ON)
 option(PRODIGY_ENABLE_DEBUG_LOGGING "Compile diagnostic logging and eBPF tracing into Prodigy production targets" OFF)
+set(
+   PRODIGY_UPGRADE_RELEASE_POLICY
+   ""
+   CACHE FILEPATH
+   "Explicit qualified upgrade-release policy JSON; empty keeps local bundle contracts unsupported"
+)
 if (PRODIGY_ENABLE_DEBUG_LOGGING)
    set(PRODIGY_DEBUG_VALUE 1)
 else()
@@ -637,6 +643,11 @@ add_executable(prodigy_retained_container_recovery_unit ${CMAKE_CURRENT_SOURCE_D
 target_compile_options(prodigy_retained_container_recovery_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_mothership_retained_recovery_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_retained_recovery_unit.cpp)
 target_compile_options(prodigy_mothership_retained_recovery_unit PRIVATE -UNDEBUG)
+add_executable(prodigy_container_retirement_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_container_retirement_unit.cpp)
+target_compile_options(prodigy_container_retirement_unit PRIVATE -O0 -fno-lto -UNDEBUG)
+add_executable(prodigy_mothership_upgrade_contract_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_upgrade_contract_unit.cpp)
+add_executable(prodigy_mothership_upgrade_admission_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_upgrade_admission_registry_unit.cpp)
+target_compile_options(prodigy_mothership_upgrade_admission_registry_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_mothership_tidesdb_migration_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_unit.cpp)
 add_executable(prodigy_mothership_tidesdb_migration_command_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_command_unit.cpp)
 target_compile_options(prodigy_mothership_tidesdb_migration_command_unit PRIVATE -UNDEBUG)
@@ -737,6 +748,9 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_restart_persistence_unit
    prodigy_retained_container_recovery_unit
    prodigy_mothership_retained_recovery_unit
+   prodigy_container_retirement_unit
+   prodigy_mothership_upgrade_contract_unit
+   prodigy_mothership_upgrade_admission_registry_unit
    prodigy_mothership_tidesdb_migration_unit
    prodigy_mothership_tidesdb_migration_command_unit
    prodigy_mothership_cluster_reconcile_unit
@@ -762,6 +776,17 @@ set(PRODIGY_COMMON_DEPO_TARGETS
 
 set(PRODIGY_BUNDLE_OUTPUT "${CMAKE_BINARY_DIR}/prodigy.${PRODIGY_RESOLVED_TARGET_ARCH}.bundle.tar.zst")
 set(PRODIGY_BUNDLE_SHA256_OUTPUT "${PRODIGY_BUNDLE_OUTPUT}.sha256")
+set(PRODIGY_UPGRADE_COMPATIBILITY_CONTRACT "${CMAKE_BINARY_DIR}/upgrade-compatibility.json")
+set(PRODIGY_UPGRADE_COMPATIBILITY_POLICY_ARGS)
+set(PRODIGY_UPGRADE_COMPATIBILITY_POLICY_DEPENDS)
+if (NOT PRODIGY_UPGRADE_RELEASE_POLICY STREQUAL "")
+   get_filename_component(PRODIGY_UPGRADE_RELEASE_POLICY "${PRODIGY_UPGRADE_RELEASE_POLICY}" ABSOLUTE)
+   if (NOT EXISTS "${PRODIGY_UPGRADE_RELEASE_POLICY}")
+      message(FATAL_ERROR "PRODIGY_UPGRADE_RELEASE_POLICY does not exist: ${PRODIGY_UPGRADE_RELEASE_POLICY}")
+   endif()
+   list(APPEND PRODIGY_UPGRADE_COMPATIBILITY_POLICY_ARGS "-DRELEASE_POLICY=${PRODIGY_UPGRADE_RELEASE_POLICY}")
+   list(APPEND PRODIGY_UPGRADE_COMPATIBILITY_POLICY_DEPENDS "${PRODIGY_UPGRADE_RELEASE_POLICY}")
+endif()
 set(PRODIGY_BUNDLE_LIBRARY_SEARCH_DIRS
    ${CMAKE_C_IMPLICIT_LINK_DIRECTORIES}
    ${CMAKE_CXX_IMPLICIT_LINK_DIRECTORIES}
@@ -888,6 +913,7 @@ target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC
    PRODIGY_DEBUG=1
    PRODIGY_TEST_APP_ARTIFACT="${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
    PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT="${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
+   PRODIGY_TEST_UPGRADE_BUNDLE="${PRODIGY_BUNDLE_OUTPUT}"
 )
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_container_overlay_sync_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_TEST_BINARY_DIR="${CMAKE_BINARY_DIR}")
@@ -1254,6 +1280,23 @@ add_custom_command(
 add_custom_target(prodigy_pingpong_unready_container_artifact ALL DEPENDS "${PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT}")
 
 add_custom_command(
+   OUTPUT "${PRODIGY_UPGRADE_COMPATIBILITY_CONTRACT}"
+   COMMAND "${CMAKE_COMMAND}"
+           -DPRODIGY_BINARY=$<TARGET_FILE:prodigy>
+           -DMOTHERSHIP_BINARY=$<TARGET_FILE:mothership>
+           -DARCHITECTURE=${PRODIGY_RESOLVED_TARGET_ARCH}
+           -DOUTPUT=${PRODIGY_UPGRADE_COMPATIBILITY_CONTRACT}
+           ${PRODIGY_UPGRADE_COMPATIBILITY_POLICY_ARGS}
+           -P "${CMAKE_CURRENT_SOURCE_DIR}/write_upgrade_compatibility_contract.cmake"
+   DEPENDS prodigy
+           mothership
+           "${CMAKE_CURRENT_SOURCE_DIR}/write_upgrade_compatibility_contract.cmake"
+           ${PRODIGY_UPGRADE_COMPATIBILITY_POLICY_DEPENDS}
+   COMMENT "Generating release upgrade compatibility contract"
+   VERBATIM
+)
+
+add_custom_command(
    OUTPUT "${PRODIGY_BUNDLE_OUTPUT}"
    COMMAND "${CMAKE_COMMAND}" -E env
            CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
@@ -1278,6 +1321,7 @@ add_custom_command(
            --tool-binary "${PRODIGY_ROOT}/prodigy/acme/acme-import-lineage"
            --container-artifact "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            --container-plan "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
+           --container-plan "${PRODIGY_UPGRADE_COMPATIBILITY_CONTRACT}"
    DEPENDS prodigy
            mothership
            prodigy_tidesdb9_export
@@ -1298,6 +1342,7 @@ add_custom_command(
            "${PRODIGY_CERTBOT_WHEELHOUSE_OUTPUT}"
            "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}"
            "${PRODIGY_DNS_RESOLVER_DEPLOYMENT_PLAN}"
+           "${PRODIGY_UPGRADE_COMPATIBILITY_CONTRACT}"
            "${PRODIGY_ROOT}/prodigy/dns/prodigy-dns-resolver.deployment.plan.v1.json.in"
            ${PRODIGY_ACME_HOOK_SCRIPTS}
            ${DISCOMBOBULATOR_SOURCE_FILES}
@@ -1326,6 +1371,7 @@ add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
 add_dependencies(prodigy_brain_replication_credentials_unit
+   prodigy_bundle
    prodigy_mothership_tunnel_provider_artifact
    prodigy_pingpong_container_artifact)
 foreach(_prodigy_artifact_test IN ITEMS
@@ -1373,6 +1419,11 @@ if (PROJECT_ENABLE_TESTS)
    include(CTest)
 
    add_test(
+      NAME prodigy_upgrade_compatibility_contract_producer_unit
+      COMMAND ${CMAKE_COMMAND} -DPRODIGY_ROOT=${PRODIGY_ROOT} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/upgrade_compatibility_contract_producer_unit.cmake
+   )
+
+   add_test(
       NAME prodigy_tidesdb_9_to_10_migration
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_tidesdb_9_to_10_migration.py
               --fixture $<TARGET_FILE:prodigy_tidesdb9_fixture>
@@ -1398,6 +1449,26 @@ if (PROJECT_ENABLE_TESTS)
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_json_argument_unit.sh ${CMAKE_BINARY_DIR}/mothership
    )
    set_tests_properties(prodigy_mothership_json_argument_unit PROPERTIES TIMEOUT 60)
+
+   add_test(
+      NAME prodigy_dev_kvm_boundary_unit
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_kvm_boundary_unit.py
+   )
+   set_tests_properties(prodigy_dev_kvm_boundary_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_dev_serial_upgrade_runtime_qualification_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_serial_upgrade_runtime_qualification_unit.sh
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_serial_upgrade_runtime_qualification.sh
+   )
+   set_tests_properties(prodigy_dev_serial_upgrade_runtime_qualification_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_dev_placement_runtime_qualification_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_placement_runtime_qualification_unit.sh
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_placement_runtime_qualification.sh
+   )
+   set_tests_properties(prodigy_dev_placement_runtime_qualification_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_dev_hostns_fail_closed
@@ -2314,6 +2385,13 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    add_test(NAME prodigy_retained_container_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_container_recovery_unit)
    add_test(NAME prodigy_mothership_retained_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_retained_recovery_unit)
+   add_test(NAME prodigy_container_retirement_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_retirement_unit)
+   add_test(NAME prodigy_container_retirement_authority_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CONTAINER_RETIREMENT_ONLY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
+   set_tests_properties(prodigy_container_retirement_authority_unit PROPERTIES TIMEOUT 30)
+   add_test(NAME prodigy_mothership_upgrade_contract_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_contract_unit)
+   add_test(NAME prodigy_mothership_upgrade_admission_registry_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_admission_registry_unit)
    add_test(
       NAME prodigy_mothership_tidesdb_migration_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_unit

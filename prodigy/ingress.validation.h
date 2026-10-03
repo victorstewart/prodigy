@@ -329,8 +329,13 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
       }
     case MothershipTopic::cancelDeployment:
     case MothershipTopic::recoverMaterializedStatefulDeployment:
+    case MothershipTopic::commitDeploymentPlacementPolicy:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case MothershipTopic::updateProdigyAdmitted:
+      {
+        return consumeVariable(cursor, terminal) && consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case MothershipTopic::pullTaskReport:
       {
@@ -340,6 +345,10 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
           return false;
         }
         return (cursor == terminal);
+      }
+    case MothershipTopic::pullUpgradeAdmissionReport:
+      {
+        return consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case MothershipTopic::pullClusterReport:
     case MothershipTopic::pullRoutableSubnets:
@@ -504,6 +513,12 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
         }
         return (cursor == terminal);
       }
+    case BrainTopic::advertiseCapabilities:
+    case BrainTopic::acknowledgeCapabilities:
+      {
+        uint64_t capabilities = 0;
+        return extractFixed(cursor, terminal, capabilities) && cursor == terminal;
+      }
     case BrainTopic::peerAddressCandidates:
       {
         if (consumeVariable(cursor, terminal) == false)
@@ -592,6 +607,8 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
         }
         return (cursor == terminal);
       }
+    case BrainTopic::observeUpgradeAdmission:
+    case BrainTopic::observeUpgradeAdmissionResponse:
     case BrainTopic::replicateBrainConfig:
     case BrainTopic::replicateClusterTopology:
     case BrainTopic::replicateMasterAuthorityState:

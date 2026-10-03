@@ -3989,6 +3989,17 @@ public:
   uint64_t sharding = 0;
   uint64_t topologyBridge = 0;
 
+  bool hasDistinctServices() const
+  {
+    // Compare materialized service identities, not the caller's raw prefixes:
+    // replacing their group bits can make different input values alias.
+    const uint64_t services[] = {client, sibling, cousin, seeding, sharding, topologyBridge};
+    for (uint32_t index = 0; index < 6; ++index)
+      for (uint32_t other = index + 1; other < 6; ++other)
+        if (services[index] != 0 && services[index] == services[other]) return false;
+    return true;
+  }
+
   StatefulMeshRole classify(uint64_t service) const
   {
     if (client != 0 && (client == service || MeshRegistry::prefixContains(client, service)))
@@ -5308,6 +5319,202 @@ static void serialize(S&& serializer, ClusterStatusReport& report)
   serializer.object(report.machineReports);
   serializer.object(report.applicationReports);
   serializer.object(report.mothershipConnectivity);
+}
+
+// A separate versioned report for release admission.  It intentionally does
+// not extend ClusterStatusReport, whose positional wire format is deployed.
+// The outer request carries target-specific work; an old Brain cannot decode
+// it and therefore cannot accidentally attest capacity for another target.
+class ProdigyUpgradeAdmissionReportRequest {
+public:
+  uint32_t version = 1;
+  String operationID = {};
+  String targetBundleSHA256 = {};
+  String targetContractSHA256 = {};
+  uint64_t requiredStagingBytes = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyUpgradeAdmissionReportRequest& request)
+{
+  serializer.value4b(request.version);
+  serializer.text1b(request.operationID, 34);
+  serializer.text1b(request.targetBundleSHA256, 64);
+  serializer.text1b(request.targetContractSHA256, 64);
+  serializer.value8b(request.requiredStagingBytes);
+}
+
+class ProdigyUpgradeAdmissionObservationRequest {
+public:
+  uint32_t version = 2;
+  uint64_t receiptVersion = 0;
+  uint64_t authorityGeneration = 0;
+  uint64_t requesterTransportGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  uint64_t nonce = 0;
+  int64_t requestedAtMs = 0;
+  String operationID = {};
+  String targetBundleSHA256 = {};
+  String targetContractSHA256 = {};
+  uint64_t requiredStagingBytes = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyUpgradeAdmissionObservationRequest& request)
+{
+  serializer.value4b(request.version); serializer.value8b(request.receiptVersion);
+  serializer.value8b(request.authorityGeneration); serializer.value8b(request.requesterTransportGeneration);
+  serializer.value16b(request.masterUUID); serializer.value8b(request.masterBootNs);
+  serializer.value8b(request.nonce); serializer.value8b(request.requestedAtMs);
+  serializer.text1b(request.operationID, 34);
+  serializer.text1b(request.targetBundleSHA256, 64);
+  serializer.text1b(request.targetContractSHA256, 64);
+  serializer.value8b(request.requiredStagingBytes);
+}
+
+class ProdigyUpgradeAdmissionPeerObservation {
+public:
+  uint128_t brainUUID = 0;
+  uint128_t machineUUID = 0;
+  uint64_t receiptVersion = 0;
+  uint64_t authorityGeneration = 0;
+  uint64_t requesterTransportGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  uint64_t nonce = 0;
+  int64_t observedAtMs = 0;
+  bool codeSupportsSerialFollowers = false;
+  bool localInstalledBundleVerified = false;
+  bool stateUploadFresh = false;
+  bool authorityAcknowledged = false;
+  bool recoveryWitnessAcknowledged = false;
+  String operationID = {};
+  String targetBundleSHA256 = {};
+  String targetContractSHA256 = {};
+  uint64_t requiredStagingBytes = 0;
+  uint64_t stagingAvailableBytes = 0;
+  bool stagingCapacityProbeComplete = false;
+  bool stagingCapacityVerified = false;
+  String installedBundleSHA256 = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyUpgradeAdmissionPeerObservation& observation)
+{
+  serializer.value16b(observation.brainUUID);
+  serializer.value16b(observation.machineUUID);
+  serializer.value8b(observation.receiptVersion);
+  serializer.value8b(observation.authorityGeneration);
+  serializer.value8b(observation.requesterTransportGeneration);
+  serializer.value16b(observation.masterUUID); serializer.value8b(observation.masterBootNs);
+  serializer.value8b(observation.nonce); serializer.value8b(observation.observedAtMs);
+  serializer.value1b(observation.codeSupportsSerialFollowers);
+  serializer.value1b(observation.localInstalledBundleVerified);
+  serializer.value1b(observation.stateUploadFresh);
+  serializer.value1b(observation.authorityAcknowledged);
+  serializer.value1b(observation.recoveryWitnessAcknowledged);
+  serializer.text1b(observation.operationID, 34);
+  serializer.text1b(observation.targetBundleSHA256, 64);
+  serializer.text1b(observation.targetContractSHA256, 64);
+  serializer.value8b(observation.requiredStagingBytes);
+  serializer.value8b(observation.stagingAvailableBytes);
+  serializer.value1b(observation.stagingCapacityProbeComplete);
+  serializer.value1b(observation.stagingCapacityVerified);
+  serializer.text1b(observation.installedBundleSHA256, UINT32_MAX);
+}
+
+class ProdigyAdmittedUpdateRequest {
+public:
+  uint32_t version = 1;
+  String operationID, sourceBundleSHA256, targetBundleSHA256, targetContractSHA256;
+  uint64_t authorityGeneration = 0;
+  uint64_t receiptVersion = 0;
+  uint64_t nonce = 0;
+  uint64_t requiredStagingBytes = 0;
+  bool requiresEmptyWorkloadSet = false;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyAdmittedUpdateRequest& request)
+{
+  serializer.value4b(request.version);
+  serializer.text1b(request.operationID, 34);
+  serializer.text1b(request.sourceBundleSHA256, 64);
+  serializer.text1b(request.targetBundleSHA256, 64);
+  serializer.text1b(request.targetContractSHA256, 64);
+  serializer.value8b(request.authorityGeneration);
+  serializer.value16b(request.masterUUID);
+  serializer.value8b(request.masterBootNs);
+  serializer.value8b(request.receiptVersion);
+  serializer.value8b(request.nonce);
+  serializer.value8b(request.requiredStagingBytes);
+  serializer.value1b(request.requiresEmptyWorkloadSet);
+}
+
+class MothershipUpgradeAdmissionReport {
+public:
+  uint32_t version = 4;
+  uint128_t clusterUUID = 0;
+  uint64_t observationReceiptVersion = 0;
+  uint64_t authorityGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  uint64_t observationNonce = 0;
+  int64_t observedAtMs = 0;
+  bool master = false;
+  bool authorityQuorumHealthy = false;
+  bool authorityAcknowledged = false;
+  bool recoveryWitnessAcknowledged = false;
+  bool currentUpdaterSupportsSerialFollowers = false;
+  bool fleetBundleDigestsFresh = false;
+  bool fleetInventoriesFresh = false;
+  bool observationComplete = false;
+  uint32_t commissionedBrainCount = 0;
+  uint32_t healthyCommissionedBrainCount = 0;
+  uint32_t activeDeploymentCount = 0;
+  uint64_t readySchedulableStorageBytes = 0;
+  bool commissionedPeerTransportVerified = false;
+  String operationID = {};
+  String targetBundleSHA256 = {};
+  String targetContractSHA256 = {};
+  uint64_t requiredStagingBytes = 0;
+  bool stagingCapacityResponsesComplete = false;
+  bool stagingCapacityComplete = false;
+  String masterApprovedBundleSHA256 = {};
+  String masterRunningProdigyVersion = {};
+  Vector<ProdigyUpgradeAdmissionPeerObservation> peers = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipUpgradeAdmissionReport& report)
+{
+  serializer.value4b(report.version);
+  serializer.value16b(report.clusterUUID);
+  serializer.value8b(report.observationReceiptVersion);
+  serializer.value8b(report.authorityGeneration); serializer.value16b(report.masterUUID);
+  serializer.value8b(report.masterBootNs); serializer.value8b(report.observationNonce);
+  serializer.value8b(report.observedAtMs); serializer.value1b(report.master);
+  serializer.value1b(report.authorityQuorumHealthy);
+  serializer.value1b(report.authorityAcknowledged);
+  serializer.value1b(report.recoveryWitnessAcknowledged);
+  serializer.value1b(report.currentUpdaterSupportsSerialFollowers);
+  serializer.value1b(report.fleetBundleDigestsFresh);
+  serializer.value1b(report.fleetInventoriesFresh);
+  serializer.value1b(report.observationComplete);
+  serializer.value4b(report.commissionedBrainCount); serializer.value4b(report.healthyCommissionedBrainCount);
+  serializer.value4b(report.activeDeploymentCount);
+  serializer.value8b(report.readySchedulableStorageBytes); serializer.value1b(report.commissionedPeerTransportVerified);
+  serializer.text1b(report.operationID, 34);
+  serializer.text1b(report.targetBundleSHA256, 64);
+  serializer.text1b(report.targetContractSHA256, 64);
+  serializer.value8b(report.requiredStagingBytes);
+  serializer.value1b(report.stagingCapacityResponsesComplete);
+  serializer.value1b(report.stagingCapacityComplete);
+  serializer.text1b(report.masterApprovedBundleSHA256, UINT32_MAX);
+  serializer.text1b(report.masterRunningProdigyVersion, UINT32_MAX);
+  serializer.container(report.peers, 256);
 }
 
 static inline void prodigyStripMachineHardwareCapturesForClusterReport(MachineHardwareProfile& hardware)
@@ -7446,6 +7653,77 @@ static void serialize(S&& serializer, ApiCredentialExpiryNoticePayload& payload)
   serializer.value1b(payload.snapshotComplete);
 }
 
+class ProdigyDeploymentPlacementPolicy {
+public:
+  uint16_t applicationID = 0;
+  uint64_t versionID = 0;
+  String operationID;
+  Vector<uint128_t> eligibleMachineUUIDs;
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyDeploymentPlacementPolicy& policy)
+{
+  serializer.value2b(policy.applicationID);
+  serializer.value8b(policy.versionID);
+  serializer.text1b(policy.operationID, 36);
+  serializer.container(policy.eligibleMachineUUIDs, 256, [](auto& nested, uint128_t& uuid) {
+    nested.value16b(uuid);
+  });
+}
+
+class CommitDeploymentPlacementPolicyResponse {
+public:
+  bool success = false;
+  uint64_t durableGeneration = 0;
+  String failure;
+  ProdigyDeploymentPlacementPolicy policy;
+};
+
+template <typename S>
+static void serialize(S&& serializer, CommitDeploymentPlacementPolicyResponse& response)
+{
+  serializer.value1b(response.success);
+  serializer.value8b(response.durableGeneration);
+  serializer.text1b(response.failure, 4096);
+  serializer.object(response.policy);
+}
+
+static inline bool prodigyDeploymentPlacementPolicyValid(const ProdigyDeploymentPlacementPolicy& policy)
+{
+  if (policy.applicationID == 0 || policy.versionID == 0 ||
+      prodigyCanonicalOperationUUID(policy.operationID) == false ||
+      policy.eligibleMachineUUIDs.empty() || policy.eligibleMachineUUIDs.size() > 256)
+  {
+    return false;
+  }
+  uint128_t previous = 0;
+  for (uint128_t machineUUID : policy.eligibleMachineUUIDs)
+  {
+    if (machineUUID == 0 || (previous != 0 && machineUUID <= previous)) return false;
+    previous = machineUUID;
+  }
+  return true;
+}
+
+static inline bool prodigyDeploymentPlacementPoliciesEqual(
+    const Vector<ProdigyDeploymentPlacementPolicy>& lhs,
+    const Vector<ProdigyDeploymentPlacementPolicy>& rhs)
+{
+  if (lhs.size() != rhs.size()) return false;
+  for (uint32_t index = 0; index < lhs.size(); ++index)
+  {
+    if (lhs[index].applicationID != rhs[index].applicationID ||
+        lhs[index].versionID != rhs[index].versionID ||
+        lhs[index].operationID.equals(rhs[index].operationID) == false ||
+        lhs[index].eligibleMachineUUIDs != rhs[index].eligibleMachineUUIDs)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -7474,10 +7752,14 @@ public:
   bytell_hash_map<uint64_t, TaskExecutionRecord> taskExecutions;
   MothershipTunnelProviderDesiredState mothershipTunnelProviderDesiredState;
   ProdigyPersistentUpdateSelfState updateSelf;
+  // Version-six master-authority tail.  This registry is deliberately separate
+  // from positional DeploymentPlan bytes.
+  Vector<ProdigyDeploymentPlacementPolicy> deploymentPlacementPolicies;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf)
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf ||
+        prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false)
     {
       return false;
     }
@@ -8510,13 +8792,14 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 5;
+  constexpr uint64_t explicitVersion = 6;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
   bool hasAllMachineRecoveryWitnesses = false;
   bool hasMaterializedStatefulRecoveryRetries = false;
   bool hasContainerRuntimeStates = false;
+  bool hasDeploymentPlacementPolicies = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -8524,24 +8807,29 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasApiCredentialExpiryNotices = state.apiCredentialExpiryNotices.empty() == false;
     hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
     hasMaterializedStatefulRecoveryRetries = state.materializedStatefulRecoveryRetries.empty() == false;
-    hasContainerRuntimeStates = containerRuntimeStates != nullptr && containerRuntimeStates->empty() == false;
+    hasDeploymentPlacementPolicies = state.deploymentPlacementPolicies.empty() == false;
+    // Version six has a package-only container slot before the policy tail.
+    // Emit that slot even when empty whenever the enclosing package supplies it.
+    hasContainerRuntimeStates = containerRuntimeStates != nullptr &&
+                                (containerRuntimeStates->empty() == false || hasDeploymentPlacementPolicies);
     // Version-four framing is cumulative: emit the earlier optional fields
     // (empty when unused) so a version-three reader has an unambiguous tail.
-    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates)
+    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies)
     {
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = true;
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasContainerRuntimeStates ? 5 :
+      uint64_t version = hasDeploymentPlacementPolicies ? 6 :
+                         (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -8555,7 +8843,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       serializer.value8b(version);
       serializer.value8b(state.generation);
       if ((version < 1 || version > explicitVersion) ||
-          (version >= 5 && containerRuntimeStates == nullptr) ||
+          (version == 5 && containerRuntimeStates == nullptr) ||
           state.generation == versionMarker)
       {
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
@@ -8565,7 +8853,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasApiCredentialExpiryNotices = version >= 2;
       hasAllMachineRecoveryWitnesses = version >= 3;
       hasMaterializedStatefulRecoveryRetries = version >= 4;
-      hasContainerRuntimeStates = version >= 5;
+      hasContainerRuntimeStates = version == 5 || (version >= 6 && containerRuntimeStates != nullptr);
+      hasDeploymentPlacementPolicies = version >= 6;
     }
   }
 
@@ -8631,6 +8920,14 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     {
       containerRuntimeStates->clear();
     }
+  }
+  if (hasDeploymentPlacementPolicies)
+  {
+    serializer.container(state.deploymentPlacementPolicies, 4096);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.deploymentPlacementPolicies.clear();
   }
 }
 

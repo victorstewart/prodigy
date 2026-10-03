@@ -27,6 +27,7 @@
 #include <services/prodigy.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/containerstore.h>
 #include <prodigy/dns.providers.h>
@@ -5568,6 +5569,11 @@ public:
     return lastIOFailure;
   }
 
+  uint128_t configuredClusterUUID(void) const
+  {
+    return expectedClusterUUID;
+  }
+
 #ifdef PRODIGY_MOTHERSHIP_TEST_ACCESS
   const Vector<MothershipProdigyClusterMachine>& unitTestRemoteMachines(void) const
   {
@@ -9801,6 +9807,337 @@ private:
     return true;
   }
 
+  static bool hashUpgradeAdmissionReport(const MothershipUpgradeAdmissionReport& report,
+                                         String& digest,
+                                         String& failure)
+  {
+    String serialized = {};
+    BitseryEngine::serialize(serialized, const_cast<MothershipUpgradeAdmissionReport&>(report));
+    if (!prodigyComputeSHA256Hex(serialized, digest, &failure))
+    {
+      if (failure.empty()) failure.assign("unable to hash upgrade admission report"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Receipt, nonce, and sampling time deliberately do not enter this digest:
+  // each read-only observation request renews them.  Every authority and peer
+  // fact that can change rollout authority or the observed source does.
+  static bool semanticUpgradeAdmissionReportDigest(const MothershipUpgradeAdmissionReport& report,
+                                                    String& digest,
+                                                    String& failure)
+  {
+    if (report.version != 4 || report.clusterUUID == 0 || report.authorityGeneration == 0 ||
+        report.masterUUID == 0 || report.masterBootNs <= 0 || report.masterApprovedBundleSHA256.empty())
+    {
+      failure.assign("upgrade admission report lacks a generation-fenced authority identity"_ctv);
+      return false;
+    }
+    String encoded = {};
+    mothershipUpgradeAppendUUID(encoded, report.clusterUUID);
+    mothershipUpgradeAppendUInt(encoded, report.authorityGeneration);
+    mothershipUpgradeAppendUUID(encoded, report.masterUUID);
+    mothershipUpgradeAppendUInt(encoded, uint64_t(report.masterBootNs));
+    mothershipUpgradeAppendBool(encoded, report.master);
+    mothershipUpgradeAppendBool(encoded, report.authorityQuorumHealthy);
+    mothershipUpgradeAppendBool(encoded, report.authorityAcknowledged);
+    mothershipUpgradeAppendBool(encoded, report.recoveryWitnessAcknowledged);
+    mothershipUpgradeAppendBool(encoded, report.currentUpdaterSupportsSerialFollowers);
+    mothershipUpgradeAppendBool(encoded, report.fleetBundleDigestsFresh);
+    mothershipUpgradeAppendBool(encoded, report.fleetInventoriesFresh);
+    mothershipUpgradeAppendBool(encoded, report.observationComplete);
+    mothershipUpgradeAppendUInt(encoded, report.commissionedBrainCount);
+    mothershipUpgradeAppendUInt(encoded, report.healthyCommissionedBrainCount);
+    mothershipUpgradeAppendUInt(encoded, report.activeDeploymentCount);
+    mothershipUpgradeAppendUInt(encoded, report.readySchedulableStorageBytes);
+    mothershipUpgradeAppendBool(encoded, report.commissionedPeerTransportVerified);
+    mothershipUpgradeAppendField(encoded, report.operationID);
+    mothershipUpgradeAppendField(encoded, report.targetBundleSHA256);
+    mothershipUpgradeAppendField(encoded, report.targetContractSHA256);
+    mothershipUpgradeAppendUInt(encoded, report.requiredStagingBytes);
+    mothershipUpgradeAppendBool(encoded, report.stagingCapacityResponsesComplete);
+    mothershipUpgradeAppendBool(encoded, report.stagingCapacityComplete);
+    mothershipUpgradeAppendField(encoded, report.masterApprovedBundleSHA256);
+    mothershipUpgradeAppendField(encoded, report.masterRunningProdigyVersion);
+    mothershipUpgradeAppendUInt(encoded, report.peers.size());
+    for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+    {
+      mothershipUpgradeAppendUUID(encoded, peer.brainUUID);
+      mothershipUpgradeAppendUUID(encoded, peer.machineUUID);
+      mothershipUpgradeAppendUInt(encoded, peer.authorityGeneration);
+      mothershipUpgradeAppendUInt(encoded, peer.requesterTransportGeneration);
+      mothershipUpgradeAppendUUID(encoded, peer.masterUUID);
+      mothershipUpgradeAppendUInt(encoded, uint64_t(peer.masterBootNs));
+      mothershipUpgradeAppendBool(encoded, peer.codeSupportsSerialFollowers);
+      mothershipUpgradeAppendBool(encoded, peer.localInstalledBundleVerified);
+      mothershipUpgradeAppendBool(encoded, peer.stateUploadFresh);
+      mothershipUpgradeAppendBool(encoded, peer.authorityAcknowledged);
+      mothershipUpgradeAppendBool(encoded, peer.recoveryWitnessAcknowledged);
+      mothershipUpgradeAppendField(encoded, peer.operationID);
+      mothershipUpgradeAppendField(encoded, peer.targetBundleSHA256);
+      mothershipUpgradeAppendField(encoded, peer.targetContractSHA256);
+      mothershipUpgradeAppendUInt(encoded, peer.requiredStagingBytes);
+      mothershipUpgradeAppendUInt(encoded, peer.stagingAvailableBytes);
+      mothershipUpgradeAppendBool(encoded, peer.stagingCapacityProbeComplete);
+      mothershipUpgradeAppendBool(encoded, peer.stagingCapacityVerified);
+      mothershipUpgradeAppendField(encoded, peer.installedBundleSHA256);
+    }
+    if (!prodigyComputeSHA256Hex(encoded, digest, &failure))
+    {
+      if (failure.empty()) failure.assign("unable to hash semantic upgrade admission report"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static void buildUpgradePlannerInput(const ProdigyApprovedUpgradeBundle& targetBundle,
+                                       const MothershipUpgradeIdentity& sourceIdentity,
+                                       const MothershipUpgradeAdmissionReport& report,
+                                       const String& observedTargetArchitecture,
+                                       const MothershipProdigyCluster *registeredCluster,
+                                       MothershipUpgradePlannerInput& input,
+                                       String& failure)
+  {
+    input = {};
+    failure.clear();
+    input.envelope = targetBundle.envelope;
+    input.observedSource = sourceIdentity;
+    input.observedTargetArchitecture = observedTargetArchitecture;
+    input.sourceClusterUUID = report.clusterUUID;
+    input.targetClusterUUID = report.clusterUUID;
+    input.currentUpdaterSupportsSerialFollowers = report.currentUpdaterSupportsSerialFollowers;
+    input.sourceQuorumHealthy = report.master && report.authorityQuorumHealthy &&
+        report.authorityAcknowledged && report.recoveryWitnessAcknowledged &&
+        report.commissionedPeerTransportVerified;
+    input.targetQuorumHealthy = input.sourceQuorumHealthy;
+    input.healthyBrains = report.healthyCommissionedBrainCount;
+    input.freeBytes = UINT64_MAX;
+    for (const auto& peer : report.peers)
+      input.freeBytes = std::min(input.freeBytes, peer.stagingAvailableBytes);
+    if (report.peers.empty()) input.freeBytes = 0;
+    // A workload-bearing fleet still needs its own overlap and endpoint proof.
+    // Empty, isolated disposable test clusters have no public app to probe.
+    input.emptyIsolatedTestCluster = registeredCluster != nullptr &&
+        registeredCluster->clusterUUID == report.clusterUUID &&
+        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::test &&
+        registeredCluster->test.specified && !registeredCluster->test.enableFakeIpv4Boundary &&
+        report.activeDeploymentCount == 0;
+    input.overlapCapacityAvailable = report.activeDeploymentCount == 0 &&
+        report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
+        report.targetBundleSHA256 == targetBundle.bundleSHA256 &&
+        report.targetContractSHA256 == targetBundle.contract.contractSHA256;
+    input.trustRootsAndUUIDBindingsMatch =
+        targetBundle.contract.transportIdentityMode == "preserveClusterIdentity"_ctv &&
+        report.commissionedPeerTransportVerified;
+    input.publicBaselineHealthy = false;
+    if (!report.observationComplete)
+      failure.assign("generation-fenced peer upgrade observation is incomplete"_ctv);
+    else if (!report.commissionedPeerTransportVerified)
+      failure.assign("commissioned peer transport is not freshly authenticated"_ctv);
+    else if (!report.fleetBundleDigestsFresh || !report.fleetInventoriesFresh ||
+             !report.authorityAcknowledged || !report.recoveryWitnessAcknowledged)
+      failure.assign("fresh authenticated fleet bundle, inventory, and authority attestations are unavailable"_ctv);
+    else
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (!peer.localInstalledBundleVerified || !peer.stateUploadFresh ||
+            !peer.codeSupportsSerialFollowers || !peer.authorityAcknowledged ||
+            !peer.recoveryWitnessAcknowledged)
+        {
+          failure.assign("observed peer is missing a fresh authenticated upgrade receipt"_ctv);
+          break;
+        }
+  }
+
+  bool requestUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
+                                     MothershipUpgradeAdmissionReport& report, String& failure)
+  {
+    report = {};
+    failure.clear();
+    if (socket.connect() != 0)
+    {
+      failure = socket.connectFailureDetail();
+      if (failure.empty()) failure.assign("failed to connect for upgrade admission report"_ctv);
+      return false;
+    }
+    String encodedRequest = {};
+    BitseryEngine::serialize(encodedRequest, const_cast<ProdigyUpgradeAdmissionReportRequest&>(request));
+    Message::construct(socket.wBuffer, MothershipTopic::pullUpgradeAdmissionReport, encodedRequest);
+    if (!socket.send())
+    {
+      failure = socket.ioFailureDetail();
+      socket.close();
+      if (failure.empty()) failure.assign("failed to request upgrade admission report"_ctv);
+      return false;
+    }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullUpgradeAdmissionReport, ProdigyWire::maxControlFrameBytes);
+    if (response == nullptr)
+    {
+      failure = socket.ioFailureDetail();
+      socket.close();
+      if (failure.empty()) failure.assign("upgrade admission report unavailable (legacy Brain does not support it)"_ctv);
+      return false;
+    }
+    String serialized = {};
+    uint8_t *args = response->args;
+    Message::extractToStringView(args, serialized);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(serialized, report) &&
+        report.version == 4 && report.clusterUUID != 0 && report.observationReceiptVersion != 0;
+    socket.close();
+    if (!valid)
+    {
+      failure.assign("upgrade admission report is invalid or unsupported"_ctv);
+      return false;
+    }
+    if (report.operationID != request.operationID || report.targetBundleSHA256 != request.targetBundleSHA256 ||
+        report.targetContractSHA256 != request.targetContractSHA256 || report.requiredStagingBytes != request.requiredStagingBytes)
+    {
+      failure.assign("upgrade admission capacity report is bound to a different target or operation"_ctv);
+      return false;
+    }
+    if (!report.stagingCapacityResponsesComplete)
+    {
+      failure.assign("upgrade admission capacity report is missing commissioned-peer measurements"_ctv);
+      return false;
+    }
+    if (!report.stagingCapacityComplete)
+    {
+      failure.assign("upgrade admission target staging capacity is insufficient or unavailable"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  void runPlanUpgrade(int argc, char *argv[])
+  {
+    if (argc != 4)
+    {
+      basics_log("usage: planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+      exit(EXIT_FAILURE);
+    }
+    String failure = {}, targetInput = {}, sourceInput = {}, operationText = {};
+    targetInput.assign(argv[1]); sourceInput.assign(argv[2]); operationText.assign(argv[3]);
+    uint128_t operationID = 0;
+    if (!prodigyParseCanonicalHex128(operationText, operationID))
+    {
+      basics_log("planUpgrade success=0 failure=operationID must be canonical nonzero hex\n");
+      exit(EXIT_FAILURE);
+    }
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String targetBundlePath = {}, sourceBundlePath = {};
+    if (!resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) ||
+        !prodigyResolveBundleArtifactInput(targetInput, architecture, targetBundlePath, &failure) ||
+        !prodigyResolveBundleArtifactInput(sourceInput, architecture, sourceBundlePath, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    ProdigyApprovedUpgradeBundle targetBundle = {}, sourceBundle = {};
+    if (!prodigyApproveBundleUpgradeContract(targetBundlePath, targetBundle, &failure) ||
+        !prodigyApproveBundleUpgradeContract(sourceBundlePath, sourceBundle, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!configureControlTarget(argv[0], &failure)) exit(EXIT_FAILURE);
+    ProdigyUpgradeAdmissionReportRequest observationRequest = {};
+    observationRequest.operationID.assign(operationText);
+    observationRequest.targetBundleSHA256.assign(targetBundle.bundleSHA256);
+    observationRequest.targetContractSHA256.assign(targetBundle.contract.contractSHA256);
+    observationRequest.requiredStagingBytes = targetBundle.contract.requiredFreeBytes;
+    if (observationRequest.requiredStagingBytes == 0)
+    {
+      basics_log("planUpgrade success=0 failure=target contract lacks nonzero staging-capacity bound\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeAdmissionReport report = {};
+    constexpr uint32_t maximumObservationAttempts = 3;
+    bool reportReceived = false;
+    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
+    {
+      if (!requestUpgradeAdmissionReport(observationRequest, report, failure))
+      {
+        break;
+      }
+      reportReceived = true;
+      if (report.observationComplete) break;
+    }
+    if (!reportReceived)
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeIdentity sourceIdentity = {};
+    sourceIdentity.releaseID = sourceBundle.contract.releaseID;
+    sourceIdentity.contractSHA256 = sourceBundle.contract.contractSHA256;
+    sourceIdentity.prodigySHA256 = sourceBundle.contract.prodigySHA256;
+    sourceIdentity.mothershipSHA256 = sourceBundle.contract.mothershipSHA256;
+    String observedTargetArchitecture = {};
+    observedTargetArchitecture.assign(machineCpuArchitectureName(architecture));
+    MothershipUpgradePlannerInput input = {};
+    MothershipProdigyCluster upgradeCluster = {};
+    const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
+    buildUpgradePlannerInput(targetBundle, sourceIdentity, report, observedTargetArchitecture,
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+    if (failure.empty() && report.masterApprovedBundleSHA256 != sourceBundle.bundleSHA256)
+      failure.assign("approved source bundle does not match master observed bundle digest"_ctv);
+    if (failure.empty())
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (peer.installedBundleSHA256 != sourceBundle.bundleSHA256)
+        {
+          failure.assign("observed peer bundle digest does not match approved source bundle"_ctv);
+          break;
+        }
+    MothershipUpgradePlan plan = mothershipPlanUpgrade(targetBundle.contract, input);
+    if (!failure.empty())
+    {
+      plan.eligible = false;
+      plan.path = MothershipUpgradePath::reject;
+      plan.firstStopGate = failure;
+      plan.reasons.push_back(failure);
+    }
+    String observedReportSHA256 = {}, semanticObservationSHA256 = {};
+    if (!hashUpgradeAdmissionReport(report, observedReportSHA256, failure) ||
+        !semanticUpgradeAdmissionReportDigest(report, semanticObservationSHA256, failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeAdmissionRecord requested = {};
+    requested.clusterUUID = report.clusterUUID;
+    requested.operationID = operationID;
+    requested.sourceBundleSHA256 = sourceBundle.bundleSHA256;
+    requested.sourceContractSHA256 = sourceBundle.contract.contractSHA256;
+    requested.sourceReleaseID = sourceIdentity.releaseID;
+    requested.sourceProdigySHA256 = sourceIdentity.prodigySHA256;
+    requested.sourceMothershipSHA256 = sourceIdentity.mothershipSHA256;
+    requested.targetBundleSHA256 = targetBundle.bundleSHA256;
+    requested.targetContractSHA256 = targetBundle.contract.contractSHA256;
+    requested.authorityGeneration = report.authorityGeneration;
+    requested.masterUUID = report.masterUUID;
+    requested.masterBootNs = report.masterBootNs;
+    requested.semanticObservationSHA256 = semanticObservationSHA256;
+    requested.approvedPath = uint8_t(plan.path);
+    requested.observationReceiptVersion = report.observationReceiptVersion;
+    requested.observationReportSHA256 = observedReportSHA256;
+    requested.plannerInputSHA256 = plan.inputSHA256;
+    requested.eligible = plan.eligible;
+    requested.firstStopGate = plan.firstStopGate;
+    MothershipUpgradeAdmissionRecord recorded = {};
+    bool resumed = false;
+    MothershipClusterRegistry registry = openClusterRegistry();
+    if (!registry.recordUpgradeAdmission(requested, recorded, resumed, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String clusterUUIDText = {};
+    clusterUUIDText.assignItoh(recorded.clusterUUID);
+    basics_log("planUpgrade success=1 eligible=%u resumed=%u clusterUUID=%s operationID=%s inputSHA256=%s firstStopGate=%s\n",
+               unsigned(recorded.eligible), unsigned(resumed), clusterUUIDText.c_str(),
+               operationText.c_str(), recorded.plannerInputSHA256.c_str(), recorded.firstStopGate.c_str());
+  }
+
   void runClusterReport(int argc, char *argv[])
   {
     if (argc < 1)
@@ -13329,6 +13666,11 @@ private:
 
     if (plan.isStateful)
     {
+      if (!StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices())
+      {
+        basics_log("stateful mesh roles must identify distinct services\n");
+        exit(EXIT_FAILURE);
+      }
       if (plan.stateless.nBase > 0)
       {
         basics_log("isStateful but provided StatelessDeploymentPlan\n");
@@ -16957,6 +17299,7 @@ private:
       }
     }
 
+
     if (offlineDNSRecovery || offlineUnconfiguredDNSRecovery)
     {
       uint128_t requestedUUID = 0;
@@ -17062,21 +17405,20 @@ private:
 
   void runUpdateProdigy(int argc, char *argv[])
   {
-    if (argc < 2)
+    if (argc != 3)
     {
-      basics_log("too few arguments. ex: updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
+      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
       exit(EXIT_FAILURE);
     }
 
-    String inputPath;
-    inputPath.assign(argv[1]);
-
-    if (inputPath.size() == 0)
+    String inputPath = {}, operationText = {};
+    inputPath.assign(argv[1]); operationText.assign(argv[2]);
+    uint128_t operationID = 0;
+    if (inputPath.empty() || !prodigyParseCanonicalHex128(operationText, operationID))
     {
-      basics_log("updateProdigy requires a non-empty path to prodigy binary or bundle\n");
+      basics_log("updateProdigy requires an approved bundle and canonical nonzero operationID\n");
       exit(EXIT_FAILURE);
     }
-
     if (access(inputPath.c_str(), R_OK) != 0)
     {
       basics_log("updateProdigy path is inaccessible: %s\n", inputPath.c_str());
@@ -17084,88 +17426,282 @@ private:
     }
 
     MachineCpuArchitecture targetArchitecture = MachineCpuArchitecture::unknown;
-    String failure;
-    if (resolveProdigyBundleTargetArchitecture(argv[0], targetArchitecture, &failure) == false)
-    {
-      basics_log("updateProdigy failed to resolve target architecture: %s\n", failure.c_str());
-      exit(EXIT_FAILURE);
-    }
-
-    String bundlePath;
-    if (prodigyResolveBundleArtifactInput(inputPath, targetArchitecture, bundlePath, &failure) == false)
+    String failure = {}, bundlePath = {};
+    if (!resolveProdigyBundleTargetArchitecture(argv[0], targetArchitecture, &failure) ||
+        !prodigyResolveBundleArtifactInput(inputPath, targetArchitecture, bundlePath, &failure))
     {
       basics_log("updateProdigy failed to resolve bundle: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
-
-    String actualBundleDigest;
-    if (prodigyApproveBundleArtifact(bundlePath, actualBundleDigest, &failure) == false)
+    ProdigyApprovedUpgradeBundle approvedBundle = {};
+    if (!prodigyApproveBundleUpgradeContract(bundlePath, approvedBundle, &failure))
     {
       basics_log("updateProdigy rejected bundle: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
-
-    uint32_t bundleSize = Filesystem::fileSize(bundlePath);
-    if (bundleSize == 0)
+    if (Filesystem::fileSize(bundlePath) == 0)
     {
       basics_log("updateProdigy bundle path is empty or inaccessible: %s\n", bundlePath.c_str());
       exit(EXIT_FAILURE);
     }
+    if (!configureControlTarget(argv[0], &failure)) exit(EXIT_FAILURE);
 
-    // Reject bad upgrade artifacts before any control-socket bootstrap so the
-    // failure is deterministic even when the target cluster is unreachable.
-    if (!configureControlTarget(argv[0]))
+    const uint128_t configuredClusterUUID = socket.configuredClusterUUID();
+    MothershipProdigyCluster upgradeCluster = {};
+    const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipUpgradeAdmissionRecord admission = {};
+    if (!registry.loadUpgradeAdmission(configuredClusterUUID, operationID, admission, &failure))
     {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!admission.eligible || admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        admission.targetBundleSHA256 != approvedBundle.bundleSHA256 ||
+        admission.targetContractSHA256 != approvedBundle.contract.contractSHA256)
+    {
+      basics_log("updateProdigy rejected by upgrade admission: operation does not authorize this same-cluster target bundle\n");
       exit(EXIT_FAILURE);
     }
 
-    if (socket.connect() == 0)
+    ProdigyUpgradeAdmissionReportRequest observationRequest = {};
+    observationRequest.operationID.assign(operationText);
+    observationRequest.targetBundleSHA256.assign(approvedBundle.bundleSHA256);
+    observationRequest.targetContractSHA256.assign(approvedBundle.contract.contractSHA256);
+    observationRequest.requiredStagingBytes = approvedBundle.contract.requiredFreeBytes;
+    if (observationRequest.requiredStagingBytes == 0)
     {
-      uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::updateProdigy);
-      Message::appendFile(socket.wBuffer, bundlePath);
-      Message::finish(socket.wBuffer, headerOffset);
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::updateProdigy, 512);
-      if (responseMessage == nullptr)
-      {
-        String failureDetail = socket.ioFailureDetail();
-        basics_log("updateProdigy success=0 failure=%s\n",
-                   failureDetail.size() ? failureDetail.c_str() : "timed out waiting for updateProdigy response");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-
-      String serializedResponse = {};
-      uint8_t *responseArgs = responseMessage->args;
-      Message::extractToStringView(responseArgs, serializedResponse);
-      MothershipResponse response = {};
-      if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
-      {
-        basics_log("updateProdigy success=0 failure=invalid response payload\n");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-      if (response.success == false)
-      {
-        basics_log("updateProdigy success=0 failure=%s\n",
-                   response.failure.size() ? response.failure.c_str() : "remote bundle staging failed");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-
-      basics_log("updateProdigy success=1 staged=1 bytes=%u path=%s sha256=%s\n",
-                 bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
-      socket.close();
-    }
-    else
-    {
+      basics_log("updateProdigy rejected by upgrade admission: target contract lacks nonzero staging-capacity bound\n");
       exit(EXIT_FAILURE);
     }
+
+    MothershipUpgradeAdmissionReport report = {};
+    constexpr uint32_t maximumObservationAttempts = 3;
+    bool reportReceived = false;
+    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
+    {
+      if (!requestUpgradeAdmissionReport(observationRequest, report, failure)) break;
+      reportReceived = true;
+      if (report.observationComplete) break;
+    }
+    if (!reportReceived)
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipUpgradeIdentity sourceIdentity = {};
+    sourceIdentity.releaseID = admission.sourceReleaseID;
+    sourceIdentity.contractSHA256 = admission.sourceContractSHA256;
+    sourceIdentity.prodigySHA256 = admission.sourceProdigySHA256;
+    sourceIdentity.mothershipSHA256 = admission.sourceMothershipSHA256;
+    String observedTargetArchitecture = {};
+    observedTargetArchitecture.assign(machineCpuArchitectureName(targetArchitecture));
+    MothershipUpgradePlannerInput input = {};
+    buildUpgradePlannerInput(approvedBundle, sourceIdentity, report, observedTargetArchitecture,
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+    if (failure.empty() && report.clusterUUID != admission.clusterUUID)
+      failure.assign("fresh upgrade report cluster identity differs from the admission record"_ctv);
+    if (failure.empty() && report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
+      failure.assign("fresh master bundle digest differs from the admitted source bundle"_ctv);
+    if (failure.empty())
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (peer.installedBundleSHA256 != admission.sourceBundleSHA256)
+        {
+          failure.assign("fresh peer bundle digest differs from the admitted source bundle"_ctv);
+          break;
+        }
+    String semanticSHA256 = {};
+    if (failure.empty() && !semanticUpgradeAdmissionReportDigest(report, semanticSHA256, failure))
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approvedBundle.contract, input);
+    if (failure.empty() && !freshPlan.eligible)
+      failure = freshPlan.firstStopGate;
+    if (failure.empty() && (freshPlan.path != MothershipUpgradePath::sameLogicalRollout ||
+                            freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
+                            report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
+                            report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
+      failure.assign("fresh report or plan no longer matches the durable admission; re-plan required"_ctv);
+    if (!failure.empty())
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    // Read only the retained, locally approved snapshot.  Re-check both the
+    // pathname and copied bytes immediately before the typed admission frame.
+    String targetBundleBytes = {}, copiedDigest = {};
+    struct stat snapshotMetadata = {};
+    if (!approvedBundle.verifyRetainedSnapshot(&failure) ||
+        ::stat(approvedBundle.retainedSnapshotPath.c_str(), &snapshotMetadata) != 0 ||
+        !S_ISREG(snapshotMetadata.st_mode) || snapshotMetadata.st_size <= 0 ||
+        uint64_t(snapshotMetadata.st_size) >= ProdigyWire::maxControlFrameBytes - 4096)
+    {
+      if (failure.empty()) failure.assign("approved bundle snapshot is unavailable or exceeds admitted frame bounds"_ctv);
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Filesystem::openReadAtClose(-1, approvedBundle.retainedSnapshotPath, targetBundleBytes,
+                                uint64_t(snapshotMetadata.st_size) + 1);
+    if (targetBundleBytes.size() != uint64_t(snapshotMetadata.st_size) ||
+        !prodigyComputeSHA256Hex(targetBundleBytes, copiedDigest, &failure) ||
+        copiedDigest != approvedBundle.bundleSHA256)
+    {
+      if (failure.empty()) failure.assign("approved bundle snapshot changed while preparing admitted frame"_ctv);
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    ProdigyAdmittedUpdateRequest request = {};
+    request.operationID = operationText;
+    request.sourceBundleSHA256 = admission.sourceBundleSHA256;
+    request.targetBundleSHA256 = approvedBundle.bundleSHA256;
+    request.targetContractSHA256 = approvedBundle.contract.contractSHA256;
+    request.authorityGeneration = report.authorityGeneration;
+    request.masterUUID = report.masterUUID;
+    request.masterBootNs = report.masterBootNs;
+    request.receiptVersion = report.observationReceiptVersion;
+    request.nonce = report.observationNonce;
+    request.requiredStagingBytes = observationRequest.requiredStagingBytes;
+    request.requiresEmptyWorkloadSet = input.emptyIsolatedTestCluster;
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    if (socket.connect() != 0)
+    {
+      basics_log("updateProdigy success=0 failure=failed to connect for admitted update\n");
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::updateProdigyAdmitted, serializedRequest, targetBundleBytes);
+    if (!socket.send())
+    {
+      String failureDetail = socket.ioFailureDetail(); socket.close();
+      basics_log("updateProdigy success=0 failure=%s\n", failureDetail.empty() ? "failed to send admitted update" : failureDetail.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::updateProdigyAdmitted, 512);
+    if (responseMessage == nullptr)
+    {
+      String failureDetail = socket.ioFailureDetail(); socket.close();
+      basics_log("updateProdigy success=0 failure=%s\n", failureDetail.empty() ? "timed out waiting for admitted update response" : failureDetail.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {}; uint8_t *responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+    MothershipResponse response = {};
+    if (responseArgs != responseMessage->terminal() || !BitseryEngine::deserializeSafe(serializedResponse, response))
+    {
+      socket.close(); basics_log("updateProdigy success=0 failure=invalid admitted update response\n");
+      exit(EXIT_FAILURE);
+    }
+    if (!response.success)
+    {
+      socket.close(); basics_log("updateProdigy success=0 failure=%s\n", response.failure.empty() ? "admitted update rejected" : response.failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s\n",
+               size_t(targetBundleBytes.size()), approvedBundle.bundleSHA256.c_str(), operationText.c_str());
+    socket.close();
+  }
+
+  void runInspectUpgradeBundle(int argc, char *argv[])
+  {
+    if (argc < 1)
+    {
+      basics_log("too few arguments. ex: inspectUpgradeBundle [path to prodigy binary or bundle]\n");
+      exit(EXIT_FAILURE);
+    }
+    String inputPath;
+    inputPath.assign(argv[0]);
+    String failure, bundlePath;
+    if (inputPath.empty() || !prodigyFileReadable(inputPath) ||
+        !prodigyResolveBundleArtifactInput(inputPath, nametagCurrentBuildMachineArchitecture(), bundlePath, &failure))
+    {
+      basics_log("inspectUpgradeBundle success=0 failure=%s\n", failure.size() ? failure.c_str() : "bundle input is invalid");
+      exit(EXIT_FAILURE);
+    }
+    ProdigyApprovedUpgradeBundle approved;
+    if (!prodigyApproveBundleUpgradeContract(bundlePath, approved, &failure))
+    {
+      basics_log("inspectUpgradeBundle success=0 path=%s failure=%s\n", bundlePath.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    const char *disposition = "unsupported";
+    const char *reason = "release declares upgrade unsupported";
+    if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) disposition = "same-cluster-rollout";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) disposition = "new-cluster-required";
+    if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) reason = "cluster preflight is required before rollout";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) reason = "separate-cluster migration still requires workload bridges";
+    auto compatibility = [](MothershipUpgradeCompatibilityState state) {
+      if (state == MothershipUpgradeCompatibilityState::compatible) return "compatible";
+      if (state == MothershipUpgradeCompatibilityState::incompatible) return "incompatible";
+      return "unknown";
+    };
+    basics_log("inspectUpgradeBundle success=1 path=%s bundleSHA256=%s contractSHA256=%s releaseID=%s architecture=%s binaryVersion=%s disposition=%s reason=%s prodigySHA256=%s mothershipSHA256=%s minimumHealthyBrains=%u requiredFreeBytes=%llu rollbackMode=%s migrationProtocolVersion=%s\n",
+               bundlePath.c_str(), approved.bundleSHA256.c_str(), approved.contract.contractSHA256.c_str(),
+               approved.contract.releaseID.c_str(), approved.contract.architecture.c_str(), approved.contract.binaryVersion.c_str(),
+               disposition, reason, approved.contract.prodigySHA256.c_str(), approved.contract.mothershipSHA256.c_str(),
+               unsigned(approved.contract.minimumHealthyBrains), (unsigned long long)approved.contract.requiredFreeBytes,
+               approved.contract.rollbackMode.c_str(), approved.contract.migrationProtocolVersion.c_str());
+    basics_log("inspectUpgradeBundle compatibility wire=%s persistentState=%s authorityState=%s transportTrust=%s containerProtocol=%s dataPlane=%s appState=%s sources=%u\n",
+               compatibility(approved.contract.compatibility.wire), compatibility(approved.contract.compatibility.persistentState),
+               compatibility(approved.contract.compatibility.authorityState), compatibility(approved.contract.compatibility.transportTrust),
+               compatibility(approved.contract.compatibility.containerProtocol), compatibility(approved.contract.compatibility.dataPlane),
+               compatibility(approved.contract.compatibility.appState), unsigned(approved.contract.sources.size()));
+  }
+
+  void runCommitDeploymentPlacementPolicy(int argc, char *argv[])
+  {
+    if (argc < 2 || !configureControlTarget(argv[0])) exit(EXIT_FAILURE);
+    String json = {}; json.append(argv[1]); json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser; simdjson::dom::element doc;
+    ProdigyDeploymentPlacementPolicy request = {};
+    bool sawApp = false, sawVersion = false, sawOperation = false, sawMachines = false;
+    if (parser.parse(json.data(), json.size()).get(doc)) { basics_log("invalid placement policy json\n"); exit(EXIT_FAILURE); }
+    for (auto field : doc.get_object())
+    {
+      String key = {}; key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("applicationID"_ctv) || key.equal("versionID"_ctv))
+      {
+        uint64_t value = 0;
+        if (field.value.get(value) != simdjson::SUCCESS || value == 0 ||
+            (key.equal("applicationID"_ctv) && value > UINT16_MAX) ||
+            (key.equal("versionID"_ctv) && value >= (uint64_t(1) << 48))) { basics_log("invalid placement numeric field\n"); exit(EXIT_FAILURE); }
+        if (key.equal("applicationID"_ctv)) { if (sawApp) exit(EXIT_FAILURE); sawApp = true; request.applicationID = uint16_t(value); }
+        else { if (sawVersion) exit(EXIT_FAILURE); sawVersion = true; request.versionID = value; }
+      }
+      else if (key.equal("operationID"_ctv))
+      {
+        if (sawOperation || field.value.type() != simdjson::dom::element_type::STRING) exit(EXIT_FAILURE);
+        sawOperation = true; request.operationID.assign(field.value.get_c_str());
+      }
+      else if (key.equal("eligibleMachineUUIDs"_ctv))
+      {
+        if (sawMachines || field.value.type() != simdjson::dom::element_type::ARRAY) exit(EXIT_FAILURE);
+        sawMachines = true;
+        for (auto entry : field.value.get_array()) {
+          if (entry.type() != simdjson::dom::element_type::STRING || request.eligibleMachineUUIDs.size() >= 256) exit(EXIT_FAILURE);
+          String machineText = {}; machineText.assign(entry.get_c_str()); uint128_t machineUUID = 0;
+          if (!prodigyParseCanonicalHex128(machineText, machineUUID) || machineUUID == 0) exit(EXIT_FAILURE);
+          request.eligibleMachineUUIDs.push_back(machineUUID);
+        }
+      }
+      else { basics_log("unknown placement policy field\n"); exit(EXIT_FAILURE); }
+    }
+    std::sort(request.eligibleMachineUUIDs.begin(), request.eligibleMachineUUIDs.end());
+    if (!sawApp || !sawVersion || !sawOperation || !sawMachines || !prodigyDeploymentPlacementPolicyValid(request))
+    { basics_log("placementPolicy requires canonical applicationID/versionID/operationID/eligibleMachineUUIDs\n"); exit(EXIT_FAILURE); }
+    String payload = {}; BitseryEngine::serialize(payload, request);
+    if (!socket.ensureConnected()) exit(EXIT_FAILURE);
+    Message::construct(socket.wBuffer, MothershipTopic::commitDeploymentPlacementPolicy, payload);
+    if (!socket.send()) exit(EXIT_FAILURE);
+    Message *message = socket.recvExpectedTopic(MothershipTopic::commitDeploymentPlacementPolicy, 4096);
+    if (message == nullptr) exit(EXIT_FAILURE);
+    String responseBytes = {}; uint8_t *args = message->args; Message::extractToStringView(args, responseBytes);
+    CommitDeploymentPlacementPolicyResponse response = {};
+    if (args != message->terminal() || !BitseryEngine::deserializeSafe(responseBytes, response)) exit(EXIT_FAILURE);
+    basics_log("placementPolicy success=%d appID=%u versionID=%llu operationID=%s durableGeneration=%llu failure=%s\n", int(response.success), unsigned(response.policy.applicationID), (unsigned long long)response.policy.versionID, response.policy.operationID.c_str(), (unsigned long long)response.durableGeneration, response.failure.c_str());
+    if (!response.success) exit(EXIT_FAILURE);
   }
 
   void runCancelDeployment(int argc, char *argv[])
@@ -19357,9 +19893,12 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
+        {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
+        {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
+        {"planUpgrade",                     &Mothership::runPlanUpgrade                     },
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
         {"printClusters",                   &Mothership::runPrintClusters                  },
@@ -19506,8 +20045,12 @@ int main(int argc, char *argv[])
     message.append("\tex: applicationReport local Radar\n");
     message.append("taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
     message.append("\tfetches a retained task execution report\n");
-    message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
-    message.append("\tpushes the exact prodigy bundle this mothership build was compiled to approve, and rejects any other bundle before dispatch\n");
+    message.append("planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+    message.append("\treads a versioned Brain admission report and records an immutable no-dispatch compatibility decision\n");
+    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
+    message.append("\tdispatches only an approved retained snapshot through the typed Brain-side operation binding\n");
+    message.append("inspectUpgradeBundle [path to prodigy binary or bundle]\n");
+    message.append("\tread-only: verifies the approved flat bundle and prints its embedded upgrade compatibility policy\n");
     message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns an applicationID for an application name\n");
     message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]\n");

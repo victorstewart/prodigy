@@ -82,6 +82,11 @@ storage_device_count=0
 storage_device_mb=1024
 inter_container_mtu=9000
 fake_boundary=0
+datacenter_fragment=1
+private4_prefix=10.0.0
+private4_subnet=10.0.0.0/24
+private6_prefix=fd00:10
+private6_subnet=fd00:10::/64
 child_names=(one two three four)
 machine_pids=(101 202 303 404)
 index=2
@@ -460,6 +465,19 @@ int main(void)
   suite.expect(containsAddress(topology.machines[0].addresses.privateAddresses, "fd00:10::a", 64), "topology_first_private_ipv6");
   suite.expect(containsAddress(topology.machines[0].addresses.publicAddresses, "2001:db8:100::a", 64), "topology_first_public_ipv6");
   suite.expect(topology.machines[0].peerAddresses.size() == 2, "topology_multihome_peer_addresses");
+
+  MothershipProdigyCluster independentCluster = cluster;
+  independentCluster.datacenterFragment = 2;
+  ClusterTopology independentTopology = {};
+  suite.expect(mothershipBuildVirtualDatacenterTopology(independentCluster, independentTopology, &failure),
+               "build_independent_fragment_topology");
+  suite.expect(containsAddress(independentTopology.machines[0].addresses.privateAddresses, "10.0.1.10", 24) &&
+                   containsAddress(independentTopology.machines[0].addresses.privateAddresses, "fd00:10:1::a", 64),
+               "independent_fragment_uses_distinct_private_network_domain");
+  String independentControlSocketPath = {};
+  mothershipResolveTestClusterControlSocketPath(independentCluster, independentControlSocketPath);
+  suite.expect(independentControlSocketPath.equals("/tmp/prodigy-vdc-0x1234-d2/mothership.sock"_ctv),
+               "independent_fragment_binds_provider_control_path");
 
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
   AddMachines bootstrapRequest = {};

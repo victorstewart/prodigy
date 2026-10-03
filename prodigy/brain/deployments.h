@@ -1428,6 +1428,9 @@ private:
     uint64_t authorityEpoch = 0;
   };
   Vector<DeferredDurableContainerSpin> deferredDurableContainerSpins;
+  // Resolved from the durable master-authority placement registry at plan admission.
+  // It is intentionally not part of DeploymentPlan wire/persistent bytes.
+  Vector<uint128_t> committedEligibleMachineUUIDs;
 
   static void releaseDurableContainerSpinReplacementWaiter(
       BrainBase *brain,
@@ -3594,6 +3597,16 @@ public:
   using StatefulWorkerTopologyUpgradePhase = ::StatefulWorkerTopologyUpgradePhase;
   constexpr static uint64_t statefulWorkerTopologyRollbackWindowMs = uint64_t(prodigyBrainStatefulTopologyRollbackWindowSeconds) * 1000ull;
 
+  void applyCommittedPlacementPolicy(const ProdigyDeploymentPlacementPolicy& policy)
+  {
+    committedEligibleMachineUUIDs = policy.eligibleMachineUUIDs;
+  }
+
+  bool hasCommittedPlacementPolicy(void) const
+  {
+    return committedEligibleMachineUUIDs.empty() == false;
+  }
+
 #if PRODIGY_DEBUG
   void debugRollbackForTest(void)
   {
@@ -3631,6 +3644,8 @@ public:
 
   bool statefulWorkerTopologyUpgradeRollbackEligibleAt(int64_t nowMs) const
   {
+    if (thisBrain != nullptr && thisBrain->statefulTopologyRetirementStarted(
+          plan.config.deploymentID(), statefulWorkerTopologyUpgradeOperationID)) return false;
     const int64_t deadlineMs = statefulWorkerTopologyUpgradeRollbackDeadlineMs();
     return (deadlineMs != 0 && nowMs < deadlineMs);
   }
@@ -4230,6 +4245,33 @@ private:
 
 public:
 
+  bool captureStatefulTopologyRetirementSources(Vector<ContainerView *>& sources) const
+  {
+    sources.clear();
+    if (!statefulWorkerTopologyUpgradePendingForAnyShardGroup() ||
+        statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+      return false;
+    for (ContainerView *container : containers)
+    {
+      if (container == nullptr || !statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) ||
+          !containerUsesStatefulWorkerTopologyUpgradeSource(container)) continue;
+      if (container->machine == nullptr || container->uuid == 0 || container->machine->uuid == 0)
+        return false;
+      sources.push_back(container);
+    }
+    return true;
+  }
+
+  void resumeStatefulTopologyRetirement(void)
+  {
+    if (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining &&
+        !statefulWorkerTopologyUpgradeRollbackEligible())
+    {
+      scheduleStatefulWorkerTopologyUpgradeBlueRetirement();
+      completeStatefulWorkerTopologyUpgradeIfReady();
+    }
+  }
+
   bool captureStatefulWorkerTopologyUpgradeOperation(ProdigyStatefulWorkerTopologyUpgradeOperation& operation) const
   {
     operation = {};
@@ -4285,6 +4327,10 @@ public:
       statefulWorkerTopologyLockedShardGroups.insert(shardGroup);
     }
 
+    autoscaleTrace("stateful-client restore-operation deploymentID=%llu operation=%llu phase=%u containers=%llu\n",
+                   (unsigned long long)plan.config.deploymentID(),
+                   (unsigned long long)operation.operationID, unsigned(operation.phase),
+                   (unsigned long long)containers.size());
     reconcileStatefulWorkerTopologyUpgradeContainers();
     armStatefulWorkerTopologyUpgradeRollbackTimer();
     return true;
@@ -4476,6 +4522,7 @@ public:
 
     if (deferredStatefulTargetLogicalCores > 0 && (deferredStatefulTargetLogicalCores != plan.config.nLogicalCores || deferredStatefulTargetMemoryMB != plan.config.memoryMB || deferredStatefulTargetStorageMB != plan.config.storageMB))
     {
+      if (thisBrain == nullptr || !thisBrain->statefulTopologyRetirementActivationEnabled()) return false;
       uint32_t oldWorkerCount = prodigyStatefulWorkerCountForLogicalCores(plan.config.nLogicalCores);
       uint32_t targetWorkerCount = prodigyStatefulWorkerCountForLogicalCores(deferredStatefulTargetLogicalCores);
       armStatefulWorkerTopologyUpgrade(
@@ -4744,6 +4791,8 @@ private:
 
   void completeStatefulWorkerTopologyUpgradeIfReady(void)
   {
+    if (thisBrain == nullptr || !thisBrain->statefulTopologyRetirementSettled(
+          plan.config.deploymentID(), statefulWorkerTopologyUpgradeOperationID)) return;
     if (waitingOnContainers.empty() == false || toSchedule.empty() == false)
     {
       return;
@@ -4862,6 +4911,14 @@ private:
   void scheduleStatefulWorkerTopologyUpgradeBlueRetirement(void)
   {
     if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false || statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::blueDraining)
+    {
+      return;
+    }
+
+    // This call may start an asynchronous durable-authority admission.  It
+    // deliberately queues no destruction until that owner re-enters here.
+    if (thisBrain == nullptr || thisBrain->statefulTopologyRetirementActivationEnabled() == false ||
+        thisBrain->prepareStatefulTopologyRetirement(this) == false)
     {
       return;
     }
@@ -4992,6 +5049,7 @@ private:
         uint16_t port = container->getRandomAdvertisementPort();
         it = container->advertisements.emplace(service, Advertisement(service, startAt, stopAt, port)).first;
         container->advertisingOnPorts.insert(it->second.port);
+        if (service == roles.client) traceStatefulClientDeclaration("reconcile-add", container);
       }
 
       if (startAt == ContainerState::scheduled)
@@ -5022,6 +5080,7 @@ private:
       container->advertisingOnPorts.erase(it->second.port);
       thisBrain->mesh->stopAdvertisement(service, container, false);
       container->advertisements.erase(it);
+      if (service == roles.client) traceStatefulClientDeclaration("reconcile-remove", container);
     };
 
     auto ensureSubscription = [&](uint64_t service, ContainerState startAt, ContainerState stopAt, SubscriptionNature nature) -> void {
@@ -5352,6 +5411,7 @@ private:
       std::fflush(stderr);
     }
   }
+
 
   void loadStress(void)
   {
@@ -6218,7 +6278,8 @@ private:
           }
           else
           {
-            if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false)
+            if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false &&
+                thisBrain != nullptr && thisBrain->statefulTopologyRetirementActivationEnabled())
             {
               armStatefulWorkerTopologyUpgrade(oldWorkerCount, nextWorkerCount, uint16_t(nextCores), nextMemoryMB, nextStorageMB);
             }
@@ -6523,6 +6584,20 @@ public:
     }
   }
 
+  void traceStatefulClientDeclaration(const char *event, const ContainerView *container) const
+  {
+    if (!autoscaleTraceEnabled() || container == nullptr || !container->isStateful) return;
+    const StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(plan);
+    const StatefulTopology topology = container->effectiveStatefulTopology(plan);
+    autoscaleTrace("stateful-client event=%s deploymentID=%llu uuid=%016llx%016llx shard=%u epoch=%u operation=%llu phase=%u client=%llu advertised=%d state=%u\n",
+                   event, (unsigned long long)container->deploymentID,
+                   (unsigned long long)(container->uuid >> 64), (unsigned long long)container->uuid,
+                   unsigned(container->shardGroup), unsigned(topology.topologyEpoch),
+                   (unsigned long long)topology.operationID, unsigned(statefulWorkerTopologyUpgradePhase),
+                   (unsigned long long)roles.client, int(roles.client != 0 && container->advertisements.contains(roles.client)),
+                   unsigned(container->state));
+  }
+
   // The master map is transient. Reconstruct its exact state from the
   // recovered canonical containers before the ordinary deficit scheduler can
   // create another replica. A recovered non-all-masters shard with one client
@@ -6560,6 +6635,7 @@ public:
       // This also handles a restored plan whose empty pruned role set falls
       // back to the canonical names. Preserve the duplicate-advertiser fence.
       const uint64_t clientService = container->effectiveStatefulMeshRoles(plan).client;
+      traceStatefulClientDeclaration("recover-inspect", container);
       if (clientService == 0 || container->advertisements.contains(clientService) == false)
       {
         continue;
@@ -7619,6 +7695,13 @@ public:
     }
 
     const ApplicationConfig& config = (configOverride ? *configOverride : deployment->plan.config);
+
+    if (deployment->committedEligibleMachineUUIDs.empty() == false &&
+        std::binary_search(deployment->committedEligibleMachineUUIDs.begin(),
+                           deployment->committedEligibleMachineUUIDs.end(), machine->uuid) == false)
+    {
+      return 0;
+    }
 
     if (prodigyMachineMeetsApplicationResourceCriteria(machine, config) == false)
     {
@@ -8803,6 +8886,7 @@ public:
     ContainerView *master = masterForShardGroup[shardGroup];
 
     master->advertisements.erase(roles.client);
+    traceStatefulClientDeclaration("change-master-remove", master);
     thisBrain->mesh->stopAdvertisement(roles.client, master, false);
 
     for (ContainerView *other : containersByShardGroup[shardGroup])
@@ -8835,6 +8919,7 @@ public:
       uint16_t port = master->getRandomAdvertisementPort();
 
       master->advertisements.emplace(roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, port));
+      traceStatefulClientDeclaration("change-master-add", master);
 
       if (master->state == ContainerState::healthy)
       {

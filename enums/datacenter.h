@@ -49,7 +49,14 @@ enum class MothershipTopic : uint16_t {
   // this appended: MothershipTopic is a wire enum.
   cancelDeployment,
   recoverMaterializedStatefulDeployment,
-  credentialExpiryNotices
+  credentialExpiryNotices,
+  // Versioned separately from ClusterStatusReport so old fixed-order report
+  // decoders fail closed instead of accepting shifted fields.
+  pullUpgradeAdmissionReport,
+  // Durable placement-policy admission is independently framed so unsupported
+  // controllers cannot silently accept a shifted deployment request.
+  commitDeploymentPlacementPolicy,
+  updateProdigyAdmitted
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -122,6 +129,12 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "recoverMaterializedStatefulDeployment";
     case MothershipTopic::credentialExpiryNotices:
       return "credentialExpiryNotices";
+    case MothershipTopic::pullUpgradeAdmissionReport:
+      return "pullUpgradeAdmissionReport";
+    case MothershipTopic::commitDeploymentPlacementPolicy:
+      return "commitDeploymentPlacementPolicy";
+    case MothershipTopic::updateProdigyAdmitted:
+      return "updateProdigyAdmitted";
   }
 
   return "unknown";
@@ -156,7 +169,14 @@ enum class BrainTopic : uint16_t {
   replicateSystemContainerArtifact,
   // Append-only durable operator-cancellation replication and acknowledgement.
   replicateDeploymentCancellation,
-  acknowledgeDeploymentCancellation
+  acknowledgeDeploymentCancellation,
+  // Explicit authenticated peer capability acknowledgement; appended to
+  // preserve all existing topic values.
+  advertiseCapabilities,
+  acknowledgeCapabilities,
+  // Read-only, generation-fenced release-admission observation exchange.
+  observeUpgradeAdmission,
+  observeUpgradeAdmissionResponse
 };
 
 enum class NeuronTopic : uint16_t {

@@ -38,6 +38,26 @@ public:
   bool holdRuntimePersistence = false;
   bool persistSucceeds = true;
   std::deque<PersistenceCompletion> pendingRuntimePersistence;
+  // Deployment algorithm fixtures explicitly supply the runtime owner's
+  // decisions. The concrete Brain durability/TLS gates have separate tests.
+  bool retirementActivation = false;
+  bool retirementPrepared = false;
+  bool retirementSettled = false;
+
+  bool statefulTopologyRetirementActivationEnabled(void) const override
+  {
+    return retirementActivation;
+  }
+
+  bool prepareStatefulTopologyRetirement(ApplicationDeployment *) override
+  {
+    return retirementPrepared;
+  }
+
+  bool statefulTopologyRetirementSettled(uint64_t, uint64_t) const override
+  {
+    return retirementSettled;
+  }
 
   bool deploymentApiCredentialsAvailableForLaunch(const DeploymentPlan&, String *failure = nullptr) const override
   {
@@ -6225,6 +6245,54 @@ int main(void)
   }
 
   {
+    DeploymentPlan deploymentPlan {};
+    deploymentPlan.config.applicationID = 6;
+    deploymentPlan.isStateful = true;
+
+    // These were the runtime matrix's old arbitrary prefix values.  All are
+    // below MeshServices' ten group bits, so group zero canonicalizes them to
+    // one service.  The builder must reject the collision before it can create
+    // multiple apparent client roles.
+    deploymentPlan.stateful.clientPrefix = 601;
+    deploymentPlan.stateful.siblingPrefix = 602;
+    deploymentPlan.stateful.cousinPrefix = 603;
+    deploymentPlan.stateful.seedingPrefix = 604;
+    deploymentPlan.stateful.shardingPrefix = 605;
+
+    ProdigyContainerServiceDefinitionContext context = {};
+    context.isStateful = true;
+    context.roles = StatefulMeshRoles::forShardGroup(deploymentPlan.stateful, deploymentPlan.config.applicationID, 0);
+    context.topology.servingMode = StatefulTopologyServingMode::catchupOnly;
+    context.advertiseClient = false;
+    context.nShardGroups = 1;
+
+    ProdigyContainerServiceDefinitions definitions = {};
+    suite.expect(prodigyBuildContainerServiceDefinitions(deploymentPlan, context, definitions) == false,
+                 "stateful_service_definitions_reject_collapsed_runtime_matrix_prefixes");
+
+    deploymentPlan.stateful.clientPrefix = MeshServices::generateStatefulService(6, 1);
+    deploymentPlan.stateful.siblingPrefix = MeshServices::generateStatefulService(6, 2);
+    deploymentPlan.stateful.cousinPrefix = MeshServices::generateStatefulService(6, 3);
+    deploymentPlan.stateful.seedingPrefix = MeshServices::generateStatefulService(6, 4);
+    deploymentPlan.stateful.shardingPrefix = MeshServices::generateStatefulService(6, 5);
+    context.roles = StatefulMeshRoles::forShardGroup(deploymentPlan.stateful, deploymentPlan.config.applicationID, 0);
+    definitions = {};
+    const bool accepted = prodigyBuildContainerServiceDefinitions(deploymentPlan, context, definitions);
+    bool containsClientAdvertisement = false;
+    bool containsSiblingAdvertisement = false;
+    for (const Advertisement& advertisement : definitions.advertisements)
+    {
+      containsClientAdvertisement = containsClientAdvertisement || advertisement.service == context.roles.client;
+      containsSiblingAdvertisement = containsSiblingAdvertisement || advertisement.service == context.roles.sibling;
+    }
+    suite.expect(accepted, "stateful_service_definitions_accept_reserved_distinct_prefixes");
+    suite.expect(accepted && containsClientAdvertisement == false,
+                 "stateful_service_definitions_suppresses_client_for_catchup_target");
+    suite.expect(accepted && containsSiblingAdvertisement,
+                 "stateful_service_definitions_retains_sibling_for_catchup_target");
+  }
+
+  {
     ContainerPlan plan {};
     plan.isStateful = true;
     plan.shardGroup = 7;
@@ -7239,8 +7307,9 @@ int main(void)
         brain.deferredStatefulScaleIntentRuntimeState.size() == 1 && brain.deferredStatefulScaleIntentRuntimeState[0].targetLogicalCores == 4,
         "stateful_autoscale_topology_upgrade_during_shard_growth_persists_deferred_topology_intent");
 
-    thisBrain = nullptr;
     deployment.deployingNewShardGroup = false;
+    suite.expect(!deployment.dispatchDeferredStatefulScaleIntent(), "stateful_deferred_topology_waits_for_capable_runtime_owner");
+    brain.retirementActivation = true;
     bool dispatched = deployment.dispatchDeferredStatefulScaleIntent();
 
     suite.expect(dispatched, "stateful_autoscale_topology_upgrade_during_shard_growth_dispatches_after_unlock");
@@ -7271,7 +7340,7 @@ int main(void)
     brain.deferredStatefulScaleIntentRuntimeState.push_back(intent);
 
     bool restored = deployment.restorePersistedDeferredStatefulScaleIntent();
-    thisBrain = nullptr;
+    brain.retirementActivation = true;
     bool dispatchedTopology = deployment.dispatchDeferredStatefulScaleIntent();
 
     suite.expect(restored, "stateful_deferred_scale_intent_restore_recovers_persisted_intent");
@@ -7992,6 +8061,39 @@ int main(void)
     suite.expect(targetA.advertisements.find(roles.topologyBridge) != targetA.advertisements.end(), "stateful_worker_topology_upgrade_cutover_reverses_bridge_advertisement_on_green");
     suite.expect(sourceA.advertisements.find(roles.client) == sourceA.advertisements.end(), "stateful_worker_topology_upgrade_cutover_removes_blue_client_advertisement");
     suite.expect(targetClientAdvertisements == 1, "stateful_worker_topology_upgrade_cutover_selects_one_green_client_master");
+    // Independently prove the actual post-cutover plans are a recoverable
+    // one-client cohort.
+    ApplicationDeployment recovered = {};
+    recovered.plan = deployment.plan;
+    ContainerView restoredTargets[3] = {};
+    bool targetPlansRoundTrip = true;
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      ContainerPlan generated = targets[index]->generatePlan(deployment.plan, deployment.nShardGroups);
+      String serialized = {};
+      ContainerPlan restored = {};
+      BitseryEngine::serialize(serialized, generated);
+      targetPlansRoundTrip = BitseryEngine::deserializeSafe(serialized, restored) && targetPlansRoundTrip;
+      if (!targetPlansRoundTrip) continue;
+      restoredTargets[index].uuid = restored.uuid;
+      restoredTargets[index].deploymentID = restored.config.deploymentID();
+      restoredTargets[index].applicationID = restored.config.applicationID;
+      restoredTargets[index].lifetime = restored.lifetime;
+      restoredTargets[index].state = restored.state;
+      restoredTargets[index].runtimeReady = restored.runtimeReady;
+      restoredTargets[index].isStateful = restored.isStateful;
+      restoredTargets[index].shardGroup = restored.shardGroup;
+      restoredTargets[index].explicitStatefulMeshRoles = restored.statefulMeshRoles;
+      restoredTargets[index].explicitStatefulTopology = restored.statefulTopology;
+      restoredTargets[index].subscriptions = restored.subscriptions;
+      restoredTargets[index].advertisements = restored.advertisements;
+      recovered.containers.insert(&restoredTargets[index]);
+    }
+    suite.expect(targetPlansRoundTrip,
+                 "stateful_worker_topology_upgrade_cutover_target_runtime_plans_roundtrip");
+    suite.expect(targetPlansRoundTrip && recovered.rebuildRecoveredStatefulShardMasters() &&
+                     recovered.masterForShardGroup.size() == 1,
+                 "stateful_worker_topology_upgrade_cutover_roundtripped_targets_recover_one_client_master");
     suite.expect(targetA.statefulTopologyCutoverReady == false, "stateful_worker_topology_upgrade_cutover_clears_target_barrier_after_cutover");
     suite.expect(deployment.statefulWorkerTopologyUpgradeRollbackDeadlineMs() > 0, "stateful_worker_topology_upgrade_cutover_arms_rollback_deadline");
     suite.expect(
@@ -8413,6 +8515,13 @@ int main(void)
     suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(), "stateful_worker_topology_upgrade_blue_retirement_waits_for_all_destroy_confirmations");
     deployment.containerDestroyed(sourceC);
 
+    suite.expect(deployment.statefulWorkerTopologyUpgradePendingForAnyShardGroup(),
+                 "stateful_worker_topology_upgrade_all_kill_acks_wait_for_terminal_authority");
+    brain.retirementSettled = true;
+    deployment.statefulWorkerTopologyUpgradePhaseChangedAtMs =
+        Time::now<TimeResolution::ms>() - int64_t(ApplicationDeployment::statefulWorkerTopologyRollbackWindowMs + 1);
+    deployment.resumeStatefulTopologyRetirement();
+
     uint32_t targetClientAdvertisements = 0;
     for (ContainerView *target : targets)
     {
@@ -8577,6 +8686,15 @@ int main(void)
     bool restored = deployment.restorePersistedStatefulWorkerTopologyUpgradeOperation();
     String report = "target failed after rollback deadline"_ctv;
     deployment.containerFailed(&target, 1234, 9, report, true);
+
+    suite.expect(source.state == ContainerState::healthy && source.plannedWork == nullptr,
+                 "stateful_worker_topology_upgrade_expired_window_waits_for_runtime_admission");
+    brain.retirementActivation = true;
+    deployment.resumeStatefulTopologyRetirement();
+    suite.expect(source.state == ContainerState::healthy && source.plannedWork == nullptr,
+                 "stateful_worker_topology_upgrade_expired_window_waits_for_durable_preparation");
+    brain.retirementPrepared = true;
+    deployment.resumeStatefulTopologyRetirement();
 
     suite.expect(restored, "stateful_worker_topology_upgrade_restore_blue_draining_expired_window_recovers_operation");
     suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "stateful_worker_topology_upgrade_expired_window_does_not_roll_back");

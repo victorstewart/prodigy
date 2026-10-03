@@ -168,7 +168,18 @@ valid_workspace()
 
 valid_control_socket_path()
 {
-   [[ "$1" =~ ^/tmp/prodigy-vdc-0x[0-9a-fA-F]{1,32}/mothership\.sock$ ]]
+   [[ "$1" =~ ^/tmp/prodigy-vdc-0x[0-9a-fA-F]{1,32}(-d([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))?/mothership\.sock$ ]]
+}
+
+network_fragment_from_control_socket_path()
+{
+   local control_socket_path="$1"
+   if [[ "${control_socket_path}" =~ -d([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/mothership\.sock$ ]]
+   then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+   else
+      printf '1\n'
+   fi
 }
 
 resolve_cgroup_scope()
@@ -691,6 +702,16 @@ machine_storage_mb="$9"
 storage_device_count="${10}"
 storage_device_mb="${11}"
 control_socket_path="${12}"
+datacenter_fragment="$(network_fragment_from_control_socket_path "${control_socket_path}")"
+private_network_domain="$((datacenter_fragment - 1))"
+private4_prefix="10.0.${private_network_domain}"
+private4_subnet="${private4_prefix}.0/24"
+private6_prefix="fd00:10"
+if [[ "${private_network_domain}" -gt 0 ]]
+then
+   private6_prefix+=":$(printf '%x' "${private_network_domain}")"
+fi
+private6_subnet="${private6_prefix}::/64"
 
 if ! valid_workspace "${workspace}" ||
    ! [[ "${machine_count}" =~ ^[0-9]+$ ]] || [[ "${machine_count}" -lt 1 || "${machine_count}" -gt 128 ]] ||
@@ -813,21 +834,24 @@ cleanup()
       wait "${machine_pid}" >/dev/null 2>&1 || true
    done
 
-   iptables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
-   iptables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
-   iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 || true
-   iptables -t nat -D POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE >/dev/null 2>&1 || true
-   ip route del 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
-   ip route del 10.0.0.0/24 via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
-   ip6tables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
-   ip6tables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
-   ip6tables -t nat -D POSTROUTING -s 2602:fac0:0:12ab:34cd::/88 -j MASQUERADE >/dev/null 2>&1 || true
-   ip6tables -t nat -D POSTROUTING -s fd00:31::2/128 -j MASQUERADE >/dev/null 2>&1 || true
-   [[ -z "${host_ipv4_forward}" ]] || sysctl -q -w "net.ipv4.ip_forward=${host_ipv4_forward}" >/dev/null 2>&1 || true
-   [[ -z "${host_ipv6_forward}" ]] || sysctl -q -w "net.ipv6.conf.all.forwarding=${host_ipv6_forward}" >/dev/null 2>&1 || true
-   ip link del "${host_edge}" >/dev/null 2>&1 || true
-   mountpoint -q "${boundary_bpffs}" && umount "${boundary_bpffs}" >/dev/null 2>&1 || true
-   rm -rf "${boundary_bpffs}" "${boundary_lock}" >/dev/null 2>&1 || true
+   if [[ "${fake_boundary}" == 1 ]]
+   then
+      iptables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
+      iptables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+      iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 || true
+      iptables -t nat -D POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE >/dev/null 2>&1 || true
+      ip route del 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
+      ip route del "${private4_subnet}" via 172.31.0.2 dev "${host_edge}" >/dev/null 2>&1 || true
+      ip6tables -D FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 || true
+      ip6tables -D FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 || true
+      ip6tables -t nat -D POSTROUTING -s 2602:fac0:0:12ab:34cd::/88 -j MASQUERADE >/dev/null 2>&1 || true
+      ip6tables -t nat -D POSTROUTING -s fd00:31::2/128 -j MASQUERADE >/dev/null 2>&1 || true
+      [[ -z "${host_ipv4_forward}" ]] || sysctl -q -w "net.ipv4.ip_forward=${host_ipv4_forward}" >/dev/null 2>&1 || true
+      [[ -z "${host_ipv6_forward}" ]] || sysctl -q -w "net.ipv6.conf.all.forwarding=${host_ipv6_forward}" >/dev/null 2>&1 || true
+      ip link del "${host_edge}" >/dev/null 2>&1 || true
+      mountpoint -q "${boundary_bpffs}" && umount "${boundary_bpffs}" >/dev/null 2>&1 || true
+      rm -rf "${boundary_bpffs}" "${boundary_lock}" >/dev/null 2>&1 || true
+   fi
 
    for child_ns in "${child_names[@]}"
    do
@@ -924,8 +948,8 @@ fi
 ip netns exec "${parent_ns}" ip link add vdcbr0 type bridge
 ip netns exec "${parent_ns}" ip link set dev vdcbr0 type bridge mcast_snooping 0
 ip netns exec "${parent_ns}" ip link set vdcbr0 mtu "${underlay_mtu}" gso_max_size "${underlay_mtu}" gso_max_segs 1 gro_max_size "${underlay_mtu}" gso_ipv4_max_size "${underlay_mtu}" gro_ipv4_max_size "${underlay_mtu}"
-ip netns exec "${parent_ns}" ip addr add 10.0.0.1/24 dev vdcbr0
-ip netns exec "${parent_ns}" ip -6 addr add fd00:10::1/64 nodad dev vdcbr0
+ip netns exec "${parent_ns}" ip addr add "${private4_prefix}.1/24" dev vdcbr0
+ip netns exec "${parent_ns}" ip -6 addr add "${private6_prefix}::1/64" nodad dev vdcbr0
 if [[ "${fake_boundary}" == "1" ]]
 then
    ip netns exec "${parent_ns}" ip -6 addr add 2602:fac0:0:12ab:ffff::1/64 nodad dev vdcbr0
@@ -951,16 +975,16 @@ do
    ip netns exec "${child_ns}" ip link set "${child_if}" name bond0
    ip netns exec "${child_ns}" ip link set bond0 mtu "${underlay_mtu}" gso_max_size "${underlay_mtu}" gso_max_segs 1 gro_max_size "${underlay_mtu}" gso_ipv4_max_size "${underlay_mtu}" gro_ipv4_max_size "${underlay_mtu}"
    ip netns exec "${child_ns}" ip link set bond0 up
-   ip netns exec "${child_ns}" ip addr add "10.0.0.${host_octet}/24" dev bond0
-   ip netns exec "${child_ns}" ip -6 addr add "fd00:10::$(printf '%x' "${host_octet}")/64" nodad dev bond0
+   ip netns exec "${child_ns}" ip addr add "${private4_prefix}.${host_octet}/24" dev bond0
+   ip netns exec "${child_ns}" ip -6 addr add "${private6_prefix}::$(printf '%x' "${host_octet}")/64" nodad dev bond0
    if [[ "${fake_boundary}" == "1" ]]
    then
       ip netns exec "${child_ns}" ip -6 addr add "2602:fac0:0:12ab:34cd::$(printf '%x' "${host_octet}")/64" nodad dev bond0
    else
       ip netns exec "${child_ns}" ip -6 addr add "2001:db8:100::$(printf '%x' "${host_octet}")/64" nodad dev bond0
    fi
-   ip netns exec "${child_ns}" ip route replace default via 10.0.0.1 dev bond0
-   ip netns exec "${child_ns}" ip -6 route replace default via fd00:10::1 dev bond0
+   ip netns exec "${child_ns}" ip route replace default via "${private4_prefix}.1" dev bond0
+   ip netns exec "${child_ns}" ip -6 route replace default via "${private6_prefix}::1" dev bond0
 done
 
 atomic_write "${pid_path}" "${pid}\n"
@@ -991,7 +1015,7 @@ then
    ip addr add 172.31.0.1/30 dev "${host_edge}"
    ip -6 addr add fd00:31::1/126 dev "${host_edge}"
    ip link set "${host_edge}" up
-   ip route replace 10.0.0.0/24 via 172.31.0.2 dev "${host_edge}"
+   ip route replace "${private4_subnet}" via 172.31.0.2 dev "${host_edge}"
    # This synthetic 1500-byte public boundary belongs only to deploymentMode=test; production clusters never execute this provider.
    ip route replace 198.18.0.0/16 via 172.31.0.2 dev "${host_edge}" mtu "${public_ingress_mtu}"
    ip netns exec "${parent_ns}" ip link set "${parent_edge}" up
@@ -999,7 +1023,7 @@ then
    ip netns exec "${parent_ns}" ip -6 addr add fd00:31::2/126 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip route replace default via 172.31.0.1 dev "${parent_edge}"
    ip netns exec "${parent_ns}" ip -6 route replace default via fd00:31::1 dev "${parent_edge}"
-   ip netns exec "${parent_ns}" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu "${public_ingress_mtu}"
+   ip netns exec "${parent_ns}" ip route replace 198.18.0.0/16 via "${private4_prefix}.10" dev vdcbr0 src "${private4_prefix}.1" mtu "${public_ingress_mtu}"
    # Development host-public IPv4 leases encode the selected machine in the
    # low address byte.  Reply-flow state is learned by that machine's egress
    # program and is intentionally not replicated, so return traffic must go
@@ -1010,10 +1034,10 @@ then
    do
       host_octet=$((9 + index))
       ip netns exec "${parent_ns}" ip route replace \
-         "198.18.0.${host_octet}/32" via "10.0.0.${host_octet}" dev vdcbr0 \
-         src 10.0.0.1 mtu "${public_ingress_mtu}"
+         "198.18.0.${host_octet}/32" via "${private4_prefix}.${host_octet}" dev vdcbr0 \
+         src "${private4_prefix}.1" mtu "${public_ingress_mtu}"
    done
-   ip netns exec "${parent_ns}" ip -6 route replace 2602:fac0:0:12ab:34cd::/88 via fd00:10::a dev vdcbr0
+   ip netns exec "${parent_ns}" ip -6 route replace 2602:fac0:0:12ab:34cd::/88 via "${private6_prefix}::a" dev vdcbr0
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv4.ip_forward=1
    ip netns exec "${parent_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1
    ip netns exec "${parent_ns}" ip6tables -t nat -A POSTROUTING -s 2602:fac0:0:12ab:34cd::/88 -o "${parent_edge}" -j SNAT --to-source fd00:31::2
@@ -1276,8 +1300,8 @@ publish_runtime()
 {
    local index host_octet role public6
 {
-   printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","parentPid":%s,"machineCount":%s,"brainCount":%s,"machineLogicalCores":%s,"machineMemoryMB":%s,"machineStorageMB":%s,"storageDeviceCount":%s,"storageDeviceMB":%s,"interContainerMTU":%s,"leaderIndex":0,"leaderNamespace":"","nodes":[' \
-      "${workspace}" "${manifest_path}" "${control_socket_path}" "${parent_ns}" "${pid}" "${machine_count}" "${brain_count}" "${machine_logical_cores}" "${machine_memory_mb}" "${machine_storage_mb}" "${storage_device_count}" "${storage_device_mb}" "${inter_container_mtu}"
+   printf '{"workspaceRoot":"%s","manifestPath":"%s","controlSocketPath":"%s","parentNamespace":"%s","parentPid":%s,"datacenterFragment":%s,"privateIPv4Subnet":"%s","privateIPv6Subnet":"%s","machineCount":%s,"brainCount":%s,"machineLogicalCores":%s,"machineMemoryMB":%s,"machineStorageMB":%s,"storageDeviceCount":%s,"storageDeviceMB":%s,"interContainerMTU":%s,"leaderIndex":0,"leaderNamespace":"","nodes":[' \
+      "${workspace}" "${manifest_path}" "${control_socket_path}" "${parent_ns}" "${pid}" "${datacenter_fragment}" "${private4_subnet}" "${private6_subnet}" "${machine_count}" "${brain_count}" "${machine_logical_cores}" "${machine_memory_mb}" "${machine_storage_mb}" "${storage_device_count}" "${storage_device_mb}" "${inter_container_mtu}"
    for index in $(seq 1 "${machine_count}")
    do
       [[ "${index}" -eq 1 ]] || printf ','
@@ -1290,8 +1314,8 @@ publish_runtime()
       else
          public6="2001:db8:100::$(printf '%x' "${host_octet}")"
       fi
-      printf '{"index":%s,"role":"%s","namespace":"%s","pid":%s,"stdoutLog":"%s/machine%s.log","ipv4":"10.0.0.%s","private6":"fd00:10::%x","public6":"%s"}' \
-         "${index}" "${role}" "${child_names[$((index - 1))]}" "${machine_pids[$((index - 1))]}" "${workspace}" "${index}" "${host_octet}" "${host_octet}" "${public6}"
+      printf '{"index":%s,"role":"%s","namespace":"%s","pid":%s,"stdoutLog":"%s/machine%s.log","ipv4":"%s.%s","private6":"%s::%x","public6":"%s"}' \
+         "${index}" "${role}" "${child_names[$((index - 1))]}" "${machine_pids[$((index - 1))]}" "${workspace}" "${index}" "${private4_prefix}" "${host_octet}" "${private6_prefix}" "${host_octet}" "${public6}"
    done
    printf ']}\n'
 } > "${manifest_path}.${pid}.tmp"

@@ -129,11 +129,18 @@ write_stateful_topology_upgrade_plan()
    local memory_mb="${7:-256}"
    local storage_mb="${8:-64}"
 
-   local client_prefix=$((app_id * 100 + 1))
-   local sibling_prefix=$((app_id * 100 + 2))
-   local cousin_prefix=$((app_id * 100 + 3))
-   local seeding_prefix=$((app_id * 100 + 4))
-   local sharding_prefix=$((app_id * 100 + 5))
+   # This is the durable Mothership stateful-service identity layout used by
+   # materializeReservedService(): application in bits 48..63, service slot
+   # in bits 40..47, and the all-ones 10-bit group suffix for a prefix.
+   # StatefulMeshRoles::forShardGroup replaces only that suffix.  Small
+   # integers would therefore collapse every role to the same group service.
+   local group_mask=$(( (1 << 10) - 1 ))
+   local client_prefix=$(( (app_id << 48) | (1 << 40) | group_mask ))
+   local sibling_prefix=$(( (app_id << 48) | (2 << 40) | group_mask ))
+   local cousin_prefix=$(( (app_id << 48) | (3 << 40) | group_mask ))
+   local seeding_prefix=$(( (app_id << 48) | (4 << 40) | group_mask ))
+   local sharding_prefix=$(( (app_id << 48) | (5 << 40) | group_mask ))
+
 
    cat > "${out_json}" <<EOF
 {

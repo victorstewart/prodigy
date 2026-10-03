@@ -100,12 +100,24 @@ static inline bool mothershipVirtualDatacenterWriteFile(String& path, const Stri
   return true;
 }
 
-static inline void mothershipVirtualDatacenterMachineAddresses(uint32_t index, bool fakeIpv4Boundary, String& private4, String& private6, String& public6)
+static inline void mothershipVirtualDatacenterMachineAddresses(
+    uint32_t index, uint8_t datacenterFragment, bool fakeIpv4Boundary,
+    String& private4, String& private6, String& public6)
 {
+  const uint32_t domain = uint32_t(datacenterFragment) - 1;
   char host[9] = {};
+  char private6Domain[9] = {};
   std::snprintf(host, sizeof(host), "%x", 9 + index);
-  private4.snprintf<"10.0.0.{itoa}"_ctv>(uint64_t(9 + index));
-  private6.snprintf<"fd00:10::{}"_ctv>(String(host));
+  std::snprintf(private6Domain, sizeof(private6Domain), "%x", domain);
+  private4.snprintf<"10.0.{itoa}.{itoa}"_ctv>(uint64_t(domain), uint64_t(9 + index));
+  if (domain == 0)
+  {
+    private6.snprintf<"fd00:10::{}"_ctv>(String(host));
+  }
+  else
+  {
+    private6.snprintf<"fd00:10:{}::{}"_ctv>(String(private6Domain), String(host));
+  }
   if (fakeIpv4Boundary)
   {
     public6.snprintf<"2602:fac0:0:12ab:34cd::{}"_ctv>(String(host));
@@ -120,7 +132,8 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
 {
   topology = {};
   topology.version = 1;
-  if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.test.machineCount == 0 || cluster.nBrains == 0 || cluster.nBrains > cluster.test.machineCount)
+  if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.datacenterFragment == 0 ||
+      cluster.test.machineCount == 0 || cluster.nBrains == 0 || cluster.nBrains > cluster.test.machineCount)
   {
     if (failure)
     {
@@ -140,7 +153,7 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
     String private4 = {};
     String private6 = {};
     String public6 = {};
-    mothershipVirtualDatacenterMachineAddresses(index, cluster.test.enableFakeIpv4Boundary, private4, private6, public6);
+    mothershipVirtualDatacenterMachineAddresses(index, cluster.datacenterFragment, cluster.test.enableFakeIpv4Boundary, private4, private6, public6);
 
     ClusterMachine machine = {};
     machine.source = ClusterMachineSource::created;

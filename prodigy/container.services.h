@@ -110,6 +110,10 @@ static inline bool prodigyBuildContainerServiceDefinitions(
     ProdigyContainerServiceDefinitions& definitions)
 {
   definitions = {};
+  if (context.isStateful && (!deployment.isStateful || !context.roles.hasDistinctServices()))
+  {
+    return false;
+  }
   definitions.subscriptions = deployment.subscriptions;
   definitions.advertisements = deployment.advertisements;
 
@@ -117,11 +121,6 @@ static inline bool prodigyBuildContainerServiceDefinitions(
   {
     return true;
   }
-  if (deployment.isStateful == false)
-  {
-    return false;
-  }
-
   auto addAdvertisement = [&](uint64_t service, ContainerState startAt) {
     definitions.advertisements.emplace_back(service, startAt, ContainerState::destroying, 0);
   };
