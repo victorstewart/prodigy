@@ -56,7 +56,10 @@ enum class MothershipTopic : uint16_t {
   // Durable placement-policy admission is independently framed so unsupported
   // controllers cannot silently accept a shifted deployment request.
   commitDeploymentPlacementPolicy,
-  updateProdigyAdmitted
+  updateProdigyAdmitted,
+  // Versioned identity receipt for cross-cluster coordinators.  Appended so
+  // older controllers reject the request rather than decoding a shifted frame.
+  pullDeploymentIdentity
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -135,6 +138,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "commitDeploymentPlacementPolicy";
     case MothershipTopic::updateProdigyAdmitted:
       return "updateProdigyAdmitted";
+    case MothershipTopic::pullDeploymentIdentity:
+      return "pullDeploymentIdentity";
   }
 
   return "unknown";

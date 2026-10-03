@@ -338,6 +338,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
         return consumeVariable(cursor, terminal) && consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case MothershipTopic::pullTaskReport:
+    case MothershipTopic::pullDeploymentIdentity:
       {
         uint64_t deploymentID = 0;
         if (extractFixed(cursor, terminal, deploymentID) == false)

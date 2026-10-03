@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,6 +24,148 @@ constexpr static const char *mothershipVirtualDatacenterProvisionedFilename = "v
 constexpr static const char *mothershipVirtualDatacenterMembersProvisionedFilename = "virtual-datacenter.members-provisioned";
 constexpr static const char *mothershipVirtualDatacenterSeedRuntimeFilename = "virtual-datacenter.seed-runtime";
 constexpr static const char *mothershipVirtualDatacenterRuntimeFilename = "virtual-datacenter.runtime";
+constexpr static const char *mothershipVirtualDatacenterPairBoundaryRoot = "/mnt/prodigy-vdc-pairs";
+
+// This is an Mothership-owned, test-provider descriptor.  It deliberately has
+// no application or controller authority: its sole purpose is to bind a
+// provider boundary to identities Mothership has already admitted and durably
+// recorded.  The provider rechecks the live runtime and selected machine
+// against these fields before it changes a namespace.
+class MothershipVirtualDatacenterPairBoundaryDescriptor {
+public:
+  String operationID;
+  String sourceClusterUUID;
+  String targetClusterUUID;
+  String sourceWorkspace;
+  String targetWorkspace;
+  String sourceRuntimeIdentity;
+  String targetRuntimeIdentity;
+  String sourceParentNamespace;
+  String targetParentNamespace;
+  uint32_t sourceMachineIndex = 0;
+  uint32_t targetMachineIndex = 0;
+  String sourceMachinePrivate4;
+  String targetMachinePrivate4;
+  String endpointIPv4;
+  uint16_t endpointPort = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipVirtualDatacenterPairBoundaryDescriptor& descriptor)
+{
+  serializer.text1b(descriptor.operationID, 34);
+  serializer.text1b(descriptor.sourceClusterUUID, 34);
+  serializer.text1b(descriptor.targetClusterUUID, 34);
+  serializer.text1b(descriptor.sourceWorkspace, UINT32_MAX);
+  serializer.text1b(descriptor.targetWorkspace, UINT32_MAX);
+  serializer.text1b(descriptor.sourceRuntimeIdentity, 32);
+  serializer.text1b(descriptor.targetRuntimeIdentity, 32);
+  serializer.text1b(descriptor.sourceParentNamespace, 32);
+  serializer.text1b(descriptor.targetParentNamespace, 32);
+  serializer.value4b(descriptor.sourceMachineIndex);
+  serializer.value4b(descriptor.targetMachineIndex);
+  serializer.text1b(descriptor.sourceMachinePrivate4, 15);
+  serializer.text1b(descriptor.targetMachinePrivate4, 15);
+  serializer.text1b(descriptor.endpointIPv4, 15);
+  serializer.value2b(descriptor.endpointPort);
+}
+
+static inline bool mothershipVirtualDatacenterPairBoundaryTokenValid(const String& value, uint32_t minimum, uint32_t maximum)
+{
+  if (value.size() < minimum || value.size() > maximum)
+  {
+    return false;
+  }
+  for (char byte : value)
+  {
+    if (byte <= ' ' || byte == '/' || byte == '\\')
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+static inline bool mothershipVirtualDatacenterPairBoundaryHexIDValid(const String& value)
+{
+  uint128_t parsed = 0;
+  return prodigyParseCanonicalHex128(value, parsed);
+}
+
+static inline bool mothershipVirtualDatacenterPairBoundaryRuntimeValid(const String& value)
+{
+  if (value.empty() || value[0] == '0')
+  {
+    return false;
+  }
+  uint64_t parsed = 0;
+  for (char byte : value)
+  {
+    if (byte < '0' || byte > '9' || parsed > (UINT64_MAX - uint64_t(byte - '0')) / 10)
+    {
+      return false;
+    }
+    parsed = parsed * 10 + uint64_t(byte - '0');
+  }
+  return parsed > 1;
+}
+
+static inline bool mothershipVirtualDatacenterPairBoundaryDescriptorValid(
+    const MothershipVirtualDatacenterPairBoundaryDescriptor& descriptor, String *failure = nullptr)
+{
+  String sourceWorkspace = descriptor.sourceWorkspace, targetWorkspace = descriptor.targetWorkspace;
+  String endpointText = descriptor.endpointIPv4, sourceIP = descriptor.sourceMachinePrivate4, targetIP = descriptor.targetMachinePrivate4;
+  auto reject = [&](const char *reason) -> bool {
+    if (failure) failure->assign(reason);
+    return false;
+  };
+  if (!mothershipVirtualDatacenterPairBoundaryHexIDValid(descriptor.operationID) ||
+      !mothershipVirtualDatacenterPairBoundaryHexIDValid(descriptor.sourceClusterUUID) ||
+      !mothershipVirtualDatacenterPairBoundaryHexIDValid(descriptor.targetClusterUUID) ||
+      descriptor.sourceClusterUUID == descriptor.targetClusterUUID)
+  {
+    return reject("pair boundary requires distinct canonical operation and cluster IDs");
+  }
+  if (descriptor.sourceWorkspace.size() < 2 || descriptor.targetWorkspace.size() < 2 ||
+      descriptor.sourceWorkspace[0] != '/' || descriptor.targetWorkspace[0] != '/' ||
+      descriptor.sourceWorkspace == descriptor.targetWorkspace || descriptor.sourceWorkspace[descriptor.sourceWorkspace.size() - 1] == '/' ||
+      descriptor.targetWorkspace[descriptor.targetWorkspace.size() - 1] == '/' ||
+      std::strstr(sourceWorkspace.c_str(), "/../") != nullptr || std::strstr(targetWorkspace.c_str(), "/../") != nullptr ||
+      std::strchr(sourceWorkspace.c_str(), '\n') != nullptr || std::strchr(targetWorkspace.c_str(), '\n') != nullptr)
+  {
+    return reject("pair boundary requires distinct canonical workspaces");
+  }
+  if (!mothershipVirtualDatacenterPairBoundaryRuntimeValid(descriptor.sourceRuntimeIdentity) ||
+      !mothershipVirtualDatacenterPairBoundaryRuntimeValid(descriptor.targetRuntimeIdentity) ||
+      descriptor.sourceRuntimeIdentity == descriptor.targetRuntimeIdentity ||
+      descriptor.sourceMachineIndex == 0 || descriptor.targetMachineIndex == 0 ||
+      descriptor.sourceMachineIndex > 128 || descriptor.targetMachineIndex > 128 ||
+      !mothershipVirtualDatacenterPairBoundaryTokenValid(descriptor.sourceMachinePrivate4, 7, 15) ||
+      !mothershipVirtualDatacenterPairBoundaryTokenValid(descriptor.targetMachinePrivate4, 7, 15))
+  {
+    return reject("pair boundary runtime or selected machine identity is invalid");
+  }
+  String expectedSourceNamespace = {};
+  expectedSourceNamespace.snprintf<"pvd-p-{}"_ctv>(descriptor.sourceRuntimeIdentity);
+  String expectedTargetNamespace = {};
+  expectedTargetNamespace.snprintf<"pvd-p-{}"_ctv>(descriptor.targetRuntimeIdentity);
+  if (descriptor.sourceParentNamespace != expectedSourceNamespace || descriptor.targetParentNamespace != expectedTargetNamespace)
+  {
+    return reject("pair boundary parent namespace does not match runtime identity");
+  }
+  in_addr endpoint = {}, sourcePrivate4 = {}, targetPrivate4 = {};
+  if (::inet_pton(AF_INET, endpointText.c_str(), &endpoint) != 1 || descriptor.endpointPort == 0 ||
+      (ntohl(endpoint.s_addr) & 0xfffe0000u) != 0xc6120000u ||
+      ::inet_pton(AF_INET, sourceIP.c_str(), &sourcePrivate4) != 1 ||
+      ::inet_pton(AF_INET, targetIP.c_str(), &targetPrivate4) != 1 ||
+      (ntohl(sourcePrivate4.s_addr) & 0xff000000u) != 0x0a000000u || (ntohl(targetPrivate4.s_addr) & 0xff000000u) != 0x0a000000u)
+  {
+    return reject("pair boundary endpoint or machine IPv4 identity is invalid");
+  }
+  if (failure) failure->clear();
+  return true;
+}
+
 
 static inline void mothershipVirtualDatacenterPath(const String& workspaceRoot, const char *name, String& path)
 {

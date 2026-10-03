@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <unistd.h>
 
@@ -14,8 +15,14 @@ static String digest(char value)
 
 int main(void)
 {
-  String path = {};
-  path.snprintf<"/tmp/prodigy-upgrade-admission-registry-{itoa}"_ctv>(uint64_t(getpid()));
+  char directoryTemplate[] = "/tmp/prodigy-upgrade-admission-registry-XXXXXX";
+  char *directory = ::mkdtemp(directoryTemplate);
+  assert(directory != nullptr);
+  struct ScopedTestDirectory {
+    std::filesystem::path path;
+    ~ScopedTestDirectory() { std::filesystem::remove_all(path); }
+  } ownedDirectory {directory};
+  String path(directory);
   MothershipClusterRegistry registry(path);
   MothershipUpgradeAdmissionRecord request = {};
   request.clusterUUID = uint128_t(0xA11);
@@ -61,6 +68,47 @@ int main(void)
   incomplete.masterUUID = 0;
   assert(!registry.recordUpgradeAdmission(incomplete, recorded, resumed, &failure));
   assert(failure == "upgrade admission record is invalid"_ctv);
-  std::filesystem::remove_all(path.c_str());
+  MothershipTestPairBoundaryRecord pair = {}, pairStored = {}, pairLoaded = {};
+  pair.boundary.operationID = "0x0abc"_ctv;
+  pair.boundary.sourceClusterUUID = "0x0a11"_ctv;
+  pair.boundary.targetClusterUUID = "0x0a22"_ctv;
+  pair.boundary.sourceWorkspace = "/tmp/source"_ctv;
+  pair.boundary.targetWorkspace = "/tmp/target"_ctv;
+  pair.boundary.sourceRuntimeIdentity = "1001"_ctv;
+  pair.boundary.targetRuntimeIdentity = "1002"_ctv;
+  pair.boundary.sourceParentNamespace = "pvd-p-1001"_ctv;
+  pair.boundary.targetParentNamespace = "pvd-p-1002"_ctv;
+  pair.boundary.sourceMachineIndex = pair.boundary.targetMachineIndex = 1;
+  pair.boundary.sourceMachinePrivate4 = "10.0.0.10"_ctv;
+  pair.boundary.targetMachinePrivate4 = "10.0.1.10"_ctv;
+  pair.boundary.endpointIPv4 = "198.18.0.1"_ctv;
+  pair.boundary.endpointPort = 19090;
+  pair.sourceDeploymentID = 100;
+  pair.targetDeploymentID = 200;
+  pair.sourcePlanSHA256 = digest('a'); pair.targetPlanSHA256 = digest('b');
+  pair.sourceBlobSHA256 = digest('c'); pair.targetBlobSHA256 = digest('c');
+  assert(registry.admitTestPairBoundary(pair, pairStored, &failure));
+  assert(registry.loadTestPairBoundary(pair.boundary.operationID, pairLoaded, &failure));
+  assert(MothershipClusterRegistry::testPairBoundaryIdentityMatches(pair, pairLoaded));
+  assert(registry.admitTestPairBoundary(pair, pairStored, &failure));
+  auto changed = pair;
+  changed.targetPlanSHA256 = digest('d');
+  assert(!registry.admitTestPairBoundary(changed, pairStored, &failure));
+  changed = pair; changed.boundary.operationID = "0x0abd"_ctv;
+  assert(!registry.admitTestPairBoundary(changed, pairStored, &failure));
+  changed = pair; changed.boundary.operationID = "0x000abc"_ctv;
+  assert(!registry.admitTestPairBoundary(changed, pairStored, &failure));
+  bool ownsBoundary = false;
+  assert(registry.clusterHasOpenTestPairBoundary(uint128_t(0xa11), ownsBoundary, &failure) && ownsBoundary);
+  assert(registry.clusterHasOpenTestPairBoundary(uint128_t(0xa22), ownsBoundary, &failure) && ownsBoundary);
+  assert(!registry.clusterHasOpenTestPairBoundary(0, ownsBoundary, &failure) && !ownsBoundary &&
+         failure == "test pair boundary cluster UUID is required"_ctv);
+  assert(registry.advanceTestPairBoundary(pair, 1, false, pairStored, &failure));
+  assert(!registry.advanceTestPairBoundary(pair, 1, false, pairLoaded, &failure)); // stale generation
+  assert(!registry.advanceTestPairBoundary(pairStored, 0, false, pairLoaded, &failure));
+  assert(registry.advanceTestPairBoundary(pairStored, 1, true, pairLoaded, &failure));
+  assert(registry.clusterHasOpenTestPairBoundary(uint128_t(0xa11), ownsBoundary, &failure) && !ownsBoundary);
+  assert(!registry.admitTestPairBoundary(pair, pairStored, &failure)); // closed ID cannot resurrect
+  assert(!registry.advanceTestPairBoundary(pairLoaded, 1, false, pairStored, &failure));
   return 0;
 }

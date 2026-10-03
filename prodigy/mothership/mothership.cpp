@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/un.h>
@@ -11104,6 +11105,211 @@ private:
                operationText.c_str(), unsigned(index), oldSHA.c_str(), successorSHA.c_str());
   }
 
+  struct TestPairLifecycleLock {
+    int fd = -1;
+    ~TestPairLifecycleLock() { if (fd >= 0) ::close(fd); }
+  };
+
+  bool lockTestPairLifecycle(TestPairLifecycleLock& lock, String& failure)
+  {
+    String path = {};
+    { auto registry = openClusterRegistry(); path = registry.path(); }
+    path.append(".test-pair-lifecycle.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      failure.assign("another test pair lifecycle operation is active"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool readDeploymentIdentity(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
+                              DeploymentIdentityReport& report, String& failure)
+  {
+    report = {};
+    socket.close();
+    String targetName = cluster.name;
+    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullDeploymentIdentity, deploymentID);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullDeploymentIdentity);
+    if (!response) { failure.assign("deployment identity observation unavailable"_ctv); socket.close(); return false; }
+    uint8_t *args = response->args;
+    String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) &&
+                       report.version == 1 && report.found && report.live &&
+                       report.clusterUUID == cluster.clusterUUID && report.deploymentID == deploymentID;
+    socket.close();
+    if (!valid) failure.assign("exact live deployment identity is unavailable"_ctv);
+    return valid;
+  }
+
+  bool testPairDeploymentReady(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
+                               uint32_t machineIndex, const String& vip, uint16_t port,
+                               DeploymentIdentityReport& report, String& failure)
+  {
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.test.enableFakeIpv4Boundary ||
+        cluster.nBrains != 3 || cluster.test.machineCount != 3 || machineIndex == 0 || machineIndex > 3)
+    {
+      failure.assign("pair endpoint qualification requires independent three-Brain test clusters without fake boundaries"_ctv);
+      return false;
+    }
+    String expectedAddress = {}, private6 = {}, public6 = {};
+    mothershipVirtualDatacenterMachineAddresses(machineIndex, cluster.datacenterFragment, false,
+                                                expectedAddress, private6, public6);
+    uint128_t expectedMachine = 0;
+    for (const ClusterMachine& machine : cluster.topology.machines)
+    {
+      bool matches = false;
+      for (const ClusterMachineAddress& address : machine.addresses.privateAddresses)
+        if (address.address == expectedAddress) matches = true;
+      if (matches)
+      {
+        if (expectedMachine != 0) { failure.assign("ambiguous test machine identity"_ctv); return false; }
+        expectedMachine = machine.uuid;
+      }
+    }
+    if (expectedMachine == 0) { failure.assign("test machine identity is unavailable"_ctv); return false; }
+    if (!readDeploymentIdentity(cluster, deploymentID, report, failure)) return false;
+    if (!report.profileEligible || report.observedEndpointIPv4 != vip || report.observedEndpointPort != port ||
+        report.observedEndpointMachineUUID != expectedMachine ||
+        report.nTarget != 1 || report.nHealthy != report.nTarget || report.nDeployed != report.nTarget ||
+        !prodigyIsSHA256HexDigest(report.canonicalPlanSHA256) || !prodigyIsSHA256HexDigest(report.containerBlobSHA256))
+    {
+      failure.assign("pair endpoint deployment is not the exact healthy single-machine stateless TCP profile"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool runTestPairProvider(const MothershipTestPairBoundaryRecord& record, const char *action,
+                           const Vector<String>& extra, String& failure)
+  {
+    const auto& d = record.boundary;
+    if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(d, &failure)) return false;
+    Vector<String> args = {};
+    args.emplace_back(std::strcmp(action, "prepare") == 0 ? "--pair-launch" : "--pair-action");
+    if (std::strcmp(action, "prepare") != 0) args.emplace_back(action);
+    String directory = {}; directory.snprintf<"{}/{}"_ctv>(String(mothershipVirtualDatacenterPairBoundaryRoot), d.operationID);
+    args.push_back(directory); args.push_back(d.operationID); args.push_back(d.sourceClusterUUID); args.push_back(d.targetClusterUUID);
+    args.push_back(d.sourceWorkspace); args.push_back(d.sourceRuntimeIdentity);
+    args.emplace_back(); args.back().assignItoa(d.sourceMachineIndex); args.push_back(d.sourceMachinePrivate4);
+    args.push_back(d.targetWorkspace); args.push_back(d.targetRuntimeIdentity);
+    args.emplace_back(); args.back().assignItoa(d.targetMachineIndex); args.push_back(d.targetMachinePrivate4);
+    args.push_back(d.endpointIPv4); args.emplace_back(); args.back().assignItoa(d.endpointPort);
+    for (const String& value : extra) args.push_back(value);
+    return mothershipRunVirtualDatacenterProvider(std::move(args), &failure);
+  }
+
+  void runPrepareTestPairBoundary(int argc, char *argv[])
+  {
+    String failure = {};
+    TestPairLifecycleLock lock;
+    if (argc != 9 || !lockTestPairLifecycle(lock, failure))
+    {
+      basics_log("prepareTestPairBoundary success=0 failure=%s\n", failure.empty() ? "expected source target operationID sourceDeploymentID targetDeploymentID sourceMachineIndex targetMachineIndex IPv4 TCPport" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipTestPairBoundaryRecord requested = {}, recorded = {};
+    auto& d = requested.boundary;
+    d.operationID.assign(argv[2]); d.endpointIPv4.assign(argv[7]);
+    uint64_t si = 0, ti = 0, port = 0;
+    uint128_t op = 0;
+    MothershipProdigyCluster source = {}, target = {};
+    bool valid = prodigyParseCanonicalHex128(d.operationID, op) && op != 0 &&
+                 mothershipParseUnsignedArgument(argv[3], UINT64_MAX, requested.sourceDeploymentID) &&
+                 mothershipParseUnsignedArgument(argv[4], UINT64_MAX, requested.targetDeploymentID) &&
+                 mothershipParseUnsignedArgument(argv[5], 3, si) && si > 0 &&
+                 mothershipParseUnsignedArgument(argv[6], 3, ti) && ti > 0 &&
+                 mothershipParseUnsignedArgument(argv[8], UINT16_MAX, port) && port > 0;
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), source, &failure) &&
+              registry.getClusterByIdentity(String(argv[1]), target, &failure) && source.clusterUUID != target.clusterUUID;
+    }
+    d.sourceMachineIndex = uint32_t(si); d.targetMachineIndex = uint32_t(ti); d.endpointPort = uint16_t(port);
+    DeploymentIdentityReport sr = {}, tr = {};
+    valid = valid && testPairDeploymentReady(source, requested.sourceDeploymentID, uint32_t(si), d.endpointIPv4, uint16_t(port), sr, failure) &&
+                     testPairDeploymentReady(target, requested.targetDeploymentID, uint32_t(ti), d.endpointIPv4, uint16_t(port), tr, failure);
+    if (valid)
+    {
+      d.sourceClusterUUID.assignItoh(source.clusterUUID);
+      d.targetClusterUUID.assignItoh(target.clusterUUID);
+      d.sourceWorkspace = source.test.workspaceRoot; d.targetWorkspace = target.test.workspaceRoot;
+      String path = {};
+      mothershipVirtualDatacenterPath(d.sourceWorkspace, "virtual-datacenter.identity", path);
+      valid = mothershipReadProcFile(path, d.sourceRuntimeIdentity);
+      mothershipVirtualDatacenterPath(d.targetWorkspace, "virtual-datacenter.identity", path);
+      valid = valid && mothershipReadProcFile(path, d.targetRuntimeIdentity);
+      while (!d.sourceRuntimeIdentity.empty() && d.sourceRuntimeIdentity[d.sourceRuntimeIdentity.size() - 1] == '\n') d.sourceRuntimeIdentity.resize(d.sourceRuntimeIdentity.size() - 1);
+      while (!d.targetRuntimeIdentity.empty() && d.targetRuntimeIdentity[d.targetRuntimeIdentity.size() - 1] == '\n') d.targetRuntimeIdentity.resize(d.targetRuntimeIdentity.size() - 1);
+      d.sourceParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.sourceRuntimeIdentity);
+      d.targetParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.targetRuntimeIdentity);
+      String private6 = {}, public6 = {};
+      mothershipVirtualDatacenterMachineAddresses(uint32_t(si), source.datacenterFragment, false, d.sourceMachinePrivate4, private6, public6);
+      mothershipVirtualDatacenterMachineAddresses(uint32_t(ti), target.datacenterFragment, false, d.targetMachinePrivate4, private6, public6);
+      requested.sourcePlanSHA256 = sr.canonicalPlanSHA256; requested.targetPlanSHA256 = tr.canonicalPlanSHA256;
+      requested.sourceBlobSHA256 = sr.containerBlobSHA256; requested.targetBlobSHA256 = tr.containerBlobSHA256;
+      if (valid) { auto registry = openClusterRegistry(); valid = registry.admitTestPairBoundary(requested, recorded, &failure); }
+    }
+    valid = valid && runTestPairProvider(recorded, "prepare", {}, failure);
+    basics_log("prepareTestPairBoundary success=%u operationID=%s migrationQualified=0 failure=%s\n", unsigned(valid), d.operationID.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runPairBoundary(int argc, char *argv[])
+  {
+    if (argc != 2) { basics_log("pairBoundary expects operationID query|selectTarget|drain|remove|crashOwner\n"); exit(EXIT_FAILURE); }
+    const bool select = std::strcmp(argv[1], "selectTarget") == 0;
+    const bool remove = std::strcmp(argv[1], "remove") == 0;
+    if (!select && !remove && std::strcmp(argv[1], "query") != 0 && std::strcmp(argv[1], "drain") != 0 && std::strcmp(argv[1], "crashOwner") != 0) exit(EXIT_FAILURE);
+    String failure = {};
+    TestPairLifecycleLock lock;
+    if (!lockTestPairLifecycle(lock, failure)) { basics_log("pairBoundary success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    MothershipTestPairBoundaryRecord record = {};
+    bool valid = false;
+    { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure); }
+    if (valid && record.closed)
+    {
+      basics_log("pairBoundary success=%u closed=1\n", unsigned(remove));
+      if (!remove) exit(EXIT_FAILURE);
+      return;
+    }
+    if (valid && select)
+    {
+      MothershipProdigyCluster source = {}, target = {};
+      { auto registry = openClusterRegistry(); valid = registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) && registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure); }
+      DeploymentIdentityReport sr = {}, tr = {};
+      valid = valid && testPairDeploymentReady(source, record.sourceDeploymentID, record.boundary.sourceMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, sr, failure) &&
+                       testPairDeploymentReady(target, record.targetDeploymentID, record.boundary.targetMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, tr, failure) &&
+                       sr.canonicalPlanSHA256 == record.sourcePlanSHA256 && tr.canonicalPlanSHA256 == record.targetPlanSHA256 &&
+                       sr.containerBlobSHA256 == record.sourceBlobSHA256 && tr.containerBlobSHA256 == record.targetBlobSHA256;
+      if (valid) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, 1, false, updated, &failure); if (valid) record = updated; }
+    }
+    valid = valid && runTestPairProvider(record, argv[1], {}, failure);
+    if (valid && remove) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, record.selectorGeneration, true, updated, &failure); }
+    basics_log("pairBoundary success=%u operation=%s migrationQualified=0 failure=%s\n", unsigned(valid), argv[1], failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runProbePairBoundary(int argc, char *argv[])
+  {
+    String failure = {};
+    uint64_t deployment = 0, count = 0, interval = 0;
+    MothershipTestPairBoundaryRecord record = {};
+    bool valid = argc == 4 && mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deployment) && deployment > 0 &&
+                 mothershipParseUnsignedArgument(argv[2], 1024, count) && count > 0 &&
+                 mothershipParseUnsignedArgument(argv[3], 60000, interval) && (count - 1) * interval <= 50000;
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure) && !record.closed && (deployment == record.sourceDeploymentID || deployment == record.targetDeploymentID); }
+    Vector<String> extra = {};
+    if (valid) { for (int index = 1; index != 4; ++index) extra.emplace_back(argv[index]); valid = runTestPairProvider(record, "probe", extra, failure); }
+    basics_log("probePairBoundary success=%u failure=%s\n", unsigned(valid), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runProbeTestCluster(int argc, char *argv[])
   {
     if (argc != 7)
@@ -11548,7 +11754,30 @@ private:
     printManagedCluster(desiredCluster);
   }
 
-  void runDeploy(int argc, char *argv[])
+  enum class DeploymentDispatchState : uint8_t {
+    rejected,
+    ambiguous,
+    accepted,
+    finished,
+  };
+
+  struct DeploymentDispatchResult {
+    DeploymentDispatchState state = DeploymentDispatchState::rejected;
+    uint32_t nBase = 0;
+    uint32_t nSurge = 0;
+    uint32_t nFit = 0;
+    String failure = {};
+  };
+
+  // Dispatches one already parsed and validated plan over the ordinary
+  // measureApplication/spinApplication control path.  An accepted result is
+  // deliberately not a readiness assertion: test-cluster callers continue to
+  // prove readiness using the existing report/probe owners.
+  bool dispatchValidatedDeployment(DeploymentPlan& plan,
+                                   const String& containerPath,
+                                   bool returnAfterInitialSpinOkay,
+                                   bool emitCLIOutput,
+                                   DeploymentDispatchResult& result)
   {
     const bool debugDeploy = (std::getenv("PRODIGY_MOTHERSHIP_DEBUG_DEPLOY") != nullptr);
     auto debugLog = [debugDeploy](const char *stage) -> void {
@@ -11558,17 +11787,228 @@ private:
         std::fflush(stdout);
       }
     };
-
-    if (argc < 3)
+    result = {};
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, plan);
+    String contractFailure = {};
+    if (Filesystem::fileExists(containerPath) == false)
     {
-      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
-      exit(EXIT_FAILURE);
+      result.failure.assign("no file exists at containerPath provided"_ctv);
+      if (emitCLIOutput) basics_log("no file exists at containerPath provided\n");
+      return false;
+    }
+    if (mothershipValidateDiscombobulatorContainerBlobContract(containerPath, &contractFailure) == false)
+    {
+      result.failure.snprintf<"container artifact rejected: {}"_ctv>(contractFailure);
+      if (emitCLIOutput) basics_log("container artifact rejected: %s\n", contractFailure.c_str());
+      return false;
+    }
+    if (socket.ensureConnected() == false)
+    {
+      result.failure = socket.connectFailureDetail();
+      if (result.failure.empty()) result.failure.assign("failed to connect to deployment control target"_ctv);
+      return false;
     }
 
-    String json;
-    if (resolveJSONArgument("deploy", argv[1], json) == false)
+    debugLog("socket_connected");
+    socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
+    uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::measureApplication);
+    Message::appendValue(socket.wBuffer, serializedPlan);
+    Message::finish(socket.wBuffer, headerOffset);
+    debugLog("measure_serialized");
+    if (socket.send() == false)
     {
-      exit(EXIT_FAILURE);
+      result.failure = socket.ioFailureDetail();
+      if (result.failure.empty()) result.failure.assign("failed to send measureApplication"_ctv);
+      return false;
+    }
+    debugLog("measure_sent");
+
+    Message *response = socket.recvExpectedTopic(MothershipTopic::measureApplication);
+    if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::measureApplication)
+    {
+      result.failure.assign("measureApplication response missing or unexpected"_ctv);
+      return false;
+    }
+    debugLog("measure_received");
+    uint8_t *args = response->args;
+    if (Message::extractArg<ArgumentNature::fixed>(args, result.nBase) == false ||
+        Message::extractArg<ArgumentNature::fixed>(args, result.nSurge) == false ||
+        Message::extractArg<ArgumentNature::fixed>(args, result.nFit) == false || args != response->terminal())
+    {
+      result.failure.assign("measureApplication response is malformed"_ctv);
+      return false;
+    }
+    if (result.nFit < result.nBase + result.nSurge)
+    {
+      result.failure.snprintf<"we would need to schedule {} base instances and {} surge instances, but the cluster can only fit {} total instances"_ctv>(
+          result.nBase, result.nSurge, result.nFit);
+      return false;
+    }
+    if (emitCLIOutput)
+      basics_log("we will schedule %u base instances and %u surge instances", result.nBase, result.nSurge);
+
+    socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
+    uint32_t spinHeaderOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::spinApplication);
+    Message::append(socket.wBuffer, plan.config.applicationID);
+    Message::appendValue(socket.wBuffer, serializedPlan);
+    debugLog("spin_plan_serialized");
+    Message::appendFile(socket.wBuffer, containerPath);
+    debugLog("spin_blob_appended");
+    Message::finish(socket.wBuffer, spinHeaderOffset);
+    if (socket.send() == false)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure = socket.ioFailureDetail();
+      if (result.failure.empty()) result.failure.assign("spinApplication send outcome is unknown"_ctv);
+      return false;
+    }
+    debugLog("spin_sent");
+
+    response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
+    if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::spinApplication)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response missing or unexpected"_ctv);
+      return false;
+    }
+    debugLog("spin_received");
+    args = response->args;
+    uint8_t responseCode = 0;
+    if (Message::extractArg<ArgumentNature::fixed>(args, responseCode) == false)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response is truncated"_ctv);
+      return false;
+    }
+    String responseMessage = {};
+    if (args != response->terminal()) Message::extractToStringView(args, responseMessage);
+    if (args != response->terminal())
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response is malformed"_ctv);
+      return false;
+    }
+    if (SpinApplicationResponseCode(responseCode) != SpinApplicationResponseCode::okay)
+    {
+      if (SpinApplicationResponseCode(responseCode) == SpinApplicationResponseCode::invalidPlan)
+      {
+        if (emitCLIOutput && responseMessage.size() > 0)
+        {
+          String owned = {}; owned.assign(responseMessage); owned.addNullTerminator(); basics_log("%s\n", owned.c_str());
+        }
+        if (emitCLIOutput) basics_log("SpinApplicationResponseCode::invalidPlan\n");
+      }
+      else if (emitCLIOutput)
+      {
+        basics_log("deploy failed: unexpected initial spinApplication frame %u\n", responseCode);
+      }
+      if (responseMessage.empty()) result.failure.snprintf<"deploy failed: unexpected initial spinApplication frame {}"_ctv>(unsigned(responseCode));
+      else result.failure.assign(responseMessage);
+      return false;
+    }
+
+    result.state = DeploymentDispatchState::accepted;
+    if (emitCLIOutput) basics_log("SpinApplicationResponseCode::okay\n");
+    if (returnAfterInitialSpinOkay)
+    {
+      socket.close();
+      return true;
+    }
+
+    for (;;)
+    {
+      response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
+      if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::spinApplication)
+      {
+        result.failure.assign("terminal spinApplication response missing or unexpected"_ctv);
+        return false;
+      }
+      args = response->args;
+      if (Message::extractArg<ArgumentNature::fixed>(args, responseCode) == false)
+      {
+        result.failure.assign("terminal spinApplication response is truncated"_ctv);
+        return false;
+      }
+      responseMessage.clear();
+      if (args != response->terminal()) Message::extractToStringView(args, responseMessage);
+      if (args != response->terminal())
+      {
+        result.failure.assign("terminal spinApplication response is malformed"_ctv);
+        return false;
+      }
+      switch (SpinApplicationResponseCode(responseCode))
+      {
+        case SpinApplicationResponseCode::progress:
+          if (emitCLIOutput && responseMessage.size() > 0)
+          {
+            String owned = {}; owned.assign(responseMessage); owned.addNullTerminator();
+            basics_log("%s\n", owned.c_str());
+          }
+          continue;
+        case SpinApplicationResponseCode::finished:
+          if (emitCLIOutput && responseMessage.size() > 0)
+          {
+            TaskExecutionRecord record = {};
+            if (BitseryEngine::deserializeSafe(responseMessage, record))
+              basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
+                         (unsigned long long)record.executionID, prodigyTaskExecutionPolicyName(record.policy),
+                         prodigyTaskExecutionStateName(record.state), unsigned(record.currentAttemptNumber),
+                         unsigned(record.attemptsStarted), unsigned(record.attemptsSucceeded), unsigned(record.attemptsFailed),
+                         unsigned(record.attemptsLost), unsigned(record.attemptsCancelled), (long long)record.completedAtMs,
+                         (long long)record.expiresAtMs, unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
+          }
+          result.state = DeploymentDispatchState::finished;
+          socket.close();
+          return true;
+        case SpinApplicationResponseCode::failed:
+        case SpinApplicationResponseCode::invalidPlan:
+          if (emitCLIOutput)
+          {
+            basics_log(SpinApplicationResponseCode(responseCode) == SpinApplicationResponseCode::failed ? "SpinApplicationResponseCode::failed\n" : "SpinApplicationResponseCode::invalidPlan\n");
+            if (responseMessage.size() > 0)
+            {
+              String owned = {}; owned.assign(responseMessage); owned.addNullTerminator(); basics_log("%s\n", owned.c_str());
+            }
+          }
+          result.state = DeploymentDispatchState::rejected;
+          result.failure = responseMessage;
+          if (result.failure.empty()) result.failure.assign("spinApplication rejected deployment"_ctv);
+          return false;
+        case SpinApplicationResponseCode::okay:
+        default:
+          result.failure.snprintf<"unexpected terminal spinApplication frame {}"_ctv>(unsigned(responseCode));
+          return false;
+      }
+    }
+  }
+
+  bool prepareDeploymentPlan(const char *target,
+                             const char *jsonArgument,
+                             const char *artifactArgument,
+                             DeploymentPlan& preparedPlan,
+                             String& preparedArtifactPath,
+                             bool& returnAfterInitialSpinOkay,
+                             String& deploymentFailure)
+  {
+    deploymentFailure.clear();
+    preparedPlan = {};
+    preparedArtifactPath.clear();
+    returnAfterInitialSpinOkay = false;
+    const bool debugDeploy = (std::getenv("PRODIGY_MOTHERSHIP_DEBUG_DEPLOY") != nullptr);
+    auto debugLog = [debugDeploy](const char *stage) -> void {
+      if (debugDeploy)
+      {
+        basics_log("DEPLOY_DEBUG stage=%s\n", stage);
+        std::fflush(stdout);
+      }
+    };
+
+    String json;
+    if (resolveJSONArgument("deploy", jsonArgument, json) == false)
+    {
+      deploymentFailure.assign("deployment JSON argument could not be resolved"_ctv);
+      return false;
     }
     json.need(simdjson::SIMDJSON_PADDING);
 
@@ -11577,17 +12017,18 @@ private:
     if (parser.parse(json.data(), json.size()).get(doc))
     {
       basics_log("invalid deployment plan json\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
-    bool returnAfterInitialSpinOkay = (std::strcmp(argv[0], "dev") == 0);
-    if (returnAfterInitialSpinOkay == false && std::strcmp(argv[0], "local") != 0)
+    returnAfterInitialSpinOkay = (std::strcmp(target, "dev") == 0);
+    if (returnAfterInitialSpinOkay == false && std::strcmp(target, "local") != 0)
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       MothershipProdigyCluster targetCluster = {};
       String clusterLookupFailure = {};
       String clusterIdentity = {};
-      clusterIdentity.setInvariant(argv[0]);
+      clusterIdentity.setInvariant(target);
       if (clusterRegistry.getClusterByIdentity(clusterIdentity, targetCluster, &clusterLookupFailure))
       {
         // Test clusters validate readiness via explicit follow-up probes. Do
@@ -11599,9 +12040,10 @@ private:
       }
     }
 
-    if (!configureControlTarget(argv[0]))
+    if (!configureControlTarget(target))
     {
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     DeploymentPlan plan {};
@@ -11626,7 +12068,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("config requires a document\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         bool hasConfigType = false;
@@ -11643,7 +12086,8 @@ private:
             if (mothershipParseApplicationCPUIsolationMode(subfield.value, plan.config, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             break;
@@ -11660,7 +12104,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("config.type requires a string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -11689,7 +12134,8 @@ private:
             else
             {
               basics_log("config.type not recognized\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("taskExecutionPolicy"_ctv))
@@ -11697,7 +12143,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("config.taskExecutionPolicy requires a string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -11715,7 +12162,8 @@ private:
             else
             {
               basics_log("config.taskExecutionPolicy not recognized\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("capabilities"_ctv))
@@ -11723,7 +12171,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::ARRAY)
             {
               basics_log("config.capabilities requires an array\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             for (auto item : subfield.value.get_array())
@@ -11731,7 +12180,8 @@ private:
               if (item.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("config.capabilities requires all string array members\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -11760,7 +12210,8 @@ private:
               else
               {
                 basics_log("config.capabilities capability is not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -11770,23 +12221,27 @@ private:
             if (mothershipParseApplicationIsolationField(subkey, subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("allowedMachineTypes"_ctv))
           {
             basics_log("config.allowedMachineTypes removed; scheduling is resource-based\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("preferredMachineTypes"_ctv))
           {
             basics_log("config.preferredMachineTypes removed; scheduling is resource-based\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("machineResourceCriteria"_ctv))
           {
             basics_log("config.machineResourceCriteria removed; place minGPUs, gpuMemoryGB, nicSpeedGbps, and any internet thresholds directly on config\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("applicationID"_ctv))
           {
@@ -11798,7 +12253,8 @@ private:
               if (value <= 0 || value > UINT16_MAX)
               {
                 basics_log("config.applicationID value invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               plan.config.applicationID = uint16_t(value);
@@ -11810,13 +12266,15 @@ private:
               if (socket.resolveApplicationIDReference(reference, plan.config.applicationID, false) == false)
               {
                 basics_log("config.applicationID symbolic reference invalid or unreserved; reserveApplicationID first\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("config.applicationID requires an integer or symbolic reference string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("versionID"_ctv))
@@ -11824,7 +12282,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("config.versionID requires a number\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11833,7 +12292,8 @@ private:
             if (value <= 0 || value > 281'474'976'710'655) // max 48 bit unsigned
             {
               basics_log("config.versionID value invalid\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.config.versionID = uint64_t(value);
@@ -11844,7 +12304,8 @@ private:
             if (mothershipParseApplicationArchitectureField(subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("requiredIsaFeatures"_ctv))
@@ -11853,7 +12314,8 @@ private:
             if (mothershipParseApplicationRequiredIsaFeaturesField(subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else
@@ -11865,7 +12327,8 @@ private:
             else if (sizeFailure.size() > 0)
             {
               basics_log("%s\n", sizeFailure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else
             {
@@ -11876,12 +12339,14 @@ private:
               else if (criteriaFailure.size() > 0)
               {
                 basics_log("%s\n", criteriaFailure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("nHugepages2MB"_ctv))
               {
                 basics_log("config.nHugepages2MB was removed because hugepages are no longer used\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("isolateCPUs"_ctv))
               {
@@ -11889,7 +12354,8 @@ private:
                 if (mothershipParseApplicationCPUIsolationMode(subfield.value, plan.config, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("nLogicalCores"_ctv))
@@ -11898,7 +12364,8 @@ private:
                 if (mothershipParseApplicationCPURequest(subfield.value, plan.config, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("maxPids"_ctv))
@@ -11908,7 +12375,8 @@ private:
                         subfield.value, plan.config, "config"_ctv, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("isolatedChildMemoryMB"_ctv))
@@ -11918,20 +12386,23 @@ private:
                         subfield.value, plan.config, "config"_ctv, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("nThreads"_ctv))
               {
                 basics_log("config.nThreads was removed because thread count is no longer an application-config knob\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("msTilHealthy"_ctv)) // maximum 32 seconds
               {
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.msTilHealthy requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11940,7 +12411,8 @@ private:
                 if (value <= 0 || value > 32'000)
                 {
                   basics_log("config.msTilHealthy value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.msTilHealthy = uint32_t(value);
@@ -11950,7 +12422,8 @@ private:
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.sTilHealthcheck requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11959,7 +12432,8 @@ private:
                 if (value <= 0 || value > 60'000)
                 {
                   basics_log("config.sTilHealthcheck value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.sTilHealthcheck = uint32_t(value);
@@ -11969,7 +12443,8 @@ private:
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.sTilKillable requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11978,7 +12453,8 @@ private:
                 if (value <= 0 || value > 120'000)
                 {
                   basics_log("config.sTilKillable value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.sTilKillable = uint32_t(value);
@@ -11986,17 +12462,20 @@ private:
               else if (subkey.equal("needsPublic6"_ctv))
               {
                 basics_log("config.needsPublic6 removed; use whiteholes on DeploymentPlan\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("needsPublic4"_ctv))
               {
                 basics_log("config.needsPublic4 removed; use whiteholes on DeploymentPlan\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else
               {
                 basics_log("config.%s invalid field\n", subkey.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -12008,29 +12487,34 @@ private:
           if (mothershipValidateApplicationMachineSelectionFields(plan.config, "config"_ctv, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (mothershipValidateApplicationRuntimeRequirements(plan.config, "config"_ctv, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
         if (hasConfigType == false)
         {
           basics_log("config requires type parameter\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
         if (plan.config.type == ApplicationType::task && hasTaskExecutionPolicy == false)
         {
           basics_log("config.taskExecutionPolicy required for ApplicationType::task\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
         if (plan.config.type != ApplicationType::task && hasTaskExecutionPolicy)
         {
           basics_log("config.taskExecutionPolicy is valid only for ApplicationType::task\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("tls"_ctv))
@@ -12042,7 +12526,8 @@ private:
         if (mothershipParseDeploymentPlanTlsPolicy(field.value, plan, resolveApplicationIDReference, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("apiCredentials"_ctv))
@@ -12054,7 +12539,8 @@ private:
         if (mothershipParseDeploymentPlanApiCredentials(field.value, plan, resolveApplicationIDReference, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("minimumSubscriberCapacity"_ctv)) // minimum value 1024 for now
@@ -12062,7 +12548,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("minimumSubscriberCapacity requires a number\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -12071,7 +12558,8 @@ private:
         if (value < 1024)
         {
           basics_log("minimumSubscriberCapacity value invalid\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.minimumSubscriberCapacity = uint32_t(value);
@@ -12081,13 +12569,15 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("horizontalScalers requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.verticalScalers.size() > 0)
         {
           basics_log("can't submit both horizontal and vertical scalers\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12095,7 +12585,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("horizontalScalers requires HorizontalScaler array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           HorizontalScaler& scaler = plan.horizontalScalers.emplace_back();
@@ -12113,7 +12604,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String metricName;
@@ -12145,13 +12637,15 @@ private:
               else
               {
                 basics_log("horizontalScalers.percentile requires a number\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (!(value > 0.0 && value <= 100.0))
               {
                 basics_log("horizontalScalers.percentile must be in (0, 100]\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.percentile = value;
@@ -12160,14 +12654,16 @@ private:
             else if (key.equal("operation"_ctv))
             {
               basics_log("horizontalScalers.operation is not supported; use percentile + threshold + direction\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("direction"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.direction requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12186,7 +12682,8 @@ private:
               else
               {
                 basics_log("horizontalScalers.direction must be upscale or downscale\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("lookbackSeconds"_ctv))
@@ -12194,7 +12691,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.lookbackSeconds requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12203,7 +12701,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.lookbackSeconds must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.lookbackSeconds = uint32_t(value);
@@ -12211,14 +12710,16 @@ private:
             else if (key.equal("nIntervals"_ctv))
             {
               basics_log("horizontalScalers.nIntervals is not supported; use lookbackSeconds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("threshold"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::DOUBLE)
               {
                 basics_log("horizontalScalers.threshold requires a double\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               double value = 0.0;
@@ -12227,7 +12728,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.threshold must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.threshold = value;
@@ -12235,14 +12737,16 @@ private:
             else if (key.equal("upscaleThreshold"_ctv) || key.equal("downscaleThreshold"_ctv))
             {
               basics_log("horizontalScalers.%s is not supported; use threshold + direction\n", key.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("minValue"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.minValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12251,7 +12755,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.minValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.minValue = uint32_t(value);
@@ -12261,7 +12766,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.maxValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12270,7 +12776,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.maxValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.maxValue = uint32_t(value);
@@ -12280,7 +12787,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.lifetime requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12299,56 +12807,65 @@ private:
               else
               {
                 basics_log("horizontalScalers.lifetime ApplicationLifetime either invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("config.horizontalScalers bad field in HorizontalScaler\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (scaler.name.size() == 0)
           {
             basics_log("config.horizontalScalers name field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasPercentile == false)
           {
             basics_log("config.horizontalScalers percentile field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.lookbackSeconds == 0)
           {
             basics_log("config.horizontalScalers lookbackSeconds field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.threshold == 0)
           {
             basics_log("config.horizontalScalers threshold field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasDirection == false)
           {
             basics_log("config.horizontalScalers direction field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasLifetime == false)
           {
             basics_log("config.horizontalScalers lifetime field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.minValue > 0 && scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
           {
             basics_log("config.horizontalScalers minValue cannot exceed maxValue\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
@@ -12357,13 +12874,15 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("verticalScalers requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.horizontalScalers.size() > 0)
         {
           basics_log("can't submit both horizontal and vertical scalers\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12371,7 +12890,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("verticalScalers requires VerticalScaler array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           VerticalScaler& scaler = plan.verticalScalers.emplace_back();
@@ -12389,7 +12909,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String metricName;
@@ -12421,13 +12942,15 @@ private:
               else
               {
                 basics_log("verticalScalers.percentile requires a number\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (!(value > 0.0 && value <= 100.0))
               {
                 basics_log("verticalScalers.percentile must be in (0, 100]\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.percentile = value;
@@ -12436,14 +12959,16 @@ private:
             else if (key.equal("operation"_ctv))
             {
               basics_log("verticalScalers.operation is not supported; use percentile + threshold + direction\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("direction"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.direction requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12462,7 +12987,8 @@ private:
               else
               {
                 basics_log("verticalScalers.direction must be upscale or downscale\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("lookbackSeconds"_ctv))
@@ -12470,7 +12996,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.lookbackSeconds requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12479,7 +13006,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.lookbackSeconds must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.lookbackSeconds = uint32_t(value);
@@ -12487,14 +13015,16 @@ private:
             else if (key.equal("nIntervals"_ctv))
             {
               basics_log("verticalScalers.nIntervals is not supported; use lookbackSeconds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("threshold"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::DOUBLE)
               {
                 basics_log("verticalScalers.threshold requires a double\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               double value = 0.0;
@@ -12503,7 +13033,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.threshold must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.threshold = value;
@@ -12511,14 +13042,16 @@ private:
             else if (key.equal("upscaleThreshold"_ctv) || key.equal("downscaleThreshold"_ctv))
             {
               basics_log("verticalScalers.%s is not supported; use threshold + direction\n", key.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("resource"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.resource requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12531,7 +13064,8 @@ private:
               else
               {
                 basics_log("verticalScalers.resource ScalingDimension invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("increment"_ctv))
@@ -12539,7 +13073,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.increment requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12548,7 +13083,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.increment must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.increment = uint32_t(value);
@@ -12558,7 +13094,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.minValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12567,7 +13104,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.minValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.minValue = uint32_t(value);
@@ -12577,7 +13115,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.maxValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12586,7 +13125,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.maxValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.maxValue = uint32_t(value);
@@ -12594,56 +13134,65 @@ private:
             else
             {
               basics_log("config.verticalScalers bad field in VerticalScaler\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (scaler.name.size() == 0)
           {
             basics_log("config.verticalScalers name field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasPercentile == false)
           {
             basics_log("config.verticalScalers percentile field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.lookbackSeconds == 0)
           {
             basics_log("config.verticalScalers lookbackSeconds field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.threshold == 0)
           {
             basics_log("config.verticalScalers threshold field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasDirection == false)
           {
             basics_log("config.verticalScalers direction field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasResource == false)
           {
             basics_log("config.verticalScalers resource field of ScalingDimension required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.increment == 0)
           {
             basics_log("config.verticalScalers increment field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
           {
             basics_log("config.verticalScalers minValue cannot exceed maxValue\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
@@ -12652,7 +13201,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("isStateful requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -12666,7 +13216,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("stateful requires a StatefulDeploymentPlan\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_object())
@@ -12679,7 +13230,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.clientPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12688,7 +13240,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.clientPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.clientPrefix = value;
@@ -12698,7 +13251,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.siblingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12707,7 +13261,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.siblingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.siblingPrefix = value;
@@ -12717,7 +13272,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.cousinPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12726,7 +13282,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.cousinPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.cousinPrefix = value;
@@ -12736,7 +13293,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.seedingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12745,7 +13303,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.seedingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.seedingPrefix = value;
@@ -12755,7 +13314,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.shardingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12764,7 +13324,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.shardingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.shardingPrefix = value;
@@ -12774,7 +13335,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.allowUpdateInPlace requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12786,7 +13348,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.seedingAlways requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12798,7 +13361,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.neverShard requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12810,7 +13374,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.allMasters requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12820,38 +13385,44 @@ private:
           else
           {
             basics_log("stateful invalid field\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
 
         if (plan.stateful.clientPrefix == 0)
         {
           basics_log("stateful.clientPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.siblingPrefix == 0)
         {
           basics_log("stateful.siblingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.cousinPrefix == 0)
         {
           basics_log("stateful.cousinPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.seedingPrefix == 0)
         {
           basics_log("stateful.seedingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.shardingPrefix == 0)
         {
           basics_log("stateful.shardingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("stateless"_ctv))
@@ -12859,7 +13430,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("stateless requires a StatelessDeploymentPlan\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_object())
@@ -12872,7 +13444,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateless.nBase requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12881,7 +13454,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.nBase must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.nBase = uint32_t(value);
@@ -12891,7 +13465,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::DOUBLE)
             {
               basics_log("stateless.maxPerRackRatio requires a float\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             double value = 0.0;
@@ -12900,7 +13475,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.maxPerRackRatio must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.maxPerRackRatio = float(value);
@@ -12910,7 +13486,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::DOUBLE)
             {
               basics_log("stateless.maxPerMachineRatio requires a float\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             double value = 0.0;
@@ -12919,7 +13496,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.maxPerMachineRatio must be >0\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.maxPerMachineRatio = float(value);
@@ -12929,7 +13507,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("canaryCount requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12938,7 +13517,8 @@ private:
             if (value < 0)
             {
               basics_log("canaryCount must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.canaryCount = uint32_t(value);
@@ -12948,7 +13528,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("canariesMustLiveForMinutes requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12957,7 +13538,8 @@ private:
             if (value <= 0)
             {
               basics_log("canariesMustLiveForMinutes must be >0\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.canariesMustLiveForMinutes = uint32_t(value);
@@ -12967,7 +13549,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateless.moveableDuringCompaction requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12977,32 +13560,37 @@ private:
           else
           {
             basics_log("stateless invalid field\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
 
         if (plan.stateless.nBase == 0)
         {
           basics_log("stateless.nBase required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateless.maxPerRackRatio == 0)
         {
           basics_log("stateless.maxPerRackRatio required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateless.maxPerMachineRatio == 0)
         {
           basics_log("stateless.maxPerMachineRatio required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.canaryCount > 0 && plan.canariesMustLiveForMinutes == 0)
         {
           basics_log("canariesMustLiveForMinutes required if canaryCount > 0\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("canaryCount"_ctv))
@@ -13010,7 +13598,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("canaryCount requires an integer\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -13019,7 +13608,8 @@ private:
         if (value < 0)
         {
           basics_log("canaryCount must be positive\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.canaryCount = uint32_t(value);
@@ -13029,7 +13619,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("canariesMustLiveForMinutes requires an integer\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -13038,7 +13629,8 @@ private:
         if (value <= 0)
         {
           basics_log("canariesMustLiveForMinutes must be >0\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.canariesMustLiveForMinutes = uint32_t(value);
@@ -13048,7 +13640,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("wormholes requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -13056,7 +13649,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("wormholes requires Wormhole array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Wormhole& wormhole = plan.wormholes.emplace_back();
@@ -13077,7 +13671,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.externalAddress requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (inet_pton(AF_INET, item.value.get_c_str(), wormhole.externalAddress.v6) == 1)
@@ -13091,7 +13686,8 @@ private:
               else
               {
                 basics_log("wormholes.externalAddress is invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               addressWasSet = true;
@@ -13101,14 +13697,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.name.assign(item.value.get_c_str());
               if (wormhole.name.size() == 0)
               {
                 basics_log("wormhole.name cannot be empty\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("externalPort"_ctv))
@@ -13116,7 +13714,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("wormhole.externalPort requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -13125,7 +13724,8 @@ private:
               if (value <= 0)
               {
                 basics_log("wormhole.externalPort must be >0\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.externalPort = uint16_t(value);
@@ -13135,7 +13735,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("wormhole.containerPort requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               int64_t value = 0;
               (void)item.value.get(value);
@@ -13143,7 +13744,8 @@ private:
               if (value <= 0)
               {
                 basics_log("wormhole.containerPort must be >0\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.containerPort = uint16_t(value);
@@ -13153,7 +13755,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.layer4 requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13170,7 +13773,8 @@ private:
               else
               {
                 basics_log("wormhole.layer4 invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("isQuic"_ctv))
@@ -13178,7 +13782,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::BOOL)
               {
                 basics_log("wormhole.isQuic requires a bool\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               {
                 bool b = false;
@@ -13194,7 +13799,8 @@ private:
               if (mothershipParseServiceUserCapacity(item.value, wormhole.userCapacity, context, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("quicCidKeyRotationHours"_ctv))
@@ -13203,7 +13809,8 @@ private:
               if (mothershipParseWormholeQuicCidKeyRotationHours(item.value, wormhole, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               quicCidKeyRotationHoursWasSet = true;
@@ -13213,7 +13820,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.source requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13222,7 +13830,8 @@ private:
               if (parseExternalAddressSource(value, wormhole.source) == false)
               {
                 basics_log("wormhole.source invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               sourceWasSet = true;
@@ -13232,7 +13841,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.routablePrefixUUID requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value = {};
@@ -13240,14 +13850,16 @@ private:
               if (value.size() == 0)
               {
                 basics_log("wormhole.routablePrefixUUID cannot be empty\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.routablePrefixUUID = String::numberFromHexString<uint128_t>(value);
               if (wormhole.routablePrefixUUID == 0)
               {
                 basics_log("wormhole.routablePrefixUUID invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               routablePrefixUUIDWasSet = true;
@@ -13258,7 +13870,8 @@ private:
               if (mothershipParseWormholeTlsResumptionConfig(item.value, wormhole.tlsResumption, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.hasTlsResumptionConfig = true;
@@ -13269,7 +13882,8 @@ private:
               if (mothershipParseWormholeDNSConfig(item.value, wormhole.dns, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.hasDNSConfig = true;
@@ -13280,13 +13894,15 @@ private:
               if (mothershipParseWormholePublicTLSConfig(item.value, publicTLS, publicTLSEnabled, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("wormhole invalid field\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
@@ -13299,69 +13915,82 @@ private:
           if (addressWasSet == false && routablePrefixUUIDWasSet == false && dnsBinding == false)
           {
             basics_log("wormhole.externalAddress or wormhole.routablePrefixUUID field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.externalPort == 0)
           {
             basics_log("wormhole.externalPort field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.containerPort == 0)
           {
             basics_log("wormhole.containerPort field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.layer4 == 0)
           {
             basics_log("wormhole.layer4 field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (sourceWasSet == false)
           {
             basics_log("wormhole.source field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (addressWasSet && routablePrefixUUIDWasSet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("wormhole.externalAddress and wormhole.routablePrefixUUID are mutually exclusive\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet == false && dnsBinding == false)
           {
             basics_log("wormhole.source=registeredRoutablePrefix requires wormhole.routablePrefixUUID\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet)
           {
             basics_log("wormhole.routablePrefixUUID requires source=registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("wormhole.dns requires source=registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.isQuic && wormhole.layer4 != IPPROTO_UDP)
           {
             basics_log("wormhole.isQuic requires layer4 == UDP\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (quicCidKeyRotationHoursWasSet && wormhole.isQuic == false)
           {
             basics_log("wormhole.quicCidKeyRotationHours requires wormhole.isQuic\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.hasTlsResumptionConfig)
           {
             if (wormhole.name.size() == 0)
             {
               basics_log("wormhole.name required when wormhole.tlsResumption.enabled\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (wormholeSupportsTlsResumption(wormhole) == false)
             {
               basics_log("wormhole.tlsResumption.enabled requires TCP or QUIC-over-UDP wormhole\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           if (publicTLSEnabled)
@@ -13369,12 +13998,14 @@ private:
             if (wormhole.name.size() == 0)
             {
               basics_log("wormhole.name required when wormhole.publicTLS.enabled\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (wormhole.hasDNSConfig == false)
             {
               basics_log("wormhole.publicTLS requires wormhole.dns\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (publicTLS.identityName.size() == 0)
             {
@@ -13387,7 +14018,8 @@ private:
             if (publicTLS.domains.size() == 0 && wormhole.dns.bindingName.size() == 0)
             {
               basics_log("wormhole.publicTLS requires domains, wormhole.dns.name, or wormhole.dns.bindingName\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             publicTLS.wormholeName = wormhole.name;
             plan.publicTLS.push_back(std::move(publicTLS));
@@ -13399,7 +14031,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("whiteholes requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -13407,7 +14040,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("whiteholes requires object array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Whitehole need = {};
@@ -13427,13 +14061,15 @@ private:
               if (countWasSet)
               {
                 basics_log("whiteholes.count may only be specified once\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               String failure;
               if (mothershipParseWhiteholeCount(item.value, count, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               countWasSet = true;
               continue;
@@ -13442,7 +14078,8 @@ private:
             if (item.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("whiteholes transport, family, and source require strings\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -13453,7 +14090,8 @@ private:
               if (parseExternalAddressTransport(value, need.transport) == false)
               {
                 basics_log("whiteholes.transport invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               transportWasSet = true;
@@ -13463,7 +14101,8 @@ private:
               if (parseExternalAddressFamily(value, need.family) == false)
               {
                 basics_log("whiteholes.family invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               familyWasSet = true;
@@ -13473,7 +14112,8 @@ private:
               if (parseExternalAddressSource(value, need.source) == false)
               {
                 basics_log("whiteholes.source invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               sourceWasSet = true;
@@ -13481,51 +14121,59 @@ private:
             else
             {
               basics_log("whiteholes invalid field\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (transportWasSet == false)
           {
             basics_log("whiteholes.transport required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (familyWasSet == false)
           {
             basics_log("whiteholes.family required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (sourceWasSet == false)
           {
             basics_log("whiteholes.source required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (need.source != ExternalAddressSource::hostPublicAddress && need.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           String failure;
           if (mothershipAppendWhiteholeDeclaration(plan.whiteholes, need, count, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
       else if (key.equal("externalAddressNeeds"_ctv))
       {
         basics_log("externalAddressNeeds removed; use whiteholes on DeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       else if (key.equal("requiresPublic6"_ctv) || key.equal("requiresPublic4"_ctv))
       {
         basics_log("%.*s removed; use whiteholes on DeploymentPlan\n", int(key.size()), key.data());
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       else if (key.equal("useHostNetworkNamespace"_ctv))
       {
@@ -13533,7 +14181,8 @@ private:
         if (mothershipParseDeploymentPlanUseHostNetworkNamespace(field.value, plan, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("networkAccess"_ctv))
@@ -13542,7 +14191,8 @@ private:
         if (mothershipParseDeploymentPlanNetworkAccess(field.value, plan, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("subscriptions"_ctv))
@@ -13550,7 +14200,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("subscriptions requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -13558,7 +14209,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("subscriptions requires Subscription array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Subscription subscription;
@@ -13573,14 +14225,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               auto rawValue = item.value.get_string();
               if (rawValue.error())
               {
                 basics_log("subscription.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13603,7 +14257,8 @@ private:
               else
               {
                 basics_log("subscription.service service provided invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("startAt"_ctv)) // ContainerState
@@ -13611,7 +14266,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.startAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13628,7 +14284,8 @@ private:
               else
               {
                 basics_log("subscription.startAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("stopAt"_ctv)) // ContainerState
@@ -13636,7 +14293,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.stopAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13657,7 +14315,8 @@ private:
               else
               {
                 basics_log("subscription.stopAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("nature"_ctv)) // SubscriptionNature
@@ -13665,7 +14324,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.nature requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13686,7 +14346,8 @@ private:
               else
               {
                 basics_log("subscription.nature SubscriptionNature provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -13694,25 +14355,29 @@ private:
           if (subscription.service == 0)
           {
             basics_log("subscription requires service parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(subscription.startAt) == 0)
           {
             basics_log("subscription requires startAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(subscription.stopAt) == 0)
           {
             basics_log("subscription requires stopAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint8_t(subscription.nature) == 0)
           {
             basics_log("subscription requires nature parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           bool replacedSubscription = false;
@@ -13737,7 +14402,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("advertisements requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -13745,7 +14411,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("advertisements requires Advertisement array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Advertisement advertisement;
@@ -13760,14 +14427,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               auto rawValue = item.value.get_string();
               if (rawValue.error())
               {
                 basics_log("advertisement.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13790,7 +14459,8 @@ private:
               else
               {
                 basics_log("advertisement.service service provided invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("startAt"_ctv))
@@ -13798,7 +14468,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.startAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13815,7 +14486,8 @@ private:
               else
               {
                 basics_log("advertisement.startAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("stopAt"_ctv))
@@ -13823,7 +14495,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.stopAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -13844,7 +14517,8 @@ private:
               else
               {
                 basics_log("advertisement.stopAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("port"_ctv))
@@ -13852,7 +14526,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("advertisement.port requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -13865,7 +14540,8 @@ private:
               else
               {
                 basics_log("advertisement.port value invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("userCapacity"_ctv))
@@ -13876,7 +14552,8 @@ private:
               if (mothershipParseServiceUserCapacity(item.value, advertisement.userCapacity, context, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -13884,25 +14561,29 @@ private:
           if (advertisement.service == 0)
           {
             basics_log("advertisement requires service parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(advertisement.startAt) == 0)
           {
             basics_log("advertisement requires startAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(advertisement.stopAt) == 0)
           {
             basics_log("advertisement requires stopAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (advertisement.port == 0)
           {
             basics_log("advertisement requires port parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           bool replacedAdvertisement = false;
@@ -13927,7 +14608,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("moveConstructively requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -13941,7 +14623,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("requiresDatacenterUniqueTag requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -13953,20 +14636,23 @@ private:
       else
       {
         basics_log("invalid DeploymentPlan field\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
     if (plan.config.nLogicalCores == 0)
     {
       basics_log("ApplicationConfig is required\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     if (plan.config.applicationID == MeshRegistry::Radar::applicationID && plan.config.nLogicalCores < radarMinimumLogicalCores)
     {
       basics_log("Radar requires config.nLogicalCores >= %u\n", radarMinimumLogicalCores);
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     if (plan.wormholes.size() > 0)
@@ -13974,13 +14660,15 @@ private:
       if (plan.isStateful)
       {
         basics_log("wormholes require stateless applications\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       if (wormholeTargetBindingsUnique(plan.wormholes) == false)
       {
         basics_log("wormholes require unique containerPort and layer4 targets\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       for (uint32_t index = 0; index < plan.wormholes.size(); index += 1)
@@ -13989,26 +14677,30 @@ private:
         if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
           basics_log("wormholes currently require source == distributableSubnet or registeredRoutablePrefix\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         const bool dnsBinding = wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0;
         if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && wormhole.routablePrefixUUID == 0 && dnsBinding == false)
         {
           basics_log("wormholes with source == registeredRoutablePrefix require routablePrefixUUID\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
           basics_log("wormholes with dns require source == registeredRoutablePrefix\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.isQuic && wormhole.layer4 != IPPROTO_UDP)
         {
           basics_log("wormholes with isQuic require layer4 == UDP\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.hasTlsResumptionConfig)
@@ -14020,7 +14712,8 @@ private:
                 wormhole.name.equal(other.name))
             {
               basics_log("resumption-enabled wormholes require unique names\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
         }
@@ -14034,7 +14727,8 @@ private:
         if (whiteholeDeclarationValid(whitehole) == false)
         {
           basics_log("whiteholes declaration invalid\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
     }
@@ -14044,7 +14738,8 @@ private:
       if (mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false)
       {
         basics_log("%s\n", failure.c_str());
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
@@ -14053,12 +14748,14 @@ private:
       if (!StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices())
       {
         basics_log("stateful mesh roles must identify distinct services\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.stateless.nBase > 0)
       {
         basics_log("isStateful but provided StatelessDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
     else
@@ -14066,7 +14763,8 @@ private:
       if (plan.stateful.clientPrefix > 0)
       {
         basics_log("isStateful == false but provided StatefulDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
@@ -14075,32 +14773,38 @@ private:
       if (plan.isStateful)
       {
         basics_log("task deployments cannot be stateful\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.stateful.clientPrefix > 0)
       {
         basics_log("task deployments cannot provide StatefulDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.stateless.nBase > 0)
       {
         basics_log("task deployments use an implicit single attempt and cannot provide StatelessDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.canaryCount > 0 || plan.canariesMustLiveForMinutes > 0)
       {
         basics_log("task deployments cannot configure canaries\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.horizontalScalers.empty() == false || plan.verticalScalers.empty() == false)
       {
         basics_log("task deployments cannot configure scalers\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.wormholes.empty() == false || plan.publicTLS.empty() == false || plan.advertisements.empty() == false)
       {
         basics_log("task deployments cannot publish inbound services\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       plan.isStateful = false;
@@ -14119,19 +14823,22 @@ private:
       if (plan.tlsIssuancePolicy.applicationID != plan.config.applicationID)
       {
         basics_log("tls.applicationID must match config.applicationID\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
     if (plan.hasApiCredentialPolicy == false)
     {
       basics_log("apiCredentials declaration required\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
     if (plan.apiCredentialPolicy.applicationID != plan.config.applicationID)
     {
       basics_log("apiCredentials.applicationID must match config.applicationID\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     for (HorizontalScaler& scaler : plan.horizontalScalers)
@@ -14148,7 +14855,8 @@ private:
       if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
       {
         basics_log("config.horizontalScalers minValue cannot exceed maxValue\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
@@ -14177,7 +14885,8 @@ private:
         case ScalingDimension::runtimeIngressHandlerComposite:
           {
             basics_log("verticalScalers.resource only supports cpu/memory/storage dimensions\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
       }
 
@@ -14190,7 +14899,8 @@ private:
       if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
       {
         basics_log("config.verticalScalers minValue cannot exceed maxValue\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       switch (scaler.resource)
@@ -14200,7 +14910,8 @@ private:
             if (plan.config.nLogicalCores < scaler.minValue || (scaler.maxValue > 0 && plan.config.nLogicalCores > scaler.maxValue))
             {
               basics_log("config.nLogicalCores must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -14209,7 +14920,8 @@ private:
             if (plan.config.memoryMB < scaler.minValue || (scaler.maxValue > 0 && plan.config.memoryMB > scaler.maxValue))
             {
               basics_log("config.memoryMB must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -14218,7 +14930,8 @@ private:
             if (plan.config.storageMB < scaler.minValue || (scaler.maxValue > 0 && plan.config.storageMB > scaler.maxValue))
             {
               basics_log("config.storageMB must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -14226,7 +14939,8 @@ private:
         case ScalingDimension::runtimeIngressHandlerComposite:
           {
             basics_log("verticalScalers.resource only supports cpu/memory/storage dimensions\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
       }
     }
@@ -14238,7 +14952,8 @@ private:
         if (scaler.direction == Scaler::Direction::downscale)
         {
           basics_log("stateful deployments cannot set horizontalScalers.direction=downscale\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
 
@@ -14247,35 +14962,25 @@ private:
         if (scaler.direction == Scaler::Direction::downscale)
         {
           basics_log("stateful deployments cannot set verticalScalers.direction=downscale\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
     }
 
-    // they have to first build the container then pass us the filepath to the compressed blob
+    // Parser validation and target-local symbolic-ID resolution above are the
+    // only plan preparation path.  Artifact validation remains with dispatch,
+    // immediately before the ordinary control-plane side effect.
     String containerPath;
-    containerPath.assign(argv[2]);
+    containerPath.assign(artifactArgument);
 
-    if (Filesystem::fileExists(containerPath) == false)
-    {
-      basics_log("no file exists at containerPath provided\n");
-      exit(EXIT_FAILURE);
-    }
-
-    String contractFailure = {};
-    if (mothershipValidateDiscombobulatorContainerBlobContract(containerPath, &contractFailure) == false)
-    {
-      basics_log("container artifact rejected: %s\n", contractFailure.c_str());
-      exit(EXIT_FAILURE);
-    }
-
-    if (std::strcmp(argv[0], "local") != 0)
+    if (std::strcmp(target, "local") != 0)
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       MothershipProdigyCluster targetCluster = {};
       String lookupFailure = {};
       String clusterIdentity = {};
-      clusterIdentity.setInvariant(argv[0]);
+      clusterIdentity.setInvariant(target);
       if (clusterRegistry.getClusterByIdentity(clusterIdentity, targetCluster, &lookupFailure))
       {
         if (targetCluster.architecture != MachineCpuArchitecture::unknown && plan.config.architecture != targetCluster.architecture)
@@ -14283,265 +14988,44 @@ private:
           basics_log("config.architecture '%s' does not match cluster architecture '%s'\n",
                      machineCpuArchitectureName(plan.config.architecture),
                      machineCpuArchitectureName(targetCluster.architecture));
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment architecture does not match target cluster"_ctv);
+      return false;
         }
       }
     }
 
     debugLog("plan_validated");
+    preparedPlan = std::move(plan);
+    preparedArtifactPath = std::move(containerPath);
+    return true;
+  }
 
-    // we could decompress it and test if it's a btrfs subvolume but.. just don't fuck with us lol
-    // zstd -d /path/to/file.zstd -o /path/to/output
-    // btrfs receive /path/to/mount/point < /path/to/decompressed/file
-
-    if (socket.ensureConnected())
+  void runDeploy(int argc, char *argv[])
+  {
+    if (argc < 3)
     {
-      debugLog("socket_connected");
-      // first measure the application against the cluster to make sure it fits
-      // Reserve for serialized plan
-      socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
-      uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::measureApplication);
-      String serializedPlan;
-      BitseryEngine::serialize(serializedPlan, plan);
-      Message::appendValue(socket.wBuffer, serializedPlan);
-      Message::finish(socket.wBuffer, headerOffset);
-      debugLog("measure_serialized");
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-      debugLog("measure_sent");
-
-      if (Message *response = socket.recvExpectedTopic(MothershipTopic::measureApplication); response)
-      {
-        debugLog("measure_received");
-        if (MothershipTopic(response->topic) != MothershipTopic::measureApplication)
-        {
-          basics_log("measureApplication failed: unexpected response topic %u\n", response->topic);
-          exit(EXIT_FAILURE);
-        }
-
-        uint8_t *args = response->args;
-
-        // nBase(4) nSurge(4) nFit(4)
-
-        uint32_t nBase;
-        Message::extractArg<ArgumentNature::fixed>(args, nBase);
-
-        uint32_t nSurge;
-        Message::extractArg<ArgumentNature::fixed>(args, nSurge);
-
-        uint32_t nFit;
-        Message::extractArg<ArgumentNature::fixed>(args, nFit);
-
-        // nFit -> we can fit this many
-
-        // nBase  -> we would schedule this many base
-        // nSurge -> we would schedule this many surge
-
-        uint32_t nNeeded = nBase + nSurge;
-
-        if (nFit < nNeeded)
-        {
-          basics_log("we would need to schedule %u base instances and %u surge instances, but the cluster can only fit %u total instances", nBase, nSurge, nFit);
-          exit(EXIT_FAILURE);
-        }
-        else
-        {
-          basics_log("we will schedule %u base instances and %u surge instances", nBase, nSurge);
-        }
-      }
-      else
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      // Reserve for plan + file contents size header
-      socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
-      uint32_t spinHeaderOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::spinApplication);
-      Message::append(socket.wBuffer, plan.config.applicationID);
-      Message::appendValue(socket.wBuffer, serializedPlan);
-      debugLog("spin_plan_serialized");
-      Message::appendFile(socket.wBuffer, containerPath);
-      debugLog("spin_blob_appended");
-      Message::finish(socket.wBuffer, spinHeaderOffset);
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-      debugLog("spin_sent");
-
-      if (Message *response = socket.recvExpectedTopic(MothershipTopic::spinApplication); response)
-      {
-        debugLog("spin_received");
-        uint8_t *args = response->args;
-
-        uint8_t responseCode;
-        Message::extractArg<ArgumentNature::fixed>(args, responseCode);
-        String responseMessage;
-        if (args != response->terminal())
-        {
-          Message::extractToStringView(args, responseMessage);
-        }
-        bool spinAccepted = false;
-
-        switch (SpinApplicationResponseCode(responseCode))
-        {
-          case SpinApplicationResponseCode::invalidPlan:
-            {
-              if (responseMessage.size() > 0)
-              {
-                String message = {};
-                message.assign(responseMessage);
-                message.addNullTerminator();
-                basics_log("%s\n", message.c_str());
-              }
-              basics_log("SpinApplicationResponseCode::invalidPlan\n");
-              break;
-            }
-          case SpinApplicationResponseCode::okay:
-            {
-              basics_log("SpinApplicationResponseCode::okay\n");
-              spinAccepted = true;
-              break;
-            }
-          default:
-            {
-              basics_log("deploy failed: unexpected initial spinApplication frame %u\n", responseCode);
-              break;
-            }
-        }
-
-        if (!spinAccepted)
-        {
-          exit(EXIT_FAILURE);
-        }
-
-        // Dev and test harnesses validate readiness with active probes. Do not
-        // block the CLI on the terminal spinApplication frame there.
-        if (returnAfterInitialSpinOkay)
-        {
-          socket.close();
-          return;
-        }
-      }
-      else
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      bool finished = false;
-
-      do // loop until we get the terminal spinApplication frame
-      {
-        Message *response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
-
-        if (response == nullptr)
-        {
-          exit(EXIT_FAILURE);
-        }
-
-        uint8_t *args = response->args;
-
-        uint8_t responseCode;
-        Message::extractArg<ArgumentNature::fixed>(args, responseCode);
-
-        switch (SpinApplicationResponseCode(responseCode))
-        {
-          case SpinApplicationResponseCode::progress:
-            {
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              break;
-            }
-          case SpinApplicationResponseCode::failed:
-            {
-              basics_log("SpinApplicationResponseCode::failed\n");
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              exit(EXIT_FAILURE);
-            }
-          case SpinApplicationResponseCode::finished:
-            {
-              if (args != response->terminal())
-              {
-                String serializedRecord = {};
-                Message::extractToStringView(args, serializedRecord);
-                TaskExecutionRecord record = {};
-                if (BitseryEngine::deserializeSafe(serializedRecord, record))
-                {
-                  basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
-                             (unsigned long long)record.executionID,
-                             prodigyTaskExecutionPolicyName(record.policy),
-                             prodigyTaskExecutionStateName(record.state),
-                             unsigned(record.currentAttemptNumber),
-                             unsigned(record.attemptsStarted),
-                             unsigned(record.attemptsSucceeded),
-                             unsigned(record.attemptsFailed),
-                             unsigned(record.attemptsLost),
-                             unsigned(record.attemptsCancelled),
-                             (long long)record.completedAtMs,
-                             (long long)record.expiresAtMs,
-                             unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
-                }
-              }
-              finished = true;
-              break;
-            }
-          case SpinApplicationResponseCode::invalidPlan:
-            {
-              basics_log("SpinApplicationResponseCode::invalidPlan\n");
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              exit(EXIT_FAILURE);
-            }
-          case SpinApplicationResponseCode::okay:
-          default:
-            break;
-        }
-
-      } while (!finished);
-
-      socket.close();
+      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
+      exit(EXIT_FAILURE);
     }
-    else
+
+    DeploymentPlan plan = {};
+    String containerPath = {};
+    String failure = {};
+    bool returnAfterInitialSpinOkay = false;
+    if (prepareDeploymentPlan(argv[0], argv[1], argv[2], plan, containerPath, returnAfterInitialSpinOkay, failure) == false)
     {
+      if (failure.size() > 0) basics_log("deploy failed: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    DeploymentDispatchResult dispatch = {};
+    if (dispatchValidatedDeployment(plan, containerPath, returnAfterInitialSpinOkay, true, dispatch) == false)
+    {
+      if (dispatch.failure.size() > 0) basics_log("deploy failed: %s\n", dispatch.failure.c_str());
       exit(EXIT_FAILURE);
     }
   }
+
   void runApplicationReport(int argc, char *argv[])
   {
     if (argc < 2)
@@ -17702,12 +18186,28 @@ private:
     }
 
     String failure;
+    TestPairLifecycleLock pairLock;
     MothershipProdigyCluster cluster = {};
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       if (clusterRegistry.getClusterByIdentity(name, cluster, &failure) == false)
       {
         basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n", name.c_str(), (failure.size() ? failure.c_str() : ""));
+        exit(EXIT_FAILURE);
+      }
+    }
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      if (!lockTestPairLifecycle(pairLock, failure))
+      {
+        basics_log("removeCluster success=0 removed=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      auto clusterRegistry = openClusterRegistry();
+      bool ownsBoundary = false;
+      if (!clusterRegistry.clusterHasOpenTestPairBoundary(cluster.clusterUUID, ownsBoundary, &failure) || ownsBoundary)
+      {
+        basics_log("removeCluster success=0 removed=0 failure=%s\n", ownsBoundary ? "remove the owned test pair boundary first" : failure.c_str());
         exit(EXIT_FAILURE);
       }
     }
@@ -20310,11 +20810,14 @@ public:
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
+        {"pairBoundary",                    &Mothership::runPairBoundary                   },
         {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
         {"planUpgrade",                     &Mothership::runPlanUpgrade                     },
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
+        {"prepareTestPairBoundary",         &Mothership::runPrepareTestPairBoundary        },
         {"printClusters",                   &Mothership::runPrintClusters                  },
+        {"probePairBoundary",               &Mothership::runProbePairBoundary              },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
         {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
@@ -20440,6 +20943,13 @@ int main(int argc, char *argv[])
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
+    message.append("prepareTestPairBoundary [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport]\n");
+    message.append("\tqualifies one shared TCP endpoint between two independent three-Brain test clusters; both exact deployments must already be healthy\n");
+    message.append("pairBoundary [operationID] [query|selectTarget|drain|remove|crashOwner]\n");
+    message.append("\tobserves, selects, or removes the test endpoint; selectTarget directs new connections to the target while retaining source connections\n");
+    message.append("\tcrashOwner explicitly kills the disposable endpoint supervisor to test cleanup; it interrupts this test endpoint\n");
+    message.append("probePairBoundary [operationID] [expectedDeploymentID] [count] [intervalMs]\n");
+    message.append("\tobserves runtime identity over one bounded TCP connection; these test operations do not authorize migration or source retirement\n");
     message.append("upsertMachineSchemas [name|clusterUUID] [json object|array]\n");
     message.append("\tremote clusters only; creates or partially overwrites machine schema budget rows keyed by schema, then reconciles created capacity to match\n");
     message.append("deltaMachineBudget [name|clusterUUID] [json]\n");

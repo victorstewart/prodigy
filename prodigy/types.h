@@ -4836,6 +4836,69 @@ public:
   }
 };
 
+// Read-only, versioned observed deployment identity.  It is not a durable
+// admission receipt: it describes the current live or persisted authority
+// view, and a coordinator must not infer a launch or retirement authorization
+// from its absence or presence.
+class DeploymentIdentityReport {
+public:
+  uint32_t version = 1;
+  bool found = false;
+  bool live = false;
+  uint16_t applicationID = 0;
+  uint64_t deploymentID = 0;
+  uint64_t versionID = 0;
+  uint128_t clusterUUID = 0;
+  String canonicalPlanSHA256 = {};
+  String containerBlobSHA256 = {};
+  uint64_t containerBlobBytes = 0;
+  uint64_t authorityGeneration = 0;
+  uint128_t masterUUID = 0;
+  int64_t masterBootNs = 0;
+  DeploymentState state = DeploymentState::none;
+  uint32_t nTarget = 0;
+  uint32_t nDeployed = 0;
+  uint32_t nHealthy = 0;
+  uint32_t acknowledgedPeerCount = 0;
+  bool isStateful = false;
+  bool useHostNetworkNamespace = false;
+  uint128_t observedPrefixUUID = 0;
+  String observedEndpointIPv4 = {};
+  uint16_t observedEndpointPort = 0;
+  uint128_t observedEndpointMachineUUID = 0;
+  bool profileEligible = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, DeploymentIdentityReport& report)
+{
+  serializer.value4b(report.version);
+  serializer.value1b(report.found);
+  serializer.value1b(report.live);
+  serializer.value2b(report.applicationID);
+  serializer.value8b(report.deploymentID);
+  serializer.value8b(report.versionID);
+  serializer.value16b(report.clusterUUID);
+  serializer.text1b(report.canonicalPlanSHA256, 64);
+  serializer.text1b(report.containerBlobSHA256, 64);
+  serializer.value8b(report.containerBlobBytes);
+  serializer.value8b(report.authorityGeneration);
+  serializer.value16b(report.masterUUID);
+  serializer.value8b(report.masterBootNs);
+  serializer.value1b(report.state);
+  serializer.value4b(report.nTarget);
+  serializer.value4b(report.nDeployed);
+  serializer.value4b(report.nHealthy);
+  serializer.value4b(report.acknowledgedPeerCount);
+  serializer.value1b(report.isStateful);
+  serializer.value1b(report.useHostNetworkNamespace);
+  serializer.value16b(report.observedPrefixUUID);
+  serializer.text1b(report.observedEndpointIPv4, 64);
+  serializer.value2b(report.observedEndpointPort);
+  serializer.value16b(report.observedEndpointMachineUUID);
+  serializer.value1b(report.profileEligible);
+}
+
 template <typename S>
 static void serialize(S&& serializer, ApplicationStatusReport& report)
 {

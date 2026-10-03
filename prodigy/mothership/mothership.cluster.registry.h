@@ -12,6 +12,39 @@
 #include <prodigy/mothership/mothership.cluster.types.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
+#include <prodigy/mothership/mothership.virtual.datacenter.h>
+
+// Local endpoint qualification is an operation of the test provider, not a
+// migration receipt. In particular, selecting the target does not authorize
+// retirement of either application or cluster.
+class MothershipTestPairBoundaryRecord {
+public:
+  uint32_t version = 1;
+  MothershipVirtualDatacenterPairBoundaryDescriptor boundary;
+  uint64_t sourceDeploymentID = 0;
+  uint64_t targetDeploymentID = 0;
+  String sourcePlanSHA256;
+  String targetPlanSHA256;
+  String sourceBlobSHA256;
+  String targetBlobSHA256;
+  uint64_t selectorGeneration = 0; // 0=source, 1=target; persist before effect
+  bool closed = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTestPairBoundaryRecord& record)
+{
+  serializer.value4b(record.version);
+  serializer.object(record.boundary);
+  serializer.value8b(record.sourceDeploymentID);
+  serializer.value8b(record.targetDeploymentID);
+  serializer.text1b(record.sourcePlanSHA256, 64);
+  serializer.text1b(record.targetPlanSHA256, 64);
+  serializer.text1b(record.sourceBlobSHA256, 64);
+  serializer.text1b(record.targetBlobSHA256, 64);
+  serializer.value8b(record.selectorGeneration);
+  serializer.value1b(record.closed);
+}
 
 class MothershipProdigyClusterRecordV3 {
 public:
@@ -127,6 +160,7 @@ private:
   constexpr static auto clustersColumnFamily = "clusters"_ctv;
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto upgradeAdmissionsColumnFamily = "upgrade_admissions"_ctv;
+  constexpr static auto testPairBoundariesColumnFamily = "test_pair_boundaries"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -2155,6 +2189,144 @@ public:
   const String& path(void)
   {
     return db.path();
+  }
+
+  static bool testPairBoundaryIdentityMatches(MothershipTestPairBoundaryRecord lhs,
+                                             MothershipTestPairBoundaryRecord rhs)
+  {
+    lhs.selectorGeneration = rhs.selectorGeneration = 0;
+    lhs.closed = rhs.closed = false;
+    String left = {}, right = {};
+    BitseryEngine::serialize(left, lhs);
+    BitseryEngine::serialize(right, rhs);
+    return left == right;
+  }
+
+  static bool testPairBoundaryRecordValid(const MothershipTestPairBoundaryRecord& record)
+  {
+    return record.version == 1 && record.selectorGeneration <= 1 &&
+           mothershipVirtualDatacenterPairBoundaryDescriptorValid(record.boundary) &&
+           record.sourceDeploymentID != 0 && record.targetDeploymentID != 0 &&
+           prodigyIsSHA256HexDigest(record.sourcePlanSHA256) &&
+           prodigyIsSHA256HexDigest(record.targetPlanSHA256) &&
+           prodigyIsSHA256HexDigest(record.sourceBlobSHA256) &&
+           prodigyIsSHA256HexDigest(record.targetBlobSHA256);
+  }
+
+  bool loadTestPairBoundary(const String& operationID, MothershipTestPairBoundaryRecord& record,
+                           String *failure = nullptr)
+  {
+    record = {};
+    String encoded = {};
+    if (!db.read(testPairBoundariesColumnFamily, operationID, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) || !testPairBoundaryRecordValid(record) ||
+        record.boundary.operationID != operationID)
+    {
+      record = {};
+      if (failure) failure->assign("test pair boundary record is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool clusterHasOpenTestPairBoundary(uint128_t clusterUUID, bool& found, String *failure = nullptr)
+  {
+    found = false;
+    if (clusterUUID == 0)
+    {
+      if (failure) failure->assign("test pair boundary cluster UUID is required"_ctv);
+      return false;
+    }
+    String uuid = {};
+    renderClusterUUIDKey(clusterUUID, uuid);
+    Vector<String> values = {};
+    if (!db.listValues(testPairBoundariesColumnFamily, values, failure)) return false;
+    for (const String& encoded : values)
+    {
+      MothershipTestPairBoundaryRecord record = {};
+      if (!BitseryEngine::deserializeSafe(encoded, record) || !testPairBoundaryRecordValid(record))
+      {
+        if (failure) failure->assign("test pair boundary record is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (!record.closed && (record.boundary.sourceClusterUUID == uuid || record.boundary.targetClusterUUID == uuid))
+        found = true;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitTestPairBoundary(const MothershipTestPairBoundaryRecord& requested,
+                            MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    recorded = {};
+    if (!testPairBoundaryRecordValid(requested) || requested.selectorGeneration != 0 || requested.closed)
+    {
+      if (failure) failure->assign("invalid initial test pair boundary identity"_ctv);
+      return false;
+    }
+    // TidesDB owns the process-exclusive registry lock for this entire short
+    // operation. A single record is the conflict index and admission commit;
+    // there is no second key that can be lost between commits after a crash.
+    Vector<String> values = {};
+    if (!db.listValues(testPairBoundariesColumnFamily, values, failure)) return false;
+    bool exists = false;
+    for (const String& encoded : values)
+    {
+      MothershipTestPairBoundaryRecord prior = {};
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || !testPairBoundaryRecordValid(prior))
+      {
+        if (failure) failure->assign("test pair boundary record is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (prior.boundary.operationID == requested.boundary.operationID)
+      {
+        if (!testPairBoundaryIdentityMatches(prior, requested) || prior.closed)
+        {
+          if (failure) failure->assign("test pair boundary operation identity conflicts or is closed"_ctv);
+          return false;
+        }
+        recorded = prior;
+        exists = true;
+        continue;
+      }
+      const auto& a = prior.boundary;
+      const auto& b = requested.boundary;
+      if (!prior.closed && (a.sourceClusterUUID == b.sourceClusterUUID || a.sourceClusterUUID == b.targetClusterUUID ||
+                            a.targetClusterUUID == b.sourceClusterUUID || a.targetClusterUUID == b.targetClusterUUID))
+      {
+        if (failure) failure->assign("a test cluster already owns an open pair boundary"_ctv);
+        return false;
+      }
+    }
+    if (exists) { if (failure) failure->clear(); return true; }
+    String encoded = {};
+    MothershipTestPairBoundaryRecord copy = requested;
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(testPairBoundariesColumnFamily, requested.boundary.operationID, encoded, failure)) return false;
+    recorded = requested;
+    return true;
+  }
+
+  bool advanceTestPairBoundary(const MothershipTestPairBoundaryRecord& expected,
+                              uint64_t nextSelectorGeneration, bool closed,
+                              MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
+    if (!testPairBoundaryIdentityMatches(recorded, expected) ||
+        recorded.selectorGeneration != expected.selectorGeneration || recorded.closed != expected.closed ||
+        nextSelectorGeneration < recorded.selectorGeneration || nextSelectorGeneration > 1 ||
+        (recorded.closed && !closed))
+    {
+      if (failure) failure->assign("test pair boundary transition is stale or regresses ownership"_ctv);
+      return false;
+    }
+    recorded.selectorGeneration = nextSelectorGeneration;
+    recorded.closed = closed;
+    String encoded = {};
+    BitseryEngine::serialize(encoded, recorded);
+    return db.write(testPairBoundariesColumnFamily, recorded.boundary.operationID, encoded, failure);
   }
 
   static bool upgradeAdmissionRequestIdentityMatches(const MothershipUpgradeAdmissionRecord& lhs,

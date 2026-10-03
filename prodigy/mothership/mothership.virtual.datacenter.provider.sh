@@ -558,6 +558,442 @@ probe_datacenter()
    ' _ "${address}" "${port}" "${payload}" "${expected}"
 }
 
+# Pair endpoints live in their own supervisor's mount namespace. The two VDC
+# parent namespace handles are bound there; neither VDC owns the shared router.
+pair_parse()
+{
+   [[ "$#" -ge 14 && "${EUID}" == 0 ]] || return 2
+   pair_args=("${@:1:14}")
+   pair_dir="$1"; pair_id="$2"; pair_source_uuid="$3"; pair_target_uuid="$4"
+   pair_source_workspace="$5"; pair_source_runtime="$6"; pair_source_index="$7"; pair_source_ip="$8"
+   pair_target_workspace="$9"; pair_target_runtime="${10}"; pair_target_index="${11}"; pair_target_ip="${12}"
+   pair_vip="${13}"; pair_port="${14}"
+   for identity in "$pair_id" "$pair_source_uuid" "$pair_target_uuid"; do
+      [[ "$identity" =~ ^0x[0-9a-f]{2,32}$ && $(( ${#identity} % 2 )) == 0 && "${identity:2:2}" != 00 ]] || return 2
+   done
+   [[ "$pair_dir" == "/mnt/prodigy-vdc-pairs/$pair_id" && ! -L "$pair_dir" &&
+      "$pair_source_uuid" != "$pair_target_uuid" && "$pair_source_runtime" != "$pair_target_runtime" &&
+      "$pair_source_workspace" != "$pair_target_workspace" ]] || return 2
+   valid_workspace "$pair_source_workspace" && valid_workspace "$pair_target_workspace" || return 2
+   python3 - "$pair_source_runtime" "$pair_target_runtime" "$pair_source_index" "$pair_target_index" \
+      "$pair_source_ip" "$pair_target_ip" "$pair_vip" "$pair_port" <<'PAIR_VALIDATE'
+import ipaddress,sys
+sr,tr,si,ti,source,target,vip,port=sys.argv[1:]
+assert all(str(int(x))==x for x in (sr,tr,si,ti,port))
+assert int(sr)>1 and int(tr)>1 and 1<=int(si)<=128 and 1<=int(ti)<=128 and 1<=int(port)<=65535
+assert ipaddress.IPv4Address(source) in ipaddress.IPv4Network('10.0.0.0/8')
+assert ipaddress.IPv4Address(target) in ipaddress.IPv4Network('10.0.0.0/8')
+assert ipaddress.IPv4Address(vip) in ipaddress.IPv4Network('198.18.0.0/15')
+PAIR_VALIDATE
+}
+
+pair_descriptor() { printf '%s\n' "${pair_args[@]}"; }
+
+pair_write()
+{
+   local path="$1" value="$2" temporary="$1.$BASHPID.tmp"
+   (umask 077; printf '%s\n' "$value" > "$temporary")
+   sync -f "$temporary"
+   mv -f -- "$temporary" "$path"
+   sync -f "${path%/*}"
+}
+
+pair_owner_live()
+{
+   [[ -f "$pair_dir/owner" && ! -L "$pair_dir/owner" ]] || return 1
+   read -r pair_pid pair_start pair_mount < "$pair_dir/owner"
+   [[ "$pair_pid" =~ ^[1-9][0-9]*$ && "$pair_pid" -gt 1 && -r "/proc/$pair_pid/stat" ]] || return 1
+   local current
+   current="$(awk '{sub(/^.*\) /, ""); print $20}' "/proc/$pair_pid/stat")"
+   [[ "$current" == "$pair_start" && "$(stat -Lc %i "/proc/$pair_pid/ns/mnt")" == "$pair_mount" ]]
+}
+
+pair_parent_identity()
+{
+   local workspace="$1" runtime="$2" index="$3" address="$4" provider_pid
+   provider_pid="$(<"$workspace/virtual-datacenter.pid")"
+   provider_process "$provider_pid" "$workspace" || return 1
+   [[ "$(runtime_identity_for_workspace "$workspace" "$provider_pid")" == "$runtime" ]] || return 1
+   python3 - "$workspace/test-cluster-manifest.json" "$runtime" "$index" "$address" <<'PAIR_PARENT' || return 1
+import json,sys
+path,runtime,index,address=sys.argv[1:]
+m=json.load(open(path)); node=next(n for n in m['nodes'] if n['index']==int(index))
+assert m['parentNamespace']=='pvd-p-'+runtime and node['ipv4']==address
+assert node['namespace']=='pvd-m'+index+'-'+runtime
+assert all(n['public6'].startswith('2001:db8:100:') for n in m['nodes'])
+PAIR_PARENT
+   printf '%s\n' "$provider_pid"
+}
+
+pair_rules()
+{
+   local mark="$1" current
+   [[ "$mark" == 1 || "$mark" == 2 ]] || return 2
+   # The map is the only selector. Replacing its element is one kernel
+   # transaction; an already marked SYN retry retains its original owner.
+   if ip netns exec pair-router nft list table inet prodigy_pair >/dev/null 2>&1; then
+      current="$(pair_selected)"
+      [[ "$current" != 2 || "$mark" == 2 ]] || return 1
+      # nft batches both commands in one transaction; there is no exposed
+      # interval with an empty map. Element replacement has no `replace` verb.
+      printf 'delete element inet prodigy_pair owner { 0 }\nadd element inet prodigy_pair owner { 0 : %s }\n' "$mark" |
+         ip netns exec pair-router nft -f -
+      return
+   fi
+   ip netns exec pair-router nft -f - <<EOF_PAIR_NFT
+table inet prodigy_pair {
+ map owner { type mark : mark; elements = { 0 : $mark }; }
+ chain prerouting {
+  type filter hook prerouting priority mangle; policy accept;
+  iifname "client0" ip daddr $pair_vip tcp dport $pair_port ct mark 0 ct state new ct mark set ct mark map @owner
+  meta mark set ct mark
+ }
+ chain forward {
+  type filter hook forward priority filter; policy drop;
+  iifname "client0" oifname "source0" ip daddr $pair_vip tcp dport $pair_port ct mark 1 accept
+  iifname "client0" oifname "target0" ip daddr $pair_vip tcp dport $pair_port ct mark 2 accept
+  iifname "source0" oifname "client0" ip saddr $pair_vip tcp sport $pair_port ct mark 1 ct state established,related accept
+  iifname "target0" oifname "client0" ip saddr $pair_vip tcp sport $pair_port ct mark 2 ct state established,related accept
+ }
+}
+EOF_PAIR_NFT
+}
+
+pair_selected()
+{
+   ip netns exec pair-router nft -j list map inet prodigy_pair owner | python3 -c '
+import json,sys
+maps=[x["map"] for x in json.load(sys.stdin)["nftables"] if "map" in x]
+assert len(maps)==1
+entry=maps[0]["elem"]
+def mark(value):
+ assert isinstance(value,(int,str)) and not isinstance(value,bool)
+ return int(value,0) if isinstance(value,str) else value
+assert len(entry)==1 and len(entry[0])==2 and mark(entry[0][0])==0 and mark(entry[0][1]) in (1,2)
+print(mark(entry[0][1]))'
+}
+
+pair_query()
+{
+   local selected counts
+   selected="$(pair_selected)" || return 1
+   # Conntrack's proc view is scoped to this namespace. Parsing failures and
+   # unavailable accounting are errors, never evidence of zero source flows.
+   counts="$(ip netns exec pair-router python3 - "$pair_vip" "$pair_port" <<'PAIR_COUNT'
+import sys
+vip,port=sys.argv[1:]; counts={1:0,2:0}
+with open('/proc/net/nf_conntrack') as f:
+ for line in f:
+  fields=line.split(); original={}; mark=None
+  for field in fields:
+   if '=' not in field: continue
+   key,value=field.split('=',1)
+   if key=='mark': mark=int(value,0)
+   elif key not in original: original[key]=value
+  if original.get('src')=='172.30.240.2' and original.get('dst')==vip and original.get('dport')==port:
+   assert 'tcp' in fields and mark in counts
+   counts[mark]+=1
+print(counts[1],counts[2])
+PAIR_COUNT
+)"
+   local source target
+   read -r source target <<< "$counts"
+   printf 'PAIR_BOUNDARY operationID=%s selected=%s drainCapability=1 sourceFlows=%s targetFlows=%s\n' \
+      "$pair_id" "$selected" "$source" "$target"
+   [[ "${1:-query}" != drain || ( "$selected" == 2 && "$source" == 0 ) ]]
+}
+
+pair_link_identity()
+{
+   ip -n "$1" -j link show "$2" | python3 -c '
+import json,sys
+links=json.load(sys.stdin); assert len(links)==1
+link=links[0]
+assert link["ifindex"]>0 and link["link_index"]>0 and link["address"]
+print(json.dumps([link["ifindex"],link["link_index"],link["address"]],separators=(",",":")))'
+}
+
+pair_link_owned()
+{
+   local side="$1" link="$2"
+   if [[ -f "$pair_dir/$side-link" ]]; then
+      [[ "$(pair_link_identity "pair-$side" "$link")" == "$(<"$pair_dir/$side-link")" ]]
+      return
+   fi
+   # The peer MAC is journaled before creation. A crash between the move and
+   # identity receipt cannot strand an unidentifiable link. This fallback is
+   # valid only before any parent route effects were authorized.
+   [[ -f "$pair_dir/$side-link-intent" && ! -f "$pair_dir/$side-route-intent" &&
+      -z "$(ip -n "pair-$side" route show exact "$pair_vip/32")" &&
+      -z "$(ip -n "pair-$side" route show exact 172.30.240.0/30)" ]] || return 1
+   ip -n "pair-$side" -d -j link show "$link" | python3 -c '
+import json,sys
+links=json.load(sys.stdin); assert len(links)==1
+assert links[0]["linkinfo"]["info_kind"]=="veth" and links[0]["address"]==sys.argv[1]
+' "$(<"$pair_dir/$side-link-intent")"
+}
+
+pair_require_no_clients()
+{
+   # A probe may outlive the supervisor. Do not claim cleanup while a process
+   # still owns either endpoint namespace. Inodes are recorded before exposure.
+   python3 - "$pair_dir" <<'PAIR_NO_CLIENTS'
+import errno,pathlib,sys
+root=pathlib.Path(sys.argv[1]); inodes=set()
+for name in ('router-network','client-network'):
+ p=root/name
+ if p.exists(): inodes.add(int(p.read_text().strip()))
+for p in pathlib.Path('/proc').glob('[0-9]*/ns/net'):
+ try: inode=p.stat().st_ino
+ except OSError as e:
+  if e.errno in (errno.ENOENT,errno.ESRCH): continue
+  raise
+ if inode in inodes: raise SystemExit('pair boundary still has an active client or router process')
+PAIR_NO_CLIENTS
+}
+
+pair_cleanup_inside()
+{
+   pair_require_no_clients || return 1
+   local status=0 side route_ip route_dev expected
+   for side in source target; do
+      route_ip="$pair_source_ip"; route_dev=pairSource0
+      [[ "$side" == source ]] || { route_ip="$pair_target_ip"; route_dev=pairTarget0; }
+      if [[ -e "/run/netns/pair-$side" ]]; then
+         # Routes were added, never replaced; only this exact nexthop belongs
+         # to the endpoint. Foreign changes are retained and reported.
+         expected="$(ip -n "pair-$side" -o route show exact "$pair_vip/32")"
+         if [[ -f "$pair_dir/$side-route-intent" && -n "$expected" ]]; then
+            [[ "$expected" == "$pair_vip via $route_ip dev vdcbr0"* ]] || { status=1; continue; }
+            ip -n "pair-$side" route del "$pair_vip/32" via "$route_ip" dev vdcbr0 || status=1
+         fi
+         if [[ -f "$pair_dir/$side-route-intent" && -f "$pair_dir/$side-forwarding" ]]; then
+            ip netns exec "pair-$side" sysctl -q -w "net.ipv4.ip_forward=$(<"$pair_dir/$side-forwarding")" || status=1
+         fi
+      fi
+   done
+   # Deleting our router namespace drops its peer links and their connected
+   # return routes; the retained parent namespace bindings then release.
+   for name in pair-client pair-router; do
+      if [[ -e "/run/netns/$name" ]]; then ip netns del "$name" || status=1; fi
+   done
+   for side in source target; do
+      if [[ -e "/run/netns/pair-$side" ]]; then
+         route_dev=pairSource0
+         [[ "$side" == source ]] || route_dev=pairTarget0
+         if ip -n "pair-$side" link show "$route_dev" >/dev/null 2>&1; then
+            if pair_link_owned "$side" "$route_dev"; then
+               ip -n "pair-$side" link del "$route_dev" || status=1
+            else
+               echo "pair boundary refuses changed $side peer link" >&2
+               status=1
+            fi
+         fi
+         umount "/run/netns/pair-$side" || status=1
+      fi
+   done
+   [[ "$status" == 0 ]] && pair_write "$pair_dir/phase" removed
+   return "$status"
+}
+
+pair_recover_remove()
+{
+   pair_parse "$@"
+   [[ "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+   # Never race a still-live owner, including one which is still preparing.
+   if pair_owner_live; then return 1; fi
+   pair_require_no_clients
+   mount --make-rprivate /
+   mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/netns
+   local side workspace runtime index address provider_pid
+   for side in source target; do
+      # No journaled parent binding means no effects were issued in that parent.
+      [[ -f "$pair_dir/$side-namespace" ]] || continue
+      workspace="$pair_source_workspace"; runtime="$pair_source_runtime"; index="$pair_source_index"; address="$pair_source_ip"
+      [[ "$side" == source ]] || { workspace="$pair_target_workspace"; runtime="$pair_target_runtime"; index="$pair_target_index"; address="$pair_target_ip"; }
+      provider_pid="$(pair_parent_identity "$workspace" "$runtime" "$index" "$address")"
+      touch "/run/netns/pair-$side"
+      mount --bind "/proc/$provider_pid/root/run/netns/pvd-p-$runtime" "/run/netns/pair-$side"
+      [[ "$(stat -Lc %i "/run/netns/pair-$side")" == "$(<"$pair_dir/$side-namespace")" ]]
+   done
+   pair_cleanup_inside
+}
+
+pair_serve()
+{
+   pair_parse "$@"
+   [[ "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+   mount --make-rprivate /
+   pair_write "$pair_dir/owner" "$$ $(awk '{sub(/^.*\) /, ""); print $20}' /proc/$$/stat) $(stat -Lc %i /proc/$$/ns/mnt)"
+   # Private netns handles cannot disappear when the invoking CLI exits.
+   mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/netns
+   trap 'pair_cleanup_inside || true' EXIT
+   trap 'exit 0' TERM INT HUP
+   local side workspace runtime index address provider_pid namespace_source
+   for side in source target; do
+      workspace="$pair_source_workspace"; runtime="$pair_source_runtime"; index="$pair_source_index"; address="$pair_source_ip"
+      [[ "$side" == source ]] || { workspace="$pair_target_workspace"; runtime="$pair_target_runtime"; index="$pair_target_index"; address="$pair_target_ip"; }
+      provider_pid="$(pair_parent_identity "$workspace" "$runtime" "$index" "$address")"
+      namespace_source="/proc/$provider_pid/root/run/netns/pvd-p-$runtime"
+      [[ -e "$namespace_source" ]]
+      touch "/run/netns/pair-$side"
+      mount --bind "$namespace_source" "/run/netns/pair-$side"
+      pair_write "$pair_dir/$side-namespace" "$(stat -Lc %i "/run/netns/pair-$side")"
+      # Refuse preexisting routes/interfaces before changing the parent.
+      [[ -z "$(ip -n "pair-$side" route show exact "$pair_vip/32")" ]]
+      [[ -z "$(ip -n "pair-$side" route show exact 172.30.240.0/30)" ]]
+      local parent_link=pairSource0
+      [[ "$side" == source ]] || parent_link=pairTarget0
+      if ip -n "pair-$side" link show "$parent_link" >/dev/null 2>&1; then return 1; fi
+      pair_write "$pair_dir/$side-forwarding" "$(ip netns exec "pair-$side" sysctl -n net.ipv4.ip_forward)"
+      pair_write "$pair_dir/$side-link-intent" "$(python3 - "$pair_id" "$side" <<'PAIR_MAC'
+import hashlib,sys
+mac=b'\x02'+hashlib.sha256((sys.argv[1]+':'+sys.argv[2]).encode()).digest()[:5]
+print(':'.join(f'{b:02x}' for b in mac))
+PAIR_MAC
+)"
+   done
+   ip netns add pair-router
+   ip netns add pair-client
+   pair_write "$pair_dir/router-network" "$(stat -Lc %i /run/netns/pair-router)"
+   pair_write "$pair_dir/client-network" "$(stat -Lc %i /run/netns/pair-client)"
+   ip -n pair-router link add client0 type veth peer name client-peer
+   ip -n pair-router link set client-peer netns pair-client
+   ip -n pair-client link set client-peer name client0
+   ip -n pair-router link add source0 type veth peer name pairSource0 address "$(<"$pair_dir/source-link-intent")"
+   ip -n pair-router link set pairSource0 netns pair-source
+   pair_write "$pair_dir/source-link" "$(pair_link_identity pair-source pairSource0)"
+   ip -n pair-router link add target0 type veth peer name pairTarget0 address "$(<"$pair_dir/target-link-intent")"
+   ip -n pair-router link set pairTarget0 netns pair-target
+   pair_write "$pair_dir/target-link" "$(pair_link_identity pair-target pairTarget0)"
+   ip -n pair-client addr add 172.30.240.2/30 dev client0
+   ip -n pair-client link set client0 up
+   ip -n pair-client route add "$pair_vip/32" via 172.30.240.1 dev client0
+   ip -n pair-router addr add 172.30.240.1/30 dev client0
+   ip -n pair-router addr add 169.254.240.1/30 dev source0
+   ip -n pair-router addr add 169.254.240.5/30 dev target0
+   for link in client0 source0 target0; do ip -n pair-router link set "$link" up; done
+   ip netns exec pair-router sysctl -q -w net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+   ip -n pair-router route add "$pair_vip/32" via 169.254.240.2 dev source0 table 101
+   ip -n pair-router route add "$pair_vip/32" via 169.254.240.6 dev target0 table 102
+   ip -n pair-router rule add priority 10001 to "$pair_vip/32" fwmark 1 lookup 101
+   ip -n pair-router rule add priority 10002 to "$pair_vip/32" fwmark 2 lookup 102
+   ip -n pair-source addr add 169.254.240.2/30 dev pairSource0
+   ip -n pair-target addr add 169.254.240.6/30 dev pairTarget0
+   for side in source target; do
+      local link=pairSource0 gateway=169.254.240.1 selected_ip="$pair_source_ip"
+      [[ "$side" == source ]] || { link=pairTarget0; gateway=169.254.240.5; selected_ip="$pair_target_ip"; }
+      ip -n "pair-$side" link set "$link" up
+      ip -n "pair-$side" route add 172.30.240.0/30 via "$gateway" dev "$link"
+      pair_write "$pair_dir/$side-route-intent" "$pair_vip $selected_ip"
+      ip -n "pair-$side" route add "$pair_vip/32" via "$selected_ip" dev vdcbr0
+      ip netns exec "pair-$side" sysctl -q -w net.ipv4.ip_forward=1
+   done
+   pair_rules 1
+   pair_write "$pair_dir/phase" prepared
+   while [[ ! -e "$pair_dir/stop" ]]; do sleep 0.2; done
+}
+
+pair_action()
+{
+   local action="$1"; shift
+   pair_parse "$@"
+   # Admission is durable before provider creation. An absent operation
+   # directory proves that no provider effect for this identity was issued.
+   if [[ "$action" == remove && ! -e "$pair_dir" ]]; then return; fi
+   [[ -r "$pair_dir/descriptor" && "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+   if [[ "$action" == remove && -f "$pair_dir/phase" && "$(<"$pair_dir/phase")" == removed ]]; then return; fi
+   if ! pair_owner_live; then
+      [[ "$action" == remove ]] || return 1
+      exec unshare --mount --propagation private -- bash "$0" --pair-recover-remove "$@"
+   fi
+   if [[ "$action" == remove ]]; then
+      pair_require_no_clients
+      pair_write "$pair_dir/stop" requested
+      for _ in $(seq 1 100); do
+         [[ "$(<"$pair_dir/phase")" != removed ]] || return 0
+         sleep 0.1
+      done
+      return 1
+   fi
+   [[ "$(<"$pair_dir/phase")" == prepared ]]
+   if [[ "$action" == crashOwner ]]; then
+      python3 - "$pair_pid" "$pair_start" "$pair_mount" <<'PAIR_CRASH'
+import os,pathlib,signal,sys
+pid,start,mount=map(int,sys.argv[1:])
+fd=os.pidfd_open(pid)
+try:
+ assert int(pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(') ',1)[1].split()[19])==start
+ assert pathlib.Path(f'/proc/{pid}/ns/mnt').stat().st_ino==mount
+ signal.pidfd_send_signal(fd,signal.SIGKILL)
+finally: os.close(fd)
+PAIR_CRASH
+      for _ in $(seq 1 100); do
+         if ! pair_owner_live; then return 0; fi
+         sleep 0.1
+      done
+      return 1
+   fi
+   exec nsenter -t "$pair_pid" -m -- bash "$0" --pair-inside "$action" "$@"
+}
+
+pair_inside()
+{
+   local action="$1"; shift
+   pair_parse "$@"
+   pair_owner_live
+   [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$pair_mount" && "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+   case "$action" in
+      query|drain) pair_query "$action" ;;
+      selectTarget) pair_rules 2; pair_query ;;
+      probe)
+         [[ "$#" == 17 ]]
+         ip netns exec pair-client timeout 60 python3 - "$pair_vip" "$pair_port" "${15}" "${16}" "${17}" <<'PAIR_PROBE'
+import json,socket,sys,time
+vip,port,expected,count,interval=sys.argv[1:]; count=int(count); interval=int(interval)
+assert 1<=count<=1024 and 0<=interval<=60000 and (count-1)*interval<=50000
+start=time.monotonic_ns()
+with socket.create_connection((vip,int(port)),timeout=3) as s:
+ s.settimeout(3); stream=s.makefile('rb')
+ for seq in range(count):
+  sent=time.monotonic_ns(); s.sendall(('identity:'+str(seq)+'\n').encode())
+  reply=stream.readline(4097).decode().rstrip('\n')
+  ok=reply.startswith('deploymentID='+expected+' containerUUID=') and reply.endswith(' request='+str(seq))
+  print('PAIR_BOUNDARY_REQUEST '+json.dumps(dict(sequence=seq,reply=reply,ok=ok,sentNs=sent,receivedNs=time.monotonic_ns())),flush=True)
+  assert ok
+  if seq+1<count: time.sleep(interval/1000)
+print('PAIR_BOUNDARY_CONNECTION '+json.dumps(dict(startNs=start,endNs=time.monotonic_ns(),requests=count)),flush=True)
+PAIR_PROBE
+         ;;
+      *) return 2 ;;
+   esac
+}
+
+pair_launch()
+{
+   pair_parse "$@"
+   [[ "$#" == 14 ]]
+   mkdir -p -m 0700 /mnt/prodigy-vdc-pairs
+   [[ ! -L /mnt/prodigy-vdc-pairs ]]
+   if [[ -d "$pair_dir" ]]; then
+      [[ -r "$pair_dir/descriptor" && "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+      pair_owner_live
+      [[ "$(<"$pair_dir/phase")" == prepared ]]
+      return
+   fi
+   mkdir -m 0700 "$pair_dir"
+   pair_write "$pair_dir/descriptor" "$(pair_descriptor)"
+   pair_write "$pair_dir/phase" preparing
+   setsid nohup unshare --mount --propagation private -- bash "$0" --pair-serve "$@" >"$pair_dir/provider.log" 2>&1 </dev/null &
+   for _ in $(seq 1 100); do
+      if [[ "$(<"$pair_dir/phase")" == prepared ]]; then pair_owner_live; return; fi
+      if [[ "$(<"$pair_dir/phase")" == removed ]]; then cat "$pair_dir/provider.log" >&2; return 1; fi
+      sleep 0.1
+   done
+   cat "$pair_dir/provider.log" >&2
+   return 1
+}
+
 stop_datacenter()
 {
    [[ "$#" -eq 2 && "${EUID}" -eq 0 ]] || return 2
@@ -639,6 +1075,11 @@ adopted_mode=0
 adopted_runtime_identity=""
 adopted_operation_dir=""
 case "${1:-}" in
+   --pair-launch) shift; pair_launch "$@"; exit ;;
+   --pair-serve) shift; pair_serve "$@"; exit ;;
+   --pair-recover-remove) shift; pair_recover_remove "$@"; exit ;;
+   --pair-action) shift; pair_action "$@"; exit ;;
+   --pair-inside) shift; pair_inside "$@"; exit ;;
    --bounded-log)
       shift
       bounded_machine_log "$@"

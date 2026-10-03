@@ -512,8 +512,48 @@ static bool acceptNextClient(int listenerFD, ControlServerState& state, int& cli
   return false;
 }
 
-static bool handleClusterReportStep(int clientFD, ControlServerState& state, String& failure)
+// Mothership subscribes to credential-expiry notices before its first ordinary
+// request on a configured cluster connection.  Complete that snapshot here so
+// each CLI mock exercises the same control framing as a real Brain.
+static bool handleCredentialExpirySnapshotRequest(int clientFD, uint128_t clusterUUID, String& failure)
 {
+  String frame = {};
+  if (recvOneMessageFrame(clientFD, frame, failure) == false)
+  {
+    return false;
+  }
+
+  Message *message = reinterpret_cast<Message *>(const_cast<uint8_t *>(frame.data()));
+  uint8_t *args = message->args;
+  String serialized = {};
+  Message::extractToStringView(args, serialized);
+  ApiCredentialExpiryNoticePayload request = {};
+  if (MothershipTopic(message->topic) != MothershipTopic::credentialExpiryNotices ||
+      args != message->terminal() || BitseryEngine::deserializeSafe(serialized, request) == false ||
+      request.clusterUUID != clusterUUID || request.requestSnapshot == false ||
+      request.includeAcknowledged || request.snapshotComplete || request.acknowledge)
+  {
+    failure.assign("credential expiry snapshot request invalid"_ctv);
+    return false;
+  }
+
+  ApiCredentialExpiryNoticePayload completion = {};
+  completion.clusterUUID = clusterUUID;
+  completion.snapshotComplete = true;
+  String serializedCompletion = {};
+  BitseryEngine::serialize(serializedCompletion, completion);
+  String completionFrame = {};
+  Message::construct(completionFrame, MothershipTopic::credentialExpiryNotices, serializedCompletion);
+  return sendAll(clientFD, completionFrame, failure);
+}
+
+static bool handleClusterReportStep(int clientFD, ControlServerState& state, uint128_t clusterUUID, String& failure)
+{
+  if (handleCredentialExpirySnapshotRequest(clientFD, clusterUUID, failure) == false)
+  {
+    return false;
+  }
+
   String frame = {};
   if (recvOneMessageFrame(clientFD, frame, failure) == false)
   {
@@ -669,8 +709,13 @@ static bool handleClusterReportStep(int clientFD, ControlServerState& state, Str
   return sendAllFragmented(clientFD, response, 257, 20'000, failure);
 }
 
-static bool handleOversizedClusterReportStep(int clientFD, ControlServerState& state, String& failure)
+static bool handleOversizedClusterReportStep(int clientFD, ControlServerState& state, uint128_t clusterUUID, String& failure)
 {
+  if (handleCredentialExpirySnapshotRequest(clientFD, clusterUUID, failure) == false)
+  {
+    return false;
+  }
+
   String frame = {};
   if (recvOneMessageFrame(clientFD, frame, failure) == false)
   {
@@ -815,9 +860,10 @@ static String buildDeployPlanJSON(uint16_t applicationID, MachineCpuArchitecture
   int written = std::snprintf(
       buffer,
       sizeof(buffer),
-      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":1,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
+      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"apiCredentials\":{\"applicationID\":%u,\"requiredCredentialNames\":[]},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":1,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
       unsigned(applicationID),
-      machineCpuArchitectureName(architecture));
+      machineCpuArchitectureName(architecture),
+      unsigned(applicationID));
 
   String json = {};
   if (written > 0)
@@ -1001,12 +1047,18 @@ static bool buildDiscombobulatorArtifact(
 static bool handleDeployStep(
     int clientFD,
     ControlServerState& state,
+    uint128_t clusterUUID,
     const String& expectedBlobPath,
     uint16_t expectedApplicationID,
     MachineCpuArchitecture expectedArchitecture,
     bool closeAfterInitialOkay,
     String& failure)
 {
+  if (handleCredentialExpirySnapshotRequest(clientFD, clusterUUID, failure) == false)
+  {
+    return false;
+  }
+
   String frame = {};
   if (recvOneMessageFrame(clientFD, frame, failure) == false)
   {
@@ -1233,7 +1285,7 @@ int main(void)
       return;
     }
 
-    if (handleClusterReportStep(clientFD, server, stepFailure) == false)
+    if (handleClusterReportStep(clientFD, server, storedCluster.clusterUUID, stepFailure) == false)
     {
       server.failure = stepFailure;
       server.stopRequested.store(true);
@@ -1343,7 +1395,7 @@ int main(void)
         return;
       }
 
-      if (handleOversizedClusterReportStep(clientFD, oversizedServer, stepFailure) == false)
+      if (handleOversizedClusterReportStep(clientFD, oversizedServer, storedCluster.clusterUUID, stepFailure) == false)
       {
         oversizedServer.failure = stepFailure;
         oversizedServer.stopRequested.store(true);
@@ -1512,6 +1564,8 @@ int main(void)
         basics_log("deploy smoke create_cluster failure: %s\n", failure.c_str());
         return EXIT_FAILURE;
       }
+
+      deployCluster = createdCluster;
     }
 
     ControlServerState deployServer = {};
@@ -1531,7 +1585,14 @@ int main(void)
         return;
       }
 
-      if (handleDeployStep(clientFD, deployServer, deployBlobPath, deployApplicationID, currentArchitecture, false, stepFailure) == false)
+      if (handleDeployStep(clientFD,
+                           deployServer,
+                           deployCluster.clusterUUID,
+                           deployBlobPath,
+                           deployApplicationID,
+                           currentArchitecture,
+                           false,
+                           stepFailure) == false)
       {
         deployServer.failure = stepFailure;
         deployServer.stopRequested.store(true);
@@ -1553,13 +1614,16 @@ int main(void)
         deployExitCode);
     suite.expect(ranDeploy, "deploy_smoke_runs_mothership_deploy");
     suite.expect(deployExitCode == EXIT_SUCCESS, "deploy_smoke_mothership_deploy_exit_success");
-    if (ranDeploy == false || deployExitCode != EXIT_SUCCESS)
-    {
-      basics_log("deploy smoke mothership output:\n%s\n", deployOutput.c_str());
-    }
-
     deployServer.stopRequested.store(true);
     deployServerThread.join();
+
+    if (ranDeploy == false || deployExitCode != EXIT_SUCCESS || deployServer.failure.size() > 0 ||
+        deployServer.acceptCount != 1 || deployServer.sawMeasureApplication == false ||
+        deployServer.sawSpinApplication == false || deployServer.deployBlobMatched == false)
+    {
+      writeFailureDetail("detail deploy_smoke_output:", deployOutput);
+      writeFailureDetail("detail deploy_smoke_server_failure:", deployServer.failure);
+    }
 
     suite.expect(deployServer.failure.size() == 0, "deploy_smoke_server_no_failure");
     suite.expect(deployServer.acceptCount == 1, "deploy_smoke_server_accept_count");
@@ -1567,11 +1631,6 @@ int main(void)
     suite.expect(deployServer.sawSpinApplication, "deploy_smoke_server_saw_spin_topic");
     suite.expect(deployServer.deployApplicationID == deployApplicationID, "deploy_smoke_spin_application_id_matches");
     suite.expect(deployServer.deployBlobMatched, "deploy_smoke_spin_blob_matches_builder_output");
-    if (deployServer.failure.size() > 0)
-    {
-      basics_log("deploy smoke server failure: %s\n", deployServer.failure.c_str());
-    }
-
     suite.expect(
         stringContains(deployOutput, "we will schedule 1 base instances and 0 surge instances"),
         "deploy_smoke_output_reports_measure_result");
@@ -1643,6 +1702,7 @@ int main(void)
 
       if (handleDeployStep(clientFD,
                            testClusterServer,
+                           createdTestDeployCluster.clusterUUID,
                            deployBlobPath,
                            deployApplicationID,
                            currentArchitecture,
@@ -1668,13 +1728,17 @@ int main(void)
         testClusterDeployExitCode);
     suite.expect(ranTestClusterDeploy, "deploy_test_cluster_runs_mothership_deploy");
     suite.expect(testClusterDeployExitCode == EXIT_SUCCESS, "deploy_test_cluster_returns_after_initial_okay");
-    if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS)
-    {
-      basics_log("deploy test cluster mothership output:\n%s\n", testClusterDeployOutput.c_str());
-    }
-
     testClusterServer.stopRequested.store(true);
     testClusterServerThread.join();
+
+    if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS ||
+        testClusterServer.failure.size() > 0 || testClusterServer.acceptCount != 1 ||
+        testClusterServer.sawMeasureApplication == false || testClusterServer.sawSpinApplication == false ||
+        testClusterServer.deployBlobMatched == false)
+    {
+      writeFailureDetail("detail deploy_test_cluster_output:", testClusterDeployOutput);
+      writeFailureDetail("detail deploy_test_cluster_server_failure:", testClusterServer.failure);
+    }
 
     suite.expect(testClusterServer.failure.size() == 0, "deploy_test_cluster_server_no_failure");
     suite.expect(testClusterServer.acceptCount == 1, "deploy_test_cluster_server_accept_count");

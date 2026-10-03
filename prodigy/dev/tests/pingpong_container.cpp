@@ -935,7 +935,18 @@ private:
         lineLength -= 1;
       }
 
-      if (lineLength == 4 && memcmp(head, "ping", 4) == 0)
+      if (lineLength >= 9 && memcmp(head, "identity:", 9) == 0 && metricsSink != nullptr)
+      {
+        // Return the identity supplied by the Neuron, rather than echoing a
+        // client-selected label as evidence of which deployment served it.
+        String identity = {};
+        identity.snprintf<"deploymentID={itoa} containerUUID={itoh} request="_ctv>(
+            metricsSink->parameters.deploymentID, metricsSink->parameters.uuid);
+        client->wBuffer.append(identity);
+        client->wBuffer.append(head + 9, lineLength - 9);
+        client->wBuffer.append('\n');
+      }
+      else if (lineLength == 4 && memcmp(head, "ping", 4) == 0)
       {
 #if PRODIGY_PINGPONG_REQUIRE_GOOGLE_EGRESS == 1
         String googleProbeReason;

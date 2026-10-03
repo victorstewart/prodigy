@@ -30549,6 +30549,7 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 #include <prodigy/dev/tests/stateful_serving_authority_tests.h>
 #include <prodigy/dev/tests/stateful_serving_launch_tests.h>
 #include <prodigy/dev/tests/stateful_serving_resource_tests.h>
+#include <prodigy/dev/tests/deployment_identity_tests.h>
 
 int main(void)
 {
@@ -30582,6 +30583,12 @@ int main(void)
     testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
     testUpgradeAdmissionObservedCapacityFacts(suite);
     testUpgradeAdmissionTargetBoundStagingCapacity(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_DEPLOYMENT_IDENTITY_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testDeploymentIdentityReceipt(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite;
@@ -31170,6 +31177,7 @@ int main(void)
   testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
   testUpgradeAdmissionObservedCapacityFacts(suite);
   testUpgradeAdmissionTargetBoundStagingCapacity(suite);
+  testDeploymentIdentityReceipt(suite);
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
   testApiCredentialPolicyAvailability(suite);

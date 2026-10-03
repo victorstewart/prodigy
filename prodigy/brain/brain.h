@@ -36380,6 +36380,107 @@ public:
           break;
           ;
         }
+      case MothershipTopic::pullDeploymentIdentity:
+        {
+          uint64_t deploymentID = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, deploymentID);
+          DeploymentIdentityReport report = {};
+          if (args != message->terminal() || deploymentID == 0)
+          {
+            String serialized = {};
+            BitseryEngine::serialize(serialized, report);
+            Message::construct(mothership->wBuffer, MothershipTopic::pullDeploymentIdentity, serialized);
+            break;
+          }
+          const DeploymentPlan *observedPlan = nullptr;
+          ApplicationDeployment *liveDeployment = nullptr;
+          if (auto live = deployments.find(deploymentID); live != deployments.end() && live->second != nullptr)
+          {
+            liveDeployment = live->second;
+            observedPlan = &liveDeployment->plan;
+          }
+          else if (auto persisted = deploymentPlans.find(deploymentID); persisted != deploymentPlans.end())
+          {
+            observedPlan = &persisted->second;
+          }
+          if (observedPlan != nullptr)
+          {
+            String serializedPlan = {}, digestFailure = {};
+            BitseryEngine::serialize(serializedPlan, *observedPlan);
+            if (prodigyComputeSHA256Hex(serializedPlan, report.canonicalPlanSHA256, &digestFailure))
+            {
+              report.found = true;
+              report.live = liveDeployment != nullptr;
+              report.applicationID = observedPlan->config.applicationID;
+              report.deploymentID = deploymentID;
+              report.versionID = observedPlan->config.versionID;
+              report.clusterUUID = brainConfig.clusterUUID;
+              report.containerBlobSHA256 = observedPlan->config.containerBlobSHA256;
+              report.containerBlobBytes = observedPlan->config.containerBlobBytes;
+              report.authorityGeneration = masterAuthorityRuntimeState.generation;
+              report.masterUUID = getExistingMasterUUID();
+              if (report.masterUUID == selfBrainUUID())
+              {
+                report.masterBootNs = boottimens;
+              }
+              else if (BrainView *master = findBrainViewByUUID(report.masterUUID); master != nullptr)
+              {
+                report.masterBootNs = master->boottimens;
+              }
+              report.isStateful = observedPlan->isStateful;
+              report.useHostNetworkNamespace = observedPlan->useHostNetworkNamespace;
+              if (observedPlan->config.type == ApplicationType::stateless &&
+                  observedPlan->wormholes.size() == 1 && !observedPlan->isStateful &&
+                  !observedPlan->useHostNetworkNamespace && observedPlan->whiteholes.empty() &&
+                  observedPlan->publicTLS.empty() && !observedPlan->hasTlsIssuancePolicy &&
+                  (!observedPlan->hasApiCredentialPolicy ||
+                   (observedPlan->apiCredentialPolicy.applicationID == observedPlan->config.applicationID &&
+                    observedPlan->apiCredentialPolicy.requiredCredentialNames.empty())))
+              {
+                const Wormhole& endpoint = observedPlan->wormholes[0];
+                if (endpoint.source == ExternalAddressSource::registeredRoutablePrefix &&
+                    endpoint.routablePrefixUUID != 0 && endpoint.layer4 == IPPROTO_TCP &&
+                    !endpoint.isQuic && !endpoint.hasDNSConfig && !endpoint.externalAddress.is6 &&
+                    endpoint.externalPort != 0)
+                {
+                  char address[INET_ADDRSTRLEN] = {};
+                  if (inet_ntop(AF_INET, endpoint.externalAddress.v6, address, sizeof(address)) != nullptr)
+                  {
+                    if (const DistributableExternalSubnet *prefix =
+                            findRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets,
+                                                        endpoint.routablePrefixUUID);
+                        prefix != nullptr && prefix->ingressScope == RoutableIngressScope::singleMachine)
+                    {
+                      if (prefix->machineUUID != 0)
+                      {
+                        report.observedPrefixUUID = endpoint.routablePrefixUUID;
+                        report.observedEndpointIPv4.assign(address);
+                        report.observedEndpointPort = endpoint.externalPort;
+                        report.observedEndpointMachineUUID = prefix->machineUUID;
+                        report.profileEligible = true;
+                      }
+                    }
+                  }
+                }
+              }
+              if (liveDeployment != nullptr)
+              {
+                DeploymentStatusReport status = liveDeployment->generateReport();
+                report.state = status.state;
+                report.nTarget = status.nTarget;
+                report.nDeployed = status.nDeployed;
+                report.nHealthy = status.nHealthy;
+                for (BrainView *peer : brains)
+                  if (peer != nullptr && liveDeployment->brainBlobEchoPeerKeys.contains(peer->uuid))
+                    ++report.acknowledgedPeerCount;
+              }
+            }
+          }
+          String serialized = {};
+          BitseryEngine::serialize(serialized, report);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullDeploymentIdentity, serialized);
+          break;
+        }
       case MothershipTopic::pullTaskReport:
         {
           uint64_t deploymentID = 0;

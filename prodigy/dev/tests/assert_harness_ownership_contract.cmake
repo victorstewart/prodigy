@@ -206,6 +206,30 @@ foreach(_forbidden IN ITEMS "ip netns" "unshare" "mount --" "bpftool")
       message(FATAL_ERROR "two-cluster coexistence client assumes a forbidden runtime or infrastructure owner: ${_forbidden}")
    endif()
 endforeach()
+set(_pair_endpoint "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_pair_endpoint_qualification.sh")
+file(READ "${_pair_endpoint}" _pair_endpoint_source)
+foreach(_required IN ITEMS
+   "prepareTestPairBoundary"
+   "pairBoundary"
+   "probePairBoundary"
+   "registerRoutableSubnet"
+   "reserveApplicationID"
+   "createCluster"
+   "removeCluster"
+   "enableFakeIpv4Boundary:false"
+   "prodigy_dev_run_discombobulator_build"
+   "PAIR_ENDPOINT_EVIDENCE")
+   string(FIND "${_pair_endpoint_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "pair endpoint client missing required Mothership capability assertion: ${_required}")
+   endif()
+endforeach()
+foreach(_forbidden IN ITEMS "ip netns" "unshare" "mount --" "bpftool" "iptables" "tc ")
+   string(FIND "${_pair_endpoint_source}" "${_forbidden}" _position)
+   if(NOT _position EQUAL -1)
+      message(FATAL_ERROR "pair endpoint client assumes a forbidden runtime or infrastructure owner: ${_forbidden}")
+   endif()
+endforeach()
 if(_two_cluster_source MATCHES "mship[^\n]*[[:space:]](deploy|reserveApplicationID|reserveServiceID|probeTestCluster)([[:space:]]|$)")
    message(FATAL_ERROR "two-cluster coexistence client must use only the declared lifecycle/report/fault Mothership operations")
 endif()

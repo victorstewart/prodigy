@@ -256,6 +256,11 @@ then
             "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" follower-retained 0 \
             "$(dirname "${prodigy_bin}")/prodigy.$(uname -m).bundle.tar.zst"
          ;;
+      pair-endpoint)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container"
+         ;;
       *) fail "unknown runtime qualification scenario: ${runtime_qualification}" ;;
    esac
 fi

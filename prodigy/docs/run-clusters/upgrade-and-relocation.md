@@ -221,6 +221,35 @@ component evidence, not a substitute for a full workload history.
 
 ## Reusable local two-cluster qualification
 
+### Shared TCP endpoint prerequisite
+
+The `pair-endpoint` runtime scenario now exercises one declared IPv4/TCP endpoint
+across two independent three-Brain test clusters. Mothership binds the operation
+to both cluster/runtime identities, exact deployment plan and artifact digests,
+and the provider-owned endpoint before creating its boundary. The boundary routes
+new connections to the selected cluster while retaining existing connections on
+their original cluster. An unsupported or failed conntrack observation blocks
+drain; it is never interpreted as zero source connections. The provider journals
+its namespace, link and route ownership for cleanup, including a dead supervisor.
+
+The observed 2026-10-03 run completed in 152.49 seconds: 31 source requests and five
+target requests succeeded, with the same held source connection spanning target
+traffic. Actual source flows reached zero before the explicit supervisor crash
+and subsequent cleanup. Creating both clusters took 8.63 seconds; selecting the
+target took 0.17 seconds. Most elapsed time was waiting for source TCP conntrack
+entries to expire. Mothership removed both clusters and the launcher stopped the
+Apple Container. The request-history validator also rejects wrong deployment
+identity, missing requests and absent overlap. Registry, command/report and
+ownership checks, the focused identity fixture, and the full credentials suite
+passed on the checkpoint's corresponding binaries.
+
+This is a narrow endpoint prerequisite. The destination in this scenario is
+deployed separately, and no source deployment retirement occurs. It does not
+qualify a durable paired migration, rollback, crash-time traffic continuity,
+stateful data, WAN routing, public TLS, HTTP/2 or HTTP/3. The next gate must bind
+target admission durably before launch and use authenticated source termination
+receipts before claiming retirement. Production migration remains unavailable.
+
 The current coexistence scenario has passed a real local run with two independent
 three-Brain clusters, exact installed-bundle observations, separate cluster UUIDs,
 trust roots, private prefixes and eight network namespace identities. It observed
