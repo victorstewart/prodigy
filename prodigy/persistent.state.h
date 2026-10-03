@@ -2285,6 +2285,45 @@ public:
   }
 };
 
+// Kept separate from the v1 sidecar so existing pending stateful snapshots
+// retain their exact secret framing.  A v2 descriptor's operation binding is
+// part of the bootstrap identity; omitting it would let a private replay blob
+// be rebound to another paired migration.
+class ProdigyPersistentContainerRetirementBootstrapSecretsV2 {
+public:
+  uint128_t containerUUID = 0;
+  uint64_t deploymentID = 0;
+  uint16_t applicationID = 0;
+  uint128_t machineUUID = 0;
+  uint64_t topologyOperationID = 0;
+  uint32_t sourceEpoch = 0;
+  uint32_t targetEpoch = 0;
+  uint64_t intentGeneration = 0;
+  ProdigyContainerRetirementKind kind = ProdigyContainerRetirementKind::statefulTopology;
+  uint128_t pairedOperationID = 0;
+  uint128_t pairedSourceClusterUUID = 0;
+  uint128_t pairedTargetClusterUUID = 0;
+  uint64_t pairedTargetDeploymentID = 0;
+  String bootstrap;
+
+  bool matches(const ProdigyContainerRetirementIntent& intent) const
+  {
+    return containerUUID == intent.containerUUID && deploymentID == intent.deploymentID &&
+           applicationID == intent.applicationID && machineUUID == intent.machineUUID &&
+           topologyOperationID == intent.topologyOperationID && sourceEpoch == intent.sourceEpoch &&
+           targetEpoch == intent.targetEpoch && intentGeneration == intent.intentGeneration &&
+           kind == intent.kind && pairedOperationID == intent.pairedOperationID &&
+           pairedSourceClusterUUID == intent.pairedSourceClusterUUID &&
+           pairedTargetClusterUUID == intent.pairedTargetClusterUUID &&
+           pairedTargetDeploymentID == intent.pairedTargetDeploymentID;
+  }
+
+  void clear(void)
+  {
+    prodigyClearPersistentSecretString(bootstrap);
+  }
+};
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentContainerRetirementBootstrapSecrets& secrets)
 {
@@ -2296,6 +2335,25 @@ static void serialize(S&& serializer, ProdigyPersistentContainerRetirementBootst
   serializer.value4b(secrets.sourceEpoch);
   serializer.value4b(secrets.targetEpoch);
   serializer.value8b(secrets.intentGeneration);
+  serializer.text1b(secrets.bootstrap, prodigyContainerRetirementJournalMaximumBootstrapBytes);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentContainerRetirementBootstrapSecretsV2& secrets)
+{
+  serializer.value16b(secrets.containerUUID);
+  serializer.value8b(secrets.deploymentID);
+  serializer.value2b(secrets.applicationID);
+  serializer.value16b(secrets.machineUUID);
+  serializer.value8b(secrets.topologyOperationID);
+  serializer.value4b(secrets.sourceEpoch);
+  serializer.value4b(secrets.targetEpoch);
+  serializer.value8b(secrets.intentGeneration);
+  serializer.value1b(secrets.kind);
+  serializer.value16b(secrets.pairedOperationID);
+  serializer.value16b(secrets.pairedSourceClusterUUID);
+  serializer.value16b(secrets.pairedTargetClusterUUID);
+  serializer.value8b(secrets.pairedTargetDeploymentID);
   serializer.text1b(secrets.bootstrap, prodigyContainerRetirementJournalMaximumBootstrapBytes);
 }
 
@@ -2337,10 +2395,11 @@ public:
   // runtime plans, but carry a distinct public descriptor vector.
   Vector<ProdigyPersistentContainerRuntimeStateSecrets> servingRuntimeStateSecrets;
   Vector<ProdigyPersistentContainerRetirementBootstrapSecrets> containerRetirementBootstrapSecrets;
+  Vector<ProdigyPersistentContainerRetirementBootstrapSecretsV2> containerRetirementBootstrapSecretsV2;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty() && containerRuntimeStateSecrets.empty() && servingRuntimeStateSecrets.empty() && containerRetirementBootstrapSecrets.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty() && containerRuntimeStateSecrets.empty() && servingRuntimeStateSecrets.empty() && containerRetirementBootstrapSecrets.empty() && containerRetirementBootstrapSecretsV2.empty();
   }
 
   void clear(void)
@@ -2411,6 +2470,11 @@ public:
       retirementSecrets.clear();
     }
     containerRetirementBootstrapSecrets.clear();
+    for (auto& retirementSecrets : containerRetirementBootstrapSecretsV2)
+    {
+      retirementSecrets.clear();
+    }
+    containerRetirementBootstrapSecretsV2.clear();
   }
 };
 
@@ -2457,7 +2521,8 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     // Preserve the established sidecar bytes until a new feature is active.
-    if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty())
+    if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty() ||
+        !secrets.containerRetirementBootstrapSecretsV2.empty())
       serializer.object(secrets.servingRuntimeStateSecrets);
   }
   else if (serializer.adapter().isCompletedSuccessfully() == false)
@@ -2466,12 +2531,22 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   }
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty())
+    if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty() ||
+        !secrets.containerRetirementBootstrapSecretsV2.empty())
       serializer.object(secrets.containerRetirementBootstrapSecrets);
   }
   else if (serializer.adapter().isCompletedSuccessfully() == false)
   {
     serializer.object(secrets.containerRetirementBootstrapSecrets);
+  }
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (!secrets.containerRetirementBootstrapSecretsV2.empty())
+      serializer.object(secrets.containerRetirementBootstrapSecretsV2);
+  }
+  else if (serializer.adapter().isCompletedSuccessfully() == false)
+  {
+    serializer.object(secrets.containerRetirementBootstrapSecretsV2);
   }
 }
 
@@ -2545,7 +2620,8 @@ static bool prodigyParsePersistentContainerRetirementDescriptor(
   if (!prodigyContainerRetirementJournalCarrier(carrier) ||
       carrier.fingerprint.size() > prodigyContainerRetirementJournalMaximumPayloadBytes ||
       BitseryEngine::deserializeSafe(carrier.fingerprint, journal) == false ||
-      journal.version != ProdigyContainerRetirementJournal::currentVersion || journal.intents.empty() ||
+      !prodigyContainerRetirementJournalVersionSupported(
+          journal.version, ProdigyContainerRetirementJournal::currentVersion) || journal.intents.empty() ||
       journal.intents.size() > prodigyContainerRetirementJournalMaximumEntries)
   {
     return false;
@@ -2755,18 +2831,40 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
       {
         continue;
       }
-      ProdigyPersistentContainerRetirementBootstrapSecrets retirementSecrets = {};
-      retirementSecrets.containerUUID = intent.containerUUID;
-      retirementSecrets.deploymentID = intent.deploymentID;
-      retirementSecrets.applicationID = intent.applicationID;
-      retirementSecrets.machineUUID = intent.machineUUID;
-      retirementSecrets.topologyOperationID = intent.topologyOperationID;
-      retirementSecrets.sourceEpoch = intent.sourceEpoch;
-      retirementSecrets.targetEpoch = intent.targetEpoch;
-      retirementSecrets.intentGeneration = intent.intentGeneration;
-      retirementSecrets.bootstrap = std::move(intent.bootstrap);
+      if (journal.version == ProdigyContainerRetirementJournal::legacyVersion)
+      {
+        ProdigyPersistentContainerRetirementBootstrapSecrets retirementSecrets = {};
+        retirementSecrets.containerUUID = intent.containerUUID;
+        retirementSecrets.deploymentID = intent.deploymentID;
+        retirementSecrets.applicationID = intent.applicationID;
+        retirementSecrets.machineUUID = intent.machineUUID;
+        retirementSecrets.topologyOperationID = intent.topologyOperationID;
+        retirementSecrets.sourceEpoch = intent.sourceEpoch;
+        retirementSecrets.targetEpoch = intent.targetEpoch;
+        retirementSecrets.intentGeneration = intent.intentGeneration;
+        retirementSecrets.bootstrap = std::move(intent.bootstrap);
+        secrets.containerRetirementBootstrapSecrets.push_back(std::move(retirementSecrets));
+      }
+      else
+      {
+        ProdigyPersistentContainerRetirementBootstrapSecretsV2 retirementSecrets = {};
+        retirementSecrets.containerUUID = intent.containerUUID;
+        retirementSecrets.deploymentID = intent.deploymentID;
+        retirementSecrets.applicationID = intent.applicationID;
+        retirementSecrets.machineUUID = intent.machineUUID;
+        retirementSecrets.topologyOperationID = intent.topologyOperationID;
+        retirementSecrets.sourceEpoch = intent.sourceEpoch;
+        retirementSecrets.targetEpoch = intent.targetEpoch;
+        retirementSecrets.intentGeneration = intent.intentGeneration;
+        retirementSecrets.kind = intent.kind;
+        retirementSecrets.pairedOperationID = intent.pairedOperationID;
+        retirementSecrets.pairedSourceClusterUUID = intent.pairedSourceClusterUUID;
+        retirementSecrets.pairedTargetClusterUUID = intent.pairedTargetClusterUUID;
+        retirementSecrets.pairedTargetDeploymentID = intent.pairedTargetDeploymentID;
+        retirementSecrets.bootstrap = std::move(intent.bootstrap);
+        secrets.containerRetirementBootstrapSecretsV2.push_back(std::move(retirementSecrets));
+      }
       intent.bootstrap.clear();
-      secrets.containerRetirementBootstrapSecrets.push_back(std::move(retirementSecrets));
     }
 
     if (!prodigyPersistentWriteContainerRetirementDescriptor(carrier, journal) ||
@@ -3094,13 +3192,27 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     for (ProdigyContainerRetirementIntent& intent : journal.intents)
     {
       uint32_t matches = 0;
-      const ProdigyPersistentContainerRetirementBootstrapSecrets *matched = nullptr;
-      for (const auto& retirementSecrets : secrets.containerRetirementBootstrapSecrets)
+      const String *bootstrap = nullptr;
+      if (journal.version == ProdigyContainerRetirementJournal::legacyVersion)
       {
-        if (retirementSecrets.matches(intent))
+        for (const auto& retirementSecrets : secrets.containerRetirementBootstrapSecrets)
         {
-          ++matches;
-          matched = &retirementSecrets;
+          if (retirementSecrets.matches(intent))
+          {
+            ++matches;
+            bootstrap = &retirementSecrets.bootstrap;
+          }
+        }
+      }
+      else
+      {
+        for (const auto& retirementSecrets : secrets.containerRetirementBootstrapSecretsV2)
+        {
+          if (retirementSecrets.matches(intent))
+          {
+            ++matches;
+            bootstrap = &retirementSecrets.bootstrap;
+          }
         }
       }
       if (intent.killAcked)
@@ -3112,19 +3224,31 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
         }
         continue;
       }
-      if (matches != 1 || matched == nullptr || matched->bootstrap.empty())
+      if (matches != 1 || bootstrap == nullptr || bootstrap->empty())
       {
         if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar is missing or ambiguous"_ctv);
         return false;
       }
-      intent.bootstrap = matched->bootstrap;
+      intent.bootstrap = *bootstrap;
     }
 
     for (const auto& retirementSecrets : secrets.containerRetirementBootstrapSecrets)
     {
       const ProdigyContainerRetirementIntent *intent =
           prodigyFindContainerRetirementIntentInValidatedJournal(journal, retirementSecrets.containerUUID);
-      if (intent == nullptr || intent->killAcked || !retirementSecrets.matches(*intent))
+      if (journal.version != ProdigyContainerRetirementJournal::legacyVersion ||
+          intent == nullptr || intent->killAcked || !retirementSecrets.matches(*intent))
+      {
+        if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar identity differs"_ctv);
+        return false;
+      }
+    }
+    for (const auto& retirementSecrets : secrets.containerRetirementBootstrapSecretsV2)
+    {
+      const ProdigyContainerRetirementIntent *intent =
+          prodigyFindContainerRetirementIntentInValidatedJournal(journal, retirementSecrets.containerUUID);
+      if (journal.version != ProdigyContainerRetirementJournal::currentVersion ||
+          intent == nullptr || intent->killAcked || !retirementSecrets.matches(*intent))
       {
         if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar identity differs"_ctv);
         return false;
@@ -3138,7 +3262,9 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
       return false;
     }
   }
-  if (!foundRetirementCarrier && !secrets.containerRetirementBootstrapSecrets.empty())
+  if (!foundRetirementCarrier &&
+      (!secrets.containerRetirementBootstrapSecrets.empty() ||
+       !secrets.containerRetirementBootstrapSecretsV2.empty()))
   {
     if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar has no carrier"_ctv);
     return false;

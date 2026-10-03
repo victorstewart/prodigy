@@ -13,6 +13,15 @@ constexpr static uint64_t prodigyContainerRetirementJournalMaximumBootstrapBytes
 // Includes the serialized framing and identity fields, not merely bootstraps.
 constexpr static uint64_t prodigyContainerRetirementJournalMaximumPayloadBytes = 16ULL * 1024ULL * 1024ULL;
 
+// Version two extends the established authority journal rather than adding a
+// second destruction-receipt owner.  Version one remains a byte-for-byte
+// compatible stateful-topology record so a mixed fleet can continue reading
+// its existing authority until the v2 capability gate has completed.
+enum class ProdigyContainerRetirementKind : uint8_t {
+  statefulTopology = 1,
+  statelessPairedMigration = 2
+};
+
 class ProdigyContainerRetirementIntent {
 public:
   uint128_t containerUUID = 0;
@@ -28,18 +37,30 @@ public:
   String bootstrap;
   bool killAcked = false;
 
+  // V2 only.  These bind a source-cluster stateless cohort to the durable
+  // independent-cluster operation and its already-admitted destination.
+  ProdigyContainerRetirementKind kind = ProdigyContainerRetirementKind::statefulTopology;
+  uint128_t pairedOperationID = 0;
+  uint128_t pairedSourceClusterUUID = 0;
+  uint128_t pairedTargetClusterUUID = 0;
+  uint64_t pairedTargetDeploymentID = 0;
+
   bool sameIdentity(const ProdigyContainerRetirementIntent& other) const
   {
     return containerUUID == other.containerUUID && deploymentID == other.deploymentID &&
            applicationID == other.applicationID && machineUUID == other.machineUUID &&
            topologyOperationID == other.topologyOperationID &&
            sourceEpoch == other.sourceEpoch && targetEpoch == other.targetEpoch &&
-           intentGeneration == other.intentGeneration;
+           intentGeneration == other.intentGeneration && kind == other.kind &&
+           pairedOperationID == other.pairedOperationID &&
+           pairedSourceClusterUUID == other.pairedSourceClusterUUID &&
+           pairedTargetClusterUUID == other.pairedTargetClusterUUID &&
+           pairedTargetDeploymentID == other.pairedTargetDeploymentID;
   }
 };
 
 template <typename S>
-static void serialize(S&& serializer, ProdigyContainerRetirementIntent& intent)
+static void prodigySerializeContainerRetirementIntentV1(S&& serializer, ProdigyContainerRetirementIntent& intent)
 {
   serializer.value16b(intent.containerUUID);
   serializer.value8b(intent.deploymentID);
@@ -53,11 +74,34 @@ static void serialize(S&& serializer, ProdigyContainerRetirementIntent& intent)
   serializer.value1b(intent.killAcked);
 }
 
+template <typename S>
+static void prodigySerializeContainerRetirementIntentV2(S&& serializer, ProdigyContainerRetirementIntent& intent)
+{
+  prodigySerializeContainerRetirementIntentV1(serializer, intent);
+  serializer.value1b(intent.kind);
+  serializer.value16b(intent.pairedOperationID);
+  serializer.value16b(intent.pairedSourceClusterUUID);
+  serializer.value16b(intent.pairedTargetClusterUUID);
+  serializer.value8b(intent.pairedTargetDeploymentID);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyContainerRetirementIntent& intent)
+{
+  // Direct intent serialization is retained only for source compatibility.
+  // Journal framing selects the durable version explicitly.
+  prodigySerializeContainerRetirementIntentV1(serializer, intent);
+}
+
 class ProdigyContainerRetirementJournal {
 public:
-  constexpr static uint8_t currentVersion = 1;
+  constexpr static uint8_t legacyVersion = 1;
+  constexpr static uint8_t currentVersion = 2;
 
-  uint8_t version = currentVersion;
+  // Existing stateful callers value-initialize this journal.  They must keep
+  // emitting the legacy framing until a dedicated v2 stateless admission has
+  // established peer capability and deliberately promotes the record.
+  uint8_t version = legacyVersion;
   Vector<ProdigyContainerRetirementIntent> intents;
 };
 
@@ -65,28 +109,53 @@ template <typename S>
 static void serialize(S&& serializer, ProdigyContainerRetirementJournal& journal)
 {
   serializer.value1b(journal.version);
-  serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
-                       [](S& serializer, ProdigyContainerRetirementIntent& intent) {
-                         serializer.object(intent);
-                       });
+  if (journal.version == ProdigyContainerRetirementJournal::legacyVersion)
+  {
+    serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
+                         [](S& serializer, ProdigyContainerRetirementIntent& intent) {
+                           prodigySerializeContainerRetirementIntentV1(serializer, intent);
+                         });
+  }
+  else if (journal.version == ProdigyContainerRetirementJournal::currentVersion)
+  {
+    serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
+                         [](S& serializer, ProdigyContainerRetirementIntent& intent) {
+                           prodigySerializeContainerRetirementIntentV2(serializer, intent);
+                         });
+  }
+}
+
+static bool prodigyContainerRetirementJournalVersionSupported(uint8_t version, uint32_t readerVersion)
+{
+  return version >= ProdigyContainerRetirementJournal::legacyVersion &&
+         version <= ProdigyContainerRetirementJournal::currentVersion &&
+         readerVersion >= version;
 }
 
 static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetirementIntent& intent)
 {
   if (intent.containerUUID == 0 || intent.deploymentID == 0 || intent.applicationID == 0 ||
-      intent.machineUUID == 0 || intent.topologyOperationID == 0 ||
-      intent.sourceEpoch == 0 || intent.targetEpoch == 0 ||
-      intent.sourceEpoch == intent.targetEpoch || intent.intentGeneration == 0 ||
+      intent.machineUUID == 0 || intent.intentGeneration == 0 ||
       intent.intentGeneration == UINT64_MAX ||
       uint16_t(intent.deploymentID >> 48) != intent.applicationID ||
       intent.bootstrap.size() > prodigyContainerRetirementJournalMaximumBootstrapBytes)
   {
     return false;
   }
-  if (intent.killAcked)
-  {
-    return intent.bootstrap.empty();
-  }
+  const bool statefulTopology = intent.kind == ProdigyContainerRetirementKind::statefulTopology;
+  const bool statelessPaired = intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration;
+  if (!statefulTopology && !statelessPaired) return false;
+  if (statefulTopology &&
+      (intent.topologyOperationID == 0 || intent.sourceEpoch == 0 || intent.targetEpoch == 0 ||
+       intent.sourceEpoch == intent.targetEpoch || intent.pairedOperationID != 0 ||
+       intent.pairedSourceClusterUUID != 0 || intent.pairedTargetClusterUUID != 0 ||
+       intent.pairedTargetDeploymentID != 0)) return false;
+  if (statelessPaired &&
+      (intent.topologyOperationID != 0 || intent.sourceEpoch != 0 || intent.targetEpoch != 0 ||
+       intent.pairedOperationID == 0 || intent.pairedSourceClusterUUID == 0 ||
+       intent.pairedTargetClusterUUID == 0 || intent.pairedSourceClusterUUID == intent.pairedTargetClusterUUID ||
+       intent.pairedTargetDeploymentID == 0)) return false;
+  if (intent.killAcked) return intent.bootstrap.empty();
 
   NeuronContainerBootstrap bootstrap = {};
   if (intent.bootstrap.empty() ||
@@ -94,8 +163,8 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
       bootstrap.plan.uuid != intent.containerUUID ||
       bootstrap.plan.config.deploymentID() != intent.deploymentID ||
       bootstrap.plan.config.applicationID != intent.applicationID ||
-      bootstrap.plan.isStateful == false ||
-      bootstrap.plan.config.type != ApplicationType::stateful ||
+      bootstrap.plan.isStateful != statefulTopology ||
+      bootstrap.plan.config.type != (statefulTopology ? ApplicationType::stateful : ApplicationType::stateless) ||
       bootstrap.plan.restartOnFailure)
   {
     return false;
@@ -109,7 +178,8 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
 
 static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerRetirementJournal& journal)
 {
-  if (journal.version != ProdigyContainerRetirementJournal::currentVersion ||
+  if (!prodigyContainerRetirementJournalVersionSupported(
+          journal.version, ProdigyContainerRetirementJournal::currentVersion) ||
       journal.intents.empty() ||
       journal.intents.size() > prodigyContainerRetirementJournalMaximumEntries)
   {
@@ -120,7 +190,11 @@ static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerReti
   uint64_t totalBootstrapBytes = 0;
   for (const ProdigyContainerRetirementIntent& intent : journal.intents)
   {
-    if (prodigyContainerRetirementIntentValid(intent) == false ||
+    if ((journal.version == ProdigyContainerRetirementJournal::legacyVersion &&
+         (intent.kind != ProdigyContainerRetirementKind::statefulTopology || intent.pairedOperationID != 0 ||
+          intent.pairedSourceClusterUUID != 0 || intent.pairedTargetClusterUUID != 0 ||
+          intent.pairedTargetDeploymentID != 0)) ||
+        prodigyContainerRetirementIntentValid(intent) == false ||
         (previousUUID != 0 && intent.containerUUID <= previousUUID) ||
         intent.bootstrap.size() > prodigyContainerRetirementJournalMaximumPayloadBytes - totalBootstrapBytes)
     {

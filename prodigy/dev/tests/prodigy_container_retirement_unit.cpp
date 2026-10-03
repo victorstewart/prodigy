@@ -17,6 +17,25 @@ public:
   }
 };
 
+// Exact pre-v2 framing: it has no version branch and always reads the v1
+// intent payload.  Keep this local test reader so compatibility is proved
+// against bytes, not only the new capability predicate.
+class LegacyContainerRetirementJournalReader {
+public:
+  uint8_t version = 0;
+  Vector<ProdigyContainerRetirementIntent> intents;
+};
+
+template <typename S>
+static void serialize(S&& serializer, LegacyContainerRetirementJournalReader& journal)
+{
+  serializer.value1b(journal.version);
+  serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
+                       [](S& serializer, ProdigyContainerRetirementIntent& intent) {
+                         serializer.object(intent);
+                       });
+}
+
 static ProdigyContainerRetirementIntent makeIntent(uint128_t uuid, bool killAcked = false)
 {
   ProdigyContainerRetirementIntent intent = {};
@@ -49,6 +68,48 @@ static ProdigyContainerRetirementJournal makeJournal(uint32_t count = 1)
   for (uint32_t index = 0; index < count; ++index)
   {
     journal.intents.push_back(makeIntent(uint128_t(index) + 1));
+  }
+  return journal;
+}
+
+static ProdigyContainerRetirementIntent makePairedStatelessIntent(uint128_t uuid, bool killAcked = false)
+{
+  ProdigyContainerRetirementIntent intent = {};
+  intent.containerUUID = uuid;
+  intent.applicationID = 7;
+  intent.deploymentID = (uint64_t(intent.applicationID) << 48) | 41;
+  intent.machineUUID = uuid + 1000;
+  intent.intentGeneration = 17;
+  intent.kind = ProdigyContainerRetirementKind::statelessPairedMigration;
+  intent.pairedOperationID = uint128_t(0x9000) + uuid;
+  intent.pairedSourceClusterUUID = uint128_t(0x10000) + uuid;
+  intent.pairedTargetClusterUUID = uint128_t(0x20000) + uuid;
+  // Deployment IDs are local to independent clusters.  The distinct source
+  // and target cluster UUIDs, not a fabricated numeric difference, bind this
+  // target identity.
+  intent.pairedTargetDeploymentID = intent.deploymentID;
+  intent.killAcked = killAcked;
+  if (!killAcked)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    bootstrap.plan.uuid = intent.containerUUID;
+    bootstrap.plan.config.applicationID = intent.applicationID;
+    bootstrap.plan.config.versionID = 41;
+    bootstrap.plan.config.type = ApplicationType::stateless;
+    bootstrap.plan.isStateful = false;
+    bootstrap.plan.restartOnFailure = false;
+    BitseryEngine::serialize(intent.bootstrap, bootstrap);
+  }
+  return intent;
+}
+
+static ProdigyContainerRetirementJournal makePairedStatelessJournal(uint32_t count = 1)
+{
+  ProdigyContainerRetirementJournal journal = {};
+  journal.version = ProdigyContainerRetirementJournal::currentVersion;
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    journal.intents.push_back(makePairedStatelessIntent(uint128_t(index) + 1));
   }
   return journal;
 }
@@ -153,9 +214,99 @@ static void testMalformedTrailingAndVersionRejected(TestSuite& suite)
                "container_retirement_oversized_carrier_rejected_before_decode");
 
   ProdigyContainerRetirementJournal wrongVersion = journal;
-  wrongVersion.version = 2;
+  wrongVersion.version = 3;
   suite.expect(prodigyWriteContainerRetirementJournalCarrier(carrier, wrongVersion, 1) == false,
                "container_retirement_version_rejected");
+}
+
+static void testV1CompatibilityAndV2PairedStatelessFraming(TestSuite& suite)
+{
+  ProdigyContainerRetirementJournal v1 = makeJournal();
+  TaskExecutionRecord v1Carrier = {};
+  ProdigyContainerRetirementJournal decodedV1 = {};
+  suite.expect(v1.version == ProdigyContainerRetirementJournal::legacyVersion &&
+                   prodigyWriteContainerRetirementJournalCarrier(v1Carrier, v1, 1) &&
+                   prodigyParseContainerRetirementJournalCarrier(v1Carrier, decodedV1) &&
+                   decodedV1.version == ProdigyContainerRetirementJournal::legacyVersion &&
+                   decodedV1.intents[0].kind == ProdigyContainerRetirementKind::statefulTopology &&
+                   decodedV1.intents[0].pairedOperationID == 0,
+               "container_retirement_v1_framing_and_defaults_preserved");
+
+  ProdigyContainerRetirementJournal v2 = makePairedStatelessJournal();
+  TaskExecutionRecord v2Carrier = {};
+  ProdigyContainerRetirementJournal decodedV2 = {};
+  LegacyContainerRetirementJournalReader legacyReader = {};
+  suite.expect(prodigyContainerRetirementJournalVersionSupported(
+                   ProdigyContainerRetirementJournal::currentVersion, 1) == false &&
+                   prodigyContainerRetirementJournalVersionSupported(
+                       ProdigyContainerRetirementJournal::currentVersion,
+                       ProdigyContainerRetirementJournal::currentVersion) &&
+                   prodigyWriteContainerRetirementJournalCarrier(v2Carrier, v2, 1) &&
+                   prodigyParseContainerRetirementJournalCarrier(v2Carrier, decodedV2) &&
+                   BitseryEngine::deserializeSafe(v2Carrier.fingerprint, legacyReader) == false &&
+                   decodedV2.version == ProdigyContainerRetirementJournal::currentVersion &&
+                   decodedV2.intents[0].sameIdentity(v2.intents[0]) &&
+                   decodedV2.intents[0].bootstrap.equals(v2.intents[0].bootstrap),
+               "container_retirement_v2_paired_framing_and_legacy_reader_rejection");
+
+  ProdigyContainerRetirementJournal accidentalV1 = v2;
+  accidentalV1.version = ProdigyContainerRetirementJournal::legacyVersion;
+  suite.expect(prodigyValidateContainerRetirementJournal(accidentalV1) == false,
+               "container_retirement_v1_rejects_v2_identity_without_silent_drop");
+}
+
+static void testPairedStatelessValidationAndMonotonicity(TestSuite& suite)
+{
+  ProdigyContainerRetirementJournal current = makePairedStatelessJournal();
+  suite.expect(prodigyValidateContainerRetirementJournal(current),
+               "container_retirement_paired_stateless_same_deployment_id_distinct_clusters_valid");
+
+  NeuronContainerBootstrap bootstrap = {};
+  ProdigyContainerRetirementJournal taskMismatch = current;
+  BitseryEngine::deserializeSafe(taskMismatch.intents[0].bootstrap, bootstrap);
+  bootstrap.plan.config.type = ApplicationType::task;
+  BitseryEngine::serialize(taskMismatch.intents[0].bootstrap, bootstrap);
+  suite.expect(prodigyValidateContainerRetirementJournal(taskMismatch) == false,
+               "container_retirement_paired_task_bootstrap_rejected");
+
+  ProdigyContainerRetirementJournal statefulMismatch = current;
+  BitseryEngine::deserializeSafe(statefulMismatch.intents[0].bootstrap, bootstrap);
+  bootstrap.plan.config.type = ApplicationType::stateful;
+  bootstrap.plan.isStateful = true;
+  BitseryEngine::serialize(statefulMismatch.intents[0].bootstrap, bootstrap);
+  suite.expect(prodigyValidateContainerRetirementJournal(statefulMismatch) == false,
+               "container_retirement_paired_stateful_bootstrap_rejected");
+
+  ProdigyContainerRetirementJournal acknowledged = current;
+  acknowledged.intents[0].killAcked = true;
+  acknowledged.intents[0].bootstrap.clear();
+  ProdigyContainerRetirementJournal merged = {};
+  suite.expect(prodigyMergeContainerRetirementJournal(current, acknowledged, merged) &&
+                   merged.intents[0].killAcked,
+               "container_retirement_paired_ack_advances_once");
+  suite.expect(prodigyMergeContainerRetirementJournal(acknowledged, current, merged) == false,
+               "container_retirement_paired_ack_downgrade_rejected");
+
+  ProdigyContainerRetirementJournal replay = current;
+  replay.intents[0].pairedOperationID += 1;
+  suite.expect(prodigyMergeContainerRetirementJournal(current, replay, merged) == false,
+               "container_retirement_paired_operation_replay_conflict_rejected");
+  ProdigyContainerRetirementJournal targetConflict = current;
+  targetConflict.intents[0].pairedTargetDeploymentID += 1;
+  suite.expect(prodigyMergeContainerRetirementJournal(current, targetConflict, merged) == false,
+               "container_retirement_paired_target_conflict_rejected");
+  ProdigyContainerRetirementJournal downgrade = current;
+  downgrade.version = ProdigyContainerRetirementJournal::legacyVersion;
+  downgrade.intents[0].kind = ProdigyContainerRetirementKind::statefulTopology;
+  downgrade.intents[0].pairedOperationID = 0;
+  downgrade.intents[0].pairedSourceClusterUUID = 0;
+  downgrade.intents[0].pairedTargetClusterUUID = 0;
+  downgrade.intents[0].pairedTargetDeploymentID = 0;
+  downgrade.intents[0].topologyOperationID = 1;
+  downgrade.intents[0].sourceEpoch = 1;
+  downgrade.intents[0].targetEpoch = 2;
+  suite.expect(prodigyMergeContainerRetirementJournal(current, downgrade, merged) == false,
+               "container_retirement_paired_v2_to_v1_downgrade_rejected");
 }
 
 static void testIdentityAndMonotonicAckFences(TestSuite& suite)
@@ -276,6 +427,8 @@ int main(void)
   TestSuite suite = {};
   testCarrierRoundTripAndExactLookup(suite);
   testMalformedTrailingAndVersionRejected(suite);
+  testV1CompatibilityAndV2PairedStatelessFraming(suite);
+  testPairedStatelessValidationAndMonotonicity(suite);
   testIdentityAndMonotonicAckFences(suite);
   testBootstrapSemanticOrderAndTrailingFences(suite);
   testCarrierCollisionAndBound(suite);

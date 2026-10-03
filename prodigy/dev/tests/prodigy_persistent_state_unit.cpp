@@ -2503,6 +2503,89 @@ int main(void)
     suite.expect(
         extractedSecrets.mothershipTunnelGatewayServerKeyPem.equals(storedTunnelGatewayAuth.serverKeyPem),
         "extract_snapshot_secrets_captures_tunnel_gateway_server_key");
+
+    // A paired stateless retirement can use the same numeric deployment ID on
+    // independent clusters.  Its cluster tuple, not that local ID, separates
+    // identities; ensure the v2 public descriptor and private bootstrap stay
+    // bound through snapshot extraction and restore.
+    ProdigyPersistentBrainSnapshot pairedSnapshot = expectedManagedSnapshot;
+    NeuronContainerBootstrap pairedBootstrap = retirementBootstrap;
+    pairedBootstrap.plan.config.type = ApplicationType::stateless;
+    pairedBootstrap.plan.isStateful = false;
+    pairedBootstrap.plan.credentialBundle.apiCredentials[0].material.assign(
+        "paired-retirement-bootstrap-private-secret"_ctv);
+    String pairedBootstrapBytes = {};
+    BitseryEngine::serialize(pairedBootstrapBytes, pairedBootstrap);
+    ProdigyContainerRetirementIntent pairedIntent = retirementIntent;
+    pairedIntent.topologyOperationID = 0;
+    pairedIntent.sourceEpoch = 0;
+    pairedIntent.targetEpoch = 0;
+    pairedIntent.kind = ProdigyContainerRetirementKind::statelessPairedMigration;
+    pairedIntent.pairedOperationID = uint128_t(0xABC001);
+    pairedIntent.pairedSourceClusterUUID = uint128_t(0xABC002);
+    pairedIntent.pairedTargetClusterUUID = uint128_t(0xABC003);
+    pairedIntent.pairedTargetDeploymentID = pairedIntent.deploymentID;
+    pairedIntent.bootstrap = pairedBootstrapBytes;
+    ProdigyContainerRetirementJournal pairedJournal = {};
+    pairedJournal.version = ProdigyContainerRetirementJournal::currentVersion;
+    pairedJournal.intents.push_back(pairedIntent);
+    TaskExecutionRecord pairedCarrier = {};
+    suite.expect(
+        prodigyWriteContainerRetirementJournalCarrier(pairedCarrier, pairedJournal, 1'700'000'000'003),
+        "persistent_snapshot_writes_v2_paired_retirement_carrier");
+    pairedSnapshot.masterAuthority.runtimeState.taskExecutions.insert_or_assign(
+        pairedCarrier.executionID, pairedCarrier);
+
+    ProdigyPersistentBrainSnapshot pairedPublic = {};
+    ProdigyPersistentBrainSnapshotSecrets pairedSecrets = {};
+    String pairedFailure = {};
+    suite.expect(
+        prodigyExtractPersistentBrainSnapshotSecrets(
+            std::move(pairedSnapshot), pairedPublic, pairedSecrets, &pairedFailure),
+        "extract_snapshot_secrets_moves_v2_paired_retirement_bootstrap_to_private_sidecar");
+    auto pairedPublicCarrier = pairedPublic.masterAuthority.runtimeState.taskExecutions.find(
+        prodigyContainerRetirementJournalExecutionID);
+    ProdigyContainerRetirementJournal pairedPublicJournal = {};
+    suite.expect(
+        pairedPublicCarrier != pairedPublic.masterAuthority.runtimeState.taskExecutions.end() &&
+            prodigyParsePersistentContainerRetirementDescriptor(
+                pairedPublicCarrier->second, pairedPublicJournal) &&
+            pairedPublicJournal.version == ProdigyContainerRetirementJournal::currentVersion &&
+            pairedPublicJournal.intents.size() == 1 && pairedPublicJournal.intents[0].bootstrap.empty() &&
+            pairedPublicJournal.intents[0].kind == ProdigyContainerRetirementKind::statelessPairedMigration &&
+            pairedPublicJournal.intents[0].pairedOperationID == pairedIntent.pairedOperationID &&
+            pairedPublicJournal.intents[0].pairedSourceClusterUUID == pairedIntent.pairedSourceClusterUUID &&
+            pairedPublicJournal.intents[0].pairedTargetClusterUUID == pairedIntent.pairedTargetClusterUUID &&
+            pairedPublicJournal.intents[0].pairedTargetDeploymentID == pairedIntent.deploymentID,
+        "extract_snapshot_secrets_keeps_v2_paired_retirement_public_identity_without_bootstrap");
+    suite.expect(
+        pairedSecrets.containerRetirementBootstrapSecrets.empty() &&
+            pairedSecrets.containerRetirementBootstrapSecretsV2.size() == 1 &&
+            pairedSecrets.containerRetirementBootstrapSecretsV2[0].matches(pairedIntent) &&
+            pairedSecrets.containerRetirementBootstrapSecretsV2[0].bootstrap.equals(pairedBootstrapBytes),
+        "extract_snapshot_secrets_keeps_v2_paired_retirement_bootstrap_private_and_exact");
+    String pairedPublicBytes = {};
+    BitseryEngine::serialize(pairedPublicBytes, pairedPublic);
+    suite.expect(
+        stringContains(pairedPublicBytes, "paired-retirement-bootstrap-private-secret"_ctv) == false,
+        "extract_snapshot_secrets_scrubs_v2_paired_retirement_bootstrap_from_public_snapshot");
+
+    ProdigyPersistentBrainSnapshot pairedRestored = pairedPublic;
+    pairedFailure.clear();
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(pairedRestored, pairedSecrets, &pairedFailure),
+        "apply_snapshot_secrets_restores_v2_paired_retirement_bootstrap");
+    auto pairedRestoredCarrier = pairedRestored.masterAuthority.runtimeState.taskExecutions.find(
+        prodigyContainerRetirementJournalExecutionID);
+    ProdigyContainerRetirementJournal pairedRestoredJournal = {};
+    suite.expect(
+        pairedRestoredCarrier != pairedRestored.masterAuthority.runtimeState.taskExecutions.end() &&
+            prodigyParseContainerRetirementJournalCarrier(
+                pairedRestoredCarrier->second, pairedRestoredJournal) &&
+            pairedRestoredJournal.intents.size() == 1 &&
+            pairedRestoredJournal.intents[0].sameIdentity(pairedIntent) &&
+            pairedRestoredJournal.intents[0].bootstrap.equals(pairedBootstrapBytes),
+        "apply_snapshot_secrets_restores_v2_paired_retirement_identity_and_private_bootstrap_once");
   }
 
   String localBrainStateJSON = {};
