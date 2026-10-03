@@ -28088,6 +28088,251 @@ static void testBrainNeuronHandlerAppliesMachineHardwareProfile(TestSuite& suite
                "brain_neuron_hardware_persists_cluster_topology");
 }
 
+class DeferredTopologyInventoryBrain final : public ResumableAddMachinesBrain {
+public:
+  class PendingTopologyPersistence {
+  public:
+    ClusterTopology topology = {};
+    PersistenceCompletion completion = {};
+  };
+
+  Vector<PendingTopologyPersistence> pendingTopologyPersistences = {};
+  uint32_t topologyPersistenceCalls = 0;
+
+  void persistAuthoritativeClusterTopologyAsync(ClusterTopology topology, PersistenceCompletion completion) override
+  {
+    topologyPersistenceCalls += 1;
+    pendingTopologyPersistences.push_back({std::move(topology), std::move(completion)});
+  }
+
+  bool hasPendingTopologyPersistence() const
+  {
+    return pendingTopologyPersistences.empty() == false;
+  }
+
+  void finishNextTopologyPersistence(bool durable)
+  {
+    if (pendingTopologyPersistences.empty())
+    {
+      return;
+    }
+    PendingTopologyPersistence pending = std::move(pendingTopologyPersistences.front());
+    pendingTopologyPersistences.erase(pendingTopologyPersistences.begin());
+    if (durable)
+    {
+      authoritativeTopology = std::move(pending.topology);
+    }
+    if (pending.completion)
+    {
+      pending.completion(durable);
+    }
+  }
+};
+
+static void testBrainReplaysHardwareReceivedBeforeTopologyAdmission(TestSuite& suite)
+{
+  DeferredTopologyInventoryBrain brain = {};
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.runtimeEnvironment.test.enabled = true;
+
+  ClusterMachine admittedFirst = makeCreatedBrainClusterMachineForTest(0x4202, "gcp-follower-before-admission-1"_ctv, "10.128.15.214"_ctv, "34.10.44.19"_ctv);
+  ClusterMachine admittedSecond = makeCreatedBrainClusterMachineForTest(0x4203, "gcp-follower-before-admission-2"_ctv, "10.128.15.215"_ctv, "34.10.44.20"_ctv);
+  Machine first = {}, second = {};
+  auto initializeFollower = [&](Machine& machine, const ClusterMachine& admitted) {
+    machine.uuid = admitted.uuid;
+    machine.isBrain = true;
+    machine.state = MachineState::deploying;
+    machine.slug = admitted.cloud.schema;
+    machine.type = admitted.cloud.providerMachineType;
+    machine.cloudID = admitted.cloud.cloudID;
+    const ClusterMachineAddress *privateAddress = prodigyFirstClusterMachineAddress(admitted.addresses.privateAddresses);
+    suite.require(privateAddress != nullptr, "brain_hardware_before_admission_fixture_private_address");
+    if (privateAddress != nullptr)
+    {
+      machine.privateAddress = privateAddress->address;
+      machine.private4 = IPAddress(machine.privateAddress.c_str(), false).v4;
+    }
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+  };
+  initializeFollower(first, admittedFirst);
+  initializeFollower(second, admittedSecond);
+
+  auto hardwareFor = [](uint64_t collectedAtMs) {
+    MachineHardwareProfile hardware = {};
+    hardware.inventoryComplete = true;
+    hardware.collectedAtMs = collectedAtMs;
+    hardware.cpu.logicalCores = 2;
+    hardware.memory.totalMB = 4096;
+    hardware.disks.push_back(MachineDiskHardwareProfile {.sizeMB = 20'480});
+    hardware.captures.push_back(MachineToolCapture {});
+    return hardware;
+  };
+
+  // Both followers report authenticated inventory while VDC has started them,
+  // but before Mothership's readyMachines admission is durable.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'334));
+  brain.applyMachineHardwareProfile(&second, hardwareFor(111'222'335));
+  suite.expect(first.hardware.inventoryComplete && second.hardware.inventoryComplete,
+               "brain_hardware_before_admission_retains_runtime_inventory");
+  suite.expect(brain.authoritativeTopology.machines.empty() && brain.topologyPersistenceCalls == 0,
+               "brain_hardware_before_admission_cannot_publish_missing_machines");
+
+  brain.authoritativeTopology.machines.push_back(admittedFirst);
+  brain.authoritativeTopology.machines.push_back(admittedSecond);
+  suite.expect(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+               "brain_hardware_before_admission_restores_admitted_machines");
+  suite.expect(brain.topologyPersistenceCalls == 1 && brain.hasPendingTopologyPersistence(),
+               "brain_hardware_before_admission_batches_sibling_inventory_into_one_durable_snapshot");
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.inventoryComplete == false &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete == false,
+               "brain_hardware_before_admission_hides_replay_before_durable_receipt");
+
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines.size() == 2 &&
+                   brain.authoritativeTopology.machines[0].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete,
+               "brain_hardware_before_admission_replays_inventory_to_authoritative_topology");
+  for (const ClusterMachine& machine : brain.authoritativeTopology.machines)
+  {
+    suite.expect(machine.totalLogicalCores == 2 && machine.totalMemoryMB == 4096 && machine.totalStorageMB == 20'480 &&
+                     prodigyMachineReadyResourcesAvailable(prodigyBuildMachineSnapshotFromClusterMachine(machine)),
+                 "brain_hardware_before_admission_replays_ready_capacity_to_authoritative_topology");
+  }
+
+  const uint32_t persistsAfterReplay = brain.topologyPersistenceCalls;
+  suite.expect(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+               "brain_hardware_before_admission_repeated_restore_succeeds");
+  suite.expect(brain.topologyPersistenceCalls == persistsAfterReplay,
+               "brain_hardware_before_admission_replay_is_idempotent_after_durability");
+
+  brain.neurons.erase(&first.neuron);
+  brain.neurons.erase(&second.neuron);
+  brain.machinesByUUID.erase(first.uuid);
+  brain.machinesByUUID.erase(second.uuid);
+  brain.machines.erase(&first);
+  brain.machines.erase(&second);
+}
+
+// A topology replay starts from the last durable snapshot. A later inventory
+// receipt must not replace that snapshot with one that omits a sibling replay
+// while the first durable write is still in flight.
+static void testBrainHardwareReplayRetainsConcurrentInventory(TestSuite& suite)
+{
+  DeferredTopologyInventoryBrain brain = {};
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.runtimeEnvironment.test.enabled = true;
+
+  ClusterMachine admittedFirst = makeCreatedBrainClusterMachineForTest(0x4204, "gcp-follower-overlap-1"_ctv, "10.128.15.216"_ctv, "34.10.44.21"_ctv);
+  ClusterMachine admittedSecond = makeCreatedBrainClusterMachineForTest(0x4205, "gcp-follower-overlap-2"_ctv, "10.128.15.217"_ctv, "34.10.44.22"_ctv);
+  Machine first = {}, second = {};
+  auto initializeFollower = [&](Machine& machine, const ClusterMachine& admitted) {
+    machine.uuid = admitted.uuid;
+    machine.isBrain = true;
+    machine.state = MachineState::deploying;
+    machine.slug = admitted.cloud.schema;
+    machine.type = admitted.cloud.providerMachineType;
+    machine.cloudID = admitted.cloud.cloudID;
+    const ClusterMachineAddress *privateAddress = prodigyFirstClusterMachineAddress(admitted.addresses.privateAddresses);
+    suite.require(privateAddress != nullptr, "brain_hardware_overlap_fixture_private_address");
+    if (privateAddress != nullptr)
+    {
+      machine.privateAddress = privateAddress->address;
+      machine.private4 = IPAddress(machine.privateAddress.c_str(), false).v4;
+    }
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+  };
+  initializeFollower(first, admittedFirst);
+  initializeFollower(second, admittedSecond);
+
+  auto hardwareFor = [](uint64_t collectedAtMs) {
+    MachineHardwareProfile hardware = {};
+    hardware.inventoryComplete = true;
+    hardware.collectedAtMs = collectedAtMs;
+    hardware.cpu.logicalCores = 2;
+    hardware.memory.totalMB = 4096;
+    hardware.disks.push_back(MachineDiskHardwareProfile {.sizeMB = 20'480});
+    return hardware;
+  };
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'340));
+  brain.applyMachineHardwareProfile(&second, hardwareFor(111'222'341));
+  brain.authoritativeTopology.machines.push_back(admittedFirst);
+  brain.authoritativeTopology.machines.push_back(admittedSecond);
+  suite.require(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+                "brain_hardware_overlap_replay_starts");
+  suite.require(brain.topologyPersistenceCalls == 1 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_replay_is_pending");
+
+  // This is the normal machineHardwareProfile path racing the replay receipt.
+  // It must merge with the replay snapshot, rather than rebuilding from the
+  // still-durable topology that has neither follower's inventory.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'342));
+  suite.require(brain.topologyPersistenceCalls == 1 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_coalesces_newest_profile_while_replay_is_pending");
+
+  brain.finishNextTopologyPersistence(true);
+  suite.require(brain.topologyPersistenceCalls == 2 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_rebuilds_from_first_durable_snapshot");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines.size() == 2 &&
+                   brain.authoritativeTopology.machines[0].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'342 &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_preserves_replayed_sibling_inventory");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'343));
+  suite.require(brain.topologyPersistenceCalls == 3 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_failure_receipt_is_pending");
+  brain.finishNextTopologyPersistence(false);
+  suite.expect(brain.topologyPersistenceCalls == 3 && brain.pendingTopologyPersistences.empty(),
+               "brain_hardware_overlap_failed_receipt_does_not_busy_loop");
+
+  // The same authenticated inventory observation is a bounded retry trigger.
+  // It must rebuild from the last durable A+B topology and retain B after failure.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'343));
+  suite.require(brain.topologyPersistenceCalls == 4 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_new_observation_retries_failure");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'343 &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_retry_preserves_sibling_inventory");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'345));
+  suite.require(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_stale_authority_receipt_is_pending");
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'346));
+  suite.require(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_stale_authority_coalesces_later_profile");
+  brain.masterAuthorityEpoch += 1;
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.empty(),
+               "brain_hardware_overlap_stale_authority_receipt_cannot_start_next_write");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'347));
+  suite.require(brain.topologyPersistenceCalls == 6 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_current_authority_can_retry_after_stale_receipt");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'347 &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_current_authority_retry_preserves_sibling_inventory");
+
+  brain.neurons.erase(&first.neuron);
+  brain.neurons.erase(&second.neuron);
+  brain.machinesByUUID.erase(first.uuid);
+  brain.machinesByUUID.erase(second.uuid);
+  brain.machines.erase(&first);
+  brain.machines.erase(&second);
+}
+
 static void testBrainIgnitionRequiresNeuronControlBeforeHealthy(TestSuite& suite)
 {
   bool createdRing = false;
@@ -30209,6 +30454,16 @@ int main(void)
     testNeuronBaseInitializesLocalContainerSubnet(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-admission-replay") == 0)
+  {
+    testBrainReplaysHardwareReceivedBeforeTopologyAdmission(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-topology-overlap") == 0)
+  {
+    testBrainHardwareReplayRetainsConcurrentInventory(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-listener-contract") == 0)
   {
     testContainerNeuronListenerContract(suite);
@@ -30303,6 +30558,11 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-bundle") == 0)
   {
     runAsyncBundleTests(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-addmachines-stale-topology") == 0)
+  {
+    testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-topology") == 0)
@@ -30990,6 +31250,8 @@ int main(void)
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);
   testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachine(suite);
   testBrainNeuronHandlerAppliesMachineHardwareProfile(suite);
+  testBrainReplaysHardwareReceivedBeforeTopologyAdmission(suite);
+  testBrainHardwareReplayRetainsConcurrentInventory(suite);
   testBrainIgnitionRequiresNeuronControlBeforeHealthy(suite);
   testBrainHealthyRequiresInventoryAndFragment(suite);
   testTestClusterConfigOverridesCollectedHardwareCapacity(suite);

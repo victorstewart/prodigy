@@ -1146,6 +1146,20 @@ public:
   bool weAreMaster = false;
   bool peerMasterIdentityPublicationPending = false;
   uint64_t masterAuthorityEpoch = 1;
+  // Hardware inventory is an asynchronous read-modify-write of the durable
+  // topology. Keep only the latest profile per immutable ClusterMachine
+  // identity and construct each write after the preceding receipt is durable.
+  class PendingMachineHardwareTopologyMutation
+  {
+  public:
+    ClusterMachine identity = {};
+    MachineHardwareProfile hardware = {};
+    uint64_t generation = 0;
+  };
+  Vector<PendingMachineHardwareTopologyMutation> pendingMachineHardwareTopologyMutations = {};
+  uint64_t pendingMachineHardwareTopologyMutationAuthorityEpoch = 0;
+  bool machineHardwareTopologyPersistencePending = false;
+  uint64_t nextMachineHardwareTopologyMutationGeneration = 1;
   uint64_t lastMothershipConnectionIncarnation = 0;
   uint64_t durableMasterAuthorityRuntimeStateGeneration = 0;
   bool masterAuthorityRuntimeStateDurable = false;
@@ -5931,14 +5945,21 @@ public:
     return true;
   }
 
-  bool mergePendingAddMachinesTopology(const ProdigyPendingAddMachinesOperation& operation, ClusterTopology& mergedTopology, String& failure) const
+  bool mergePendingAddMachinesTopology(const ProdigyPendingAddMachinesOperation& operation,
+                                        const Vector<ClusterMachine> *completedBootstrapMachines,
+                                        ClusterTopology& mergedTopology, String& failure) const
   {
     failure.clear();
 
     ClusterTopology authoritativeTopology = {};
-    if (loadAuthoritativeClusterTopology(authoritativeTopology) == false)
+    if (loadAuthoritativeClusterTopologyForMutation(authoritativeTopology) == false)
     {
-      failure.assign("failed to load authoritative topology for addMachines resume"_ctv);
+      failure.assign("failed to load authoritative topology for addMachines mutation"_ctv);
+      return false;
+    }
+    if (authoritativeTopology.version == std::numeric_limits<decltype(authoritativeTopology.version)>::max())
+    {
+      failure.assign("authoritative topology version exhausted during addMachines"_ctv);
       return false;
     }
 
@@ -5948,14 +5969,41 @@ public:
       return false;
     }
 
-    for (const ClusterMachine& machine : operation.plannedTopology.machines)
-    {
-      if (clusterTopologyContainsMachineIdentity(mergedTopology, machine))
+    Vector<ClusterMachine> intendedAdditions = {};
+    auto appendPlannedMachine = [&](const ClusterMachine& identity) {
+      const ClusterMachine *planned = prodigyFindClusterMachineByIdentity(operation.plannedTopology.machines, identity);
+      if (planned != nullptr && prodigyFindClusterMachineByIdentity(intendedAdditions, *planned) == nullptr)
       {
-        continue;
+        intendedAdditions.push_back(*planned);
       }
+    };
+    // These are the exact machines this operation has durably created or has
+    // actually bootstrapped. They may be overlaid on a newer topology; copying
+    // every missing member from the old full snapshot would resurrect a member
+    // another authority transition removed while bootstrap was in flight.
+    for (const ClusterMachine& machine : operation.request.readyMachines) appendPlannedMachine(machine);
+    for (const ClusterMachine& machine : operation.machinesToBootstrap) appendPlannedMachine(machine);
+    if (completedBootstrapMachines != nullptr)
+    {
+      for (const ClusterMachine& machine : *completedBootstrapMachines) appendPlannedMachine(machine);
+    }
 
-      mergedTopology.machines.push_back(machine);
+    if (authoritativeTopology.version == operation.plannedTopology.version)
+    {
+      // No topology generation advanced since this operation captured its
+      // plan, so the complete target remains a safe recovery source.
+      for (const ClusterMachine& machine : operation.plannedTopology.machines)
+      {
+        appendPlannedMachine(machine);
+      }
+    }
+
+    for (const ClusterMachine& machine : intendedAdditions)
+    {
+      if (clusterTopologyContainsMachineIdentity(mergedTopology, machine) == false)
+      {
+        mergedTopology.machines.push_back(machine);
+      }
     }
 
     for (const ClusterMachine& removedMachine : operation.request.removedMachines)
@@ -5966,9 +6014,35 @@ public:
       mergedTopology.machines.erase(it, mergedTopology.machines.end());
     }
 
+    if (authoritativeTopology.version != operation.plannedTopology.version)
+    {
+      // A completed created machine is normally passed by the live caller. On
+      // recovery it must still be present in machinesToBootstrap. Refuse to
+      // erase the journal if its identity cannot be proven an operation-owned
+      // addition rather than reviving a concurrently removed old member.
+      for (const ClusterMachine& planned : operation.plannedTopology.machines)
+      {
+        if (clusterTopologyContainsMachineIdentity(authoritativeTopology, planned) ||
+            prodigyFindClusterMachineByIdentity(intendedAdditions, planned) != nullptr ||
+            std::any_of(operation.request.removedMachines.begin(), operation.request.removedMachines.end(),
+                        [&](const ClusterMachine& removed) { return planned.sameIdentityAs(removed); }))
+        {
+          continue;
+        }
+        failure.assign("stale addMachines topology has an unclassified missing machine"_ctv);
+        return false;
+      }
+    }
+
     prodigyNormalizeClusterTopologyPeerAddresses(mergedTopology);
     mergedTopology.version = authoritativeTopology.version + 1;
     return true;
+  }
+
+  bool mergePendingAddMachinesTopology(const ProdigyPendingAddMachinesOperation& operation,
+                                        ClusterTopology& mergedTopology, String& failure) const
+  {
+    return mergePendingAddMachinesTopology(operation, nullptr, mergedTopology, failure);
   }
 
   virtual bool canSuspendRemoteBootstrap(void) const
@@ -16631,6 +16705,14 @@ public:
     return false;
   }
 
+  // Mutation callers read the newest admitted topology snapshot immediately
+  // before enqueueing a dependent write. This is deliberately separate from
+  // membership/readiness readers, which require a durable topology.
+  virtual bool loadAuthoritativeClusterTopologyForMutation(ClusterTopology& topology) const
+  {
+    return loadAuthoritativeClusterTopology(topology);
+  }
+
   virtual bool persistAuthoritativeClusterTopology(const ClusterTopology& topology)
   {
     (void)topology;
@@ -16657,6 +16739,171 @@ public:
     return false;
   }
 
+  void startPendingMachineHardwareTopologyPersistence()
+  {
+    if (machineHardwareTopologyPersistencePending || pendingMachineHardwareTopologyMutations.empty() ||
+        isActiveMaster() == false)
+    {
+      return;
+    }
+    if (pendingMachineHardwareTopologyMutationAuthorityEpoch != masterAuthorityEpoch)
+    {
+      pendingMachineHardwareTopologyMutations.clear();
+      pendingMachineHardwareTopologyMutationAuthorityEpoch = 0;
+      return;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false || topology.machines.empty() ||
+        topology.version == std::numeric_limits<decltype(topology.version)>::max())
+    {
+      // Do not spin on a transiently unavailable topology. A subsequent
+      // inventory or restore observation can retry from its then-durable base.
+      return;
+    }
+
+    bool updatedTopology = false;
+    Vector<uint64_t> submittedGenerations = {};
+    for (auto mutation = pendingMachineHardwareTopologyMutations.begin();
+         mutation != pendingMachineHardwareTopologyMutations.end();)
+    {
+      ClusterMachine *clusterMachine = prodigyFindClusterMachineByIdentity(topology.machines, mutation->identity);
+      if (clusterMachine == nullptr)
+      {
+        // The immutable target is no longer admitted. It must not hold the
+        // hardware queue or be applied to a replacement machine.
+        mutation = pendingMachineHardwareTopologyMutations.erase(mutation);
+        continue;
+      }
+
+      prodigyApplyHardwareProfileToClusterMachine(*clusterMachine, mutation->hardware,
+                                                  brainConfig.machineReservedResources);
+      if (brainConfig.runtimeEnvironment.test.enabled)
+      {
+        String schema = {};
+        if (resolveClusterMachineSchemaKey(*clusterMachine, schema))
+        {
+          auto configIt = brainConfig.configBySlug.find(schema);
+          if (configIt != brainConfig.configBySlug.end())
+          {
+            (void)clusterMachineApplyOwnedResourcesFromConfig(*clusterMachine, configIt->second,
+                                                               brainConfig.machineReservedResources);
+          }
+        }
+      }
+      updatedTopology = true;
+      submittedGenerations.push_back(mutation->generation);
+      ++mutation;
+    }
+
+    if (updatedTopology == false)
+    {
+      return;
+    }
+
+    prodigyStripMachineHardwareCapturesFromClusterTopology(topology);
+    topology.version += 1;
+    machineHardwareTopologyPersistencePending = true;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const uint64_t epoch = masterAuthorityEpoch;
+    persistAuthoritativeClusterTopologyAsync(
+        topology,
+        [this, lifetime, epoch, topology, submittedGenerations = std::move(submittedGenerations)](bool durable) mutable {
+          if (lifetime.expired()) return;
+          machineHardwareTopologyPersistencePending = false;
+          const bool current = durable && isActiveMaster() && masterAuthorityEpoch == epoch;
+          if (current == false)
+          {
+            // A failed receipt remains eligible for a later observation-driven
+            // retry. A demotion/epoch change invalidates these local intents.
+            if (masterAuthorityEpoch != epoch || isActiveMaster() == false)
+            {
+              pendingMachineHardwareTopologyMutations.clear();
+              pendingMachineHardwareTopologyMutationAuthorityEpoch = 0;
+            }
+            return;
+          }
+
+          pendingMachineHardwareTopologyMutations.erase(
+              std::remove_if(pendingMachineHardwareTopologyMutations.begin(),
+                             pendingMachineHardwareTopologyMutations.end(),
+                             [&](const PendingMachineHardwareTopologyMutation& mutation) {
+                               return std::find(submittedGenerations.begin(), submittedGenerations.end(),
+                                                mutation.generation) != submittedGenerations.end();
+                             }),
+              pendingMachineHardwareTopologyMutations.end());
+          if (pendingMachineHardwareTopologyMutations.empty())
+          {
+            pendingMachineHardwareTopologyMutationAuthorityEpoch = 0;
+          }
+          String serializedTopology = {};
+          BitseryEngine::serialize(serializedTopology, topology);
+          queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
+          startPendingMachineHardwareTopologyPersistence();
+        });
+  }
+
+  void persistMachineHardwareProfilesToAuthoritativeTopology(const Vector<Machine *>& machinesWithHardware)
+  {
+    if (isActiveMaster() == false || machinesWithHardware.empty())
+    {
+      return;
+    }
+
+    // Capture only immutable topology identity plus the newest hardware value;
+    // never retain a Machine pointer across an asynchronous receipt.
+    if (pendingMachineHardwareTopologyMutations.empty() == false &&
+        pendingMachineHardwareTopologyMutationAuthorityEpoch != masterAuthorityEpoch)
+    {
+      pendingMachineHardwareTopologyMutations.clear();
+      pendingMachineHardwareTopologyMutationAuthorityEpoch = 0;
+    }
+
+    ClusterTopology topology = {};
+    if (loadAuthoritativeClusterTopology(topology) == false || topology.machines.empty())
+    {
+      return;
+    }
+
+    for (Machine *machine : machinesWithHardware)
+    {
+      if (machine == nullptr)
+      {
+        continue;
+      }
+      const ClusterMachine *clusterMachine = prodigyFindAuthoritativeClusterMachineForMachine(topology, *machine);
+      if (clusterMachine == nullptr)
+      {
+        continue;
+      }
+
+      auto existing = std::find_if(pendingMachineHardwareTopologyMutations.begin(),
+                                   pendingMachineHardwareTopologyMutations.end(),
+                                   [&](const PendingMachineHardwareTopologyMutation& mutation) {
+                                     return mutation.identity.sameIdentityAs(*clusterMachine);
+                                   });
+      if (existing != pendingMachineHardwareTopologyMutations.end())
+      {
+        existing->hardware = machine->hardware;
+        existing->generation = nextMachineHardwareTopologyMutationGeneration++;
+      }
+      else
+      {
+        PendingMachineHardwareTopologyMutation mutation = {};
+        mutation.identity = *clusterMachine;
+        mutation.hardware = machine->hardware;
+        mutation.generation = nextMachineHardwareTopologyMutationGeneration++;
+        if (pendingMachineHardwareTopologyMutations.empty())
+        {
+          pendingMachineHardwareTopologyMutationAuthorityEpoch = masterAuthorityEpoch;
+        }
+        pendingMachineHardwareTopologyMutations.push_back(std::move(mutation));
+      }
+    }
+
+    startPendingMachineHardwareTopologyPersistence();
+  }
+
   void applyMachineHardwareProfile(Machine *machine, const MachineHardwareProfile& hardware)
   {
     if (machine == nullptr)
@@ -16681,54 +16928,17 @@ public:
 
     if (changed == false && configuredCapacityChanged == false)
     {
+      // A prior hardware topology receipt can have failed after retaining this
+      // exact mutation. The next authenticated observation is its bounded
+      // retry trigger; do not manufacture a timer-driven retry loop.
+      startPendingMachineHardwareTopologyPersistence();
       return;
     }
 
     persistLocalRuntimeStateAsync();
-
-    if (isActiveMaster())
-    {
-      ClusterTopology topology = {};
-      if (loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false)
-      {
-        bool updatedTopology = false;
-        for (ClusterMachine& clusterMachine : topology.machines)
-        {
-          if (prodigyClusterMachineMatchesMachineIdentity(clusterMachine, *machine) == false)
-          {
-            continue;
-          }
-
-          prodigyApplyHardwareProfileToClusterMachine(clusterMachine, hardware, brainConfig.machineReservedResources);
-          if (brainConfig.runtimeEnvironment.test.enabled)
-          {
-            auto configIt = brainConfig.configBySlug.find(machine->slug);
-            if (configIt != brainConfig.configBySlug.end())
-            {
-              (void)clusterMachineApplyOwnedResourcesFromConfig(clusterMachine, configIt->second, brainConfig.machineReservedResources);
-            }
-          }
-          updatedTopology = true;
-          break;
-        }
-
-        if (updatedTopology == false)
-        {
-          return;
-        }
-
-        prodigyStripMachineHardwareCapturesFromClusterTopology(topology);
-        topology.version += 1;
-        const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-        const uint64_t epoch = masterAuthorityEpoch;
-        persistAuthoritativeClusterTopologyAsync(topology, [this, lifetime, epoch, topology](bool durable) {
-          if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch) return;
-          String serializedTopology;
-          BitseryEngine::serialize(serializedTopology, topology);
-          queueBrainReplication(BrainTopic::replicateClusterTopology, serializedTopology);
-        });
-      }
-    }
+    Vector<Machine *> machinesWithHardware = {};
+    machinesWithHardware.push_back(machine);
+    persistMachineHardwareProfilesToAuthoritativeTopology(machinesWithHardware);
   }
 
   static bool resolveClusterMachinePrivate4(const ClusterMachine& clusterMachine, uint32_t& private4)
@@ -19457,6 +19667,7 @@ public:
   {
     bool restoredAny = false;
     bytell_hash_set<Machine *> knownMachines = machines;
+    Vector<Machine *> machinesWithHardwareToReplay = {};
 
     for (const ClusterMachine& clusterMachine : topology.machines)
     {
@@ -19494,6 +19705,15 @@ public:
         PRODIGY_DEBUG_FLUSH();
       }
 
+      // A follower can complete authenticated hardware inventory before its
+      // creator durably admits its ClusterMachine. Compare the durable shape:
+      // topology intentionally strips tool captures from hardware profiles.
+      MachineHardwareProfile durableHardware = machine->hardware;
+      prodigyStripMachineHardwareCapturesForClusterReport(durableHardware);
+      if (knownMachine && durableHardware.inventoryComplete && clusterMachine.hardware != durableHardware)
+      {
+        machinesWithHardwareToReplay.push_back(machine);
+      }
       applyClusterMachineRecord(machine, clusterMachine, resolvedPrivate4, resolvedPeerAddress, resolvedPeerAddressText);
       PRODIGY_DEBUG_LOG( "prodigy topology restore-machine applied machine=%p uuid=%llu private4=%u isBrain=%d isThisMachine=%d slug=%s cloudID=%s\n",
                    machine,
@@ -19579,6 +19799,10 @@ public:
       restoredAny = true;
     }
 
+    // Submit every pre-admission inventory result in one authoritative snapshot.
+    // The writer is asynchronous, so separate snapshots could otherwise overwrite
+    // sibling follower inventory before either receipt becomes durable.
+    persistMachineHardwareProfilesToAuthoritativeTopology(machinesWithHardwareToReplay);
     return restoredAny;
   }
 
@@ -32053,12 +32277,28 @@ public:
 
       if (response.failure.size() == 0 && readOnlyTopologyRequest == false)
       {
+        // Bootstrap and journal receipts may yield while another authoritative
+        // topology update commits. Reconcile this operation's exact additions
+        // onto the newest durable base instead of persisting targetTopology's
+        // pre-bootstrap snapshot.
+        const ProdigyPendingAddMachinesOperation *pendingOperation =
+            pendingAddMachinesOperationID == 0 ? nullptr : findPendingAddMachinesOperation(pendingAddMachinesOperationID);
+        ClusterTopology reconciledTopology = {};
+        if (pendingOperation == nullptr ||
+            mergePendingAddMachinesTopology(*pendingOperation, &startedMachines, reconciledTopology, response.failure) == false)
+        {
+          if (response.failure.empty())
+          {
+            response.failure.assign("missing durable addMachines operation before topology commit"_ctv);
+          }
+          goto addmachines_finalize;
+        }
+        targetTopology = std::move(reconciledTopology);
         PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-post-bootstrap started=%u targetMachines=%u currentVersion=%u\n",
                      uint32_t(startedMachines.size()),
                      uint32_t(targetTopology.machines.size()),
                      uint32_t(currentTopology.version));
         PRODIGY_DEBUG_FLUSH();
-        targetTopology.version = currentTopology.version + 1;
 
         PRODIGY_DEBUG_LOG( "prodigy mothership addMachines-persist-topology version=%u machines=%u\n",
                      uint32_t(targetTopology.version),
