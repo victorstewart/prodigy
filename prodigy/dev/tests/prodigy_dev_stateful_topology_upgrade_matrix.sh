@@ -32,7 +32,7 @@ do
    fi
 done
 
-deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip rg)
+deps=(awk btrfs cargo mkfs.btrfs mount umount stat zstd timeout ip rg nproc)
 for cmd in "${deps[@]}"
 do
    if ! command -v "${cmd}" >/dev/null 2>&1
@@ -41,6 +41,15 @@ do
       exit 77
    fi
 done
+
+# The largest overlap keeps a three-core source beside a five-core target.
+# Runtime reserves two additional CPUs; fake inventory cannot supply real CPUs.
+available_cpus="$(nproc)"
+if [[ "${available_cpus}" -lt 10 ]]
+then
+   echo "FAIL: stateful topology matrix requires at least 10 available CPUs (3 source + 5 target + 2 reserved); got ${available_cpus}"
+   exit 1
+fi
 
 PRODIGY_BIN="$(readlink -f "${PRODIGY_BIN}" 2>/dev/null || printf '%s' "${PRODIGY_BIN}")"
 MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${MOTHERSHIP_BIN}")"
@@ -51,6 +60,11 @@ tmpdir="$(mktemp -d)"
 export TMPDIR="${tmpdir}"
 failed_cases=0
 total_cases=0
+selected_case="${PRODIGY_DEV_STATEFUL_TOPOLOGY_CASE:-}"
+case "${selected_case}" in
+   ""|stateful_vertical_core_raise_blue_green_cutover|stateful_odd_core_raise_blue_green_cutover|stateful_topology_upgrade_crash_recovery|stateful_repeated_topology_raise_soak) ;;
+   *) echo "FAIL: unknown stateful topology case: ${selected_case}" >&2; exit 2 ;;
+esac
 
 cleanup()
 {
@@ -136,7 +150,10 @@ write_stateful_topology_upgrade_plan()
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
-  "useHostNetworkNamespace": true,
+  "apiCredentials": {
+    "applicationID": ${app_id},
+    "requiredCredentialNames": []
+  },
   "minimumSubscriberCapacity": 1024,
   "isStateful": true,
   "stateful": {
@@ -188,6 +205,10 @@ run_case()
    local case_name="$1"
    shift
 
+   if [[ -n "${selected_case}" && "${selected_case}" != "${case_name}" ]]
+   then
+      return 0
+   fi
    total_cases=$((total_cases + 1))
    echo "=== STATEFUL_TOPOLOGY_CASE ${case_name} ==="
 
@@ -203,6 +224,11 @@ run_case()
 
    echo "STATEFUL_TOPOLOGY_CASE_FAIL ${case_name}"
    failed_cases=$((failed_cases + 1))
+   if [[ "${PRODIGY_DEV_STATEFUL_TOPOLOGY_STOP_ON_FAILURE:-0}" == 1 ]]
+   then
+      echo "STATEFUL_TOPOLOGY_RUNTIME_SUMMARY total=${total_cases} failed=${failed_cases} stoppedEarly=1"
+      return 1
+   fi
 }
 
 build_case_artifacts "even_worker_raise" 6 2 2 4
@@ -232,7 +258,7 @@ run_case "stateful_vertical_core_raise_blue_green_cutover" \
    --deploy-report-require-scaler-value-min=1 \
    --deploy-skip-probe=1 \
    --require-brain-log-substring="stateful topology upgrade arm" \
-   --require-brain-log-substring="stateful topology cutover" \
+   --require-brain-log-substring="autoscale topologyCutover" \
    --require-brain-log-substring="cores=2->4 workers=1->2"
 
 build_case_artifacts "odd_worker_raise" 6 3 2 5
@@ -262,7 +288,7 @@ run_case "stateful_odd_core_raise_blue_green_cutover" \
    --deploy-report-require-scaler-value-min=1 \
    --deploy-skip-probe=1 \
    --require-brain-log-substring="stateful topology upgrade arm" \
-   --require-brain-log-substring="stateful topology cutover" \
+   --require-brain-log-substring="autoscale topologyCutover" \
    --require-brain-log-substring="cores=3->5 workers=1->3"
 
 build_case_artifacts "topology_crash_recovery" 6 2 2 4
@@ -298,10 +324,11 @@ run_case "stateful_topology_upgrade_crash_recovery" \
    --deploy-report-require-scaler-value-min=1 \
    --deploy-skip-probe=1 \
    --require-brain-log-substring="stateful topology upgrade arm" \
-   --require-brain-log-substring="stateful topology cutover"
+   --require-brain-log-substring="autoscale topologyCutover"
 
 build_case_artifacts "repeated_odd_soak" 6 1 2 5
 run_case "stateful_repeated_topology_raise_soak" \
+   --deploy-report-success-hold-ms=300000 \
    --brains=3 \
    --test-machine-logical-cores=32 \
    --duration=300 \
@@ -327,7 +354,7 @@ run_case "stateful_repeated_topology_raise_soak" \
    --deploy-report-require-scaler-value-min=1 \
    --deploy-skip-probe=1 \
    --require-brain-log-substring="stateful topology upgrade arm" \
-   --require-brain-log-substring="stateful topology cutover" \
+   --require-brain-log-substring="autoscale topologyCutover" \
    --require-brain-log-substring="cores=1->3 workers=1->1" \
    --require-brain-log-substring="cores=3->5 workers=1->3"
 
@@ -338,4 +365,10 @@ then
    exit 1
 fi
 
-echo "STATEFUL_TOPOLOGY_RUNTIME_PASS"
+if [[ -n "${selected_case}" ]]
+then
+   [[ "${total_cases}" == 1 ]] || { echo "FAIL: selected case did not run" >&2; exit 1; }
+   echo "STATEFUL_TOPOLOGY_SELECTED_CASE_PASS case=${selected_case}"
+else
+   echo "STATEFUL_TOPOLOGY_RUNTIME_PASS"
+fi

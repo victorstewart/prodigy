@@ -1270,6 +1270,11 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
       {
         retained[index].explicitStatefulMeshRoles.client = 0;
       }
+      else
+      {
+        retained[index].advertisements.emplace(
+            roles.client, Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 0));
+      }
     }
     successor.containers.insert(&retained[index]);
     successor.containersByShardGroup.insert(0, &retained[index]);
@@ -1396,6 +1401,127 @@ static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
   suite.expect(deployment.architectedStatefulConstructionDataStrategy(0) == DataStrategy::genesis,
                "removed_recovered_stateful_master_remains_genesis");
   deployment.masterForShardGroup.clear();
+}
+
+static void testRecoveredStatefulMasterAdvertisementFence(TestSuite& suite)
+{
+  auto initializePlan = [](ApplicationDeployment& deployment) {
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.applicationID = 19'211;
+    deployment.plan.config.versionID = 1;
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(19'211, 1);
+    deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(19'211, 2);
+    deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(19'211, 3);
+    deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(19'211, 4);
+    deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(19'211, 5);
+    deployment.plan.stateful.allMasters = false;
+  };
+  auto generatedClientAdvertisement = [](const DeploymentPlan& plan, Advertisement& clientAdvertisement) {
+    const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(
+        plan.stateful, plan.config.applicationID, 0);
+    StatefulTopology topology = {};
+    prodigyPopulateDefaultStatefulTopology(topology, 0, plan.config);
+    ProdigyContainerServiceDefinitionContext context = {};
+    context.isStateful = true;
+    context.roles = roles;
+    context.topology = topology;
+    context.advertiseClient = true;
+    context.nShardGroups = 1;
+    ProdigyContainerServiceDefinitions definitions = {};
+    if (prodigyBuildContainerServiceDefinitions(plan, context, definitions) == false)
+    {
+      return false;
+    }
+    for (const Advertisement& definition : definitions.advertisements)
+    {
+      if (definition.service == roles.client)
+      {
+        clientAdvertisement = definition;
+        return true;
+      }
+    }
+    return false;
+  };
+  auto seedCanonicalReplica = [](ApplicationDeployment& deployment, ContainerView& container, uint128_t uuid) {
+    container.uuid = uuid;
+    container.deploymentID = deployment.plan.config.deploymentID();
+    container.applicationID = deployment.plan.config.applicationID;
+    container.lifetime = ApplicationLifetime::base;
+    container.isStateful = true;
+    container.shardGroup = 0;
+    container.state = ContainerState::healthy;
+    deployment.containers.insert(&container);
+  };
+
+  ApplicationDeployment deployment = {};
+  initializePlan(deployment);
+  Advertisement clientAdvertisement = {};
+  const bool generated = generatedClientAdvertisement(deployment.plan, clientAdvertisement);
+  suite.expect(generated, "recovered_stateful_master_fixture_generates_actual_client_advertisement");
+  if (generated == false) return;
+
+  ContainerView replicas[3] = {};
+  seedCanonicalReplica(deployment, replicas[0], uint128_t(0x1921101));
+  seedCanonicalReplica(deployment, replicas[1], uint128_t(0x1921102));
+  seedCanonicalReplica(deployment, replicas[2], uint128_t(0x1921103));
+  // All three retained views deliberately use canonical fallback roles.  The
+  // generated service definition is the evidence that only this replica was
+  // serving the client role when the inventory was persisted.
+  replicas[0].advertisements.emplace(clientAdvertisement.service, clientAdvertisement);
+  suite.expect(deployment.rebuildRecoveredStatefulShardMasters() &&
+                   deployment.masterForShardGroup.contains(0) &&
+                   deployment.masterForShardGroup[0] == &replicas[0],
+               "recovered_stateful_master_uses_actual_client_advertisement_not_canonical_role_default");
+
+  ContainerPlan generatedPlans[3] = {
+      replicas[0].generatePlan(deployment.plan, 1),
+      replicas[1].generatePlan(deployment.plan, 1),
+      replicas[2].generatePlan(deployment.plan, 1)};
+  ContainerPlan restoredPlans[3] = {};
+  bool restoredPlansDecoded = true;
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    String serializedContainerPlan = {};
+    BitseryEngine::serialize(serializedContainerPlan, generatedPlans[index]);
+    restoredPlansDecoded = BitseryEngine::deserializeSafe(serializedContainerPlan, restoredPlans[index]) && restoredPlansDecoded;
+  }
+  suite.expect(restoredPlansDecoded,
+               "recovered_stateful_master_container_plan_roundtrip_decodes_roles_and_advertisements");
+  if (restoredPlansDecoded)
+  {
+    ApplicationDeployment restored = {};
+    restored.plan = deployment.plan;
+    ContainerView restoredReplicas[3] = {};
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      const ContainerPlan& plan = restoredPlans[index];
+      restoredReplicas[index].uuid = plan.uuid;
+      restoredReplicas[index].deploymentID = plan.config.deploymentID();
+      restoredReplicas[index].applicationID = plan.config.applicationID;
+      restoredReplicas[index].lifetime = plan.lifetime;
+      restoredReplicas[index].isStateful = plan.isStateful;
+      restoredReplicas[index].shardGroup = plan.shardGroup;
+      restoredReplicas[index].state = plan.state;
+      restoredReplicas[index].runtimeReady = plan.runtimeReady;
+      restoredReplicas[index].explicitStatefulMeshRoles = plan.statefulMeshRoles;
+      restoredReplicas[index].explicitStatefulTopology = plan.statefulTopology;
+      restoredReplicas[index].subscriptions = plan.subscriptions;
+      restoredReplicas[index].advertisements = plan.advertisements;
+      restored.containers.insert(&restoredReplicas[index]);
+    }
+    suite.expect(restoredReplicas[0].advertisements.contains(clientAdvertisement.service) &&
+                     restoredReplicas[1].advertisements.contains(clientAdvertisement.service) == false &&
+                     restoredReplicas[2].advertisements.contains(clientAdvertisement.service) == false &&
+                     restored.rebuildRecoveredStatefulShardMasters() &&
+                     restored.masterForShardGroup.contains(0) &&
+                     restored.masterForShardGroup[0] == &restoredReplicas[0],
+                 "recovered_stateful_master_roundtripped_container_plans_select_actual_client_advertiser");
+  }
+
+  replicas[1].advertisements.emplace(clientAdvertisement.service, clientAdvertisement);
+  suite.expect(deployment.rebuildRecoveredStatefulShardMasters() == false,
+               "recovered_stateful_master_rejects_two_actual_client_advertisements");
 }
 
 static void testMaterializedStatefulRecoveryInitialHealth(TestSuite& suite)
@@ -2059,6 +2185,11 @@ int main(void)
     testRecoveredStatefulQuorumDataStrategy(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (std::getenv("PRODIGY_TEST_RECOVERED_STATEFUL_MASTER_ADVERTISEMENT_ONLY") != nullptr)
+  {
+    testRecoveredStatefulMasterAdvertisementFence(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY") != nullptr)
   {
     testMaterializedStatefulRecoveryInitialHealth(suite);
@@ -2176,6 +2307,8 @@ int main(void)
     dprintf(STDOUT_FILENO, "cold_restart_storage_focused failed=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+
+  testRecoveredStatefulMasterAdvertisementFence(suite);
 
   // Exercise the CLI's parser directly; this path needs no runtime resources.
   {

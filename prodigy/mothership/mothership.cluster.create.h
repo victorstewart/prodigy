@@ -1117,11 +1117,12 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     }
     if (fetched == false)
     {
-      localFailure.snprintf<"test cluster topology did not become ready expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa}"_ctv>(
+      localFailure.snprintf<"test cluster topology did not become ready expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa} readyMachines={itoa}"_ctv>(
           uint64_t(cluster.test.machineCount),
           uint64_t(currentTopology.machines.size()),
           uint64_t(cluster.nBrains),
-          uint64_t(clusterTopologyBrainCount(currentTopology)));
+          uint64_t(clusterTopologyBrainCount(currentTopology)),
+          uint64_t(mothershipClusterTopologyMachinesWithReadyResources(currentTopology)));
       return failWithCleanup(localFailure);
     }
 

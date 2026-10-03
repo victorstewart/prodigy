@@ -3968,18 +3968,15 @@ public:
     statefulWorkerTopologyUpgradeSourceEpoch = currentServingStatefulTopologyEpochForLockedShardGroups(sourceWorkerCount);
     statefulWorkerTopologyUpgradeTargetEpoch = generateDistinctTopologyUpgradeEpoch(statefulWorkerTopologyUpgradeSourceEpoch);
 
-#if PRODIGY_DEBUG
-    PRODIGY_DEBUG_LOG( "stateful topology upgrade arm deploymentID=%llu cores=%u->%u workers=%u->%u sourceEpoch=%u targetEpoch=%u lockedGroups=%u\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(plan.config.nLogicalCores),
-                 unsigned(targetLogicalCores),
-                 unsigned(sourceWorkerCount),
-                 unsigned(targetWorkerCount),
-                 unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
-                 unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
-                 unsigned(statefulWorkerTopologyLockedShardGroups.size()));
-    PRODIGY_DEBUG_FLUSH();
-#endif
+    autoscaleTrace("stateful topology upgrade arm deploymentID=%llu cores=%u->%u workers=%u->%u sourceEpoch=%u targetEpoch=%u lockedGroups=%u\n",
+                   (unsigned long long)plan.config.deploymentID(),
+                   unsigned(plan.config.nLogicalCores),
+                   unsigned(targetLogicalCores),
+                   unsigned(sourceWorkerCount),
+                   unsigned(targetWorkerCount),
+                   unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
+                   unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
+                   unsigned(statefulWorkerTopologyLockedShardGroups.size()));
 
     for (ContainerView *container : containers)
     {
@@ -4936,16 +4933,6 @@ private:
 
     statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;
     statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
-#if PRODIGY_DEBUG
-    PRODIGY_DEBUG_LOG( "stateful topology cutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
-                 (unsigned long long)plan.config.deploymentID(),
-                 unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
-                 unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
-                 unsigned(statefulWorkerTopologyUpgradeSourceWorkerCount),
-                 unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount),
-                 unsigned(statefulWorkerTopologyLockedShardGroups.size()));
-    PRODIGY_DEBUG_FLUSH();
-#endif
     autoscaleTrace("autoscale topologyCutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
                    (unsigned long long)plan.config.deploymentID(),
                    unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
@@ -5360,7 +5347,9 @@ private:
   {
     if (autoscaleTraceEnabled())
     {
-      basics_log(format, args...);
+      // This opt-in diagnostic must also work in release qualification builds.
+      std::fprintf(stderr, format, args...);
+      std::fflush(stderr);
     }
   }
 
@@ -6552,7 +6541,7 @@ public:
       if (container == nullptr || container->deploymentID != plan.config.deploymentID() ||
           container->isStateful == false)
       {
-        basics_log("deployment recoverAfterReboot cannot reconstruct stateful master deploymentID=%llu appID=%u\n",
+        autoscaleTrace("deployment recoverAfterReboot cannot reconstruct stateful master deploymentID=%llu appID=%u\n",
                    (unsigned long long)plan.config.deploymentID(), unsigned(plan.config.applicationID));
         return false;
       }
@@ -6566,13 +6555,18 @@ public:
           continue;
       }
 
-      if (container->effectiveStatefulMeshRoles(plan).client == 0)
+      // Canonical role sets name every service, including client, on every
+      // replica. Only its selected advertiser owns that shard's client role.
+      // This also handles a restored plan whose empty pruned role set falls
+      // back to the canonical names. Preserve the duplicate-advertiser fence.
+      const uint64_t clientService = container->effectiveStatefulMeshRoles(plan).client;
+      if (clientService == 0 || container->advertisements.contains(clientService) == false)
       {
         continue;
       }
       if (masterForShardGroup.contains(container->shardGroup))
       {
-        basics_log("deployment recoverAfterReboot found conflicting stateful client masters deploymentID=%llu appID=%u shardGroup=%u\n",
+        autoscaleTrace("deployment recoverAfterReboot found conflicting stateful client masters deploymentID=%llu appID=%u shardGroup=%u\n",
                    (unsigned long long)plan.config.deploymentID(), unsigned(plan.config.applicationID),
                    unsigned(container->shardGroup));
         return false;
@@ -6657,6 +6651,10 @@ public:
   // Reconcile pending work and close target deficits after master/brain recovery.
   void recoverAfterReboot(void)
   {
+    autoscaleTrace("deployment recovery inspect deploymentID=%llu state=%u containers=%llu topologyPhase=%u lockedGroups=%llu\n",
+                   (unsigned long long)plan.config.deploymentID(), unsigned(state),
+                   (unsigned long long)containers.size(), unsigned(statefulWorkerTopologyUpgradePhase),
+                   (unsigned long long)statefulWorkerTopologyLockedShardGroups.size());
 #if PRODIGY_DEBUG
     PRODIGY_DEBUG_LOG(
                  "deployment recoverAfterReboot begin deploymentID=%llu appID=%u state=%u waiting=%llu toSchedule=%llu nDeployed=%u nTarget=%u nHealthy=%u suspended=%u\n",

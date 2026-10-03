@@ -29356,6 +29356,12 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
     retained[index].runtimeReady = true;
     retained[index].explicitStatefulMeshRoles = roles;
     if (index == 1) retained[index].explicitStatefulMeshRoles.client = 0;
+    if (index == 0)
+    {
+      retained[index].advertisements.emplace(roles.client,
+          Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 19'113));
+      retained[index].advertisingOnPorts.insert(19'113);
+    }
     head->containers.insert(&retained[index]);
     head->containersByShardGroup.insert(0, &retained[index]);
     head->countPerMachine[&machines[index]] = 1;
@@ -29383,10 +29389,15 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
                "orphaned_materialized_head_failed_barrier_remains_held");
   head->materializedStatefulRecoveryHealthFailed = false;
   retained[1].explicitStatefulMeshRoles.client = roles.client;
+  retained[1].advertisements.emplace(roles.client,
+      Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 19'114));
+  retained[1].advertisingOnPorts.insert(19'114);
   brain.recoverDeploymentsAfterNeuronState();
   suite.expect(head->containers.size() == 2,
                "orphaned_materialized_head_duplicate_client_remains_held");
   retained[1].explicitStatefulMeshRoles.client = 0;
+  retained[1].advertisements.erase(roles.client);
+  retained[1].advertisingOnPorts.erase(19'114);
   retained[1].state = ContainerState::scheduled;
   brain.recoverDeploymentsAfterNeuronState();
   suite.expect(head->containers.size() == 2,

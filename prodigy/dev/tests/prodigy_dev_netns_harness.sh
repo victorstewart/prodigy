@@ -26,6 +26,7 @@ repo_root="$(cd "${script_dir}/../../.." && pwd -P)"
 mkdir -p "${repo_root}/.run"
 
 runner_mode=oneshot
+runtime_qualification=
 workspace_root=
 manifest_path=
 machines=3
@@ -126,6 +127,9 @@ declare -a required_log_substrings=()
 while [[ $# -gt 0 ]]
 do
    case "$1" in
+      --runtime-qualification=*)
+         runtime_qualification="${1#*=}"
+         ;;
       --require-brain-log-substring=*)
          required_log_substrings+=("${1#*=}")
          ;;
@@ -190,6 +194,22 @@ mothership_bin="$(readlink -f "${mothership_bin}")"
 [[ -x "${mothership_bin}" ]] || fail "Mothership binary is not executable: ${mothership_bin}"
 [[ -x "$(dirname "${mothership_bin}")/prodigy" ]] || fail "Mothership has no sibling Prodigy binary"
 [[ "$(readlink -f "$(dirname "${mothership_bin}")/prodigy")" == "${prodigy_bin}" ]] || fail "Mothership and requested Prodigy must be sibling release artifacts"
+if [[ -n "${runtime_qualification}" ]]
+then
+   export PRODIGY_DEV_ENABLE_FAKE_IPV4_BOUNDARY="${enable_fake_ipv4_boundary}"
+   export PRODIGY_DEV_TEST_MACHINE_LOGICAL_CORES="${test_machine_logical_cores}"
+   export PRODIGY_DEV_TEST_MACHINE_MEMORY_MB="${test_machine_memory_mb}"
+   export PRODIGY_DEV_TEST_MACHINE_STORAGE_MB="${test_machine_storage_mb}"
+   case "${runtime_qualification}" in
+      stateful-topology)
+         exec bash "${script_dir}/prodigy_dev_stateful_topology_upgrade_matrix.sh" "${prodigy_bin}" "${mothership_bin}" "$(dirname "${prodigy_bin}")/prodigy_pingpong_container_noport"
+         ;;
+      os-update)
+         exec bash "${script_dir}/prodigy_dev_os_update_reimage_matrix.sh" "${prodigy_bin}" "${mothership_bin}"
+         ;;
+      *) fail "unknown runtime qualification scenario: ${runtime_qualification}" ;;
+   esac
+fi
 
 tmpdir="$(mktemp -d "${repo_root}/.run/prodigy-dev-harness.XXXXXX")"
 if [[ -z "${workspace_root}" ]]
@@ -776,12 +796,19 @@ runtime_resources_satisfied()
 wait_application_report()
 {
    [[ -n "${deploy_report_application}" ]] || return 0
+   local phase="${1:-initial}"
    local report="${tmpdir}/application-report.log"
    local block="${tmpdir}/application-deployment.log"
-   local peak_healthy=0
-   local peak_target=0
-   local peak_deployed=0
-   local peak_shards=0
+   if [[ "${phase}" != initial ]]
+   then
+      report="${tmpdir}/application-${phase}-report.log"
+      block="${tmpdir}/application-${phase}-deployment.log"
+   fi
+   # Retain the observed transition peaks when requiring fresh recovery health.
+   local peak_healthy="${application_report_peak_healthy:-0}"
+   local peak_target="${application_report_peak_target:-0}"
+   local peak_deployed="${application_report_peak_deployed:-0}"
+   local peak_shards="${application_report_peak_shards:-0}"
    local started="$(date +%s%3N)"
    local stable_since=0
    local attempt
@@ -832,12 +859,19 @@ wait_application_report()
             stable=$((now - stable_since))
             if [[ "${stable}" -ge "${deploy_report_success_hold_ms}" ]]
             then
-               echo "APPLICATION_REPORT_ASSERT success application=${deploy_report_application} healthy=${healthy} target=${target} deployed=${deployed} shards=${shards} crashes=${crashes}"
+               application_report_peak_healthy="${peak_healthy}"
+               application_report_peak_target="${peak_target}"
+               application_report_peak_deployed="${peak_deployed}"
+               application_report_peak_shards="${peak_shards}"
+               echo "APPLICATION_REPORT_ASSERT success application=${deploy_report_application} phase=${phase} healthy=${healthy} target=${target} deployed=${deployed} shards=${shards} crashes=${crashes}"
                return 0
             fi
          else
             stable_since=0
          fi
+      else
+         # A missing observation breaks the continuous healthy hold window.
+         stable_since=0
       fi
 
       if [[ "${deploy_ping_port}" -gt 0 && "${deploy_skip_probe}" == 0 && ( "${deploy_report_traffic_burst}" -gt 1 || -n "${deploy_report_require_scaler}" ) ]]
@@ -1049,6 +1083,10 @@ then
    if [[ "${expect_peer_recovery}" == 1 && "${fault_duration}" -gt 0 ]]
    then
       wait_cluster_healthy || fail "expected peer recovery after fault"
+   fi
+   if [[ "${fault_duration}" -gt 0 && -n "${deploy_report_application}" ]]
+   then
+      wait_application_report post-fault || fail "application did not satisfy its report constraints after fault recovery"
    fi
    if [[ "${deploy_ping_after_fault}" == 1 && "${deploy_skip_probe}" == 0 && "${deploy_ping_port}" -gt 0 ]]
    then

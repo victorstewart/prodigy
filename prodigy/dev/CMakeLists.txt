@@ -1542,6 +1542,10 @@ if (PROJECT_ENABLE_TESTS)
    )
 
    add_test(
+      NAME prodigy_dev_application_report_hold_unit
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_application_report_hold_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness.sh
+   )
+   add_test(
       NAME prodigy_dev_scaler_report_parser_unit
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_scaler_report_parser_unit.sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_netns_harness.sh
    )
@@ -2259,6 +2263,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_deployments_unit>
    )
    set_tests_properties(prodigy_recovered_stateful_target_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_recovered_stateful_master_advertisement_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_RECOVERED_STATEFUL_MASTER_ADVERTISEMENT_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_recovered_stateful_master_advertisement_unit PROPERTIES TIMEOUT 30)
    add_test(
       NAME prodigy_materialized_stateful_recovery_initial_health_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY=1
