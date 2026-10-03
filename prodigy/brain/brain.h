@@ -13298,7 +13298,8 @@ public:
               canonicalCohort = false;
               break;
             }
-            clientMasters += container->effectiveStatefulMeshRoles(head->plan).client != 0;
+            const uint64_t clientService = container->effectiveStatefulMeshRoles(head->plan).client;
+            clientMasters += clientService != 0 && container->advertisements.contains(clientService);
           }
           if (canonicalCohort && clientMasters == 1)
           {
