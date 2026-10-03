@@ -1257,6 +1257,11 @@ private:
   void continueQuicCidReconciliation(void)
   {
     if (resettingRings || ringPreparationQuiescing) return;
+    // Timers and control I/O queued by earlier completions must reach the
+    // kernel before this callback enters blocking BPF calls. Otherwise their
+    // relative timeouts start only after the slow map work, allowing another
+    // reconciliation turn to run before the control timer becomes ready.
+    Ring::submitPending();
     RoutingReconcileBudget budget;
     quicCidDiscoveryFailed = false;
     if (quicCidDesiredRefreshPending)
