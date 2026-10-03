@@ -733,6 +733,61 @@ assert links[0]["linkinfo"]["info_kind"]=="veth" and links[0]["address"]==sys.ar
 ' "$(<"$pair_dir/$side-link-intent")"
 }
 
+# Return 0 only if a successful namespace inventory contains this exact link,
+# 1 only if that successful inventory omits it, and 2 for any command or JSON
+# error. A nonzero `ip link show <name>` alone is not evidence of teardown.
+pair_link_presence()
+{
+   local namespace="$1" link="$2" inventory
+   inventory="$(ip -n "$namespace" -j link show)" || return 2
+   python3 -c '
+import json,sys
+try:
+ links=json.loads(sys.stdin.read())
+ assert isinstance(links,list)
+ names=[]
+ for item in links:
+  assert isinstance(item,dict) and isinstance(item.get("ifname"),str) and item["ifname"]
+  names.append(item["ifname"])
+ assert len(names)==len(set(names))
+except Exception:
+ raise SystemExit(2)
+raise SystemExit(0 if sys.argv[1] in names else 1)
+' "$link" <<<"$inventory"
+}
+
+# A router namespace can be torn down asynchronously after its owner is
+# SIGKILLed.  Its veth peer may therefore disappear between the first lookup
+# and the identity read below.  Absence is safe; any link which still exists
+# must prove the journaled identity before this owner deletes it.
+pair_remove_owned_link()
+{
+   local side="$1" link="$2" presence
+   if pair_link_presence "pair-$side" "$link"; then
+      :
+   else
+      presence=$?
+      [[ "$presence" == 1 ]] && return 0
+      return 1
+   fi
+   if pair_link_owned "$side" "$link"; then
+      if ip -n "pair-$side" link del "$link"; then return 0; fi
+      # Do not turn a concurrent kernel peer teardown into a leaked boundary.
+      if pair_link_presence "pair-$side" "$link"; then return 1; else
+         presence=$?
+         [[ "$presence" == 1 ]] && return 0
+         return 1
+      fi
+   fi
+   # A failed identity read is acceptable only when a *successful* inventory
+   # immediately proves the link vanished. A lookup error remains fail-closed.
+   if pair_link_presence "pair-$side" "$link"; then return 1; else
+      presence=$?
+      [[ "$presence" == 1 ]] && return 0
+      return 1
+   fi
+}
+
 pair_require_no_clients()
 {
    # A probe may outlive the supervisor. Do not claim cleanup while a process
@@ -781,13 +836,9 @@ pair_cleanup_inside()
       if [[ -e "/run/netns/pair-$side" ]]; then
          route_dev=pairSource0
          [[ "$side" == source ]] || route_dev=pairTarget0
-         if ip -n "pair-$side" link show "$route_dev" >/dev/null 2>&1; then
-            if pair_link_owned "$side" "$route_dev"; then
-               ip -n "pair-$side" link del "$route_dev" || status=1
-            else
-               echo "pair boundary refuses changed $side peer link" >&2
-               status=1
-            fi
+         if ! pair_remove_owned_link "$side" "$route_dev"; then
+            echo "pair boundary refuses changed $side peer link" >&2
+            status=1
          fi
          umount "/run/netns/pair-$side" || status=1
       fi

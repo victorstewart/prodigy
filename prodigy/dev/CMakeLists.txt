@@ -664,6 +664,8 @@ target_include_directories(prodigy_mothership_pricing_unit PRIVATE "${CMAKE_BINA
 target_include_directories(prodigy_mothership_unix_connect_unit PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_executable(prodigy_mothership_virtual_datacenter_unit
    ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_virtual_datacenter_unit.cpp)
+add_executable(prodigy_pair_boundary_cleanup_unit
+   ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pair_boundary_cleanup_unit.cpp)
 add_executable(prodigy_mothership_neuron_checkpoint_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_neuron_checkpoint_unit.cpp)
 add_executable(prodigy_mothership_provider_credential_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_credential_registry_unit.cpp)
 add_executable(prodigy_mothership_provider_machine_destroy_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_machine_destroy_unit.cpp)
@@ -764,6 +766,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_addmachines_progress_unit
    prodigy_mothership_unix_connect_unit
    prodigy_mothership_virtual_datacenter_unit
+   prodigy_pair_boundary_cleanup_unit
    prodigy_mothership_neuron_checkpoint_unit
    prodigy_mothership_provider_credential_registry_unit
    prodigy_mothership_provider_machine_destroy_unit
@@ -1031,6 +1034,7 @@ target_compile_options(prodigy_mothership_cluster_create_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_addmachines_progress_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_unix_connect_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_virtual_datacenter_unit PUBLIC -O2)
+target_compile_options(prodigy_pair_boundary_cleanup_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_neuron_checkpoint_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_credential_registry_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_provider_machine_destroy_unit PUBLIC -O2)
@@ -2439,6 +2443,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_virtual_datacenter_unit
    )
    set_tests_properties(prodigy_mothership_virtual_datacenter_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_pair_boundary_cleanup_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_pair_boundary_cleanup_unit
+   )
+   set_tests_properties(prodigy_pair_boundary_cleanup_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_mothership_neuron_checkpoint_unit
