@@ -575,6 +575,7 @@ add_executable(prodigy_brain_spot_async_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/p
 add_executable(prodigy_pairing_parser_adversarial_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pairing_parser_adversarial_unit.cpp)
 add_executable(prodigy_bootstrap_config_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_bootstrap_config_unit.cpp)
 add_executable(prodigy_persistent_state_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_persistent_state_unit.cpp)
+add_executable(prodigy_stateful_serving_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_stateful_serving_authority_unit.cpp)
 add_executable(prodigy_async_persistence_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_async_persistence_unit.cpp)
 add_executable(prodigy_brain_async_authority_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_async_authority_unit.cpp)
 add_executable(prodigy_brain_retirement_authority_ack_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_retirement_authority_ack_unit.cpp)
@@ -684,6 +685,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_pairing_parser_adversarial_unit
    prodigy_bootstrap_config_unit
    prodigy_persistent_state_unit
+   prodigy_stateful_serving_authority_unit
    prodigy_async_persistence_unit
    prodigy_brain_async_authority_unit
    prodigy_brain_retirement_authority_ack_unit
@@ -2386,6 +2388,11 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_retained_container_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_retained_container_recovery_unit)
    add_test(NAME prodigy_mothership_retained_recovery_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_retained_recovery_unit)
    add_test(NAME prodigy_container_retirement_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_container_retirement_unit)
+   add_test(NAME prodigy_stateful_serving_authority_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_stateful_serving_authority_unit)
+   add_test(NAME prodigy_stateful_serving_authority_replication_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_STATEFUL_SERVING_AUTHORITY_ONLY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
+   set_tests_properties(prodigy_stateful_serving_authority_replication_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_container_retirement_authority_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CONTAINER_RETIREMENT_ONLY=1
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)

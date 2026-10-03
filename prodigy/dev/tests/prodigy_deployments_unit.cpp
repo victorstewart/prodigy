@@ -43,6 +43,75 @@ public:
   bool retirementActivation = false;
   bool retirementPrepared = false;
   bool retirementSettled = false;
+  bool servingPreparationApproved = true;
+  bool servingRecoveryReady = true;
+  bool statefulServingRecoveryReady() const override { return servingRecoveryReady; }
+  uint32_t servingPreparationCalls = 0;
+  StatefulServingLaunchAdmission servingLaunchAdmission = StatefulServingLaunchAdmission::ready;
+  ContainerPlan lastServingLaunchPlan;
+  uint32_t servingLaunchCalls = 0;
+
+  StatefulServingLaunchAdmission prepareStatefulServingLaunch(
+      ApplicationDeployment *, ContainerView *, const ContainerPlan& launch, uint128_t) override
+  {
+    ++servingLaunchCalls;
+    lastServingLaunchPlan = launch;
+    return servingLaunchAdmission;
+  }
+
+  ProdigyStatefulServingAuthority servingDecision;
+  Vector<BrainReplicatedContainerRuntimeState> servingPlans;
+  Machine servingFixtureMachine = {};
+
+  bool prepareStatefulServingTransition(ApplicationDeployment *deployment, StatefulWorkerTopologyUpgradePhase phase) override
+  {
+    ++servingPreparationCalls;
+    if (!servingPreparationApproved) return false;
+    servingPlans.clear();
+    servingDecision = {};
+    servingDecision.deploymentID = deployment->plan.config.deploymentID();
+    servingDecision.applicationID = deployment->plan.config.applicationID;
+    servingDecision.operationID = deployment->statefulWorkerTopologyUpgradeOperationID;
+    servingDecision.phase = phase;
+    servingDecision.allMasters = deployment->plan.stateful.allMasters;
+    servingDecision.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
+    servingFixtureMachine.uuid = 1;
+    for (ContainerView *container : deployment->containers)
+    {
+      if (!container->isStateful || !deployment->statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup)) continue;
+      const bool source = container->explicitStatefulTopology.topologyEpoch == deployment->statefulWorkerTopologyUpgradeSourceEpoch;
+      if (phase == StatefulWorkerTopologyUpgradePhase::none && source) continue;
+      BrainReplicatedContainerRuntimeState state = {};
+      state.machineUUID = container->machine != nullptr ? container->machine->uuid : servingFixtureMachine.uuid;
+      state.plan = container->generatePlan(deployment->plan, deployment->nShardGroups);
+      servingPlans.push_back(std::move(state));
+    }
+    if (!deployment->projectStatefulServingPlans(phase, servingPlans)) return false;
+    for (const auto& state : servingPlans)
+    {
+      ProdigyStatefulServingAuthorityMember member = {};
+      member.containerUUID = state.plan.uuid;
+      member.machineUUID = state.machineUUID;
+      member.shardGroup = state.plan.shardGroup;
+      member.isSource = phase != StatefulWorkerTopologyUpgradePhase::none &&
+                        state.plan.statefulTopology.topologyEpoch == deployment->statefulWorkerTopologyUpgradeSourceEpoch;
+      member.advertiseClient = state.plan.advertisements.contains(state.plan.statefulMeshRoles.client);
+      if (!member.isSource) servingDecision.targetConfig = state.plan.config;
+      servingDecision.members.push_back(std::move(member));
+    }
+    return true;
+  }
+
+  bool restoreStatefulServingDecision(ApplicationDeployment *deployment) override
+  {
+    if (!servingPreparationApproved) return false;
+    Vector<ContainerView *> withoutMachine;
+    for (ContainerView *container : deployment->containers)
+      if (container->machine == nullptr) { withoutMachine.push_back(container); container->machine = &servingFixtureMachine; }
+    const bool applied = deployment->applyStatefulServingPlans(servingDecision, servingPlans);
+    for (ContainerView *container : withoutMachine) container->machine = nullptr;
+    return applied;
+  }
 
   bool statefulTopologyRetirementActivationEnabled(void) const override
   {
@@ -959,6 +1028,7 @@ static void testInplacePairingOrder(TestSuite& suite)
   ScopedFreshRing ring;
   TestBrain brain = {};
   brain.holdRuntimePersistence = true;
+  brain.servingLaunchAdmission = BrainBase::StatefulServingLaunchAdmission::pending;
   BrainBase *savedBrain = thisBrain;
   thisBrain = &brain;
 
@@ -1035,6 +1105,28 @@ static void testInplacePairingOrder(TestSuite& suite)
     successor.schedule(nullptr);
   }
 
+  suite.expect(green != nullptr && brain.pendingRuntimePersistence.empty() &&
+                   oldLocal.state == ContainerState::healthy &&
+                   brain.lastServingLaunchPlan.uuid == green->uuid &&
+                   brain.lastServingLaunchPlan.subscriptions.size() > 0,
+               "serving_launch_pending_authority_preserves_exact_plan_and_predecessor");
+  suite.expect(green && successor.hasUnsentStatefulServingLaunch(green->uuid, localMachine.uuid) &&
+                   !successor.hasUnsentStatefulServingLaunch(green->uuid, remoteMachine.uuid),
+               "serving_launch_unsent_receipt_binds_exact_machine");
+  const uint32_t admissionCalls = brain.servingLaunchCalls;
+  brain.servingRecoveryReady = false;
+  successor.resumeDurableContainerSpinsAfterServingAuthority();
+  suite.expect(brain.servingLaunchCalls == admissionCalls && brain.pendingRuntimePersistence.empty(),
+               "serving_launch_inventory_barrier_blocks_deferred_retry");
+  brain.servingRecoveryReady = true;
+  successor.resumeDurableContainerSpinsAfterServingAuthority();
+  suite.expect(brain.servingLaunchCalls == admissionCalls + 1 && brain.pendingRuntimePersistence.empty(),
+               "serving_launch_pending_retry_is_one_bounded_attempt");
+  brain.servingLaunchAdmission = BrainBase::StatefulServingLaunchAdmission::ready;
+  successor.resumeDurableContainerSpinsAfterServingAuthority();
+
+  suite.expect(green && !successor.hasUnsentStatefulServingLaunch(green->uuid, localMachine.uuid),
+               "serving_launch_admitted_launch_is_not_an_unsent_reservation");
   suite.expect(green != nullptr && brain.pendingRuntimePersistence.size() == 1 &&
                    oldLocal.state == ContainerState::healthy && brain.containers.contains(oldLocal.uuid),
                "inplace_pairing_order_holds_healthy_predecessor_until_durable_receipt");
@@ -1107,6 +1199,10 @@ static void testInplacePairingOrder(TestSuite& suite)
   suite.expect(durableReceipt ? (decodedSpin && queuedReplacement == oldLocal.uuid) : !decodedSpin,
                durableReceipt ? "inplace_pairing_order_success_receipt_emits_replacement_spin"
                               : "inplace_pairing_order_failed_receipt_emits_no_spin");
+  const auto bytesAfterReceipt = localMachine.neuron.wBuffer.size();
+  successor.resumeDurableContainerSpinsAfterServingAuthority();
+  suite.expect(localMachine.neuron.wBuffer.size() == bytesAfterReceipt,
+               "serving_launch_duplicate_authority_resume_does_not_duplicate_spin");
   suite.expect(durableReceipt ? (decodedSpin && serializedOldLocal == false && serializedRemote) : true,
                "inplace_pairing_order_bootstrap_serializes_only_live_remote_sibling");
 
@@ -2188,6 +2284,128 @@ static void testMaterializedStatefulRecoveryInitialHealth(TestSuite& suite)
     brain.racks.erase(rackB.uuid);
     brain.racks.erase(rackC.uuid);
     thisBrain = savedBrain;
+}
+
+static void testPartialGreenRecoveryScheduling(TestSuite& suite)
+{
+  ScopedFreshRing ring;
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+  brain.servingRecoveryReady = false;
+  brain.servingLaunchAdmission = BrainBase::StatefulServingLaunchAdmission::pending;
+  Rack racks[3]; Machine machines[3]; ScopedSocketPair sockets[3];
+  for (uint32_t i = 0; i < 3; ++i)
+  {
+    racks[i].uuid = 19'300'000 + i;
+    suite.expect(sockets[i].create(suite, "partial_green_control_socket") &&
+                     seedSchedulableMachine(brain, racks[i], machines[i], 0x19300000 + i,
+                         0x0a000190 + i, "partial-green"_ctv, sockets[i]),
+                 "partial_green_machine_ready");
+    brain.racks.insert_or_assign(racks[i].uuid, &racks[i]);
+  }
+  ApplicationDeployment deployment = {};
+  seedCommonPlan(deployment, true);
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+  deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+  deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+  deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+  deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+  deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+  deployment.nShardGroups = 1;
+  deployment.nTargetBase = 3;
+  deployment.state = DeploymentState::running;
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  ProdigyStatefulWorkerTopologyUpgradeOperation operation = {};
+  operation.deploymentID = deployment.plan.config.deploymentID();
+  operation.applicationID = deployment.plan.config.applicationID;
+  operation.operationID = 0x19300100;
+  operation.phase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
+  operation.sourceEpoch = 2; operation.targetEpoch = 400;
+  operation.sourceWorkerCount = 2; operation.targetWorkerCount = 4;
+  operation.targetLogicalCores = 4; operation.targetMemoryMB = 512; operation.targetStorageMB = 64;
+  operation.lockedShardGroups.push_back(0);
+  suite.expect(deployment.restoreStatefulWorkerTopologyUpgradeOperation(operation), "partial_green_restores_operation");
+  ContainerView retained[4];
+  for (uint32_t i = 0; i < 4; ++i)
+  {
+    auto& container = retained[i];
+    container.uuid = 0x19300200 + i;
+    container.deploymentID = operation.deploymentID;
+    container.applicationID = operation.applicationID;
+    container.machine = &machines[i % 3];
+    container.isStateful = true; container.shardGroup = 0;
+    container.lifetime = ApplicationLifetime::base;
+    container.state = ContainerState::healthy; container.runtimeReady = true;
+    container.explicitStatefulMeshRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, operation.applicationID, 0);
+    auto& topology = container.explicitStatefulTopology;
+    topology.operationID = operation.operationID;
+    topology.shardGroup = 0;
+    topology.topologyEpoch = i < 3 ? operation.sourceEpoch : operation.targetEpoch;
+    topology.sourceEpoch = operation.sourceEpoch; topology.targetEpoch = operation.targetEpoch;
+    topology.workerCount = i < 3 ? operation.sourceWorkerCount : operation.targetWorkerCount;
+    topology.servingMode = i < 3 ? StatefulTopologyServingMode::serve : StatefulTopologyServingMode::catchupOnly;
+    topology.bridgeMode = StatefulTopologyBridgeMode::sourceToTarget;
+    deployment.containers.insert(&container);
+    deployment.containersByShardGroup.insert(0, &container);
+    deployment.countPerMachine[container.machine] += 1;
+    deployment.countPerRack[container.machine->rack] += 1;
+    deployment.racksByShardGroup[0].insert(container.machine->rack);
+    brain.containers.insert_or_assign(container.uuid, &container);
+    container.machine->upsertContainerIndexEntry(operation.deploymentID, &container);
+  }
+  retained[3].state = ContainerState::scheduled;
+  retained[3].runtimeReady = false;
+  deployment.waitingOnContainers.insert_or_assign(&retained[3], ContainerState::healthy);
+  deployment.startStatefulWorkerTopologyUpgradeTargets();
+  deployment.resumeStatefulTopologyRetirement();
+  suite.expect(deployment.containers.size() == 4 && brain.servingLaunchCalls == 0 &&
+                   brain.servingPreparationCalls == 0, "partial_green_inventory_barrier_blocks_scheduling_and_cutover");
+  brain.servingRecoveryReady = true;
+  deployment.startStatefulWorkerTopologyUpgradeTargets();
+  uint32_t targets = 0, unsent = 0;
+  for (const auto *container : deployment.containers)
+    if (container->explicitStatefulTopology.operationID == operation.operationID &&
+        container->explicitStatefulTopology.topologyEpoch == operation.targetEpoch)
+    {
+      ++targets;
+      unsent += deployment.hasUnsentStatefulServingLaunch(container->uuid, container->machine->uuid);
+    }
+  suite.expect(targets == 3 && unsent == 2 && deployment.containers.size() == 6 &&
+                   retained[3].state == ContainerState::scheduled,
+               "partial_green_refills_missing_siblings_while_admitted_target_awaits_health");
+  const auto calls = brain.servingLaunchCalls;
+  deployment.startStatefulWorkerTopologyUpgradeTargets();
+  suite.expect(deployment.containers.size() == 6 && brain.servingLaunchCalls == calls,
+               "partial_green_repeated_resume_does_not_duplicate_reservations");
+  Vector<ContainerView *> created;
+  for (auto *container : deployment.containers)
+    if (container != &retained[0] && container != &retained[1] && container != &retained[2] && container != &retained[3])
+      created.push_back(container);
+  for (auto *container : created)
+  {
+    deployment.waitingOnContainers.erase(container);
+    deployment.containers.erase(container);
+    while (deployment.containersByShardGroup.eraseEntry(0, container)) {}
+    container->machine->removeContainerIndexEntry(operation.deploymentID, container);
+    brain.containers.erase(container->uuid);
+    delete container;
+  }
+  for (auto& container : retained)
+  {
+    deployment.waitingOnContainers.erase(&container);
+    deployment.containers.erase(&container);
+    while (deployment.containersByShardGroup.eraseEntry(0, &container)) {}
+    container.machine->removeContainerIndexEntry(operation.deploymentID, &container);
+    brain.containers.erase(container.uuid);
+  }
+  brain.deployments.erase(operation.deploymentID);
+  for (uint32_t i = 0; i < 3; ++i)
+  {
+    racks[i].machines.erase(&machines[i]); brain.machines.erase(&machines[i]); brain.racks.erase(racks[i].uuid);
+  }
+  thisBrain = savedBrain;
 }
 
 int main(void)
@@ -6873,8 +7091,8 @@ int main(void)
 
     suite.expect(deployment.statefulWorkerTopologyUpgradeSourceEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_reuses_current_serving_epoch_for_repeated_raise");
     suite.expect(deployment.statefulWorkerTopologyUpgradeTargetEpoch != currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_assigns_distinct_target_epoch");
-    suite.expect(servingA.explicitStatefulTopology.sourceEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_preserves_source_epoch_on_blue");
-    suite.expect(servingA.explicitStatefulTopology.targetEpoch == deployment.statefulWorkerTopologyUpgradeTargetEpoch, "stateful_worker_topology_upgrade_repeated_raise_sets_next_target_epoch_on_blue");
+    suite.expect(servingA.explicitStatefulTopology.sourceEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_preserves_source_epoch_while_awaiting_authority");
+    suite.expect(servingA.explicitStatefulTopology.targetEpoch == currentServingEpoch, "stateful_worker_topology_upgrade_repeated_raise_leaves_source_target_epoch_unchanged_while_awaiting_authority");
 
     thisBrain = savedBrain;
   }
@@ -7782,6 +8000,37 @@ int main(void)
     deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
     deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
     deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+
+    ContainerView sourceContainers[3] = {};
+    Machine sourceMachines[3] = {};
+    Rack sourceRacks[3] = {};
+    const StatefulMeshRoles sourceRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      ContainerView& source = sourceContainers[index];
+      source.uuid = uint128_t(0x19072010 + index);
+      source.deploymentID = deployment.plan.config.deploymentID();
+      source.applicationID = deployment.plan.config.applicationID;
+      sourceRacks[index].uuid = 19'072'010 + index;
+      sourceMachines[index].uuid = uint128_t(0x19072100 + index);
+      sourceMachines[index].rack = &sourceRacks[index];
+      source.machine = &sourceMachines[index];
+      source.isStateful = true;
+      source.shardGroup = 0;
+      source.state = ContainerState::healthy;
+      source.explicitStatefulMeshRoles = sourceRoles;
+      source.explicitStatefulTopology.shardGroup = 0;
+      source.explicitStatefulTopology.topologyEpoch = 2;
+      source.explicitStatefulTopology.sourceEpoch = 2;
+      source.explicitStatefulTopology.targetEpoch = 2;
+      source.explicitStatefulTopology.workerCount = 2;
+      source.explicitStatefulTopology.servingMode = StatefulTopologyServingMode::serve;
+      deployment.containers.insert(&source);
+      deployment.containersByShardGroup.insert(0, &source);
+      brain.containers.insert_or_assign(source.uuid, &source);
+      source.machine->upsertContainerIndexEntry(source.deploymentID, &source);
+    }
+
     deployment.armStatefulWorkerTopologyUpgrade(2, 4, 4, 512, 64);
 
     ContainerView *container = nullptr;
@@ -7823,6 +8072,15 @@ int main(void)
       delete container;
     }
 
+    for (ContainerView& source : sourceContainers)
+    {
+      deployment.containers.erase(&source);
+      while (deployment.containersByShardGroup.eraseEntry(source.shardGroup, &source))
+      {
+      }
+      source.machine->removeContainerIndexEntry(source.deploymentID, &source);
+      brain.containers.erase(source.uuid);
+    }
     rack.machines.erase(&machine);
     brain.machines.erase(&machine);
     brain.racks.erase(rack.uuid);
@@ -8043,7 +8301,14 @@ int main(void)
     suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_cutover_waits_for_all_targets");
     deployment.containerIsRuntimeReady(&targetC);
     suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "stateful_worker_topology_upgrade_cutover_waits_for_barrier_proof");
+    brain.servingPreparationApproved = false;
     noteCutoverBarrier(&targetC);
+    suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap &&
+                     sourceA.advertisements.contains(roles.client) && !targetA.advertisements.contains(roles.client) &&
+                     targetA.explicitStatefulTopology.servingMode == StatefulTopologyServingMode::catchupOnly,
+                 "stateful_worker_topology_upgrade_no_serving_effect_before_authority_approval");
+    brain.servingPreparationApproved = true;
+    deployment.resumeStatefulTopologyRetirement();
 
     uint32_t targetClientAdvertisements = 0;
     for (ContainerView *target : targets)
@@ -12897,6 +13162,7 @@ int main(void)
     thisBrain = savedBrain;
   }
 
+  testPartialGreenRecoveryScheduling(suite);
   testInplacePairingOrder(suite);
 
   for (bool renewAfterEntryFailure : {false, true})

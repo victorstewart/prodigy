@@ -2888,7 +2888,7 @@ static bool deserializeMasterAuthorityTransition(
 {
   ProdigyMasterAuthorityStateTransition transition;
   if (BitseryEngine::deserializeSafe(serialized, transition) == false ||
-      transition.version != ProdigyMasterAuthorityStateTransition::currentVersion)
+      !transition.supportedVersion())
   {
     return false;
   }
@@ -7041,6 +7041,9 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   brain.weAreMaster = true;
   brain.nBrains = 2;
   brain.brainConfig.clusterUUID = 0x7707;
+  follower.registrationFresh = true;
+  follower.uuid = 0x7708;
+  follower.boottimens = 7708;
   follower.connected = true;
   follower.version = ProdigyBinaryVersion;
   follower.weConnectToIt = true;
@@ -8375,6 +8378,9 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
   {
     return;
   }
+  follower.registrationFresh = true;
+  follower.uuid = 0x7808;
+  follower.boottimens = 7808;
   follower.connected = true;
   brain.brains.insert(&follower);
 
@@ -24958,7 +24964,7 @@ static void testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(TestSu
   brain.machines.erase(&machine);
 }
 
-static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyCutover(TestSuite& suite)
+static void testBrainNeuronHandlerContainerStatisticsRequiresStatefulTopologyAuthority(TestSuite& suite)
 {
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
@@ -25041,8 +25047,8 @@ static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyC
       uint64_t(1));
   brain.neuronHandler(&machine.neuron, message);
 
-  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "brain_neuron_container_statistics_cutover_enters_blue_draining");
-  suite.expect(targetC.statefulTopologyCutoverReady == false, "brain_neuron_container_statistics_cutover_clears_target_barrier_after_cutover");
+  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "brain_neuron_container_statistics_barriers_cannot_bypass_missing_authority");
+  suite.expect(targetC.statefulTopologyCutoverReady, "brain_neuron_container_statistics_retains_barrier_while_authority_pending");
 
   for (ContainerView *container : sources)
   {
@@ -25071,7 +25077,7 @@ static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyC
   thisBrain = previousBrain;
 }
 
-static void testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(TestSuite& suite)
+static void testBrainReplicatedMetricAppendCannotAuthorizeStatefulTopologyCutover(TestSuite& suite)
 {
   TestBrain brain = {};
   brain.weAreMaster = false;
@@ -25156,8 +25162,8 @@ static void testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(Tes
       uint64_t(1));
   brain.brainHandler(&follower, readyMessage);
 
-  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "brain_replicated_metric_append_cutover_enters_blue_draining");
-  suite.expect(targetC.statefulTopologyCutoverReady == false, "brain_replicated_metric_append_cutover_clears_target_barrier_after_cutover");
+  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "brain_replicated_metric_append_follower_cannot_authorize_cutover");
+  suite.expect(targetC.statefulTopologyCutoverReady, "brain_replicated_metric_append_follower_retains_barrier");
 
   for (ContainerView *container : sources)
   {
@@ -30540,9 +30546,23 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 #include <prodigy/dev/tests/placement_policy_tests.h>
 #include <prodigy/dev/tests/upgrade_admission_observation_tests.h>
 #include <prodigy/dev/tests/container_retirement_authority_tests.h>
+#include <prodigy/dev/tests/stateful_serving_authority_tests.h>
+#include <prodigy/dev/tests/stateful_serving_launch_tests.h>
+#include <prodigy/dev/tests/stateful_serving_resource_tests.h>
 
 int main(void)
 {
+  if (getenv("PRODIGY_TEST_STATEFUL_SERVING_AUTHORITY_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testStatefulServingAuthorityTransitionFences(suite);
+    testStatefulServingAuthorityAsyncReceipt(suite);
+    testStatefulServingAuthorityFanoutCapability(suite);
+    testRestoredRuntimeRequiresFreshInventory(suite);
+    testStatefulServingLaunchAdmission(suite);
+    testStatefulServingResourceAdjustment(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (getenv("PRODIGY_TEST_CONTAINER_RETIREMENT_ONLY") != nullptr)
   {
     TestSuite suite;
@@ -31376,8 +31396,8 @@ int main(void)
   testMachineHealthySkipsScheduledStatelessDonorMoveUntilQuiescent(suite);
   testDrainMachineSkipsScheduledLiveRedeployUntilHealthy(suite);
   testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(suite);
-  testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyCutover(suite);
-  testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(suite);
+  testBrainNeuronHandlerContainerStatisticsRequiresStatefulTopologyAuthority(suite);
+  testBrainReplicatedMetricAppendCannotAuthorizeStatefulTopologyCutover(suite);
   testBrainNeuronHandlerHandlesRestartingContainerFailure(suite);
   testBrainNeuronHandlerRestartingStatefulMasterKeepsClientServiceSticky(suite);
   testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsMachine(suite);

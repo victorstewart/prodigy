@@ -1422,6 +1422,8 @@ private:
     uint128_t containerUUID = 0;
     uint128_t replaceContainerUUID = 0;
     String bootstrap = {};
+    ContainerPlan launchPlan = {};
+    bool waitingForServingAuthority = false;
     bool retainedStorageRecoveryLaunch = false;
     String retainedSourceBootstrap = {};
     uint64_t deploymentID = 0;
@@ -1479,7 +1481,8 @@ private:
   void failDurableContainerSpinPersistence(
       BrainBase *brain,
       const DeferredDurableContainerSpin& deferred,
-      ContainerView *container)
+      ContainerView *container,
+      String reason = String("container launch record was not durably persisted"_ctv))
   {
     releaseDurableContainerSpinReplacementWaiter(brain, deferred.deploymentID, deferred.replaceContainerUUID);
     if (brain == nullptr || container == nullptr || state == DeploymentState::failed)
@@ -1499,7 +1502,7 @@ private:
         this,
         plan.config.applicationID,
         deferred.deploymentID,
-        "container launch record was not durably persisted"_ctv,
+        reason,
         generateReport());
     if (waitingOnContainers.empty() && schedulingStack.execution)
     {
@@ -1509,7 +1512,9 @@ private:
 
   void armDurableContainerLaunchPersistenceContinuation(void)
   {
-    if (durableContainerLaunchPersistenceContinuationQueued || deferredDurableContainerSpins.empty())
+    if (durableContainerLaunchPersistenceContinuationQueued ||
+        std::none_of(deferredDurableContainerSpins.begin(), deferredDurableContainerSpins.end(),
+                     [](const auto& pending) { return !pending.waitingForServingAuthority; }))
     {
       return;
     }
@@ -1557,27 +1562,29 @@ private:
   void retryDeferredDurableContainerSpins(void)
   {
     durableContainerLaunchPersistenceContinuationQueued = false;
-    for (size_t index = 0; index < deferredDurableContainerSpins.size();)
+    // A retry may still await a peer receipt. Process one bounded batch so a
+    // requeued request cannot be consumed again by this same invocation.
+    Vector<DeferredDurableContainerSpin> pending = std::move(deferredDurableContainerSpins);
+    deferredDurableContainerSpins.clear();
+    for (DeferredDurableContainerSpin& deferred : pending)
     {
-      DeferredDurableContainerSpin& deferred = deferredDurableContainerSpins[index];
       BrainBase *brain = thisBrain;
       ContainerView *container = currentDurableContainerSpin(brain, deferred);
       if (container == nullptr)
       {
         releaseDurableContainerSpinReplacementWaiter(brain, deferred.deploymentID, deferred.replaceContainerUUID);
-        deferredDurableContainerSpins.erase(deferredDurableContainerSpins.begin() + index);
         continue;
       }
 
       const BrainBase::UpdateSelfPersistenceAdmission admission = brain->updateSelfPersistenceAdmission();
       if (admission == BrainBase::UpdateSelfPersistenceAdmission::backpressured)
       {
-        ++index;
+        deferred.waitingForServingAuthority = false;
+        deferredDurableContainerSpins.push_back(std::move(deferred));
         continue;
       }
 
       DeferredDurableContainerSpin retry = std::move(deferred);
-      deferredDurableContainerSpins.erase(deferredDurableContainerSpins.begin() + index);
       if (admission == BrainBase::UpdateSelfPersistenceAdmission::rejected)
       {
         failDurableContainerSpinPersistence(brain, retry, container);
@@ -1588,6 +1595,7 @@ private:
           retry.containerUUID,
           retry.replaceContainerUUID,
           std::move(retry.bootstrap),
+          std::move(retry.launchPlan),
           retry.retainedStorageRecoveryLaunch,
           std::move(retry.retainedSourceBootstrap));
     }
@@ -3993,26 +4001,36 @@ public:
                    unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
                    unsigned(statefulWorkerTopologyLockedShardGroups.size()));
 
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
-      {
-        continue;
-      }
-
-      configureStatefulWorkerTopologyUpgradeSource(container);
-      reconcileLiveStatefulTopologyServices(container);
-    }
-
     persistStatefulWorkerTopologyUpgradeOperation();
+    resumeStatefulTopologyRetirement();
+  }
 
+  void startStatefulWorkerTopologyUpgradeTargets(void)
+  {
+    if (statefulWorkerTopologyUpgradePhase != StatefulWorkerTopologyUpgradePhase::greenBootstrap ||
+        thisBrain == nullptr || !thisBrain->statefulServingRecoveryReady() || !toSchedule.empty()) return;
     Vector<uint32_t> shardGroups = {};
     shardGroups.reserve(statefulWorkerTopologyLockedShardGroups.size() * 3);
     for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
     {
-      shardGroups.push_back(shardGroup);
-      shardGroups.push_back(shardGroup);
-      shardGroups.push_back(shardGroup);
+      bytell_hash_set<uint128_t> targets;
+      for (const ContainerView *container : containers)
+      {
+        if (container == nullptr || container->uuid == 0 || container->shardGroup != shardGroup ||
+            container->deploymentID != plan.config.deploymentID() ||
+            !containerUsesStatefulWorkerTopologyUpgradeTarget(container) ||
+            container->explicitStatefulTopology.sourceEpoch != statefulWorkerTopologyUpgradeSourceEpoch ||
+            container->explicitStatefulTopology.targetEpoch != statefulWorkerTopologyUpgradeTargetEpoch ||
+            container->state == ContainerState::aboutToDestroy || container->state == ContainerState::destroying ||
+            container->state == ContainerState::destroyed) continue;
+        targets.insert(container->uuid);
+      }
+      // A cold restart can retain only the target whose launch was admitted.
+      // Refill its missing peers without replacing that exact live identity.
+      // That admitted target may still await health from its missing siblings;
+      // waitingOnContainers must not suppress the deficit calculation.
+      if (targets.size() > 3) return;
+      for (size_t count = targets.size(); count < 3; ++count) shardGroups.push_back(shardGroup);
     }
 
     if (thisBrain != nullptr && shardGroups.empty() == false)
@@ -4245,6 +4263,207 @@ private:
 
 public:
 
+  // Calculate declarations on detached views. Preparing authority must not
+  // publish pairings, change the live master map, or mutate runtime state.
+  bool projectStatefulServingPlans(StatefulWorkerTopologyUpgradePhase phase,
+                                  Vector<BrainReplicatedContainerRuntimeState>& states)
+  {
+    if (!statefulWorkerTopologyUpgradePendingForAnyShardGroup() || states.empty()) return false;
+    const auto previousPhase = statefulWorkerTopologyUpgradePhase;
+    statefulWorkerTopologyUpgradePhase = phase;
+    for (auto& state : states)
+    {
+      ContainerPlan& candidate = state.plan;
+      const bool source = candidate.statefulTopology.topologyEpoch == statefulWorkerTopologyUpgradeSourceEpoch;
+      if ((candidate.statefulTopology.operationID != statefulWorkerTopologyUpgradeOperationID &&
+           !(source && phase == StatefulWorkerTopologyUpgradePhase::greenBootstrap)) ||
+          (!source && candidate.statefulTopology.topologyEpoch != statefulWorkerTopologyUpgradeTargetEpoch) ||
+          !statefulWorkerTopologyLockedShardGroups.contains(candidate.shardGroup) ||
+          (phase == StatefulWorkerTopologyUpgradePhase::none && source))
+      {
+        statefulWorkerTopologyUpgradePhase = previousPhase;
+        return false;
+      }
+      candidate.statefulMeshRoles = statefulMeshRolesForShardGroup(candidate.shardGroup);
+      candidate.statefulTopology = phase == StatefulWorkerTopologyUpgradePhase::none
+          ? statefulWorkerTopologyUpgradeSteadyTargetTopology(candidate.shardGroup)
+          : (source ? statefulWorkerTopologyUpgradeSourceTopology(candidate.shardGroup)
+                    : statefulWorkerTopologyUpgradeTargetTopology(candidate.shardGroup));
+      if (!source) candidate.config = statefulWorkerTopologyUpgradeTargetConfig();
+    }
+    statefulWorkerTopologyUpgradePhase = previousPhase;
+
+    bytell_hash_map<uint32_t, uint128_t> clients;
+    for (const auto& state : states)
+    {
+      const auto& candidate = state.plan;
+      if (!prodigyStatefulTopologyServesClients(candidate.statefulTopology)) continue;
+      auto existing = masterForShardGroup.find(candidate.shardGroup);
+      const bool selected = existing != masterForShardGroup.end() && existing->second != nullptr &&
+                            existing->second->uuid == candidate.uuid;
+      auto choice = clients.find(candidate.shardGroup);
+      if (selected || choice == clients.end()) clients[candidate.shardGroup] = candidate.uuid;
+      else
+      {
+        const bool preserve = existing != masterForShardGroup.end() && existing->second != nullptr &&
+                              existing->second->uuid == choice->second;
+        if (!preserve && candidate.uuid < choice->second) choice->second = candidate.uuid;
+      }
+    }
+    for (auto& state : states)
+    {
+      ContainerPlan& candidate = state.plan;
+      ContainerView detached = {};
+      detached.uuid = candidate.uuid;
+      detached.isStateful = true;
+      detached.shardGroup = candidate.shardGroup;
+      detached.state = candidate.state;
+      detached.explicitStatefulMeshRoles = candidate.statefulMeshRoles;
+      detached.explicitStatefulTopology = candidate.statefulTopology;
+      detached.advertisements = candidate.advertisements;
+      detached.subscriptions = candidate.subscriptions;
+      for (const auto& [service, advertisement] : detached.advertisements)
+        detached.advertisingOnPorts.insert(advertisement.port);
+      const bool client = prodigyStatefulTopologyServesClients(candidate.statefulTopology) &&
+                          (plan.stateful.allMasters || clients[candidate.shardGroup] == candidate.uuid);
+      reconcileLiveStatefulTopologyServices(&detached, false, client ? 1 : 0);
+      candidate.advertisements = std::move(detached.advertisements);
+      candidate.subscriptions = std::move(detached.subscriptions);
+    }
+    return true;
+  }
+
+  bool applyStatefulServingPlans(const ProdigyStatefulServingAuthority& authority,
+                                const Vector<BrainReplicatedContainerRuntimeState>& states)
+  {
+    if (thisBrain == nullptr || thisBrain->mesh == nullptr ||
+        authority.deploymentID != plan.config.deploymentID() ||
+        authority.applicationID != plan.config.applicationID || authority.allMasters != plan.stateful.allMasters)
+      return false;
+    // A retained steady record cannot cancel a newer admitted topology change.
+    if (statefulWorkerTopologyUpgradePending && statefulWorkerTopologyUpgradeOperationID != authority.operationID)
+      return false;
+    for (const auto& member : authority.members)
+    {
+      auto live = std::find_if(containers.begin(), containers.end(), [&](ContainerView *container) {
+        return container != nullptr && container->uuid == member.containerUUID;
+      });
+      if (live != containers.end() && ((*live)->machine == nullptr ||
+          (*live)->machine->uuid != member.machineUUID || (*live)->shardGroup != member.shardGroup)) return false;
+    }
+    const bool phaseChanged = statefulWorkerTopologyUpgradePhase != authority.phase;
+    if (authority.phase == StatefulWorkerTopologyUpgradePhase::none)
+    {
+      plan.config = authority.targetConfig;
+      updateVerticalAdjustmentForStatefulWorkerTopologyTarget(plan.config);
+    }
+    else if (phaseChanged)
+    {
+      statefulWorkerTopologyUpgradePhase = authority.phase;
+      statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
+    }
+    for (const auto& member : authority.members) masterForShardGroup.erase(member.shardGroup);
+    for (const auto& desired : states)
+    {
+      if (desired.plan.config.deploymentID() != authority.deploymentID) continue;
+      auto live = std::find_if(containers.begin(), containers.end(), [&](ContainerView *container) {
+        return container != nullptr && container->uuid == desired.plan.uuid;
+      });
+      if (live == containers.end()) continue;
+      ContainerView *container = *live;
+      const ContainerPlan& candidate = desired.plan;
+      // Remove obsolete mesh declarations while the previous ports are known.
+      for (const auto& [service, advertisement] : container->advertisements)
+      {
+        auto wanted = candidate.advertisements.find(service);
+        if (wanted == candidate.advertisements.end() || wanted->second.port != advertisement.port)
+          thisBrain->mesh->stopAdvertisement(service, container, false);
+      }
+      for (const auto& [service, subscription] : container->subscriptions)
+        if (!candidate.subscriptions.contains(service))
+          thisBrain->mesh->stopSubscription(service, container, subscription.nature, false);
+      container->explicitStatefulMeshRoles = candidate.statefulMeshRoles;
+      container->explicitStatefulTopology = candidate.statefulTopology;
+      container->advertisements = candidate.advertisements;
+      container->subscriptions = candidate.subscriptions;
+      container->advertisingOnPorts.clear();
+      for (const auto& [service, advertisement] : container->advertisements)
+        container->advertisingOnPorts.insert(advertisement.port);
+      const bool client = candidate.advertisements.contains(candidate.statefulMeshRoles.client);
+      if (client && !plan.stateful.allMasters) masterForShardGroup[container->shardGroup] = container;
+      reconcileLiveStatefulTopologyServices(container, true, client ? 1 : 0);
+      if (phaseChanged) clearStatefulWorkerTopologyCutoverBarrier(container);
+    }
+    if (authority.phase == StatefulWorkerTopologyUpgradePhase::none && statefulWorkerTopologyUpgradePending)
+    {
+      clearStatefulWorkerTopologyUpgradeOperation();
+      recomputeStatefulBaseTargetFromShardGroups();
+      recountStatefulDeploymentCountersFromLiveContainers();
+    }
+    else if (phaseChanged)
+    {
+      persistStatefulWorkerTopologyUpgradeOperation();
+      armStatefulWorkerTopologyUpgradeRollbackTimer();
+    }
+    if (phaseChanged && authority.phase == StatefulWorkerTopologyUpgradePhase::blueDraining)
+      autoscaleTrace("autoscale topologyCutover deploymentID=%llu operationID=%llu authorityRevision=%llu sourceEpoch=%u targetEpoch=%u\n",
+                     (unsigned long long)authority.deploymentID,
+                     (unsigned long long)authority.operationID,
+                     (unsigned long long)authority.revision,
+                     unsigned(authority.sourceEpoch), unsigned(authority.targetEpoch));
+    return true;
+  }
+
+  void applyStatefulServingResourceTargets(const ProdigyStatefulServingAuthority& authority,
+                                           const Vector<BrainReplicatedContainerRuntimeState>& states)
+  {
+    if (thisBrain == nullptr || !thisBrain->canControlNeurons() ||
+        authority.phase != StatefulWorkerTopologyUpgradePhase::none ||
+        authority.deploymentID != plan.config.deploymentID()) return;
+    struct Target {
+      ContainerView *container = nullptr;
+      uint16_t cores = 0;
+      uint32_t baseMemoryMB = 0;
+      uint32_t baseStorageMB = 0;
+      bool downscale = false;
+      uint32_t graceSeconds = 0;
+    };
+    Vector<Target> targets;
+    Vector<Machine *> affected;
+    for (const auto& desired : states)
+    {
+      if (desired.plan.config.deploymentID() != authority.deploymentID) continue;
+      auto live = std::find_if(containers.begin(), containers.end(), [&](ContainerView *container) {
+        return container != nullptr && container->uuid == desired.plan.uuid;
+      });
+      if (live == containers.end() || (*live)->machine == nullptr ||
+          (*live)->machine->uuid != desired.machineUUID || (*live)->state != ContainerState::healthy ||
+          !(*live)->runtimeReady || !prodigyMachineReadyForScheduling((*live)->machine) ||
+          !thisBrain->statefulServingResourceObservationSupported((*live)->machine)) continue;
+      ContainerView *container = *live;
+      const uint16_t cores = uint16_t(applicationSharedCPUCoreHint(desired.plan.config));
+      affected.push_back(container->machine);
+      const uint32_t memoryMB = desired.plan.config.totalMemoryMB();
+      const uint32_t storageMB = desired.plan.config.totalStorageMB();
+      if (container->runtime_nLogicalCores == cores && container->runtime_memoryMB == memoryMB &&
+          container->runtime_storageMB == storageMB) continue;
+      targets.push_back({container, cores,
+          desired.plan.config.memoryMB, desired.plan.config.storageMB,
+          cores < container->runtime_nLogicalCores || memoryMB < container->runtime_memoryMB ||
+              storageMB < container->runtime_storageMB,
+          desired.plan.config.sTilKillable});
+    }
+    // Rebuild even when the fresh inventory already matches the target: that
+    // observation is what releases capacity held during a pending downscale.
+    if (!thisBrain->refreshStatefulServingMachineCapacity(affected)) return;
+    for (const Target& target : targets)
+    {
+      queueSend(target.container->machine, NeuronTopic::adjustContainerResources,
+                target.container->uuid, target.cores, target.baseMemoryMB, target.baseStorageMB,
+                target.downscale, target.graceSeconds, uint8_t(1));
+    }
+  }
+
   bool captureStatefulTopologyRetirementSources(Vector<ContainerView *>& sources) const
   {
     sources.clear();
@@ -4264,6 +4483,17 @@ public:
 
   void resumeStatefulTopologyRetirement(void)
   {
+    if (thisBrain != nullptr && !thisBrain->statefulServingRecoveryReady()) return;
+    if (thisBrain != nullptr && thisBrain->statefulServingDecisionExists(plan.config.deploymentID()) &&
+        !thisBrain->restoreStatefulServingDecision(this)) return;
+    if (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap)
+    {
+      if (thisBrain == nullptr ||
+          !thisBrain->prepareStatefulServingTransition(this, StatefulWorkerTopologyUpgradePhase::greenBootstrap) ||
+          !thisBrain->restoreStatefulServingDecision(this)) return;
+      startStatefulWorkerTopologyUpgradeTargets();
+      commitStatefulWorkerTopologyUpgradeCutover();
+    }
     if (statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining &&
         !statefulWorkerTopologyUpgradeRollbackEligible())
     {
@@ -4803,43 +5033,8 @@ private:
       return;
     }
 
-    ApplicationConfig targetConfig = statefulWorkerTopologyUpgradeTargetConfig();
-    uint32_t targetWorkerCount = statefulWorkerTopologyUpgradeTargetWorkerCount;
-    uint32_t targetEpoch = statefulWorkerTopologyUpgradeTargetEpoch;
-    bytell_hash_set<uint32_t> lockedShardGroups = statefulWorkerTopologyLockedShardGroups;
-
-    plan.config = targetConfig;
-    updateVerticalAdjustmentForStatefulWorkerTopologyTarget(targetConfig);
-
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || lockedShardGroups.contains(container->shardGroup) == false)
-      {
-        continue;
-      }
-
-      container->explicitStatefulMeshRoles = statefulMeshRolesForShardGroup(container->shardGroup);
-      container->explicitStatefulTopology = statefulWorkerTopologyUpgradeSteadyTargetTopology(container->shardGroup);
-      container->explicitStatefulTopology.workerCount = targetWorkerCount;
-      container->explicitStatefulTopology.topologyEpoch = targetEpoch;
-      container->explicitStatefulTopology.sourceEpoch = targetEpoch;
-      container->explicitStatefulTopology.targetEpoch = targetEpoch;
-    }
-
-    clearStatefulWorkerTopologyUpgradeOperation();
-
-    recomputeStatefulBaseTargetFromShardGroups();
-    recountStatefulDeploymentCountersFromLiveContainers();
-
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || lockedShardGroups.contains(container->shardGroup) == false)
-      {
-        continue;
-      }
-
-      reconcileLiveStatefulTopologyServices(container);
-    }
+    if (!thisBrain->prepareStatefulServingTransition(this, StatefulWorkerTopologyUpgradePhase::none) ||
+        !thisBrain->restoreStatefulServingDecision(this)) return;
 
     dispatchDeferredStatefulScaleIntent();
   }
@@ -4877,35 +5072,9 @@ private:
       return;
     }
 
-    statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;
-    statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
-    for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
-    {
-      masterForShardGroup.erase(shardGroup);
-    }
-
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || container->isStateful == false || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
-      {
-        continue;
-      }
-
-      clearStatefulWorkerTopologyCutoverBarrier(container);
-
-      if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
-      {
-        configureStatefulWorkerTopologyUpgradeTarget(container);
-      }
-      else
-      {
-        configureStatefulWorkerTopologyUpgradeSource(container);
-      }
-
-      reconcileLiveStatefulTopologyServices(container);
-    }
-
-    persistStatefulWorkerTopologyUpgradeOperation();
+    if (thisBrain == nullptr ||
+        !thisBrain->prepareStatefulServingTransition(this, StatefulWorkerTopologyUpgradePhase::greenBootstrap)) return;
+    (void)thisBrain->restoreStatefulServingDecision(this);
   }
 
   void scheduleStatefulWorkerTopologyUpgradeBlueRetirement(void)
@@ -4988,48 +5157,14 @@ private:
       return;
     }
 
-    statefulWorkerTopologyUpgradePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;
-    statefulWorkerTopologyUpgradePhaseChangedAtMs = Time::now<TimeResolution::ms>();
-    autoscaleTrace("autoscale topologyCutover deploymentID=%llu sourceEpoch=%u targetEpoch=%u workers=%u->%u lockedGroups=%u\n",
-                   (unsigned long long)plan.config.deploymentID(),
-                   unsigned(statefulWorkerTopologyUpgradeSourceEpoch),
-                   unsigned(statefulWorkerTopologyUpgradeTargetEpoch),
-                   unsigned(statefulWorkerTopologyUpgradeSourceWorkerCount),
-                   unsigned(statefulWorkerTopologyUpgradeTargetWorkerCount),
-                   unsigned(statefulWorkerTopologyLockedShardGroups.size()));
-    for (uint32_t shardGroup : statefulWorkerTopologyLockedShardGroups)
-    {
-      masterForShardGroup.erase(shardGroup);
-    }
-
-    for (ContainerView *container : containers)
-    {
-      if (container == nullptr || container->isStateful == false || statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup) == false)
-      {
-        continue;
-      }
-
-      clearStatefulWorkerTopologyCutoverBarrier(container);
-
-      if (containerUsesStatefulWorkerTopologyUpgradeTarget(container))
-      {
-        configureStatefulWorkerTopologyUpgradeTarget(container);
-      }
-      else
-      {
-        configureStatefulWorkerTopologyUpgradeSource(container);
-      }
-
-      reconcileLiveStatefulTopologyServices(container);
-    }
-
-    persistStatefulWorkerTopologyUpgradeOperation();
-    armStatefulWorkerTopologyUpgradeRollbackTimer();
+    if (thisBrain == nullptr || !thisBrain->statefulServingRecoveryReady() ||
+        !thisBrain->prepareStatefulServingTransition(this, StatefulWorkerTopologyUpgradePhase::blueDraining)) return;
+    (void)thisBrain->restoreStatefulServingDecision(this);
   }
 
-  void reconcileLiveStatefulTopologyServices(ContainerView *container)
+  void reconcileLiveStatefulTopologyServices(ContainerView *container, bool publish = true, int clientSelection = -1)
   {
-    if (container == nullptr || container->isStateful == false || thisBrain == nullptr || thisBrain->mesh == nullptr)
+    if (container == nullptr || container->isStateful == false || thisBrain == nullptr || (publish && thisBrain->mesh == nullptr))
     {
       return;
     }
@@ -5049,19 +5184,19 @@ private:
         uint16_t port = container->getRandomAdvertisementPort();
         it = container->advertisements.emplace(service, Advertisement(service, startAt, stopAt, port)).first;
         container->advertisingOnPorts.insert(it->second.port);
-        if (service == roles.client) traceStatefulClientDeclaration("reconcile-add", container);
+        if (publish && service == roles.client) traceStatefulClientDeclaration("reconcile-add", container);
       }
 
       if (startAt == ContainerState::scheduled)
       {
         if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
         {
-          thisBrain->mesh->advertise(service, container, it->second.port, false);
+          if (publish) thisBrain->mesh->advertise(service, container, it->second.port, false);
         }
       }
       else if (startAt == ContainerState::healthy && container->state == ContainerState::healthy)
       {
-        thisBrain->mesh->advertise(service, container, it->second.port, false);
+        if (publish) thisBrain->mesh->advertise(service, container, it->second.port, false);
       }
     };
 
@@ -5078,9 +5213,9 @@ private:
       }
 
       container->advertisingOnPorts.erase(it->second.port);
-      thisBrain->mesh->stopAdvertisement(service, container, false);
+      if (publish) thisBrain->mesh->stopAdvertisement(service, container, false);
       container->advertisements.erase(it);
-      if (service == roles.client) traceStatefulClientDeclaration("reconcile-remove", container);
+      if (publish && service == roles.client) traceStatefulClientDeclaration("reconcile-remove", container);
     };
 
     auto ensureSubscription = [&](uint64_t service, ContainerState startAt, ContainerState stopAt, SubscriptionNature nature) -> void {
@@ -5099,7 +5234,7 @@ private:
       {
         if (container->state == ContainerState::scheduled || container->state == ContainerState::healthy)
         {
-          thisBrain->mesh->subscribe(service, container, it->second.nature, false);
+          if (publish) thisBrain->mesh->subscribe(service, container, it->second.nature, false);
         }
       }
     };
@@ -5116,7 +5251,7 @@ private:
         return;
       }
 
-      thisBrain->mesh->stopSubscription(service, container, it->second.nature, false);
+      if (publish) thisBrain->mesh->stopSubscription(service, container, it->second.nature, false);
       container->subscriptions.erase(it);
     };
 
@@ -5141,7 +5276,7 @@ private:
     if (prodigyStatefulTopologyServesClients(topology) == false)
     {
       eraseAdvertisement(roles.client);
-      if (plan.stateful.allMasters == false)
+      if (publish && clientSelection < 0 && plan.stateful.allMasters == false)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt != masterForShardGroup.end() && masterIt->second == container)
@@ -5152,8 +5287,8 @@ private:
     }
     else if (roles.client != 0)
     {
-      bool shouldAdvertiseClient = plan.stateful.allMasters;
-      if (plan.stateful.allMasters == false)
+      bool shouldAdvertiseClient = clientSelection >= 0 ? clientSelection != 0 : plan.stateful.allMasters;
+      if (clientSelection < 0 && plan.stateful.allMasters == false)
       {
         auto masterIt = masterForShardGroup.find(container->shardGroup);
         if (masterIt == masterForShardGroup.end() || masterIt->second == nullptr || masterIt->second->state == ContainerState::destroyed)
@@ -5180,6 +5315,11 @@ private:
 
   void reconcileStatefulWorkerTopologyUpgradeContainers(void)
   {
+    if (thisBrain != nullptr && thisBrain->statefulServingDecisionExists(plan.config.deploymentID()))
+    {
+      (void)thisBrain->restoreStatefulServingDecision(this);
+      return;
+    }
     if (statefulWorkerTopologyUpgradePendingForAnyShardGroup() == false)
     {
       return;
@@ -5281,6 +5421,7 @@ private:
       uint128_t containerUUID,
       uint128_t replaceContainerUUID,
       String bootstrap,
+      ContainerPlan launchPlan,
       bool retainedStorageRecoveryLaunch,
       String retainedSourceBootstrap = {})
   {
@@ -5304,10 +5445,28 @@ private:
         .containerUUID = containerUUID,
         .replaceContainerUUID = replaceContainerUUID,
         .bootstrap = std::move(bootstrap),
+        .launchPlan = std::move(launchPlan),
         .retainedStorageRecoveryLaunch = retainedStorageRecoveryLaunch,
         .retainedSourceBootstrap = std::move(retainedSourceBootstrap),
         .deploymentID = deploymentID,
         .authorityEpoch = authorityEpoch};
+
+    ContainerView *launchContainer = currentDurableContainerSpin(brain, deferred);
+    const auto servingAdmission = brain->prepareStatefulServingLaunch(this, launchContainer, deferred.launchPlan, machine->uuid);
+    if (servingAdmission == BrainBase::StatefulServingLaunchAdmission::pending)
+    {
+      // Authority ACK, not persistence capacity, owns this retry. Do not arm
+      // the backpressure continuation and spin in the same loop.
+      deferred.waitingForServingAuthority = true;
+      deferDurableContainerSpinForPersistence(std::move(deferred));
+      return;
+    }
+    if (servingAdmission == BrainBase::StatefulServingLaunchAdmission::rejected)
+    {
+      failDurableContainerSpinPersistence(brain, deferred, launchContainer,
+          "stateful container launch is not admitted by serving authority"_ctv);
+      return;
+    }
 
     // A capacity miss has no side effects.  Preserve the scheduled owner and
     // retry it from the deployment's existing Ring dispatcher after the
@@ -6335,6 +6494,27 @@ private:
             }
           }
 
+          bool authorityPending = false;
+          bool authorityRejected = false;
+          if (hasHeadroom && plan.isStateful && thisBrain != nullptr)
+          {
+            const auto admission = thisBrain->prepareStatefulServingResourceAdjustment(this, nextConfig);
+            authorityPending = admission == BrainBase::StatefulServingResourceAdjustmentAdmission::pending;
+            authorityRejected = admission == BrainBase::StatefulServingResourceAdjustmentAdmission::rejected;
+            if (authorityPending || authorityRejected)
+            {
+              // The exact desired plans are either retained by the existing
+              // authority commit (pending) or were not admitted (rejected).
+              // Do not charge capacity, mutate plan.config, or send a runtime
+              // delta until the authority owner restores an acknowledged target.
+              hasHeadroom = false;
+              autoscaleTrace("autoscale verticalInPlace authorityDeferred deploymentID=%llu pending=%u rejected=%u cores=%u->%u memMB=%u->%u storMB=%u->%u\n",
+                             (unsigned long long)plan.config.deploymentID(), unsigned(authorityPending), unsigned(authorityRejected),
+                             unsigned(oldCores), unsigned(nextCores), unsigned(oldMemoryMB), unsigned(nextMemoryMB),
+                             unsigned(oldStorageMB), unsigned(nextStorageMB));
+            }
+          }
+
           if (hasHeadroom)
           {
             for (const auto& [machine, count] : containersPerMachine)
@@ -6392,7 +6572,7 @@ private:
                            unsigned(nextStorageMB),
                            unsigned(containers.size()));
           }
-          else
+          else if (!authorityPending && !authorityRejected)
           {
             autoscaleTrace("autoscale verticalInPlace denied deploymentID=%llu cores=%u->%u memMB=%u->%u storMB=%u->%u\n",
                            (unsigned long long)plan.config.deploymentID(),
@@ -6727,6 +6907,8 @@ public:
   // Reconcile pending work and close target deficits after master/brain recovery.
   void recoverAfterReboot(void)
   {
+    if (thisBrain != nullptr && thisBrain->statefulServingDecisionExists(plan.config.deploymentID()) &&
+        !thisBrain->restoreStatefulServingDecision(this)) return;
     autoscaleTrace("deployment recovery inspect deploymentID=%llu state=%u containers=%llu topologyPhase=%u lockedGroups=%llu\n",
                    (unsigned long long)plan.config.deploymentID(), unsigned(state),
                    (unsigned long long)containers.size(), unsigned(statefulWorkerTopologyUpgradePhase),
@@ -8654,6 +8836,23 @@ public:
     commitStatefulWorkerTopologyUpgradeCutover();
   }
 
+  bool hasUnsentStatefulServingLaunch(uint128_t uuid, uint128_t machineUUID) const
+  {
+    if (thisBrain == nullptr) return false;
+    for (const auto& pending : deferredDurableContainerSpins)
+      if (pending.waitingForServingAuthority && pending.containerUUID == uuid &&
+          pending.deploymentID == plan.config.deploymentID() &&
+          pending.authorityEpoch == thisBrain->containerLaunchAuthorityEpoch() &&
+          pending.machine != nullptr && thisBrain->machines.contains(pending.machine) &&
+          pending.machine->uuid == machineUUID) return true;
+    return false;
+  }
+
+  void resumeDurableContainerSpinsAfterServingAuthority()
+  {
+    if (thisBrain != nullptr && thisBrain->statefulServingRecoveryReady()) retryDeferredDurableContainerSpins();
+  }
+
   void containerStatefulTopologyCutoverBarrierUpdated(ContainerView *container)
   {
     if (container == nullptr)
@@ -8881,6 +9080,13 @@ public:
 
   void changeShardGroupMaster(uint32_t shardGroup)
   {
+    if (thisBrain != nullptr && thisBrain->statefulServingDecisionExists(plan.config.deploymentID()))
+    {
+      auto selected = masterForShardGroup.find(shardGroup);
+      if (selected != masterForShardGroup.end() && selected->second != nullptr)
+        (void)thisBrain->prepareStatefulClientChange(this, shardGroup, selected->second->uuid);
+      return;
+    }
     StatefulMeshRoles roles = statefulMeshRolesForShardGroup(shardGroup);
 
     ContainerView *master = masterForShardGroup[shardGroup];
@@ -9348,6 +9554,7 @@ public:
                   container->uuid,
                   retainedStorageRecoverySource.sourceContainerUUID,
                   std::move(buffer),
+                  bootstrap.plan,
                   true,
                   std::move(retainedSourceBuffer));
             }
@@ -9358,6 +9565,7 @@ public:
                   container->uuid,
                   replaceContainerUUID,
                   std::move(buffer),
+                  bootstrap.plan,
                   false);
             }
 

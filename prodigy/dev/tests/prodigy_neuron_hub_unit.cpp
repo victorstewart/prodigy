@@ -385,6 +385,91 @@ static void testNeuronHubRetainsBuffersUntilCloseRetirement(TestSuite& suite)
   ::close(listener);
 }
 
+static void testNeuronResourceObservationReply(TestSuite& suite)
+{
+  TestNeuronControlRuntime runtime = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &runtime;
+
+  NeuronBrainControlStream control = {};
+  control.connected = true;
+  control.isFixedFile = true;
+  control.fslot = 0;
+  control.pendingSend = true; // Capture frames without scheduling host I/O.
+  runtime.brain = &control;
+
+  Container container = {};
+  container.plan.uuid = 0x7a590001;
+  container.plan.config.nLogicalCores = 1;
+  container.plan.config.memoryMB = 512;
+  container.plan.config.storageMB = 0;
+  runtime.containers.insert_or_assign(container.plan.uuid, &container);
+
+  auto sendCommand = [&](uint8_t observationVersion) -> void {
+    String command = {};
+    if (observationVersion == 0)
+      Message::construct(command, NeuronTopic::adjustContainerResources, container.plan.uuid,
+                         uint16_t(1), uint32_t(512), uint32_t(0), false, uint32_t(0));
+    else
+      Message::construct(command, NeuronTopic::adjustContainerResources, container.plan.uuid,
+                         uint16_t(1), uint32_t(512), uint32_t(0), false, uint32_t(0),
+                         observationVersion);
+    runtime.neuronHandler(reinterpret_cast<Message *>(command.data()));
+  };
+  auto replies = [&]() -> uint32_t {
+    uint32_t count = 0;
+    size_t offset = 0;
+    while (offset + Message::headerBytes <= control.wBuffer.size())
+    {
+      Message *message = reinterpret_cast<Message *>(control.wBuffer.data() + offset);
+      if (message->size < Message::headerBytes || message->size > control.wBuffer.size() - offset)
+        return UINT32_MAX;
+      count += NeuronTopic(message->topic) == NeuronTopic::adjustContainerResources;
+      offset += message->size;
+    }
+    return offset == control.wBuffer.size() ? count : UINT32_MAX;
+  };
+
+  sendCommand(0);
+  suite.expect(control.wBuffer.empty() && container.plan.config.storageMB == 0,
+               "neuron_resource_legacy_zero_storage_failure_has_no_reply_or_runtime_effect");
+
+  sendCommand(1);
+  bool replyValid = replies() == 1;
+  if (replyValid)
+  {
+    Message *message = reinterpret_cast<Message *>(control.wBuffer.data());
+    replyValid &= ProdigyIngressValidation::validateNeuronPayloadForBrain(
+        message->topic, message->args, message->terminal());
+    uint8_t *args = message->args;
+    uint8_t version = 0, success = 1;
+    uint128_t uuid = 0;
+    uint16_t cores = 0;
+    uint32_t memoryMB = 0, storageMB = UINT32_MAX;
+    Message::extractArg<ArgumentNature::fixed>(args, version);
+    Message::extractArg<ArgumentNature::fixed>(args, uuid);
+    Message::extractArg<ArgumentNature::fixed>(args, cores);
+    Message::extractArg<ArgumentNature::fixed>(args, memoryMB);
+    Message::extractArg<ArgumentNature::fixed>(args, storageMB);
+    Message::extractArg<ArgumentNature::fixed>(args, success);
+    replyValid &= args == message->terminal() && version == 1 && uuid == container.plan.uuid &&
+                  cores == uint16_t(applicationSharedCPUCoreHint(container.plan.config)) &&
+                  memoryMB == 512 && storageMB == 0 && success == 0;
+  }
+  suite.expect(replyValid && container.wBuffer.empty(),
+               "neuron_resource_observation_reply_reports_failed_zero_storage_without_container_effect");
+
+  control.wBuffer.clear();
+  sendCommand(2);
+  suite.expect(control.wBuffer.empty() && container.plan.config.storageMB == 0,
+               "neuron_resource_unknown_observation_flag_has_no_action_or_reply");
+
+  // Neither stack fixture is owned by Neuron after this point.
+  runtime.containers.erase(container.plan.uuid);
+  runtime.brain = nullptr;
+  thisNeuron = previousNeuron;
+}
+
 static void testNeuronRetiredBrainCloseDoesNotDeleteReplacement(TestSuite& suite)
 {
   TestNeuronControlRuntime runtime = {};
@@ -804,6 +889,7 @@ int main(void)
     testNeuronHubCanQueueToNeuron(suite);
     testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
     testNeuronHubRetainsBuffersUntilCloseRetirement(suite);
+    testNeuronResourceObservationReply(suite);
     testNeuronRetiredBrainCloseDoesNotDeleteReplacement(suite);
     testNeuronActiveBrainCloseRetainsPendingStreamUntilRecvDrain(suite);
     testContainerRestartWaitsForControlRetirement(suite);

@@ -4285,6 +4285,78 @@ static void serialize(S&& serializer, ProdigyStatefulWorkerTopologyUpgradeOperat
   serializer.value8b(operation.updatedAtMs);
 }
 
+class ProdigyStatefulServingAuthorityMember {
+public:
+  uint128_t containerUUID = 0;
+  uint128_t machineUUID = 0;
+  uint32_t shardGroup = 0;
+  bool isSource = false;
+  bool advertiseClient = false;
+  String planSHA256;
+
+  bool operator==(const ProdigyStatefulServingAuthorityMember& other) const
+  {
+    return containerUUID == other.containerUUID && machineUUID == other.machineUUID && shardGroup == other.shardGroup &&
+           isSource == other.isSource && advertiseClient == other.advertiseClient && planSHA256.equals(other.planSHA256);
+  }
+  bool operator!=(const ProdigyStatefulServingAuthorityMember& other) const { return !(*this == other); }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulServingAuthorityMember& member)
+{
+  serializer.value16b(member.containerUUID); serializer.value16b(member.machineUUID);
+  serializer.value4b(member.shardGroup); serializer.value1b(member.isSource);
+  serializer.value1b(member.advertiseClient); serializer.text1b(member.planSHA256, 64);
+}
+
+static inline bool prodigyStatefulServingApplicationConfigEqual(const ApplicationConfig& a, const ApplicationConfig& b)
+{
+  String as = {}, bs = {}; ApplicationConfig ac = a, bc = b;
+  Vector<int> acaps = {}, bcaps = {};
+  for (int value : ac.capabilities) acaps.push_back(value);
+  for (int value : bc.capabilities) bcaps.push_back(value);
+  std::sort(acaps.begin(), acaps.end()); std::sort(bcaps.begin(), bcaps.end());
+  ac.capabilities.clear(); bc.capabilities.clear();
+  BitseryEngine::serialize(as, ac); BitseryEngine::serialize(bs, bc);
+  return acaps == bcaps && as.equals(bs);
+}
+
+class ProdigyStatefulServingAuthority {
+public:
+  uint64_t deploymentID = 0;
+  uint16_t applicationID = 0;
+  uint64_t operationID = 0;
+  uint64_t revision = 0;
+  StatefulWorkerTopologyUpgradePhase phase = StatefulWorkerTopologyUpgradePhase::none;
+  uint32_t sourceEpoch = 0;
+  uint32_t targetEpoch = 0;
+  ApplicationConfig targetConfig;
+  bool allMasters = false;
+  // Canonical order: shardGroup, isSource, containerUUID.
+  Vector<ProdigyStatefulServingAuthorityMember> members;
+
+  bool operator==(const ProdigyStatefulServingAuthority& other) const
+  {
+    if (deploymentID != other.deploymentID || applicationID != other.applicationID || operationID != other.operationID ||
+        revision != other.revision || phase != other.phase || sourceEpoch != other.sourceEpoch || targetEpoch != other.targetEpoch ||
+        allMasters != other.allMasters || !prodigyStatefulServingApplicationConfigEqual(targetConfig, other.targetConfig) ||
+        members.size() != other.members.size()) return false;
+    for (uint32_t i = 0; i < members.size(); ++i) if (members[i] != other.members[i]) return false;
+    return true;
+  }
+  bool operator!=(const ProdigyStatefulServingAuthority& other) const { return !(*this == other); }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyStatefulServingAuthority& authority)
+{
+  serializer.value8b(authority.deploymentID); serializer.value2b(authority.applicationID);
+  serializer.value8b(authority.operationID); serializer.value8b(authority.revision); serializer.value1b(authority.phase);
+  serializer.value4b(authority.sourceEpoch); serializer.value4b(authority.targetEpoch); serializer.object(authority.targetConfig);
+  serializer.value1b(authority.allMasters); serializer.container(authority.members, 4096);
+}
+
 class ProdigyDeferredStatefulScaleIntent {
 public:
 
@@ -7741,6 +7813,7 @@ public:
   Vector<ProdigyPendingElasticAddressAssignment> pendingElasticAddressAssignments;
   Vector<ProdigyPendingElasticAddressRelease> pendingElasticAddressReleases;
   Vector<ProdigyStatefulWorkerTopologyUpgradeOperation> statefulWorkerTopologyUpgradeOperations;
+  Vector<ProdigyStatefulServingAuthority> statefulServingAuthorities;
   Vector<ProdigyDeferredStatefulScaleIntent> deferredStatefulScaleIntents;
   Vector<ProdigyMaterializedStatefulRecoveryOperation> materializedStatefulRecoveryOperations;
   Vector<ProdigyMaterializedStatefulRecoveryRetry> materializedStatefulRecoveryRetries;
@@ -7758,7 +7831,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false)
     {
       return false;
@@ -7811,6 +7884,11 @@ public:
       {
         return false;
       }
+    }
+
+    for (uint32_t index = 0; index < statefulServingAuthorities.size(); ++index)
+    {
+      if (statefulServingAuthorities[index] != other.statefulServingAuthorities[index]) return false;
     }
 
     for (uint32_t index = 0; index < deferredStatefulScaleIntents.size(); ++index)
@@ -7936,12 +8014,13 @@ template <typename S>
 static void prodigySerializeMasterAuthorityRuntimeState(
     S&& serializer,
     ProdigyMasterAuthorityRuntimeState& state,
-    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates);
+    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates,
+    Vector<BrainReplicatedContainerRuntimeState> *servingRuntimeStates);
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
 {
-  prodigySerializeMasterAuthorityRuntimeState(serializer, state, nullptr);
+  prodigySerializeMasterAuthorityRuntimeState(serializer, state, nullptr, nullptr);
 }
 
 class ProdigyMasterAuthorityStateTransitionAck {
@@ -8789,10 +8868,11 @@ template <typename S>
 static void prodigySerializeMasterAuthorityRuntimeState(
     S&& serializer,
     ProdigyMasterAuthorityRuntimeState& state,
-    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates)
+    Vector<BrainReplicatedContainerRuntimeState> *containerRuntimeStates,
+    Vector<BrainReplicatedContainerRuntimeState> *servingRuntimeStates)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 6;
+  constexpr uint64_t explicitVersion = 7;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
@@ -8800,6 +8880,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasMaterializedStatefulRecoveryRetries = false;
   bool hasContainerRuntimeStates = false;
   bool hasDeploymentPlacementPolicies = false;
+  bool hasStatefulServingAuthorities = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -8808,28 +8889,30 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasAllMachineRecoveryWitnesses = state.updateSelf.machineRecoveryWitnesses.empty() == false;
     hasMaterializedStatefulRecoveryRetries = state.materializedStatefulRecoveryRetries.empty() == false;
     hasDeploymentPlacementPolicies = state.deploymentPlacementPolicies.empty() == false;
+    hasStatefulServingAuthorities = state.statefulServingAuthorities.empty() == false;
+    if (hasStatefulServingAuthorities) hasDeploymentPlacementPolicies = true;
     // Version six has a package-only container slot before the policy tail.
     // Emit that slot even when empty whenever the enclosing package supplies it.
     hasContainerRuntimeStates = containerRuntimeStates != nullptr &&
                                 (containerRuntimeStates->empty() == false || hasDeploymentPlacementPolicies);
     // Version-four framing is cumulative: emit the earlier optional fields
     // (empty when unused) so a version-three reader has an unambiguous tail.
-    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies)
+    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities)
     {
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = true;
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -8855,6 +8938,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasMaterializedStatefulRecoveryRetries = version >= 4;
       hasContainerRuntimeStates = version == 5 || (version >= 6 && containerRuntimeStates != nullptr);
       hasDeploymentPlacementPolicies = version >= 6;
+      hasStatefulServingAuthorities = version >= 7;
     }
   }
 
@@ -8928,6 +9012,17 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.deploymentPlacementPolicies.clear();
+  }
+  if (hasStatefulServingAuthorities)
+  {
+    serializer.container(state.statefulServingAuthorities, 4096);
+    if (servingRuntimeStates != nullptr)
+      serializer.container(*servingRuntimeStates, 4096);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.statefulServingAuthorities.clear();
+    if (servingRuntimeStates != nullptr) servingRuntimeStates->clear();
   }
 }
 
@@ -9250,6 +9345,10 @@ public:
   // Snapshot persistence retains only their identities publicly; full records
   // live in the paired private sidecar.
   Vector<BrainReplicatedContainerRuntimeState> containerRuntimeStates;
+  // Immutable desired serving plans are separate from observed live plans:
+  // preparing a cutover must not change cold-start observations before ACK.
+  // Their full content uses this package's existing private snapshot owner.
+  Vector<BrainReplicatedContainerRuntimeState> servingRuntimeStates;
   bytell_hash_map<uint64_t, DeploymentPlan> deploymentPlans;
   bytell_hash_map<uint64_t, FailedDeploymentRecord> failedDeployments;
   ProdigyMasterAuthorityRuntimeState runtimeState;
@@ -9413,7 +9512,7 @@ static void serialize(S&& serializer, ProdigyPersistentMasterAuthorityPackage& p
   serializer.object(package.deploymentPlans);
   serializer.object(package.failedDeployments);
   prodigySerializeMasterAuthorityRuntimeState(
-      serializer, package.runtimeState, &package.containerRuntimeStates);
+      serializer, package.runtimeState, &package.containerRuntimeStates, &package.servingRuntimeStates);
 }
 
 class ContainerParameters { // startup payload for container launch; stateful mesh and topology metadata use the full serializer path

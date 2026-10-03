@@ -1204,6 +1204,7 @@ public:
     ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
     snapshot.brainConfig = candidate.brainConfig;
     snapshot.masterAuthority.runtimeState = candidate.runtimeState;
+    snapshot.masterAuthority.servingRuntimeStates = candidate.servingRuntimeStates;
     prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
     ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
     const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);

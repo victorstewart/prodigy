@@ -27,6 +27,7 @@
 #include <networking/reconnector.h>
 
 class ContainerView;
+class ContainerPlan;
 class ApplicationDeployment;
 class MachineTicket;
 class Mesh;
@@ -71,6 +72,7 @@ public:
   bool transitionAfterBundleAckSend = false;
   bool placementPolicyCapabilityAcknowledged = false;
   bool containerRetirementCapabilityAcknowledged = false;
+  bool statefulServingAuthorityCapabilityAcknowledged = false;
   uint128_t containerRetirementCapabilityUUID = 0;
   int64_t containerRetirementCapabilityBootNs = 0;
   uint64_t containerRetirementCapabilityIOGeneration = 0;
@@ -137,6 +139,7 @@ public:
     transitionAfterBundleAckSend = false;
     placementPolicyCapabilityAcknowledged = false;
     containerRetirementCapabilityAcknowledged = false;
+    statefulServingAuthorityCapabilityAcknowledged = false;
     containerRetirementCapabilityUUID = 0;
     containerRetirementCapabilityBootNs = 0;
     containerRetirementCapabilityIOGeneration = 0;
@@ -700,6 +703,37 @@ public:
   virtual bool prepareStatefulTopologyRetirement(ApplicationDeployment *deployment)
   {
     (void)deployment;
+    return false;
+  }
+  // The serving decision is committed by the same authority owner before
+  // deployment reconciliation can publish it or retire its previous owner.
+  virtual bool prepareStatefulServingTransition(
+      ApplicationDeployment *, StatefulWorkerTopologyUpgradePhase)
+  {
+    return false;
+  }
+
+  enum class StatefulServingLaunchAdmission : uint8_t { ready, pending, rejected };
+  enum class StatefulServingResourceAdjustmentAdmission : uint8_t { ready, pending, rejected };
+  virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
+  virtual bool statefulServingRecoveryReady() const { return true; }
+  virtual StatefulServingResourceAdjustmentAdmission prepareStatefulServingResourceAdjustment(
+      ApplicationDeployment *, const ApplicationConfig&)
+  {
+    return StatefulServingResourceAdjustmentAdmission::ready;
+  }
+  virtual bool refreshStatefulServingMachineCapacity(const Vector<Machine *>&) { return false; }
+  virtual bool statefulServingResourceObservationSupported(const Machine *) const { return false; }
+  virtual bool prepareStatefulClientChange(ApplicationDeployment *, uint32_t, uint128_t) { return false; }
+  virtual StatefulServingLaunchAdmission prepareStatefulServingLaunch(
+      ApplicationDeployment *, ContainerView *, const ContainerPlan&, uint128_t)
+  {
+    return StatefulServingLaunchAdmission::ready;
+  }
+
+
+  virtual bool restoreStatefulServingDecision(ApplicationDeployment *)
+  {
     return false;
   }
   // Concrete runtime owners must prove the commissioned peers can retain the

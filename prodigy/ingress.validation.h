@@ -651,6 +651,18 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
   }
 }
 
+static bool extractContainerResourceObservation(uint8_t *& cursor, uint8_t *terminal,
+    uint128_t& uuid, uint16_t& cores, uint32_t& memoryMB, uint32_t& storageMB, uint8_t& applied)
+{
+  uint8_t version = 0;
+  return extractFixed(cursor, terminal, version) && version == 1 &&
+      extractFixed(cursor, terminal, uuid) && uuid != 0 &&
+      extractFixed(cursor, terminal, cores) && cores != 0 &&
+      extractFixed(cursor, terminal, memoryMB) && memoryMB != 0 &&
+      extractFixed(cursor, terminal, storageMB) &&
+      extractFixed(cursor, terminal, applied) && applied <= 1 && cursor == terminal;
+}
+
 static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint8_t *terminal)
 {
   if (args == nullptr || terminal == nullptr || args > terminal)
@@ -737,6 +749,14 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
     case NeuronTopic::openSwitchboardWormholes:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case NeuronTopic::adjustContainerResources:
+      {
+        uint128_t uuid = 0;
+        uint16_t cores = 0;
+        uint32_t memoryMB = 0, storageMB = 0;
+        uint8_t applied = 0;
+        return extractContainerResourceObservation(cursor, terminal, uuid, cores, memoryMB, storageMB, applied);
       }
     case NeuronTopic::containerStatistics:
       {
@@ -987,7 +1007,9 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         {
           return false;
         }
-        return (cursor == terminal);
+        if (cursor == terminal) return true;
+        uint8_t observationVersion = 0;
+        return extractFixed(cursor, terminal, observationVersion) && observationVersion == 1 && cursor == terminal;
       }
     case NeuronTopic::changeContainerLifetime:
       {

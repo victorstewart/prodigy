@@ -133,10 +133,36 @@ Those earlier passes do not qualify service ownership. Collision rejection at
 Mothership/Brain admission and service construction now has passing regressions.
 The corrected crash rehearsal exposed a second failure: cutover selects one client
 advertiser, but recovery restores older catchup plans with no client advertiser.
-The selected serving plans are not bound to the durable authority receipt that
-settles retirement. That receipt must cover the complete target cohort, including
-lost/partial replication and delayed Neuron uploads, before this gate can pass.
-Neither this matrix nor its counters establish cross-cluster migration safety.
+The candidate now binds the exact serving cohort, machine identities, selected
+client, topology and desired configuration to the existing authority receipt
+before cutover effects. The decision survives transition clearing; delayed runtime
+reports preserve observed liveness and allocation without replacing that desired
+state. Desired plans and retirement bootstraps use the existing private snapshot
+sidecar, with strict matching to the public authority identity. Initial green
+launches are admitted serially as catchup-only members. Recovery waits for pending
+authority materialization and fresh inventory before scheduling missing targets.
+
+Corrected crash and four-case rehearsals have passed on their recorded artifacts.
+Later changes still require qualification on their own exact artifacts. Neither
+this matrix nor its counters establishes acknowledged application-write continuity
+or cross-cluster migration safety.
+
+Steady memory/storage adjustments also use the durable serving decision. Capacity
+reserves the larger of desired and observed allocations until Neuron reports the
+applied result. An optional versioned reply on the existing resource command avoids
+resetting routing merely to observe a resource change. The extended command requires
+the existing current-connection, current-authority witness for an installed bundle
+identical to the Brain's measured bundle. Unsupported or mixed bundle identities
+remain blocked; this is not a claim of general mixed-version resource compatibility.
+Legacy commands omit the observation request and receive no new reply. Lost replies
+retain the reservation and use the existing desired-state retry owner.
+
+Ordinary new-UUID replacement within a sealed steady deployment is still rejected.
+Enabling it requires a durable predecessor/successor binding and a machine-bound
+terminal fence; missing inventory and generic destruction callbacks are insufficient.
+Same-machine Neuron stop/drain/storage handoff is an existing execution primitive,
+but cross-machine writer/volume fencing remains unimplemented. These limitations
+must remain visible in release qualification and cannot be bypassed by a harness.
 
 ## First hop from runtime19b
 
@@ -155,8 +181,18 @@ receipt. None of these paths proves a first hop with continuous controller quoru
 Production admission must keep that requirement distinct from uninterrupted
 application traffic, and neither property may be inferred from a staged bundle.
 For the Nametag rollout, both are required: continuous controller quorum and
-uninterrupted application service. Production stays on runtime19b until a qualified
-migration path satisfies both. A measured controller gap is not an allowed fallback.
+uninterrupted application service. The next feasibility gate is a Mothership-owned
+single-Brain retained-runtime replacement using the existing retained-recovery
+owner. This mechanism does not yet exist as a qualified command. It must preserve
+application processes, storage, Neuron adoption and routing, support durable resume,
+and prove old/new protocol and leadership compatibility. New-only state stays
+dormant throughout the mixed-version period. Qualify followers individually, then
+the master through a proven handoff, while measuring both quorum and traffic.
+
+Production stays on runtime19b until a qualified route satisfies both requirements.
+Full independent-cluster migration remains separate required work; it is not
+automatically the smallest first hop. If retained replacement cannot satisfy its
+gates, compare a concrete migration route. A controller gap is not a fallback.
 
 ## Existing automated evidence
 

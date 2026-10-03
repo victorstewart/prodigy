@@ -5342,7 +5342,8 @@ public:
         }
       case NeuronTopic::adjustContainerResources:
         {
-          // containerUUID(16) nLogicalCores(2) memoryMB(4) storageMB(4) [isDownscale(1)] [graceSeconds(4)]
+          if (!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, args, terminal)) break;
+          // containerUUID(16) nLogicalCores(2) memoryMB(4) storageMB(4) [isDownscale(1)] [graceSeconds(4)] [observationVersion(1)]
 
           uint128_t containerUUID = 0;
           uint16_t targetCores = 0;
@@ -5350,6 +5351,7 @@ public:
           uint32_t targetStorageMB = 0;
           bool isDownscale = false;
           uint32_t graceSeconds = 0;
+          uint8_t observationVersion = 0;
 
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
           Message::extractArg<ArgumentNature::fixed>(args, targetCores);
@@ -5365,12 +5367,15 @@ public:
           {
             Message::extractArg<ArgumentNature::fixed>(args, graceSeconds);
           }
+          if (args < terminal) Message::extractArg<ArgumentNature::fixed>(args, observationVersion);
+          if (args != terminal || observationVersion > 1) break;
 
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
             String failureReport;
-            if (ContainerManager::adjustRunningContainerResources(container, targetCores, targetMemoryMB, targetStorageMB, &failureReport))
+            const bool applied = ContainerManager::adjustRunningContainerResources(container, targetCores, targetMemoryMB, targetStorageMB, &failureReport);
+            if (applied)
             {
               String payload;
               if (ProdigyWire::serializeResourceDeltaPayload(payload, targetCores, targetMemoryMB, targetStorageMB, isDownscale, graceSeconds) &&
@@ -5388,6 +5393,16 @@ public:
                          unsigned(targetMemoryMB),
                          unsigned(targetStorageMB),
                          (failureReport.size() ? failureReport.c_str() : "unknown"));
+            }
+            // Legacy callers never requested a reply. New serving-authority
+            // callers need the applied observation, not an optimistic send
+            // receipt and not a disruptive full stateUpload/routing reset.
+            if (observationVersion == 1 && brain != nullptr && streamIsActive(brain))
+            {
+              Message::construct(brain->wBuffer, NeuronTopic::adjustContainerResources, uint8_t(1),
+                  containerUUID, uint16_t(applicationSharedCPUCoreHint(container->plan.config)),
+                  container->plan.config.memoryMB, container->plan.config.storageMB, uint8_t(applied));
+              Ring::queueSend(brain);
             }
           }
 

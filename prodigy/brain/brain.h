@@ -35,6 +35,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.retirement.h>
+#include <prodigy/stateful.serving.authority.h>
 #include <prodigy/application.container.privileges.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/acme.certbot.h>
@@ -1015,11 +1016,13 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 1;
+  constexpr static uint8_t currentVersion = 2;
 
-  uint8_t version = currentVersion;
+  uint8_t version = 1;
+  bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
   ProdigyMasterAuthorityRuntimeState runtimeState;
   BrainConfig brainConfig;
+  Vector<BrainReplicatedContainerRuntimeState> servingRuntimeStates;
 };
 
 template <typename S>
@@ -1028,6 +1031,8 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   serializer.value1b(transition.version);
   serializer.object(transition.runtimeState);
   serializer.object(transition.brainConfig);
+  if (transition.version == 2)
+    serializer.container(transition.servingRuntimeStates, 4096);
 }
 
 // An adopted machine's explicit peer or address list is operator authority.
@@ -1257,6 +1262,9 @@ public:
   // the exact accepted plans separately from scheduler indexes: planned views
   // can survive an upload that did not observe a corresponding process.
   bytell_hash_set<uint128_t> persistedMachineInventoryUploaded;
+  // Derived from successfully restored records, never a new launch authority.
+  // An inventory received before those records materialize cannot attest them.
+  bytell_hash_set<uint128_t> pendingRestoredContainerInventory;
   bytell_hash_map<uint128_t, Vector<String>> persistedMachineStateUploadPlansByMachine;
   struct ContainerRetirementInventory {
     uint64_t authorityEpoch = 0;
@@ -1557,6 +1565,7 @@ public:
   uint64_t nextMintedClientTlsGeneration = 1;
   uint64_t nextTlsResumptionGeneration = 1;
   ProdigyMasterAuthorityRuntimeState masterAuthorityRuntimeState;
+  Vector<BrainReplicatedContainerRuntimeState> statefulServingRuntimeStates;
   bytell_hash_map<uint64_t, Vector<BrainReplicatedContainerRuntimeState>> pendingReplicatedContainerRuntimeStates;
 
   bool failedDeploymentRetentionWaitsForCanonicalRuntime(uint64_t deploymentID) const override
@@ -6458,6 +6467,10 @@ public:
   {
     ProdigyMasterAuthorityStateTransition transition;
     transition.runtimeState = masterAuthorityRuntimeState;
+    transition.servingRuntimeStates = statefulServingRuntimeStates;
+    if (!transition.runtimeState.statefulServingAuthorities.empty()) transition.version = 2;
+    if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
+          transition.servingRuntimeStates, transition.runtimeState.generation)) return false;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     ownBrainConfig(brainConfig, transition.brainConfig);
     BitseryEngine::serialize(serialized, transition);
@@ -6471,7 +6484,8 @@ public:
     {
       return;
     }
-    if ((onlyUnacknowledged || masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
+    if ((onlyUnacknowledged || !masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
+         masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
          masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
         (masterAuthorityRuntimeStateDurable == false ||
          durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation))
@@ -6543,24 +6557,16 @@ public:
     }
     for (BrainView *peer : brains)
     {
-      if (onlyUnacknowledged &&
-          (!retryNeeded(peer) || peerHasAcknowledgedCurrentMasterAuthority(peer, transitionDigest))) continue;
-      if (onlyUnacknowledged)
-      {
-        const uint64_t appendBytes = uint64_t(serialized.size()) + brainPeerReplicationFrameHeadroomBytes;
-        if (appendBytes > brainPeerReplicationBufferedBytesLimit ||
-            brainPeerBufferedBytes(peer) > brainPeerReplicationBufferedBytesLimit - appendBytes) continue;
-      }
-      noteMasterAuthorityTransitionSentToPeer(peer,
-                                              masterAuthorityRuntimeState,
-                                              transitionDigest);
-      if (onlyUnacknowledged)
-      {
-        Message::construct(peer->wBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
-        Ring::queueSend(peer);
-      }
+      if (!peerCanReceiveMasterAuthorityState(peer) ||
+          (onlyUnacknowledged &&
+           (!retryNeeded(peer) || peerHasAcknowledgedCurrentMasterAuthority(peer, transitionDigest)))) continue;
+      const uint64_t appendBytes = uint64_t(serialized.size()) + brainPeerReplicationFrameHeadroomBytes;
+      if (appendBytes > brainPeerReplicationBufferedBytesLimit ||
+          brainPeerBufferedBytes(peer) > brainPeerReplicationBufferedBytesLimit - appendBytes) continue;
+      Message::construct(peer->wBuffer, BrainTopic::replicateMasterAuthorityState, serialized);
+      noteMasterAuthorityTransitionSentToPeer(peer, masterAuthorityRuntimeState, transitionDigest);
+      Ring::queueSend(peer);
     }
-    if (!onlyUnacknowledged) queueBrainReplication(BrainTopic::replicateMasterAuthorityState, serialized);
   }
 
   void noteMasterAuthorityRuntimeStateChanged(bool replicate = true, bool persist = true)
@@ -6988,10 +6994,479 @@ public:
     }
   }
 
+  bool statefulServingDecisionExists(uint64_t deploymentID) const override
+  {
+    return std::any_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(),
+        [=](const auto& authority) { return authority.deploymentID == deploymentID; });
+  }
+
+  bool statefulServingRecoveryReady() const override
+  {
+    return !recoveringPersistedNeuronInventory && pendingReplicatedContainerRuntimeStates.empty();
+  }
+
+  bool statefulServingPeersCapable() const
+  {
+    if (!statefulTopologyRetirementPeersCapable()) return false;
+    ClusterTopology topology = {};
+    if (!loadAuthoritativeClusterTopology(topology)) return false;
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      BrainView *peer = brainPeerForTopologyMember(member);
+      if (!containerRetirementPeerCapabilityCurrent(peer) ||
+          !peer->statefulServingAuthorityCapabilityAcknowledged) return false;
+    }
+    return true;
+  }
+
+  bool refreshStatefulServingMachineCapacity(const Vector<Machine *>& affected) override
+  {
+    if (!weAreMaster) return false;
+    for (Machine *machine : affected)
+      if (machine == nullptr || !machines.contains(machine) ||
+          !brainConfig.configBySlug.contains(machine->slug)) return false;
+    bytell_hash_set<Machine *> seen;
+    for (Machine *machine : affected)
+    {
+      if (machine == nullptr || !seen.insert(machine).second) continue;
+      auto config = brainConfig.configBySlug.find(machine->slug);
+      // Rebuild from ownership, claims, and every indexed container.  Do not
+      // debit desired-minus-observed runtime here: cold restored views may
+      // carry an older runtime snapshot after their plan was projected.
+      (void)applyConfiguredMachineCapacity(machine, config->second, false);
+    }
+    return true;
+  }
+
+  bool statefulServingResourceObservationSupported(const Machine *machine) const override
+  {
+    if (machine == nullptr || !neuronControlStreamActive(machine)) return false;
+    const auto& peer = machine->neuron;
+    // Reuse the current-stream witness that the installed bundle equals this
+    // Brain's measured bundle. Older Neurons reject the extended request; no
+    // new-only resource operation is sent to an unverified or mixed bundle.
+    return !peer.artifactCapabilityPending && peer.artifactChunksEnabled &&
+        peer.verifiedInstalledBundleIOGeneration == peer.ioGeneration &&
+        peer.verifiedInstalledBundleAuthorityEpoch == masterAuthorityEpoch &&
+        prodigyIsSHA256HexDigest(peer.verifiedInstalledBundleSHA256);
+  }
+
+  StatefulServingResourceAdjustmentAdmission prepareStatefulServingResourceAdjustment(
+      ApplicationDeployment *deployment, const ApplicationConfig& targetConfig) override
+  {
+    if (deployment == nullptr) return StatefulServingResourceAdjustmentAdmission::rejected;
+    const uint64_t deploymentID = deployment->plan.config.deploymentID();
+    auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [=](const auto& value) {
+          return value.deploymentID == deploymentID;
+        });
+    // Preserve the established uncovered in-place adjustment path.
+    if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end())
+      return StatefulServingResourceAdjustmentAdmission::ready;
+    auto owner = deployments.find(deploymentID);
+    if (!weAreMaster || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1 ||
+        owner == deployments.end() || owner->second != deployment)
+      return StatefulServingResourceAdjustmentAdmission::rejected;
+    if (current->phase != StatefulWorkerTopologyUpgradePhase::none ||
+        deployment->statefulWorkerTopologyUpgradePending)
+      return StatefulServingResourceAdjustmentAdmission::rejected;
+    ApplicationConfig permitted = current->targetConfig;
+    permitted.nLogicalCores = targetConfig.nLogicalCores;
+    permitted.memoryMB = targetConfig.memoryMB;
+    permitted.storageMB = targetConfig.storageMB;
+    if (!prodigyStatefulServingApplicationConfigEqual(permitted, targetConfig) ||
+        prodigyStatefulCoreChangeRequiresTopologyUpgrade(true, current->targetConfig.nLogicalCores,
+                                                       targetConfig.nLogicalCores))
+      return StatefulServingResourceAdjustmentAdmission::rejected;
+    // This also closes admission while any previously submitted authority
+    // revision is awaiting persistence, replication, peer ACK, or recovery.
+    if (!statefulServingRecoveryReady() || !statefulServingPeersCapable() ||
+        !containerRetirementAuthorityAcknowledged())
+      return StatefulServingResourceAdjustmentAdmission::pending;
+    if (prodigyStatefulServingApplicationConfigEqual(current->targetConfig, targetConfig))
+    {
+      const bool everyMemberSealed = std::all_of(current->members.begin(), current->members.end(), [&](const auto& member) {
+        auto state = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+            [&](const auto& value) { return value.plan.uuid == member.containerUUID; });
+        return state != statefulServingRuntimeStates.end() &&
+               prodigyStatefulServingApplicationConfigEqual(state->plan.config, targetConfig);
+      });
+      // A covered target is always applied by restoreStatefulServingDecision;
+      // never fall through to the legacy direct debit/send path.
+      return everyMemberSealed ? StatefulServingResourceAdjustmentAdmission::pending
+                               : StatefulServingResourceAdjustmentAdmission::rejected;
+    }
+
+    Vector<Machine *> affected;
+    bytell_hash_map<Machine *, uint32_t> counts;
+    if (deployment->containers.size() != current->members.size())
+      return StatefulServingResourceAdjustmentAdmission::pending;
+    for (const auto& member : current->members)
+    {
+      auto live = containers.find(member.containerUUID);
+      if (live == containers.end() || live->second == nullptr || !deployment->containers.contains(live->second) ||
+          live->second->machine == nullptr || live->second->machine->uuid != member.machineUUID ||
+          !machines.contains(live->second->machine) || !brainConfig.configBySlug.contains(live->second->machine->slug) ||
+          live->second->state != ContainerState::healthy || !live->second->runtimeReady ||
+          !prodigyMachineReadyForScheduling(live->second->machine) ||
+          !statefulServingResourceObservationSupported(live->second->machine) ||
+          live->second->runtime_nLogicalCores != applicationSharedCPUCoreHint(current->targetConfig) ||
+          live->second->runtime_memoryMB != current->targetConfig.totalMemoryMB() ||
+          live->second->runtime_storageMB != current->targetConfig.totalStorageMB())
+        return StatefulServingResourceAdjustmentAdmission::pending;
+      ++counts[live->second->machine];
+    }
+    for (const auto& [machine, count] : counts)
+    {
+      if (int64_t(targetConfig.nLogicalCores) - current->targetConfig.nLogicalCores >
+              int64_t(machine->nLogicalCores_available) / count ||
+          int64_t(targetConfig.totalMemoryMB()) - current->targetConfig.totalMemoryMB() >
+              int64_t(machine->memoryMB_available) / count ||
+          int64_t(targetConfig.totalStorageMB()) - current->targetConfig.totalStorageMB() >
+              int64_t(machine->storageMB_available) / count)
+        return StatefulServingResourceAdjustmentAdmission::pending;
+      affected.push_back(machine);
+    }
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    ProdigyStatefulServingAuthority next = *current;
+    next.revision = masterAuthorityRuntimeState.generation + 1;
+    next.targetConfig = targetConfig;
+    for (const auto& saved : statefulServingRuntimeStates)
+    {
+      if (saved.plan.config.deploymentID() != deploymentID) continue;
+      auto member = std::find_if(next.members.begin(), next.members.end(), [&](const auto& value) {
+        return value.containerUUID == saved.plan.uuid && value.machineUUID == saved.machineUUID &&
+               value.shardGroup == saved.plan.shardGroup;
+      });
+      if (member == next.members.end()) return StatefulServingResourceAdjustmentAdmission::rejected;
+      auto state = saved;
+      state.plan.config = targetConfig;
+      if (!prodigyStatefulServingRuntimeDigest(state, member->planSHA256))
+        return StatefulServingResourceAdjustmentAdmission::rejected;
+      states.push_back(std::move(state));
+    }
+    if (states.size() != next.members.size() ||
+        !prodigyValidateStatefulServingAuthority(next, states, next.revision))
+      return StatefulServingResourceAdjustmentAdmission::rejected;
+    // commitStatefulServingDecision retains the exact target package and its
+    // existing async retry; return pending until its normal durable peer ACK.
+    (void)commitStatefulServingDecision(std::move(next), std::move(states));
+    // Reserve the intended capacity using the existing accounting owner while
+    // persistence/peer ACKs are pending. This reversible reservation prevents
+    // another scheduler from consuming the same headroom; no runtime delta is
+    // sent until the durable authority is restored.
+    (void)refreshStatefulServingMachineCapacity(affected);
+    return StatefulServingResourceAdjustmentAdmission::pending;
+  }
+
+  bool prepareStatefulServingTransition(ApplicationDeployment *deployment,
+      StatefulWorkerTopologyUpgradePhase phase) override
+  {
+    if (deployment == nullptr || !statefulServingRecoveryReady() || !statefulServingPeersCapable() ||
+        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return false;
+    const uint64_t deploymentID = deployment->plan.config.deploymentID();
+    auto owner = deployments.find(deploymentID);
+    if (owner == deployments.end() || owner->second != deployment ||
+        !deployment->statefulWorkerTopologyUpgradePending) return false;
+    auto& authorities = masterAuthorityRuntimeState.statefulServingAuthorities;
+    auto existing = std::find_if(authorities.begin(), authorities.end(),
+        [=](const auto& authority) { return authority.deploymentID == deploymentID; });
+    if (existing != authorities.end() &&
+        existing->operationID == deployment->statefulWorkerTopologyUpgradeOperationID && existing->phase == phase)
+      return containerRetirementAuthorityAcknowledged();
+
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    for (ContainerView *container : deployment->containers)
+    {
+      if (container == nullptr || !container->isStateful ||
+          !deployment->statefulWorkerTopologyLockedShardGroups.contains(container->shardGroup)) continue;
+      if (phase == StatefulWorkerTopologyUpgradePhase::none &&
+          container->explicitStatefulTopology.topologyEpoch == deployment->statefulWorkerTopologyUpgradeSourceEpoch) continue;
+      BrainReplicatedContainerRuntimeState state = {};
+      if (!captureReplicatedContainerRuntimeState(container, state)) return false;
+      states.push_back(std::move(state));
+    }
+    if (!deployment->projectStatefulServingPlans(phase, states)) return false;
+    ProdigyStatefulServingAuthority authority = {};
+    authority.deploymentID = deploymentID;
+    authority.applicationID = deployment->plan.config.applicationID;
+    authority.operationID = deployment->statefulWorkerTopologyUpgradeOperationID;
+    authority.revision = masterAuthorityRuntimeState.generation + 1;
+    authority.phase = phase;
+    authority.sourceEpoch = deployment->statefulWorkerTopologyUpgradeSourceEpoch;
+    authority.targetEpoch = deployment->statefulWorkerTopologyUpgradeTargetEpoch;
+    authority.allMasters = deployment->plan.stateful.allMasters;
+    authority.targetConfig = deployment->statefulWorkerTopologyUpgradeTargetConfig();
+    for (const auto& state : states)
+    {
+      ProdigyStatefulServingAuthorityMember member = {};
+      member.containerUUID = state.plan.uuid;
+      member.machineUUID = state.machineUUID;
+      member.shardGroup = state.plan.shardGroup;
+      member.isSource = phase != StatefulWorkerTopologyUpgradePhase::none &&
+                        state.plan.statefulTopology.topologyEpoch == authority.sourceEpoch;
+      member.advertiseClient = state.plan.advertisements.contains(state.plan.statefulMeshRoles.client);
+      if (!member.isSource) authority.targetConfig = state.plan.config;
+      if (!prodigyStatefulServingRuntimeDigest(state, member.planSHA256)) return false;
+      authority.members.push_back(std::move(member));
+    }
+    std::sort(authority.members.begin(), authority.members.end(), [](const auto& lhs, const auto& rhs) {
+      if (lhs.shardGroup != rhs.shardGroup) return lhs.shardGroup < rhs.shardGroup;
+      if (lhs.isSource != rhs.isSource) return lhs.isSource < rhs.isSource;
+      return lhs.containerUUID < rhs.containerUUID;
+    });
+    return commitStatefulServingDecision(std::move(authority), std::move(states));
+  }
+
+  bool commitStatefulServingDecision(ProdigyStatefulServingAuthority authority,
+                                     Vector<BrainReplicatedContainerRuntimeState> states)
+  {
+    if (!prodigyValidateStatefulServingAuthority(authority, states, authority.revision)) return false;
+    auto& authorities = masterAuthorityRuntimeState.statefulServingAuthorities;
+    const uint64_t deploymentID = authority.deploymentID;
+    auto existing = std::find_if(authorities.begin(), authorities.end(),
+        [=](const auto& value) { return value.deploymentID == deploymentID; });
+    if (existing == authorities.end()) authorities.push_back(std::move(authority));
+    else *existing = std::move(authority);
+    std::sort(authorities.begin(), authorities.end(), [](const auto& lhs, const auto& rhs) {
+      return lhs.deploymentID < rhs.deploymentID;
+    });
+    std::erase_if(statefulServingRuntimeStates,
+        [=](const auto& state) { return state.plan.config.deploymentID() == deploymentID; });
+    for (auto& state : states) statefulServingRuntimeStates.push_back(std::move(state));
+    std::sort(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.plan.uuid < rhs.plan.uuid; });
+    // This existing owner persists the exact package and replicates its digest.
+    // No live declaration or retirement changes before its durable peer ACKs.
+    commitMasterAuthorityStateChangeAsync({});
+    return false;
+  }
+
+  StatefulServingLaunchAdmission prepareStatefulServingLaunch(
+      ApplicationDeployment *deployment, ContainerView *container,
+      const ContainerPlan& launchPlan, uint128_t machineUUID) override
+  {
+    if (deployment == nullptr || container == nullptr || launchPlan.uuid == 0 || machineUUID == 0)
+      return StatefulServingLaunchAdmission::rejected;
+    auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+          return value.deploymentID == launchPlan.config.deploymentID();
+        });
+    if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end())
+      return StatefulServingLaunchAdmission::ready;
+    auto owner = deployments.find(launchPlan.config.deploymentID());
+    auto canonical = containers.find(launchPlan.uuid);
+    if (!weAreMaster || owner == deployments.end() || owner->second != deployment ||
+        canonical == containers.end() || canonical->second != container ||
+        container->uuid != launchPlan.uuid || container->deploymentID != owner->first ||
+        container->shardGroup != launchPlan.shardGroup || !launchPlan.isStateful ||
+        container->machine == nullptr || container->machine->uuid != machineUUID ||
+        !machines.contains(container->machine) || container->state != ContainerState::scheduled)
+      return StatefulServingLaunchAdmission::rejected;
+    // A retained steady cohort may not admit a replacement without an
+    // authenticated predecessor terminal fence. Green is the sole supported
+    // expansion: targets are catchup-only and are admitted one at a time.
+    if (current->applicationID != launchPlan.config.applicationID ||
+        current->phase != StatefulWorkerTopologyUpgradePhase::greenBootstrap ||
+        launchPlan.statefulTopology.topologyEpoch != current->targetEpoch ||
+        launchPlan.statefulTopology.operationID != current->operationID ||
+        launchPlan.statefulTopology.servingMode != StatefulTopologyServingMode::catchupOnly ||
+        launchPlan.statefulTopology.bridgeMode != StatefulTopologyBridgeMode::sourceToTarget ||
+        launchPlan.advertisements.contains(launchPlan.statefulMeshRoles.client) ||
+        prodigyStatefulServingApplicationConfigEqual(launchPlan.config, current->targetConfig) == false)
+      return StatefulServingLaunchAdmission::rejected;
+    if (!statefulServingRecoveryReady()) return StatefulServingLaunchAdmission::pending;
+    auto member = std::find_if(current->members.begin(), current->members.end(), [&](const auto& value) {
+      return value.containerUUID == launchPlan.uuid;
+    });
+    if (member != current->members.end())
+    {
+      auto sealed = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+          [&](const auto& value) { return value.plan.uuid == launchPlan.uuid; });
+      if (sealed == statefulServingRuntimeStates.end() || member->machineUUID != machineUUID)
+        return StatefulServingLaunchAdmission::rejected;
+      // Runtime metrics and route ACKs may advance while this exact launch
+      // waits. Compare its immutable plan against the sealed payload without
+      // mistaking those observations for a new launch identity.
+      BrainReplicatedContainerRuntimeState observed = *sealed;
+      String observedDigest = {};
+      observed.machineUUID = machineUUID;
+      observed.plan = launchPlan;
+      if (!prodigyStatefulServingRuntimeDigest(observed, observedDigest) ||
+          observedDigest.equals(member->planSHA256) == false) return StatefulServingLaunchAdmission::rejected;
+      return containerRetirementAuthorityAcknowledged() ? StatefulServingLaunchAdmission::ready
+                                                         : StatefulServingLaunchAdmission::pending;
+    }
+    uint32_t targets = 0;
+    for (const auto& value : current->members)
+      if (!value.isSource && value.shardGroup == launchPlan.shardGroup) ++targets;
+    if (targets >= 3 || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1)
+      return StatefulServingLaunchAdmission::rejected;
+    if (!containerRetirementAuthorityAcknowledged()) return StatefulServingLaunchAdmission::pending;
+    BrainReplicatedContainerRuntimeState admitted = {};
+    if (!captureReplicatedContainerRuntimeState(container, admitted)) return StatefulServingLaunchAdmission::rejected;
+    admitted.machineUUID = machineUUID;
+    admitted.plan = launchPlan;
+    ProdigyStatefulServingAuthority authority = *current;
+    authority.revision = masterAuthorityRuntimeState.generation + 1;
+    ProdigyStatefulServingAuthorityMember added = {};
+    added.containerUUID = launchPlan.uuid;
+    added.machineUUID = machineUUID;
+    added.shardGroup = launchPlan.shardGroup;
+    added.isSource = false;
+    added.advertiseClient = false;
+    if (!prodigyStatefulServingRuntimeDigest(admitted, added.planSHA256)) return StatefulServingLaunchAdmission::rejected;
+    authority.members.push_back(std::move(added));
+    std::sort(authority.members.begin(), authority.members.end(), [](const auto& lhs, const auto& rhs) {
+      if (lhs.shardGroup != rhs.shardGroup) return lhs.shardGroup < rhs.shardGroup;
+      if (lhs.isSource != rhs.isSource) return lhs.isSource < rhs.isSource;
+      return lhs.containerUUID < rhs.containerUUID;
+    });
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    for (const auto& state : statefulServingRuntimeStates)
+      if (state.plan.config.deploymentID() == authority.deploymentID) states.push_back(state);
+    states.push_back(std::move(admitted));
+    if (!prodigyValidateStatefulServingAuthority(authority, states, authority.revision))
+      return StatefulServingLaunchAdmission::rejected;
+    (void)commitStatefulServingDecision(std::move(authority), std::move(states));
+    return StatefulServingLaunchAdmission::pending;
+  }
+
+  bool prepareStatefulClientChange(ApplicationDeployment *deployment, uint32_t shardGroup,
+                                   uint128_t failedUUID) override
+  {
+    if (deployment == nullptr || deployment->plan.stateful.allMasters || !statefulServingPeersCapable() ||
+        !containerRetirementAuthorityAcknowledged() || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return false;
+    auto owner = deployments.find(deployment->plan.config.deploymentID());
+    if (owner == deployments.end() || owner->second != deployment) return false;
+    auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+          return value.deploymentID == owner->first;
+        });
+    if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end()) return false;
+    ContainerView *selected = nullptr;
+    for (const auto& member : current->members)
+    {
+      if (member.shardGroup != shardGroup || member.containerUUID == failedUUID) continue;
+      auto live = containers.find(member.containerUUID);
+      if (live == containers.end() || live->second == nullptr || live->second->state != ContainerState::healthy ||
+          !live->second->runtimeReady || live->second->machine == nullptr || live->second->machine->uuid != member.machineUUID ||
+          !prodigyStatefulTopologyServesClients(live->second->explicitStatefulTopology)) continue;
+      if (selected == nullptr || live->second->uuid < selected->uuid) selected = live->second;
+    }
+    if (selected == nullptr) return false;
+    ProdigyStatefulServingAuthority authority = *current;
+    authority.revision = masterAuthorityRuntimeState.generation + 1;
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    for (const auto& saved : statefulServingRuntimeStates)
+    {
+      if (saved.plan.config.deploymentID() != authority.deploymentID) continue;
+      auto state = saved;
+      if (state.plan.shardGroup == shardGroup)
+      {
+        const uint64_t client = state.plan.statefulMeshRoles.client;
+        if (state.plan.uuid == selected->uuid)
+        {
+          if (!state.plan.advertisements.contains(client))
+            state.plan.advertisements.emplace(client,
+                Advertisement(client, ContainerState::healthy, ContainerState::destroying, selected->getRandomAdvertisementPort()));
+        }
+        else
+        {
+          state.plan.advertisements.erase(client);
+          state.plan.advertisementPairings.map.erase(client);
+        }
+        for (auto& member : authority.members)
+          if (member.containerUUID == state.plan.uuid)
+          {
+            member.advertiseClient = state.plan.uuid == selected->uuid;
+            if (!prodigyStatefulServingRuntimeDigest(state, member.planSHA256)) return false;
+          }
+      }
+      states.push_back(std::move(state));
+    }
+    return commitStatefulServingDecision(std::move(authority), std::move(states));
+  }
+
+  bool restoreStatefulServingDecision(ApplicationDeployment *deployment) override
+  {
+    if (deployment == nullptr) return false;
+    auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& candidate) {
+          return candidate.deploymentID == deployment->plan.config.deploymentID();
+        });
+    if (authority == masterAuthorityRuntimeState.statefulServingAuthorities.end()) return true;
+    if (deployment->statefulWorkerTopologyUpgradePending &&
+        deployment->statefulWorkerTopologyUpgradeOperationID != authority->operationID)
+    {
+      return authority->phase == StatefulWorkerTopologyUpgradePhase::none &&
+             deployment->statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap &&
+             deployment->statefulWorkerTopologyUpgradeSourceEpoch == authority->targetEpoch &&
+             prepareStatefulServingTransition(deployment, StatefulWorkerTopologyUpgradePhase::greenBootstrap);
+    }
+    if (!statefulServingPeersCapable() || !containerRetirementAuthorityAcknowledged()) return false;
+    if (!authority->allMasters && !recoveringPersistedNeuronInventory &&
+        !pendingReplicatedContainerRuntimeStates.contains(authority->deploymentID))
+      for (const auto& member : authority->members)
+      {
+        if (!member.advertiseClient) continue;
+        auto live = containers.find(member.containerUUID);
+        if (live == containers.end() || live->second == nullptr ||
+            live->second->state == ContainerState::destroyed || live->second->state == ContainerState::destroying ||
+            live->second->state == ContainerState::aboutToDestroy)
+          return prepareStatefulClientChange(deployment, member.shardGroup, member.containerUUID);
+      }
+    const bool applied = deployment->applyStatefulServingPlans(*authority, statefulServingRuntimeStates);
+    if (!applied || !statefulServingRecoveryReady()) return false;
+    // The authority package is now durable, peer-acknowledged, and fully
+    // materialized.  Only this point may reconcile desired resources to live
+    // containers; cold restore accounting is rebuilt from indexed ownership.
+    deployment->applyStatefulServingResourceTargets(*authority, statefulServingRuntimeStates);
+    deployment->resumeDurableContainerSpinsAfterServingAuthority();
+    return true;
+  }
+
+  // Neuron inventory reports process/liveness facts. It cannot rewrite the
+  // serving decision retained by the authority package.
+  bool projectStatefulServingPlan(ContainerPlan& plan, uint128_t machineUUID) const
+  {
+    for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities)
+    {
+      auto member = std::find_if(authority.members.begin(), authority.members.end(),
+          [&](const auto& value) { return value.containerUUID == plan.uuid; });
+      if (authority.deploymentID != plan.config.deploymentID())
+      {
+        if (member != authority.members.end()) return false;
+        continue;
+      }
+      if (authority.applicationID != plan.config.applicationID) return false;
+      if (member == authority.members.end() || member->machineUUID != machineUUID || member->shardGroup != plan.shardGroup) return false;
+      if (!masterAuthorityRuntimeStateDurable ||
+          durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+          (weAreMaster && !containerRetirementAuthorityAcknowledged())) return false;
+      auto desired = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+          [&](const auto& value) { return value.plan.uuid == plan.uuid; });
+      if (desired == statefulServingRuntimeStates.end()) return false;
+      plan.config = desired->plan.config;
+      plan.statefulMeshRoles = desired->plan.statefulMeshRoles;
+      plan.statefulTopology = desired->plan.statefulTopology;
+      plan.advertisements = desired->plan.advertisements;
+      plan.subscriptions = desired->plan.subscriptions;
+      for (auto it = plan.advertisementPairings.map.begin(); it != plan.advertisementPairings.map.end();)
+        if (!plan.advertisements.contains(it->first)) it = plan.advertisementPairings.map.erase(it); else ++it;
+      for (auto it = plan.subscriptionPairings.map.begin(); it != plan.subscriptionPairings.map.end();)
+        if (!plan.subscriptions.contains(it->first)) it = plan.subscriptionPairings.map.erase(it); else ++it;
+      return true;
+    }
+    return true;
+  }
+
   bool statefulTopologyRetirementActivationEnabled(void) const override
   {
     return pendingMothershipUpdateArtifact == nullptr && updateSelfState == UpdateSelfState::idle &&
-           statefulTopologyRetirementPeersCapable();
+           statefulServingPeersCapable();
   }
 
   bool containerRetirementPeerCapabilityCurrent(BrainView *peer) const
@@ -7045,7 +7520,8 @@ public:
 
   bool containerRetirementAuthorityAcknowledged() const
   {
-    if (!statefulTopologyRetirementPeersCapable()) return false;
+    if (!statefulTopologyRetirementPeersCapable() ||
+        (!masterAuthorityRuntimeState.statefulServingAuthorities.empty() && !statefulServingPeersCapable())) return false;
     String serialized, digest;
     ClusterTopology topology = {};
     if (!serializeCurrentMasterAuthorityTransition(serialized, digest) ||
@@ -7269,12 +7745,42 @@ public:
     (void)reconcileContainerRetirements();
     Vector<uint64_t> owners;
     for (const auto& [id, deployment] : deployments)
-      if (deployment != nullptr && deployment->statefulWorkerTopologyUpgradePending) owners.push_back(id);
+      if (deployment != nullptr && (deployment->statefulWorkerTopologyUpgradePending || statefulServingDecisionExists(id))) owners.push_back(id);
     for (uint64_t id : owners)
     {
+      if (containerRetirementAuthorityAcknowledged()) applyPendingReplicatedContainerRuntimeStates(id);
       auto owner = deployments.find(id);
-      if (owner != deployments.end() && owner->second != nullptr) owner->second->resumeStatefulTopologyRetirement();
+      if (statefulServingRecoveryReady() && owner != deployments.end() && owner->second != nullptr)
+        owner->second->resumeStatefulTopologyRetirement();
     }
+    // The last delayed authority ACK can materialize the last inventory record
+    // on this heartbeat, with no further Neuron event to wake recovery. Rejoin
+    // the existing inventory/scheduler owner rather than scheduling here.
+    if (recoveringPersistedNeuronInventory && pendingReplicatedContainerRuntimeStates.empty())
+      recoverDeploymentsAfterNeuronState();
+  }
+
+  bool isUnsentStatefulServingReservation(const BrainReplicatedContainerRuntimeState& state) const
+  {
+    const ProdigyStatefulServingAuthority *covered = nullptr;
+    for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities)
+    {
+      // Even a planned admitted UUID must survive the authority-committed,
+      // local-launch-persistence-held interval, including identity conflicts.
+      for (const auto& member : authority.members)
+        if (member.containerUUID == state.plan.uuid) return false;
+      if (authority.deploymentID == state.plan.config.deploymentID()) covered = &authority;
+    }
+    if (covered == nullptr || covered->phase != StatefulWorkerTopologyUpgradePhase::greenBootstrap ||
+        !state.plan.isStateful || state.plan.statefulTopology.operationID != covered->operationID ||
+        state.plan.statefulTopology.topologyEpoch != covered->targetEpoch ||
+        state.plan.statefulTopology.sourceEpoch != covered->sourceEpoch ||
+        state.plan.statefulTopology.targetEpoch != covered->targetEpoch ||
+        state.plan.statefulTopology.servingMode != StatefulTopologyServingMode::catchupOnly) return false;
+    if (state.plan.state == ContainerState::planned) return true;
+    auto owner = deployments.find(covered->deploymentID);
+    return state.plan.state == ContainerState::scheduled && owner != deployments.end() && owner->second != nullptr &&
+           owner->second->hasUnsentStatefulServingLaunch(state.plan.uuid, state.machineUUID);
   }
 
   void capturePersistentMasterAuthorityPackage(ProdigyPersistentMasterAuthorityPackage& package) const
@@ -7289,6 +7795,7 @@ public:
     captureAuthoritativeDeploymentPlans(package.deploymentPlans);
     package.failedDeployments = failedDeployments;
     package.runtimeState = masterAuthorityRuntimeState;
+    package.servingRuntimeStates = statefulServingRuntimeStates;
     package.runtimeState.hasCompletedInitialMasterElection = hasCompletedInitialMasterElection;
     package.runtimeState.nextMintedClientTlsGeneration = (nextMintedClientTlsGeneration == 0) ? 1 : nextMintedClientTlsGeneration;
     package.runtimeState.nextTlsResumptionGeneration = (nextTlsResumptionGeneration == 0) ? 1 : nextTlsResumptionGeneration;
@@ -7308,6 +7815,7 @@ public:
       (void)uuid;
       BrainReplicatedContainerRuntimeState state = {};
       if (captureReplicatedContainerRuntimeState(container, state) &&
+          !isUnsentStatefulServingReservation(state) &&
           prodigyFindContainerRetirementIntentInValidatedJournal(capturedRetirements, state.plan.uuid) == nullptr)
       {
         package.containerRuntimeStates.push_back(std::move(state));
@@ -7326,7 +7834,7 @@ public:
       (void)deploymentID;
       for (const BrainReplicatedContainerRuntimeState& state : pending)
       {
-        if (state.plan.uuid != 0 &&
+        if (state.plan.uuid != 0 && !isUnsentStatefulServingReservation(state) &&
             prodigyFindContainerRetirementIntentInValidatedJournal(capturedRetirements, state.plan.uuid) == nullptr &&
             capturedUUIDs.insert(state.plan.uuid).second)
         {
@@ -7344,6 +7852,8 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (!prodigyValidateStatefulServingAuthorities(restoredRuntimeState.statefulServingAuthorities,
+          package.servingRuntimeStates, restoredRuntimeState.generation)) return false;
     ProdigyMachineRetirementJournal retirementJournal = {};
     if (decodeMachineRetirementJournal(restoredRuntimeState, retirementJournal) == false)
     {
@@ -7382,6 +7892,7 @@ public:
     deploymentPlans = package.deploymentPlans;
     failedDeployments = package.failedDeployments;
     pendingReplicatedContainerRuntimeStates.clear();
+    pendingRestoredContainerInventory.clear();
     for (const BrainReplicatedContainerRuntimeState& state : package.containerRuntimeStates)
     {
       // Retirement intent is authoritative before views are reconstructed: a
@@ -7394,6 +7905,7 @@ public:
       }
       pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
     }
+    statefulServingRuntimeStates = package.servingRuntimeStates;
     masterAuthorityRuntimeState = std::move(restoredRuntimeState);
     if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
     {
@@ -7835,6 +8347,7 @@ public:
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
   {
+    if (!incoming.statefulServingAuthorities.empty()) return false; // Requires the paired transition payload.
     PreparedMasterAuthorityRuntimeState prepared;
     return prepareReplicatedMasterAuthorityRuntimeState(incoming, prepared) &&
            applyPreparedMasterAuthorityRuntimeState(std::move(prepared), persist);
@@ -7844,6 +8357,7 @@ public:
   {
     BrainConfig config;
     PreparedMasterAuthorityRuntimeState runtime;
+    Vector<BrainReplicatedContainerRuntimeState> servingRuntimeStates;
     bool configChanged = false;
   };
 
@@ -7854,7 +8368,11 @@ public:
     const bool incomingHasPendingElasticOperations =
         incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
         incoming.runtimeState.pendingElasticAddressReleases.empty() == false;
-    if (incoming.version != ProdigyMasterAuthorityStateTransition::currentVersion ||
+    if (!incoming.supportedVersion() ||
+        (incoming.version == 1 && (!incoming.runtimeState.statefulServingAuthorities.empty() ||
+                                  !incoming.servingRuntimeStates.empty())) ||
+        !prodigyValidateStatefulServingAuthorities(incoming.runtimeState.statefulServingAuthorities,
+              incoming.servingRuntimeStates, incoming.runtimeState.generation) ||
         validatePendingElasticAddressOperations(incoming.runtimeState, &incoming.brainConfig) == false ||
         elasticAddressSagaFencesRuntimeEnvironment(incoming.brainConfig.runtimeEnvironment) ||
         (brainConfig.clusterUUID != 0 && incomingHasPendingElasticOperations &&
@@ -7888,7 +8406,17 @@ public:
     {
       return false;
     }
+    for (const auto& previous : masterAuthorityRuntimeState.statefulServingAuthorities)
+    {
+      auto next = std::find_if(incoming.runtimeState.statefulServingAuthorities.begin(),
+          incoming.runtimeState.statefulServingAuthorities.end(), [&](const auto& authority) {
+            return authority.deploymentID == previous.deploymentID;
+          });
+      if (next == incoming.runtimeState.statefulServingAuthorities.end() || next->revision < previous.revision ||
+          (next->revision == previous.revision && *next != previous)) return false;
+    }
     if (!prepareReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, prepared.runtime, &ownedIncoming)) return false;
+    prepared.servingRuntimeStates = incoming.servingRuntimeStates;
     prepared.config = std::move(ownedIncoming);
     prepared.configChanged = configChanged;
     return true;
@@ -7910,6 +8438,8 @@ public:
       }
     }
     BrainConfig previousConfig = std::move(brainConfig);
+    auto previousServing = std::move(statefulServingRuntimeStates);
+    statefulServingRuntimeStates = std::move(prepared.servingRuntimeStates);
     brainConfig = std::move(prepared.config);
     if (applyPreparedMasterAuthorityRuntimeState(std::move(prepared.runtime), persist, alreadyDurable))
     {
@@ -7921,6 +8451,7 @@ public:
       return true;
     }
     brainConfig = std::move(previousConfig);
+    statefulServingRuntimeStates = std::move(previousServing);
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     return false;
   }
@@ -8103,6 +8634,8 @@ public:
     ProdigyMasterAuthorityStateTransition candidate;
     candidate.brainConfig = pending->prepared.config;
     candidate.runtimeState = pending->prepared.runtime.runtimeState;
+    candidate.servingRuntimeStates = pending->prepared.servingRuntimeStates;
+    if (!candidate.runtimeState.statefulServingAuthorities.empty()) candidate.version = 2;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
@@ -8178,6 +8711,8 @@ public:
   bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
+            (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
             containerRetirementPeerCapabilityCurrent(peer)) &&
            (!machineRetirementJournalPresent(masterAuthorityRuntimeState) ||
@@ -8602,11 +9137,15 @@ public:
       created = true;
     }
 
-    prodigyCancelWormholeRuntimeAckDeadline(container);
-    detachContainerRuntimeState(container);
-
     bool uploadedRuntimeReady = state.plan.runtimeReady;
     ContainerPlan plan = state.plan;
+    if (!projectStatefulServingPlan(plan, state.machineUUID))
+    {
+      if (created) delete container;
+      return ReplicatedContainerRuntimeStateApplyResult::deferred;
+    }
+    prodigyCancelWormholeRuntimeAckDeadline(container);
+    detachContainerRuntimeState(container);
     plan.runtimeReady = false;
     applyContainerRuntimePlanToView(container, machine, deployment, plan);
     deployment->traceStatefulClientDeclaration("replicated-plan-apply", container);
@@ -8679,11 +9218,18 @@ public:
 
     for (const BrainReplicatedContainerRuntimeState& state : pending)
     {
-      if (applyReplicatedContainerRuntimeStateNow(state) == ReplicatedContainerRuntimeStateApplyResult::deferred)
+      const auto result = applyReplicatedContainerRuntimeStateNow(state);
+      if (result == ReplicatedContainerRuntimeStateApplyResult::deferred)
       {
         pendingReplicatedContainerRuntimeStates[state.plan.config.deploymentID()].push_back(state);
       }
+      else if (result == ReplicatedContainerRuntimeStateApplyResult::applied &&
+               weAreMaster && recoveringPersistedNeuronInventory)
+      {
+        pendingRestoredContainerInventory.insert(state.plan.uuid);
+      }
     }
+    (void)replayRestoredContainerInventory();
   }
 
   void applyReplicatedContainerRuntimeState(const BrainReplicatedContainerRuntimeState& state)
@@ -13283,6 +13829,11 @@ public:
       return false;
     }
 
+    if (!pendingReplicatedContainerRuntimeStates.empty() || !replayRestoredContainerInventory())
+    {
+      return false;
+    }
+
     bool haveMachineInventory = false;
     for (Machine *machine : machines)
     {
@@ -16478,6 +17029,46 @@ public:
     return seen.size() == canonical.size();
   }
 
+  bool replayRestoredContainerInventory()
+  {
+    if (!weAreMaster || !recoveringPersistedNeuronInventory) return pendingRestoredContainerInventory.empty();
+    // Never emit a partial bootstrap while another deployment or machine is
+    // still awaiting materialization. Retain exact UUIDs across split batches.
+    if (!pendingReplicatedContainerRuntimeStates.empty()) return false;
+    Vector<uint128_t> observed;
+    bytell_hash_set<Machine *> replay;
+    for (uint128_t uuid : pendingRestoredContainerInventory)
+    {
+      auto current = containers.find(uuid);
+      if (current == containers.end() || current->second == nullptr ||
+          containerRuntimeStateRetired(masterAuthorityRuntimeState, uuid))
+      {
+        observed.push_back(uuid);
+        continue;
+      }
+      Machine *machine = current->second->machine;
+      if (machine == nullptr || !machine->runtimeReady || !neuronControlStreamActive(machine) ||
+          !persistedMachineInventoryUploaded.contains(machine->uuid)) continue;
+      auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+      if (inventory == containerRetirementInventoryByMachine.end() ||
+          inventory->second.authorityEpoch != masterAuthorityEpoch ||
+          inventory->second.ioGeneration != machine->neuron.ioGeneration) continue;
+      if (inventory->second.present.contains(uuid)) observed.push_back(uuid);
+      else replay.insert(machine);
+    }
+    for (uint128_t uuid : observed) pendingRestoredContainerInventory.erase(uuid);
+    for (Machine *machine : replay)
+    {
+      traceContainerRetirement("restored inventory replay private4=%u pending=%zu\n",
+          unsigned(machine->private4), size_t(pendingRestoredContainerInventory.size()));
+      // The ordinary replay owner invalidates the receipt immediately. It
+      // adopts these same UUIDs and later reports actual runtime health.
+      queueNeuronStateUploadForMachine(machine);
+      refreshNeuronControlHandshakeWatchdog(&machine->neuron, "restored-inventory-replay");
+    }
+    return pendingRestoredContainerInventory.empty();
+  }
+
   void queueNeuronStateUploadForMachine(Machine *machine)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0 || machine->fragment == 0)
@@ -17135,7 +17726,15 @@ public:
         continue;
       }
 
-      const ApplicationConfig& indexedConfig = deploymentIt->second->plan.config;
+      const ProdigyStatefulServingAuthority *steadyAuthority = nullptr;
+      for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities)
+        if (authority.deploymentID == deploymentID && authority.phase == StatefulWorkerTopologyUpgradePhase::none)
+        {
+          // A staged steady-resource revision is also its capacity reservation.
+          // Persistence failure retains it under the existing authority retry.
+          steadyAuthority = &authority;
+          break;
+        }
       for (ContainerView *container : indexedContainers)
       {
         if (container == nullptr || container->state == ContainerState::destroyed)
@@ -17143,7 +17742,22 @@ public:
           continue;
         }
 
-        prodigyDebitMachineScalarResources(machine, indexedConfig, 1);
+        ApplicationConfig reserved = deploymentIt->second->plan.config;
+        if (steadyAuthority != nullptr && std::any_of(steadyAuthority->members.begin(), steadyAuthority->members.end(),
+            [&](const auto& member) { return member.containerUUID == container->uuid && member.machineUUID == machine->uuid; }))
+        {
+          reserved = steadyAuthority->targetConfig;
+          // Reserve an upscale before its durable ACK, and retain a downscale's
+          // old allocation until a fresh Neuron inventory confirms its release.
+          // Sending the adjustment is not evidence that the runtime applied it.
+          if (reserved.cpuMode == ApplicationCPUMode::isolated)
+            reserved.nLogicalCores = std::max(reserved.nLogicalCores, uint32_t(container->runtime_nLogicalCores));
+          reserved.memoryMB = std::max(reserved.memoryMB, container->runtime_memoryMB);
+          const uint32_t observedStorage = container->runtime_storageMB > reserved.filesystemMB
+              ? container->runtime_storageMB - reserved.filesystemMB : 0;
+          reserved.storageMB = std::max(reserved.storageMB, observedStorage);
+        }
+        prodigyDebitMachineScalarResources(machine, reserved, 1);
         prodigyConsumeAssignedGPUsFromMachineAvailability(machine, container->assignedGPUMemoryMBs, container->assignedGPUDevices);
       }
     }
@@ -21872,6 +22486,7 @@ public:
       persistedMachineInventoryEnumerated = false;
       persistedMachineInventoryUploaded.clear();
       persistedMachineStateUploadPlansByMachine.clear();
+      pendingRestoredContainerInventory.clear();
       recoveredNeuronPairingsUnified = false;
     }
 
@@ -30259,7 +30874,7 @@ public:
           bv->containerRetirementCapabilityIOGeneration = 0;
           if (bv->version >= ProdigyBrainUpgradeCapabilityProtocolMinimumVersion)
           {
-            Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, uint64_t(3));
+            Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, uint64_t(7));
             Ring::queueSend(bv);
           }
           if (bv->machine != nullptr)
@@ -30883,7 +31498,7 @@ public:
               bv->version < ProdigyBrainUpgradeCapabilityProtocolMinimumVersion) break;
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
-          Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & uint64_t(3));
+          Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & uint64_t(7));
           Ring::queueSend(bv);
           break;
         }
@@ -30900,6 +31515,7 @@ public:
               bv->tlsPeerUUID == bv->uuid && bv->uuid != 0 && bv->boottimens != 0)
           {
             bv->containerRetirementCapabilityAcknowledged = true;
+            bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -30928,7 +31544,7 @@ public:
 
           ProdigyMasterAuthorityStateTransition incoming = {};
           if (BitseryEngine::deserializeSafe(serialized, incoming) &&
-              incoming.version == ProdigyMasterAuthorityStateTransition::currentVersion &&
+              incoming.supportedVersion() &&
               validatePendingElasticAddressOperations(incoming.runtimeState,
                                                       &incoming.brainConfig))
           {
@@ -39238,8 +39854,19 @@ public:
             {
               continue;
             }
+            // Keep the Neuron's allocation observation independent of the
+            // durable desired configuration. A lost resource delta must remain
+            // visible so the authority owner can retry it after this upload.
+            const uint16_t observedCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
+            const uint32_t observedMemoryMB = plan.config.totalMemoryMB();
+            const uint32_t observedStorageMB = plan.config.totalStorageMB();
+            if (!projectStatefulServingPlan(plan, neuron->machine->uuid))
+            {
+              malformedStateUpload = true;
+              break;
+            }
             String acceptedPlan = {};
-            acceptedPlan.assign(buffer);
+            BitseryEngine::serialize(acceptedPlan, plan);
             acceptedStateUploadPlans.push_back(std::move(acceptedPlan));
             ContainerView *container = nullptr;
             if (auto existing = containers.find(plan.uuid); existing != containers.end())
@@ -39310,11 +39937,11 @@ public:
             container->machine = neuron->machine;
             container->createdAtMs = plan.createdAtMs;
             container->taskAttemptNumber = plan.taskAttemptNumber;
-            // Neuron state upload currently transmits the serialized container plan.
-            // Seed runtime usage from plan resources; live stats update these later.
-            container->runtime_nLogicalCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
-            container->runtime_memoryMB = plan.config.totalMemoryMB();
-            container->runtime_storageMB = plan.config.totalStorageMB();
+            // The projected plan governs desired service/configuration; these
+            // fields retain the actual allocation reported by this Neuron.
+            container->runtime_nLogicalCores = observedCores;
+            container->runtime_memoryMB = observedMemoryMB;
+            container->runtime_storageMB = observedStorageMB;
             container->addresses = plan.addresses; // directly assigned interface addresses; currently just container-network IPv6
             container->wormholes = plan.wormholes;
             container->whiteholes = plan.whiteholes;
@@ -39573,6 +40200,17 @@ public:
           }
           promoteMachineToHealthyIfReady(neuron->machine);
           refreshNeuronControlHandshakeWatchdog(neuron, "state-upload");
+          // A resource observation can be older/larger than the sealed desired
+          // plan. Reserve it before claims resume, even while the ordinary
+          // routing resync still owns the container-ready barrier.
+          if (std::any_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+              masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& authority) {
+                return authority.phase == StatefulWorkerTopologyUpgradePhase::none &&
+                    std::any_of(authority.members.begin(), authority.members.end(), [&](const auto& member) {
+                      return member.machineUUID == neuron->machine->uuid;
+                    });
+              }))
+            (void)refreshStatefulServingMachineCapacity({neuron->machine});
           resumeMachineClaimsIfSchedulingReady(neuron->machine);
           sendNeuronSwitchboardStateSync(neuron->machine);
           recoverDeploymentsAfterNeuronState();
@@ -39703,6 +40341,42 @@ public:
             }
             break;
           }
+          break;
+        }
+      case NeuronTopic::adjustContainerResources:
+        {
+          // Optional versioned reply on the existing resource operation. It
+          // reports actual allocation without a full inventory/routing reset.
+          if (!weAreMaster || neuron == nullptr || neuron->machine == nullptr ||
+              &neuron->machine->neuron != neuron || !machines.contains(neuron->machine) ||
+              !statefulServingResourceObservationSupported(neuron->machine) ||
+              !containerRetirementAuthorityAcknowledged()) break;
+          uint8_t applied = 0;
+          uint128_t uuid = 0;
+          uint16_t cores = 0;
+          uint32_t memoryMB = 0, storageMB = 0;
+          if (!ProdigyIngressValidation::extractContainerResourceObservation(
+              args, terminal, uuid, cores, memoryMB, storageMB, applied)) break;
+          auto live = containers.find(uuid);
+          if (live == containers.end() || live->second == nullptr || live->second->machine != neuron->machine) break;
+          ContainerView *container = live->second;
+          auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+              masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+                return value.deploymentID == container->deploymentID && value.phase == StatefulWorkerTopologyUpgradePhase::none;
+              });
+          if (authority == masterAuthorityRuntimeState.statefulServingAuthorities.end() ||
+              !std::any_of(authority->members.begin(), authority->members.end(), [&](const auto& member) {
+                return member.containerUUID == uuid && member.machineUUID == neuron->machine->uuid;
+              }) || storageMB > UINT32_MAX - authority->targetConfig.filesystemMB) break;
+          // An old successful reply cannot complete a newer desired revision.
+          if (applied && (cores != applicationSharedCPUCoreHint(authority->targetConfig) ||
+              memoryMB != authority->targetConfig.memoryMB || storageMB != authority->targetConfig.storageMB)) break;
+          container->runtime_nLogicalCores = cores;
+          container->runtime_memoryMB = memoryMB;
+          container->runtime_storageMB = storageMB + authority->targetConfig.filesystemMB;
+          (void)refreshStatefulServingMachineCapacity({neuron->machine});
+          // No immediate resend from a failure reply. The existing heartbeat
+          // restore retries a still-unobserved target, without a second journal.
           break;
         }
       case NeuronTopic::containerStatistics:
