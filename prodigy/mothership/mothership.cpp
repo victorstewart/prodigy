@@ -56,6 +56,7 @@
 #include <prodigy/mothership/mothership.gcp.host.operations.h>
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
+#include <prodigy/mothership/mothership.additional.ingress.retire.h>
 #include <prodigy/types.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
@@ -7487,6 +7488,36 @@ private:
     String payload = {}; BitseryEngine::serialize(payload, inventory);
     String encoded = {}; Base64::encode(payload.data(), payload.size(), encoded);
     basics_log("offlineDNSCleanupInventory success=1 payload=%s\n", encoded.c_str());
+  }
+
+  // This is intentionally a local, explicitly witnessed repair command.  The
+  // caller's guarded SSH transport selects the registered machine; the command
+  // itself cannot select a host or discover an attachment to remove.
+  void runRetireAdditionalIngressLocal(int argc, char *argv[])
+  {
+    if (argc != 8)
+    {
+      basics_log("retireAdditionalIngressLocal requires bootID interface ifindex programID tag mapCount localSubnetMapID subnet\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipAdditionalIngressRetirement request = {};
+    request.bootID.assign(argv[0]); request.interfaceName.assign(argv[1]);
+    uint64_t value = 0;
+    const bool valid = mothershipParseUnsignedArgument(argv[2], UINT32_MAX, value) && (request.ifindex = uint32_t(value)) != 0 &&
+        mothershipParseUnsignedArgument(argv[3], UINT32_MAX, value) && (request.programID = uint32_t(value)) != 0 &&
+        mothershipAdditionalIngressRetirementHex(argv[4], request.tag, sizeof(request.tag)) &&
+        mothershipParseUnsignedArgument(argv[5], UINT32_MAX, value) && (request.mapCount = uint32_t(value)) != 0 &&
+        mothershipParseUnsignedArgument(argv[6], UINT32_MAX, value) && (request.localSubnetMapID = uint32_t(value)) != 0 &&
+        mothershipAdditionalIngressRetirementHex(argv[7], request.subnet, sizeof(request.subnet));
+    String failure = {};
+    if (!valid || !mothershipRetireAdditionalIngressLocal(request, &failure))
+    {
+      basics_log("retireAdditionalIngressLocal success=0 failure=%s\n", failure.size() ? failure.c_str() : "invalid arguments");
+      exit(EXIT_FAILURE);
+    }
+    basics_log("retireAdditionalIngressLocal success=1 bootID=%s interface=%s ifindex=%u programID=%u tag=%s mapCount=%u localSubnetMapID=%u subnet=%s\n",
+               request.bootID.c_str(), request.interfaceName.c_str(), request.ifindex, request.programID,
+               argv[4], request.mapCount, request.localSubnetMapID, argv[7]);
   }
 
   bool stopAndWipeLocalProdigyInstance(const MothershipProdigyCluster& cluster, String& failure)
@@ -19199,6 +19230,7 @@ public:
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
@@ -19313,6 +19345,8 @@ int main(int argc, char *argv[])
     message.append("\tremote clusters only; removes one machine schema budget row by schema and reconciles any excess created machines away\n");
     message.append("removeCluster [name|clusterUUID]\n");
     message.append("\tremoves one managed Prodigy cluster record\n");
+    message.append("retireAdditionalIngressLocal [bootID] [interface] [ifindex] [programID] [tagHex] [mapCount] [localSubnetMapID] [subnetHex]\n");
+    message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");

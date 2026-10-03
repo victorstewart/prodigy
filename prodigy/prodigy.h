@@ -169,6 +169,10 @@ private:
 
   void beginShutdown(void)
   {
+    if (neuron != nullptr)
+    {
+      neuron->detachAdditionalIngressForShutdown();
+    }
     Guardian::signalHandler(SIGINT, NULL, NULL);
   }
 

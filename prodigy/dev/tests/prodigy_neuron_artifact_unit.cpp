@@ -100,6 +100,11 @@ public:
     board.additionalIngressEth = ingress;
   }
 
+  static bool hasAdditionalIngress(const Switchboard& board)
+  {
+    return board.additionalIngressEth != nullptr;
+  }
+
   static bool retainedAdditionalIngressWitnessMatches(uint32_t witnessedProgramID,
                                                       uint32_t candidateProgramID,
                                                       uint32_t candidateMapCount,
@@ -477,6 +482,13 @@ int main()
     lazySwitchboard->resetState();
     suite.expect(lazySwitchboard->boundaryRouterProgram() == nullptr,
                  "switchboard_reset_releases_router_without_remaining_consumers");
+    SwitchboardRingTestAccess::setBoundaryConsumer(*lazySwitchboard, &retainedRouter, &selectedIngress);
+    lazySwitchboardNeuron.detachAdditionalIngressForShutdown();
+    suite.expect(SwitchboardRingTestAccess::hasAdditionalIngress(*lazySwitchboard) == false,
+                 "neuron_shutdown_detaches_additional_ingress_before_guardian_exit");
+    lazySwitchboardNeuron.detachAdditionalIngressForShutdown();
+    suite.expect(SwitchboardRingTestAccess::hasAdditionalIngress(*lazySwitchboard) == false,
+                 "neuron_shutdown_additional_ingress_detach_is_idempotent");
   }
   String fixture = {};
   const bool hasArtifactFixture = loadFixture(fixture);
