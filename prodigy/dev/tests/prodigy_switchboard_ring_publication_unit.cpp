@@ -166,6 +166,12 @@ struct FakeBPFKernel {
   uint32_t routingOperations = 0;
   uint32_t routingUpdates = 0;
   uint32_t routingDeletes = 0;
+  // Slow-map diagnostics record the actual duration of only the fake routing
+  // calls that deliberately sleep.  Map-info and lookup accounting remains
+  // separate because those hooks are not delayed by this workload.
+  uint64_t delayedRoutingCalls = 0;
+  uint64_t delayedRoutingTotalUs = 0;
+  uint64_t delayedRoutingMaximumUs = 0;
   std::unordered_map<int, uint32_t> routingLookups = {};
   bool failRouting = false;
   bool failRoutingLookup = false;
@@ -223,6 +229,7 @@ struct FakeBPFKernel {
     routingDelayUs = 0;
     routingOperations = 0;
     routingUpdates = routingDeletes = 0;
+    delayedRoutingCalls = delayedRoutingTotalUs = delayedRoutingMaximumUs = 0;
     routingLookups.clear();
     failRouting = false;
     failRoutingLookup = false;
@@ -293,6 +300,37 @@ struct FakeBPFKernel {
     std::lock_guard lock(mutex);
     routingOperations = routingUpdates = routingDeletes = 0;
     routingLookups.clear();
+    delayedRoutingCalls = delayedRoutingTotalUs = delayedRoutingMaximumUs = 0;
+  }
+
+  struct DelayedRoutingSnapshot {
+    uint64_t calls = 0;
+    uint64_t totalUs = 0;
+    uint64_t maximumUs = 0;
+  };
+
+  void delayRoutingCall(void)
+  {
+    uint64_t delayUs = 0;
+    {
+      std::lock_guard lock(mutex);
+      delayUs = routingDelayUs;
+    }
+    if (delayUs == 0) return;
+    const auto started = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+    const uint64_t elapsedUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count());
+    std::lock_guard lock(mutex);
+    ++delayedRoutingCalls;
+    delayedRoutingTotalUs += elapsedUs;
+    delayedRoutingMaximumUs = std::max(delayedRoutingMaximumUs, elapsedUs);
+  }
+
+  DelayedRoutingSnapshot delayedRoutingSnapshot(void)
+  {
+    std::lock_guard lock(mutex);
+    return {delayedRoutingCalls, delayedRoutingTotalUs, delayedRoutingMaximumUs};
   }
 
   template <typename Key, typename Value>
@@ -587,7 +625,7 @@ extern "C" int __wrap_bpf_map_update_elem(int fd, const void *key, const void *v
 
   if (isRoutingMapFD(fd))
   {
-    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
+    fakeKernel.delayRoutingCall();
     std::lock_guard lock(fakeKernel.mutex);
     fakeKernel.routingOperations += 1;
     fakeKernel.routingUpdates += 1;
@@ -761,7 +799,7 @@ extern "C" int __wrap_bpf_map_get_next_key(int fd, const void *key, void *next)
 {
   if (isRoutingMapFD(fd))
   {
-    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
+    fakeKernel.delayRoutingCall();
     std::lock_guard lock(fakeKernel.mutex);
     fakeKernel.routingOperations += 1;
     fakeKernel.noteRoutingOperation();
@@ -780,7 +818,7 @@ extern "C" int __wrap_bpf_map_delete_elem(int fd, const void *key)
 {
   if (isRoutingMapFD(fd))
   {
-    if (fakeKernel.routingDelayUs) std::this_thread::sleep_for(std::chrono::microseconds(fakeKernel.routingDelayUs));
+    fakeKernel.delayRoutingCall();
     std::lock_guard lock(fakeKernel.mutex);
     fakeKernel.routingOperations += 1;
     fakeKernel.routingDeletes += 1;
@@ -1612,6 +1650,15 @@ static void runNonQuicRoutingSlowMapDeadline(TestSuite& suite)
   bool everyReceiptObservedAppliedState = true;
   bool everyWorkloadDeferredItsReceipt = true;
   bool everyWorkloadRespectedOperationBudget = true;
+  uint64_t delayedRoutingCalls = 0;
+  uint64_t delayedRoutingTotalUs = 0;
+  uint64_t delayedRoutingMaximumUs = 0;
+  uint64_t controlIntervalsWithDelayedRouting = 0;
+  uint64_t slowControlIntervals = 0;
+  uint64_t slowControlIntervalsWithOneDelayedRoutingCall = 0;
+  uint64_t slowControlIntervalsWithMultipleDelayedRoutingCalls = 0;
+  uint64_t slowControlIntervalsWithoutDelayedRoutingCalls = 0;
+  uint64_t maximumDelayedRoutingCallsPerControlInterval = 0;
 
   for (uint32_t workload = 0; workload < workloadCount; ++workload)
   {
@@ -1653,8 +1700,32 @@ static void runNonQuicRoutingSlowMapDeadline(TestSuite& suite)
                  "switchboard_nonquic_slow_map_does_not_ack_before_applied_reconciliation");
 
     std::vector<uint64_t> workloadControlIntervals = {};
-    const bool settled = ring.runUntilWithControl([&] { return receipt; }, workloadControlIntervals, 1'500);
+    FakeBPFKernel::DelayedRoutingSnapshot previousDelayedRouting = fakeKernel.delayedRoutingSnapshot();
+    const bool settled = ring.runUntilWithControl([&] { return receipt; }, workloadControlIntervals, 1'500, [&] {
+      const FakeBPFKernel::DelayedRoutingSnapshot currentDelayedRouting = fakeKernel.delayedRoutingSnapshot();
+      // The first control dispatch establishes the interval origin.  Later
+      // dispatches have the matching elapsed sample appended by TestRing.
+      if (!workloadControlIntervals.empty())
+      {
+        const uint64_t delayedCalls = currentDelayedRouting.calls - previousDelayedRouting.calls;
+        maximumDelayedRoutingCallsPerControlInterval =
+            std::max(maximumDelayedRoutingCallsPerControlInterval, delayedCalls);
+        if (delayedCalls != 0) ++controlIntervalsWithDelayedRouting;
+        if (workloadControlIntervals.back() >= 3'000)
+        {
+          ++slowControlIntervals;
+          if (delayedCalls == 0) ++slowControlIntervalsWithoutDelayedRoutingCalls;
+          else if (delayedCalls == 1) ++slowControlIntervalsWithOneDelayedRoutingCall;
+          else ++slowControlIntervalsWithMultipleDelayedRoutingCalls;
+        }
+      }
+      previousDelayedRouting = currentDelayedRouting;
+    });
     controlIntervals.insert(controlIntervals.end(), workloadControlIntervals.begin(), workloadControlIntervals.end());
+    const FakeBPFKernel::DelayedRoutingSnapshot measuredDelayedRouting = fakeKernel.delayedRoutingSnapshot();
+    delayedRoutingCalls += measuredDelayedRouting.calls;
+    delayedRoutingTotalUs += measuredDelayedRouting.totalUs;
+    delayedRoutingMaximumUs = std::max(delayedRoutingMaximumUs, measuredDelayedRouting.maximumUs);
     const bool currentReceipt = settled && receiptValue;
     bool appliedCurrentState = currentReceipt;
     for (const auto& [definition, meta] : expectedPortals)
@@ -1701,6 +1772,19 @@ static void runNonQuicRoutingSlowMapDeadline(TestSuite& suite)
           !everyReceiptObservedAppliedState || !everyWorkloadDeferredItsReceipt ||
           !everyWorkloadRespectedOperationBudget || completedWorkloads != workloadCount ||
           !timingAndSamplingPassed));
+  dprintf(STDERR_FILENO,
+          "NONQUIC_SLOW_MAP_DELAYED_CALLS=%llu DELAY_TOTAL_US=%llu DELAY_MAX_US=%llu "
+          "CONTROL_WITH_DELAYED_CALLS=%llu CONTROL_MAX_DELAYED_CALLS=%llu "
+          "SLOW_INTERVALS=%llu SLOW_ZERO=%llu SLOW_ONE=%llu SLOW_MULTIPLE=%llu\n",
+          static_cast<unsigned long long>(delayedRoutingCalls),
+          static_cast<unsigned long long>(delayedRoutingTotalUs),
+          static_cast<unsigned long long>(delayedRoutingMaximumUs),
+          static_cast<unsigned long long>(controlIntervalsWithDelayedRouting),
+          static_cast<unsigned long long>(maximumDelayedRoutingCallsPerControlInterval),
+          static_cast<unsigned long long>(slowControlIntervals),
+          static_cast<unsigned long long>(slowControlIntervalsWithoutDelayedRoutingCalls),
+          static_cast<unsigned long long>(slowControlIntervalsWithOneDelayedRoutingCall),
+          static_cast<unsigned long long>(slowControlIntervalsWithMultipleDelayedRoutingCalls));
   printSamples("NONQUIC_SLOW_MAP_CONTROL_RAW_US=", controlIntervals);
 }
 

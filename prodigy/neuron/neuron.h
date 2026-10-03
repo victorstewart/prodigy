@@ -50,6 +50,7 @@
 #include <switchboard/overlay.route.h>
 #include <switchboard/switchboard.h>
 #include <switchboard/whitehole.route.h>
+#include <switchboard/host.tcx.retention.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/wire.h>
 
@@ -2637,14 +2638,28 @@ protected:
     String hostEgressPath = {};
     String hostRouterFailure = {};
     bool hostRouterBPFEnabled = resolveOptionalHostRouterBPFPaths(hostIngressPath, hostEgressPath, &hostRouterFailure);
+    SwitchboardHostTCXRetentionPair retainedHostTCX = {};
+    bool retainedHostTCXPresent = false;
     if (hostRouterFailure.size() > 0)
     {
       basics_log("setupNetworking invalid host router bpf configuration reason=%s ifidx=%d\n",
                  hostRouterFailure.c_str(),
                  eth.ifidx);
+      std::fprintf(stderr, "setupNetworking invalid host router bpf configuration reason=%s ifidx=%d\n",
+                   hostRouterFailure.c_str(), eth.ifidx);
     }
     else if (hostRouterBPFEnabled)
     {
+      if (switchboardHostTCXReadRetainedPair(eth, "/sys/fs/bpf"_ctv, retainedHostTCX, retainedHostTCXPresent) == false ||
+          (retainedHostTCXPresent && switchboardHostTCXVerifyRetainedPair(eth, "/sys/fs/bpf"_ctv, retainedHostTCX) == false))
+      {
+        std::fprintf(stderr, "setupNetworking rejected invalid retained host TCX pins ifidx=%d\n", eth.ifidx);
+        if (failureReport) failureReport->assign("invalid retained host TCX pins"_ctv);
+        return;
+      }
+      if (retainedHostTCXPresent)
+        basics_log("setupNetworking retained TCX admitted ifidx=%d ingressLink=%u egressLink=%u\n",
+                     eth.ifidx, retainedHostTCX.ingress.linkID, retainedHostTCX.egress.linkID);
       bool reuseWormholeFlowMaps = switchboardPinnedWormholeFlowMapsCompatible(eth.ifidx);
       tcx_egress_program = eth.loadPreattachedProgram(BPF_TCX_EGRESS, hostEgressPath);
       if (tcx_egress_program)
@@ -2655,6 +2670,12 @@ protected:
         {
           basics_log("setupNetworking detaching stale host egress without authoritative wormhole flow maps path=%s ifidx=%d\n",
                      hostEgressPath.c_str(), eth.ifidx);
+          if (retainedHostTCXPresent)
+          {
+            std::fprintf(stderr, "setupNetworking retained host egress TCX link is stale ifidx=%d errno=%d\n", eth.ifidx, errno);
+            if (failureReport) failureReport->assign("retained host egress TCX link is stale"_ctv);
+            return;
+          }
           eth.detachBPF(BPF_TCX_EGRESS);
           tcx_egress_program = nullptr;
         }
@@ -2662,6 +2683,13 @@ protected:
 
       if (tcx_egress_program == nullptr)
       {
+        if (retainedHostTCXPresent)
+        {
+          std::fprintf(stderr, "setupNetworking retained host egress TCX link could not be adopted ifidx=%d errno=%d\n",
+                       eth.ifidx, errno);
+          if (failureReport) failureReport->assign("retained host egress TCX link could not be adopted"_ctv);
+          return;
+        }
         bool mapsReused = reuseWormholeFlowMaps == false;
         tcx_egress_program = eth.attachBPF(BPF_TCX_EGRESS, hostEgressPath, "host_egress"_ctv,
                                            [&](struct bpf_object *obj, Vector<int>& inner_map_fds) -> void {
@@ -2725,6 +2753,8 @@ protected:
       {
         basics_log("setupNetworking skipping host ingress attach because shared flow map pinning failed ifidx=%d\n",
                    eth.ifidx);
+        std::fprintf(stderr, "setupNetworking shared flow map pinning failed ifidx=%d whiteholeReply=%d wormhole=%d\n",
+                     eth.ifidx, int(whiteholeReplyFlowPinned), int(wormholeFlowPinned));
       }
       else
       {
@@ -2740,6 +2770,12 @@ protected:
           {
             basics_log("setupNetworking detaching stale host ingress with incompatible maps path=%s ifidx=%d\n",
                        hostIngressPath.c_str(), eth.ifidx);
+            if (retainedHostTCXPresent)
+            {
+              std::fprintf(stderr, "setupNetworking retained host ingress TCX link is stale ifidx=%d errno=%d\n", eth.ifidx, errno);
+              if (failureReport) failureReport->assign("retained host ingress TCX link is stale"_ctv);
+              return;
+            }
             eth.detachBPF(BPF_TCX_INGRESS);
             tcx_ingress_program = nullptr;
           }
@@ -2757,6 +2793,12 @@ protected:
         }
         else
         {
+          if (retainedHostTCXPresent)
+          {
+            std::fprintf(stderr, "setupNetworking retained host ingress TCX link could not be adopted ifidx=%d errno=%d\n", eth.ifidx, errno);
+            if (failureReport) failureReport->assign("retained host ingress TCX link could not be adopted"_ctv);
+            return;
+          }
           eth.addIP(containerSubnet6);
 
           // load and setup tcx ingress program
@@ -2771,6 +2813,12 @@ protected:
           {
             basics_log("setupNetworking detaching host ingress without shared wormhole flow map path=%s ifidx=%d\n",
                        hostIngressPath.c_str(), eth.ifidx);
+            if (retainedHostTCXPresent)
+            {
+              std::fprintf(stderr, "setupNetworking retained host ingress TCX link is stale ifidx=%d errno=%d\n", eth.ifidx, errno);
+              if (failureReport) failureReport->assign("retained host ingress TCX link is stale"_ctv);
+              return;
+            }
             eth.detachBPF(BPF_TCX_INGRESS);
             tcx_ingress_program = nullptr;
           }
@@ -2814,6 +2862,19 @@ protected:
       ensureWormholeFlowGCTickQueued();
     }
 
+    // Only adopt a retention operation already established by the lifecycle
+    // owner. Ordinary runtime startup must not create persistent link pins.
+    if (retainedHostTCXPresent &&
+        switchboardHostTCXVerifyRetainedPair(eth, "/sys/fs/bpf"_ctv, retainedHostTCX) == false)
+    {
+      std::fprintf(stderr, "setupNetworking retained host TCX identity changed ifidx=%d\n", eth.ifidx);
+      if (failureReport) failureReport->assign("retained host TCX identity changed"_ctv);
+      return;
+    }
+
+    if (retainedHostTCXPresent)
+      basics_log("setupNetworking retained TCX adopted ifidx=%d ingress=%d egress=%d\n",
+                   eth.ifidx, int(tcx_ingress_program != nullptr), int(tcx_egress_program != nullptr));
     iaas->setLocalContainerPrefixes(localPrefixes);
     ensureBGP()->setMachinePrefixes(localPrefixes);
 
@@ -2848,6 +2909,8 @@ protected:
     String device = {};
     if (resolveOptionalAdditionalIngressDevice(device, failureReport) == false)
     {
+      std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=%s primaryIfidx=%d\n",
+                   failureReport ? failureReport->c_str() : "additional ingress configuration invalid", eth.ifidx);
       return false;
     }
     if (device.size() == 0)
@@ -2859,6 +2922,8 @@ protected:
     if (tcx_ingress_program == nullptr)
     {
       if (failureReport) failureReport->assign("additional ingress requires host ingress router"_ctv);
+      std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=missing-host-ingress-router primaryIfidx=%d device=%s\n",
+                   eth.ifidx, device.c_str());
       return false;
     }
     if (!additionalIngressEth) additionalIngressEth = std::make_unique<EthDevice>();
@@ -2866,6 +2931,8 @@ protected:
     if (additionalIngressEth->ifidx == 0 || additionalIngressEth->ifidx == eth.ifidx)
     {
       if (failureReport) failureReport->assign("additional ingress is not a distinct veth"_ctv);
+      std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=not-distinct-veth primaryIfidx=%d additionalIfidx=%d device=%s\n",
+                   eth.ifidx, additionalIngressEth->ifidx, device.c_str());
       return false;
     }
     String iflinkPath = {};
@@ -2881,9 +2948,18 @@ protected:
     if (peerIfidx == 0 || end == iflink || peerIfidx == additionalIngressEth->ifidx)
     {
       if (failureReport) failureReport->assign("additional ingress does not prove a veth peer"_ctv);
+      std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=unproven-veth-peer primaryIfidx=%d additionalIfidx=%d peerIfidx=%lu device=%s\n",
+                   eth.ifidx, additionalIngressEth->ifidx, peerIfidx, device.c_str());
       return false;
     }
-    return ensureSwitchboard()->configureAdditionalIngress(*additionalIngressEth, tcx_ingress_program, failureReport);
+    const bool configured = ensureSwitchboard()->configureAdditionalIngress(*additionalIngressEth, tcx_ingress_program, failureReport);
+    if (configured == false)
+    {
+      std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=%s primaryIfidx=%d additionalIfidx=%d peerIfidx=%lu device=%s\n",
+                   failureReport ? failureReport->c_str() : "switchboard additional ingress rejected",
+                   eth.ifidx, additionalIngressEth->ifidx, peerIfidx, device.c_str());
+    }
+    return configured;
   }
 
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) override
@@ -5342,7 +5418,8 @@ public:
         }
       case NeuronTopic::adjustContainerResources:
         {
-          // containerUUID(16) nLogicalCores(2) memoryMB(4) storageMB(4) [isDownscale(1)] [graceSeconds(4)]
+          if (!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, args, terminal)) break;
+          // containerUUID(16) nLogicalCores(2) memoryMB(4) storageMB(4) [isDownscale(1)] [graceSeconds(4)] [observationVersion(1)]
 
           uint128_t containerUUID = 0;
           uint16_t targetCores = 0;
@@ -5350,6 +5427,7 @@ public:
           uint32_t targetStorageMB = 0;
           bool isDownscale = false;
           uint32_t graceSeconds = 0;
+          uint8_t observationVersion = 0;
 
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
           Message::extractArg<ArgumentNature::fixed>(args, targetCores);
@@ -5365,12 +5443,15 @@ public:
           {
             Message::extractArg<ArgumentNature::fixed>(args, graceSeconds);
           }
+          if (args < terminal) Message::extractArg<ArgumentNature::fixed>(args, observationVersion);
+          if (args != terminal || observationVersion > 1) break;
 
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
             String failureReport;
-            if (ContainerManager::adjustRunningContainerResources(container, targetCores, targetMemoryMB, targetStorageMB, &failureReport))
+            const bool applied = ContainerManager::adjustRunningContainerResources(container, targetCores, targetMemoryMB, targetStorageMB, &failureReport);
+            if (applied)
             {
               String payload;
               if (ProdigyWire::serializeResourceDeltaPayload(payload, targetCores, targetMemoryMB, targetStorageMB, isDownscale, graceSeconds) &&
@@ -5388,6 +5469,16 @@ public:
                          unsigned(targetMemoryMB),
                          unsigned(targetStorageMB),
                          (failureReport.size() ? failureReport.c_str() : "unknown"));
+            }
+            // Legacy callers never requested a reply. New serving-authority
+            // callers need the applied observation, not an optimistic send
+            // receipt and not a disruptive full stateUpload/routing reset.
+            if (observationVersion == 1 && brain != nullptr && streamIsActive(brain))
+            {
+              Message::construct(brain->wBuffer, NeuronTopic::adjustContainerResources, uint8_t(1),
+                  containerUUID, uint16_t(applicationSharedCPUCoreHint(container->plan.config)),
+                  container->plan.config.memoryMB, container->plan.config.storageMB, uint8_t(applied));
+              Ring::queueSend(brain);
             }
           }
 

@@ -1064,6 +1064,84 @@ int main(void)
     mothershipResolveTestClusterControlRecord(storedTestLocal.controls, storedTestLocal);
     suite.expect(equalClusters(storedTestLocal, createdCluster), "create_test_local_normalized");
 
+    MothershipProdigyCluster secondTestLocal = testLocal;
+    secondTestLocal.name = "test-local-second"_ctv;
+    secondTestLocal.test.workspaceRoot = "/tmp/nametag-test-local-second"_ctv;
+    MothershipProdigyCluster storedSecondTestLocal = {};
+    bool createSecondTestLocal = registry.createCluster(secondTestLocal, &storedSecondTestLocal, &failure);
+    suite.expect(createSecondTestLocal, "create_second_test_local");
+    suite.expect(storedSecondTestLocal.datacenterFragment != 0 &&
+                     storedSecondTestLocal.datacenterFragment != storedTestLocal.datacenterFragment,
+                 "create_second_test_local_allocates_distinct_network_fragment");
+    String secondControlSocketPath = {};
+    mothershipResolveTestClusterControlSocketPath(storedSecondTestLocal, secondControlSocketPath);
+    suite.expect(secondControlSocketPath != storedTestLocal.controls[0].path,
+                 "create_second_test_local_uses_distinct_provider_control_path");
+    Vector<MothershipProdigyClusterControl> expectedSecondTestControls = {};
+    mothershipResolveTestClusterControlRecord(expectedSecondTestControls, storedSecondTestLocal);
+    suite.expect(equalControls(storedSecondTestLocal.controls, expectedSecondTestControls),
+                 "create_second_test_local_persists_fragment_resolved_controls");
+
+    MothershipProdigyCluster duplicateTestWorkspace = testLocal;
+    duplicateTestWorkspace.name = "test-local-duplicate-workspace"_ctv;
+    suite.expect(!registry.createCluster(duplicateTestWorkspace, nullptr, &failure),
+                 "create_test_duplicate_workspace_rejected");
+    suite.expect(failure.equals("test workspace overlaps another cluster"_ctv),
+                 "create_test_duplicate_workspace_reason");
+
+    duplicateTestWorkspace.test.workspaceRoot.append("/child"_ctv);
+    suite.expect(!registry.createCluster(duplicateTestWorkspace, nullptr, &failure),
+                 "create_test_nested_workspace_rejected");
+    suite.expect(failure.equals("test workspace overlaps another cluster"_ctv),
+                 "create_test_nested_workspace_reason");
+    {
+      String isolatedRegistryPath = {};
+      isolatedRegistryPath.snprintf<"{}/fake-boundary-overlap"_ctv>(dbPath);
+      MothershipClusterRegistry isolatedRegistry(isolatedRegistryPath);
+      MothershipProdigyCluster isolatedFake = testLocal;
+      isolatedFake.test.workspaceRoot = "/tmp/prodigy-fake-boundary/owner/child"_ctv;
+      isolatedFake.test.enableFakeIpv4Boundary = true;
+      suite.expect(isolatedRegistry.createCluster(isolatedFake, nullptr, &failure),
+                   "create_isolated_fake_boundary");
+      MothershipProdigyCluster contender = secondTestLocal;
+      contender.test.workspaceRoot = "/tmp/prodigy-fake-boundary/owner"_ctv;
+      suite.expect(!isolatedRegistry.createCluster(contender, nullptr, &failure) &&
+                       failure.equals("test workspace overlaps another cluster"_ctv),
+                   "create_test_ancestor_workspace_rejected");
+      contender.test.workspaceRoot = "/tmp/prodigy-without-fake-boundary"_ctv;
+      suite.expect(!isolatedRegistry.createCluster(contender, nullptr, &failure) &&
+                       failure.equals("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv),
+                   "create_normal_test_with_existing_fake_boundary_rejected");
+    }
+
+    MothershipProdigyCluster fakeBoundaryTest = secondTestLocal;
+    fakeBoundaryTest.name = "test-fake-boundary"_ctv;
+    fakeBoundaryTest.test.workspaceRoot = "/tmp/test-fake-boundary"_ctv;
+    fakeBoundaryTest.test.enableFakeIpv4Boundary = true;
+    suite.expect(!registry.createCluster(fakeBoundaryTest, nullptr, &failure),
+                 "create_test_fake_boundary_with_existing_cluster_rejected");
+    suite.expect(failure.equals("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv),
+                 "create_test_fake_boundary_with_existing_cluster_reason");
+
+    MothershipProdigyCluster enableExistingFakeBoundary = storedTestLocal;
+    enableExistingFakeBoundary.test.enableFakeIpv4Boundary = true;
+    suite.expect(!registry.upsertCluster(enableExistingFakeBoundary, nullptr, &failure),
+                 "update_test_enable_shared_fake_boundary_rejected");
+    suite.expect(failure.equals("test fake IPv4 boundary is single-tenant until its public boundary domain is virtualized"_ctv),
+                 "update_test_enable_shared_fake_boundary_reason");
+
+    MothershipProdigyCluster updatedSecondTestLocal = storedSecondTestLocal;
+    updatedSecondTestLocal.lastRefreshMs = 848'484;
+    updatedSecondTestLocal.datacenterFragment = storedTestLocal.datacenterFragment;
+    suite.expect(registry.upsertCluster(updatedSecondTestLocal, &updatedSecondTestLocal, &failure),
+                 "update_test_preserves_network_fragment");
+    suite.expect(updatedSecondTestLocal.datacenterFragment == storedSecondTestLocal.datacenterFragment,
+                 "update_test_cannot_replace_allocated_fragment");
+    Vector<MothershipProdigyClusterControl> expectedUpdatedSecondTestControls = {};
+    mothershipResolveTestClusterControlRecord(expectedUpdatedSecondTestControls, updatedSecondTestLocal);
+    suite.expect(equalControls(updatedSecondTestLocal.controls, expectedUpdatedSecondTestControls),
+                 "update_test_retains_fragment_resolved_controls");
+
     MothershipProdigyCluster duplicateRemoteUUID = remoteCreated;
     duplicateRemoteUUID.name = "managed-aws-duplicate-uuid"_ctv;
     duplicateRemoteUUID.clusterUUID = storedRemoteCreated.clusterUUID;
@@ -1281,7 +1359,7 @@ int main(void)
       basics_log("detail list_clusters: %s\n", failure.c_str());
     }
     suite.expect(listClusters, "list_clusters");
-    suite.expect(clusters.size() == 9, "list_clusters_count");
+    suite.expect(clusters.size() == 10, "list_clusters_count");
   }
 
   {
@@ -1589,6 +1667,13 @@ int main(void)
       basics_log("detail remove_topology_owner: %s\n", failure.c_str());
     }
     suite.expect(removeTopologyOwner, "remove_topology_owner");
+
+    bool removeSecondTestLocal = registry.removeCluster("test-local-second"_ctv, &failure);
+    if (!removeSecondTestLocal)
+    {
+      basics_log("detail remove_second_test_local: %s\n", failure.c_str());
+    }
+    suite.expect(removeSecondTestLocal, "remove_second_test_local");
 
     bool removeTestLocal = registry.removeCluster("test-local"_ctv, &failure);
     if (!removeTestLocal)

@@ -130,10 +130,23 @@ public:
   uint128_t lastStoppedMothershipTunnelProviderContainerUUID = 0;
   bool allowLocalStateRefreshBeforeIgnition = false;
   String testMothershipStagedBundlePath = {};
+  bool testUpgradeAdmissionCapacityProbeSucceeds = true;
+  uint64_t testUpgradeAdmissionCapacityAvailableBytes = UINT64_MAX;
 
   String mothershipStagedBundlePath() const override
   {
     return testMothershipStagedBundlePath.size() ? testMothershipStagedBundlePath : prodigyStagedBundlePath();
+  }
+
+  std::function<bool(uint64_t&, String&)> mothershipUpdateStagingCapacityProbe() const override
+  {
+    const bool succeeds = testUpgradeAdmissionCapacityProbeSucceeds;
+    const uint64_t available = testUpgradeAdmissionCapacityAvailableBytes;
+    return [succeeds, available](uint64_t& bytes, String& failure) {
+      bytes = available;
+      if (!succeeds) failure.assign("test staging capacity probe failed"_ctv);
+      return succeeds;
+    };
   }
 
   bool localNeuronStateRefreshMayBypassIgnition(const Machine *machine, bool haveData) const override
@@ -2875,7 +2888,7 @@ static bool deserializeMasterAuthorityTransition(
 {
   ProdigyMasterAuthorityStateTransition transition;
   if (BitseryEngine::deserializeSafe(serialized, transition) == false ||
-      transition.version != ProdigyMasterAuthorityStateTransition::currentVersion)
+      !transition.supportedVersion())
   {
     return false;
   }
@@ -3366,6 +3379,21 @@ static void testSpinApplicationCredentialPolicyAdmission(TestSuite& suite)
   omitted.apiCredentialPolicy = {};
   suite.expect(submit(omitted, "CredentialAdmissionOmitted"_ctv) == "invalid plan: api credential policy declaration required"_ctv,
                "spin_application_rejects_omitted_api_credential_policy");
+
+  // This invalid policy makes the pre-fix path reject without artifact I/O.
+  // Role identity must be rejected first, before any deployment is admitted.
+  DeploymentPlan collidingRoles = {};
+  seedStatefulDeployRequestPlan(collidingRoles, 62'020);
+  collidingRoles.hasApiCredentialPolicy = false;
+  collidingRoles.apiCredentialPolicy = {};
+  collidingRoles.stateful.clientPrefix = 601;
+  collidingRoles.stateful.siblingPrefix = 602;
+  collidingRoles.stateful.cousinPrefix = 603;
+  collidingRoles.stateful.seedingPrefix = 604;
+  collidingRoles.stateful.shardingPrefix = 605;
+  suite.expect(submit(collidingRoles, "StatefulRoleCollision"_ctv) ==
+                   "invalid plan: stateful mesh roles must identify distinct services"_ctv,
+               "spin_application_rejects_stateful_role_collision_before_admission");
 
   DeploymentPlan unavailable = {};
   seedDeployRequestPlan(unavailable, 62'018);
@@ -7013,6 +7041,9 @@ static void testMothershipTunnelProviderConfigureAppliesAtomicallyAndReplicates(
   brain.weAreMaster = true;
   brain.nBrains = 2;
   brain.brainConfig.clusterUUID = 0x7707;
+  follower.registrationFresh = true;
+  follower.uuid = 0x7708;
+  follower.boottimens = 7708;
   follower.connected = true;
   follower.version = ProdigyBinaryVersion;
   follower.weConnectToIt = true;
@@ -7666,22 +7697,118 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
                "cluster_report_missing_current_install_bundle_has_no_fallback");
 
   MachineStatusReport localActive = {};
-  MachineStatusReport remoteUpdating = {};
+  MachineStatusReport verifiedFollower = {};
+  MachineStatusReport disconnectedFollower = {};
+  MachineStatusReport staleFollower = {};
+  MachineStatusReport staleAuthorityFollower = {};
+  MachineStatusReport pendingFollower = {};
   MachineStatusReport localIdle = {};
+  NeuronView follower = {};
+  follower.artifactChunksEnabled = true;
+  follower.ioGeneration = 41;
+  follower.verifiedInstalledBundleSHA256.assign(expectedCurrentDigest);
+  follower.verifiedInstalledBundleIOGeneration = follower.ioGeneration;
+  follower.verifiedInstalledBundleAuthorityEpoch = 17;
+  const uint64_t firstCapabilityValidation = follower.artifactCapabilityValidationGeneration + 1;
+  const uint64_t latestCapabilityValidation = firstCapabilityValidation + 1;
+  follower.artifactCapabilityValidationGeneration = latestCapabilityValidation;
+  suite.expect(
+      prodigyNeuronArtifactCapabilityValidationMatches(&follower, follower.ioGeneration, firstCapabilityValidation) == false &&
+          prodigyNeuronArtifactCapabilityValidationMatches(&follower, follower.ioGeneration, latestCapabilityValidation),
+      "cluster_report_repeated_registration_rejects_stale_capability_completion");
   prodigyAssignMachineBundleReportDigests(
       localActive, true, "waitingForBundle", expectedCurrentDigest, expectedStagedDigest);
   prodigyAssignMachineBundleReportDigests(
-      remoteUpdating, false, "updating", expectedCurrentDigest, expectedStagedDigest);
+      verifiedFollower, false, "idle", "master-has-changed-bundle"_ctv, expectedStagedDigest,
+      &follower, true, 17);
+  prodigyAssignMachineBundleReportDigests(
+      disconnectedFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      &follower, false, 17);
+  follower.ioGeneration += 1;
+  prodigyAssignMachineBundleReportDigests(
+      staleFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      &follower, true, 17);
+  follower.ioGeneration -= 1;
+  prodigyAssignMachineBundleReportDigests(
+      staleAuthorityFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      &follower, true, 18);
+  follower.artifactCapabilityPending = true;
+  prodigyAssignMachineBundleReportDigests(
+      pendingFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      &follower, true, 17);
+  follower.artifactCapabilityPending = false;
   prodigyAssignMachineBundleReportDigests(
       localIdle, true, "idle", expectedCurrentDigest, expectedStagedDigest);
   suite.expect(
       localActive.approvedBundleSHA256.equal(expectedCurrentDigest) &&
           localActive.stagedBundleSHA256.equal(expectedStagedDigest) &&
-          remoteUpdating.approvedBundleSHA256.size() == 0 &&
-          remoteUpdating.stagedBundleSHA256.size() == 0 &&
+          verifiedFollower.approvedBundleSHA256.equal(expectedCurrentDigest) &&
+          verifiedFollower.stagedBundleSHA256.size() == 0 &&
+          disconnectedFollower.approvedBundleSHA256.size() == 0 &&
+          staleFollower.approvedBundleSHA256.size() == 0 &&
+          staleAuthorityFollower.approvedBundleSHA256.size() == 0 &&
+          pendingFollower.approvedBundleSHA256.size() == 0 &&
           localIdle.approvedBundleSHA256.equal(expectedCurrentDigest) &&
           localIdle.stagedBundleSHA256.size() == 0,
-      "cluster_report_binds_bundle_data_to_local_non_idle_update_only");
+      "cluster_report_binds_exact_verified_follower_digest_without_master_rewrite");
+
+  const uint64_t capabilityValidationBeforeReset = follower.artifactCapabilityValidationGeneration;
+  follower.reset();
+  suite.expect(
+      follower.verifiedInstalledBundleSHA256.empty() && follower.verifiedInstalledBundleIOGeneration == 0 &&
+          follower.verifiedInstalledBundleAuthorityEpoch == 0 &&
+          follower.artifactCapabilityValidationGeneration != capabilityValidationBeforeReset,
+      "cluster_report_follower_digest_clears_on_neuron_reset");
+  follower.verifiedInstalledBundleSHA256.assign(expectedCurrentDigest);
+  follower.verifiedInstalledBundleIOGeneration = follower.ioGeneration;
+  follower.verifiedInstalledBundleAuthorityEpoch = 17;
+  TestBrain registrationBrain = {};
+  registrationBrain.establishNeuronArtifactCapability(&follower, {});
+  suite.expect(
+      follower.verifiedInstalledBundleSHA256.empty() && follower.verifiedInstalledBundleIOGeneration == 0 &&
+          follower.verifiedInstalledBundleAuthorityEpoch == 0,
+      "cluster_report_follower_digest_clears_on_reregistration_before_validation");
+
+  // Exercise the Mothership report handler, rather than only its assignment
+  // helper.  A follower report carries the exact registration digest only
+  // while that same verified control stream remains live.
+  ScopedRing reportRing = {};
+  TestBrain reportBrain = {};
+  reportBrain.weAreMaster = true;
+  reportBrain.noMasterYet = false;
+  Machine reportFollower = {};
+  reportFollower.uuid = uint128_t(0x7711);
+  reportFollower.isBrain = true;
+  reportFollower.runtimeReady = true;
+  reportFollower.state = MachineState::healthy;
+  reportFollower.neuron.machine = &reportFollower;
+  reportFollower.neuron.connected = true;
+  reportFollower.neuron.isFixedFile = true;
+  reportFollower.neuron.fslot = 22;
+  reportFollower.neuron.artifactChunksEnabled = true;
+  reportFollower.neuron.ioGeneration = 9;
+  reportFollower.neuron.verifiedInstalledBundleSHA256.assign(expectedCurrentDigest);
+  reportFollower.neuron.verifiedInstalledBundleIOGeneration = 9;
+  reportFollower.neuron.verifiedInstalledBundleAuthorityEpoch = reportBrain.masterAuthorityEpoch;
+  reportBrain.machines.insert(&reportFollower);
+
+  ClusterStatusReport liveFollowerReport = {};
+  suite.require(pullClusterStatusReportForTest(reportBrain, liveFollowerReport),
+                "cluster_report_verified_follower_handler_deserializes");
+  suite.expect(
+      liveFollowerReport.machineReports.size() == 1 &&
+          liveFollowerReport.machineReports[0].approvedBundleSHA256.equal(expectedCurrentDigest),
+      "cluster_report_handler_publishes_exact_verified_follower_digest");
+
+  reportFollower.neuron.connected = false;
+  ClusterStatusReport disconnectedFollowerReport = {};
+  suite.require(pullClusterStatusReportForTest(reportBrain, disconnectedFollowerReport),
+                "cluster_report_disconnected_follower_handler_deserializes");
+  suite.expect(
+      disconnectedFollowerReport.machineReports.size() == 1 &&
+          disconnectedFollowerReport.machineReports[0].approvedBundleSHA256.empty(),
+      "cluster_report_handler_blanks_disconnected_follower_digest");
+  reportBrain.machines.erase(&reportFollower);
 
   (void)::unlink(fixtureBundlePath.c_str());
   (void)::unlink(fixtureStagedPath.c_str());
@@ -8251,6 +8378,9 @@ static void testMachineSchemaMutationsQueueRuntimeStateReplication(TestSuite& su
   {
     return;
   }
+  follower.registrationFresh = true;
+  follower.uuid = 0x7808;
+  follower.boottimens = 7808;
   follower.connected = true;
   brain.brains.insert(&follower);
 
@@ -11789,8 +11919,9 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
   ScopedRing scopedRing = {};
 
   TestBrain brain = {};
-  brain.nBrains = 1;
-  brain.weAreMaster = false;
+  brain.nBrains = 3;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
   brain.updateSelfUseStagedBundleOnly = true;
 
   BrainView peerA = {};
@@ -11801,6 +11932,7 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
   peerA.connected = true;
   peerA.isFixedFile = true;
   peerA.fslot = 11;
+  peerA.registrationFresh = true;
 
   BrainView peerB = {};
   peerB.uuid = 0x7712;
@@ -11810,21 +11942,48 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
   peerB.connected = true;
   peerB.isFixedFile = true;
   peerB.fslot = 12;
+  peerB.registrationFresh = true;
 
   brain.brains.insert(&peerA);
   brain.brains.insert(&peerB);
   brain.beginUpdateSelfBundle(2);
 
+  auto countTopic = [](BrainView& peer, BrainTopic topic) {
+    uint32_t count = 0;
+    forEachMessageInBuffer(peer.wBuffer, [&](Message *frame) {
+      count += BrainTopic(frame->topic) == topic;
+    });
+    return count;
+  };
+  auto completeControlSend = [](BrainView& peer) {
+    // The fixed-slot fixture has no real SQE completion.  Model the completed
+    // authority frame before allowing the serial update command to use this
+    // transport, as the production send handler does.
+    peer.wBuffer.clear();
+    peer.clearQueuedSendBytes();
+    peer.pendingSend = false;
+    peer.pendingSendBytes = 0;
+  };
+
+  suite.expect(countTopic(peerA, BrainTopic::replicateMasterAuthorityState) >= 1 &&
+                   countTopic(peerB, BrainTopic::replicateMasterAuthorityState) >= 1 &&
+                   brain.updateSelfBundleIssuedPeerKeys.empty(),
+               "update_self_bundle_waits_for_authority_control_send_drain");
+  completeControlSend(peerA);
+  completeControlSend(peerB);
+  brain.queueUpdateSelfBundleToPeer(&peerA);
+  brain.queueUpdateSelfBundleToPeer(&peerB);
+
   suite.expect(brain.updateSelfBundleIssuedPeerKeys.size() == 2,
-               "update_self_bundle_issues_distinct_known_uuid_peers_sharing_peer_address");
+               "update_self_bundle_issues_distinct_known_uuid_peers_sharing_peer_address_after_control_drain");
   suite.expect(brain.updateSelfBundleIssuedPeerKeys.contains(peerA.uuid),
                "update_self_bundle_issues_peer_a_by_uuid");
   suite.expect(brain.updateSelfBundleIssuedPeerKeys.contains(peerB.uuid),
                "update_self_bundle_issues_peer_b_by_uuid");
 
   // Echoes arrive after the queued bundle send has completed.
-  peerA.pendingSend = false;
-  peerB.pendingSend = false;
+  completeControlSend(peerA);
+  completeControlSend(peerB);
   brain.onUpdateSelfBundleEcho(&peerA);
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForBundleEchos, "update_self_bundle_echo_waits_for_all_peers");
   suite.expect(brain.updateSelfBundleEchos == 1, "update_self_bundle_echo_counts_first_peer");
@@ -11833,8 +11992,15 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
 
   suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots, "update_self_bundle_echo_transitions_followers");
   suite.expect(brain.updateSelfFollowerBootNsByPeerKey.size() == 2, "update_self_bundle_echo_captures_follower_boot_ns");
-  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerA.uuid), "update_self_bundle_echo_marks_transition_sent_peer_a");
-  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerB.uuid), "update_self_bundle_echo_marks_transition_sent_peer_b");
+  suite.expect(countTopic(peerA, BrainTopic::replicateMasterAuthorityState) >= 1 &&
+                   countTopic(peerB, BrainTopic::replicateMasterAuthorityState) >= 1 &&
+                   brain.updateSelfTransitionIssuedPeerKeys.empty(),
+               "update_self_bundle_echo_waits_for_followup_authority_control_drain");
+  completeControlSend(peerA);
+  completeControlSend(peerB);
+  brain.maybeQueueUpdateSelfFollowerTransition();
+  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerA.uuid), "update_self_bundle_echo_marks_first_serial_transition_sent");
+  suite.expect(brain.updateSelfTransitionIssuedPeerKeys.contains(peerB.uuid) == false, "update_self_bundle_echo_keeps_second_follower_in_voter_set");
 
   uint32_t peerATransitionFrames = 0;
   forEachMessageInBuffer(peerA.wBuffer, [&](Message *frame) {
@@ -11852,8 +12018,8 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
     }
   });
 
-  suite.expect(peerATransitionFrames == 1, "update_self_bundle_echo_queues_transition_for_peer_a");
-  suite.expect(peerBTransitionFrames == 1, "update_self_bundle_echo_queues_transition_for_peer_b");
+  suite.expect(peerATransitionFrames == 1, "update_self_bundle_echo_queues_first_serial_transition");
+  suite.expect(peerBTransitionFrames == 0, "update_self_bundle_echo_does_not_queue_parallel_transition");
 }
 
 static void testUpdateSelfPeerRegistrationCreditsBootNsChange(TestSuite& suite)
@@ -11861,26 +12027,27 @@ static void testUpdateSelfPeerRegistrationCreditsBootNsChange(TestSuite& suite)
   ScopedRing scopedRing = {};
 
   TestBrain brain = {};
-  brain.nBrains = 1;
-  brain.weAreMaster = false;
+  brain.nBrains = 3;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
   brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
   brain.updateSelfExpectedEchos = 1;
 
   BrainView peer = {};
   peer.private4 = 0x0a000021;
+  peer.uuid = 0x7721;
   peer.boottimens = 200;
   peer.connected = true;
   peer.isFixedFile = true;
   peer.fslot = 21;
   brain.brains.insert(&peer);
-  brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(uint128_t(peer.private4), 100);
+  brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(peer.uuid, 100);
 
   brain.onUpdateSelfPeerRegistration(&peer);
 
-  suite.expect(brain.updateSelfFollowerRebootedPeerKeys.contains(uint128_t(peer.private4)), "update_self_registration_boot_ns_change_marks_rebooted");
-  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos, "update_self_registration_boot_ns_change_starts_relinquish");
-  suite.expect(brain.updateSelfPlannedMasterPeerKey == uint128_t(peer.private4), "update_self_registration_boot_ns_change_sets_designated_master");
-  suite.expect(brain.updateSelfRelinquishIssuedPeerKeys.contains(uint128_t(peer.private4)), "update_self_registration_boot_ns_change_marks_relinquish_sent");
+  suite.expect(brain.updateSelfFollowerRebootedPeerKeys.contains(peer.uuid), "update_self_registration_boot_ns_change_marks_rebooted");
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots, "update_self_registration_boot_ns_change_waits_for_runtime_witness");
+  suite.expect(brain.updateSelfPlannedMasterPeerKey == 0 && brain.updateSelfRelinquishIssuedPeerKeys.empty(), "update_self_registration_boot_ns_change_does_not_relinquish_before_runtime_witness");
 
   uint32_t relinquishFrames = 0;
   uint8_t relinquishStatus = 0;
@@ -11897,9 +12064,8 @@ static void testUpdateSelfPeerRegistrationCreditsBootNsChange(TestSuite& suite)
     relinquishFrames += 1;
   });
 
-  suite.expect(relinquishFrames == 1, "update_self_registration_boot_ns_change_queues_relinquish");
-  suite.expect(relinquishStatus == 1, "update_self_registration_boot_ns_change_sets_relinquish_status");
-  suite.expect(designatedPeerKey == uint128_t(peer.private4), "update_self_registration_boot_ns_change_preserves_designated_master");
+  suite.expect(relinquishFrames == 0, "update_self_registration_boot_ns_change_queues_no_relinquish_before_runtime_witness");
+  suite.expect(relinquishStatus == 0 && designatedPeerKey == 0, "update_self_registration_boot_ns_change_has_no_unauthorized_designation");
 }
 
 static void testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(TestSuite& suite)
@@ -11907,35 +12073,38 @@ static void testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(Te
   ScopedRing scopedRing = {};
 
   TestBrain brain = {};
-  brain.nBrains = 1;
-  brain.weAreMaster = false;
+  brain.nBrains = 3;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
   brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
   brain.updateSelfExpectedEchos = 1;
 
   BrainView peer = {};
   peer.private4 = 0x0a000031;
+  peer.uuid = 0x7731;
   peer.boottimens = 300;
   peer.connected = true;
   peer.isFixedFile = true;
   peer.fslot = 31;
   brain.brains.insert(&peer);
-  brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(uint128_t(peer.private4), 300);
-  brain.updateSelfFollowerReconnectedPeerKeys.insert(uint128_t(peer.private4));
+  brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(peer.uuid, 300);
+  brain.updateSelfFollowerReconnectedPeerKeys.insert(peer.uuid);
 
   brain.onUpdateSelfPeerRegistration(&peer);
 
-  suite.expect(brain.updateSelfFollowerRebootedPeerKeys.contains(uint128_t(peer.private4)), "update_self_registration_reconnect_marks_rebooted");
-  suite.expect(brain.updateSelfFollowerReconnectedPeerKeys.contains(uint128_t(peer.private4)) == false, "update_self_registration_reconnect_consumes_reconnect_credit");
-  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos, "update_self_registration_reconnect_starts_relinquish");
+  suite.expect(brain.updateSelfFollowerRebootedPeerKeys.empty(), "update_self_registration_reconnect_does_not_credit_same_boot_reconnect");
+  suite.expect(brain.updateSelfFollowerReconnectedPeerKeys.contains(peer.uuid) == false, "update_self_registration_reconnect_consumes_reconnect_credit");
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots, "update_self_registration_reconnect_waits_for_runtime_witness");
 }
 
-static void testMaybeRelinquishMasterSelectsLowestPeerKey(TestSuite& suite)
+static void testMaybeRelinquishMasterWaitsForRuntimeWitness(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
 
   TestBrain brain = {};
   brain.nBrains = 1;
-  brain.weAreMaster = false;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
   brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
   brain.updateSelfExpectedEchos = 2;
 
@@ -11960,10 +12129,8 @@ static void testMaybeRelinquishMasterSelectsLowestPeerKey(TestSuite& suite)
 
   brain.maybeRelinquishMasterForUpdateSelf();
 
-  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForRelinquishEchos, "update_self_relinquish_waits_for_echoes");
-  suite.expect(brain.updateSelfPlannedMasterPeerKey == uint128_t(lowerPeer.private4), "update_self_relinquish_picks_lowest_peer_key");
-  suite.expect(brain.updateSelfRelinquishIssuedPeerKeys.contains(uint128_t(higherPeer.private4)), "update_self_relinquish_issues_higher_peer");
-  suite.expect(brain.updateSelfRelinquishIssuedPeerKeys.contains(uint128_t(lowerPeer.private4)), "update_self_relinquish_issues_lower_peer");
+  suite.expect(brain.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots, "update_self_relinquish_waits_for_runtime_witness");
+  suite.expect(brain.updateSelfPlannedMasterPeerKey == 0 && brain.updateSelfRelinquishIssuedPeerKeys.empty(), "update_self_relinquish_does_not_elect_before_runtime_witness");
 
   uint32_t relinquishFrames = 0;
   uint128_t designatedPeerKey = 0;
@@ -11980,8 +12147,7 @@ static void testMaybeRelinquishMasterSelectsLowestPeerKey(TestSuite& suite)
     relinquishFrames += 1;
   });
 
-  suite.expect(relinquishFrames == 1, "update_self_relinquish_queues_message");
-  suite.expect(designatedPeerKey == uint128_t(lowerPeer.private4), "update_self_relinquish_message_preserves_lowest_peer_key");
+  suite.expect(relinquishFrames == 0 && designatedPeerKey == 0, "update_self_relinquish_queues_no_message_before_runtime_witness");
 }
 
 static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(TestSuite& suite)
@@ -11990,6 +12156,8 @@ static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(T
 
   TestBrain sender = {};
   sender.nBrains = 3;
+  sender.weAreMaster = true;
+  sender.noMasterYet = false;
   sender.updateSelfState = Brain::UpdateSelfState::waitingForRelinquishEchos;
   sender.updateSelfExpectedEchos = 1;
 
@@ -12000,10 +12168,40 @@ static void testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(T
   peer.connected = true;
   peer.isFixedFile = true;
   peer.fslot = 51;
+  peer.registrationFresh = true;
   sender.brains.insert(&peer);
   sender.updateSelfFollowerRebootedPeerKeys.insert(peer.uuid);
   sender.updateSelfRelinquishIssuedPeerKeys.insert(peer.uuid);
+  sender.masterAuthorityRuntimeStateDurable = true;
+  sender.durableMasterAuthorityRuntimeStateGeneration = sender.masterAuthorityRuntimeState.generation;
 
+  sender.runBrainPeerHeartbeatTick();
+
+  uint32_t authorityFrames = 0;
+  uint32_t commandsBeforeControlDrain = 0;
+  forEachMessageInBuffer(peer.wBuffer, [&](Message *frame) {
+    authorityFrames += BrainTopic(frame->topic) == BrainTopic::replicateMasterAuthorityState;
+    commandsBeforeControlDrain += BrainTopic(frame->topic) == BrainTopic::relinquishMasterStatus;
+  });
+  suite.expect(authorityFrames == 1 && commandsBeforeControlDrain == 0,
+               "update_self_relinquish_heartbeat_waits_for_authority_control_send_drain");
+
+  String serializedAuthority = {}, authorityDigest = {};
+  suite.require(sender.serializeCurrentMasterAuthorityTransition(serializedAuthority, authorityDigest),
+                "update_self_relinquish_heartbeat_authority_digest");
+  ProdigyMasterAuthorityStateTransitionAck authorityAck = {};
+  authorityAck.generation = sender.masterAuthorityRuntimeState.generation;
+  authorityAck.peerUUID = peer.uuid;
+  authorityAck.peerBootNs = peer.boottimens;
+  authorityAck.transitionDigest = authorityDigest;
+  sender.acknowledgeMasterAuthorityTransition(&peer, authorityAck);
+  peer.wBuffer.clear();
+  peer.clearQueuedSendBytes();
+  peer.pendingSend = false;
+  peer.pendingSendBytes = 0;
+  // The prior heartbeat just completed its authority-control write.  Make the
+  // next explicit tick a heartbeat cadence so it exercises the retry owner.
+  peer.lastHeartbeatSendMs = 0;
   sender.runBrainPeerHeartbeatTick();
 
   uint32_t retriedCommands = 0;
@@ -12136,92 +12334,51 @@ static void testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(TestSuite& su
   thisNeuron = previousNeuron;
 }
 
-static void testUpdateProdigyRespondsBeforeSingleBrainTransition(TestSuite& suite)
+static bool expectLegacyUpdateProdigyRejection(
+    TestSuite& suite, TestBrain& brain, Mothership& mothership, const String& bundle, const char* name)
 {
-  ScopedAsyncMothershipRing ring = {};
-  ScopedTempDir stage = {};
-  if (suite.require(stage.valid(), "update_prodigy_single_brain_private_stage_created") == false) return;
+  String request = {};
+  brain.mothershipHandler(
+      &mothership, buildMothershipMessage(request, MothershipTopic::updateProdigy, bundle));
+  if (mothership.wBuffer.size() < sizeof(Message))
+  {
+    suite.expect(false, name);
+    return false;
+  }
+  Message *response = reinterpret_cast<Message *>(mothership.wBuffer.data());
+  String serializedResponse = {};
+  uint8_t *args = response->args;
+  Message::extractToStringView(args, serializedResponse);
+  MothershipResponse decoded = {};
+  const bool rejected = MothershipTopic(response->topic) == MothershipTopic::updateProdigy &&
+      args == response->terminal() && BitseryEngine::deserializeSafe(serializedResponse, decoded) &&
+      !decoded.success && decoded.failure == "legacy updateProdigy is not an admission path"_ctv;
+  suite.expect(rejected, name);
+  mothership.wBuffer.clear();
+  return rejected;
+}
 
+static void testUpdateProdigyLegacyTopicRejectsBeforeSingleBrainTransition(TestSuite& suite)
+{
+  ScopedFreshRing ring = {};
   TestBrain brain = {};
-  brain.testMothershipStagedBundlePath.assign((stage.path / "bundle.tar.zst").c_str());
   brain.nBrains = 1;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
-  brain.masterAuthorityRuntimeStateDurable = true;
-  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
-  Machine local = {};
-  local.uuid = 0x7701;
-  local.isThisMachine = true;
-  local.isBrain = true;
-  local.runtimeReady = true;
-  brain.machines.insert(&local);
-  brain.persistedMachineInventoryUploaded.insert(local.uuid);
-  brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(local.uuid, Vector<String>{});
+  Mothership mothership = {};
 
-  ScopedSocketPair sockets = {};
-  if (suite.require(sockets.create(suite, "update_prodigy_single_brain_socket_pair"), "update_prodigy_single_brain_socket_pair_required") == false) return;
-  // A successful one-Brain update forfeits master status after the ACK drains.
-  // That queues the stream's ordinary close completion, whose production owner
-  // deletes Mothership.  Give the fixture the same heap lifetime.
-  Mothership *mothership = new Mothership();
-  mothership->fd = sockets.takeLeft();
-  mothership->isFixedFile = false;
-  brain.mothership = mothership;
-  if (suite.require(brain.activateMothershipConnection(mothership), "update_prodigy_single_brain_activates_mothership") == false) return;
-  RingDispatcher::installMultiplexee(mothership, &brain);
-
-  String bundle = "unit-update-bundle"_ctv;
-  String messageBuffer = {};
-  brain.mothershipHandler(mothership, buildMothershipMessage(messageBuffer, MothershipTopic::updateProdigy, bundle));
-  suite.expect(mothership->wBuffer.empty(), "update_prodigy_single_brain_defers_response_until_durable_stage");
-  suite.expect(brain.transitionToNewBundleCalls == 0,
-               "update_prodigy_single_brain_does_not_transition_before_durable_stage_or_ack");
-  ring.runFor(500);
-
-  String responseBytes = {};
-  uint8_t buffer[4096] = {};
-  for (;;)
-  {
-    ssize_t received = ::recv(sockets.right, buffer, sizeof(buffer), 0);
-    if (received > 0) { responseBytes.append(buffer, uint64_t(received)); continue; }
-    break;
-  }
-  MothershipResponse response = {};
-  bool decoded = false;
-  if (responseBytes.size() >= sizeof(Message))
-  {
-    Message *responseMessage = reinterpret_cast<Message *>(responseBytes.data());
-    if (MothershipTopic(responseMessage->topic) == MothershipTopic::updateProdigy)
-    {
-      String serializedResponse = {};
-      uint8_t *responseArgs = responseMessage->args;
-      Message::extractToStringView(responseArgs, serializedResponse);
-      decoded = BitseryEngine::deserializeSafe(serializedResponse, response);
-    }
-  }
-  suite.expect(decoded && response.success, "update_prodigy_response_success");
-  suite.expect(brain.updateSelfLocalMachineUUID == 0 &&
-                   brain.updateSelfMachineRecoveryWitnesses.size() == 1 &&
-                   brain.updateSelfMachineRecoveryWitnesses[0].machineUUID == local.uuid,
-               "update_prodigy_single_brain_persists_all_machine_handoff_before_success");
-  suite.expect(brain.updateSelfTransitionAfterMothershipAck == false && brain.transitionToNewBundleCalls == 1,
-               "update_prodigy_single_brain_transitions_only_after_actual_ack_send");
-
-  if (brain.artifactIO)
-  {
-    suite.expect(quiesceArtifactIOForTest(brain.artifactIO.get()), "update_prodigy_quiesces_artifact_raw_poll_before_ring_teardown");
-    brain.artifactIO.reset();
-  }
-  brain.machines.erase(&local);
+  expectLegacyUpdateProdigyRejection(
+      suite, brain, mothership, "unit-update-bundle"_ctv,
+      "update_prodigy_legacy_topic_rejects_before_single_brain_stage");
+  suite.expect(brain.pendingMothershipUpdateArtifact == nullptr && brain.transitionToNewBundleCalls == 0 &&
+                   !brain.updateSelfTransitionAfterMothershipAck,
+               "update_prodigy_legacy_topic_does_not_begin_single_brain_transition");
 }
 
-static void testUpdateProdigyDefersSuccessUntilWorkersRestore(TestSuite& suite)
+static void testUpdateProdigyLegacyTopicRejectsBeforeWorkersUpdate(TestSuite& suite)
 {
-  ScopedAsyncMothershipRing ring = {};
-  ScopedTempDir stage = {};
-  if (suite.require(stage.valid(), "update_prodigy_workers_private_stage_created") == false) return;
+  ScopedFreshRing ring = {};
   TestBrain brain = {};
-  brain.testMothershipStagedBundlePath.assign((stage.path / "bundle.tar.zst").c_str());
   brain.nBrains = 1;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
@@ -12229,48 +12386,25 @@ static void testUpdateProdigyDefersSuccessUntilWorkersRestore(TestSuite& suite)
   worker.uuid = 0x7711;
   worker.isBrain = false;
   brain.machines.insert(&worker);
-
-  ScopedSocketPair sockets = {};
-  if (suite.require(sockets.create(suite, "update_prodigy_workers_socket_pair"), "update_prodigy_workers_socket_pair_required") == false) return;
   Mothership mothership = {};
-  mothership.fd = sockets.takeLeft();
-  mothership.isFixedFile = false;
-  brain.mothership = &mothership;
-  if (suite.require(brain.activateMothershipConnection(&mothership), "update_prodigy_workers_activates_mothership") == false) return;
-  RingDispatcher::installMultiplexee(&mothership, &brain);
 
-  String buffer = {};
-  String bundle = "must-not-stage-partial-upgrade"_ctv;
-  brain.mothershipHandler(&mothership,
-      buildMothershipMessage(buffer, MothershipTopic::updateProdigy, bundle));
-  ring.runFor(500);
-  suite.expect(mothership.wBuffer.empty(),
-               "update_prodigy_workers_defer_success_until_restored");
-  suite.expect(!brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0,
-               "update_prodigy_workers_do_not_transition_master");
-  suite.expect(brain.updateSelfWorkerMachineUUIDs.contains(worker.uuid) &&
-                   brain.updateSelfWorkerExpectedBundleSHA256.size() == 64,
-               "update_prodigy_workers_persist_expected_digest");
-  if (brain.artifactIO)
-  {
-    suite.expect(quiesceArtifactIOForTest(brain.artifactIO.get()), "update_prodigy_quiesces_artifact_raw_poll_before_ring_teardown");
-    brain.artifactIO.reset();
-  }
-  RingDispatcher::eraseMultiplexee(&mothership);
-  brain.activeMotherships.erase(&mothership);
-  ::close(mothership.fd);
-  mothership.fd = -1;
+  expectLegacyUpdateProdigyRejection(
+      suite, brain, mothership, "must-not-stage-partial-upgrade"_ctv,
+      "update_prodigy_legacy_topic_rejects_before_worker_stage");
+  suite.expect(brain.pendingMothershipUpdateArtifact == nullptr &&
+                   !brain.updateSelfTransitionAfterMothershipAck && brain.transitionToNewBundleCalls == 0 &&
+                   brain.updateSelfWorkerMachineUUIDs.empty() && brain.updateSelfWorkerExpectedBundleSHA256.empty(),
+               "update_prodigy_legacy_topic_does_not_create_worker_operation");
   brain.machines.erase(&worker);
 }
 
-static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& suite)
+static void testUpdateProdigyLegacyTopicPreservesExistingWorkerOperation(TestSuite& suite)
 {
-  ScopedAsyncMothershipRing ring = {};
+  ScopedFreshRing ring = {};
   ScopedTempDir stage = {};
-  if (suite.require(stage.valid(), "update_prodigy_rejection_private_stage_created") == false) return;
+  if (suite.require(stage.valid(), "update_prodigy_legacy_rejection_private_stage_created") == false) return;
   TestBrain brain = {};
   brain.testMothershipStagedBundlePath.assign((stage.path / "bundle.tar.zst").c_str());
-  brain.nBrains = 1;
   brain.weAreMaster = true;
   brain.noMasterYet = false;
 
@@ -12287,7 +12421,7 @@ static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& su
   String oldDigest = {};
   String digestFailure = {};
   suite.expect(prodigyComputeSHA256Hex(oldBundle, oldDigest, &digestFailure),
-               "update_prodigy_rejection_computes_existing_digest");
+               "update_prodigy_legacy_rejection_computes_existing_digest");
   Filesystem::openWriteAtClose(-1, brain.testMothershipStagedBundlePath, oldBundle);
 
   brain.updateSelfWorkerExpectedBundleSHA256 = oldDigest;
@@ -12299,70 +12433,27 @@ static void testUpdateProdigyRejectsDifferentDigestWithoutMutation(TestSuite& su
   Mothership priorMothership = {};
   brain.updateSelfWorkerMothership = &priorMothership;
   const ProdigyPersistentUpdateSelfState before = brain.capturePersistentUpdateSelfState();
-  String queuedBefore = worker.neuron.wBuffer;
-  String pendingQueuedBefore = pendingWorker.neuron.wBuffer;
+  const String queuedBefore = worker.neuron.wBuffer;
+  const String pendingQueuedBefore = pendingWorker.neuron.wBuffer;
 
   brain.machines.insert(&worker);
   brain.machines.insert(&pendingWorker);
-  ScopedSocketPair sockets = {};
-  if (suite.require(sockets.create(suite, "update_prodigy_rejection_socket_pair"), "update_prodigy_rejection_socket_pair_required") == false) return;
   Mothership mothership = {};
-  mothership.fd = sockets.takeLeft();
-  mothership.isFixedFile = false;
-  brain.mothership = &mothership;
-  if (suite.require(brain.activateMothershipConnection(&mothership), "update_prodigy_rejection_activates_mothership") == false) return;
-  RingDispatcher::installMultiplexee(&mothership, &brain);
-  String request = {};
-  brain.mothershipHandler(&mothership,
-      buildMothershipMessage(request, MothershipTopic::updateProdigy, rejectedBundle));
-  ring.runFor(500);
+  expectLegacyUpdateProdigyRejection(
+      suite, brain, mothership, rejectedBundle,
+      "update_prodigy_legacy_topic_rejects_before_existing_worker_operation");
 
   String stagedAfter = {};
   Filesystem::openReadAtClose(-1, brain.testMothershipStagedBundlePath, stagedAfter);
   suite.expect(stagedAfter == oldBundle,
-               "update_prodigy_rejection_preserves_staged_bundle");
+               "update_prodigy_legacy_rejection_preserves_staged_bundle");
   suite.expect(equalSerializedObjects(before, brain.capturePersistentUpdateSelfState()),
-               "update_prodigy_rejection_preserves_durable_worker_operation");
+               "update_prodigy_legacy_rejection_preserves_durable_worker_operation");
   suite.expect(brain.updateSelfWorkerMothership == &priorMothership,
-               "update_prodigy_rejection_preserves_pending_mothership");
+               "update_prodigy_legacy_rejection_preserves_pending_mothership");
   suite.expect(worker.neuron.wBuffer == queuedBefore &&
                    pendingWorker.neuron.wBuffer == pendingQueuedBefore,
-               "update_prodigy_rejection_queues_no_worker_messages");
-
-  String responseBytes = {};
-  uint8_t responseBuffer[4096] = {};
-  for (;;)
-  {
-    ssize_t received = ::recv(sockets.right, responseBuffer, sizeof(responseBuffer), 0);
-    if (received > 0) { responseBytes.append(responseBuffer, uint64_t(received)); continue; }
-    break;
-  }
-  MothershipResponse response = {};
-  bool decoded = false;
-  if (responseBytes.size() >= sizeof(Message))
-  {
-    Message *responseMessage = reinterpret_cast<Message *>(responseBytes.data());
-    if (MothershipTopic(responseMessage->topic) == MothershipTopic::updateProdigy)
-    {
-      String serializedResponse = {};
-      uint8_t *responseArgs = responseMessage->args;
-      Message::extractToStringView(responseArgs, serializedResponse);
-      decoded = BitseryEngine::deserializeSafe(serializedResponse, response);
-    }
-  }
-  suite.expect(decoded && response.success == false &&
-                   response.failure == "another worker bundle upgrade is incomplete"_ctv,
-               "update_prodigy_rejection_reports_incomplete_upgrade");
-
-  if (brain.artifactIO)
-  {
-    suite.expect(quiesceArtifactIOForTest(brain.artifactIO.get()), "update_prodigy_quiesces_artifact_raw_poll_before_ring_teardown");
-    brain.artifactIO.reset();
-  }
-  RingDispatcher::eraseMultiplexee(&mothership);
-  brain.activeMotherships.erase(&mothership);
-  ::close(mothership.fd);
-  mothership.fd = -1;
+               "update_prodigy_legacy_rejection_queues_no_worker_messages");
   brain.machines.erase(&worker);
   brain.machines.erase(&pendingWorker);
 }
@@ -24873,7 +24964,7 @@ static void testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(TestSu
   brain.machines.erase(&machine);
 }
 
-static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyCutover(TestSuite& suite)
+static void testBrainNeuronHandlerContainerStatisticsRequiresStatefulTopologyAuthority(TestSuite& suite)
 {
   TestBrain brain = {};
   NoopBrainIaaS iaas = {};
@@ -24956,8 +25047,8 @@ static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyC
       uint64_t(1));
   brain.neuronHandler(&machine.neuron, message);
 
-  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "brain_neuron_container_statistics_cutover_enters_blue_draining");
-  suite.expect(targetC.statefulTopologyCutoverReady == false, "brain_neuron_container_statistics_cutover_clears_target_barrier_after_cutover");
+  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "brain_neuron_container_statistics_barriers_cannot_bypass_missing_authority");
+  suite.expect(targetC.statefulTopologyCutoverReady, "brain_neuron_container_statistics_retains_barrier_while_authority_pending");
 
   for (ContainerView *container : sources)
   {
@@ -24986,7 +25077,7 @@ static void testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyC
   thisBrain = previousBrain;
 }
 
-static void testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(TestSuite& suite)
+static void testBrainReplicatedMetricAppendCannotAuthorizeStatefulTopologyCutover(TestSuite& suite)
 {
   TestBrain brain = {};
   brain.weAreMaster = false;
@@ -25071,8 +25162,8 @@ static void testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(Tes
       uint64_t(1));
   brain.brainHandler(&follower, readyMessage);
 
-  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::blueDraining, "brain_replicated_metric_append_cutover_enters_blue_draining");
-  suite.expect(targetC.statefulTopologyCutoverReady == false, "brain_replicated_metric_append_cutover_clears_target_barrier_after_cutover");
+  suite.expect(deployment.statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap, "brain_replicated_metric_append_follower_cannot_authorize_cutover");
+  suite.expect(targetC.statefulTopologyCutoverReady, "brain_replicated_metric_append_follower_retains_barrier");
 
   for (ContainerView *container : sources)
   {
@@ -28088,6 +28179,251 @@ static void testBrainNeuronHandlerAppliesMachineHardwareProfile(TestSuite& suite
                "brain_neuron_hardware_persists_cluster_topology");
 }
 
+class DeferredTopologyInventoryBrain final : public ResumableAddMachinesBrain {
+public:
+  class PendingTopologyPersistence {
+  public:
+    ClusterTopology topology = {};
+    PersistenceCompletion completion = {};
+  };
+
+  Vector<PendingTopologyPersistence> pendingTopologyPersistences = {};
+  uint32_t topologyPersistenceCalls = 0;
+
+  void persistAuthoritativeClusterTopologyAsync(ClusterTopology topology, PersistenceCompletion completion) override
+  {
+    topologyPersistenceCalls += 1;
+    pendingTopologyPersistences.push_back({std::move(topology), std::move(completion)});
+  }
+
+  bool hasPendingTopologyPersistence() const
+  {
+    return pendingTopologyPersistences.empty() == false;
+  }
+
+  void finishNextTopologyPersistence(bool durable)
+  {
+    if (pendingTopologyPersistences.empty())
+    {
+      return;
+    }
+    PendingTopologyPersistence pending = std::move(pendingTopologyPersistences.front());
+    pendingTopologyPersistences.erase(pendingTopologyPersistences.begin());
+    if (durable)
+    {
+      authoritativeTopology = std::move(pending.topology);
+    }
+    if (pending.completion)
+    {
+      pending.completion(durable);
+    }
+  }
+};
+
+static void testBrainReplaysHardwareReceivedBeforeTopologyAdmission(TestSuite& suite)
+{
+  DeferredTopologyInventoryBrain brain = {};
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.runtimeEnvironment.test.enabled = true;
+
+  ClusterMachine admittedFirst = makeCreatedBrainClusterMachineForTest(0x4202, "gcp-follower-before-admission-1"_ctv, "10.128.15.214"_ctv, "34.10.44.19"_ctv);
+  ClusterMachine admittedSecond = makeCreatedBrainClusterMachineForTest(0x4203, "gcp-follower-before-admission-2"_ctv, "10.128.15.215"_ctv, "34.10.44.20"_ctv);
+  Machine first = {}, second = {};
+  auto initializeFollower = [&](Machine& machine, const ClusterMachine& admitted) {
+    machine.uuid = admitted.uuid;
+    machine.isBrain = true;
+    machine.state = MachineState::deploying;
+    machine.slug = admitted.cloud.schema;
+    machine.type = admitted.cloud.providerMachineType;
+    machine.cloudID = admitted.cloud.cloudID;
+    const ClusterMachineAddress *privateAddress = prodigyFirstClusterMachineAddress(admitted.addresses.privateAddresses);
+    suite.require(privateAddress != nullptr, "brain_hardware_before_admission_fixture_private_address");
+    if (privateAddress != nullptr)
+    {
+      machine.privateAddress = privateAddress->address;
+      machine.private4 = IPAddress(machine.privateAddress.c_str(), false).v4;
+    }
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+  };
+  initializeFollower(first, admittedFirst);
+  initializeFollower(second, admittedSecond);
+
+  auto hardwareFor = [](uint64_t collectedAtMs) {
+    MachineHardwareProfile hardware = {};
+    hardware.inventoryComplete = true;
+    hardware.collectedAtMs = collectedAtMs;
+    hardware.cpu.logicalCores = 2;
+    hardware.memory.totalMB = 4096;
+    hardware.disks.push_back(MachineDiskHardwareProfile {.sizeMB = 20'480});
+    hardware.captures.push_back(MachineToolCapture {});
+    return hardware;
+  };
+
+  // Both followers report authenticated inventory while VDC has started them,
+  // but before Mothership's readyMachines admission is durable.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'334));
+  brain.applyMachineHardwareProfile(&second, hardwareFor(111'222'335));
+  suite.expect(first.hardware.inventoryComplete && second.hardware.inventoryComplete,
+               "brain_hardware_before_admission_retains_runtime_inventory");
+  suite.expect(brain.authoritativeTopology.machines.empty() && brain.topologyPersistenceCalls == 0,
+               "brain_hardware_before_admission_cannot_publish_missing_machines");
+
+  brain.authoritativeTopology.machines.push_back(admittedFirst);
+  brain.authoritativeTopology.machines.push_back(admittedSecond);
+  suite.expect(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+               "brain_hardware_before_admission_restores_admitted_machines");
+  suite.expect(brain.topologyPersistenceCalls == 1 && brain.hasPendingTopologyPersistence(),
+               "brain_hardware_before_admission_batches_sibling_inventory_into_one_durable_snapshot");
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.inventoryComplete == false &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete == false,
+               "brain_hardware_before_admission_hides_replay_before_durable_receipt");
+
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines.size() == 2 &&
+                   brain.authoritativeTopology.machines[0].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete,
+               "brain_hardware_before_admission_replays_inventory_to_authoritative_topology");
+  for (const ClusterMachine& machine : brain.authoritativeTopology.machines)
+  {
+    suite.expect(machine.totalLogicalCores == 2 && machine.totalMemoryMB == 4096 && machine.totalStorageMB == 20'480 &&
+                     prodigyMachineReadyResourcesAvailable(prodigyBuildMachineSnapshotFromClusterMachine(machine)),
+                 "brain_hardware_before_admission_replays_ready_capacity_to_authoritative_topology");
+  }
+
+  const uint32_t persistsAfterReplay = brain.topologyPersistenceCalls;
+  suite.expect(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+               "brain_hardware_before_admission_repeated_restore_succeeds");
+  suite.expect(brain.topologyPersistenceCalls == persistsAfterReplay,
+               "brain_hardware_before_admission_replay_is_idempotent_after_durability");
+
+  brain.neurons.erase(&first.neuron);
+  brain.neurons.erase(&second.neuron);
+  brain.machinesByUUID.erase(first.uuid);
+  brain.machinesByUUID.erase(second.uuid);
+  brain.machines.erase(&first);
+  brain.machines.erase(&second);
+}
+
+// A topology replay starts from the last durable snapshot. A later inventory
+// receipt must not replace that snapshot with one that omits a sibling replay
+// while the first durable write is still in flight.
+static void testBrainHardwareReplayRetainsConcurrentInventory(TestSuite& suite)
+{
+  DeferredTopologyInventoryBrain brain = {};
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.runtimeEnvironment.test.enabled = true;
+
+  ClusterMachine admittedFirst = makeCreatedBrainClusterMachineForTest(0x4204, "gcp-follower-overlap-1"_ctv, "10.128.15.216"_ctv, "34.10.44.21"_ctv);
+  ClusterMachine admittedSecond = makeCreatedBrainClusterMachineForTest(0x4205, "gcp-follower-overlap-2"_ctv, "10.128.15.217"_ctv, "34.10.44.22"_ctv);
+  Machine first = {}, second = {};
+  auto initializeFollower = [&](Machine& machine, const ClusterMachine& admitted) {
+    machine.uuid = admitted.uuid;
+    machine.isBrain = true;
+    machine.state = MachineState::deploying;
+    machine.slug = admitted.cloud.schema;
+    machine.type = admitted.cloud.providerMachineType;
+    machine.cloudID = admitted.cloud.cloudID;
+    const ClusterMachineAddress *privateAddress = prodigyFirstClusterMachineAddress(admitted.addresses.privateAddresses);
+    suite.require(privateAddress != nullptr, "brain_hardware_overlap_fixture_private_address");
+    if (privateAddress != nullptr)
+    {
+      machine.privateAddress = privateAddress->address;
+      machine.private4 = IPAddress(machine.privateAddress.c_str(), false).v4;
+    }
+    machine.neuron.machine = &machine;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+  };
+  initializeFollower(first, admittedFirst);
+  initializeFollower(second, admittedSecond);
+
+  auto hardwareFor = [](uint64_t collectedAtMs) {
+    MachineHardwareProfile hardware = {};
+    hardware.inventoryComplete = true;
+    hardware.collectedAtMs = collectedAtMs;
+    hardware.cpu.logicalCores = 2;
+    hardware.memory.totalMB = 4096;
+    hardware.disks.push_back(MachineDiskHardwareProfile {.sizeMB = 20'480});
+    return hardware;
+  };
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'340));
+  brain.applyMachineHardwareProfile(&second, hardwareFor(111'222'341));
+  brain.authoritativeTopology.machines.push_back(admittedFirst);
+  brain.authoritativeTopology.machines.push_back(admittedSecond);
+  suite.require(brain.restoreMachinesFromClusterTopology(brain.authoritativeTopology),
+                "brain_hardware_overlap_replay_starts");
+  suite.require(brain.topologyPersistenceCalls == 1 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_replay_is_pending");
+
+  // This is the normal machineHardwareProfile path racing the replay receipt.
+  // It must merge with the replay snapshot, rather than rebuilding from the
+  // still-durable topology that has neither follower's inventory.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'342));
+  suite.require(brain.topologyPersistenceCalls == 1 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_coalesces_newest_profile_while_replay_is_pending");
+
+  brain.finishNextTopologyPersistence(true);
+  suite.require(brain.topologyPersistenceCalls == 2 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_rebuilds_from_first_durable_snapshot");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines.size() == 2 &&
+                   brain.authoritativeTopology.machines[0].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'342 &&
+                   brain.authoritativeTopology.machines[1].hardware.inventoryComplete &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_preserves_replayed_sibling_inventory");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'343));
+  suite.require(brain.topologyPersistenceCalls == 3 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_failure_receipt_is_pending");
+  brain.finishNextTopologyPersistence(false);
+  suite.expect(brain.topologyPersistenceCalls == 3 && brain.pendingTopologyPersistences.empty(),
+               "brain_hardware_overlap_failed_receipt_does_not_busy_loop");
+
+  // The same authenticated inventory observation is a bounded retry trigger.
+  // It must rebuild from the last durable A+B topology and retain B after failure.
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'343));
+  suite.require(brain.topologyPersistenceCalls == 4 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_new_observation_retries_failure");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'343 &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_retry_preserves_sibling_inventory");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'345));
+  suite.require(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_stale_authority_receipt_is_pending");
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'346));
+  suite.require(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_stale_authority_coalesces_later_profile");
+  brain.masterAuthorityEpoch += 1;
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.topologyPersistenceCalls == 5 && brain.pendingTopologyPersistences.empty(),
+               "brain_hardware_overlap_stale_authority_receipt_cannot_start_next_write");
+
+  brain.applyMachineHardwareProfile(&first, hardwareFor(111'222'347));
+  suite.require(brain.topologyPersistenceCalls == 6 && brain.pendingTopologyPersistences.size() == 1,
+                "brain_hardware_overlap_current_authority_can_retry_after_stale_receipt");
+  brain.finishNextTopologyPersistence(true);
+  suite.expect(brain.authoritativeTopology.machines[0].hardware.collectedAtMs == 111'222'347 &&
+                   brain.authoritativeTopology.machines[1].hardware.collectedAtMs == 111'222'341,
+               "brain_hardware_overlap_current_authority_retry_preserves_sibling_inventory");
+
+  brain.neurons.erase(&first.neuron);
+  brain.neurons.erase(&second.neuron);
+  brain.machinesByUUID.erase(first.uuid);
+  brain.machinesByUUID.erase(second.uuid);
+  brain.machines.erase(&first);
+  brain.machines.erase(&second);
+}
+
 static void testBrainIgnitionRequiresNeuronControlBeforeHealthy(TestSuite& suite)
 {
   bool createdRing = false;
@@ -29110,7 +29446,12 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
     retained[index].state = ContainerState::healthy;
     retained[index].runtimeReady = true;
     retained[index].explicitStatefulMeshRoles = roles;
-    if (index == 1) retained[index].explicitStatefulMeshRoles.client = 0;
+    if (index == 0)
+    {
+      retained[index].advertisements.emplace(roles.client,
+          Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 19'113));
+      retained[index].advertisingOnPorts.insert(19'113);
+    }
     head->containers.insert(&retained[index]);
     head->containersByShardGroup.insert(0, &retained[index]);
     head->countPerMachine[&machines[index]] = 1;
@@ -29137,11 +29478,14 @@ static void testOrphanedMaterializedStatefulHeadRecovery(TestSuite& suite)
   suite.expect(head->containers.size() == 2,
                "orphaned_materialized_head_failed_barrier_remains_held");
   head->materializedStatefulRecoveryHealthFailed = false;
-  retained[1].explicitStatefulMeshRoles.client = roles.client;
+  retained[1].advertisements.emplace(roles.client,
+      Advertisement(roles.client, ContainerState::healthy, ContainerState::destroying, 19'114));
+  retained[1].advertisingOnPorts.insert(19'114);
   brain.recoverDeploymentsAfterNeuronState();
   suite.expect(head->containers.size() == 2,
                "orphaned_materialized_head_duplicate_client_remains_held");
-  retained[1].explicitStatefulMeshRoles.client = 0;
+  retained[1].advertisements.erase(roles.client);
+  retained[1].advertisingOnPorts.erase(19'114);
   retained[1].state = ContainerState::scheduled;
   brain.recoverDeploymentsAfterNeuronState();
   suite.expect(head->containers.size() == 2,
@@ -30199,14 +30543,80 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 #include <prodigy/dev/tests/async_bundle_tests.h>
 #include <prodigy/dev/tests/prodigy_brain_async_recovery_tests.h>
 #include <prodigy/dev/tests/prodigy_brain_async_topology_tests.h>
+#include <prodigy/dev/tests/placement_policy_tests.h>
+#include <prodigy/dev/tests/upgrade_admission_observation_tests.h>
+#include <prodigy/dev/tests/container_retirement_authority_tests.h>
+#include <prodigy/dev/tests/stateful_serving_authority_tests.h>
+#include <prodigy/dev/tests/stateful_serving_launch_tests.h>
+#include <prodigy/dev/tests/stateful_serving_resource_tests.h>
+#include <prodigy/dev/tests/deployment_identity_tests.h>
 
 int main(void)
 {
+  if (getenv("PRODIGY_TEST_STATEFUL_SERVING_AUTHORITY_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testStatefulServingAuthorityTransitionFences(suite);
+    testStatefulServingAuthorityAsyncReceipt(suite);
+    testStatefulServingAuthorityFanoutCapability(suite);
+    testRestoredRuntimeRequiresFreshInventory(suite);
+    testStatefulServingLaunchAdmission(suite);
+    testStatefulServingResourceAdjustment(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_CONTAINER_RETIREMENT_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testContainerRetirementAuthority(suite);
+    testContainerRetirementAuthorityQuarantinesDelayedRuntime(suite);
+    testContainerRetirementDurability(suite);
+    testContainerRetirementPreKill(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_UPGRADE_ADMISSION_OBSERVATION_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testUpgradeAdmissionObservationFences(suite);
+    testAdmittedUpdateRejectsUnfencedRequests(suite);
+    testAdmittedUpdateCanonicalOperationPassesFreshFence(suite);
+    testGeneratedUpgradeBundlePolicyAndAsyncOwner(suite);
+    testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
+    testUpgradeAdmissionObservedCapacityFacts(suite);
+    testUpgradeAdmissionTargetBoundStagingCapacity(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_DEPLOYMENT_IDENTITY_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testDeploymentIdentityReceipt(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   TestSuite suite;
+
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "placement-policy") == 0)
+  {
+    testPlacementPolicyTests(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "neuron-local-subnet-initialization") == 0)
   {
     testNeuronBaseInitializesLocalContainerSubnet(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-topology-overlap") == 0)
+  {
+    testBrainHardwareReplayRetainsConcurrentInventory(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-addmachines-stale-topology") == 0)
+  {
+    testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-admission-replay") == 0)
+  {
+    testBrainReplaysHardwareReceivedBeforeTopologyAdmission(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-listener-contract") == 0)
@@ -30257,6 +30667,19 @@ int main(void)
   {
     testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
     testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "update-self-serial") == 0)
+  {
+    testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
+    testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
+    testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
+    testMaybeRelinquishMasterWaitsForRuntimeWitness(suite);
+    testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
+    testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
+    testUpdateProdigyLegacyTopicRejectsBeforeSingleBrainTransition(suite);
+    testUpdateProdigyLegacyTopicRejectsBeforeWorkersUpdate(suite);
+    testUpdateProdigyLegacyTopicPreservesExistingWorkerOperation(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "imported-tls-factory") == 0)
@@ -30530,9 +30953,13 @@ int main(void)
   }
   if (std::getenv("PRODIGY_TEST_BUNDLE_UPDATE_ONLY") != nullptr)
   {
-    testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
-    testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
-    testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
+    testUpdateProdigyLegacyTopicRejectsBeforeSingleBrainTransition(suite);
+    testUpdateProdigyLegacyTopicRejectsBeforeWorkersUpdate(suite);
+    testUpdateProdigyLegacyTopicPreservesExistingWorkerOperation(suite);
+    testAdmittedUpdateRejectsUnfencedRequests(suite);
+    testAdmittedUpdateCanonicalOperationPassesFreshFence(suite);
+    testGeneratedUpgradeBundlePolicyAndAsyncOwner(suite);
+    testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
     testBootstrapBundleSupersessionReceipt(suite);
     testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
     testWorkerStateUploadClearsOnlyValidatedExecFence(suite);
@@ -30610,7 +31037,7 @@ int main(void)
     testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
     testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
     testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
-    testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
+    testMaybeRelinquishMasterWaitsForRuntimeWitness(suite);
     testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
     testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
     if (createdRing)
@@ -30742,6 +31169,15 @@ int main(void)
   }
 
   testContainerNeuronListenerContract(suite);
+  testPlacementPolicyTests(suite);
+  testUpgradeAdmissionObservationFences(suite);
+  testAdmittedUpdateRejectsUnfencedRequests(suite);
+  testAdmittedUpdateCanonicalOperationPassesFreshFence(suite);
+  testGeneratedUpgradeBundlePolicyAndAsyncOwner(suite);
+  testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
+  testUpgradeAdmissionObservedCapacityFacts(suite);
+  testUpgradeAdmissionTargetBoundStagingCapacity(suite);
+  testDeploymentIdentityReceipt(suite);
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
   testApiCredentialPolicyAvailability(suite);
@@ -30832,12 +31268,12 @@ int main(void)
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
-  testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
+  testMaybeRelinquishMasterWaitsForRuntimeWitness(suite);
   testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
   testUpdateSelfFinalRelinquishPersistsDesignatedHandoff(suite);
-  testUpdateProdigyRespondsBeforeSingleBrainTransition(suite);
-  testUpdateProdigyDefersSuccessUntilWorkersRestore(suite);
-  testUpdateProdigyRejectsDifferentDigestWithoutMutation(suite);
+  testUpdateProdigyLegacyTopicRejectsBeforeSingleBrainTransition(suite);
+  testUpdateProdigyLegacyTopicRejectsBeforeWorkersUpdate(suite);
+  testUpdateProdigyLegacyTopicPreservesExistingWorkerOperation(suite);
   testWorkerBundleUpgradeAcknowledgementOrderingAndRecovery(suite);
   testPersistentMasterAuthorityPackageRestore(suite);
   testCompletedLocalRecoveryWitnessSupersedesNewerAuthority(suite);
@@ -30968,8 +31404,8 @@ int main(void)
   testMachineHealthySkipsScheduledStatelessDonorMoveUntilQuiescent(suite);
   testDrainMachineSkipsScheduledLiveRedeployUntilHealthy(suite);
   testBrainNeuronHandlerRecordsContainerStatisticsAndReplicates(suite);
-  testBrainNeuronHandlerContainerStatisticsCanTriggerStatefulTopologyCutover(suite);
-  testBrainReplicatedMetricAppendCanTriggerStatefulTopologyCutover(suite);
+  testBrainNeuronHandlerContainerStatisticsRequiresStatefulTopologyAuthority(suite);
+  testBrainReplicatedMetricAppendCannotAuthorizeStatefulTopologyCutover(suite);
   testBrainNeuronHandlerHandlesRestartingContainerFailure(suite);
   testBrainNeuronHandlerRestartingStatefulMasterKeepsClientServiceSticky(suite);
   testBrainNeuronHandlerHandlesNonRestartingContainerFailureAndDrainsMachine(suite);
@@ -30990,6 +31426,8 @@ int main(void)
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);
   testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachine(suite);
   testBrainNeuronHandlerAppliesMachineHardwareProfile(suite);
+  testBrainReplaysHardwareReceivedBeforeTopologyAdmission(suite);
+  testBrainHardwareReplayRetainsConcurrentInventory(suite);
   testBrainIgnitionRequiresNeuronControlBeforeHealthy(suite);
   testBrainHealthyRequiresInventoryAndFragment(suite);
   testTestClusterConfigOverridesCollectedHardwareCapacity(suite);

@@ -32,6 +32,11 @@ constexpr static inline uint32_t vultrCreateRecoveryMaxAttempts = 48u;
 constexpr static inline uint32_t vultrMachineProvisioningUnchangedPollSleepMs = 250u;
 constexpr static inline uint32_t vultrMachineProvisioningTimeoutMs = 600'000u;
 
+static inline bool vultrVerifiedResourceNotFound(MultiCurlClient::Status status, long statusCode)
+{
+  return status == MultiCurlClient::Status::success && statusCode == 404;
+}
+
 static inline uint32_t vultrHashRackIdentity(std::string_view s)
 {
   uint32_t h = 2'166'136'261u;
@@ -1186,7 +1191,9 @@ private:
   ProdigyHostTask<bool> fetchMachineDetail(CoroutineStack *coro,
                                            const String& id,
                                            MachineConfig::MachineKind kind,
-                                           String& response)
+                                           String& response,
+                                           MultiCurlClient::Status *statusOut = nullptr,
+                                           long *statusCodeOut = nullptr)
   {
     String url;
     url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(String(resourcePath(kind)), id);
@@ -1194,6 +1201,14 @@ private:
     MultiCurlClient::Result result = co_await client.send(
         coro, client.request(MultiCurlClient::Method::get, url, nullptr,
                              VultrHttpTransport::getTimeout));
+    if (statusOut)
+    {
+      *statusOut = result.status;
+    }
+    if (statusCodeOut)
+    {
+      *statusCodeOut = result.statusCode;
+    }
     response = std::move(result.body);
     co_return VultrHttpTransport::succeeded(result);
   }
@@ -2592,11 +2607,23 @@ public:
       co_return;
     }
     Vector<String> vmLabels = {};
+    bool sawVerifiedNotFound = false;
+    bool sawUnexpectedFailure = false;
     for (MachineConfig::MachineKind kind : {MachineConfig::MachineKind::bareMetal, MachineConfig::MachineKind::vm})
     {
       String detailResponse;
-      if (co_await fetchMachineDetail(coro, cloudID, kind, detailResponse) == false)
+      MultiCurlClient::Status detailStatus = MultiCurlClient::Status::initializationFailure;
+      long detailStatusCode = 0;
+      if (co_await fetchMachineDetail(coro, cloudID, kind, detailResponse, &detailStatus, &detailStatusCode) == false)
       {
+        if (vultrVerifiedResourceNotFound(detailStatus, detailStatusCode))
+        {
+          sawVerifiedNotFound = true;
+        }
+        else
+        {
+          sawUnexpectedFailure = true;
+        }
         continue;
       }
       if (kind == MachineConfig::MachineKind::vm)
@@ -2632,8 +2659,25 @@ public:
         }
         co_return;
       }
+      if (vultrVerifiedResourceNotFound(response.status, response.statusCode))
+      {
+        if (vmLabels.empty() == false)
+        {
+          String blockFailure = {};
+          if (co_await destroyBootBlocksForMachineLabels(coro, vmLabels, blockFailure) == false)
+          {
+            failure = std::move(blockFailure);
+          }
+        }
+        co_return;
+      }
+      sawUnexpectedFailure = true;
     }
-    failure.assign("vultr machine not found"_ctv);
+    if (sawVerifiedNotFound && sawUnexpectedFailure == false)
+    {
+      co_return;
+    }
+    failure.assign("vultr machine deletion failed"_ctv);
   }
 
 private:

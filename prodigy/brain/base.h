@@ -27,6 +27,7 @@
 #include <networking/reconnector.h>
 
 class ContainerView;
+class ContainerPlan;
 class ApplicationDeployment;
 class MachineTicket;
 class Mesh;
@@ -68,9 +69,13 @@ public:
   bool connected = false;
   bool currentStreamAccepted = false;
   bool registrationFresh = false;
-  bool transitionAfterBundleEcho = false;
   bool transitionAfterBundleAckSend = false;
-  bool installedBundleReadPending = false;
+  bool placementPolicyCapabilityAcknowledged = false;
+  bool containerRetirementCapabilityAcknowledged = false;
+  bool statefulServingAuthorityCapabilityAcknowledged = false;
+  uint128_t containerRetirementCapabilityUUID = 0;
+  int64_t containerRetirementCapabilityBootNs = 0;
+  uint64_t containerRetirementCapabilityIOGeneration = 0;
   // Local elapsed time only: wall-clock corrections must not suppress probes
   // while Ring's elapsed-time liveness deadline continues to run.
   int64_t lastReceiveMs = 0;
@@ -131,9 +136,13 @@ public:
     connected = false;
     currentStreamAccepted = false;
     registrationFresh = false;
-    transitionAfterBundleEcho = false;
     transitionAfterBundleAckSend = false;
-    installedBundleReadPending = false;
+    placementPolicyCapabilityAcknowledged = false;
+    containerRetirementCapabilityAcknowledged = false;
+    statefulServingAuthorityCapabilityAcknowledged = false;
+    containerRetirementCapabilityUUID = 0;
+    containerRetirementCapabilityBootNs = 0;
+    containerRetirementCapabilityIOGeneration = 0;
     kernel.clear();
     osID.clear();
     osVersionID.clear();
@@ -687,6 +696,63 @@ public:
   virtual bool workerBundleUpgradeTransitionPending(const Machine *machine) const
   {
     (void)machine;
+    return false;
+  }
+  // Stateful source retirement is opt-in: the concrete Brain must durably
+  // journal every source and prove capability/authority ACK coverage first.
+  virtual bool prepareStatefulTopologyRetirement(ApplicationDeployment *deployment)
+  {
+    (void)deployment;
+    return false;
+  }
+  // The serving decision is committed by the same authority owner before
+  // deployment reconciliation can publish it or retire its previous owner.
+  virtual bool prepareStatefulServingTransition(
+      ApplicationDeployment *, StatefulWorkerTopologyUpgradePhase)
+  {
+    return false;
+  }
+
+  enum class StatefulServingLaunchAdmission : uint8_t { ready, pending, rejected };
+  enum class StatefulServingResourceAdjustmentAdmission : uint8_t { ready, pending, rejected };
+  virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
+  virtual bool statefulServingRecoveryReady() const { return true; }
+  virtual StatefulServingResourceAdjustmentAdmission prepareStatefulServingResourceAdjustment(
+      ApplicationDeployment *, const ApplicationConfig&)
+  {
+    return StatefulServingResourceAdjustmentAdmission::ready;
+  }
+  virtual bool refreshStatefulServingMachineCapacity(const Vector<Machine *>&) { return false; }
+  virtual bool statefulServingResourceObservationSupported(const Machine *) const { return false; }
+  virtual bool prepareStatefulClientChange(ApplicationDeployment *, uint32_t, uint128_t) { return false; }
+  virtual StatefulServingLaunchAdmission prepareStatefulServingLaunch(
+      ApplicationDeployment *, ContainerView *, const ContainerPlan&, uint128_t)
+  {
+    return StatefulServingLaunchAdmission::ready;
+  }
+
+
+  virtual bool restoreStatefulServingDecision(ApplicationDeployment *)
+  {
+    return false;
+  }
+  // Concrete runtime owners must prove the commissioned peers can retain the
+  // durable journal before starting a topology change.
+  virtual bool statefulTopologyRetirementActivationEnabled(void) const
+  {
+    return false;
+  }
+
+  virtual bool statefulTopologyRetirementSettled(uint64_t deploymentID, uint64_t operationID) const
+  {
+    (void)deploymentID;
+    (void)operationID;
+    return false;
+  }
+  virtual bool statefulTopologyRetirementStarted(uint64_t deploymentID, uint64_t operationID) const
+  {
+    (void)deploymentID;
+    (void)operationID;
     return false;
   }
 

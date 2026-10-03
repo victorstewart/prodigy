@@ -26,6 +26,8 @@ repo_root="$(cd "${script_dir}/../../.." && pwd -P)"
 mkdir -p "${repo_root}/.run"
 
 runner_mode=oneshot
+runtime_qualification=
+two_cluster_coexistence=0
 workspace_root=
 manifest_path=
 machines=3
@@ -41,6 +43,14 @@ mothership_bin=
 mothership_autoscale_interval_seconds=180
 mothership_update_prodigy_input=
 mothership_update_start=2
+mothership_plan_upgrade_target_bundle=
+mothership_plan_upgrade_source_bundle=
+mothership_plan_upgrade_operation_id=
+update_continuity_probe=0
+update_continuity_probe_interval_ms=250
+update_continuity_max_failures=0
+update_fault_receipt=
+update_command_timeout=240
 os_update_restart_on_command="${PRODIGY_DEV_OS_UPDATE_RESTART_ON_COMMAND:-0}"
 os_update_command_timeout=90
 os_update_rollout_timeout=
@@ -126,11 +136,23 @@ declare -a required_log_substrings=()
 while [[ $# -gt 0 ]]
 do
    case "$1" in
+      --runtime-qualification=*)
+         runtime_qualification="${1#*=}"
+         ;;
+      --two-cluster-coexistence=*)
+         two_cluster_coexistence="${1#*=}"
+         ;;
       --require-brain-log-substring=*)
          required_log_substrings+=("${1#*=}")
          ;;
       --tunnel-ebpf=*|--host-ingress-ebpf=*|--host-egress-ebpf=*|--fake-ipv4-boundary-ebpf=*|--private-ipv4-prefix=*|--switchboard-gateway-index=*)
          fail "runtime-owned artifact and network overrides are no longer harness options: ${1%%=*}"
+         ;;
+      --mothership-plan-upgrade-target-bundle=*|--mothership-plan-upgrade-source-bundle=*|--mothership-plan-upgrade-operation-id=*|--update-continuity-probe=*|--update-continuity-probe-interval-ms=*|--update-continuity-max-failures=*|--update-fault-receipt=*|--update-command-timeout=*)
+         key="${1%%=*}"
+         key="${key#--}"
+         key="${key//-/_}"
+         printf -v "${key}" '%s' "${1#*=}"
          ;;
       --runner-mode=*|--workspace-root=*|--manifest-path=*|--machines=*|--brains=*|--test-machine-logical-cores=*|--test-machine-memory-mb=*|--test-machine-storage-mb=*|--duration=*|--brain-bootstrap-family=*|--inter-container-mtu=*|--enable-fake-ipv4-boundary=*|--mothership-bin=*|--mothership-autoscale-interval-seconds=*|--mothership-update-prodigy-input=*|--mothership-update-start=*|--os-update-restart-on-command=*|--os-update-command-timeout=*|--os-update-rollout-timeout=*|--master-index=*|--fault-mode=*|--fault-targets=*|--fault-start=*|--fault-start-on-ready=*|--fault-duration=*|--fault-cycles=*|--fault-down=*|--fault-up=*|--post-fault-window=*|--fault-master-change-budget-ms=*|--update-master-change-budget-ms=*|--update-order-budget-ms=*|--expect-master-available=*|--expect-master-change=*|--expect-master-change-during-fault=*|--expect-peer-recovery=*|--expect-full-brain-registration=*|--deploy-plan-json=*|--deploy-container-zstd=*|--deploy-expect-accept=*|--deploy-expect-text=*|--deploy-second-plan-json=*|--deploy-second-container-zstd=*|--deploy-second-start=*|--deploy-second-expect-accept=*|--deploy-second-expect-text=*|--deploy-second-container-log-receipt=*|--deploy-third-plan-json=*|--deploy-third-container-zstd=*|--deploy-third-start=*|--deploy-third-expect-accept=*|--deploy-third-expect-text=*|--deploy-fourth-plan-json=*|--deploy-fourth-container-zstd=*|--deploy-fourth-start=*|--deploy-fourth-expect-accept=*|--deploy-fourth-expect-text=*|--deploy-fourth-container-log-receipt=*|--deploy-ping-port=*|--deploy-ping-payload=*|--deploy-ping-expect=*|--deploy-ping-all=*|--deploy-ping-after-fault=*|--deploy-skip-probe=*|--deploy-report-application=*|--deploy-report-version-id=*|--deploy-report-version-min=*|--deploy-report-attempts=*|--deploy-report-min-healthy=*|--deploy-report-max-healthy-min=*|--deploy-report-final-healthy-min=*|--deploy-report-final-healthy-max=*|--deploy-report-min-target=*|--deploy-report-max-target-min=*|--deploy-report-final-target-max=*|--deploy-report-min-deployed=*|--deploy-report-max-deployed-min=*|--deploy-report-final-deployed-max=*|--deploy-report-min-shard-groups=*|--deploy-report-max-shard-groups-min=*|--deploy-report-final-shard-groups-max=*|--deploy-report-max-crashes-max=*|--deploy-report-runtime-cores-min=*|--deploy-report-runtime-memory-min-mb=*|--deploy-report-runtime-storage-min-mb=*|--deploy-report-runtime-cores-max-min=*|--deploy-report-runtime-memory-max-min-mb=*|--deploy-report-runtime-storage-max-min-mb=*|--deploy-report-require-scaler=*|--deploy-report-require-scaler-value-min=*|--deploy-report-traffic-burst=*|--deploy-report-success-hold-ms=*|--deploy-report-floor-min-runtime-ms=*|--deploy-report-poll-interval-ms=*|--deploy-mesh-mode=*|--deploy-mesh-require-all=*)
          key="${1%%=*}"
@@ -164,7 +186,7 @@ boolean()
    [[ "$1" == 0 || "$1" == 1 ]]
 }
 
-for value in "${machines}" "${brains}" "${test_machine_logical_cores}" "${test_machine_memory_mb}" "${test_machine_storage_mb}" "${duration}" "${inter_container_mtu}" "${mothership_autoscale_interval_seconds}" "${fault_start}" "${fault_duration}" "${fault_cycles}" "${fault_down}" "${fault_up}" "${post_fault_window}" "${deploy_fourth_start}" "${deploy_ping_port}" "${deploy_report_attempts}" "${deploy_report_poll_interval_ms}"
+for value in "${machines}" "${brains}" "${test_machine_logical_cores}" "${test_machine_memory_mb}" "${test_machine_storage_mb}" "${duration}" "${inter_container_mtu}" "${mothership_autoscale_interval_seconds}" "${update_command_timeout}" "${update_continuity_probe_interval_ms}" "${update_continuity_max_failures}" "${fault_start}" "${fault_duration}" "${fault_cycles}" "${fault_down}" "${fault_up}" "${post_fault_window}" "${deploy_fourth_start}" "${deploy_ping_port}" "${deploy_report_attempts}" "${deploy_report_poll_interval_ms}"
 do
    unsigned "${value}" || fail "numeric option is invalid: ${value}"
 done
@@ -172,10 +194,31 @@ done
 [[ "${runner_mode}" == oneshot || "${runner_mode}" == persistent ]] || fail "runner mode must be oneshot or persistent"
 [[ "${brain_bootstrap_family}" =~ ^(ipv4|private6|public6|multihome6)$ ]] || fail "brain bootstrap family is invalid"
 [[ "${fault_mode}" =~ ^(link|crash|flap)$ ]] || fail "fault mode is invalid"
-for value in "${enable_fake_ipv4_boundary}" "${fault_start_on_ready}" "${expect_full_brain_registration}" "${deploy_expect_accept}" "${deploy_second_expect_accept}" "${deploy_third_expect_accept}" "${deploy_fourth_expect_accept}" "${deploy_ping_all}" "${deploy_ping_after_fault}" "${deploy_skip_probe}" "${deploy_report_version_min}" "${deploy_mesh_require_all}" "${os_update_restart_on_command}"
+for value in "${two_cluster_coexistence}" "${enable_fake_ipv4_boundary}" "${update_continuity_probe}" "${fault_start_on_ready}" "${expect_full_brain_registration}" "${deploy_expect_accept}" "${deploy_second_expect_accept}" "${deploy_third_expect_accept}" "${deploy_fourth_expect_accept}" "${deploy_ping_all}" "${deploy_ping_after_fault}" "${deploy_skip_probe}" "${deploy_report_version_min}" "${deploy_mesh_require_all}" "${os_update_restart_on_command}"
 do
    boolean "${value}" || fail "boolean option is invalid: ${value}"
 done
+if [[ -n "${update_fault_receipt}" ]]
+then
+   fail "receipt-gated update faults require the typed per-member rollout receipt report; descriptive clusterReport updateStage is not a receipt"
+fi
+if [[ -n "${mothership_plan_upgrade_target_bundle}" || -n "${mothership_plan_upgrade_source_bundle}" || -n "${mothership_plan_upgrade_operation_id}" ]]
+then
+   [[ -n "${mothership_plan_upgrade_target_bundle}" && -n "${mothership_plan_upgrade_source_bundle}" && -n "${mothership_plan_upgrade_operation_id}" ]] ||
+      fail "planUpgrade requires target bundle, source bundle, and canonical operation ID"
+fi
+if [[ -n "${mothership_update_prodigy_input}" ]]
+then
+   [[ "${mothership_plan_upgrade_operation_id}" =~ ^0x[0-9a-f]{1,32}$ &&
+      ! "${mothership_plan_upgrade_operation_id}" =~ ^0x0+$ ]] ||
+      fail "updateProdigy requires a nonzero lower-case 0x hex operation ID"
+fi
+if [[ "${update_continuity_probe}" == 1 ]]
+then
+   [[ -n "${mothership_update_prodigy_input}" ]] || fail "concurrent update probes require --mothership-update-prodigy-input"
+   [[ "${deploy_ping_port}" -gt 0 && "${deploy_skip_probe}" == 0 ]] || fail "concurrent update probes require an enabled deployment probe"
+   [[ -n "${deploy_report_application}" ]] || fail "concurrent update probes require --deploy-report-application"
+fi
 if [[ "${enable_fake_ipv4_boundary}" == 1 && "${PRODIGY_DEV_ALLOW_BPF_ATTACH:-0}" != 1 ]]
 then
    fail "fake IPv4 boundary requires explicitly authorized BPF attachment"
@@ -190,6 +233,41 @@ mothership_bin="$(readlink -f "${mothership_bin}")"
 [[ -x "${mothership_bin}" ]] || fail "Mothership binary is not executable: ${mothership_bin}"
 [[ -x "$(dirname "${mothership_bin}")/prodigy" ]] || fail "Mothership has no sibling Prodigy binary"
 [[ "$(readlink -f "$(dirname "${mothership_bin}")/prodigy")" == "${prodigy_bin}" ]] || fail "Mothership and requested Prodigy must be sibling release artifacts"
+if [[ -n "${runtime_qualification}" ]]
+then
+   export PRODIGY_DEV_ENABLE_FAKE_IPV4_BOUNDARY="${enable_fake_ipv4_boundary}"
+   export PRODIGY_DEV_TEST_MACHINE_LOGICAL_CORES="${test_machine_logical_cores}"
+   export PRODIGY_DEV_TEST_MACHINE_MEMORY_MB="${test_machine_memory_mb}"
+   export PRODIGY_DEV_TEST_MACHINE_STORAGE_MB="${test_machine_storage_mb}"
+   case "${runtime_qualification}" in
+      stateful-topology)
+         exec bash "${script_dir}/prodigy_dev_stateful_topology_upgrade_matrix.sh" "${prodigy_bin}" "${mothership_bin}" "$(dirname "${prodigy_bin}")/prodigy_pingpong_container_noport"
+         ;;
+      os-update)
+         exec bash "${script_dir}/prodigy_dev_os_update_reimage_matrix.sh" "${prodigy_bin}" "${mothership_bin}"
+         ;;
+      stateless-placement)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec "${script_dir}/prodigy_dev_placement_runtime_qualification.sh" "${prodigy_bin}" "${mothership_bin}" "${deploy_container_zstd}" "${deploy_plan_json}"
+         ;;
+      retained-follower)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec bash "${script_dir}/prodigy_dev_storage_multidrive_resize_smoke.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" follower-retained 0 \
+            "$(dirname "${prodigy_bin}")/prodigy.$(uname -m).bundle.tar.zst"
+         ;;
+      pair-endpoint)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container"
+         ;;
+      *) fail "unknown runtime qualification scenario: ${runtime_qualification}" ;;
+   esac
+fi
+if [[ "${two_cluster_coexistence}" == 1 ]]
+then
+   exec "${script_dir}/prodigy_dev_two_cluster_coexistence.sh" "${prodigy_bin}" "${mothership_bin}"
+fi
 
 tmpdir="$(mktemp -d "${repo_root}/.run/prodigy-dev-harness.XXXXXX")"
 if [[ -z "${workspace_root}" ]]
@@ -207,6 +285,7 @@ export PRODIGY_MOTHERSHIP_TIDESDB_PATH="${PRODIGY_MOTHERSHIP_TIDESDB_PATH:-${tmp
 create_log="${tmpdir}/create.log"
 cluster_created=0
 keep_tmp="${PRODIGY_DEV_KEEP_TMP:-0}"
+update_command_pid=
 
 copy_observation_logs()
 {
@@ -230,6 +309,11 @@ cleanup()
    trap - EXIT HUP INT TERM
    set +e
    [[ "${status}" -eq 0 ]] || preserve_tmp=1
+   if [[ -n "${update_command_pid}" ]] && kill -0 "${update_command_pid}" >/dev/null 2>&1
+   then
+      kill "${update_command_pid}" >/dev/null 2>&1 || true
+      wait "${update_command_pid}" >/dev/null 2>&1 || true
+   fi
 
    preserve_observation_logs()
    {
@@ -738,9 +822,9 @@ scaler_satisfied()
          name = $0
          sub(/^[[:space:]]*name:[[:space:]]*/, "", name)
       }
-      /^[[:space:]]*value:/ && name == wanted {
+      /^[[:space:]]*(nvalue|value):/ && name == wanted {
          value = $0
-         sub(/^[[:space:]]*value:[[:space:]]*/, "", value)
+         sub(/^[[:space:]]*(nvalue|value):[[:space:]]*/, "", value)
          if ((value + 0) >= (minimum + 0)) found = 1
       }
       END { exit(found ? 0 : 1) }
@@ -776,12 +860,19 @@ runtime_resources_satisfied()
 wait_application_report()
 {
    [[ -n "${deploy_report_application}" ]] || return 0
+   local phase="${1:-initial}"
    local report="${tmpdir}/application-report.log"
    local block="${tmpdir}/application-deployment.log"
-   local peak_healthy=0
-   local peak_target=0
-   local peak_deployed=0
-   local peak_shards=0
+   if [[ "${phase}" != initial ]]
+   then
+      report="${tmpdir}/application-${phase}-report.log"
+      block="${tmpdir}/application-${phase}-deployment.log"
+   fi
+   # Retain the observed transition peaks when requiring fresh recovery health.
+   local peak_healthy="${application_report_peak_healthy:-0}"
+   local peak_target="${application_report_peak_target:-0}"
+   local peak_deployed="${application_report_peak_deployed:-0}"
+   local peak_shards="${application_report_peak_shards:-0}"
    local started="$(date +%s%3N)"
    local stable_since=0
    local attempt
@@ -832,12 +923,19 @@ wait_application_report()
             stable=$((now - stable_since))
             if [[ "${stable}" -ge "${deploy_report_success_hold_ms}" ]]
             then
-               echo "APPLICATION_REPORT_ASSERT success application=${deploy_report_application} healthy=${healthy} target=${target} deployed=${deployed} shards=${shards} crashes=${crashes}"
+               application_report_peak_healthy="${peak_healthy}"
+               application_report_peak_target="${peak_target}"
+               application_report_peak_deployed="${peak_deployed}"
+               application_report_peak_shards="${peak_shards}"
+               echo "APPLICATION_REPORT_ASSERT success application=${deploy_report_application} phase=${phase} healthy=${healthy} target=${target} deployed=${deployed} shards=${shards} crashes=${crashes}"
                return 0
             fi
          else
             stable_since=0
          fi
+      else
+         # A missing observation breaks the continuous healthy hold window.
+         stable_since=0
       fi
 
       if [[ "${deploy_ping_port}" -gt 0 && "${deploy_skip_probe}" == 0 && ( "${deploy_report_traffic_burst}" -gt 1 || -n "${deploy_report_require_scaler}" ) ]]
@@ -888,14 +986,80 @@ then
    echo "DEPLOY_PING success port=${deploy_ping_port}"
 fi
 
+run_update_admission()
+{
+   [[ -n "${mothership_plan_upgrade_target_bundle}" ]] || return 0
+   local output="${tmpdir}/plan-upgrade.log"
+   if ! "${mothership_bin}" planUpgrade "${cluster_name}" \
+      "${mothership_plan_upgrade_target_bundle}" \
+      "${mothership_plan_upgrade_source_bundle}" \
+      "${mothership_plan_upgrade_operation_id}" >"${output}" 2>&1
+   then
+      sed -n '1,240p' "${output}" >&2
+      fail "planUpgrade rejected the source/target admission"
+   fi
+   rg -q 'planUpgrade success=1 eligible=1' "${output}" || {
+      sed -n '1,240p' "${output}" >&2
+      fail "planUpgrade did not persist an eligible admission"
+   }
+   echo "MOTHERSHIP_UPDATE_ADMISSION success operationID=${mothership_plan_upgrade_operation_id}"
+}
+
+run_update_continuity_sample()
+{
+   local sample="$1"
+   local report="${tmpdir}/update-application-${sample}.log"
+   if probe_once "${deploy_ping_all}"
+   then
+      update_continuity_successes=$((update_continuity_successes + 1))
+   else
+      update_continuity_failures=$((update_continuity_failures + 1))
+   fi
+   if ! application_report "${deploy_report_application}" "${report}" || rg -q '^[[:space:]]*state: DeploymentState::failed$' "${report}"
+   then
+      update_continuity_failures=$((update_continuity_failures + 1))
+   fi
+}
+
 if [[ -n "${mothership_update_prodigy_input}" ]]
 then
+   run_update_admission
    sleep "${mothership_update_start}"
    update_before="$(date +%s%3N)"
-   "${mothership_bin}" updateProdigy "${cluster_name}" "${mothership_update_prodigy_input}" >"${tmpdir}/update.log" 2>&1 || {
-      sed -n '1,240p' "${tmpdir}/update.log" >&2
-      fail "updateProdigy failed"
-   }
+   if [[ "${update_continuity_probe}" == 1 ]]
+   then
+      update_continuity_successes=0
+      update_continuity_failures=0
+      update_continuity_sample=0
+      timeout --preserve-status "${update_command_timeout}"s \
+         "${mothership_bin}" updateProdigy "${cluster_name}" "${mothership_update_prodigy_input}" "${mothership_plan_upgrade_operation_id}" >"${tmpdir}/update.log" 2>&1 &
+      update_command_pid="$!"
+      while kill -0 "${update_command_pid}" >/dev/null 2>&1
+      do
+         update_continuity_sample=$((update_continuity_sample + 1))
+         run_update_continuity_sample "${update_continuity_sample}"
+         printf -v update_probe_sleep '%d.%03d' "$((update_continuity_probe_interval_ms / 1000))" "$((update_continuity_probe_interval_ms % 1000))"
+         sleep "${update_probe_sleep}"
+      done
+      update_status=0
+      wait "${update_command_pid}" || update_status="$?"
+      update_command_pid=
+      if [[ "${update_status}" -ne 0 ]]
+      then
+         sed -n '1,240p' "${tmpdir}/update.log" >&2
+         fail "updateProdigy failed"
+      fi
+      [[ "${update_continuity_successes}" -gt 0 ]] || fail "no successful application probe occurred while updateProdigy was in progress"
+      [[ "${update_continuity_failures}" -le "${update_continuity_max_failures}" ]] ||
+         fail "application continuity failures exceeded update budget: ${update_continuity_failures}/${update_continuity_max_failures}"
+      echo "UPDATE_CONTINUITY success=${update_continuity_successes} failures=${update_continuity_failures}"
+   else
+      timeout --preserve-status "${update_command_timeout}"s \
+         "${mothership_bin}" updateProdigy "${cluster_name}" "${mothership_update_prodigy_input}" "${mothership_plan_upgrade_operation_id}" >"${tmpdir}/update.log" 2>&1 || {
+         sed -n '1,240p' "${tmpdir}/update.log" >&2
+         fail "updateProdigy failed"
+      }
+   fi
    wait_cluster_healthy || fail "cluster did not recover after updateProdigy"
    update_after="$(date +%s%3N)"
    [[ $((update_after - update_before)) -le "${update_order_budget_ms}" || "${update_order_budget_ms}" -eq 0 ]] || fail "updateProdigy exceeded its completion budget"
@@ -1049,6 +1213,10 @@ then
    if [[ "${expect_peer_recovery}" == 1 && "${fault_duration}" -gt 0 ]]
    then
       wait_cluster_healthy || fail "expected peer recovery after fault"
+   fi
+   if [[ "${fault_duration}" -gt 0 && -n "${deploy_report_application}" ]]
+   then
+      wait_application_report post-fault || fail "application did not satisfy its report constraints after fault recovery"
    fi
    if [[ "${deploy_ping_after_fault}" == 1 && "${deploy_skip_probe}" == 0 && "${deploy_ping_port}" -gt 0 ]]
    then

@@ -367,6 +367,307 @@ static bool configureTransportRuntimeForNode(
   return ProdigyTransportTLSRuntime::configure(bootstrap, failure);
 }
 
+static bool pumpTLSBaseHandshake(
+    TLSBase& client,
+    Buffer& clientWire,
+    Buffer& clientPlain,
+    TLSBase& server,
+    Buffer& serverWire,
+    Buffer& serverPlain,
+    bool *sawTransportFailure = nullptr,
+    uint32_t maxRounds = 32)
+{
+  if (sawTransportFailure)
+  {
+    *sawTransportFailure = false;
+  }
+
+  for (uint32_t round = 0; round < maxRounds; ++round)
+  {
+    bool progressed = false;
+    auto pump = [&](TLSBase& from, Buffer& fromWire, TLSBase& to, Buffer& toPlain) -> bool {
+      if (from.encryptInto(fromWire) == false)
+      {
+        if (sawTransportFailure)
+        {
+          *sawTransportFailure = true;
+        }
+        return false;
+      }
+
+      const uint32_t bytes = uint32_t(fromWire.outstandingBytes());
+      if (bytes == 0)
+      {
+        return true;
+      }
+
+      if (toPlain.remainingCapacity() < bytes && toPlain.reserve(toPlain.size() + bytes) == false)
+      {
+        return false;
+      }
+
+      std::memcpy(toPlain.pTail(), fromWire.pHead(), bytes);
+      if (to.decryptFrom(toPlain, bytes) == false)
+      {
+        if (sawTransportFailure)
+        {
+          *sawTransportFailure = true;
+        }
+        return false;
+      }
+
+      from.noteEncryptedBytesSent(bytes);
+      fromWire.consume(bytes, true);
+      progressed = true;
+      return true;
+    };
+
+    if (pump(client, clientWire, server, serverPlain) == false ||
+        pump(server, serverWire, client, clientPlain) == false)
+    {
+      return false;
+    }
+
+    if (client.isTLSNegotiated() && server.isTLSNegotiated())
+    {
+      return true;
+    }
+
+    if (progressed == false)
+    {
+      break;
+    }
+  }
+
+  return false;
+}
+
+static bool makeExpiredTransportCertificate(
+    const String& certificatePem,
+    const String& rootKeyPem,
+    String& expiredCertificatePem)
+{
+  expiredCertificatePem.clear();
+  X509 *certificate = VaultPem::x509FromPem(certificatePem);
+  EVP_PKEY *rootKey = VaultPem::privateKeyFromPem(rootKeyPem);
+  const bool expired = certificate != nullptr && rootKey != nullptr &&
+      X509_gmtime_adj(X509_getm_notBefore(certificate), -2 * 24 * 60 * 60) != nullptr &&
+      X509_time_adj_ex(X509_getm_notAfter(certificate), -1, 0, nullptr) != nullptr &&
+      X509_sign(certificate, rootKey, nullptr) != 0 &&
+      VaultPem::x509ToPem(certificate, expiredCertificatePem);
+  if (certificate)
+  {
+    X509_free(certificate);
+  }
+  if (rootKey)
+  {
+    EVP_PKEY_free(rootKey);
+  }
+  if (expired == false)
+  {
+    expiredCertificatePem.clear();
+  }
+  return expired;
+}
+
+static void runTransportTLSAdmissionNegativeCases(
+    TestSuite& suite,
+    uint128_t clientUUID,
+    uint128_t serverUUID,
+    const String& rootCertPem,
+    const String& rootKeyPem,
+    const String& clientCertPem,
+    const String& clientKeyPem,
+    const String& serverCertPem,
+    const String& serverKeyPem,
+    String& failure)
+{
+  const auto configureServer = [&]() -> bool {
+    const bool configured = configureTransportRuntimeForNode(
+        serverUUID, rootCertPem, rootKeyPem, serverCertPem, serverKeyPem, &failure);
+    suite.expect(configured && failure.size() == 0, "transport_tls_admission_configures_server_context");
+    return configured && failure.size() == 0;
+  };
+
+  if (configureServer() == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+
+  SSL_CTX *sameRootClientContext = TLSBase::generateCtxFromPEM(
+      reinterpret_cast<const char *>(rootCertPem.data()), uint32_t(rootCertPem.size()),
+      reinterpret_cast<const char *>(clientCertPem.data()), uint32_t(clientCertPem.size()),
+      reinterpret_cast<const char *>(clientKeyPem.data()), uint32_t(clientKeyPem.size()));
+  suite.expect(sameRootClientContext != nullptr, "transport_tls_admission_constructs_same_root_client_context");
+  if (sameRootClientContext == nullptr)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+
+  // Prove the raw TLSBase pump itself completes with the same certificate and
+  // exact Prodigy server context before using it for the no-certificate case.
+  {
+    TLSBase sameRootClient(sameRootClientContext, false);
+    TLSBase server(ProdigyTransportTLSRuntime::context(), true);
+    Buffer clientWire(4096, MemoryType::heap);
+    Buffer clientPlain(4096, MemoryType::heap);
+    Buffer serverWire(4096, MemoryType::heap);
+    Buffer serverPlain(4096, MemoryType::heap);
+    bool transportFailure = false;
+    suite.expect(
+        pumpTLSBaseHandshake(sameRootClient, clientWire, clientPlain, server, serverWire, serverPlain, &transportFailure),
+        "transport_tls_admission_same_root_raw_handshake_succeeds");
+    suite.expect(transportFailure == false, "transport_tls_admission_same_root_raw_handshake_has_no_transport_failure");
+    suite.expect(
+        sameRootClient.ssl != nullptr && server.ssl != nullptr &&
+            SSL_get_verify_result(sameRootClient.ssl) == X509_V_OK &&
+            SSL_get_verify_result(server.ssl) == X509_V_OK,
+        "transport_tls_admission_same_root_raw_handshake_verifies_both_peers");
+    uint128_t peerUUID = 0;
+    suite.expect(
+        ProdigyTransportTLSRuntime::extractPeerUUID(server.ssl, peerUUID) && peerUUID == clientUUID,
+        "transport_tls_admission_same_root_extracts_client_uuid");
+  }
+  SSL_CTX_free(sameRootClientContext);
+
+  // The server uses the exact Prodigy transport context.  A bare TLS 1.3
+  // client is intentional: it proves that the context rejects a peer which
+  // did not present a client certificate.
+  const int serverVerifyMode = SSL_CTX_get_verify_mode(ProdigyTransportTLSRuntime::context());
+  suite.expect(
+      (serverVerifyMode & (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT)) ==
+          (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT),
+      "transport_tls_no_certificate_server_context_requires_verified_peer_certificate");
+  SSL_CTX *noCertificateClientContext = SSL_CTX_new(TLS_client_method());
+  const bool noCertificateClientContextReady = noCertificateClientContext != nullptr &&
+      SSL_CTX_set_min_proto_version(noCertificateClientContext, TLS1_3_VERSION) == 1;
+  if (noCertificateClientContextReady)
+  {
+    SSL_CTX_set_verify(noCertificateClientContext, SSL_VERIFY_NONE, nullptr);
+  }
+  suite.expect(noCertificateClientContextReady, "transport_tls_no_certificate_constructs_tls13_client");
+  if (noCertificateClientContextReady)
+  {
+    {
+      TLSBase noCertificateClient(noCertificateClientContext, false);
+      TLSBase server(ProdigyTransportTLSRuntime::context(), true);
+      Buffer clientWire(4096, MemoryType::heap);
+      Buffer clientPlain(4096, MemoryType::heap);
+      Buffer serverWire(4096, MemoryType::heap);
+      Buffer serverPlain(4096, MemoryType::heap);
+      bool transportFailure = false;
+      suite.expect(
+          pumpTLSBaseHandshake(noCertificateClient, clientWire, clientPlain, server, serverWire, serverPlain, &transportFailure) == false,
+          "transport_tls_no_certificate_rejects_handshake");
+      suite.expect(transportFailure, "transport_tls_no_certificate_fails_during_tls_validation");
+      suite.expect(noCertificateClient.ssl != nullptr && SSL_get_certificate(noCertificateClient.ssl) == nullptr,
+                   "transport_tls_no_certificate_client_has_no_leaf");
+      suite.expect(server.isTLSNegotiated() == false, "transport_tls_no_certificate_server_never_negotiates");
+    }
+    SSL_CTX_free(noCertificateClientContext);
+  }
+  else if (noCertificateClientContext)
+  {
+    SSL_CTX_free(noCertificateClientContext);
+  }
+
+  String untrustedRootCertPem = {};
+  String untrustedRootKeyPem = {};
+  String untrustedClientCertPem = {};
+  String untrustedClientKeyPem = {};
+  const bool generatedUntrustedRoot = Vault::generateTransportRootCertificateEd25519(untrustedRootCertPem, untrustedRootKeyPem, &failure);
+  suite.expect(generatedUntrustedRoot && failure.size() == 0, "transport_tls_wrong_root_generates_untrusted_root");
+  if (generatedUntrustedRoot == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  const bool generatedUntrustedClient =
+      Vault::generateTransportNodeCertificateEd25519(
+          untrustedRootCertPem, untrustedRootKeyPem, clientUUID, {}, untrustedClientCertPem, untrustedClientKeyPem, &failure);
+  suite.expect(generatedUntrustedClient && failure.size() == 0, "transport_tls_wrong_root_generates_untrusted_client");
+  if (generatedUntrustedClient == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  const bool configuredWrongRootClient = configureTransportRuntimeForNode(
+      clientUUID, rootCertPem, rootKeyPem, untrustedClientCertPem, untrustedClientKeyPem, &failure);
+  suite.expect(configuredWrongRootClient && failure.size() == 0, "transport_tls_wrong_root_configures_client_context");
+  if (configuredWrongRootClient == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  ProdigyTransportTLSStream wrongRootClient = {};
+  reserveTransportStream(wrongRootClient);
+  const bool beganWrongRootClient = wrongRootClient.beginTransportTLS(false);
+  suite.expect(beganWrongRootClient, "transport_tls_wrong_root_begins_client");
+  if (beganWrongRootClient == false || configureServer() == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  ProdigyTransportTLSStream wrongRootServer = {};
+  reserveTransportStream(wrongRootServer);
+  const bool beganWrongRootServer = wrongRootServer.beginTransportTLS(true);
+  suite.expect(beganWrongRootServer, "transport_tls_wrong_root_begins_server");
+  if (beganWrongRootServer == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  suite.expect(completeTransportHandshake(wrongRootClient, wrongRootServer) == false, "transport_tls_wrong_root_rejects_handshake");
+  suite.expect(wrongRootServer.isTLSNegotiated() == false, "transport_tls_wrong_root_server_never_negotiates");
+  suite.expect(
+      wrongRootServer.ssl != nullptr && SSL_get_verify_result(wrongRootServer.ssl) != X509_V_OK,
+      "transport_tls_wrong_root_server_records_chain_validation_failure");
+
+  String expiredClientCertPem = {};
+  const bool madeExpiredClient = makeExpiredTransportCertificate(clientCertPem, rootKeyPem, expiredClientCertPem);
+  suite.expect(madeExpiredClient, "transport_tls_expired_certificate_constructs_expired_leaf");
+  if (madeExpiredClient == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  const bool configuredExpiredClient = configureTransportRuntimeForNode(
+      clientUUID, rootCertPem, rootKeyPem, expiredClientCertPem, clientKeyPem, &failure);
+  suite.expect(configuredExpiredClient && failure.size() == 0, "transport_tls_expired_certificate_configures_client_context");
+  if (configuredExpiredClient == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  ProdigyTransportTLSStream expiredClient = {};
+  reserveTransportStream(expiredClient);
+  const bool beganExpiredClient = expiredClient.beginTransportTLS(false);
+  suite.expect(beganExpiredClient, "transport_tls_expired_certificate_begins_client");
+  if (beganExpiredClient == false || configureServer() == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  ProdigyTransportTLSStream expiredServer = {};
+  reserveTransportStream(expiredServer);
+  const bool beganExpiredServer = expiredServer.beginTransportTLS(true);
+  suite.expect(beganExpiredServer, "transport_tls_expired_certificate_begins_server");
+  if (beganExpiredServer == false)
+  {
+    ProdigyTransportTLSRuntime::clear();
+    return;
+  }
+  suite.expect(completeTransportHandshake(expiredClient, expiredServer) == false, "transport_tls_expired_certificate_rejects_handshake");
+  suite.expect(expiredServer.isTLSNegotiated() == false, "transport_tls_expired_certificate_server_never_negotiates");
+  suite.expect(
+      expiredServer.ssl != nullptr && SSL_get_verify_result(expiredServer.ssl) == X509_V_ERR_CERT_HAS_EXPIRED,
+      "transport_tls_expired_certificate_server_records_expired_validation_failure");
+
+  ProdigyTransportTLSRuntime::clear();
+}
+
 static EVP_MAC_CTX *makeTransportTlsHmacContextForTest(void)
 {
   EVP_MAC *mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
@@ -1095,6 +1396,18 @@ int main(int argc, char **argv)
   {
     X509_free(serverCert);
   }
+
+  runTransportTLSAdmissionNegativeCases(
+      suite,
+      clientUUID,
+      serverUUID,
+      rootCertPem,
+      rootKeyPem,
+      clientCertPem,
+      clientKeyPem,
+      serverCertPem,
+      serverKeyPem,
+      failure);
 
   if (boundedSendOnly)
   {

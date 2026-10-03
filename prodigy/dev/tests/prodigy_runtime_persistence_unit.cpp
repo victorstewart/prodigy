@@ -378,6 +378,214 @@ static void testProductionPersistenceAdmissionFromArtifactCompletion(TestSuite& 
   reopened.close();
 }
 
+static ClusterTopology runtimePersistenceTopology(uint64_t version, uint128_t uuid)
+{
+  ClusterTopology topology = {};
+  topology.version = version;
+  ClusterMachine machine = {};
+  machine.uuid = uuid;
+  machine.source = ClusterMachineSource::created;
+  machine.backing = ClusterMachineBacking::cloud;
+  machine.isBrain = true;
+  ClusterMachineAddress privateAddress = {};
+  privateAddress.address.assign("10.77.0.1"_ctv);
+  privateAddress.cidr = 24;
+  machine.addresses.privateAddresses.push_back(std::move(privateAddress));
+  topology.machines.push_back(std::move(machine));
+  prodigyNormalizeClusterTopologyPeerAddresses(topology);
+  return topology;
+}
+
+static void testProductionTopologySnapshotOverlap(TestSuite& suite)
+{
+  for (int failureMode = 0; failureMode < 2; ++failureMode)
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    suite.expect(io != nullptr, "topology_snapshot_overlap_starts_writer");
+    if (!io) continue;
+
+    std::atomic<bool> firstEntered = false, releaseFirst = false, releaseSecond = false;
+    std::atomic<uint32_t> snapshotWrites = 0;
+    auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io,
+        [&](auto& backing, auto& request) {
+          if (!request.writeSnapshot) return;
+          const uint32_t write = ++snapshotWrites;
+          if (write == 1)
+          {
+            firstEntered = true;
+            while (!releaseFirst.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (failureMode)
+            {
+              request.result.failure.assign("injected predecessor failure"_ctv);
+              return;
+            }
+          }
+          if (failureMode == 0 && write == 2)
+            while (!releaseSecond.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          request.result.snapshotDurable = backing.saveBrainSnapshot(request.snapshot, &request.result.failure);
+          request.result.durable = request.result.snapshotDurable;
+          if (request.result.snapshotDurable)
+            request.result.bootStateDurable = backing.saveBootState(request.bootState, &request.result.failure);
+        });
+
+    const ClusterTopology baselineTopology = runtimePersistenceTopology(6, 0x7a00);
+    const ClusterTopology firstTopology = runtimePersistenceTopology(7, 0x7a01);
+    ClusterTopology secondTopology = {};
+    secondTopology.version = 8;
+    ProdigyPersistentBrainSnapshot baselineSnapshot = {};
+    baselineSnapshot.topology = baselineTopology;
+    baselineSnapshot.brainConfig.clusterUUID = 0x7a00;
+    prodigyAppendClusterTopologyBrainPeers(baselineSnapshot.brainPeers, baselineSnapshot.topology);
+    ProdigyPersistentBootState baselineBoot = runtimePersistenceBootState();
+    baselineBoot.bootstrapConfig.bootstrapPeers = baselineSnapshot.brainPeers;
+    String seedFailure = {};
+    suite.expect(store.saveBrainSnapshot(baselineSnapshot, &seedFailure) &&
+                     store.saveBootState(baselineBoot, &seedFailure),
+                 "topology_snapshot_overlap_seeds_durable_baseline");
+    persistentLocalBrainState = {};
+    persistentBootState = baselineBoot;
+    persistedBrainSnapshot = baselineSnapshot;
+    havePersistedBrainSnapshot = true;
+    ProdigyHostControlNetwork network;
+    bool firstTopologyReceipt = false, firstTopologyDurable = false;
+    bool replayReceipt = false, replayDurable = false;
+    bool secondTopologyReceipt = false, secondTopologyDurable = false;
+    bool ordinaryReceipt = false, ordinaryDurable = false;
+    bool pendingReadDurableOnly = false;
+    bool pendingSecondSubmitted = false, ordinarySubmitted = false;
+    bool durableBaselineStaleRejected = false, durableBaselineConflictRejected = false;
+    bool durableReplayReceipt = false, durableReplayDurable = false, durableReplayWasInline = false;
+    {
+      ProdigyBrain brain(network, writer);
+      brain.brainConfig.clusterUUID = 0x7a00;
+      brain.persistAuthoritativeClusterTopologyAsync(firstTopology, [&](bool durable) {
+        firstTopologyReceipt = true;
+        firstTopologyDurable = durable;
+      });
+      // This replay must share the outstanding durability receipt instead of
+      // observing an invented synchronous success.
+      brain.persistAuthoritativeClusterTopologyAsync(firstTopology, [&](bool durable) {
+        replayReceipt = true;
+        replayDurable = durable;
+      });
+      ClusterTopology durableRead = {};
+      pendingReadDurableOnly = brain.loadAuthoritativeClusterTopology(durableRead) && durableRead == baselineTopology;
+      ClusterTopology mutationBase = {};
+      suite.expect(brain.loadAuthoritativeClusterTopologyForMutation(mutationBase) && mutationBase == firstTopology,
+                   "topology_snapshot_overlap_dependent_mutation_retains_admitted_base");
+      ClusterTopology stale = firstTopology;
+      stale.version -= 1;
+      brain.persistAuthoritativeClusterTopologyAsync(std::move(stale), [&](bool durable) {
+        durableBaselineStaleRejected = !durable;
+      });
+      ClusterTopology conflict = firstTopology;
+      conflict.machines[0].uuid = 0x7a02;
+      brain.persistAuthoritativeClusterTopologyAsync(std::move(conflict), [&](bool durable) {
+        durableBaselineConflictRejected = !durable;
+      });
+      suite.expect(!firstTopologyReceipt && !replayReceipt && pendingReadDurableOnly &&
+                       durableBaselineStaleRejected && durableBaselineConflictRejected,
+                   "topology_snapshot_overlap_pending_shadow_preserves_durable_reads_and_waits_for_identical_replay");
+
+      ring.tickAction = [&] {
+        if (failureMode == 0 && firstEntered.load() && !pendingSecondSubmitted)
+        {
+          pendingSecondSubmitted = true;
+          brain.persistAuthoritativeClusterTopologyAsync(secondTopology, [&](bool durable) {
+            secondTopologyReceipt = true;
+            secondTopologyDurable = durable;
+          });
+          releaseFirst = true;
+        }
+        // The first callback must not clear the newer T2 shadow. Keep the T2
+        // worker blocked until this ordinary snapshot has been constructed.
+        if (failureMode == 0 && firstTopologyReceipt && !ordinarySubmitted)
+        {
+          ordinarySubmitted = true;
+          brain.persistLocalRuntimeStateAsync([&](bool durable) {
+            ordinaryReceipt = true;
+            ordinaryDurable = durable;
+            if (failureMode)
+            {
+              Ring::exit = true;
+              return;
+            }
+            ClusterTopology staleDurable = firstTopology;
+            brain.persistAuthoritativeClusterTopologyAsync(std::move(staleDurable), [&](bool result) {
+              durableBaselineStaleRejected = !result;
+            });
+            ClusterTopology conflictDurable = secondTopology;
+            conflictDurable.machines.push_back(runtimePersistenceTopology(8, 0x7a03).machines[0]);
+            brain.persistAuthoritativeClusterTopologyAsync(std::move(conflictDurable), [&](bool result) {
+              durableBaselineConflictRejected = !result;
+            });
+            brain.persistAuthoritativeClusterTopologyAsync(secondTopology, [&](bool result) {
+              durableReplayReceipt = true;
+              durableReplayDurable = result;
+              Ring::exit = true;
+            });
+            durableReplayWasInline = durableReplayReceipt;
+          });
+          releaseSecond = true;
+        }
+        if (failureMode && firstEntered.load() && !ordinarySubmitted)
+        {
+          ordinarySubmitted = true;
+          brain.persistLocalRuntimeStateAsync([&](bool durable) {
+            ordinaryReceipt = true;
+            ordinaryDurable = durable;
+            Ring::exit = true;
+          });
+          releaseFirst = true;
+        }
+        if (!ordinaryReceipt || (failureMode == 0 && !durableReplayReceipt)) ring.armTick(1);
+      };
+      ring.armTick(1);
+      ring.armDeadline(3000);
+      Ring::start();
+      releaseFirst = true;
+
+      const bool expectedDurable = failureMode == 0;
+      suite.expect(!ring.timedOut && pendingSecondSubmitted == expectedDurable && ordinarySubmitted &&
+                       firstTopologyReceipt && replayReceipt && ordinaryReceipt &&
+                       firstTopologyDurable == expectedDurable && replayDurable == expectedDurable &&
+                       ordinaryDurable == expectedDurable &&
+                       (failureMode || (secondTopologyReceipt && secondTopologyDurable && durableReplayReceipt &&
+                                        durableReplayDurable && !durableReplayWasInline)) && writer->drainForExec(),
+                   failureMode == 0 ? "topology_snapshot_overlap_receipts_follow_fifo_success" :
+                                      "topology_snapshot_overlap_failed_predecessor_fences_fifo_successor");
+    }
+    writer.reset();
+    io->stop();
+    ring.drainStoppedIO();
+    io.reset();
+    (void)network.shutdown();
+    store.close();
+
+    ProdigyPersistentStateStore reopened(root.path);
+    ProdigyPersistentBrainSnapshot stored = {};
+    String failure = {};
+    const bool loaded = reopened.loadBrainSnapshot(stored, &failure);
+    ProdigyPersistentBootState storedBoot = {};
+    const bool bootLoaded = reopened.loadBootState(storedBoot, &failure);
+    suite.expect(failureMode == 0 ?
+                     loaded && bootLoaded && stored.topology == secondTopology && stored.brainPeers.empty() &&
+                         storedBoot.bootstrapConfig.bootstrapPeers.empty() && durableBaselineStaleRejected &&
+                         durableBaselineConflictRejected :
+                     loaded && stored.topology == baselineTopology,
+                 failureMode == 0 ? "topology_snapshot_overlap_ordinary_snapshot_retains_admitted_topology_and_peers" :
+                                    "topology_snapshot_overlap_failed_predecessor_preserves_durable_baseline");
+    reopened.close();
+    persistentLocalBrainState = {};
+    persistentBootState = {};
+    persistedBrainSnapshot = {};
+    havePersistedBrainSnapshot = false;
+  }
+}
+
 static void testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(TestSuite& suite)
 {
   // The first durable receipt begins bundle progress.  Its ArtifactIO slot is
@@ -766,11 +974,18 @@ int main(void)
     testDurableMaterializedRecoveryHistoricalCull(suite);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "topology-snapshot-overlap") == 0)
+  {
+    testProductionTopologySnapshotOverlap(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);
+  testProductionTopologySnapshotOverlap(suite);
   testPersistentWriterDetachesViewBackedSchemaFields(suite);
   testPersistentWriterRetainedAccountingChargesManyShortStrings(suite);
   testNeuronOSUpdateUsesOwnedReceiptDrivenRequest(suite);

@@ -82,6 +82,11 @@ storage_device_count=0
 storage_device_mb=1024
 inter_container_mtu=9000
 fake_boundary=0
+datacenter_fragment=1
+private4_prefix=10.0.0
+private4_subnet=10.0.0.0/24
+private6_prefix=fd00:10
+private6_subnet=fd00:10::/64
 child_names=(one two three four)
 machine_pids=(101 202 303 404)
 index=2
@@ -375,6 +380,7 @@ nsenter() {
     *) return 1 ;;
   esac
 }
+
 fault_link_set "$workspace" 700 vp1 down
 fault_link_set "$workspace" 700 vp1 up
 printf '701\n' > "$workspace/virtual-datacenter.identity"
@@ -460,6 +466,19 @@ int main(void)
   suite.expect(containsAddress(topology.machines[0].addresses.privateAddresses, "fd00:10::a", 64), "topology_first_private_ipv6");
   suite.expect(containsAddress(topology.machines[0].addresses.publicAddresses, "2001:db8:100::a", 64), "topology_first_public_ipv6");
   suite.expect(topology.machines[0].peerAddresses.size() == 2, "topology_multihome_peer_addresses");
+
+  MothershipProdigyCluster independentCluster = cluster;
+  independentCluster.datacenterFragment = 2;
+  ClusterTopology independentTopology = {};
+  suite.expect(mothershipBuildVirtualDatacenterTopology(independentCluster, independentTopology, &failure),
+               "build_independent_fragment_topology");
+  suite.expect(containsAddress(independentTopology.machines[0].addresses.privateAddresses, "10.0.1.10", 24) &&
+                   containsAddress(independentTopology.machines[0].addresses.privateAddresses, "fd00:10:1::a", 64),
+               "independent_fragment_uses_distinct_private_network_domain");
+  String independentControlSocketPath = {};
+  mothershipResolveTestClusterControlSocketPath(independentCluster, independentControlSocketPath);
+  suite.expect(independentControlSocketPath.equals("/tmp/prodigy-vdc-0x1234-d2/mothership.sock"_ctv),
+               "independent_fragment_binds_provider_control_path");
 
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
   AddMachines bootstrapRequest = {};
@@ -564,8 +583,23 @@ int main(void)
   suite.expect(mothershipVDCParseUnsigned(overflow, overflow + sizeof(overflow) - 1, parsed) == false, "recovery_identity_rejects_overflow");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(1, 1) == false, "recovery_rejects_only_brain");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 3) == false, "recovery_rejects_second_brain");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 3, false, true), "recovery_allows_test_only_three_brain_follower");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 3, false, true) == false, "recovery_rejects_test_follower_zero_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 1) == false, "recovery_rejects_zero_machine_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 1), "recovery_allows_worker_after_brains");
+  MothershipVDCTestRecoveryFaultPhase testFault = MothershipVDCTestRecoveryFaultPhase::none;
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("frozen"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::frozen,
+               "recovery_accepts_test_fault_at_frozen_transition");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("rootInstalled"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::rootInstalled,
+               "recovery_accepts_test_fault_after_durable_root_install");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("workerReplaced"_ctv, testFault) &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::workerReplaced,
+               "recovery_accepts_test_fault_after_durable_replacement");
+  suite.expect(mothershipVDCTestParseRecoveryFaultPhase("committed"_ctv, testFault) == false &&
+               testFault == MothershipVDCTestRecoveryFaultPhase::none,
+               "recovery_rejects_unqualified_test_fault_phase");
 
   Vector<String> providerArguments = {};
   for (const char *argument : {"bash", "/proc/self/fd/7", "--serve", "/tmp/prodigy/vdc-unit", "3", "2", "65495", "0", "42", "4", "8192", "8192", "0", "1024", "/tmp/prodigy-vdc-0x1234/mothership.sock"})
@@ -596,14 +630,37 @@ int main(void)
   recovery.expectedIncompleteWorkerBundle = recovery.expectedOldBundle;
   recovery.previousBootSHA256 = recovery.expectedOldBundle;
   recovery.successorBootSHA256 = recovery.successorBundle;
+  recovery.testOnlyFollowerReplacement = true;
+  recovery.selectedMachineUUID.assign("11111111111111111111111111111111"_ctv);
+  recovery.masterMachineUUID.assign("22222222222222222222222222222222"_ctv);
+  recovery.witnessMachineUUID.assign("33333333333333333333333333333333"_ctv);
+  recovery.preflightReportSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  recovery.commissionedBrains[0] = {923, 11, 21, 31};
+  recovery.commissionedBrains[1] = {929, 12, 22, 32};
+  recovery.commissionedBrains[2] = {937, 13, 23, 33};
+  recovery.version = 3;
+  suite.expect(mothershipVDCTestFollowerRecoveryMatches(recovery, recovery.clusterUUID, 2,
+                                                         recovery.expectedOldBundle, recovery.successorBundle),
+               "recovery_accepts_exact_test_follower_retry_binding");
+  suite.expect(mothershipVDCTestFollowerRecoveryMatches(recovery, recovery.clusterUUID, 2,
+                                                         recovery.successorBundle, recovery.expectedOldBundle) == false,
+               "recovery_rejects_test_follower_retry_with_reversed_bundle_binding");
   char recoveryDirectory[] = "./vdc-recovery-unit.XXXXXX";
   const bool directoryCreated = ::mkdtemp(recoveryDirectory) != nullptr;
   suite.expect(directoryCreated, "recovery_creates_scoped_test_directory");
   if (directoryCreated)
   {
     String directory(recoveryDirectory);
+    MothershipVDCBundleRecovery legacyRecovery = recovery;
+    legacyRecovery.version = 2;
+    suite.expect(mothershipVDCWriteRecovery(directory, legacyRecovery, &failure), "recovery_preserves_v2_journal_writer");
+    MothershipVDCBundleRecovery restored = recovery;
+    suite.expect(mothershipVDCReadRecovery(directory, restored) && restored.version == 2 &&
+                 restored.expectedOldBundle == legacyRecovery.expectedOldBundle && restored.testOnlyFollowerReplacement == false &&
+                 restored.selectedMachineUUID.empty() && restored.preflightReportSHA256.empty() &&
+                 restored.commissionedBrains[0].pid == 0,
+                 "recovery_reads_existing_v2_journal_without_v3_tail");
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure), "recovery_durably_writes_intent");
-    MothershipVDCBundleRecovery restored = {};
     suite.expect(mothershipVDCReadRecovery(directory, restored) && restored.clusterUUID == recovery.clusterUUID &&
                  restored.operationID == recovery.operationID && restored.runtimeIdentity == recovery.runtimeIdentity &&
                  restored.machineIndex == 2 && restored.phase == MothershipVDCRecoveryPhase::ready &&
@@ -613,8 +670,27 @@ int main(void)
                  restored.expectedOldBundle == recovery.expectedOldBundle && restored.successorBundle == recovery.successorBundle &&
                  restored.expectedIncompleteWorkerBundle == recovery.expectedIncompleteWorkerBundle &&
                  restored.previousBootSHA256 == recovery.previousBootSHA256 && restored.successorBootSHA256 == recovery.successorBootSHA256 &&
-                 restored.providerArguments[0] == cluster.test.workspaceRoot, "recovery_preserves_distinct_runtime_and_process_identity");
+                 restored.providerArguments[0] == cluster.test.workspaceRoot && restored.testOnlyFollowerReplacement &&
+                 restored.selectedMachineUUID == recovery.selectedMachineUUID && restored.masterMachineUUID == recovery.masterMachineUUID &&
+                 restored.witnessMachineUUID == recovery.witnessMachineUUID && restored.preflightReportSHA256 == recovery.preflightReportSHA256 &&
+                 mothershipVDCSameProcess(restored.commissionedBrains[2], recovery.commissionedBrains[2]),
+                 "recovery_preserves_test_follower_preflight_and_process_identity");
+    recovery.version = 4;
+    recovery.retainedTCX[0] = {7, 46, 123, 456, 800, 801, {1,2,3,4,5,6,7,8}};
+    recovery.retainedTCX[1] = {7, 47, 124, 457, 800, 801, {8,7,6,5,4,3,2,1}};
+    suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) &&
+                 restored.version == 4 && restored.retainedTCX[0].ifindex == 7 &&
+                 restored.retainedTCX[0].attachType == 46 && restored.retainedTCX[0].programID == 123 &&
+                 restored.retainedTCX[0].linkID == 456 && restored.retainedTCX[0].programTag[7] == 8 &&
+                 restored.retainedTCX[0].wormholeFlowMapID == 800 && restored.retainedTCX[1].wormholePendingFlowMapID == 801 &&
+                 restored.retainedTCX[1].linkID == 457 && restored.retainedTCX[1].programTag[7] == 1 &&
+                 mothershipVDCTestFollowerRecoveryMatches(restored, recovery.clusterUUID, 2, recovery.expectedOldBundle, recovery.successorBundle),
+                 "recovery_preserves_exact_retained_tcx_link_identity");
     recovery.version = 3;
+    suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) &&
+                 restored.retainedTCX[0].linkID == 0 && restored.retainedTCX[1].programID == 0,
+                 "recovery_does_not_invent_retained_links_for_old_journal");
+    recovery.version = 5;
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) == false,
                  "recovery_rejects_unknown_journal_version");
     String path = {}; mothershipVirtualDatacenterPath(directory, "operation", path);
@@ -649,7 +725,6 @@ int main(void)
   recovery.providerArguments[11] = "/tmp/another-cluster.sock"_ctv;
   suite.expect(mothershipVDCPrepareSupersessionBoot(originalBoot, recovery, successorBoot, &failure) == false,
                "recovery_rejects_bootstrap_control_identity_mismatch");
-
   // Signal only this test's own child. A stale start-time must not affect it.
   pid_t child = ::fork();
   if (child == 0) { while (true) ::pause(); }

@@ -115,6 +115,17 @@ foreach(_required IN ITEMS
    endif()
 endforeach()
 
+foreach(_required IN ITEMS
+   "machine_bpffs_root=\"\${filesystem_root}/machine-bpffs\""
+   "mount -t bpf bpf \"\${machine_bpffs}\""
+   "mount --bind \"\${PRODIGY_VDC_MACHINE_BPFFS}\" /sys/fs/bpf"
+   "valid_machine_bpffs \"\${index}\" || failed 1 \"\$LINENO\"")
+   string(FIND "${_provider_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "virtual datacenter must retain a provider-owned bpffs per fake machine: ${_required}")
+   endif()
+endforeach()
+
 foreach(_forbidden IN ITEMS
    "PRODIGY_DEV_SHARED_TRANSPORT_TLS_DIR="
    "shared-transport-tls"
@@ -136,7 +147,7 @@ endforeach()
 foreach(_required IN ITEMS
    "public_ingress_mtu=1500"
    "ip route replace 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\" mtu \"\${public_ingress_mtu}\""
-   "ip netns exec \"\${parent_ns}\" ip route replace 198.18.0.0/16 via 10.0.0.10 dev vdcbr0 src 10.0.0.1 mtu \"\${public_ingress_mtu}\""
+   "ip netns exec \"\${parent_ns}\" ip route replace 198.18.0.0/16 via \"\${private4_prefix}.10\" dev vdcbr0 src \"\${private4_prefix}.1\" mtu \"\${public_ingress_mtu}\""
    "ip route del 198.18.0.0/16 via 172.31.0.2 dev \"\${host_edge}\""
    "iptables -t nat -A POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o \"\${host_edge}\" -j SNAT --to-source 172.31.0.1"
    "iptables -t nat -D POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o \"\${host_edge}\" -j SNAT --to-source 172.31.0.1")
@@ -173,6 +184,59 @@ if(_darwin_branch EQUAL -1 OR _linux_branch EQUAL -1 OR
    _darwin_route_delete LESS _darwin_branch OR _darwin_route_delete GREATER _linux_branch OR
    _darwin_cleanup_trap GREATER _darwin_route_add OR _darwin_route_delete GREATER _darwin_container_stop)
    message(FATAL_ERROR "Apple host route setup and teardown must remain confined to the Darwin launcher branch")
+endif()
+
+set(_two_cluster_coexistence "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_two_cluster_coexistence.sh")
+file(READ "${_two_cluster_coexistence}" _two_cluster_source)
+foreach(_required IN ITEMS
+   "createCluster"
+   "clusterReport"
+   "faultTestCluster"
+   "removeCluster"
+   "enableFakeIpv4Boundary:false"
+   "TWO_CLUSTER_COEXISTENCE_EVIDENCE")
+   string(FIND "${_two_cluster_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "two-cluster coexistence client missing required Mothership lifecycle assertion: ${_required}")
+   endif()
+endforeach()
+foreach(_forbidden IN ITEMS "ip netns" "unshare" "mount --" "bpftool")
+   string(FIND "${_two_cluster_source}" "${_forbidden}" _position)
+   if(NOT _position EQUAL -1)
+      message(FATAL_ERROR "two-cluster coexistence client assumes a forbidden runtime or infrastructure owner: ${_forbidden}")
+   endif()
+endforeach()
+set(_pair_endpoint "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_pair_endpoint_qualification.sh")
+file(READ "${_pair_endpoint}" _pair_endpoint_source)
+foreach(_required IN ITEMS
+   "prepareTestPairBoundary"
+   "pairBoundary"
+   "probePairBoundary"
+   "registerRoutableSubnet"
+   "reserveApplicationID"
+   "createCluster"
+   "removeCluster"
+   "enableFakeIpv4Boundary:false"
+   "prodigy_dev_run_discombobulator_build"
+   "PAIR_ENDPOINT_EVIDENCE")
+   string(FIND "${_pair_endpoint_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "pair endpoint client missing required Mothership capability assertion: ${_required}")
+   endif()
+endforeach()
+foreach(_forbidden IN ITEMS "ip netns" "unshare" "mount --" "bpftool" "iptables" "tc ")
+   string(FIND "${_pair_endpoint_source}" "${_forbidden}" _position)
+   if(NOT _position EQUAL -1)
+      message(FATAL_ERROR "pair endpoint client assumes a forbidden runtime or infrastructure owner: ${_forbidden}")
+   endif()
+endforeach()
+if(_two_cluster_source MATCHES "mship[^\n]*[[:space:]](deploy|reserveApplicationID|reserveServiceID|probeTestCluster)([[:space:]]|$)")
+   message(FATAL_ERROR "two-cluster coexistence client must use only the declared lifecycle/report/fault Mothership operations")
+endif()
+string(FIND "${_source}" "--two-cluster-coexistence=*)" _two_cluster_option)
+string(FIND "${_source}" "prodigy_dev_two_cluster_coexistence.sh" _two_cluster_dispatch)
+if(_two_cluster_option EQUAL -1 OR _two_cluster_dispatch EQUAL -1)
+   message(FATAL_ERROR "netns harness must dispatch the bounded two-cluster coexistence client")
 endif()
 
 file(GLOB _scenario_scripts "${PRODIGY_ROOT}/prodigy/dev/tests/*.sh")

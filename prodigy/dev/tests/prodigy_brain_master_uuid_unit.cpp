@@ -1377,6 +1377,16 @@ static void forEachMessageInBuffer(String& buffer, Handler&& handler)
   }
 }
 
+static bool queuedBrainBundleUpdateOrTransition(String& buffer)
+{
+  bool found = false;
+  forEachMessageInBuffer(buffer, [&](Message *message) {
+    const BrainTopic topic = BrainTopic(message->topic);
+    found = found || topic == BrainTopic::updateBundle || topic == BrainTopic::transitionToNewBundle;
+  });
+  return found;
+}
+
 static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 {
   {
@@ -7320,13 +7330,8 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_consistent_self_master_claim_keeps_self_master");
     suite.expect(brain.masterQuorumDegraded == false, "registration_consistent_self_master_claim_clears_quorum_degraded");
     suite.expect(brain.persistCalls == 1, "registration_consistent_self_master_claim_skips_extra_persist");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_consistent_self_master_claim_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_consistent_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_consistent_self_master_claim_keeps_older_peer_unadmitted");
 
     brain.brains.erase(peer);
     delete peer;
@@ -7376,13 +7381,8 @@ int main(void)
 
     suite.expect(sawRegistration, "registration_self_master_claim_echoes_registration");
     suite.expect(echoedMasterUUID == neuron.uuid, "registration_self_master_claim_echoes_self_master_uuid");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_self_master_claim_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_self_master_claim_keeps_older_peer_unadmitted");
 
     brain.brains.erase(peer);
     delete peer;
@@ -7420,13 +7420,8 @@ int main(void)
 
     suite.expect(brain.weAreMaster, "registration_conflicting_self_master_claim_keeps_self_master");
     suite.expect(brain.masterQuorumDegraded, "registration_conflicting_self_master_claim_preserves_quorum_degraded");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_conflicting_self_master_claim_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_conflicting_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_conflicting_self_master_claim_keeps_older_peer_unadmitted");
 
     brain.brains.erase(conflictingPeer);
     brain.brains.erase(peer);
@@ -7511,13 +7506,8 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_majority_override_ignores_stale_candidate_claim_keeps_self_master");
     suite.expect(candidate->isMasterBrain == false, "registration_majority_override_ignores_stale_candidate_claim_does_not_elect_candidate");
     suite.expect(brain.persistCalls == 1, "registration_majority_override_ignores_stale_candidate_claim_skips_extra_persist");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_majority_override_ignores_stale_candidate_claim_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_majority_override_ignores_stale_candidate_claim_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_majority_override_ignores_stale_candidate_claim_keeps_older_peer_unadmitted");
 
     brain.brains.erase(candidate);
     brain.brains.erase(peer);
@@ -7559,13 +7549,8 @@ int main(void)
     suite.expect(brain.weAreMaster, "registration_non_majority_override_keeps_self_master");
     suite.expect(candidate->isMasterBrain == false, "registration_non_majority_override_does_not_elect_candidate");
     suite.expect(brain.persistCalls == 1, "registration_non_majority_override_skips_extra_persist");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_non_majority_override_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_non_majority_override_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_non_majority_override_keeps_older_peer_unadmitted");
 
     brain.brains.erase(candidate);
     brain.brains.erase(peer);
@@ -7720,18 +7705,10 @@ int main(void)
         uint128_t(0));
     brain.testBrainHandler(peer, message);
 
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_master_late_join_starts_artifact_io");
-    suite.expect(peer->installedBundleReadPending,
-                 "registration_master_late_join_admits_installed_bundle_read");
-    suite.expect(peer->transitionAfterBundleEcho == false,
-                 "registration_master_late_join_defers_transition_until_durable_bundle_queue");
-    if (brain.artifactIO != nullptr)
-    {
-      const bool artifactIOQuiesced = quiesceBrainArtifactIOForTest(brain);
-      suite.expect(artifactIOQuiesced,
-                   "registration_master_late_join_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr,
+                 "registration_master_late_join_does_not_start_unadmitted_artifact_io");
+    suite.expect(!queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_master_late_join_does_not_queue_bundle_or_transition");
 
     brain.brains.erase(peer);
     delete peer;
@@ -7851,13 +7828,8 @@ int main(void)
 
     suite.expect(brain.weAreMaster, "registration_pending_designated_master_elects_self");
     suite.expect(brain.persistCalls == 1, "registration_pending_designated_master_self_persists");
-    suite.expect(brain.artifactIO != nullptr,
-                 "registration_pending_designated_master_starts_artifact_io_for_older_bundle");
-    if (brain.artifactIO != nullptr)
-    {
-      suite.expect(quiesceBrainArtifactIOForTest(brain),
-                   "registration_pending_designated_master_quiesces_artifact_io_before_ring_shutdown");
-    }
+    suite.expect(brain.artifactIO == nullptr && !queuedBrainBundleUpdateOrTransition(peer->wBuffer),
+                 "registration_pending_designated_master_keeps_older_peer_unadmitted");
 
     brain.brains.erase(peer);
     delete peer;

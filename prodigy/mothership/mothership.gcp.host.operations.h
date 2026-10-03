@@ -6,6 +6,50 @@
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/iaas/runtime/runtime.h>
 
+// Providers whose API transport is backed by the host Ring must execute their
+// lifecycle coroutine on that Ring.  GCP additionally prepares a short-lived
+// credential environment before its specialized jobs; callers retain that
+// preparation and use this adapter for providers such as Vultr.
+template <typename Operation>
+static inline bool mothershipRunProviderHostJob(
+    MothershipHostRingRuntime& runtime,
+    const ProdigyRuntimeEnvironmentConfig& environment,
+    MultiCurlClient::TimePoint deadline,
+    const char *operationName,
+    String& failure,
+    Operation&& operation)
+{
+  failure.clear();
+  bool providerCreated = false;
+  bool completed = false;
+  const bool ran = runtime.run([&](ProdigyProviderServices services, CoroutineStack *coro) -> void {
+    services.operationDeadline = deadline;
+    std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, services);
+    providerCreated = provider != nullptr;
+    if (providerCreated == false)
+    {
+      failure.snprintf<"failed to construct provider for {}"_ctv>(String(operationName));
+      co_return;
+    }
+    provider->configureRuntimeEnvironment(environment);
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          operation(coro, *provider, completed, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+  });
+  if (ran == false && failure.empty())
+  {
+    failure.snprintf<"provider {} host Ring unavailable"_ctv>(String(operationName));
+  }
+  else if (providerCreated && completed == false && failure.empty())
+  {
+    failure.snprintf<"provider {} did not complete"_ctv>(String(operationName));
+  }
+  return ran && providerCreated && completed && failure.empty();
+}
+
 static inline bool mothershipRunGcpMachineDestroyJob(
     MothershipHostRingRuntime& runtime,
     const MothershipProviderCredential& credential,

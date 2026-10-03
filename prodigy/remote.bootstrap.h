@@ -1934,7 +1934,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   String tempBundleSHA256Path = {};
   prodigyResolveBundleSHA256Path(tempBundlePath, tempBundleSHA256Path);
 
-  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1 || ! command -v btrfs >/dev/null 2>&1 || ! command -v mkfs.btrfs >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends zstd btrfs-progs; else echo 'missing zstd or btrfs-progs on remote host' >&2; exit 1; fi; fi; "_ctv);
+  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1 || ! command -v btrfs >/dev/null 2>&1 || ! command -v mkfs.btrfs >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends zstd btrfs-progs; elif command -v pacman >/dev/null 2>&1; then pacman -Syu --noconfirm --needed zstd btrfs-progs; else echo 'missing zstd or btrfs-progs on remote host' >&2; exit 1; fi; fi; "_ctv);
   plan.installCommand.append(plan.mkdirCommand);
   plan.installCommand.append("; "_ctv);
   prodigyAppendRemoteContainerRootCommand(plan.installCommand);

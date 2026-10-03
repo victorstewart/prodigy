@@ -1213,6 +1213,58 @@ int main(void)
             reinterpret_cast<uint8_t *>(taskResult.data()),
             reinterpret_cast<uint8_t *>(taskResult.data() + taskResult.size())),
         "task_result_valid_for_neuron");
+    // New control topics use the ordinary bounded variable framing. These
+    // tests pass explicit frame bounds so truncation/trailing bytes cannot be
+    // hidden by a stale Message::size field.
+    ProdigyUpgradeAdmissionObservationRequest upgradeRequest = {};
+    upgradeRequest.receiptVersion = 1; upgradeRequest.authorityGeneration = 2;
+    upgradeRequest.requesterTransportGeneration = 3; upgradeRequest.masterUUID = 4;
+    upgradeRequest.masterBootNs = 5; upgradeRequest.nonce = 6; upgradeRequest.requestedAtMs = 7;
+    upgradeRequest.operationID.assignItoh(uint128_t(1));
+    upgradeRequest.targetBundleSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+    upgradeRequest.targetContractSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+    upgradeRequest.requiredStagingBytes = 4096;
+    String upgradePayload = {}; BitseryEngine::serialize(upgradePayload, upgradeRequest);
+    frame.clear(); Message::construct(frame, BrainTopic::observeUpgradeAdmission, upgradePayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal()),
+                 "upgrade_observation_request_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal() - 1),
+                 "upgrade_observation_request_ingress_truncated");
+    frame.append(uint8_t(0));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateBrainPayload(uint16_t(BrainTopic::observeUpgradeAdmission), message->args,
+                 reinterpret_cast<uint8_t *>(frame.data() + frame.size())), "upgrade_observation_request_ingress_trailing");
+    ProdigyUpgradeAdmissionPeerObservation upgradeResponse = {}; upgradeResponse.brainUUID=8; upgradeResponse.machineUUID=8;
+    upgradeResponse.receiptVersion=1; upgradeResponse.authorityGeneration=2; upgradeResponse.requesterTransportGeneration=3;
+    upgradeResponse.masterUUID=4; upgradeResponse.masterBootNs=5; upgradeResponse.nonce=6; upgradeResponse.observedAtMs=7;
+    upgradePayload.clear(); BitseryEngine::serialize(upgradePayload, upgradeResponse);
+    frame.clear(); Message::construct(frame, BrainTopic::observeUpgradeAdmissionResponse, upgradePayload); message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateBrainPayload(message->topic,message->args,message->terminal()), "upgrade_observation_response_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic,message->args,message->terminal()-1), "upgrade_observation_response_ingress_truncated");
+    frame.clear(); Message::construct(frame, BrainTopic::advertiseCapabilities, uint64_t(1)); message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal()), "upgrade_capability_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal() - 1), "upgrade_capability_ingress_truncated");
+    ProdigyDeploymentPlacementPolicy placement = {}; placement.applicationID=1; placement.versionID=2;
+    placement.operationID.assign("00000000-0000-4000-8000-000000000001"_ctv); placement.eligibleMachineUUIDs.push_back(3);
+    String placementPayload = {}; BitseryEngine::serialize(placementPayload, placement);
+    frame.clear(); Message::construct(frame, MothershipTopic::commitDeploymentPlacementPolicy, placementPayload); message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic,message->args,message->terminal()), "placement_policy_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic,message->args,message->terminal()-1), "placement_policy_ingress_truncated");
+
+    ProdigyUpgradeAdmissionReportRequest admissionRequest = {};
+    admissionRequest.operationID.assignItoh(uint128_t(1));
+    admissionRequest.targetBundleSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+    admissionRequest.targetContractSHA256.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+    admissionRequest.requiredStagingBytes = 4096;
+    String admissionPayload = {}; BitseryEngine::serialize(admissionPayload, admissionRequest);
+    frame.clear(); Message::construct(frame, MothershipTopic::pullUpgradeAdmissionReport, admissionPayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+                 "upgrade_admission_capacity_request_ingress_valid");
+    suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
+                 "upgrade_admission_capacity_request_ingress_truncated");
+
     Vector<uint8_t> oversizedTaskResult;
     oversizedTaskResult.resize(prodigyTaskResultMaxBytes + 1);
     suite.expect(

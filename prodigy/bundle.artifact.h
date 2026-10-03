@@ -8,6 +8,7 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -614,6 +616,30 @@ static inline bool prodigyStageBundleWithExpectedSHA256(
   return true;
 }
 
+// Pin file identity for the asynchronous request lifetime, including successful
+// requests whose prepared artifact is simply released after acknowledgment.
+class ProdigyBundleArtifactFD {
+  int fd = -1;
+public:
+  ProdigyBundleArtifactFD() = default;
+  ProdigyBundleArtifactFD(const ProdigyBundleArtifactFD&) = delete;
+  ProdigyBundleArtifactFD& operator=(const ProdigyBundleArtifactFD&) = delete;
+  ProdigyBundleArtifactFD(ProdigyBundleArtifactFD&& other) noexcept : fd(other.fd) { other.fd = -1; }
+  ProdigyBundleArtifactFD& operator=(ProdigyBundleArtifactFD&& other) noexcept
+  {
+    if (this != &other) { *this = other.fd; other.fd = -1; }
+    return *this;
+  }
+  ProdigyBundleArtifactFD& operator=(int replacement)
+  {
+    if (fd >= 0) (void)::close(fd);
+    fd = replacement;
+    return *this;
+  }
+  operator int() const { return fd; }
+  ~ProdigyBundleArtifactFD() { if (fd >= 0) (void)::close(fd); }
+};
+
 struct ProdigyPreparedBundleArtifact {
   String stageBundlePath = {};
   String stageSHA256Path = {};
@@ -621,6 +647,11 @@ struct ProdigyPreparedBundleArtifact {
   String sha256Path = {};
   String sha256 = {};
   uint64_t bytes = 0;
+  // Keep both created inodes open until this request publishes or discards
+  // them. A pathname device/inode pair alone is not an ownership fence: an
+  // unlinked inode can be reused before a later pathname check.
+  ProdigyBundleArtifactFD stageBundleFD;
+  ProdigyBundleArtifactFD stageSHA256FD;
   dev_t stageBundleDevice = 0;
   ino_t stageBundleInode = 0;
   dev_t stageSHA256Device = 0;
@@ -638,20 +669,36 @@ struct ProdigyPreparedBundleArtifact {
   bool published = false;
 };
 
-static inline bool prodigyFsyncBundleArtifactPath(const String& path, String *failure = nullptr)
+static inline bool prodigyBundleArtifactFDMatchesPath(int fd, const String& path, struct stat *metadata = nullptr)
 {
+  if (fd < 0 || path.empty()) return false;
+  struct stat opened = {};
+  struct stat named = {};
   String pathText = {};
   pathText.assign(path);
-  int fd = ::open(pathText.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (fd < 0 || ::fsync(fd) != 0)
+  if (::fstat(fd, &opened) != 0 || ::lstat(pathText.c_str(), &named) != 0 ||
+      opened.st_dev != named.st_dev || opened.st_ino != named.st_ino)
   {
-    const int error = errno;
-    if (fd >= 0) (void)::close(fd);
-    if (failure) failure->snprintf<"failed to fsync bundle artifact {} errno={itoa}"_ctv>(path, uint64_t(error));
     return false;
   }
-  (void)::close(fd);
+  if (metadata) *metadata = opened;
   return true;
+}
+
+static inline void prodigyDiscardBundleArtifactPathMatchingFD(const String& path, int fd)
+{
+  if (prodigyBundleArtifactFDMatchesPath(fd, path))
+  {
+    String pathText = {};
+    pathText.assign(path);
+    (void)::unlink(pathText.c_str());
+  }
+}
+
+static inline void prodigyClosePreparedBundleArtifactFDs(ProdigyPreparedBundleArtifact& prepared)
+{
+  prepared.stageBundleFD = -1;
+  prepared.stageSHA256FD = -1;
 }
 
 static inline bool prodigyFsyncBundleArtifactParent(const String& path, String *failure = nullptr)
@@ -682,6 +729,7 @@ static inline bool prodigyPrepareBundleArtifact(
     const String& expectedDigest,
     String *failure = nullptr)
 {
+  prodigyClosePreparedBundleArtifactFDs(prepared);
   prepared = {};
   if (failure) failure->clear();
   // Preparation outlives the caller's views and publication needs C strings.
@@ -691,35 +739,51 @@ static inline bool prodigyPrepareBundleArtifact(
   prepared.stageBundlePath.assign(bundlePath);
   prepared.stageBundlePath.append(".incoming.XXXXXX"_ctv);
   prepared.stageBundlePath.addNullTerminator();
-  int bundleFD = ::mkstemp(reinterpret_cast<char *>(prepared.stageBundlePath.data()));
-  if (bundleFD < 0)
+  prepared.stageBundleFD = ::mkstemp(reinterpret_cast<char *>(prepared.stageBundlePath.data()));
+  if (prepared.stageBundleFD < 0 || ::fcntl(prepared.stageBundleFD, F_SETFD, FD_CLOEXEC) != 0)
   {
+    if (prepared.stageBundleFD >= 0)
+    {
+      prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageBundlePath, prepared.stageBundleFD);
+      prodigyClosePreparedBundleArtifactFDs(prepared);
+    }
     if (failure) failure->assign("bundle artifact stage creation failed"_ctv);
     return false;
   }
-  (void)::close(bundleFD);
   const uint64_t createdStageBytes = std::strlen(reinterpret_cast<const char *>(prepared.stageBundlePath.data()));
   prepared.stageBundlePath = prepared.stageBundlePath.substr(0, createdStageBytes, Copy::yes);
   prodigyResolveBundleSHA256Path(prepared.stageBundlePath, prepared.stageSHA256Path);
 
   String actual = {};
-  if (prodigyStageBundleWithExpectedSHA256(prepared.stageBundlePath, bundle, expectedDigest, actual, failure) == false ||
-      prodigyFsyncBundleArtifactPath(prepared.stageBundlePath, failure) == false ||
-      prodigyFsyncBundleArtifactPath(prepared.stageSHA256Path, failure) == false)
+  if (prodigyStageBundleWithExpectedSHA256(prepared.stageBundlePath, bundle, expectedDigest, actual, failure) == false)
   {
-    (void)::unlink(prepared.stageBundlePath.c_str());
-    (void)::unlink(prepared.stageSHA256Path.c_str());
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageBundlePath, prepared.stageBundleFD);
+    prodigyClosePreparedBundleArtifactFDs(prepared);
+    return false;
+  }
+
+  String stageSHA256Path = {};
+  stageSHA256Path.assign(prepared.stageSHA256Path);
+  prepared.stageSHA256FD = ::open(stageSHA256Path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (prepared.stageSHA256FD < 0 || ::fsync(prepared.stageBundleFD) != 0 ||
+      ::fsync(prepared.stageSHA256FD) != 0)
+  {
+    if (failure && failure->empty()) failure->assign("bundle artifact stage durability failed"_ctv);
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageBundlePath, prepared.stageBundleFD);
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageSHA256Path, prepared.stageSHA256FD);
+    prodigyClosePreparedBundleArtifactFDs(prepared);
     return false;
   }
 
   struct stat bundleMetadata = {};
   struct stat shaMetadata = {};
-  if (::stat(prepared.stageBundlePath.c_str(), &bundleMetadata) != 0 ||
-      ::stat(prepared.stageSHA256Path.c_str(), &shaMetadata) != 0)
+  if (!prodigyBundleArtifactFDMatchesPath(prepared.stageBundleFD, prepared.stageBundlePath, &bundleMetadata) ||
+      !prodigyBundleArtifactFDMatchesPath(prepared.stageSHA256FD, prepared.stageSHA256Path, &shaMetadata))
   {
     if (failure) failure->assign("bundle artifact staging metadata unavailable"_ctv);
-    (void)::unlink(prepared.stageBundlePath.c_str());
-    (void)::unlink(prepared.stageSHA256Path.c_str());
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageBundlePath, prepared.stageBundleFD);
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageSHA256Path, prepared.stageSHA256FD);
+    prodigyClosePreparedBundleArtifactFDs(prepared);
     return false;
   }
   prepared.sha256 = actual;
@@ -744,8 +808,8 @@ static inline bool prodigyPublishPreparedBundleArtifact(ProdigyPreparedBundleArt
   }
   struct stat bundleMetadata = {};
   struct stat shaMetadata = {};
-  if (::stat(prepared.stageBundlePath.c_str(), &bundleMetadata) != 0 ||
-      ::stat(prepared.stageSHA256Path.c_str(), &shaMetadata) != 0 ||
+  if (!prodigyBundleArtifactFDMatchesPath(prepared.stageBundleFD, prepared.stageBundlePath, &bundleMetadata) ||
+      !prodigyBundleArtifactFDMatchesPath(prepared.stageSHA256FD, prepared.stageSHA256Path, &shaMetadata) ||
       bundleMetadata.st_dev != prepared.stageBundleDevice || bundleMetadata.st_ino != prepared.stageBundleInode ||
       shaMetadata.st_dev != prepared.stageSHA256Device || shaMetadata.st_ino != prepared.stageSHA256Inode ||
       uint64_t(bundleMetadata.st_size) != prepared.bytes)
@@ -758,7 +822,7 @@ static inline bool prodigyPublishPreparedBundleArtifact(ProdigyPreparedBundleArt
     if (failure && failure->empty()) failure->assign("bundle artifact publication failed"_ctv);
     return false;
   }
-  if (::stat(prepared.bundlePath.c_str(), &bundleMetadata) != 0 ||
+  if (!prodigyBundleArtifactFDMatchesPath(prepared.stageBundleFD, prepared.bundlePath, &bundleMetadata) ||
       bundleMetadata.st_dev != prepared.stageBundleDevice || bundleMetadata.st_ino != prepared.stageBundleInode)
   {
     if (failure) failure->assign("bundle artifact published identity changed"_ctv);
@@ -773,7 +837,7 @@ static inline bool prodigyPublishPreparedBundleArtifact(ProdigyPreparedBundleArt
     if (failure && failure->empty()) failure->assign("bundle artifact publication failed"_ctv);
     return false;
   }
-  if (::stat(prepared.sha256Path.c_str(), &shaMetadata) != 0 ||
+  if (!prodigyBundleArtifactFDMatchesPath(prepared.stageSHA256FD, prepared.sha256Path, &shaMetadata) ||
       shaMetadata.st_dev != prepared.stageSHA256Device || shaMetadata.st_ino != prepared.stageSHA256Inode)
   {
     if (failure) failure->assign("bundle artifact published identity changed"_ctv);
@@ -796,8 +860,9 @@ static inline bool prodigyFsyncPublishedBundleArtifact(const ProdigyPreparedBund
   String sha256Path = {};
   bundlePath.assign(prepared.bundlePath);
   sha256Path.assign(prepared.sha256Path);
-  if (prepared.published == false || ::stat(bundlePath.c_str(), &bundleMetadata) != 0 ||
-      ::stat(sha256Path.c_str(), &shaMetadata) != 0 ||
+  if (prepared.published == false ||
+      !prodigyBundleArtifactFDMatchesPath(prepared.stageBundleFD, bundlePath, &bundleMetadata) ||
+      !prodigyBundleArtifactFDMatchesPath(prepared.stageSHA256FD, sha256Path, &shaMetadata) ||
       bundleMetadata.st_dev != prepared.publishedBundleDevice || bundleMetadata.st_ino != prepared.publishedBundleInode ||
       shaMetadata.st_dev != prepared.publishedSHA256Device || shaMetadata.st_ino != prepared.publishedSHA256Inode)
   {
@@ -812,25 +877,17 @@ static inline bool prodigyFsyncPublishedBundleArtifact(const ProdigyPreparedBund
 // untouched.
 static inline void prodigyDiscardPreparedBundleArtifact(ProdigyPreparedBundleArtifact& prepared)
 {
-  auto discardExact = [](const String& path, dev_t device, ino_t inode) {
-    String pathText = {};
-    pathText.assign(path);
-    struct stat metadata = {};
-    if (path.size() && ::stat(pathText.c_str(), &metadata) == 0 && metadata.st_dev == device && metadata.st_ino == inode)
-    {
-      (void)::unlink(pathText.c_str());
-    }
-  };
-  discardExact(prepared.stageBundlePath, prepared.stageBundleDevice, prepared.stageBundleInode);
-  discardExact(prepared.stageSHA256Path, prepared.stageSHA256Device, prepared.stageSHA256Inode);
+  prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageBundlePath, prepared.stageBundleFD);
+  prodigyDiscardBundleArtifactPathMatchingFD(prepared.stageSHA256Path, prepared.stageSHA256FD);
   if (prepared.bundlePublished)
   {
-    discardExact(prepared.bundlePath, prepared.publishedBundleDevice, prepared.publishedBundleInode);
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.bundlePath, prepared.stageBundleFD);
   }
   if (prepared.sha256Published)
   {
-    discardExact(prepared.sha256Path, prepared.publishedSHA256Device, prepared.publishedSHA256Inode);
+    prodigyDiscardBundleArtifactPathMatchingFD(prepared.sha256Path, prepared.stageSHA256FD);
   }
+  prodigyClosePreparedBundleArtifactFDs(prepared);
   prepared = {};
 }
 
@@ -998,6 +1055,58 @@ static inline bool prodigyResolveBundleHomeDirectory(String& bundleHome, String 
 static inline String prodigyStagedBundlePath(void)
 {
   return "/root/prodigy.bundle.new.tar.zst"_ctv;
+}
+
+// This deliberately measures the two filesystems touched by the update
+// transaction: the incoming bundle path and the installed-root replacement.
+// `requiredBytes` is a release-contract bound for the total temporary usage on
+// either filesystem.  Returning the smaller availability means a split-root
+// installation must satisfy the bound on both filesystems.
+static inline bool prodigyMeasureBundleUpdateFilesystemAvailabilityAtPaths(
+    const String& stagedBundlePath, const String& installRoot,
+    uint64_t& availableBytes, String *failure = nullptr)
+{
+  availableBytes = 0;
+  if (failure) failure->clear();
+  String stagedParent = {};
+  prodigyDirname(stagedBundlePath, stagedParent);
+  String installParent = {};
+  prodigyDirname(installRoot, installParent);
+  // Replacement roots are siblings (.new / .prev), so probe the parent rather
+  // than a possibly separately mounted current install root.
+  if (stagedBundlePath.empty() || installRoot.empty() || stagedParent.empty() || installParent.empty())
+  {
+    if (failure && failure->empty()) failure->assign("bundle update filesystem path is unavailable"_ctv);
+    return false;
+  }
+  auto measure = [&](const String& path, uint64_t& bytes) {
+    std::string native(reinterpret_cast<const char *>(path.data()), path.size());
+    struct statvfs stat = {};
+    if (::statvfs(native.c_str(), &stat) != 0 || stat.f_frsize == 0 ||
+        uint64_t(stat.f_bavail) > UINT64_MAX / uint64_t(stat.f_frsize)) return false;
+    bytes = uint64_t(stat.f_bavail) * uint64_t(stat.f_frsize);
+    return true;
+  };
+  uint64_t stagedBytes = 0, installBytes = 0;
+  if (!measure(stagedParent, stagedBytes) || !measure(installParent, installBytes))
+  {
+    if (failure) failure->assign("bundle update filesystem availability is unavailable"_ctv);
+    return false;
+  }
+  availableBytes = std::min(stagedBytes, installBytes);
+  return true;
+}
+
+static inline bool prodigyMeasureBundleUpdateFilesystemAvailability(
+    const String& stagedBundlePath, uint64_t& availableBytes, String *failure = nullptr)
+{
+  String installRoot = {};
+  if (!prodigyResolveCurrentInstallRoot(installRoot, failure))
+  {
+    availableBytes = 0;
+    return false;
+  }
+  return prodigyMeasureBundleUpdateFilesystemAvailabilityAtPaths(stagedBundlePath, installRoot, availableBytes, failure);
 }
 
 class ProdigyInstallRootPaths {

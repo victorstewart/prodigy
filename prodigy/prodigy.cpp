@@ -820,6 +820,13 @@ static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, S
 class ProdigyBrain : public Brain {
   ProdigyHostControlNetwork& hostControlNetwork;
   std::shared_ptr<ProdigyPersistentStateWriter> persistentWriter;
+  // A submitted authoritative topology has not received its durable receipt
+  // yet, so loadAuthoritativeClusterTopology must not expose it.  Ordinary
+  // full snapshots submitted behind it must nevertheless retain it: the
+  // worker commits FIFO while cache replacement happens later on the Ring.
+  bool haveAdmittedAuthoritativeTopology = false;
+  ClusterTopology admittedAuthoritativeTopology = {};
+  std::shared_ptr<Vector<PersistenceCompletion>> admittedAuthoritativeTopologyWaiters = {};
   RuntimeAwareBrainIaaS *runtimeAwareIaaS = nullptr;
   bool runtimePersistenceStarted = false;
   struct ExecPersistenceState { bool prepared = false, durable = false, closed = false; String failure; };
@@ -868,7 +875,8 @@ class ProdigyBrain : public Brain {
     bootState.bootstrapSshKeyPackage = snapshot.brainConfig.bootstrapSshKeyPackage;
     bootState.bootstrapSshHostKeyPackage = snapshot.brainConfig.bootstrapSshHostKeyPackage;
     bootState.bootstrapSshPrivateKeyPath = snapshot.brainConfig.bootstrapSshPrivateKeyPath;
-    if (!snapshot.brainPeers.empty()) bootState.bootstrapConfig.bootstrapPeers = snapshot.brainPeers;
+    if (haveAdmittedAuthoritativeTopology || snapshot.topology.version != 0 || !snapshot.brainPeers.empty())
+      bootState.bootstrapConfig.bootstrapPeers = snapshot.brainPeers;
     bootState.runtimeEnvironment = snapshot.brainConfig.runtimeEnvironment.configured() ?
         snapshot.brainConfig.runtimeEnvironment : persistentBootState.runtimeEnvironment;
     bootState.initialTopology = {};
@@ -1032,12 +1040,14 @@ public:
     }
     else
     {
-      const ClusterTopology *authoritativeTopology =
-          (havePersistedBrainSnapshot && persistedBrainSnapshot.topology.machines.empty() == false)
-              ? &persistedBrainSnapshot.topology
-              : (persistentBootState.initialTopology.machines.empty() == false
-                     ? &persistentBootState.initialTopology
-                     : nullptr);
+      const ClusterTopology *authoritativeTopology = haveAdmittedAuthoritativeTopology
+          ? &admittedAuthoritativeTopology
+          : ((havePersistedBrainSnapshot &&
+              (persistedBrainSnapshot.topology.version != 0 || persistedBrainSnapshot.topology.machines.empty() == false))
+                 ? &persistedBrainSnapshot.topology
+                 : (persistentBootState.initialTopology.machines.empty() == false
+                        ? &persistentBootState.initialTopology
+                        : nullptr));
 
       if (authoritativeTopology != nullptr)
       {
@@ -1194,6 +1204,7 @@ public:
     ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
     snapshot.brainConfig = candidate.brainConfig;
     snapshot.masterAuthority.runtimeState = candidate.runtimeState;
+    snapshot.masterAuthority.servingRuntimeStates = candidate.servingRuntimeStates;
     prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
     ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
     const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
@@ -1715,13 +1726,26 @@ public:
 
   bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
   {
-    if (havePersistedBrainSnapshot && persistedBrainSnapshot.topology.machines.empty() == false)
+    if (havePersistedBrainSnapshot &&
+        (persistedBrainSnapshot.topology.version != 0 || persistedBrainSnapshot.topology.machines.empty() == false))
     {
       topology = persistedBrainSnapshot.topology;
       return true;
     }
 
     return prodigyResolveInitialTopologyFromBootState(persistentBootState, topology);
+  }
+
+  bool loadAuthoritativeClusterTopologyForMutation(ClusterTopology& topology) const override
+  {
+    // A dependent FIFO write must retain already admitted membership. This
+    // view is only a mutation base; ordinary readers still await durability.
+    if (haveAdmittedAuthoritativeTopology)
+    {
+      topology = admittedAuthoritativeTopology;
+      return true;
+    }
+    return loadAuthoritativeClusterTopology(topology);
   }
 
   bool persistAuthoritativeClusterTopology(const ClusterTopology& topology) override
@@ -1732,19 +1756,78 @@ public:
   void persistAuthoritativeClusterTopologyAsync(ClusterTopology topology,
                                                  PersistenceCompletion completion = {}) override
   {
+    prodigyNormalizeClusterTopologyPeerAddresses(topology);
+    prodigyStripMachineHardwareCapturesFromClusterTopology(topology);
+    if (!ProdigyPersistentStateWriter::detach(topology))
+    {
+      if (completion) completion(false);
+      return;
+    }
+    if (haveAdmittedAuthoritativeTopology)
+    {
+      if (topology.version < admittedAuthoritativeTopology.version ||
+          (topology.version == admittedAuthoritativeTopology.version && topology != admittedAuthoritativeTopology))
+      {
+        std::fprintf(stderr, "Prodigy topology persistence rejected conflicting snapshot candidateVersion=%llu admittedVersion=%llu\n",
+                     static_cast<unsigned long long>(topology.version),
+                     static_cast<unsigned long long>(admittedAuthoritativeTopology.version));
+        if (completion) completion(false);
+        return;
+      }
+      if (topology.version == admittedAuthoritativeTopology.version)
+      {
+        // The existing submission owns the only durable receipt for this
+        // version.  Replays must wait for that receipt rather than claiming
+        // durability before the worker has committed it.
+        if (completion)
+        {
+          if (admittedAuthoritativeTopologyWaiters)
+            admittedAuthoritativeTopologyWaiters->push_back(std::move(completion));
+          else
+            completion(false);
+        }
+        return;
+      }
+    }
+    else
+    {
+      // An explicit topology is a complete replacement snapshot. Once a
+      // durable topology exists, an older read-modify-write or a conflicting
+      // same-version request must not resurrect membership that it omitted.
+      const ClusterTopology *durableTopology = havePersistedBrainSnapshot
+          ? &persistedBrainSnapshot.topology
+          : (persistentBootState.initialTopology.machines.empty() == false
+                 ? &persistentBootState.initialTopology
+                 : nullptr);
+      if (durableTopology &&
+          (topology.version < durableTopology->version ||
+           (topology.version == durableTopology->version && topology != *durableTopology)))
+      {
+        std::fprintf(stderr, "Prodigy topology persistence rejected conflicting snapshot candidateVersion=%llu durableVersion=%llu\n",
+                     static_cast<unsigned long long>(topology.version),
+                     static_cast<unsigned long long>(durableTopology->version));
+        if (completion) completion(false);
+        return;
+      }
+    }
+
     ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot(&topology);
     prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
     ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
+    // An explicit authoritative topology, including one with no Brain peers,
+    // owns its matching boot peer set rather than inheriting an older one.
+    bootState.bootstrapConfig.bootstrapPeers = snapshot.brainPeers;
     const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);
     if (!retainedBytes || !ensurePersistentWriter()) { if (completion) completion(false); return; }
     auto cachedSnapshot = std::make_shared<ProdigyPersistentBrainSnapshot>(std::move(snapshot));
     auto cachedBootState = std::make_shared<ProdigyPersistentBootState>(std::move(bootState));
     if (!ProdigyPersistentStateWriter::detach(*cachedSnapshot) ||
         !ProdigyPersistentStateWriter::detach(*cachedBootState)) { if (completion) completion(false); return; }
-    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    auto waiters = std::make_shared<Vector<PersistenceCompletion>>();
+    if (completion) waiters->push_back(std::move(completion));
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
     const bool admitted = persistentWriter->submitSnapshot(*cachedSnapshot, *cachedBootState, retainedBytes,
-        [cachedSnapshot, cachedBootState, callback, lifetime](auto&& result) mutable {
+        [this, cachedSnapshot, cachedBootState, waiters, lifetime, topology](auto&& result) mutable {
           if (lifetime.expired()) return;
           if (result.snapshotDurable)
           {
@@ -1754,9 +1837,29 @@ public:
           if (result.bootStateDurable) persistentBootState = std::move(*cachedBootState);
           const bool durable = result.snapshotDurable && result.bootStateDurable;
           if (durable && !lifetime.expired() && thisBrain) thisBrain->sendNeuronSwitchboardOverlayRoutes();
-          if (*callback) (*callback)(durable);
+          // A newer admitted topology can be queued before this Ring receipt.
+          // Only the matching receipt may clear its shadow.
+          if (haveAdmittedAuthoritativeTopology && topology == admittedAuthoritativeTopology)
+          {
+            haveAdmittedAuthoritativeTopology = false;
+            admittedAuthoritativeTopology = {};
+            admittedAuthoritativeTopologyWaiters.reset();
+          }
+          for (PersistenceCompletion& waiter : *waiters)
+            if (waiter) waiter(durable);
         });
-    if (!admitted && *callback) (*callback)(false);
+    if (!admitted)
+    {
+      for (PersistenceCompletion& waiter : *waiters)
+        if (waiter) waiter(false);
+      return;
+    }
+    // Publish the normalized full topology only after the writer accepted its
+    // request. A later ordinary snapshot now carries this topology, peers, and
+    // matching boot state; a rejected request cannot influence a later write.
+    admittedAuthoritativeTopology = topology;
+    haveAdmittedAuthoritativeTopology = true;
+    admittedAuthoritativeTopologyWaiters = std::move(waiters);
   }
 };
 

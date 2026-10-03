@@ -45,6 +45,16 @@ static inline void mothershipResolveTestClusterControlSocketPath(const Mothershi
   clusterUUID.assignItoh(cluster.clusterUUID);
   path.assign("/tmp/prodigy-vdc-"_ctv);
   path.append(clusterUUID);
+  // Fragment one preserves the long-standing single-VDC control path.  Later
+  // registry-assigned test fragments bind the provider's private domain without
+  // granting callers a network-identity knob.
+  if (cluster.datacenterFragment > 1)
+  {
+    path.append("-d"_ctv);
+    String fragment = {};
+    fragment.assignItoa(cluster.datacenterFragment);
+    path.append(fragment);
+  }
   path.append("/mothership.sock"_ctv);
 }
 

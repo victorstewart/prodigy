@@ -514,6 +514,32 @@ int main(int argc, char *argv[])
                    survivingPreparedReplacementMetadata.st_ino == preparedReplacementMetadata.st_ino,
                "prepared_bundle_cleanup_does_not_delete_replacement");
 
+  // Successful request destruction must release its identity pins without
+  // deleting the accepted artifact. Move ownership must not duplicate pins.
+  String acceptedPath = {};
+  acceptedPath.assign(tempDirectory);
+  acceptedPath.append("/accepted.bundle.tar.zst"_ctv);
+  int acceptedBundleFD = -1, acceptedSHA256FD = -1;
+  {
+    ProdigyPreparedBundleArtifact accepted = {};
+    suite.expect(prodigyPrepareBundleArtifact(accepted, acceptedPath, bundleBytes, bundleDigest, &failure) &&
+                     prodigyPublishPreparedBundleArtifact(accepted, &failure) &&
+                     prodigyFsyncPublishedBundleArtifact(accepted, &failure),
+                 "prepared_bundle_success_pins_published_pair");
+    acceptedBundleFD = accepted.stageBundleFD;
+    acceptedSHA256FD = accepted.stageSHA256FD;
+    ProdigyPreparedBundleArtifact moved = std::move(accepted);
+    suite.expect(int(accepted.stageBundleFD) == -1 && int(accepted.stageSHA256FD) == -1 &&
+                     int(moved.stageBundleFD) == acceptedBundleFD && int(moved.stageSHA256FD) == acceptedSHA256FD,
+                 "prepared_bundle_move_transfers_identity_pin_ownership");
+  }
+  errno = 0;
+  const bool bundleClosed = acceptedBundleFD >= 0 && ::fcntl(acceptedBundleFD, F_GETFD) == -1 && errno == EBADF;
+  errno = 0;
+  const bool sidecarClosed = acceptedSHA256FD >= 0 && ::fcntl(acceptedSHA256FD, F_GETFD) == -1 && errno == EBADF;
+  suite.expect(bundleClosed && sidecarClosed && fileExists(acceptedPath),
+               "prepared_bundle_success_destruction_releases_pins_and_preserves_accepted_bundle");
+
   // Production's default staged path is a `_ctv` read-only String. Exercise
   // both literal-equivalent capacity and a view with no spare terminator byte.
   // Each uses a task-owned target and must materialize the borrowed paths.

@@ -10,9 +10,10 @@
 // Workers retain the live Brain as their plan owner. A sole Brain requires
 // the authenticated checkpoint path plus an exact incomplete-update receipt.
 static inline bool mothershipVDCRecoveryTargetIsSupported(uint32_t machineIndex, uint32_t brainCount,
-    bool checkpointedSupersession = false)
+    bool checkpointedSupersession = false, bool testOnlyFollowerReplacement = false)
 {
-  return machineIndex > brainCount || (checkpointedSupersession && machineIndex == 1 && brainCount == 1);
+  return machineIndex > brainCount || (checkpointedSupersession && machineIndex == 1 && brainCount == 1) ||
+         (testOnlyFollowerReplacement && brainCount == 3 && machineIndex >= 1 && machineIndex <= brainCount);
 }
 
 // The provider keeps resource plumbing. Mothership owns the exact process
@@ -21,6 +22,25 @@ enum class MothershipVDCRecoveryPhase : uint8_t {
   accepted, frozen, ready, committed, workerStopped, workerKilled,
   rootInstalled, launchRequested, replaced, complete
 };
+
+// Command-scoped fault injection for the disposable follower-recovery
+// qualification.  It is deliberately outside MothershipVDCBundleRecovery, so
+// a recovery journal remains an ordinary durable operation on retry.
+enum class MothershipVDCTestRecoveryFaultPhase : uint8_t {
+  none, frozen, rootInstalled, workerReplaced
+};
+
+static inline bool mothershipVDCTestParseRecoveryFaultPhase(const String& text,
+                                                            MothershipVDCTestRecoveryFaultPhase& phase)
+{
+  phase = MothershipVDCTestRecoveryFaultPhase::none;
+  if (text.empty()) return true;
+  if (text.equals("frozen"_ctv)) phase = MothershipVDCTestRecoveryFaultPhase::frozen;
+  else if (text.equals("rootInstalled"_ctv)) phase = MothershipVDCTestRecoveryFaultPhase::rootInstalled;
+  else if (text.equals("workerReplaced"_ctv)) phase = MothershipVDCTestRecoveryFaultPhase::workerReplaced;
+  else return false;
+  return true;
+}
 
 class MothershipVDCProcessIdentity {
 public:
@@ -41,8 +61,33 @@ static void serialize(S&& serializer, MothershipVDCProcessIdentity& identity)
   serializer.value8b(identity.cgroupNamespace);
 }
 
+// Kernel identities are meaningful only inside the retained worker's recorded
+// network namespace. The existing Switchboard owner validates and pins them;
+// this record binds the lifecycle transition to those exact resources.
+class MothershipVDCRetainedTCX {
+public:
+  uint32_t ifindex = 0, attachType = 0, programID = 0, linkID = 0;
+  uint32_t wormholeFlowMapID = 0, wormholePendingFlowMapID = 0;
+  uint8_t programTag[8] = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipVDCRetainedTCX& link)
+{
+  serializer.value4b(link.ifindex);
+  serializer.value4b(link.attachType);
+  serializer.value4b(link.programID);
+  serializer.value4b(link.linkID);
+  serializer.value4b(link.wormholeFlowMapID);
+  serializer.value4b(link.wormholePendingFlowMapID);
+  for (uint8_t& byte : link.programTag) serializer.value1b(byte);
+}
+
 class MothershipVDCBundleRecovery {
 public:
+  // Version three binds the test-only three-Brain follower preflight to the
+  // same retained provider transaction.  It is deliberately not a production
+  // rollout or authority-admission record.
   uint8_t version = 2;
   uint128_t clusterUUID = 0;
   uint128_t operationID = 0;
@@ -54,6 +99,11 @@ public:
   String expectedIncompleteWorkerBundle, previousBootSHA256, successorBootSHA256;
   String providerCgroup, workerCgroup;
   String providerArguments[12];
+  bool testOnlyFollowerReplacement = false;
+  String selectedMachineUUID, masterMachineUUID, witnessMachineUUID;
+  String preflightReportSHA256;
+  MothershipVDCProcessIdentity commissionedBrains[3];
+  MothershipVDCRetainedTCX retainedTCX[2];
 };
 
 template <typename S>
@@ -79,6 +129,17 @@ static void serialize(S&& serializer, MothershipVDCBundleRecovery& operation)
   serializer.text1b(operation.providerCgroup, 4096);
   serializer.text1b(operation.workerCgroup, 4096);
   for (String& argument : operation.providerArguments) serializer.text1b(argument, 4096);
+  if (operation.version == 3 || operation.version == 4)
+  {
+    serializer.value1b(operation.testOnlyFollowerReplacement);
+    serializer.text1b(operation.selectedMachineUUID, 64);
+    serializer.text1b(operation.masterMachineUUID, 64);
+    serializer.text1b(operation.witnessMachineUUID, 64);
+    serializer.text1b(operation.preflightReportSHA256, 64);
+    for (MothershipVDCProcessIdentity& brain : operation.commissionedBrains) serializer.object(brain);
+  }
+  if (operation.version == 4)
+    for (MothershipVDCRetainedTCX& link : operation.retainedTCX) serializer.object(link);
 }
 
 static inline bool mothershipVDCRead(const String& path, String& output, uint64_t maximum = 65536)
@@ -224,12 +285,29 @@ static inline bool mothershipVDCWriteRecovery(const String& directory, Mothershi
 
 static inline bool mothershipVDCReadRecovery(const String& directory, MothershipVDCBundleRecovery& operation)
 {
+  // Clear optional versioned tails before decoding an older record into a
+  // reused object; neither preflight nor retained-link identities may leak in.
+  operation = {};
   String path = {}, serialized = {};
   mothershipVirtualDatacenterPath(directory, "operation", path);
   return mothershipVDCRead(path, serialized) && BitseryEngine::deserializeSafe(serialized, operation) &&
-         operation.version == 2 && operation.clusterUUID != 0 && operation.operationID != 0 &&
+         (operation.version == 2 || operation.version == 3 || operation.version == 4) && operation.clusterUUID != 0 && operation.operationID != 0 &&
          operation.runtimeIdentity > 1 && operation.machineIndex > 0 &&
          operation.phase <= MothershipVDCRecoveryPhase::complete;
+}
+
+static inline bool mothershipVDCTestFollowerRecoveryMatches(const MothershipVDCBundleRecovery& operation,
+                                                            uint128_t clusterUUID, uint32_t machineIndex,
+                                                            const String& sourceBundle, const String& successorBundle)
+{
+  if ((operation.version != 3 && operation.version != 4) || operation.testOnlyFollowerReplacement == false || operation.clusterUUID != clusterUUID ||
+      operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(sourceBundle) == false ||
+      operation.successorBundle.equals(successorBundle) == false || operation.selectedMachineUUID.empty() ||
+      operation.masterMachineUUID.empty() || operation.witnessMachineUUID.empty() || operation.preflightReportSHA256.empty() ||
+      operation.selectedMachineUUID.equals(operation.masterMachineUUID) ||
+      operation.selectedMachineUUID.equals(operation.witnessMachineUUID) ||
+      operation.masterMachineUUID.equals(operation.witnessMachineUUID)) return false;
+  return true;
 }
 
 // Prepare through the boot-state owner before stopping anything. The caller

@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/un.h>
@@ -27,6 +28,7 @@
 #include <services/prodigy.h>
 
 #include <prodigy/bootstrap.config.h>
+#include <prodigy/bundle.upgrade.h>
 #include <prodigy/container.contract.h>
 #include <prodigy/containerstore.h>
 #include <prodigy/dns.providers.h>
@@ -57,6 +59,7 @@
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/types.h>
+#include <switchboard/host.tcx.retention.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
@@ -3903,16 +3906,146 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
   return true;
 }
 
-static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
-    const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
-    const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA, String *failure)
+// The lifecycle owner asks Switchboard to retain its existing resources. It
+// neither attaches a program nor writes a routing map. Namespace entry stays in
+// this bounded child, and the durable recovery record owns the exact identities.
+static bool mothershipVDCRetainFollowerNetworking(MothershipVDCBundleRecovery& operation,
+                                                 bool capture, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
-  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains, expectedIncompleteWorkerSHA.empty() == false) == false)
+  if (!operation.testOnlyFollowerReplacement || operation.machineIndex == 0 || operation.machineIndex > 3)
+    return reject("host routing retention requires the admitted test follower");
+  const auto& owner = capture ? operation.worker : operation.adopter;
+  char state = 0;
+  if (!mothershipVDCProcessMatches(owner, &state) || (capture && state != 'T' && state != 't'))
+    return reject("host routing retention namespace owner changed or worker is not stopped");
+  struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } mount, network, input, output;
+  String path = {};
+  path.snprintf<"/proc/{itoa}/ns/mnt"_ctv>(owner.pid);
+  mount.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (capture) path.snprintf<"/proc/{itoa}/ns/net"_ctv>(owner.pid);
+  else path.snprintf<"/proc/{itoa}/root/run/netns/pvd-m{itoa}-{itoa}"_ctv>(owner.pid, uint64_t(operation.machineIndex), operation.runtimeIdentity);
+  network.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  struct stat mountInfo = {}, networkInfo = {};
+  if (mount.fd < 0 || network.fd < 0 || ::fstat(mount.fd, &mountInfo) != 0 || ::fstat(network.fd, &networkInfo) != 0 ||
+      uint64_t(mountInfo.st_ino) != owner.mountNamespace || uint64_t(networkInfo.st_ino) != operation.worker.networkNamespace ||
+      !mothershipVDCProcessMatches(owner))
+    return reject("host routing retention namespace identity mismatch");
+  int descriptors[2];
+  if (::pipe2(descriptors, O_CLOEXEC) != 0) return reject("cannot open host routing retention receipt channel");
+  input.fd = descriptors[0]; output.fd = descriptors[1];
+  struct Receipt { MothershipVDCRetainedTCX links[2]; int result = 1; } receipt = {};
+  pid_t child = ::fork();
+  if (child == 0)
+  {
+    ::close(input.fd);
+    ::signal(SIGALRM, SIG_DFL);
+    ::alarm(10);
+    if (::setns(mount.fd, CLONE_NEWNS) != 0 || ::setns(network.fd, CLONE_NEWNET) != 0) _exit(125);
+    const uint32_t ifindex = ::if_nametoindex("bond0"); // the admitted VDC machine interface
+    String bpffsRoot = {};
+    if (capture) bpffsRoot.assign("/sys/fs/bpf"_ctv);
+    else bpffsRoot.snprintf<"/mnt/prodigy-vdc-{itoa}/machine-bpffs/machine{itoa}"_ctv>(operation.runtimeIdentity, uint64_t(operation.machineIndex));
+    SwitchboardHostTCXRetentionPair pair = {};
+    auto importIdentity = [](const MothershipVDCRetainedTCX& source, SwitchboardHostTCXRetentionIdentity& target) {
+      target.interfaceIndex = source.ifindex;
+      target.direction = source.attachType == uint32_t(BPF_TCX_INGRESS) ? SwitchboardHostTCXDirection::ingress : SwitchboardHostTCXDirection::egress;
+      target.programID = source.programID; target.linkID = source.linkID;
+      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+    };
+    auto exportIdentity = [](const SwitchboardHostTCXRetentionIdentity& source, MothershipVDCRetainedTCX& target) {
+      target.ifindex = source.interfaceIndex;
+      target.attachType = uint32_t(switchboardHostTCXAttachType(source.direction));
+      target.programID = source.programID; target.linkID = source.linkID;
+      target.wormholeFlowMapID = source.wormholeFlowMapID; target.wormholePendingFlowMapID = source.wormholePendingFlowMapID;
+      std::memcpy(target.programTag, source.programTag, sizeof(target.programTag));
+    };
+    bool okay = false;
+    if (capture)
+      okay = switchboardHostTCXRetainCurrentPair(ifindex, bpffsRoot, pair);
+    else if (operation.version == 4 && operation.retainedTCX[0].attachType == uint32_t(BPF_TCX_INGRESS) &&
+             operation.retainedTCX[1].attachType == uint32_t(BPF_TCX_EGRESS))
+    {
+      importIdentity(operation.retainedTCX[0], pair.ingress);
+      importIdentity(operation.retainedTCX[1], pair.egress);
+      okay = switchboardHostTCXVerifyRetainedPair(ifindex, bpffsRoot, pair);
+    }
+    if (okay)
+    {
+      exportIdentity(pair.ingress, receipt.links[0]);
+      exportIdentity(pair.egress, receipt.links[1]);
+      receipt.result = 0;
+    }
+    ssize_t bytes;
+    do { bytes = ::write(output.fd, &receipt, sizeof(receipt)); } while (bytes < 0 && errno == EINTR);
+    _exit(bytes == sizeof(receipt) && okay ? 0 : 1);
+  }
+  if (child < 0) return reject("cannot launch bounded host routing retention request");
+  ::close(output.fd); output.fd = -1;
+  size_t received = 0;
+  while (received < sizeof(receipt))
+  {
+    ssize_t bytes = ::read(input.fd, reinterpret_cast<char *>(&receipt) + received, sizeof(receipt) - received);
+    if (bytes < 0 && errno == EINTR) continue;
+    if (bytes <= 0) break;
+    received += size_t(bytes);
+  }
+  int status = 0;
+  pid_t waited;
+  do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || received != sizeof(receipt) || receipt.result != 0)
+    return reject("exact host routing link retention failed; follower recovery remains held");
+  if (capture)
+  {
+    operation.version = 4;
+    for (unsigned index = 0; index < 2; ++index) operation.retainedTCX[index] = receipt.links[index];
+  }
+  basics_log("retainedFollowerNetworking verified=1 machineIndex=%u capture=%u ingressLink=%u egressLink=%u flowMap=%u pendingMap=%u\n",
+             operation.machineIndex, unsigned(capture), receipt.links[0].linkID, receipt.links[1].linkID,
+             receipt.links[0].wormholeFlowMapID, receipt.links[0].wormholePendingFlowMapID);
+  return true;
+}
+
+static void mothershipVDCTestFaultAfterRecoveryTransition(MothershipVDCTestRecoveryFaultPhase requested,
+    MothershipVDCTestRecoveryFaultPhase transition, const MothershipVDCBundleRecovery& operation)
+{
+  if (requested != transition) return;
+  String operationText = {}; operationText.assignItoh(operation.operationID);
+  const char *phase = transition == MothershipVDCTestRecoveryFaultPhase::frozen ? "frozen" :
+                      transition == MothershipVDCTestRecoveryFaultPhase::rootInstalled ? "rootInstalled" : "workerReplaced";
+  basics_log("recoverTestClusterFollowerBrain testFault=1 phase=%s operationID=%s machineIndex=%u before_exit=86\n",
+             phase, operationText.c_str(), unsigned(operation.machineIndex));
+  std::fflush(stdout);
+  std::fflush(stderr);
+  _exit(86);
+}
+
+static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
+    const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
+    const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA,
+    const MothershipVDCBundleRecovery *followerPreflight, MothershipVDCTestRecoveryFaultPhase testFaultAfterPhase,
+    uint128_t *completedOperationID, String *failure)
+{
+  auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  const bool followerReplacement = followerPreflight != nullptr;
+  // A follower retains its unchanged boot record and restarts under the old
+  // master, which remains the plan owner.  Bootstrap supersession/checkpoint
+  // is reserved for the existing sole-Brain path.
+  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains, expectedIncompleteWorkerSHA.empty() == false,
+                                              followerReplacement) == false)
     return reject("Brain replacement is unsupported without an authoritative local-container checkpoint");
-  if (expectedIncompleteWorkerSHA.empty() == false && (machineIndex != 1 || cluster.nBrains != 1 ||
+  if (followerReplacement && expectedIncompleteWorkerSHA.empty() == false)
+    return reject("test follower replacement must retain its original boot without an incomplete-update receipt");
+  if (testFaultAfterPhase != MothershipVDCTestRecoveryFaultPhase::none && followerReplacement == false)
+    return reject("test recovery fault injection requires the test-only follower operation");
+  if (expectedIncompleteWorkerSHA.empty() == false && ((!followerReplacement && (machineIndex != 1 || cluster.nBrains != 1)) ||
       prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
     return reject("incomplete bundle supersession requires the sole Brain and a distinct expected pending digest");
+  if (followerReplacement && (cluster.nBrains != 3 || machineIndex > 3 || machineIndex == 0 ||
+      mothershipVDCTestFollowerRecoveryMatches(*followerPreflight, cluster.clusterUUID, machineIndex,
+                                               expectedOldSHA, successorSHA) == false))
+    return reject("test follower replacement preflight is incomplete or differs from retained recovery request");
   String lockPath = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery.lock", lockPath);
   struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } lock;
@@ -3922,7 +4055,9 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   String recoveryRoot = {}, directory = {}, directoryName = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery", recoveryRoot);
   if (::mkdir(recoveryRoot.c_str(), 0700) != 0 && errno != EEXIST) return reject("cannot create provider recovery owner");
-  directoryName.snprintf<"machine{itoa}-{}-{}"_ctv>(uint64_t(machineIndex), expectedOldSHA, successorSHA);
+  String recoveryPrefix = {};
+  if (followerReplacement) recoveryPrefix.assign("follower-"_ctv);
+  directoryName.snprintf<"{}machine{itoa}-{}-{}"_ctv>(recoveryPrefix, uint64_t(machineIndex), expectedOldSHA, successorSHA);
   mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
   String activePath = {}, active = {};
   MothershipVDCProcessIdentity refusedWorker = {}, refusedSupervisor = {};
@@ -4007,9 +4142,17 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   if (::access(operationPath.c_str(), F_OK) == 0)
   {
     if (mothershipVDCReadRecovery(directory, operation) == false || operation.clusterUUID != cluster.clusterUUID ||
-        operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(expectedOldSHA) == false ||
+        operation.machineIndex != machineIndex || operation.testOnlyFollowerReplacement != followerReplacement ||
+        operation.expectedOldBundle.equals(expectedOldSHA) == false ||
         operation.expectedIncompleteWorkerBundle.equals(expectedIncompleteWorkerSHA) == false ||
-        operation.successorBundle.equals(successorSHA) == false) return reject("provider recovery operation identity mismatch");
+        operation.successorBundle.equals(successorSHA) == false ||
+        (followerReplacement && (operation.selectedMachineUUID != followerPreflight->selectedMachineUUID ||
+                                 operation.masterMachineUUID != followerPreflight->masterMachineUUID ||
+                                 operation.witnessMachineUUID != followerPreflight->witnessMachineUUID ||
+                                 operation.preflightReportSHA256 != followerPreflight->preflightReportSHA256)))
+      return reject("provider recovery operation identity mismatch");
+    if (followerReplacement && operation.version < 4 && operation.phase >= MothershipVDCRecoveryPhase::workerKilled)
+      return reject("legacy follower recovery journal has no retained routing identities; cannot attest this retry");
   }
   else
   {
@@ -4019,6 +4162,15 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     operation.expectedOldBundle = expectedOldSHA;
     operation.successorBundle = successorSHA;
     operation.expectedIncompleteWorkerBundle = expectedIncompleteWorkerSHA;
+    if (followerReplacement)
+    {
+      operation.version = 3;
+      operation.testOnlyFollowerReplacement = true;
+      operation.selectedMachineUUID = followerPreflight->selectedMachineUUID;
+      operation.masterMachineUUID = followerPreflight->masterMachineUUID;
+      operation.witnessMachineUUID = followerPreflight->witnessMachineUUID;
+      operation.preflightReportSHA256 = followerPreflight->preflightReportSHA256;
+    }
     uint64_t supervisorPID = 0;
     if (mothershipVDCReadNumber(pidPath, supervisorPID) == false || mothershipVDCReadProcess(supervisorPID, operation.supervisor) == false)
       return reject("retained provider process identity unavailable");
@@ -4044,7 +4196,14 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       while (end != terminal && *end != '\n') ++end;
       uint64_t worker = 0;
       if (end == terminal || mothershipVDCParseUnsigned(cursor, end, worker) == false || worker < 2) return reject("retained worker inventory is malformed");
-      if (index == machineIndex && mothershipVDCReadProcess(worker, operation.worker) == false) return reject("selected worker identity unavailable");
+      if (followerReplacement && index <= 3 &&
+          mothershipVDCReadProcess(worker, operation.commissionedBrains[index - 1]) == false)
+        return reject("commissioned Brain process identity unavailable");
+      if (index == machineIndex)
+      {
+        if (followerReplacement) operation.worker = operation.commissionedBrains[index - 1];
+        else if (mothershipVDCReadProcess(worker, operation.worker) == false) return reject("selected worker identity unavailable");
+      }
       cursor = end + 1;
     }
     if (cursor != terminal) return reject("retained worker inventory has unexpected entries");
@@ -4062,6 +4221,18 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     expectedWorker.append(leaf);
     if (operation.workerCgroup.equals(expectedWorker) == false || operation.worker.networkNamespace == operation.supervisor.networkNamespace)
       return reject("selected worker does not own the expected isolated machine cgroup");
+    if (followerReplacement)
+    {
+      for (uint32_t index = 1; index <= 3; ++index)
+      {
+        String brainRoot = {}, observedBundle = {};
+        brainRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(index));
+        if (mothershipVDCProcessMatches(operation.commissionedBrains[index - 1]) == false ||
+            fileDigest(brainRoot, "prodigy.bundle.tar.zst", observedBundle) == false ||
+            observedBundle.equals(expectedOldSHA) == false)
+          return reject("commissioned Brain source artifact or process identity differs from exact legacy fixture");
+      }
+    }
     if (fileDigest(installedRoot, "prodigy.bundle.tar.zst", installedDigest) == false || installedDigest.equals(expectedOldSHA) == false ||
         fileDigest(installedRoot, "prodigy", operation.oldExecutable) == false || executableMatches(operation.worker, operation.oldExecutable) == false)
       return reject("selected worker installed bundle or executable differs from expected old artifact");
@@ -4079,7 +4250,28 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
           mothershipVDCDurableWrite(directory, "previous-boot.json", originalBoot, failure) == false ||
           mothershipVDCDurableWrite(directory, "successor-boot.json", successorBoot, failure) == false) return false;
     }
+    else if (followerReplacement &&
+             prodigyComputeFileSHA256Hex(bootPath, operation.previousBootSHA256, failure) == false)
+    {
+      return false;
+    }
     if (save() == false) return false;
+  }
+  // Before this test-only transaction takes the irreversible provider handoff,
+  // all three identities captured from the initial authenticated 19b fixture
+  // must still be live.  A completed retry is handled by the command's durable
+  // query path and never reaches this admission check.
+  if (followerReplacement && operation.phase < MothershipVDCRecoveryPhase::committed)
+  {
+    for (uint32_t member = 1; member <= 3; ++member)
+    {
+      String root = {}, observedBundle = {};
+      root.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(member));
+      if (mothershipVDCProcessMatches(operation.commissionedBrains[member - 1]) == false ||
+          fileDigest(root, "prodigy.bundle.tar.zst", observedBundle) == false ||
+          observedBundle.equals(operation.expectedOldBundle) == false)
+        return reject("commissioned Brain identity changed before retained follower handoff");
+    }
   }
   if (refusedWorker.pid > 1 &&
       (operation.phase != MothershipVDCRecoveryPhase::accepted ||
@@ -4116,15 +4308,18 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   };
   if (operation.phase < MothershipVDCRecoveryPhase::committed)
   {
+    const bool transitionsFromAccepted = operation.phase == MothershipVDCRecoveryPhase::accepted;
     if (mothershipVDCSignal(operation.supervisor, SIGSTOP) == false || waitStopped(operation.supervisor) == false)
       return reject("cannot freeze the exact retained provider");
     operation.phase = MothershipVDCRecoveryPhase::frozen;
     if (save() == false) return false;
+    if (transitionsFromAccepted)
+      mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::frozen, operation);
     String currentCgroup = {};
     if (mothershipVDCReadProcessFile(operation.supervisor.pid, "cgroup", currentCgroup) == false || currentCgroup.equals(operation.providerCgroup) == false ||
         executableMatches(operation.worker, operation.oldExecutable) == false)
       return reject("retained process identity changed before provider handoff");
-    if (expectedIncompleteWorkerSHA.empty() == false)
+    if (expectedIncompleteWorkerSHA.empty() == false || followerReplacement)
     {
       String observedBootSHA = {};
       if (prodigyComputeFileSHA256Hex(bootPath, observedBootSHA, failure) == false || observedBootSHA.equals(operation.previousBootSHA256) == false)
@@ -4226,6 +4421,14 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   }
   if (operation.phase == MothershipVDCRecoveryPhase::workerStopped)
   {
+    if (followerReplacement)
+    {
+      // Partial pinning before a coordinator crash is safely repeatable while
+      // the exact original worker is stopped. Never kill it until both kernel
+      // references and their durable identity have been established.
+      const bool capture = operation.retainedTCX[0].linkID == 0 && operation.retainedTCX[1].linkID == 0;
+      if (mothershipVDCRetainFollowerNetworking(operation, capture, failure) == false || save() == false) return false;
+    }
     if (mothershipVDCProcessMatches(operation.worker) && mothershipVDCSignal(operation.worker, SIGKILL) == false)
       return reject("cannot stop exact selected worker; recovery remains held");
     for (unsigned i = 0; i < 100 && mothershipVDCProcessMatches(operation.worker); ++i) ::usleep(10000);
@@ -4233,6 +4436,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     operation.phase = MothershipVDCRecoveryPhase::workerKilled;
     if (save() == false) return false;
   }
+  if (followerReplacement && operation.phase >= MothershipVDCRecoveryPhase::workerKilled &&
+      mothershipVDCRetainFollowerNetworking(operation, false, failure) == false) return false;
   if (operation.phase == MothershipVDCRecoveryPhase::workerKilled)
   {
     String installed = {}, previous = {}, staged = {};
@@ -4255,6 +4460,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
         mothershipVDCDurableWrite(directory, "root-installed", directoryName, failure) == false) return false;
     operation.phase = MothershipVDCRecoveryPhase::rootInstalled;
     if (save() == false) return false;
+    mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::rootInstalled, operation);
   }
   if (operation.phase == MothershipVDCRecoveryPhase::rootInstalled)
   {
@@ -4303,10 +4509,15 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     if (replaced == false) return reject("replacement runtime was not observed; provider retains selected machine without cgroup reset");
     operation.phase = MothershipVDCRecoveryPhase::replaced;
     if (save() == false) return false;
+    mothershipVDCTestFaultAfterRecoveryTransition(testFaultAfterPhase, MothershipVDCTestRecoveryFaultPhase::workerReplaced, operation);
   }
   if (executableMatches(operation.replacement, operation.successorExecutable) == false) return reject("replacement runtime identity no longer matches completed recovery");
+  if (followerReplacement && mothershipVDCRetainFollowerNetworking(operation, false, failure) == false) return false;
+  // Completion is a process/resource retention receipt. Async Neuron adoption,
+  // application health and quorum remain separately observed qualification gates.
   operation.phase = MothershipVDCRecoveryPhase::complete;
   if (save() == false || mothershipVDCDurableWrite(directory, "complete", directoryName, failure) == false) return false;
+  if (completedOperationID) *completedOperationID = operation.operationID;
   if (failure) failure->clear();
   return true;
 }
@@ -5566,6 +5777,11 @@ public:
   const String& ioFailureDetail(void) const
   {
     return lastIOFailure;
+  }
+
+  uint128_t configuredClusterUUID(void) const
+  {
+    return expectedClusterUUID;
   }
 
 #ifdef PRODIGY_MOTHERSHIP_TEST_ACCESS
@@ -7268,6 +7484,29 @@ private:
       {
         return false;
       }
+      if (environment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        if (mothershipRunProviderHostJob(
+                hostRuntime,
+                environment,
+                MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+                "schema cpu capability inference",
+                failure,
+                [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+                  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                        inferClusterMachineSchemaCpuCapabilities(provider, coro, cluster, capabilities, jobFailure);
+                      }))
+                  {
+                    co_await coro->suspendAtIndex(suspendIndex);
+                  }
+                  completed = jobFailure.empty();
+                }) == false)
+        {
+          return false;
+        }
+        publishClusterMachineSchemaCpuCapabilities(cluster, capabilities);
+        return true;
+      }
       std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
       if (provider == nullptr)
       {
@@ -7305,6 +7544,24 @@ private:
     if (mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, credential, environment, &failure) == false)
     {
       return false;
+    }
+    if (environment.kind == ProdigyEnvironmentKind::vultr)
+    {
+      return mothershipRunProviderHostJob(
+          hostRuntime,
+          environment,
+          MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+          "create preflight",
+          failure,
+          [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  preflightClusterProviderCreate(provider, coro, preflight, jobFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            completed = jobFailure.empty();
+          });
     }
     std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(environment, {});
     if (provider == nullptr)
@@ -7383,14 +7640,34 @@ private:
     }
     else
     {
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
-      if (provider == nullptr)
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
-        failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
-        return false;
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "machine destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderMachines(coro, provider, cloudIDs, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
       }
-      provider->configureRuntimeEnvironment(runtimeEnvironment);
-      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      else
+      {
+        std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+        if (provider == nullptr)
+        {
+          failure.assign("failed to construct runtime provider for cluster destroy"_ctv);
+          return false;
+        }
+        provider->configureRuntimeEnvironment(runtimeEnvironment);
+        destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      }
     }
 
     destroyedCloudMachines = destroyed ? uint32_t(createdMachines.size()) : 0;
@@ -8352,6 +8629,11 @@ private:
 
     Mothership *owner = nullptr;
     MothershipTunnelGatewayAuth tunnelProviderGatewayAuth;
+    // This is command-scoped test input, deliberately not cluster state.  A
+    // persisted cluster always resolves its normal release sibling on later
+    // reconciliation.
+    String testInitialBundlePath;
+    String testInitialBundleSHA256;
 
     class SeedProvisioningProgressPrinter final : public BrainIaaSMachineProvisioningProgressSink {
     private:
@@ -8522,6 +8804,34 @@ private:
         return tagged;
       }
 
+      if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const bool tagged = mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            tagRuntimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "cloud machine tagging",
+            tagFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              provider.configureBootstrapSSHAccess(cluster.bootstrapSshUser, cluster.bootstrapSshKeyPackage,
+                                                   cluster.bootstrapSshHostKeyPackage, cluster.bootstrapSshPrivateKeyPath);
+              completed = true;
+              for (const ClusterMachine& machine : machines)
+              {
+                completed = false;
+                if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                      prodigyEnsureCloudMachineTagged(coro, provider, cluster.clusterUUID, machine, completed, &jobFailure);
+                    }))
+                {
+                  co_await coro->suspendAtIndex(suspendIndex);
+                }
+                if (completed == false || jobFailure.empty() == false) co_return;
+              }
+            });
+        if (tagged == false && failure) failure->assign(tagFailure);
+        return tagged;
+      }
+
       std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(tagRuntimeEnvironment, {});
       if (provider == nullptr)
       {
@@ -8551,9 +8861,12 @@ private:
 
   public:
 
-    explicit ClusterCreateHooks(Mothership *mothership, MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {})
+    explicit ClusterCreateHooks(Mothership *mothership, MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {},
+                                String initialTestBundlePath = {}, String initialTestBundleSHA256 = {})
         : owner(mothership),
-          tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth))
+          tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth)),
+          testInitialBundlePath(std::move(initialTestBundlePath)),
+          testInitialBundleSHA256(std::move(initialTestBundleSHA256))
     {}
 
     bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
@@ -8897,6 +9210,40 @@ private:
         return false;
       }
 
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const bool provisioned = mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() +
+                std::chrono::milliseconds(prodigyMachineProvisioningTimeoutMs),
+            "seed provisioning",
+            localFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipProvisionCreatedSeedMachine(coro,
+                                                          cluster,
+                                                          instruction,
+                                                          provider,
+                                                          seedMachine,
+                                                          completed,
+                                                          &progressPrinter,
+                                                          timingAttribution,
+                                                          &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        if (provisioned == false)
+        {
+          if (failure) failure->assign(localFailure);
+          return false;
+        }
+        if (failure) failure->clear();
+        return true;
+      }
+
       std::unique_ptr<BrainIaaS> provider =
           prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
       if (provider == nullptr)
@@ -9024,6 +9371,57 @@ private:
         return true;
       }
 
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        const MultiCurlClient::TimePoint cleanupDeadline =
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10);
+        (void)mothershipRunProviderHostJob(
+            owner->hostRuntime,
+            runtimeEnvironment,
+            cleanupDeadline - std::chrono::minutes(3),
+            "cluster cleanup",
+            destroyClusterFailure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderClusterMachines(coro, provider, clusterUUIDTagValue,
+                                                             destroyedClusterMachines, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        Vector<String> seedCloudIDs = {};
+        seedCloudIDs.push_back(seedMachine.cloud.cloudID);
+        if (mothershipRunProviderHostJob(
+                owner->hostRuntime,
+                runtimeEnvironment,
+                cleanupDeadline,
+                "seed machine destroy",
+                localFailure,
+                [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+                  if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                        mothershipDestroyProviderMachines(coro, provider, seedCloudIDs, completed, &jobFailure);
+                      }))
+                  {
+                    co_await coro->suspendAtIndex(suspendIndex);
+                  }
+                }) == false)
+        {
+          if (failure)
+          {
+            if (localFailure.empty() == false && destroyClusterFailure.empty() == false)
+            {
+              localFailure.append("; bulk cleanup also failed: "_ctv);
+              localFailure.append(destroyClusterFailure);
+            }
+            failure->assign(localFailure.empty() ? destroyClusterFailure : localFailure);
+          }
+          return false;
+        }
+        if (failure) failure->clear();
+        return true;
+      }
+
       std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
       if (provider == nullptr)
       {
@@ -9094,13 +9492,31 @@ private:
           return false;
         }
 
-        String localProdigyPath = {};
         String bundlePath = {};
-        if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
-            prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false ||
+        String approvedDigest = {};
+        if (testInitialBundlePath.empty())
+        {
+          String localProdigyPath = {};
+          if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
+              prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false)
+          {
+            finalizeTiming();
+            return false;
+          }
+        }
+        else
+        {
+          bundlePath = testInitialBundlePath;
+        }
+        if (prodigyApproveBundleArtifact(bundlePath, approvedDigest, failure) == false ||
+            (testInitialBundleSHA256.empty() == false && approvedDigest.equals(testInitialBundleSHA256) == false) ||
             mothershipProvisionVirtualDatacenterSeed(cluster, topology, request, runtimeEnvironment, bundlePath, failure) == false ||
             mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterSeedRuntimeFilename, failure) == false)
         {
+          if (failure && failure->empty() && testInitialBundleSHA256.empty() == false)
+          {
+            failure->assign("test initial bundle changed after create admission"_ctv);
+          }
           finalizeTiming();
           return false;
         }
@@ -9164,6 +9580,17 @@ private:
             {
               failure->assign(tagFailure);
             }
+            finalizeTiming();
+            return false;
+          }
+        }
+        else if (tagRuntimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+        {
+          Vector<ClusterMachine> seedMachines = {};
+          seedMachines.push_back(seedMachine);
+          if (ensureCloudMachinesTaggedLocally(cluster, seedMachines, &tagFailure) == false)
+          {
+            if (failure) failure->assign(tagFailure);
             finalizeTiming();
             return false;
           }
@@ -9614,6 +10041,337 @@ private:
     }
 
     return true;
+  }
+
+  static bool hashUpgradeAdmissionReport(const MothershipUpgradeAdmissionReport& report,
+                                         String& digest,
+                                         String& failure)
+  {
+    String serialized = {};
+    BitseryEngine::serialize(serialized, const_cast<MothershipUpgradeAdmissionReport&>(report));
+    if (!prodigyComputeSHA256Hex(serialized, digest, &failure))
+    {
+      if (failure.empty()) failure.assign("unable to hash upgrade admission report"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Receipt, nonce, and sampling time deliberately do not enter this digest:
+  // each read-only observation request renews them.  Every authority and peer
+  // fact that can change rollout authority or the observed source does.
+  static bool semanticUpgradeAdmissionReportDigest(const MothershipUpgradeAdmissionReport& report,
+                                                    String& digest,
+                                                    String& failure)
+  {
+    if (report.version != 4 || report.clusterUUID == 0 || report.authorityGeneration == 0 ||
+        report.masterUUID == 0 || report.masterBootNs <= 0 || report.masterApprovedBundleSHA256.empty())
+    {
+      failure.assign("upgrade admission report lacks a generation-fenced authority identity"_ctv);
+      return false;
+    }
+    String encoded = {};
+    mothershipUpgradeAppendUUID(encoded, report.clusterUUID);
+    mothershipUpgradeAppendUInt(encoded, report.authorityGeneration);
+    mothershipUpgradeAppendUUID(encoded, report.masterUUID);
+    mothershipUpgradeAppendUInt(encoded, uint64_t(report.masterBootNs));
+    mothershipUpgradeAppendBool(encoded, report.master);
+    mothershipUpgradeAppendBool(encoded, report.authorityQuorumHealthy);
+    mothershipUpgradeAppendBool(encoded, report.authorityAcknowledged);
+    mothershipUpgradeAppendBool(encoded, report.recoveryWitnessAcknowledged);
+    mothershipUpgradeAppendBool(encoded, report.currentUpdaterSupportsSerialFollowers);
+    mothershipUpgradeAppendBool(encoded, report.fleetBundleDigestsFresh);
+    mothershipUpgradeAppendBool(encoded, report.fleetInventoriesFresh);
+    mothershipUpgradeAppendBool(encoded, report.observationComplete);
+    mothershipUpgradeAppendUInt(encoded, report.commissionedBrainCount);
+    mothershipUpgradeAppendUInt(encoded, report.healthyCommissionedBrainCount);
+    mothershipUpgradeAppendUInt(encoded, report.activeDeploymentCount);
+    mothershipUpgradeAppendUInt(encoded, report.readySchedulableStorageBytes);
+    mothershipUpgradeAppendBool(encoded, report.commissionedPeerTransportVerified);
+    mothershipUpgradeAppendField(encoded, report.operationID);
+    mothershipUpgradeAppendField(encoded, report.targetBundleSHA256);
+    mothershipUpgradeAppendField(encoded, report.targetContractSHA256);
+    mothershipUpgradeAppendUInt(encoded, report.requiredStagingBytes);
+    mothershipUpgradeAppendBool(encoded, report.stagingCapacityResponsesComplete);
+    mothershipUpgradeAppendBool(encoded, report.stagingCapacityComplete);
+    mothershipUpgradeAppendField(encoded, report.masterApprovedBundleSHA256);
+    mothershipUpgradeAppendField(encoded, report.masterRunningProdigyVersion);
+    mothershipUpgradeAppendUInt(encoded, report.peers.size());
+    for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+    {
+      mothershipUpgradeAppendUUID(encoded, peer.brainUUID);
+      mothershipUpgradeAppendUUID(encoded, peer.machineUUID);
+      mothershipUpgradeAppendUInt(encoded, peer.authorityGeneration);
+      mothershipUpgradeAppendUInt(encoded, peer.requesterTransportGeneration);
+      mothershipUpgradeAppendUUID(encoded, peer.masterUUID);
+      mothershipUpgradeAppendUInt(encoded, uint64_t(peer.masterBootNs));
+      mothershipUpgradeAppendBool(encoded, peer.codeSupportsSerialFollowers);
+      mothershipUpgradeAppendBool(encoded, peer.localInstalledBundleVerified);
+      mothershipUpgradeAppendBool(encoded, peer.stateUploadFresh);
+      mothershipUpgradeAppendBool(encoded, peer.authorityAcknowledged);
+      mothershipUpgradeAppendBool(encoded, peer.recoveryWitnessAcknowledged);
+      mothershipUpgradeAppendField(encoded, peer.operationID);
+      mothershipUpgradeAppendField(encoded, peer.targetBundleSHA256);
+      mothershipUpgradeAppendField(encoded, peer.targetContractSHA256);
+      mothershipUpgradeAppendUInt(encoded, peer.requiredStagingBytes);
+      mothershipUpgradeAppendUInt(encoded, peer.stagingAvailableBytes);
+      mothershipUpgradeAppendBool(encoded, peer.stagingCapacityProbeComplete);
+      mothershipUpgradeAppendBool(encoded, peer.stagingCapacityVerified);
+      mothershipUpgradeAppendField(encoded, peer.installedBundleSHA256);
+    }
+    if (!prodigyComputeSHA256Hex(encoded, digest, &failure))
+    {
+      if (failure.empty()) failure.assign("unable to hash semantic upgrade admission report"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static void buildUpgradePlannerInput(const ProdigyApprovedUpgradeBundle& targetBundle,
+                                       const MothershipUpgradeIdentity& sourceIdentity,
+                                       const MothershipUpgradeAdmissionReport& report,
+                                       const String& observedTargetArchitecture,
+                                       const MothershipProdigyCluster *registeredCluster,
+                                       MothershipUpgradePlannerInput& input,
+                                       String& failure)
+  {
+    input = {};
+    failure.clear();
+    input.envelope = targetBundle.envelope;
+    input.observedSource = sourceIdentity;
+    input.observedTargetArchitecture = observedTargetArchitecture;
+    input.sourceClusterUUID = report.clusterUUID;
+    input.targetClusterUUID = report.clusterUUID;
+    input.currentUpdaterSupportsSerialFollowers = report.currentUpdaterSupportsSerialFollowers;
+    input.sourceQuorumHealthy = report.master && report.authorityQuorumHealthy &&
+        report.authorityAcknowledged && report.recoveryWitnessAcknowledged &&
+        report.commissionedPeerTransportVerified;
+    input.targetQuorumHealthy = input.sourceQuorumHealthy;
+    input.healthyBrains = report.healthyCommissionedBrainCount;
+    input.freeBytes = UINT64_MAX;
+    for (const auto& peer : report.peers)
+      input.freeBytes = std::min(input.freeBytes, peer.stagingAvailableBytes);
+    if (report.peers.empty()) input.freeBytes = 0;
+    // A workload-bearing fleet still needs its own overlap and endpoint proof.
+    // Empty, isolated disposable test clusters have no public app to probe.
+    input.emptyIsolatedTestCluster = registeredCluster != nullptr &&
+        registeredCluster->clusterUUID == report.clusterUUID &&
+        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::test &&
+        registeredCluster->test.specified && !registeredCluster->test.enableFakeIpv4Boundary &&
+        report.activeDeploymentCount == 0;
+    input.overlapCapacityAvailable = report.activeDeploymentCount == 0 &&
+        report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
+        report.targetBundleSHA256 == targetBundle.bundleSHA256 &&
+        report.targetContractSHA256 == targetBundle.contract.contractSHA256;
+    input.trustRootsAndUUIDBindingsMatch =
+        targetBundle.contract.transportIdentityMode == "preserveClusterIdentity"_ctv &&
+        report.commissionedPeerTransportVerified;
+    input.publicBaselineHealthy = false;
+    if (!report.observationComplete)
+      failure.assign("generation-fenced peer upgrade observation is incomplete"_ctv);
+    else if (!report.commissionedPeerTransportVerified)
+      failure.assign("commissioned peer transport is not freshly authenticated"_ctv);
+    else if (!report.fleetBundleDigestsFresh || !report.fleetInventoriesFresh ||
+             !report.authorityAcknowledged || !report.recoveryWitnessAcknowledged)
+      failure.assign("fresh authenticated fleet bundle, inventory, and authority attestations are unavailable"_ctv);
+    else
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (!peer.localInstalledBundleVerified || !peer.stateUploadFresh ||
+            !peer.codeSupportsSerialFollowers || !peer.authorityAcknowledged ||
+            !peer.recoveryWitnessAcknowledged)
+        {
+          failure.assign("observed peer is missing a fresh authenticated upgrade receipt"_ctv);
+          break;
+        }
+  }
+
+  bool requestUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
+                                     MothershipUpgradeAdmissionReport& report, String& failure)
+  {
+    report = {};
+    failure.clear();
+    if (socket.connect() != 0)
+    {
+      failure = socket.connectFailureDetail();
+      if (failure.empty()) failure.assign("failed to connect for upgrade admission report"_ctv);
+      return false;
+    }
+    String encodedRequest = {};
+    BitseryEngine::serialize(encodedRequest, const_cast<ProdigyUpgradeAdmissionReportRequest&>(request));
+    Message::construct(socket.wBuffer, MothershipTopic::pullUpgradeAdmissionReport, encodedRequest);
+    if (!socket.send())
+    {
+      failure = socket.ioFailureDetail();
+      socket.close();
+      if (failure.empty()) failure.assign("failed to request upgrade admission report"_ctv);
+      return false;
+    }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullUpgradeAdmissionReport, ProdigyWire::maxControlFrameBytes);
+    if (response == nullptr)
+    {
+      failure = socket.ioFailureDetail();
+      socket.close();
+      if (failure.empty()) failure.assign("upgrade admission report unavailable (legacy Brain does not support it)"_ctv);
+      return false;
+    }
+    String serialized = {};
+    uint8_t *args = response->args;
+    Message::extractToStringView(args, serialized);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(serialized, report) &&
+        report.version == 4 && report.clusterUUID != 0 && report.observationReceiptVersion != 0;
+    socket.close();
+    if (!valid)
+    {
+      failure.assign("upgrade admission report is invalid or unsupported"_ctv);
+      return false;
+    }
+    if (report.operationID != request.operationID || report.targetBundleSHA256 != request.targetBundleSHA256 ||
+        report.targetContractSHA256 != request.targetContractSHA256 || report.requiredStagingBytes != request.requiredStagingBytes)
+    {
+      failure.assign("upgrade admission capacity report is bound to a different target or operation"_ctv);
+      return false;
+    }
+    if (!report.stagingCapacityResponsesComplete)
+    {
+      failure.assign("upgrade admission capacity report is missing commissioned-peer measurements"_ctv);
+      return false;
+    }
+    if (!report.stagingCapacityComplete)
+    {
+      failure.assign("upgrade admission target staging capacity is insufficient or unavailable"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  void runPlanUpgrade(int argc, char *argv[])
+  {
+    if (argc != 4)
+    {
+      basics_log("usage: planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+      exit(EXIT_FAILURE);
+    }
+    String failure = {}, targetInput = {}, sourceInput = {}, operationText = {};
+    targetInput.assign(argv[1]); sourceInput.assign(argv[2]); operationText.assign(argv[3]);
+    uint128_t operationID = 0;
+    if (!prodigyParseCanonicalHex128(operationText, operationID))
+    {
+      basics_log("planUpgrade success=0 failure=operationID must be canonical nonzero hex\n");
+      exit(EXIT_FAILURE);
+    }
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String targetBundlePath = {}, sourceBundlePath = {};
+    if (!resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) ||
+        !prodigyResolveBundleArtifactInput(targetInput, architecture, targetBundlePath, &failure) ||
+        !prodigyResolveBundleArtifactInput(sourceInput, architecture, sourceBundlePath, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    ProdigyApprovedUpgradeBundle targetBundle = {}, sourceBundle = {};
+    if (!prodigyApproveBundleUpgradeContract(targetBundlePath, targetBundle, &failure) ||
+        !prodigyApproveBundleUpgradeContract(sourceBundlePath, sourceBundle, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!configureControlTarget(argv[0], &failure)) exit(EXIT_FAILURE);
+    ProdigyUpgradeAdmissionReportRequest observationRequest = {};
+    observationRequest.operationID.assign(operationText);
+    observationRequest.targetBundleSHA256.assign(targetBundle.bundleSHA256);
+    observationRequest.targetContractSHA256.assign(targetBundle.contract.contractSHA256);
+    observationRequest.requiredStagingBytes = targetBundle.contract.requiredFreeBytes;
+    if (observationRequest.requiredStagingBytes == 0)
+    {
+      basics_log("planUpgrade success=0 failure=target contract lacks nonzero staging-capacity bound\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeAdmissionReport report = {};
+    constexpr uint32_t maximumObservationAttempts = 3;
+    bool reportReceived = false;
+    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
+    {
+      if (!requestUpgradeAdmissionReport(observationRequest, report, failure))
+      {
+        break;
+      }
+      reportReceived = true;
+      if (report.observationComplete) break;
+    }
+    if (!reportReceived)
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeIdentity sourceIdentity = {};
+    sourceIdentity.releaseID = sourceBundle.contract.releaseID;
+    sourceIdentity.contractSHA256 = sourceBundle.contract.contractSHA256;
+    sourceIdentity.prodigySHA256 = sourceBundle.contract.prodigySHA256;
+    sourceIdentity.mothershipSHA256 = sourceBundle.contract.mothershipSHA256;
+    String observedTargetArchitecture = {};
+    observedTargetArchitecture.assign(machineCpuArchitectureName(architecture));
+    MothershipUpgradePlannerInput input = {};
+    MothershipProdigyCluster upgradeCluster = {};
+    const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
+    buildUpgradePlannerInput(targetBundle, sourceIdentity, report, observedTargetArchitecture,
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+    if (failure.empty() && report.masterApprovedBundleSHA256 != sourceBundle.bundleSHA256)
+      failure.assign("approved source bundle does not match master observed bundle digest"_ctv);
+    if (failure.empty())
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (peer.installedBundleSHA256 != sourceBundle.bundleSHA256)
+        {
+          failure.assign("observed peer bundle digest does not match approved source bundle"_ctv);
+          break;
+        }
+    MothershipUpgradePlan plan = mothershipPlanUpgrade(targetBundle.contract, input);
+    if (!failure.empty())
+    {
+      plan.eligible = false;
+      plan.path = MothershipUpgradePath::reject;
+      plan.firstStopGate = failure;
+      plan.reasons.push_back(failure);
+    }
+    String observedReportSHA256 = {}, semanticObservationSHA256 = {};
+    if (!hashUpgradeAdmissionReport(report, observedReportSHA256, failure) ||
+        !semanticUpgradeAdmissionReportDigest(report, semanticObservationSHA256, failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradeAdmissionRecord requested = {};
+    requested.clusterUUID = report.clusterUUID;
+    requested.operationID = operationID;
+    requested.sourceBundleSHA256 = sourceBundle.bundleSHA256;
+    requested.sourceContractSHA256 = sourceBundle.contract.contractSHA256;
+    requested.sourceReleaseID = sourceIdentity.releaseID;
+    requested.sourceProdigySHA256 = sourceIdentity.prodigySHA256;
+    requested.sourceMothershipSHA256 = sourceIdentity.mothershipSHA256;
+    requested.targetBundleSHA256 = targetBundle.bundleSHA256;
+    requested.targetContractSHA256 = targetBundle.contract.contractSHA256;
+    requested.authorityGeneration = report.authorityGeneration;
+    requested.masterUUID = report.masterUUID;
+    requested.masterBootNs = report.masterBootNs;
+    requested.semanticObservationSHA256 = semanticObservationSHA256;
+    requested.approvedPath = uint8_t(plan.path);
+    requested.observationReceiptVersion = report.observationReceiptVersion;
+    requested.observationReportSHA256 = observedReportSHA256;
+    requested.plannerInputSHA256 = plan.inputSHA256;
+    requested.eligible = plan.eligible;
+    requested.firstStopGate = plan.firstStopGate;
+    MothershipUpgradeAdmissionRecord recorded = {};
+    bool resumed = false;
+    MothershipClusterRegistry registry = openClusterRegistry();
+    if (!registry.recordUpgradeAdmission(requested, recorded, resumed, &failure))
+    {
+      basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String clusterUUIDText = {};
+    clusterUUIDText.assignItoh(recorded.clusterUUID);
+    basics_log("planUpgrade success=1 eligible=%u resumed=%u clusterUUID=%s operationID=%s inputSHA256=%s firstStopGate=%s\n",
+               unsigned(recorded.eligible), unsigned(resumed), clusterUUIDText.c_str(),
+               operationText.c_str(), recorded.plannerInputSHA256.c_str(), recorded.firstStopGate.c_str());
   }
 
   void runClusterReport(int argc, char *argv[])
@@ -10189,13 +10947,367 @@ private:
     if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
         prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
         prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA) ||
-        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA, &failure) == false)
+        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA,
+                                                 nullptr, MothershipVDCTestRecoveryFaultPhase::none, nullptr, &failure) == false)
     {
       basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "recovery identity validation failed" : failure.c_str());
       exit(EXIT_FAILURE);
     }
     basics_log("recoverTestClusterBundle accepted=1 phase=workerReplaced machineIndex=%u successorSHA256=%s applicationHealthAttested=0\n",
                unsigned(index), successorSHA.c_str());
+  }
+
+  // This is deliberately a disposable, exact-runtime19b fixture operation.
+  // It does not admit a production rollout, attest application health or prove
+  // an authority quorum after the retained process is replaced.
+  void runRecoverTestClusterFollowerBrain(int argc, char *argv[])
+  {
+    if (argc != 4 && argc != 5)
+    {
+      basics_log("recoverTestClusterFollowerBrain expects [name|clusterUUID] [approved bundle] [nonmaster machine index] [exact runtime19b bundle SHA256] [optional test fault phase: frozen|rootInstalled|workerReplaced]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}; identity.assign(argv[0]);
+    String input = {}; input.assign(argv[1]);
+    String oldSHA = {}; oldSHA.assign(argv[3]);
+    String faultText = {};
+    if (argc == 5) faultText.assign(argv[4]);
+    MothershipVDCTestRecoveryFaultPhase testFaultAfterPhase = MothershipVDCTestRecoveryFaultPhase::none;
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    uint64_t index = 0;
+    if (mothershipVDCTestParseRecoveryFaultPhase(faultText, testFaultAfterPhase) == false)
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=invalid test fault phase\n");
+      exit(EXIT_FAILURE);
+    }
+    // A completed transaction is queried from its durable owner before a new
+    // report is requested.  The selected member now runs the successor, so a
+    // second report cannot be expected to reproduce the initial 19b snapshot.
+    if (loadClusterForScopedMutation("recoverTestClusterFollowerBrain", identity, cluster, failure) &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.nBrains == 3 &&
+        cluster.test.machineCount == 3 && mothershipParseUnsignedArgument(argv[2], 3, index) && index > 0 &&
+        prodigyIsSHA256HexDigest(oldSHA))
+    {
+      MachineCpuArchitecture completedArchitecture = MachineCpuArchitecture::unknown;
+      String completedBundle = {}, completedSHA = {};
+      if (resolveProdigyBundleTargetArchitecture(argv[0], completedArchitecture, &failure) &&
+          prodigyResolveBundleArtifactInput(input, completedArchitecture, completedBundle, &failure) &&
+          prodigyApproveBundleArtifact(completedBundle, completedSHA, &failure) && completedSHA.equals(oldSHA) == false)
+      {
+        String recoveryRoot = {}, directoryName = {}, directory = {};
+        mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery", recoveryRoot);
+        directoryName.snprintf<"follower-machine{itoa}-{}-{}"_ctv>(index, oldSHA, completedSHA);
+        mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
+        MothershipVDCBundleRecovery completed = {};
+        if (mothershipVDCReadRecovery(directory, completed) &&
+            mothershipVDCTestFollowerRecoveryMatches(completed, cluster.clusterUUID, uint32_t(index), oldSHA, completedSHA))
+        {
+          const bool wasComplete = completed.phase == MothershipVDCRecoveryPhase::complete;
+          uint128_t resumedOperationID = 0;
+          String noIncompleteBundle = {};
+          if (mothershipRecoverVirtualDatacenterBundle(cluster, completedBundle, completedSHA, uint32_t(index), oldSHA, noIncompleteBundle,
+                                                       &completed, MothershipVDCTestRecoveryFaultPhase::none, &resumedOperationID, &failure) == false)
+          {
+            basics_log("recoverTestClusterFollowerBrain accepted=0 resumed=1 failure=%s\n", failure.empty() ? "retained follower recovery could not resume" : failure.c_str());
+            exit(EXIT_FAILURE);
+          }
+          completed.operationID = resumedOperationID;
+          String operationText = {}; operationText.assignItoh(completed.operationID);
+          basics_log("recoverTestClusterFollowerBrain accepted=1 resumed=1 phase=%s operationID=%s machineIndex=%u sourceSHA256=%s successorSHA256=%s applicationHealthAttested=0 quorumAttested=0\n",
+                     wasComplete ? "complete" : "workerReplaced",
+                     operationText.c_str(), unsigned(index), oldSHA.c_str(), completedSHA.c_str());
+          return;
+        }
+      }
+    }
+    // The initial admission below starts from a fresh legacy fixture only.
+    failure.clear(); cluster = {}; index = 0;
+    if (loadClusterForScopedMutation("recoverTestClusterFollowerBrain", identity, cluster, failure) == false ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.nBrains != 3 ||
+        cluster.test.machineCount != 3 || mothershipParseUnsignedArgument(argv[2], 3, index) == false ||
+        index == 0 || prodigyIsSHA256HexDigest(oldSHA) == false || configureControlTarget(argv[0], &failure) == false ||
+        socket.connect() != 0)
+    {
+      socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "invalid exact legacy test fixture request" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::pullClusterReport);
+    if (socket.send() == false)
+    {
+      failure = socket.ioFailureDetail(); socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "cluster report request failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullClusterReport, 1024);
+    if (response == nullptr)
+    {
+      failure = socket.ioFailureDetail(); socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "cluster report unavailable" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedReport = {}; uint8_t *args = response->args;
+    Message::extractToStringView(args, serializedReport);
+    ClusterStatusReport report = {};
+    MothershipVDCBundleRecovery preflight = {};
+    bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(serializedReport, report) &&
+                 prodigyComputeSHA256Hex(serializedReport, preflight.preflightReportSHA256, &failure) &&
+                 report.hasTopology && report.topology.machines.size() == 3 && report.machineReports.size() == 3 && cluster.topology.machines.size() == 3;
+    uint32_t masters = 0;
+    for (uint32_t member = 0; valid && member < 3; ++member)
+    {
+      const ClusterMachine& topologyMachine = report.topology.machines[member];
+      String uuid = {}; uuid.assignItoh(topologyMachine.uuid);
+      const MachineStatusReport *status = nullptr;
+      for (const MachineStatusReport& candidate : report.machineReports)
+        if (candidate.machineUUID.equals(uuid)) { status = &candidate; break; }
+      if (topologyMachine.uuid == 0 || cluster.topology.machines[member].uuid != topologyMachine.uuid || status == nullptr || status->isBrain == false ||
+          status->state.equals("healthy"_ctv) == false || status->controlPlaneReachable == false ||
+          status->runtimeReady == false || status->runningProdigyVersion.equals("19"_ctv) == false)
+      { valid = false; break; }
+      if (status->currentMaster) { ++masters; preflight.masterMachineUUID = uuid; }
+      else if (member + 1 == index) preflight.selectedMachineUUID = uuid;
+      else preflight.witnessMachineUUID = uuid;
+    }
+    socket.close();
+    if (!valid || masters != 1 || preflight.selectedMachineUUID.empty() || preflight.witnessMachineUUID.empty() ||
+        preflight.selectedMachineUUID.equals(preflight.masterMachineUUID) || preflight.witnessMachineUUID.equals(preflight.masterMachineUUID))
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=authenticated report is not an exact healthy runtime19b master-plus-two-follower fixture\n");
+      exit(EXIT_FAILURE);
+    }
+    preflight.clusterUUID = cluster.clusterUUID;
+    preflight.version = 3;
+    preflight.machineIndex = uint32_t(index);
+    preflight.expectedOldBundle = oldSHA;
+    preflight.testOnlyFollowerReplacement = true;
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String bundle = {}, successorSHA = {};
+    if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
+        prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
+        prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA))
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "test follower recovery validation failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    preflight.successorBundle = successorSHA;
+    uint128_t operationID = 0;
+    String noIncompleteBundle = {};
+    if (mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, noIncompleteBundle,
+                                                 &preflight, testFaultAfterPhase, &operationID, &failure) == false)
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "test follower recovery validation failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String operationText = {}; operationText.assignItoh(operationID);
+    basics_log("recoverTestClusterFollowerBrain accepted=1 phase=workerReplaced operationID=%s machineIndex=%u sourceSHA256=%s successorSHA256=%s applicationHealthAttested=0 quorumAttested=0\n",
+               operationText.c_str(), unsigned(index), oldSHA.c_str(), successorSHA.c_str());
+  }
+
+  struct TestPairLifecycleLock {
+    int fd = -1;
+    ~TestPairLifecycleLock() { if (fd >= 0) ::close(fd); }
+  };
+
+  bool lockTestPairLifecycle(TestPairLifecycleLock& lock, String& failure)
+  {
+    String path = {};
+    { auto registry = openClusterRegistry(); path = registry.path(); }
+    path.append(".test-pair-lifecycle.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX | LOCK_NB) != 0)
+    {
+      failure.assign("another test pair lifecycle operation is active"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool readDeploymentIdentity(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
+                              DeploymentIdentityReport& report, String& failure)
+  {
+    report = {};
+    socket.close();
+    String targetName = cluster.name;
+    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullDeploymentIdentity, deploymentID);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullDeploymentIdentity);
+    if (!response) { failure.assign("deployment identity observation unavailable"_ctv); socket.close(); return false; }
+    uint8_t *args = response->args;
+    String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) &&
+                       report.version == 1 && report.found && report.live &&
+                       report.clusterUUID == cluster.clusterUUID && report.deploymentID == deploymentID;
+    socket.close();
+    if (!valid) failure.assign("exact live deployment identity is unavailable"_ctv);
+    return valid;
+  }
+
+  bool testPairDeploymentReady(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
+                               uint32_t machineIndex, const String& vip, uint16_t port,
+                               DeploymentIdentityReport& report, String& failure)
+  {
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.test.enableFakeIpv4Boundary ||
+        cluster.nBrains != 3 || cluster.test.machineCount != 3 || machineIndex == 0 || machineIndex > 3)
+    {
+      failure.assign("pair endpoint qualification requires independent three-Brain test clusters without fake boundaries"_ctv);
+      return false;
+    }
+    String expectedAddress = {}, private6 = {}, public6 = {};
+    mothershipVirtualDatacenterMachineAddresses(machineIndex, cluster.datacenterFragment, false,
+                                                expectedAddress, private6, public6);
+    uint128_t expectedMachine = 0;
+    for (const ClusterMachine& machine : cluster.topology.machines)
+    {
+      bool matches = false;
+      for (const ClusterMachineAddress& address : machine.addresses.privateAddresses)
+        if (address.address == expectedAddress) matches = true;
+      if (matches)
+      {
+        if (expectedMachine != 0) { failure.assign("ambiguous test machine identity"_ctv); return false; }
+        expectedMachine = machine.uuid;
+      }
+    }
+    if (expectedMachine == 0) { failure.assign("test machine identity is unavailable"_ctv); return false; }
+    if (!readDeploymentIdentity(cluster, deploymentID, report, failure)) return false;
+    if (!report.profileEligible || report.observedEndpointIPv4 != vip || report.observedEndpointPort != port ||
+        report.observedEndpointMachineUUID != expectedMachine ||
+        report.nTarget != 1 || report.nHealthy != report.nTarget || report.nDeployed != report.nTarget ||
+        !prodigyIsSHA256HexDigest(report.canonicalPlanSHA256) || !prodigyIsSHA256HexDigest(report.containerBlobSHA256))
+    {
+      failure.assign("pair endpoint deployment is not the exact healthy single-machine stateless TCP profile"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool runTestPairProvider(const MothershipTestPairBoundaryRecord& record, const char *action,
+                           const Vector<String>& extra, String& failure)
+  {
+    const auto& d = record.boundary;
+    if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(d, &failure)) return false;
+    Vector<String> args = {};
+    args.emplace_back(std::strcmp(action, "prepare") == 0 ? "--pair-launch" : "--pair-action");
+    if (std::strcmp(action, "prepare") != 0) args.emplace_back(action);
+    String directory = {}; directory.snprintf<"{}/{}"_ctv>(String(mothershipVirtualDatacenterPairBoundaryRoot), d.operationID);
+    args.push_back(directory); args.push_back(d.operationID); args.push_back(d.sourceClusterUUID); args.push_back(d.targetClusterUUID);
+    args.push_back(d.sourceWorkspace); args.push_back(d.sourceRuntimeIdentity);
+    args.emplace_back(); args.back().assignItoa(d.sourceMachineIndex); args.push_back(d.sourceMachinePrivate4);
+    args.push_back(d.targetWorkspace); args.push_back(d.targetRuntimeIdentity);
+    args.emplace_back(); args.back().assignItoa(d.targetMachineIndex); args.push_back(d.targetMachinePrivate4);
+    args.push_back(d.endpointIPv4); args.emplace_back(); args.back().assignItoa(d.endpointPort);
+    for (const String& value : extra) args.push_back(value);
+    return mothershipRunVirtualDatacenterProvider(std::move(args), &failure);
+  }
+
+  void runPrepareTestPairBoundary(int argc, char *argv[])
+  {
+    String failure = {};
+    TestPairLifecycleLock lock;
+    if (argc != 9 || !lockTestPairLifecycle(lock, failure))
+    {
+      basics_log("prepareTestPairBoundary success=0 failure=%s\n", failure.empty() ? "expected source target operationID sourceDeploymentID targetDeploymentID sourceMachineIndex targetMachineIndex IPv4 TCPport" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipTestPairBoundaryRecord requested = {}, recorded = {};
+    auto& d = requested.boundary;
+    d.operationID.assign(argv[2]); d.endpointIPv4.assign(argv[7]);
+    uint64_t si = 0, ti = 0, port = 0;
+    uint128_t op = 0;
+    MothershipProdigyCluster source = {}, target = {};
+    bool valid = prodigyParseCanonicalHex128(d.operationID, op) && op != 0 &&
+                 mothershipParseUnsignedArgument(argv[3], UINT64_MAX, requested.sourceDeploymentID) &&
+                 mothershipParseUnsignedArgument(argv[4], UINT64_MAX, requested.targetDeploymentID) &&
+                 mothershipParseUnsignedArgument(argv[5], 3, si) && si > 0 &&
+                 mothershipParseUnsignedArgument(argv[6], 3, ti) && ti > 0 &&
+                 mothershipParseUnsignedArgument(argv[8], UINT16_MAX, port) && port > 0;
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), source, &failure) &&
+              registry.getClusterByIdentity(String(argv[1]), target, &failure) && source.clusterUUID != target.clusterUUID;
+    }
+    d.sourceMachineIndex = uint32_t(si); d.targetMachineIndex = uint32_t(ti); d.endpointPort = uint16_t(port);
+    DeploymentIdentityReport sr = {}, tr = {};
+    valid = valid && testPairDeploymentReady(source, requested.sourceDeploymentID, uint32_t(si), d.endpointIPv4, uint16_t(port), sr, failure) &&
+                     testPairDeploymentReady(target, requested.targetDeploymentID, uint32_t(ti), d.endpointIPv4, uint16_t(port), tr, failure);
+    if (valid)
+    {
+      d.sourceClusterUUID.assignItoh(source.clusterUUID);
+      d.targetClusterUUID.assignItoh(target.clusterUUID);
+      d.sourceWorkspace = source.test.workspaceRoot; d.targetWorkspace = target.test.workspaceRoot;
+      String path = {};
+      mothershipVirtualDatacenterPath(d.sourceWorkspace, "virtual-datacenter.identity", path);
+      valid = mothershipReadProcFile(path, d.sourceRuntimeIdentity);
+      mothershipVirtualDatacenterPath(d.targetWorkspace, "virtual-datacenter.identity", path);
+      valid = valid && mothershipReadProcFile(path, d.targetRuntimeIdentity);
+      while (!d.sourceRuntimeIdentity.empty() && d.sourceRuntimeIdentity[d.sourceRuntimeIdentity.size() - 1] == '\n') d.sourceRuntimeIdentity.resize(d.sourceRuntimeIdentity.size() - 1);
+      while (!d.targetRuntimeIdentity.empty() && d.targetRuntimeIdentity[d.targetRuntimeIdentity.size() - 1] == '\n') d.targetRuntimeIdentity.resize(d.targetRuntimeIdentity.size() - 1);
+      d.sourceParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.sourceRuntimeIdentity);
+      d.targetParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.targetRuntimeIdentity);
+      String private6 = {}, public6 = {};
+      mothershipVirtualDatacenterMachineAddresses(uint32_t(si), source.datacenterFragment, false, d.sourceMachinePrivate4, private6, public6);
+      mothershipVirtualDatacenterMachineAddresses(uint32_t(ti), target.datacenterFragment, false, d.targetMachinePrivate4, private6, public6);
+      requested.sourcePlanSHA256 = sr.canonicalPlanSHA256; requested.targetPlanSHA256 = tr.canonicalPlanSHA256;
+      requested.sourceBlobSHA256 = sr.containerBlobSHA256; requested.targetBlobSHA256 = tr.containerBlobSHA256;
+      if (valid) { auto registry = openClusterRegistry(); valid = registry.admitTestPairBoundary(requested, recorded, &failure); }
+    }
+    valid = valid && runTestPairProvider(recorded, "prepare", {}, failure);
+    basics_log("prepareTestPairBoundary success=%u operationID=%s migrationQualified=0 failure=%s\n", unsigned(valid), d.operationID.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runPairBoundary(int argc, char *argv[])
+  {
+    if (argc != 2) { basics_log("pairBoundary expects operationID query|selectTarget|drain|remove|crashOwner\n"); exit(EXIT_FAILURE); }
+    const bool select = std::strcmp(argv[1], "selectTarget") == 0;
+    const bool remove = std::strcmp(argv[1], "remove") == 0;
+    if (!select && !remove && std::strcmp(argv[1], "query") != 0 && std::strcmp(argv[1], "drain") != 0 && std::strcmp(argv[1], "crashOwner") != 0) exit(EXIT_FAILURE);
+    String failure = {};
+    TestPairLifecycleLock lock;
+    if (!lockTestPairLifecycle(lock, failure)) { basics_log("pairBoundary success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    MothershipTestPairBoundaryRecord record = {};
+    bool valid = false;
+    { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure); }
+    if (valid && record.closed)
+    {
+      basics_log("pairBoundary success=%u closed=1\n", unsigned(remove));
+      if (!remove) exit(EXIT_FAILURE);
+      return;
+    }
+    if (valid && select)
+    {
+      MothershipProdigyCluster source = {}, target = {};
+      { auto registry = openClusterRegistry(); valid = registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) && registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure); }
+      DeploymentIdentityReport sr = {}, tr = {};
+      valid = valid && testPairDeploymentReady(source, record.sourceDeploymentID, record.boundary.sourceMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, sr, failure) &&
+                       testPairDeploymentReady(target, record.targetDeploymentID, record.boundary.targetMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, tr, failure) &&
+                       sr.canonicalPlanSHA256 == record.sourcePlanSHA256 && tr.canonicalPlanSHA256 == record.targetPlanSHA256 &&
+                       sr.containerBlobSHA256 == record.sourceBlobSHA256 && tr.containerBlobSHA256 == record.targetBlobSHA256;
+      if (valid) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, 1, false, updated, &failure); if (valid) record = updated; }
+    }
+    valid = valid && runTestPairProvider(record, argv[1], {}, failure);
+    if (valid && remove) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, record.selectorGeneration, true, updated, &failure); }
+    basics_log("pairBoundary success=%u operation=%s migrationQualified=0 failure=%s\n", unsigned(valid), argv[1], failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runProbePairBoundary(int argc, char *argv[])
+  {
+    String failure = {};
+    uint64_t deployment = 0, count = 0, interval = 0;
+    MothershipTestPairBoundaryRecord record = {};
+    bool valid = argc == 4 && mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deployment) && deployment > 0 &&
+                 mothershipParseUnsignedArgument(argv[2], 1024, count) && count > 0 &&
+                 mothershipParseUnsignedArgument(argv[3], 60000, interval) && (count - 1) * interval <= 50000;
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure) && !record.closed && (deployment == record.sourceDeploymentID || deployment == record.targetDeploymentID); }
+    Vector<String> extra = {};
+    if (valid) { for (int index = 1; index != 4; ++index) extra.emplace_back(argv[index]); valid = runTestPairProvider(record, "probe", extra, failure); }
+    basics_log("probePairBoundary success=%u failure=%s\n", unsigned(valid), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
   }
 
   void runProbeTestCluster(int argc, char *argv[])
@@ -10642,7 +11754,30 @@ private:
     printManagedCluster(desiredCluster);
   }
 
-  void runDeploy(int argc, char *argv[])
+  enum class DeploymentDispatchState : uint8_t {
+    rejected,
+    ambiguous,
+    accepted,
+    finished,
+  };
+
+  struct DeploymentDispatchResult {
+    DeploymentDispatchState state = DeploymentDispatchState::rejected;
+    uint32_t nBase = 0;
+    uint32_t nSurge = 0;
+    uint32_t nFit = 0;
+    String failure = {};
+  };
+
+  // Dispatches one already parsed and validated plan over the ordinary
+  // measureApplication/spinApplication control path.  An accepted result is
+  // deliberately not a readiness assertion: test-cluster callers continue to
+  // prove readiness using the existing report/probe owners.
+  bool dispatchValidatedDeployment(DeploymentPlan& plan,
+                                   const String& containerPath,
+                                   bool returnAfterInitialSpinOkay,
+                                   bool emitCLIOutput,
+                                   DeploymentDispatchResult& result)
   {
     const bool debugDeploy = (std::getenv("PRODIGY_MOTHERSHIP_DEBUG_DEPLOY") != nullptr);
     auto debugLog = [debugDeploy](const char *stage) -> void {
@@ -10652,17 +11787,228 @@ private:
         std::fflush(stdout);
       }
     };
-
-    if (argc < 3)
+    result = {};
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, plan);
+    String contractFailure = {};
+    if (Filesystem::fileExists(containerPath) == false)
     {
-      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
-      exit(EXIT_FAILURE);
+      result.failure.assign("no file exists at containerPath provided"_ctv);
+      if (emitCLIOutput) basics_log("no file exists at containerPath provided\n");
+      return false;
+    }
+    if (mothershipValidateDiscombobulatorContainerBlobContract(containerPath, &contractFailure) == false)
+    {
+      result.failure.snprintf<"container artifact rejected: {}"_ctv>(contractFailure);
+      if (emitCLIOutput) basics_log("container artifact rejected: %s\n", contractFailure.c_str());
+      return false;
+    }
+    if (socket.ensureConnected() == false)
+    {
+      result.failure = socket.connectFailureDetail();
+      if (result.failure.empty()) result.failure.assign("failed to connect to deployment control target"_ctv);
+      return false;
     }
 
-    String json;
-    if (resolveJSONArgument("deploy", argv[1], json) == false)
+    debugLog("socket_connected");
+    socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
+    uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::measureApplication);
+    Message::appendValue(socket.wBuffer, serializedPlan);
+    Message::finish(socket.wBuffer, headerOffset);
+    debugLog("measure_serialized");
+    if (socket.send() == false)
     {
-      exit(EXIT_FAILURE);
+      result.failure = socket.ioFailureDetail();
+      if (result.failure.empty()) result.failure.assign("failed to send measureApplication"_ctv);
+      return false;
+    }
+    debugLog("measure_sent");
+
+    Message *response = socket.recvExpectedTopic(MothershipTopic::measureApplication);
+    if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::measureApplication)
+    {
+      result.failure.assign("measureApplication response missing or unexpected"_ctv);
+      return false;
+    }
+    debugLog("measure_received");
+    uint8_t *args = response->args;
+    if (Message::extractArg<ArgumentNature::fixed>(args, result.nBase) == false ||
+        Message::extractArg<ArgumentNature::fixed>(args, result.nSurge) == false ||
+        Message::extractArg<ArgumentNature::fixed>(args, result.nFit) == false || args != response->terminal())
+    {
+      result.failure.assign("measureApplication response is malformed"_ctv);
+      return false;
+    }
+    if (result.nFit < result.nBase + result.nSurge)
+    {
+      result.failure.snprintf<"we would need to schedule {} base instances and {} surge instances, but the cluster can only fit {} total instances"_ctv>(
+          result.nBase, result.nSurge, result.nFit);
+      return false;
+    }
+    if (emitCLIOutput)
+      basics_log("we will schedule %u base instances and %u surge instances", result.nBase, result.nSurge);
+
+    socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
+    uint32_t spinHeaderOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::spinApplication);
+    Message::append(socket.wBuffer, plan.config.applicationID);
+    Message::appendValue(socket.wBuffer, serializedPlan);
+    debugLog("spin_plan_serialized");
+    Message::appendFile(socket.wBuffer, containerPath);
+    debugLog("spin_blob_appended");
+    Message::finish(socket.wBuffer, spinHeaderOffset);
+    if (socket.send() == false)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure = socket.ioFailureDetail();
+      if (result.failure.empty()) result.failure.assign("spinApplication send outcome is unknown"_ctv);
+      return false;
+    }
+    debugLog("spin_sent");
+
+    response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
+    if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::spinApplication)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response missing or unexpected"_ctv);
+      return false;
+    }
+    debugLog("spin_received");
+    args = response->args;
+    uint8_t responseCode = 0;
+    if (Message::extractArg<ArgumentNature::fixed>(args, responseCode) == false)
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response is truncated"_ctv);
+      return false;
+    }
+    String responseMessage = {};
+    if (args != response->terminal()) Message::extractToStringView(args, responseMessage);
+    if (args != response->terminal())
+    {
+      result.state = DeploymentDispatchState::ambiguous;
+      result.failure.assign("initial spinApplication response is malformed"_ctv);
+      return false;
+    }
+    if (SpinApplicationResponseCode(responseCode) != SpinApplicationResponseCode::okay)
+    {
+      if (SpinApplicationResponseCode(responseCode) == SpinApplicationResponseCode::invalidPlan)
+      {
+        if (emitCLIOutput && responseMessage.size() > 0)
+        {
+          String owned = {}; owned.assign(responseMessage); owned.addNullTerminator(); basics_log("%s\n", owned.c_str());
+        }
+        if (emitCLIOutput) basics_log("SpinApplicationResponseCode::invalidPlan\n");
+      }
+      else if (emitCLIOutput)
+      {
+        basics_log("deploy failed: unexpected initial spinApplication frame %u\n", responseCode);
+      }
+      if (responseMessage.empty()) result.failure.snprintf<"deploy failed: unexpected initial spinApplication frame {}"_ctv>(unsigned(responseCode));
+      else result.failure.assign(responseMessage);
+      return false;
+    }
+
+    result.state = DeploymentDispatchState::accepted;
+    if (emitCLIOutput) basics_log("SpinApplicationResponseCode::okay\n");
+    if (returnAfterInitialSpinOkay)
+    {
+      socket.close();
+      return true;
+    }
+
+    for (;;)
+    {
+      response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
+      if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::spinApplication)
+      {
+        result.failure.assign("terminal spinApplication response missing or unexpected"_ctv);
+        return false;
+      }
+      args = response->args;
+      if (Message::extractArg<ArgumentNature::fixed>(args, responseCode) == false)
+      {
+        result.failure.assign("terminal spinApplication response is truncated"_ctv);
+        return false;
+      }
+      responseMessage.clear();
+      if (args != response->terminal()) Message::extractToStringView(args, responseMessage);
+      if (args != response->terminal())
+      {
+        result.failure.assign("terminal spinApplication response is malformed"_ctv);
+        return false;
+      }
+      switch (SpinApplicationResponseCode(responseCode))
+      {
+        case SpinApplicationResponseCode::progress:
+          if (emitCLIOutput && responseMessage.size() > 0)
+          {
+            String owned = {}; owned.assign(responseMessage); owned.addNullTerminator();
+            basics_log("%s\n", owned.c_str());
+          }
+          continue;
+        case SpinApplicationResponseCode::finished:
+          if (emitCLIOutput && responseMessage.size() > 0)
+          {
+            TaskExecutionRecord record = {};
+            if (BitseryEngine::deserializeSafe(responseMessage, record))
+              basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
+                         (unsigned long long)record.executionID, prodigyTaskExecutionPolicyName(record.policy),
+                         prodigyTaskExecutionStateName(record.state), unsigned(record.currentAttemptNumber),
+                         unsigned(record.attemptsStarted), unsigned(record.attemptsSucceeded), unsigned(record.attemptsFailed),
+                         unsigned(record.attemptsLost), unsigned(record.attemptsCancelled), (long long)record.completedAtMs,
+                         (long long)record.expiresAtMs, unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
+          }
+          result.state = DeploymentDispatchState::finished;
+          socket.close();
+          return true;
+        case SpinApplicationResponseCode::failed:
+        case SpinApplicationResponseCode::invalidPlan:
+          if (emitCLIOutput)
+          {
+            basics_log(SpinApplicationResponseCode(responseCode) == SpinApplicationResponseCode::failed ? "SpinApplicationResponseCode::failed\n" : "SpinApplicationResponseCode::invalidPlan\n");
+            if (responseMessage.size() > 0)
+            {
+              String owned = {}; owned.assign(responseMessage); owned.addNullTerminator(); basics_log("%s\n", owned.c_str());
+            }
+          }
+          result.state = DeploymentDispatchState::rejected;
+          result.failure = responseMessage;
+          if (result.failure.empty()) result.failure.assign("spinApplication rejected deployment"_ctv);
+          return false;
+        case SpinApplicationResponseCode::okay:
+        default:
+          result.failure.snprintf<"unexpected terminal spinApplication frame {}"_ctv>(unsigned(responseCode));
+          return false;
+      }
+    }
+  }
+
+  bool prepareDeploymentPlan(const char *target,
+                             const char *jsonArgument,
+                             const char *artifactArgument,
+                             DeploymentPlan& preparedPlan,
+                             String& preparedArtifactPath,
+                             bool& returnAfterInitialSpinOkay,
+                             String& deploymentFailure)
+  {
+    deploymentFailure.clear();
+    preparedPlan = {};
+    preparedArtifactPath.clear();
+    returnAfterInitialSpinOkay = false;
+    const bool debugDeploy = (std::getenv("PRODIGY_MOTHERSHIP_DEBUG_DEPLOY") != nullptr);
+    auto debugLog = [debugDeploy](const char *stage) -> void {
+      if (debugDeploy)
+      {
+        basics_log("DEPLOY_DEBUG stage=%s\n", stage);
+        std::fflush(stdout);
+      }
+    };
+
+    String json;
+    if (resolveJSONArgument("deploy", jsonArgument, json) == false)
+    {
+      deploymentFailure.assign("deployment JSON argument could not be resolved"_ctv);
+      return false;
     }
     json.need(simdjson::SIMDJSON_PADDING);
 
@@ -10671,17 +12017,18 @@ private:
     if (parser.parse(json.data(), json.size()).get(doc))
     {
       basics_log("invalid deployment plan json\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
-    bool returnAfterInitialSpinOkay = (std::strcmp(argv[0], "dev") == 0);
-    if (returnAfterInitialSpinOkay == false && std::strcmp(argv[0], "local") != 0)
+    returnAfterInitialSpinOkay = (std::strcmp(target, "dev") == 0);
+    if (returnAfterInitialSpinOkay == false && std::strcmp(target, "local") != 0)
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       MothershipProdigyCluster targetCluster = {};
       String clusterLookupFailure = {};
       String clusterIdentity = {};
-      clusterIdentity.setInvariant(argv[0]);
+      clusterIdentity.setInvariant(target);
       if (clusterRegistry.getClusterByIdentity(clusterIdentity, targetCluster, &clusterLookupFailure))
       {
         // Test clusters validate readiness via explicit follow-up probes. Do
@@ -10693,9 +12040,10 @@ private:
       }
     }
 
-    if (!configureControlTarget(argv[0]))
+    if (!configureControlTarget(target))
     {
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     DeploymentPlan plan {};
@@ -10720,7 +12068,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("config requires a document\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         bool hasConfigType = false;
@@ -10737,7 +12086,8 @@ private:
             if (mothershipParseApplicationCPUIsolationMode(subfield.value, plan.config, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             break;
@@ -10754,7 +12104,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("config.type requires a string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -10783,7 +12134,8 @@ private:
             else
             {
               basics_log("config.type not recognized\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("taskExecutionPolicy"_ctv))
@@ -10791,7 +12143,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("config.taskExecutionPolicy requires a string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -10809,7 +12162,8 @@ private:
             else
             {
               basics_log("config.taskExecutionPolicy not recognized\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("capabilities"_ctv))
@@ -10817,7 +12171,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::ARRAY)
             {
               basics_log("config.capabilities requires an array\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             for (auto item : subfield.value.get_array())
@@ -10825,7 +12180,8 @@ private:
               if (item.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("config.capabilities requires all string array members\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -10854,7 +12210,8 @@ private:
               else
               {
                 basics_log("config.capabilities capability is not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -10864,23 +12221,27 @@ private:
             if (mothershipParseApplicationIsolationField(subkey, subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("allowedMachineTypes"_ctv))
           {
             basics_log("config.allowedMachineTypes removed; scheduling is resource-based\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("preferredMachineTypes"_ctv))
           {
             basics_log("config.preferredMachineTypes removed; scheduling is resource-based\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("machineResourceCriteria"_ctv))
           {
             basics_log("config.machineResourceCriteria removed; place minGPUs, gpuMemoryGB, nicSpeedGbps, and any internet thresholds directly on config\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           else if (subkey.equal("applicationID"_ctv))
           {
@@ -10892,7 +12253,8 @@ private:
               if (value <= 0 || value > UINT16_MAX)
               {
                 basics_log("config.applicationID value invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               plan.config.applicationID = uint16_t(value);
@@ -10904,13 +12266,15 @@ private:
               if (socket.resolveApplicationIDReference(reference, plan.config.applicationID, false) == false)
               {
                 basics_log("config.applicationID symbolic reference invalid or unreserved; reserveApplicationID first\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("config.applicationID requires an integer or symbolic reference string\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("versionID"_ctv))
@@ -10918,7 +12282,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("config.versionID requires a number\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -10927,7 +12292,8 @@ private:
             if (value <= 0 || value > 281'474'976'710'655) // max 48 bit unsigned
             {
               basics_log("config.versionID value invalid\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.config.versionID = uint64_t(value);
@@ -10938,7 +12304,8 @@ private:
             if (mothershipParseApplicationArchitectureField(subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else if (subkey.equal("requiredIsaFeatures"_ctv))
@@ -10947,7 +12314,8 @@ private:
             if (mothershipParseApplicationRequiredIsaFeaturesField(subfield.value, plan.config, "config"_ctv, &failure) == false)
             {
               basics_log("%s\n", failure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           else
@@ -10959,7 +12327,8 @@ private:
             else if (sizeFailure.size() > 0)
             {
               basics_log("%s\n", sizeFailure.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else
             {
@@ -10970,12 +12339,14 @@ private:
               else if (criteriaFailure.size() > 0)
               {
                 basics_log("%s\n", criteriaFailure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("nHugepages2MB"_ctv))
               {
                 basics_log("config.nHugepages2MB was removed because hugepages are no longer used\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("isolateCPUs"_ctv))
               {
@@ -10983,7 +12354,8 @@ private:
                 if (mothershipParseApplicationCPUIsolationMode(subfield.value, plan.config, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("nLogicalCores"_ctv))
@@ -10992,7 +12364,8 @@ private:
                 if (mothershipParseApplicationCPURequest(subfield.value, plan.config, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("maxPids"_ctv))
@@ -11002,7 +12375,8 @@ private:
                         subfield.value, plan.config, "config"_ctv, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("isolatedChildMemoryMB"_ctv))
@@ -11012,20 +12386,23 @@ private:
                         subfield.value, plan.config, "config"_ctv, &failure) == false)
                 {
                   basics_log("%s\n", failure.c_str());
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
               }
               else if (subkey.equal("nThreads"_ctv))
               {
                 basics_log("config.nThreads was removed because thread count is no longer an application-config knob\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("msTilHealthy"_ctv)) // maximum 32 seconds
               {
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.msTilHealthy requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11034,7 +12411,8 @@ private:
                 if (value <= 0 || value > 32'000)
                 {
                   basics_log("config.msTilHealthy value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.msTilHealthy = uint32_t(value);
@@ -11044,7 +12422,8 @@ private:
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.sTilHealthcheck requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11053,7 +12432,8 @@ private:
                 if (value <= 0 || value > 60'000)
                 {
                   basics_log("config.sTilHealthcheck value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.sTilHealthcheck = uint32_t(value);
@@ -11063,7 +12443,8 @@ private:
                 if (subfield.value.type() != simdjson::dom::element_type::INT64)
                 {
                   basics_log("config.sTilKillable requires a number\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 int64_t value = 0;
@@ -11072,7 +12453,8 @@ private:
                 if (value <= 0 || value > 120'000)
                 {
                   basics_log("config.sTilKillable value invalid\n");
-                  exit(EXIT_FAILURE);
+                  deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
                 }
 
                 plan.config.sTilKillable = uint32_t(value);
@@ -11080,17 +12462,20 @@ private:
               else if (subkey.equal("needsPublic6"_ctv))
               {
                 basics_log("config.needsPublic6 removed; use whiteholes on DeploymentPlan\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else if (subkey.equal("needsPublic4"_ctv))
               {
                 basics_log("config.needsPublic4 removed; use whiteholes on DeploymentPlan\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               else
               {
                 basics_log("config.%s invalid field\n", subkey.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -11102,29 +12487,34 @@ private:
           if (mothershipValidateApplicationMachineSelectionFields(plan.config, "config"_ctv, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (mothershipValidateApplicationRuntimeRequirements(plan.config, "config"_ctv, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
         if (hasConfigType == false)
         {
           basics_log("config requires type parameter\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
         if (plan.config.type == ApplicationType::task && hasTaskExecutionPolicy == false)
         {
           basics_log("config.taskExecutionPolicy required for ApplicationType::task\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
         if (plan.config.type != ApplicationType::task && hasTaskExecutionPolicy)
         {
           basics_log("config.taskExecutionPolicy is valid only for ApplicationType::task\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("tls"_ctv))
@@ -11136,7 +12526,8 @@ private:
         if (mothershipParseDeploymentPlanTlsPolicy(field.value, plan, resolveApplicationIDReference, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("apiCredentials"_ctv))
@@ -11148,7 +12539,8 @@ private:
         if (mothershipParseDeploymentPlanApiCredentials(field.value, plan, resolveApplicationIDReference, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("minimumSubscriberCapacity"_ctv)) // minimum value 1024 for now
@@ -11156,7 +12548,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("minimumSubscriberCapacity requires a number\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -11165,7 +12558,8 @@ private:
         if (value < 1024)
         {
           basics_log("minimumSubscriberCapacity value invalid\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.minimumSubscriberCapacity = uint32_t(value);
@@ -11175,13 +12569,15 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("horizontalScalers requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.verticalScalers.size() > 0)
         {
           basics_log("can't submit both horizontal and vertical scalers\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -11189,7 +12585,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("horizontalScalers requires HorizontalScaler array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           HorizontalScaler& scaler = plan.horizontalScalers.emplace_back();
@@ -11207,7 +12604,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String metricName;
@@ -11239,13 +12637,15 @@ private:
               else
               {
                 basics_log("horizontalScalers.percentile requires a number\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (!(value > 0.0 && value <= 100.0))
               {
                 basics_log("horizontalScalers.percentile must be in (0, 100]\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.percentile = value;
@@ -11254,14 +12654,16 @@ private:
             else if (key.equal("operation"_ctv))
             {
               basics_log("horizontalScalers.operation is not supported; use percentile + threshold + direction\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("direction"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.direction requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -11280,7 +12682,8 @@ private:
               else
               {
                 basics_log("horizontalScalers.direction must be upscale or downscale\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("lookbackSeconds"_ctv))
@@ -11288,7 +12691,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.lookbackSeconds requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11297,7 +12701,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.lookbackSeconds must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.lookbackSeconds = uint32_t(value);
@@ -11305,14 +12710,16 @@ private:
             else if (key.equal("nIntervals"_ctv))
             {
               basics_log("horizontalScalers.nIntervals is not supported; use lookbackSeconds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("threshold"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::DOUBLE)
               {
                 basics_log("horizontalScalers.threshold requires a double\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               double value = 0.0;
@@ -11321,7 +12728,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.threshold must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.threshold = value;
@@ -11329,14 +12737,16 @@ private:
             else if (key.equal("upscaleThreshold"_ctv) || key.equal("downscaleThreshold"_ctv))
             {
               basics_log("horizontalScalers.%s is not supported; use threshold + direction\n", key.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("minValue"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.minValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11345,7 +12755,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.minValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.minValue = uint32_t(value);
@@ -11355,7 +12766,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("horizontalScalers.maxValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11364,7 +12776,8 @@ private:
               if (value <= 0)
               {
                 basics_log("horizontalScalers.maxValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.maxValue = uint32_t(value);
@@ -11374,7 +12787,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("horizontalScalers.lifetime requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -11393,56 +12807,65 @@ private:
               else
               {
                 basics_log("horizontalScalers.lifetime ApplicationLifetime either invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("config.horizontalScalers bad field in HorizontalScaler\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (scaler.name.size() == 0)
           {
             basics_log("config.horizontalScalers name field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasPercentile == false)
           {
             basics_log("config.horizontalScalers percentile field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.lookbackSeconds == 0)
           {
             basics_log("config.horizontalScalers lookbackSeconds field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.threshold == 0)
           {
             basics_log("config.horizontalScalers threshold field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasDirection == false)
           {
             basics_log("config.horizontalScalers direction field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasLifetime == false)
           {
             basics_log("config.horizontalScalers lifetime field of HorizontalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.minValue > 0 && scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
           {
             basics_log("config.horizontalScalers minValue cannot exceed maxValue\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
@@ -11451,13 +12874,15 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("verticalScalers requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.horizontalScalers.size() > 0)
         {
           basics_log("can't submit both horizontal and vertical scalers\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -11465,7 +12890,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("verticalScalers requires VerticalScaler array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           VerticalScaler& scaler = plan.verticalScalers.emplace_back();
@@ -11483,7 +12909,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String metricName;
@@ -11515,13 +12942,15 @@ private:
               else
               {
                 basics_log("verticalScalers.percentile requires a number\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (!(value > 0.0 && value <= 100.0))
               {
                 basics_log("verticalScalers.percentile must be in (0, 100]\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.percentile = value;
@@ -11530,14 +12959,16 @@ private:
             else if (key.equal("operation"_ctv))
             {
               basics_log("verticalScalers.operation is not supported; use percentile + threshold + direction\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("direction"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.direction requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -11556,7 +12987,8 @@ private:
               else
               {
                 basics_log("verticalScalers.direction must be upscale or downscale\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("lookbackSeconds"_ctv))
@@ -11564,7 +12996,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.lookbackSeconds requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11573,7 +13006,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.lookbackSeconds must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.lookbackSeconds = uint32_t(value);
@@ -11581,14 +13015,16 @@ private:
             else if (key.equal("nIntervals"_ctv))
             {
               basics_log("verticalScalers.nIntervals is not supported; use lookbackSeconds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("threshold"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::DOUBLE)
               {
                 basics_log("verticalScalers.threshold requires a double\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               double value = 0.0;
@@ -11597,7 +13033,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.threshold must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.threshold = value;
@@ -11605,14 +13042,16 @@ private:
             else if (key.equal("upscaleThreshold"_ctv) || key.equal("downscaleThreshold"_ctv))
             {
               basics_log("verticalScalers.%s is not supported; use threshold + direction\n", key.c_str());
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             else if (key.equal("resource"_ctv))
             {
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("verticalScalers.resource requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -11625,7 +13064,8 @@ private:
               else
               {
                 basics_log("verticalScalers.resource ScalingDimension invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("increment"_ctv))
@@ -11633,7 +13073,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.increment requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11642,7 +13083,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.increment must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.increment = uint32_t(value);
@@ -11652,7 +13094,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.minValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11661,7 +13104,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.minValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.minValue = uint32_t(value);
@@ -11671,7 +13115,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("verticalScalers.maxValue requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -11680,7 +13125,8 @@ private:
               if (value <= 0)
               {
                 basics_log("verticalScalers.maxValue must be positive\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               scaler.maxValue = uint32_t(value);
@@ -11688,56 +13134,65 @@ private:
             else
             {
               basics_log("config.verticalScalers bad field in VerticalScaler\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (scaler.name.size() == 0)
           {
             basics_log("config.verticalScalers name field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasPercentile == false)
           {
             basics_log("config.verticalScalers percentile field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.lookbackSeconds == 0)
           {
             basics_log("config.verticalScalers lookbackSeconds field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.threshold == 0)
           {
             basics_log("config.verticalScalers threshold field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasDirection == false)
           {
             basics_log("config.verticalScalers direction field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (hasResource == false)
           {
             basics_log("config.verticalScalers resource field of ScalingDimension required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.increment == 0)
           {
             basics_log("config.verticalScalers increment field of VerticalScaler required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
           {
             basics_log("config.verticalScalers minValue cannot exceed maxValue\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
@@ -11746,7 +13201,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("isStateful requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -11760,7 +13216,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("stateful requires a StatefulDeploymentPlan\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_object())
@@ -11773,7 +13230,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.clientPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11782,7 +13240,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.clientPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.clientPrefix = value;
@@ -11792,7 +13251,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.siblingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11801,7 +13261,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.siblingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.siblingPrefix = value;
@@ -11811,7 +13272,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.cousinPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11820,7 +13282,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.cousinPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.cousinPrefix = value;
@@ -11830,7 +13293,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.seedingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11839,7 +13303,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.seedingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.seedingPrefix = value;
@@ -11849,7 +13314,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateful.shardingPrefix requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11858,7 +13324,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateful.shardingPrefix must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateful.shardingPrefix = value;
@@ -11868,7 +13335,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.allowUpdateInPlace requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -11880,7 +13348,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.seedingAlways requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -11892,7 +13361,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.neverShard requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -11904,7 +13374,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateful.allMasters requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -11914,38 +13385,44 @@ private:
           else
           {
             basics_log("stateful invalid field\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
 
         if (plan.stateful.clientPrefix == 0)
         {
           basics_log("stateful.clientPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.siblingPrefix == 0)
         {
           basics_log("stateful.siblingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.cousinPrefix == 0)
         {
           basics_log("stateful.cousinPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.seedingPrefix == 0)
         {
           basics_log("stateful.seedingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateful.shardingPrefix == 0)
         {
           basics_log("stateful.shardingPrefix required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("stateless"_ctv))
@@ -11953,7 +13430,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::OBJECT)
         {
           basics_log("stateless requires a StatelessDeploymentPlan\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_object())
@@ -11966,7 +13444,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("stateless.nBase requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -11975,7 +13454,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.nBase must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.nBase = uint32_t(value);
@@ -11985,7 +13465,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::DOUBLE)
             {
               basics_log("stateless.maxPerRackRatio requires a float\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             double value = 0.0;
@@ -11994,7 +13475,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.maxPerRackRatio must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.maxPerRackRatio = float(value);
@@ -12004,7 +13486,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::DOUBLE)
             {
               basics_log("stateless.maxPerMachineRatio requires a float\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             double value = 0.0;
@@ -12013,7 +13496,8 @@ private:
             if (value <= 0)
             {
               basics_log("stateless.maxPerMachineRatio must be >0\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.stateless.maxPerMachineRatio = float(value);
@@ -12023,7 +13507,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("canaryCount requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12032,7 +13517,8 @@ private:
             if (value < 0)
             {
               basics_log("canaryCount must be positive\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.canaryCount = uint32_t(value);
@@ -12042,7 +13528,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::INT64)
             {
               basics_log("canariesMustLiveForMinutes requires an integer\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             int64_t value = 0;
@@ -12051,7 +13538,8 @@ private:
             if (value <= 0)
             {
               basics_log("canariesMustLiveForMinutes must be >0\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             plan.canariesMustLiveForMinutes = uint32_t(value);
@@ -12061,7 +13549,8 @@ private:
             if (subfield.value.type() != simdjson::dom::element_type::BOOL)
             {
               basics_log("stateless.moveableDuringCompaction requires a bool\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             bool b = false;
@@ -12071,32 +13560,37 @@ private:
           else
           {
             basics_log("stateless invalid field\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
 
         if (plan.stateless.nBase == 0)
         {
           basics_log("stateless.nBase required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateless.maxPerRackRatio == 0)
         {
           basics_log("stateless.maxPerRackRatio required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.stateless.maxPerMachineRatio == 0)
         {
           basics_log("stateless.maxPerMachineRatio required\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (plan.canaryCount > 0 && plan.canariesMustLiveForMinutes == 0)
         {
           basics_log("canariesMustLiveForMinutes required if canaryCount > 0\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("canaryCount"_ctv))
@@ -12104,7 +13598,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("canaryCount requires an integer\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -12113,7 +13608,8 @@ private:
         if (value < 0)
         {
           basics_log("canaryCount must be positive\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.canaryCount = uint32_t(value);
@@ -12123,7 +13619,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::INT64)
         {
           basics_log("canariesMustLiveForMinutes requires an integer\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         int64_t value = 0;
@@ -12132,7 +13629,8 @@ private:
         if (value <= 0)
         {
           basics_log("canariesMustLiveForMinutes must be >0\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         plan.canariesMustLiveForMinutes = uint32_t(value);
@@ -12142,7 +13640,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("wormholes requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12150,7 +13649,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("wormholes requires Wormhole array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Wormhole& wormhole = plan.wormholes.emplace_back();
@@ -12171,7 +13671,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.externalAddress requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               if (inet_pton(AF_INET, item.value.get_c_str(), wormhole.externalAddress.v6) == 1)
@@ -12185,7 +13686,8 @@ private:
               else
               {
                 basics_log("wormholes.externalAddress is invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               addressWasSet = true;
@@ -12195,14 +13697,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.name requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.name.assign(item.value.get_c_str());
               if (wormhole.name.size() == 0)
               {
                 basics_log("wormhole.name cannot be empty\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("externalPort"_ctv))
@@ -12210,7 +13714,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("wormhole.externalPort requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12219,7 +13724,8 @@ private:
               if (value <= 0)
               {
                 basics_log("wormhole.externalPort must be >0\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.externalPort = uint16_t(value);
@@ -12229,7 +13735,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("wormhole.containerPort requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               int64_t value = 0;
               (void)item.value.get(value);
@@ -12237,7 +13744,8 @@ private:
               if (value <= 0)
               {
                 basics_log("wormhole.containerPort must be >0\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.containerPort = uint16_t(value);
@@ -12247,7 +13755,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.layer4 requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12264,7 +13773,8 @@ private:
               else
               {
                 basics_log("wormhole.layer4 invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("isQuic"_ctv))
@@ -12272,7 +13782,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::BOOL)
               {
                 basics_log("wormhole.isQuic requires a bool\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               {
                 bool b = false;
@@ -12288,7 +13799,8 @@ private:
               if (mothershipParseServiceUserCapacity(item.value, wormhole.userCapacity, context, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("quicCidKeyRotationHours"_ctv))
@@ -12297,7 +13809,8 @@ private:
               if (mothershipParseWormholeQuicCidKeyRotationHours(item.value, wormhole, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               quicCidKeyRotationHoursWasSet = true;
@@ -12307,7 +13820,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.source requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12316,7 +13830,8 @@ private:
               if (parseExternalAddressSource(value, wormhole.source) == false)
               {
                 basics_log("wormhole.source invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               sourceWasSet = true;
@@ -12326,7 +13841,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("wormhole.routablePrefixUUID requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value = {};
@@ -12334,14 +13850,16 @@ private:
               if (value.size() == 0)
               {
                 basics_log("wormhole.routablePrefixUUID cannot be empty\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.routablePrefixUUID = String::numberFromHexString<uint128_t>(value);
               if (wormhole.routablePrefixUUID == 0)
               {
                 basics_log("wormhole.routablePrefixUUID invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               routablePrefixUUIDWasSet = true;
@@ -12352,7 +13870,8 @@ private:
               if (mothershipParseWormholeTlsResumptionConfig(item.value, wormhole.tlsResumption, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.hasTlsResumptionConfig = true;
@@ -12363,7 +13882,8 @@ private:
               if (mothershipParseWormholeDNSConfig(item.value, wormhole.dns, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               wormhole.hasDNSConfig = true;
@@ -12374,13 +13894,15 @@ private:
               if (mothershipParseWormholePublicTLSConfig(item.value, publicTLS, publicTLSEnabled, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else
             {
               basics_log("wormhole invalid field\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
@@ -12393,69 +13915,82 @@ private:
           if (addressWasSet == false && routablePrefixUUIDWasSet == false && dnsBinding == false)
           {
             basics_log("wormhole.externalAddress or wormhole.routablePrefixUUID field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.externalPort == 0)
           {
             basics_log("wormhole.externalPort field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.containerPort == 0)
           {
             basics_log("wormhole.containerPort field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.layer4 == 0)
           {
             basics_log("wormhole.layer4 field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (sourceWasSet == false)
           {
             basics_log("wormhole.source field required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (addressWasSet && routablePrefixUUIDWasSet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("wormhole.externalAddress and wormhole.routablePrefixUUID are mutually exclusive\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet == false && dnsBinding == false)
           {
             basics_log("wormhole.source=registeredRoutablePrefix requires wormhole.routablePrefixUUID\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.source != ExternalAddressSource::registeredRoutablePrefix && routablePrefixUUIDWasSet)
           {
             basics_log("wormhole.routablePrefixUUID requires source=registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("wormhole.dns requires source=registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.isQuic && wormhole.layer4 != IPPROTO_UDP)
           {
             basics_log("wormhole.isQuic requires layer4 == UDP\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (quicCidKeyRotationHoursWasSet && wormhole.isQuic == false)
           {
             basics_log("wormhole.quicCidKeyRotationHours requires wormhole.isQuic\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
           if (wormhole.hasTlsResumptionConfig)
           {
             if (wormhole.name.size() == 0)
             {
               basics_log("wormhole.name required when wormhole.tlsResumption.enabled\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (wormholeSupportsTlsResumption(wormhole) == false)
             {
               basics_log("wormhole.tlsResumption.enabled requires TCP or QUIC-over-UDP wormhole\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
           if (publicTLSEnabled)
@@ -12463,12 +13998,14 @@ private:
             if (wormhole.name.size() == 0)
             {
               basics_log("wormhole.name required when wormhole.publicTLS.enabled\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (wormhole.hasDNSConfig == false)
             {
               basics_log("wormhole.publicTLS requires wormhole.dns\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             if (publicTLS.identityName.size() == 0)
             {
@@ -12481,7 +14018,8 @@ private:
             if (publicTLS.domains.size() == 0 && wormhole.dns.bindingName.size() == 0)
             {
               basics_log("wormhole.publicTLS requires domains, wormhole.dns.name, or wormhole.dns.bindingName\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             publicTLS.wormholeName = wormhole.name;
             plan.publicTLS.push_back(std::move(publicTLS));
@@ -12493,7 +14031,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("whiteholes requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12501,7 +14040,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("whiteholes requires object array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Whitehole need = {};
@@ -12521,13 +14061,15 @@ private:
               if (countWasSet)
               {
                 basics_log("whiteholes.count may only be specified once\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               String failure;
               if (mothershipParseWhiteholeCount(item.value, count, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
               countWasSet = true;
               continue;
@@ -12536,7 +14078,8 @@ private:
             if (item.value.type() != simdjson::dom::element_type::STRING)
             {
               basics_log("whiteholes transport, family, and source require strings\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
 
             String value;
@@ -12547,7 +14090,8 @@ private:
               if (parseExternalAddressTransport(value, need.transport) == false)
               {
                 basics_log("whiteholes.transport invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               transportWasSet = true;
@@ -12557,7 +14101,8 @@ private:
               if (parseExternalAddressFamily(value, need.family) == false)
               {
                 basics_log("whiteholes.family invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               familyWasSet = true;
@@ -12567,7 +14112,8 @@ private:
               if (parseExternalAddressSource(value, need.source) == false)
               {
                 basics_log("whiteholes.source invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               sourceWasSet = true;
@@ -12575,51 +14121,59 @@ private:
             else
             {
               basics_log("whiteholes invalid field\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
 
           if (transportWasSet == false)
           {
             basics_log("whiteholes.transport required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (familyWasSet == false)
           {
             basics_log("whiteholes.family required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (sourceWasSet == false)
           {
             basics_log("whiteholes.source required\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (need.source != ExternalAddressSource::hostPublicAddress && need.source != ExternalAddressSource::registeredRoutablePrefix)
           {
             basics_log("whiteholes currently require source == hostPublicAddress or registeredRoutablePrefix\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           String failure;
           if (mothershipAppendWhiteholeDeclaration(plan.whiteholes, need, count, &failure) == false)
           {
             basics_log("%s\n", failure.c_str());
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
         }
       }
       else if (key.equal("externalAddressNeeds"_ctv))
       {
         basics_log("externalAddressNeeds removed; use whiteholes on DeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       else if (key.equal("requiresPublic6"_ctv) || key.equal("requiresPublic4"_ctv))
       {
         basics_log("%.*s removed; use whiteholes on DeploymentPlan\n", int(key.size()), key.data());
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       else if (key.equal("useHostNetworkNamespace"_ctv))
       {
@@ -12627,7 +14181,8 @@ private:
         if (mothershipParseDeploymentPlanUseHostNetworkNamespace(field.value, plan, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("networkAccess"_ctv))
@@ -12636,7 +14191,8 @@ private:
         if (mothershipParseDeploymentPlanNetworkAccess(field.value, plan, &failure) == false)
         {
           basics_log("%s\n", failure.c_str());
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
       else if (key.equal("subscriptions"_ctv))
@@ -12644,7 +14200,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("subscriptions requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12652,7 +14209,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("subscriptions requires Subscription array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Subscription subscription;
@@ -12667,14 +14225,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               auto rawValue = item.value.get_string();
               if (rawValue.error())
               {
                 basics_log("subscription.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12697,7 +14257,8 @@ private:
               else
               {
                 basics_log("subscription.service service provided invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("startAt"_ctv)) // ContainerState
@@ -12705,7 +14266,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.startAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12722,7 +14284,8 @@ private:
               else
               {
                 basics_log("subscription.startAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("stopAt"_ctv)) // ContainerState
@@ -12730,7 +14293,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.stopAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12751,7 +14315,8 @@ private:
               else
               {
                 basics_log("subscription.stopAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("nature"_ctv)) // SubscriptionNature
@@ -12759,7 +14324,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("subscription.nature requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12780,7 +14346,8 @@ private:
               else
               {
                 basics_log("subscription.nature SubscriptionNature provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -12788,25 +14355,29 @@ private:
           if (subscription.service == 0)
           {
             basics_log("subscription requires service parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(subscription.startAt) == 0)
           {
             basics_log("subscription requires startAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(subscription.stopAt) == 0)
           {
             basics_log("subscription requires stopAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint8_t(subscription.nature) == 0)
           {
             basics_log("subscription requires nature parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           bool replacedSubscription = false;
@@ -12831,7 +14402,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::ARRAY)
         {
           basics_log("advertisements requires an array\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         for (auto subfield : field.value.get_array())
@@ -12839,7 +14411,8 @@ private:
           if (subfield.type() != simdjson::dom::element_type::OBJECT)
           {
             basics_log("advertisements requires Advertisement array members\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           Advertisement advertisement;
@@ -12854,14 +14427,16 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               auto rawValue = item.value.get_string();
               if (rawValue.error())
               {
                 basics_log("advertisement.service requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12884,7 +14459,8 @@ private:
               else
               {
                 basics_log("advertisement.service service provided invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("startAt"_ctv))
@@ -12892,7 +14468,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.startAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12909,7 +14486,8 @@ private:
               else
               {
                 basics_log("advertisement.startAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("stopAt"_ctv))
@@ -12917,7 +14495,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::STRING)
               {
                 basics_log("advertisement.stopAt requires a string\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               String value;
@@ -12938,7 +14517,8 @@ private:
               else
               {
                 basics_log("advertisement.stopAt ContainerState provided invalid or not allowed\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("port"_ctv))
@@ -12946,7 +14526,8 @@ private:
               if (item.value.type() != simdjson::dom::element_type::INT64)
               {
                 basics_log("advertisement.port requires an integer\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
 
               int64_t value = 0;
@@ -12959,7 +14540,8 @@ private:
               else
               {
                 basics_log("advertisement.port value invalid\n");
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
             else if (key.equal("userCapacity"_ctv))
@@ -12970,7 +14552,8 @@ private:
               if (mothershipParseServiceUserCapacity(item.value, advertisement.userCapacity, context, &failure) == false)
               {
                 basics_log("%s\n", failure.c_str());
-                exit(EXIT_FAILURE);
+                deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
               }
             }
           }
@@ -12978,25 +14561,29 @@ private:
           if (advertisement.service == 0)
           {
             basics_log("advertisement requires service parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(advertisement.startAt) == 0)
           {
             basics_log("advertisement requires startAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (uint64_t(advertisement.stopAt) == 0)
           {
             basics_log("advertisement requires stopAt parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           if (advertisement.port == 0)
           {
             basics_log("advertisement requires port parameter\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
 
           bool replacedAdvertisement = false;
@@ -13021,7 +14608,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("moveConstructively requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -13035,7 +14623,8 @@ private:
         if (field.value.type() != simdjson::dom::element_type::BOOL)
         {
           basics_log("requiresDatacenterUniqueTag requires a bool\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         {
@@ -13047,20 +14636,23 @@ private:
       else
       {
         basics_log("invalid DeploymentPlan field\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
     if (plan.config.nLogicalCores == 0)
     {
       basics_log("ApplicationConfig is required\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     if (plan.config.applicationID == MeshRegistry::Radar::applicationID && plan.config.nLogicalCores < radarMinimumLogicalCores)
     {
       basics_log("Radar requires config.nLogicalCores >= %u\n", radarMinimumLogicalCores);
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     if (plan.wormholes.size() > 0)
@@ -13068,13 +14660,15 @@ private:
       if (plan.isStateful)
       {
         basics_log("wormholes require stateless applications\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       if (wormholeTargetBindingsUnique(plan.wormholes) == false)
       {
         basics_log("wormholes require unique containerPort and layer4 targets\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       for (uint32_t index = 0; index < plan.wormholes.size(); index += 1)
@@ -13083,26 +14677,30 @@ private:
         if (wormhole.source != ExternalAddressSource::distributableSubnet && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
           basics_log("wormholes currently require source == distributableSubnet or registeredRoutablePrefix\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         const bool dnsBinding = wormhole.hasDNSConfig && wormhole.dns.bindingName.size() > 0;
         if (wormhole.source == ExternalAddressSource::registeredRoutablePrefix && wormhole.routablePrefixUUID == 0 && dnsBinding == false)
         {
           basics_log("wormholes with source == registeredRoutablePrefix require routablePrefixUUID\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.hasDNSConfig && wormhole.source != ExternalAddressSource::registeredRoutablePrefix)
         {
           basics_log("wormholes with dns require source == registeredRoutablePrefix\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.isQuic && wormhole.layer4 != IPPROTO_UDP)
         {
           basics_log("wormholes with isQuic require layer4 == UDP\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
 
         if (wormhole.hasTlsResumptionConfig)
@@ -13114,7 +14712,8 @@ private:
                 wormhole.name.equal(other.name))
             {
               basics_log("resumption-enabled wormholes require unique names\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
           }
         }
@@ -13128,7 +14727,8 @@ private:
         if (whiteholeDeclarationValid(whitehole) == false)
         {
           basics_log("whiteholes declaration invalid\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
     }
@@ -13138,16 +14738,24 @@ private:
       if (mothershipValidateDeploymentPlanNetworkAccess(plan, &failure) == false)
       {
         basics_log("%s\n", failure.c_str());
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
     if (plan.isStateful)
     {
+      if (!StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).hasDistinctServices())
+      {
+        basics_log("stateful mesh roles must identify distinct services\n");
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
+      }
       if (plan.stateless.nBase > 0)
       {
         basics_log("isStateful but provided StatelessDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
     else
@@ -13155,7 +14763,8 @@ private:
       if (plan.stateful.clientPrefix > 0)
       {
         basics_log("isStateful == false but provided StatefulDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
@@ -13164,32 +14773,38 @@ private:
       if (plan.isStateful)
       {
         basics_log("task deployments cannot be stateful\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.stateful.clientPrefix > 0)
       {
         basics_log("task deployments cannot provide StatefulDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.stateless.nBase > 0)
       {
         basics_log("task deployments use an implicit single attempt and cannot provide StatelessDeploymentPlan\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.canaryCount > 0 || plan.canariesMustLiveForMinutes > 0)
       {
         basics_log("task deployments cannot configure canaries\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.horizontalScalers.empty() == false || plan.verticalScalers.empty() == false)
       {
         basics_log("task deployments cannot configure scalers\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
       if (plan.wormholes.empty() == false || plan.publicTLS.empty() == false || plan.advertisements.empty() == false)
       {
         basics_log("task deployments cannot publish inbound services\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       plan.isStateful = false;
@@ -13208,19 +14823,22 @@ private:
       if (plan.tlsIssuancePolicy.applicationID != plan.config.applicationID)
       {
         basics_log("tls.applicationID must match config.applicationID\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
     if (plan.hasApiCredentialPolicy == false)
     {
       basics_log("apiCredentials declaration required\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
     if (plan.apiCredentialPolicy.applicationID != plan.config.applicationID)
     {
       basics_log("apiCredentials.applicationID must match config.applicationID\n");
-      exit(EXIT_FAILURE);
+      deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
     }
 
     for (HorizontalScaler& scaler : plan.horizontalScalers)
@@ -13237,7 +14855,8 @@ private:
       if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
       {
         basics_log("config.horizontalScalers minValue cannot exceed maxValue\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
     }
 
@@ -13266,7 +14885,8 @@ private:
         case ScalingDimension::runtimeIngressHandlerComposite:
           {
             basics_log("verticalScalers.resource only supports cpu/memory/storage dimensions\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
       }
 
@@ -13279,7 +14899,8 @@ private:
       if (scaler.maxValue > 0 && scaler.minValue > scaler.maxValue)
       {
         basics_log("config.verticalScalers minValue cannot exceed maxValue\n");
-        exit(EXIT_FAILURE);
+        deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
       }
 
       switch (scaler.resource)
@@ -13289,7 +14910,8 @@ private:
             if (plan.config.nLogicalCores < scaler.minValue || (scaler.maxValue > 0 && plan.config.nLogicalCores > scaler.maxValue))
             {
               basics_log("config.nLogicalCores must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -13298,7 +14920,8 @@ private:
             if (plan.config.memoryMB < scaler.minValue || (scaler.maxValue > 0 && plan.config.memoryMB > scaler.maxValue))
             {
               basics_log("config.memoryMB must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -13307,7 +14930,8 @@ private:
             if (plan.config.storageMB < scaler.minValue || (scaler.maxValue > 0 && plan.config.storageMB > scaler.maxValue))
             {
               basics_log("config.storageMB must be within verticalScalers minValue/maxValue bounds\n");
-              exit(EXIT_FAILURE);
+              deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
             }
             break;
           }
@@ -13315,7 +14939,8 @@ private:
         case ScalingDimension::runtimeIngressHandlerComposite:
           {
             basics_log("verticalScalers.resource only supports cpu/memory/storage dimensions\n");
-            exit(EXIT_FAILURE);
+            deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
           }
       }
     }
@@ -13327,7 +14952,8 @@ private:
         if (scaler.direction == Scaler::Direction::downscale)
         {
           basics_log("stateful deployments cannot set horizontalScalers.direction=downscale\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
 
@@ -13336,35 +14962,25 @@ private:
         if (scaler.direction == Scaler::Direction::downscale)
         {
           basics_log("stateful deployments cannot set verticalScalers.direction=downscale\n");
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment request rejected"_ctv);
+      return false;
         }
       }
     }
 
-    // they have to first build the container then pass us the filepath to the compressed blob
+    // Parser validation and target-local symbolic-ID resolution above are the
+    // only plan preparation path.  Artifact validation remains with dispatch,
+    // immediately before the ordinary control-plane side effect.
     String containerPath;
-    containerPath.assign(argv[2]);
+    containerPath.assign(artifactArgument);
 
-    if (Filesystem::fileExists(containerPath) == false)
-    {
-      basics_log("no file exists at containerPath provided\n");
-      exit(EXIT_FAILURE);
-    }
-
-    String contractFailure = {};
-    if (mothershipValidateDiscombobulatorContainerBlobContract(containerPath, &contractFailure) == false)
-    {
-      basics_log("container artifact rejected: %s\n", contractFailure.c_str());
-      exit(EXIT_FAILURE);
-    }
-
-    if (std::strcmp(argv[0], "local") != 0)
+    if (std::strcmp(target, "local") != 0)
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       MothershipProdigyCluster targetCluster = {};
       String lookupFailure = {};
       String clusterIdentity = {};
-      clusterIdentity.setInvariant(argv[0]);
+      clusterIdentity.setInvariant(target);
       if (clusterRegistry.getClusterByIdentity(clusterIdentity, targetCluster, &lookupFailure))
       {
         if (targetCluster.architecture != MachineCpuArchitecture::unknown && plan.config.architecture != targetCluster.architecture)
@@ -13372,265 +14988,44 @@ private:
           basics_log("config.architecture '%s' does not match cluster architecture '%s'\n",
                      machineCpuArchitectureName(plan.config.architecture),
                      machineCpuArchitectureName(targetCluster.architecture));
-          exit(EXIT_FAILURE);
+          deploymentFailure.assign("deployment architecture does not match target cluster"_ctv);
+      return false;
         }
       }
     }
 
     debugLog("plan_validated");
+    preparedPlan = std::move(plan);
+    preparedArtifactPath = std::move(containerPath);
+    return true;
+  }
 
-    // we could decompress it and test if it's a btrfs subvolume but.. just don't fuck with us lol
-    // zstd -d /path/to/file.zstd -o /path/to/output
-    // btrfs receive /path/to/mount/point < /path/to/decompressed/file
-
-    if (socket.ensureConnected())
+  void runDeploy(int argc, char *argv[])
+  {
+    if (argc < 3)
     {
-      debugLog("socket_connected");
-      // first measure the application against the cluster to make sure it fits
-      // Reserve for serialized plan
-      socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
-      uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::measureApplication);
-      String serializedPlan;
-      BitseryEngine::serialize(serializedPlan, plan);
-      Message::appendValue(socket.wBuffer, serializedPlan);
-      Message::finish(socket.wBuffer, headerOffset);
-      debugLog("measure_serialized");
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-      debugLog("measure_sent");
-
-      if (Message *response = socket.recvExpectedTopic(MothershipTopic::measureApplication); response)
-      {
-        debugLog("measure_received");
-        if (MothershipTopic(response->topic) != MothershipTopic::measureApplication)
-        {
-          basics_log("measureApplication failed: unexpected response topic %u\n", response->topic);
-          exit(EXIT_FAILURE);
-        }
-
-        uint8_t *args = response->args;
-
-        // nBase(4) nSurge(4) nFit(4)
-
-        uint32_t nBase;
-        Message::extractArg<ArgumentNature::fixed>(args, nBase);
-
-        uint32_t nSurge;
-        Message::extractArg<ArgumentNature::fixed>(args, nSurge);
-
-        uint32_t nFit;
-        Message::extractArg<ArgumentNature::fixed>(args, nFit);
-
-        // nFit -> we can fit this many
-
-        // nBase  -> we would schedule this many base
-        // nSurge -> we would schedule this many surge
-
-        uint32_t nNeeded = nBase + nSurge;
-
-        if (nFit < nNeeded)
-        {
-          basics_log("we would need to schedule %u base instances and %u surge instances, but the cluster can only fit %u total instances", nBase, nSurge, nFit);
-          exit(EXIT_FAILURE);
-        }
-        else
-        {
-          basics_log("we will schedule %u base instances and %u surge instances", nBase, nSurge);
-        }
-      }
-      else
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      // Reserve for plan + file contents size header
-      socket.wBuffer.reserve(socket.wBuffer.size() + 1024);
-      uint32_t spinHeaderOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::spinApplication);
-      Message::append(socket.wBuffer, plan.config.applicationID);
-      Message::appendValue(socket.wBuffer, serializedPlan);
-      debugLog("spin_plan_serialized");
-      Message::appendFile(socket.wBuffer, containerPath);
-      debugLog("spin_blob_appended");
-      Message::finish(socket.wBuffer, spinHeaderOffset);
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-      debugLog("spin_sent");
-
-      if (Message *response = socket.recvExpectedTopic(MothershipTopic::spinApplication); response)
-      {
-        debugLog("spin_received");
-        uint8_t *args = response->args;
-
-        uint8_t responseCode;
-        Message::extractArg<ArgumentNature::fixed>(args, responseCode);
-        String responseMessage;
-        if (args != response->terminal())
-        {
-          Message::extractToStringView(args, responseMessage);
-        }
-        bool spinAccepted = false;
-
-        switch (SpinApplicationResponseCode(responseCode))
-        {
-          case SpinApplicationResponseCode::invalidPlan:
-            {
-              if (responseMessage.size() > 0)
-              {
-                String message = {};
-                message.assign(responseMessage);
-                message.addNullTerminator();
-                basics_log("%s\n", message.c_str());
-              }
-              basics_log("SpinApplicationResponseCode::invalidPlan\n");
-              break;
-            }
-          case SpinApplicationResponseCode::okay:
-            {
-              basics_log("SpinApplicationResponseCode::okay\n");
-              spinAccepted = true;
-              break;
-            }
-          default:
-            {
-              basics_log("deploy failed: unexpected initial spinApplication frame %u\n", responseCode);
-              break;
-            }
-        }
-
-        if (!spinAccepted)
-        {
-          exit(EXIT_FAILURE);
-        }
-
-        // Dev and test harnesses validate readiness with active probes. Do not
-        // block the CLI on the terminal spinApplication frame there.
-        if (returnAfterInitialSpinOkay)
-        {
-          socket.close();
-          return;
-        }
-      }
-      else
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      bool finished = false;
-
-      do // loop until we get the terminal spinApplication frame
-      {
-        Message *response = socket.recvExpectedTopic(MothershipTopic::spinApplication);
-
-        if (response == nullptr)
-        {
-          exit(EXIT_FAILURE);
-        }
-
-        uint8_t *args = response->args;
-
-        uint8_t responseCode;
-        Message::extractArg<ArgumentNature::fixed>(args, responseCode);
-
-        switch (SpinApplicationResponseCode(responseCode))
-        {
-          case SpinApplicationResponseCode::progress:
-            {
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              break;
-            }
-          case SpinApplicationResponseCode::failed:
-            {
-              basics_log("SpinApplicationResponseCode::failed\n");
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              exit(EXIT_FAILURE);
-            }
-          case SpinApplicationResponseCode::finished:
-            {
-              if (args != response->terminal())
-              {
-                String serializedRecord = {};
-                Message::extractToStringView(args, serializedRecord);
-                TaskExecutionRecord record = {};
-                if (BitseryEngine::deserializeSafe(serializedRecord, record))
-                {
-                  basics_log("taskReport found=1 deploymentID=%llu policy=%s state=%s attempt=%u started=%u succeeded=%u failed=%u lost=%u cancelled=%u completedAtMs=%lld expiresAtMs=%lld resultBytes=%u\n",
-                             (unsigned long long)record.executionID,
-                             prodigyTaskExecutionPolicyName(record.policy),
-                             prodigyTaskExecutionStateName(record.state),
-                             unsigned(record.currentAttemptNumber),
-                             unsigned(record.attemptsStarted),
-                             unsigned(record.attemptsSucceeded),
-                             unsigned(record.attemptsFailed),
-                             unsigned(record.attemptsLost),
-                             unsigned(record.attemptsCancelled),
-                             (long long)record.completedAtMs,
-                             (long long)record.expiresAtMs,
-                             unsigned(record.hasFinalAttempt ? record.finalAttempt.termination.result.size() : 0u));
-                }
-              }
-              finished = true;
-              break;
-            }
-          case SpinApplicationResponseCode::invalidPlan:
-            {
-              basics_log("SpinApplicationResponseCode::invalidPlan\n");
-              String message;
-              if (args != response->terminal())
-              {
-                Message::extractToStringView(args, message);
-              }
-              if (message.size() > 0)
-              {
-                String owned = {};
-                owned.assign(message);
-                owned.addNullTerminator();
-                basics_log("%s\n", owned.c_str());
-              }
-              exit(EXIT_FAILURE);
-            }
-          case SpinApplicationResponseCode::okay:
-          default:
-            break;
-        }
-
-      } while (!finished);
-
-      socket.close();
+      basics_log("too few arguments provided to deploy. ex: deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
+      exit(EXIT_FAILURE);
     }
-    else
+
+    DeploymentPlan plan = {};
+    String containerPath = {};
+    String failure = {};
+    bool returnAfterInitialSpinOkay = false;
+    if (prepareDeploymentPlan(argv[0], argv[1], argv[2], plan, containerPath, returnAfterInitialSpinOkay, failure) == false)
     {
+      if (failure.size() > 0) basics_log("deploy failed: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    DeploymentDispatchResult dispatch = {};
+    if (dispatchValidatedDeployment(plan, containerPath, returnAfterInitialSpinOkay, true, dispatch) == false)
+    {
+      if (dispatch.failure.size() > 0) basics_log("deploy failed: %s\n", dispatch.failure.c_str());
       exit(EXIT_FAILURE);
     }
   }
+
   void runApplicationReport(int argc, char *argv[])
   {
     if (argc < 2)
@@ -14447,6 +15842,31 @@ private:
     cloudIDs.clear();
     failure.clear();
     bytell_hash_set<Machine *> machines = {};
+    if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+    {
+      const bool listed = mothershipRunProviderHostJob(
+          hostRuntime,
+          runtimeEnvironment,
+          MultiCurlClient::Clock::now() + std::chrono::seconds(30),
+          "machine inventory",
+          failure,
+          [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  provider.getMachines(coro, metro, machines, jobFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+            completed = jobFailure.empty();
+          });
+      for (Machine *machine : machines)
+      {
+        if (machine != nullptr && machine->cloudID.size() > 0) cloudIDs.push_back(machine->cloudID);
+        delete machine;
+      }
+      machines.clear();
+      return listed;
+    }
     if (runtimeEnvironment.kind != ProdigyEnvironmentKind::gcp)
     {
       blockingProvider.getMachines(nullptr, metro, machines, failure);
@@ -14851,7 +16271,27 @@ private:
     }
     else
     {
-      destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      {
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "machine destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& jobProvider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderMachines(coro, jobProvider, cloudIDs, completed, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+      }
+      else
+      {
+        destroyed = mothershipDestroyProviderMachinesInline(*provider, cloudIDs, &failure);
+      }
     }
     if (destroyed == false)
     {
@@ -15040,19 +16480,40 @@ private:
     }
     else
     {
-      std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
-      if (provider == nullptr)
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
-        failure.assign("failed to construct provider iaas"_ctv);
+        completed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "cluster destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& jobProvider, bool& jobCompleted, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderClusterMachines(coro, jobProvider, clusterUUID, destroyed,
+                                                             jobCompleted, &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
       }
       else
       {
-        provider->configureRuntimeEnvironment(runtimeEnvironment);
-        completed = mothershipDestroyProviderClusterMachinesInline(
-            *provider,
-            clusterUUID,
-            destroyed,
-            &failure);
+        std::unique_ptr<BrainIaaS> provider = prodigyCreateProviderBrainIaaS(runtimeEnvironment, {});
+        if (provider == nullptr)
+        {
+          failure.assign("failed to construct provider iaas"_ctv);
+        }
+        else
+        {
+          provider->configureRuntimeEnvironment(runtimeEnvironment);
+          completed = mothershipDestroyProviderClusterMachinesInline(
+              *provider,
+              clusterUUID,
+              destroyed,
+              &failure);
+        }
       }
     }
     if (completed == false)
@@ -15926,9 +17387,9 @@ private:
 
   void runCreateCluster(int argc, char *argv[])
   {
-    if (argc < 1)
+    if (argc < 1 || argc > 2)
     {
-      basics_log("too few arguments. ex: createCluster [json|-|@path]\n");
+      basics_log("usage: createCluster [json|-|@path] [optional test initial bundle]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -15939,6 +17400,12 @@ private:
     MothershipProviderCredential dnsProviderCredentialOverride = {};
     bool hasProviderCredentialOverride = false;
     bool hasDNSProviderCredentialOverride = false;
+    const bool hasTestInitialBundleInput = argc == 2;
+    String testInitialBundleInput = {};
+    if (hasTestInitialBundleInput)
+    {
+      testInitialBundleInput.assign(argv[1]);
+    }
 
     String json;
     if (resolveJSONArgument("createCluster", argv[0], json) == false)
@@ -16535,6 +18002,29 @@ private:
     }
 
     String failure;
+
+    // A test fixture may select an exact, independently built initial runtime.
+    // Keep it transient: neither the request nor the registry record gains a
+    // release path, and non-test clusters cannot use it.  This admission must
+    // precede tunnel preparation and inline-credential persistence.  Require an
+    // explicit archive: a caller-selected input must never fall through to the
+    // Mothership's installed-bundle resolver.
+    String testInitialBundlePath = {};
+    String testInitialBundleSHA256 = {};
+    if (hasTestInitialBundleInput)
+    {
+      if (testInitialBundleInput.empty() ||
+          request.deploymentMode != MothershipClusterDeploymentMode::test ||
+          prodigyIsZstdFile(testInitialBundleInput) == false ||
+          prodigyApproveBundleArtifact(testInitialBundleInput, testInitialBundleSHA256, &failure) == false)
+      {
+        if (failure.empty()) failure.assign("test initial bundle requires deploymentMode=test and an approved nonempty explicit zstd archive"_ctv);
+        basics_log("createCluster success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      testInitialBundlePath = testInitialBundleInput;
+    }
+
     if (request.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
       ensureClusterUUIDForCreate(request);
@@ -16626,7 +18116,7 @@ private:
       }
     }
 
-    ClusterCreateHooks hooks(this, std::move(tunnelProviderGatewayAuth));
+    ClusterCreateHooks hooks(this, std::move(tunnelProviderGatewayAuth), std::move(testInitialBundlePath), std::move(testInitialBundleSHA256));
     MothershipClusterCreateTimingSummary timingSummary = {};
     if (mothershipStandUpCluster(stored, credentialPtr, hooks, &timingSummary, &failure, dnsCredentialPtr) == false)
     {
@@ -16696,6 +18186,7 @@ private:
     }
 
     String failure;
+    TestPairLifecycleLock pairLock;
     MothershipProdigyCluster cluster = {};
     {
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
@@ -16705,6 +18196,22 @@ private:
         exit(EXIT_FAILURE);
       }
     }
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      if (!lockTestPairLifecycle(pairLock, failure))
+      {
+        basics_log("removeCluster success=0 removed=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      auto clusterRegistry = openClusterRegistry();
+      bool ownsBoundary = false;
+      if (!clusterRegistry.clusterHasOpenTestPairBoundary(cluster.clusterUUID, ownsBoundary, &failure) || ownsBoundary)
+      {
+        basics_log("removeCluster success=0 removed=0 failure=%s\n", ownsBoundary ? "remove the owned test pair boundary first" : failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+
 
     if (offlineDNSRecovery || offlineUnconfiguredDNSRecovery)
     {
@@ -16811,21 +18318,20 @@ private:
 
   void runUpdateProdigy(int argc, char *argv[])
   {
-    if (argc < 2)
+    if (argc != 3)
     {
-      basics_log("too few arguments. ex: updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
+      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
       exit(EXIT_FAILURE);
     }
 
-    String inputPath;
-    inputPath.assign(argv[1]);
-
-    if (inputPath.size() == 0)
+    String inputPath = {}, operationText = {};
+    inputPath.assign(argv[1]); operationText.assign(argv[2]);
+    uint128_t operationID = 0;
+    if (inputPath.empty() || !prodigyParseCanonicalHex128(operationText, operationID))
     {
-      basics_log("updateProdigy requires a non-empty path to prodigy binary or bundle\n");
+      basics_log("updateProdigy requires an approved bundle and canonical nonzero operationID\n");
       exit(EXIT_FAILURE);
     }
-
     if (access(inputPath.c_str(), R_OK) != 0)
     {
       basics_log("updateProdigy path is inaccessible: %s\n", inputPath.c_str());
@@ -16833,88 +18339,282 @@ private:
     }
 
     MachineCpuArchitecture targetArchitecture = MachineCpuArchitecture::unknown;
-    String failure;
-    if (resolveProdigyBundleTargetArchitecture(argv[0], targetArchitecture, &failure) == false)
-    {
-      basics_log("updateProdigy failed to resolve target architecture: %s\n", failure.c_str());
-      exit(EXIT_FAILURE);
-    }
-
-    String bundlePath;
-    if (prodigyResolveBundleArtifactInput(inputPath, targetArchitecture, bundlePath, &failure) == false)
+    String failure = {}, bundlePath = {};
+    if (!resolveProdigyBundleTargetArchitecture(argv[0], targetArchitecture, &failure) ||
+        !prodigyResolveBundleArtifactInput(inputPath, targetArchitecture, bundlePath, &failure))
     {
       basics_log("updateProdigy failed to resolve bundle: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
-
-    String actualBundleDigest;
-    if (prodigyApproveBundleArtifact(bundlePath, actualBundleDigest, &failure) == false)
+    ProdigyApprovedUpgradeBundle approvedBundle = {};
+    if (!prodigyApproveBundleUpgradeContract(bundlePath, approvedBundle, &failure))
     {
       basics_log("updateProdigy rejected bundle: %s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
-
-    uint32_t bundleSize = Filesystem::fileSize(bundlePath);
-    if (bundleSize == 0)
+    if (Filesystem::fileSize(bundlePath) == 0)
     {
       basics_log("updateProdigy bundle path is empty or inaccessible: %s\n", bundlePath.c_str());
       exit(EXIT_FAILURE);
     }
+    if (!configureControlTarget(argv[0], &failure)) exit(EXIT_FAILURE);
 
-    // Reject bad upgrade artifacts before any control-socket bootstrap so the
-    // failure is deterministic even when the target cluster is unreachable.
-    if (!configureControlTarget(argv[0]))
+    const uint128_t configuredClusterUUID = socket.configuredClusterUUID();
+    MothershipProdigyCluster upgradeCluster = {};
+    const bool hasUpgradeCluster = tryLoadStoredClusterTarget(argv[0], upgradeCluster);
+    MothershipClusterRegistry registry = openClusterRegistry();
+    MothershipUpgradeAdmissionRecord admission = {};
+    if (!registry.loadUpgradeAdmission(configuredClusterUUID, operationID, admission, &failure))
     {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!admission.eligible || admission.approvedPath != uint8_t(MothershipUpgradePath::sameLogicalRollout) ||
+        admission.targetBundleSHA256 != approvedBundle.bundleSHA256 ||
+        admission.targetContractSHA256 != approvedBundle.contract.contractSHA256)
+    {
+      basics_log("updateProdigy rejected by upgrade admission: operation does not authorize this same-cluster target bundle\n");
       exit(EXIT_FAILURE);
     }
 
-    if (socket.connect() == 0)
+    ProdigyUpgradeAdmissionReportRequest observationRequest = {};
+    observationRequest.operationID.assign(operationText);
+    observationRequest.targetBundleSHA256.assign(approvedBundle.bundleSHA256);
+    observationRequest.targetContractSHA256.assign(approvedBundle.contract.contractSHA256);
+    observationRequest.requiredStagingBytes = approvedBundle.contract.requiredFreeBytes;
+    if (observationRequest.requiredStagingBytes == 0)
     {
-      uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::updateProdigy);
-      Message::appendFile(socket.wBuffer, bundlePath);
-      Message::finish(socket.wBuffer, headerOffset);
-
-      if (socket.send() == false)
-      {
-        exit(EXIT_FAILURE);
-      }
-
-      Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::updateProdigy, 512);
-      if (responseMessage == nullptr)
-      {
-        String failureDetail = socket.ioFailureDetail();
-        basics_log("updateProdigy success=0 failure=%s\n",
-                   failureDetail.size() ? failureDetail.c_str() : "timed out waiting for updateProdigy response");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-
-      String serializedResponse = {};
-      uint8_t *responseArgs = responseMessage->args;
-      Message::extractToStringView(responseArgs, serializedResponse);
-      MothershipResponse response = {};
-      if (BitseryEngine::deserializeSafe(serializedResponse, response) == false)
-      {
-        basics_log("updateProdigy success=0 failure=invalid response payload\n");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-      if (response.success == false)
-      {
-        basics_log("updateProdigy success=0 failure=%s\n",
-                   response.failure.size() ? response.failure.c_str() : "remote bundle staging failed");
-        socket.close();
-        exit(EXIT_FAILURE);
-      }
-
-      basics_log("updateProdigy success=1 staged=1 bytes=%u path=%s sha256=%s\n",
-                 bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
-      socket.close();
-    }
-    else
-    {
+      basics_log("updateProdigy rejected by upgrade admission: target contract lacks nonzero staging-capacity bound\n");
       exit(EXIT_FAILURE);
     }
+
+    MothershipUpgradeAdmissionReport report = {};
+    constexpr uint32_t maximumObservationAttempts = 3;
+    bool reportReceived = false;
+    for (uint32_t attempt = 0; attempt < maximumObservationAttempts; ++attempt)
+    {
+      if (!requestUpgradeAdmissionReport(observationRequest, report, failure)) break;
+      reportReceived = true;
+      if (report.observationComplete) break;
+    }
+    if (!reportReceived)
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    MothershipUpgradeIdentity sourceIdentity = {};
+    sourceIdentity.releaseID = admission.sourceReleaseID;
+    sourceIdentity.contractSHA256 = admission.sourceContractSHA256;
+    sourceIdentity.prodigySHA256 = admission.sourceProdigySHA256;
+    sourceIdentity.mothershipSHA256 = admission.sourceMothershipSHA256;
+    String observedTargetArchitecture = {};
+    observedTargetArchitecture.assign(machineCpuArchitectureName(targetArchitecture));
+    MothershipUpgradePlannerInput input = {};
+    buildUpgradePlannerInput(approvedBundle, sourceIdentity, report, observedTargetArchitecture,
+                             hasUpgradeCluster ? &upgradeCluster : nullptr, input, failure);
+    if (failure.empty() && report.clusterUUID != admission.clusterUUID)
+      failure.assign("fresh upgrade report cluster identity differs from the admission record"_ctv);
+    if (failure.empty() && report.masterApprovedBundleSHA256 != admission.sourceBundleSHA256)
+      failure.assign("fresh master bundle digest differs from the admitted source bundle"_ctv);
+    if (failure.empty())
+      for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+        if (peer.installedBundleSHA256 != admission.sourceBundleSHA256)
+        {
+          failure.assign("fresh peer bundle digest differs from the admitted source bundle"_ctv);
+          break;
+        }
+    String semanticSHA256 = {};
+    if (failure.empty() && !semanticUpgradeAdmissionReportDigest(report, semanticSHA256, failure))
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    MothershipUpgradePlan freshPlan = mothershipPlanUpgrade(approvedBundle.contract, input);
+    if (failure.empty() && !freshPlan.eligible)
+      failure = freshPlan.firstStopGate;
+    if (failure.empty() && (freshPlan.path != MothershipUpgradePath::sameLogicalRollout ||
+                            freshPlan.inputSHA256 != admission.plannerInputSHA256 ||
+                            report.authorityGeneration != admission.authorityGeneration || report.masterUUID != admission.masterUUID ||
+                            report.masterBootNs != admission.masterBootNs || semanticSHA256 != admission.semanticObservationSHA256))
+      failure.assign("fresh report or plan no longer matches the durable admission; re-plan required"_ctv);
+    if (!failure.empty())
+    {
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    // Read only the retained, locally approved snapshot.  Re-check both the
+    // pathname and copied bytes immediately before the typed admission frame.
+    String targetBundleBytes = {}, copiedDigest = {};
+    struct stat snapshotMetadata = {};
+    if (!approvedBundle.verifyRetainedSnapshot(&failure) ||
+        ::stat(approvedBundle.retainedSnapshotPath.c_str(), &snapshotMetadata) != 0 ||
+        !S_ISREG(snapshotMetadata.st_mode) || snapshotMetadata.st_size <= 0 ||
+        uint64_t(snapshotMetadata.st_size) >= ProdigyWire::maxControlFrameBytes - 4096)
+    {
+      if (failure.empty()) failure.assign("approved bundle snapshot is unavailable or exceeds admitted frame bounds"_ctv);
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Filesystem::openReadAtClose(-1, approvedBundle.retainedSnapshotPath, targetBundleBytes,
+                                uint64_t(snapshotMetadata.st_size) + 1);
+    if (targetBundleBytes.size() != uint64_t(snapshotMetadata.st_size) ||
+        !prodigyComputeSHA256Hex(targetBundleBytes, copiedDigest, &failure) ||
+        copiedDigest != approvedBundle.bundleSHA256)
+    {
+      if (failure.empty()) failure.assign("approved bundle snapshot changed while preparing admitted frame"_ctv);
+      basics_log("updateProdigy rejected by upgrade admission: %s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    ProdigyAdmittedUpdateRequest request = {};
+    request.operationID = operationText;
+    request.sourceBundleSHA256 = admission.sourceBundleSHA256;
+    request.targetBundleSHA256 = approvedBundle.bundleSHA256;
+    request.targetContractSHA256 = approvedBundle.contract.contractSHA256;
+    request.authorityGeneration = report.authorityGeneration;
+    request.masterUUID = report.masterUUID;
+    request.masterBootNs = report.masterBootNs;
+    request.receiptVersion = report.observationReceiptVersion;
+    request.nonce = report.observationNonce;
+    request.requiredStagingBytes = observationRequest.requiredStagingBytes;
+    request.requiresEmptyWorkloadSet = input.emptyIsolatedTestCluster;
+    String serializedRequest = {};
+    BitseryEngine::serialize(serializedRequest, request);
+    if (socket.connect() != 0)
+    {
+      basics_log("updateProdigy success=0 failure=failed to connect for admitted update\n");
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::updateProdigyAdmitted, serializedRequest, targetBundleBytes);
+    if (!socket.send())
+    {
+      String failureDetail = socket.ioFailureDetail(); socket.close();
+      basics_log("updateProdigy success=0 failure=%s\n", failureDetail.empty() ? "failed to send admitted update" : failureDetail.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::updateProdigyAdmitted, 512);
+    if (responseMessage == nullptr)
+    {
+      String failureDetail = socket.ioFailureDetail(); socket.close();
+      basics_log("updateProdigy success=0 failure=%s\n", failureDetail.empty() ? "timed out waiting for admitted update response" : failureDetail.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedResponse = {}; uint8_t *responseArgs = responseMessage->args;
+    Message::extractToStringView(responseArgs, serializedResponse);
+    MothershipResponse response = {};
+    if (responseArgs != responseMessage->terminal() || !BitseryEngine::deserializeSafe(serializedResponse, response))
+    {
+      socket.close(); basics_log("updateProdigy success=0 failure=invalid admitted update response\n");
+      exit(EXIT_FAILURE);
+    }
+    if (!response.success)
+    {
+      socket.close(); basics_log("updateProdigy success=0 failure=%s\n", response.failure.empty() ? "admitted update rejected" : response.failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s\n",
+               size_t(targetBundleBytes.size()), approvedBundle.bundleSHA256.c_str(), operationText.c_str());
+    socket.close();
+  }
+
+  void runInspectUpgradeBundle(int argc, char *argv[])
+  {
+    if (argc < 1)
+    {
+      basics_log("too few arguments. ex: inspectUpgradeBundle [path to prodigy binary or bundle]\n");
+      exit(EXIT_FAILURE);
+    }
+    String inputPath;
+    inputPath.assign(argv[0]);
+    String failure, bundlePath;
+    if (inputPath.empty() || !prodigyFileReadable(inputPath) ||
+        !prodigyResolveBundleArtifactInput(inputPath, nametagCurrentBuildMachineArchitecture(), bundlePath, &failure))
+    {
+      basics_log("inspectUpgradeBundle success=0 failure=%s\n", failure.size() ? failure.c_str() : "bundle input is invalid");
+      exit(EXIT_FAILURE);
+    }
+    ProdigyApprovedUpgradeBundle approved;
+    if (!prodigyApproveBundleUpgradeContract(bundlePath, approved, &failure))
+    {
+      basics_log("inspectUpgradeBundle success=0 path=%s failure=%s\n", bundlePath.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    const char *disposition = "unsupported";
+    const char *reason = "release declares upgrade unsupported";
+    if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) disposition = "same-cluster-rollout";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) disposition = "new-cluster-required";
+    if (approved.contract.disposition == MothershipUpgradeDisposition::sameClusterRollout) reason = "cluster preflight is required before rollout";
+    else if (approved.contract.disposition == MothershipUpgradeDisposition::newClusterRequired) reason = "separate-cluster migration still requires workload bridges";
+    auto compatibility = [](MothershipUpgradeCompatibilityState state) {
+      if (state == MothershipUpgradeCompatibilityState::compatible) return "compatible";
+      if (state == MothershipUpgradeCompatibilityState::incompatible) return "incompatible";
+      return "unknown";
+    };
+    basics_log("inspectUpgradeBundle success=1 path=%s bundleSHA256=%s contractSHA256=%s releaseID=%s architecture=%s binaryVersion=%s disposition=%s reason=%s prodigySHA256=%s mothershipSHA256=%s minimumHealthyBrains=%u requiredFreeBytes=%llu rollbackMode=%s migrationProtocolVersion=%s\n",
+               bundlePath.c_str(), approved.bundleSHA256.c_str(), approved.contract.contractSHA256.c_str(),
+               approved.contract.releaseID.c_str(), approved.contract.architecture.c_str(), approved.contract.binaryVersion.c_str(),
+               disposition, reason, approved.contract.prodigySHA256.c_str(), approved.contract.mothershipSHA256.c_str(),
+               unsigned(approved.contract.minimumHealthyBrains), (unsigned long long)approved.contract.requiredFreeBytes,
+               approved.contract.rollbackMode.c_str(), approved.contract.migrationProtocolVersion.c_str());
+    basics_log("inspectUpgradeBundle compatibility wire=%s persistentState=%s authorityState=%s transportTrust=%s containerProtocol=%s dataPlane=%s appState=%s sources=%u\n",
+               compatibility(approved.contract.compatibility.wire), compatibility(approved.contract.compatibility.persistentState),
+               compatibility(approved.contract.compatibility.authorityState), compatibility(approved.contract.compatibility.transportTrust),
+               compatibility(approved.contract.compatibility.containerProtocol), compatibility(approved.contract.compatibility.dataPlane),
+               compatibility(approved.contract.compatibility.appState), unsigned(approved.contract.sources.size()));
+  }
+
+  void runCommitDeploymentPlacementPolicy(int argc, char *argv[])
+  {
+    if (argc < 2 || !configureControlTarget(argv[0])) exit(EXIT_FAILURE);
+    String json = {}; json.append(argv[1]); json.need(simdjson::SIMDJSON_PADDING);
+    simdjson::dom::parser parser; simdjson::dom::element doc;
+    ProdigyDeploymentPlacementPolicy request = {};
+    bool sawApp = false, sawVersion = false, sawOperation = false, sawMachines = false;
+    if (parser.parse(json.data(), json.size()).get(doc)) { basics_log("invalid placement policy json\n"); exit(EXIT_FAILURE); }
+    for (auto field : doc.get_object())
+    {
+      String key = {}; key.setInvariant(field.key.data(), field.key.size());
+      if (key.equal("applicationID"_ctv) || key.equal("versionID"_ctv))
+      {
+        uint64_t value = 0;
+        if (field.value.get(value) != simdjson::SUCCESS || value == 0 ||
+            (key.equal("applicationID"_ctv) && value > UINT16_MAX) ||
+            (key.equal("versionID"_ctv) && value >= (uint64_t(1) << 48))) { basics_log("invalid placement numeric field\n"); exit(EXIT_FAILURE); }
+        if (key.equal("applicationID"_ctv)) { if (sawApp) exit(EXIT_FAILURE); sawApp = true; request.applicationID = uint16_t(value); }
+        else { if (sawVersion) exit(EXIT_FAILURE); sawVersion = true; request.versionID = value; }
+      }
+      else if (key.equal("operationID"_ctv))
+      {
+        if (sawOperation || field.value.type() != simdjson::dom::element_type::STRING) exit(EXIT_FAILURE);
+        sawOperation = true; request.operationID.assign(field.value.get_c_str());
+      }
+      else if (key.equal("eligibleMachineUUIDs"_ctv))
+      {
+        if (sawMachines || field.value.type() != simdjson::dom::element_type::ARRAY) exit(EXIT_FAILURE);
+        sawMachines = true;
+        for (auto entry : field.value.get_array()) {
+          if (entry.type() != simdjson::dom::element_type::STRING || request.eligibleMachineUUIDs.size() >= 256) exit(EXIT_FAILURE);
+          String machineText = {}; machineText.assign(entry.get_c_str()); uint128_t machineUUID = 0;
+          if (!prodigyParseCanonicalHex128(machineText, machineUUID) || machineUUID == 0) exit(EXIT_FAILURE);
+          request.eligibleMachineUUIDs.push_back(machineUUID);
+        }
+      }
+      else { basics_log("unknown placement policy field\n"); exit(EXIT_FAILURE); }
+    }
+    std::sort(request.eligibleMachineUUIDs.begin(), request.eligibleMachineUUIDs.end());
+    if (!sawApp || !sawVersion || !sawOperation || !sawMachines || !prodigyDeploymentPlacementPolicyValid(request))
+    { basics_log("placementPolicy requires canonical applicationID/versionID/operationID/eligibleMachineUUIDs\n"); exit(EXIT_FAILURE); }
+    String payload = {}; BitseryEngine::serialize(payload, request);
+    if (!socket.ensureConnected()) exit(EXIT_FAILURE);
+    Message::construct(socket.wBuffer, MothershipTopic::commitDeploymentPlacementPolicy, payload);
+    if (!socket.send()) exit(EXIT_FAILURE);
+    Message *message = socket.recvExpectedTopic(MothershipTopic::commitDeploymentPlacementPolicy, 4096);
+    if (message == nullptr) exit(EXIT_FAILURE);
+    String responseBytes = {}; uint8_t *args = message->args; Message::extractToStringView(args, responseBytes);
+    CommitDeploymentPlacementPolicyResponse response = {};
+    if (args != message->terminal() || !BitseryEngine::deserializeSafe(responseBytes, response)) exit(EXIT_FAILURE);
+    basics_log("placementPolicy success=%d appID=%u versionID=%llu operationID=%s durableGeneration=%llu failure=%s\n", int(response.success), unsigned(response.policy.applicationID), (unsigned long long)response.policy.versionID, response.policy.operationID.c_str(), (unsigned long long)response.durableGeneration, response.failure.c_str());
+    if (!response.success) exit(EXIT_FAILURE);
   }
 
   void runCancelDeployment(int argc, char *argv[])
@@ -19106,12 +20806,18 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
+        {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
+        {"pairBoundary",                    &Mothership::runPairBoundary                   },
+        {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
+        {"planUpgrade",                     &Mothership::runPlanUpgrade                     },
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
+        {"prepareTestPairBoundary",         &Mothership::runPrepareTestPairBoundary        },
         {"printClusters",                   &Mothership::runPrintClusters                  },
+        {"probePairBoundary",               &Mothership::runProbePairBoundary              },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
         {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
@@ -19122,6 +20828,7 @@ public:
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
+        {"recoverTestClusterFollowerBrain", &Mothership::runRecoverTestClusterFollowerBrain},
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -19183,7 +20890,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -19216,10 +20923,11 @@ int main(int argc, char *argv[])
     message.append("recommendClusterForApplications [json]\n");
     message.append("\trecommends the cheapest AWS/GCP/Azure cluster for a required country and billingModel=hourly|spot, optionally under budget, across providers=[\"all\"] or an explicit provider set\n");
     message.append("\taccepts required minMachines plus optional ingressGBPerHour and egressGBPerHour, and now considers up to three distinct machine types per recommendation\n");
-    message.append("createCluster [json|-|@path]\n");
+    message.append("createCluster [json|-|@path] [optional test initial bundle]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
+    message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
@@ -19229,10 +20937,19 @@ int main(int argc, char *argv[])
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
+    message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
+    message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
+    message.append("prepareTestPairBoundary [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport]\n");
+    message.append("\tqualifies one shared TCP endpoint between two independent three-Brain test clusters; both exact deployments must already be healthy\n");
+    message.append("pairBoundary [operationID] [query|selectTarget|drain|remove|crashOwner]\n");
+    message.append("\tobserves, selects, or removes the test endpoint; selectTarget directs new connections to the target while retaining source connections\n");
+    message.append("\tcrashOwner explicitly kills the disposable endpoint supervisor to test cleanup; it interrupts this test endpoint\n");
+    message.append("probePairBoundary [operationID] [expectedDeploymentID] [count] [intervalMs]\n");
+    message.append("\tobserves runtime identity over one bounded TCP connection; these test operations do not authorize migration or source retirement\n");
     message.append("upsertMachineSchemas [name|clusterUUID] [json object|array]\n");
     message.append("\tremote clusters only; creates or partially overwrites machine schema budget rows keyed by schema, then reconciles created capacity to match\n");
     message.append("deltaMachineBudget [name|clusterUUID] [json]\n");
@@ -19255,8 +20972,12 @@ int main(int argc, char *argv[])
     message.append("\tex: applicationReport local Radar\n");
     message.append("taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
     message.append("\tfetches a retained task execution report\n");
-    message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
-    message.append("\tpushes the exact prodigy bundle this mothership build was compiled to approve, and rejects any other bundle before dispatch\n");
+    message.append("planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
+    message.append("\treads a versioned Brain admission report and records an immutable no-dispatch compatibility decision\n");
+    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
+    message.append("\tdispatches only an approved retained snapshot through the typed Brain-side operation binding\n");
+    message.append("inspectUpgradeBundle [path to prodigy binary or bundle]\n");
+    message.append("\tread-only: verifies the approved flat bundle and prints its embedded upgrade compatibility policy\n");
     message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns an applicationID for an application name\n");
     message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]\n");

@@ -231,10 +231,101 @@ static void testAsyncAddMachinesProviderJournalDurability(TestSuite& suite)
  }
 }
 
+static void testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(TestSuite& suite);
+
 static void runAsyncAddMachinesTests(TestSuite& suite)
 {
   ScopedRing ring;
   testAsyncAddMachinesAdoptedJournalDurability(suite);
   testAsyncAddMachinesFinalJournalDurability(suite);
   testAsyncAddMachinesProviderJournalDurability(suite);
+  testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(suite);
+}
+
+// The first journal receipt can yield while bootstrap is active. A hardware
+// topology mutation then advances the durable base before addMachines commits
+// its requested worker; persistence must receive the reconciled next version,
+// retain that hardware, and add only the requested worker.
+class StaleAddMachinesTopologyReconciliationBrain final : public ResumableAddMachinesBrain {
+public:
+  mutable bool topologyAdvancedDuringBootstrap = false;
+
+  bool canSuspendRemoteBootstrap(void) const override { return false; }
+
+  bool normalizeAdoptedClusterMachine(const ClusterMachine& requested, const String&,
+                                      const String&, ClusterMachine& normalized,
+                                      String& failure) const override
+  {
+    normalized = requested;
+    failure.clear();
+    return true;
+  }
+
+  bool bootstrapClusterMachineBlocking(
+      const ClusterMachine& clusterMachine,
+      const AddMachines& request,
+      const ClusterTopology& topology,
+      String& failure,
+      ProdigyRemoteBootstrapBundleApprovalCache *bundleApprovalCache = nullptr) const override
+  {
+    const bool bootstrapped = ResumableAddMachinesBrain::bootstrapClusterMachineBlocking(
+        clusterMachine, request, topology, failure, bundleApprovalCache);
+    if (bootstrapped && topologyAdvancedDuringBootstrap == false)
+    {
+      auto& owner = const_cast<StaleAddMachinesTopologyReconciliationBrain&>(*this);
+      MachineHardwareProfile hardware = {};
+      hardware.inventoryComplete = true;
+      hardware.collectedAtMs = 222'333'444;
+      hardware.cpu.logicalCores = 6;
+      hardware.memory.totalMB = 12'288;
+      hardware.disks.push_back(MachineDiskHardwareProfile {.sizeMB = 65'536});
+      prodigyApplyHardwareProfileToClusterMachine(
+          owner.authoritativeTopology.machines[0], hardware, owner.brainConfig.machineReservedResources);
+      ++owner.authoritativeTopology.version;
+      owner.topologyAdvancedDuringBootstrap = true;
+    }
+    return bootstrapped;
+  }
+
+  bool persistAuthoritativeClusterTopology(const ClusterTopology& topology) override
+  {
+    if (topology.version != authoritativeTopology.version + 1)
+    {
+      return false;
+    }
+    return ResumableAddMachinesBrain::persistAuthoritativeClusterTopology(topology);
+  }
+};
+
+static void testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(TestSuite& suite)
+{
+  NoopBrainIaaS iaas = {};
+  StaleAddMachinesTopologyReconciliationBrain brain = {};
+  configureAsyncAddMachinesBrain(brain, iaas, 0xaadd05, 0xaadd51);
+  brain.holdRuntimePersistence = true;
+
+  bool completed = false;
+  AddMachines response = {};
+  brain.addMachines(nullptr,
+      asyncAddMachinesAdoptedRequest(brain.brainConfig.clusterUUID,
+                                     asyncAddMachinesAdoptedWorker(0xaadd52, "2001:db8:aa::52"_ctv)),
+      {}, nullptr, [&](AddMachines value) { completed = true; response = std::move(value); });
+  suite.require(brain.pendingRuntimePersistence.size() == 1 && !completed,
+                "async_addmachines_stale_topology_holds_initial_journal");
+
+  brain.finishRuntimePersistence(true);
+  suite.require(brain.topologyAdvancedDuringBootstrap && brain.authoritativeTopology.version == 19 &&
+                    brain.pendingRuntimePersistence.size() == 1 && !completed,
+                "async_addmachines_stale_topology_reconciles_after_journal_and_bootstrap");
+  brain.finishRuntimePersistence(true);
+
+  const ClusterMachine *seed = prodigyFindClusterMachineByIdentity(
+      brain.authoritativeTopology.machines, asyncAddMachinesSeedMachine(0xaadd51, "2001:db8:aa::10"_ctv));
+  const ClusterMachine *worker = prodigyFindClusterMachineByIdentity(
+      brain.authoritativeTopology.machines, asyncAddMachinesAdoptedWorker(0xaadd52, "2001:db8:aa::52"_ctv));
+  suite.expect(completed && response.success && response.hasTopology &&
+                   brain.authoritativeTopology.version == 19 && brain.authoritativeTopology.machines.size() == 2 &&
+                   seed != nullptr && seed->hardware.inventoryComplete && seed->totalLogicalCores == 6 &&
+                   worker != nullptr && brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(),
+               "async_addmachines_stale_topology_preserves_latest_hardware_and_requested_membership");
 }
