@@ -699,6 +699,7 @@ static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
 
 static void testDurableMaterializedRecoveryHistoricalCull(TestSuite& suite)
 {
+  PersistenceRing ring = {};
   ProdigyHostControlNetwork network;
   ProdigyBrain brain(network, {});
   BrainBase *savedBrain = thisBrain;

@@ -139,16 +139,18 @@ machine_pids=()
 mkdir -p "$workspace"
 start_machine() { local index="$1"; machine_pids[$((index - 1))]=$((100 + index)); printf '%s\n' "$index" >> "$workspace/starts"; }
 start_initial_runtime & gate=$!
-for _ in $(seq 1 100); do [[ -r "$workspace/starts" ]] && break; sleep 0.01; done
+for _ in $(seq 1 100); do [[ -s "$workspace/starts" ]] && break; sleep 0.01; done
 [[ "$(<"$workspace/starts")" == 1 ]]
 [[ ! -e "$seed_runtime_path" || "$(<"$seed_runtime_path")" == 101 ]]
-printf 'members\n' > "$members_provisioned_path"
+printf 'members\n' > "$members_provisioned_path.$$.tmp"
+mv -f "$members_provisioned_path.$$.tmp" "$members_provisioned_path"
 wait "$gate"
 [[ "$(tr '\n' ' ' < "$workspace/starts")" == '1 2 3 ' ]]
 rm -f "$workspace/starts" "$members_provisioned_path"
 start_initial_runtime & malformed=$!
-for _ in $(seq 1 100); do [[ -r "$workspace/starts" ]] && break; sleep 0.01; done
-printf 'unexpected\n' > "$members_provisioned_path"
+for _ in $(seq 1 100); do [[ -s "$workspace/starts" ]] && break; sleep 0.01; done
+printf 'unexpected\n' > "$members_provisioned_path.$$.tmp"
+mv -f "$members_provisioned_path.$$.tmp" "$members_provisioned_path"
 if wait "$malformed"; then exit 1; fi
 [[ "$(<"$workspace/starts")" == 1 ]]
 )TEST";
@@ -465,6 +467,35 @@ int main(void)
   bootstrapRequest.controlSocketPath = controlSocketPath;
   ClusterTopology seedTopology = topology;
   seedTopology.machines.erase(seedTopology.machines.begin() + 1, seedTopology.machines.end());
+  seedTopology.machines[0].uuid = 0x4a01;
+  suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, topology, &failure),
+               "bootstrap_members_preallocate_durable_identities");
+  suite.expect(topology.machines[0].uuid == seedTopology.machines[0].uuid &&
+                   topology.machines[1].uuid != 0 && topology.machines[2].uuid != 0 &&
+                   topology.machines[0].uuid != topology.machines[1].uuid &&
+                   topology.machines[0].uuid != topology.machines[2].uuid &&
+                   topology.machines[1].uuid != topology.machines[2].uuid,
+               "bootstrap_members_preserve_seed_and_allocate_distinct_peer_identities");
+  const ClusterTopology assignedTopology = topology;
+  suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, topology, &failure) &&
+                   topology == assignedTopology,
+               "bootstrap_member_identity_assignment_retries_without_changing_published_ids");
+  ClusterTopology duplicateUUIDTopology = topology;
+  duplicateUUIDTopology.machines[2].uuid = duplicateUUIDTopology.machines[1].uuid;
+  suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, duplicateUUIDTopology, &failure) == false,
+               "bootstrap_member_identity_assignment_rejects_duplicate_existing_ids");
+  ClusterTopology ambiguousSeedTopology = topology;
+  ambiguousSeedTopology.machines[0].uuid = 0;
+  ambiguousSeedTopology.machines[1] = ambiguousSeedTopology.machines[0];
+  suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, ambiguousSeedTopology, &failure) == false &&
+                   ambiguousSeedTopology.machines[0].uuid == 0 && ambiguousSeedTopology.machines[1].uuid == 0,
+               "bootstrap_member_identity_assignment_rejects_ambiguous_seed_without_partial_assignment");
+  ClusterTopology seedUUIDCollisionTopology = topology;
+  seedUUIDCollisionTopology.machines[0].uuid = 0;
+  seedUUIDCollisionTopology.machines[1].uuid = seedTopology.machines[0].uuid;
+  suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, seedUUIDCollisionTopology, &failure) == false &&
+                   seedUUIDCollisionTopology.machines[0].uuid == 0,
+               "bootstrap_member_identity_assignment_rejects_member_id_that_conflicts_with_zero_id_seed");
   String seedBootJSON = {}, seedTLSJSON = {}, peerBootJSON = {}, peerTLSJSON = {};
   suite.expect(prodigyBuildRemoteBootstrapBootMaterial(seedTopology.machines[0], bootstrapRequest, seedTopology,
                                                        runtimeEnvironment, seedBootJSON, seedTLSJSON, &failure),
@@ -493,6 +524,34 @@ int main(void)
   suite.expect(peerTLS.ownerClusterUUID == seedTLS.ownerClusterUUID && peerTLS.uuid != seedTLS.uuid &&
                peerTLS.transportTLS.clusterRootCertPem.equals(seedTLS.transportTLS.clusterRootCertPem),
                "bootstrap_peer_shares_seed_authority_with_distinct_identity");
+  suite.expect(seedTLS.uuid == topology.machines[0].uuid &&
+                   peerTLS.uuid == topology.machines[1].uuid &&
+                   peerBoot.initialTopology.machines[0].uuid == topology.machines[0].uuid &&
+                   peerBoot.initialTopology.machines[1].uuid == topology.machines[1].uuid &&
+                   peerBoot.initialTopology.machines[2].uuid == topology.machines[2].uuid,
+               "bootstrap_peer_tls_and_boot_topology_use_durable_member_identities");
+  Vector<ClusterMachine> readyMachines = {};
+  for (const ClusterMachine& machine : topology.machines)
+  {
+    if (machine.sameIdentityAs(seedTopology.machines[0]) == false) readyMachines.push_back(machine);
+  }
+  suite.expect(readyMachines.size() == 2 && readyMachines[0].uuid == topology.machines[1].uuid &&
+                   readyMachines[1].uuid == topology.machines[2].uuid,
+               "bootstrap_members_ready_request_carries_preallocated_tls_identities");
+  for (uint32_t index = 1; index < topology.machines.size(); ++index)
+  {
+    String memberBootJSON = {}, memberTLSJSON = {};
+    ProdigyPersistentBootState memberBoot = {};
+    ProdigyPersistentLocalBrainState memberTLS = {};
+    const bool built = prodigyBuildRemoteBootstrapBootMaterial(topology.machines[index], bootstrapRequest, topology,
+                                                                runtimeEnvironment, memberBootJSON, memberTLSJSON, &failure);
+    const bool parsedMember = built && parseProdigyPersistentBootStateJSON(memberBootJSON, memberBoot, &failure) &&
+                              parseProdigyPersistentLocalBrainStateJSON(memberTLSJSON, memberTLS, &failure);
+    suite.expect(parsedMember && memberTLS.uuid == topology.machines[index].uuid &&
+                     memberBoot.initialTopology.machines.size() == topology.machines.size() &&
+                     memberBoot.initialTopology.machines[index].uuid == topology.machines[index].uuid,
+                 "bootstrap_every_member_tls_identity_matches_ready_identity");
+  }
 
   uint64_t parsed = 0;
   char processState = 0;

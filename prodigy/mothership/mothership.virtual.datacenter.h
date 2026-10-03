@@ -183,6 +183,104 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
   return true;
 }
 
+// Member boot material contains the local TLS identity.  Allocate and retain
+// every member identity before any boot material is written, so the same
+// topology is later admitted through readyMachines.  The seed has already
+// published its durable identity and must be preserved exactly.
+static inline bool mothershipAssignVirtualDatacenterMachineUUIDs(
+    const ClusterTopology& seedTopology,
+    ClusterTopology& topology,
+    String *failure = nullptr)
+{
+  if (seedTopology.machines.size() != 1 || seedTopology.machines[0].uuid == 0 || topology.machines.empty())
+  {
+    if (failure) failure->assign("virtual datacenter identity assignment requires one identified seed"_ctv);
+    return false;
+  }
+
+  for (uint32_t index = 0; index < topology.machines.size(); ++index)
+  {
+    if (topology.machines[index].uuid == 0)
+    {
+      continue;
+    }
+    for (uint32_t prior = 0; prior < index; ++prior)
+    {
+      if (topology.machines[prior].uuid == topology.machines[index].uuid)
+      {
+        if (failure) failure->assign("virtual datacenter topology contains duplicate machine UUIDs"_ctv);
+        return false;
+      }
+    }
+  }
+
+  uint32_t seedIndex = uint32_t(topology.machines.size());
+  for (uint32_t index = 0; index < topology.machines.size(); ++index)
+  {
+    if (topology.machines[index].sameIdentityAs(seedTopology.machines[0]) == false)
+    {
+      continue;
+    }
+    if (seedIndex != topology.machines.size() ||
+        (topology.machines[index].uuid != 0 && topology.machines[index].uuid != seedTopology.machines[0].uuid))
+    {
+      if (failure)
+      {
+        if (seedIndex != topology.machines.size() && topology.machines[seedIndex].uuid == 0 &&
+            topology.machines[index].uuid == seedTopology.machines[0].uuid)
+        {
+          failure->assign("virtual datacenter member UUID conflicts with configured seed"_ctv);
+        }
+        else
+        {
+          failure->assign("virtual datacenter seed identity is ambiguous"_ctv);
+        }
+      }
+      return false;
+    }
+    seedIndex = index;
+  }
+  if (seedIndex == topology.machines.size())
+  {
+    if (failure) failure->assign("virtual datacenter topology does not contain the configured seed"_ctv);
+    return false;
+  }
+  topology.machines[seedIndex].uuid = seedTopology.machines[0].uuid;
+
+  for (ClusterMachine& machine : topology.machines)
+  {
+    if (machine.uuid != 0)
+    {
+      continue;
+    }
+    for (;;)
+    {
+      uint128_t candidate = Random::generateNumberWithNBits<128, uint128_t>();
+      if (candidate == 0)
+      {
+        continue;
+      }
+      bool duplicate = false;
+      for (const ClusterMachine& other : topology.machines)
+      {
+        if (&machine != &other && other.uuid == candidate)
+        {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate == false)
+      {
+        machine.uuid = candidate;
+        break;
+      }
+    }
+  }
+
+  if (failure) failure->clear();
+  return true;
+}
+
 static inline bool mothershipWriteVirtualDatacenterBootstrapMaterial(
     const MothershipProdigyCluster& cluster,
     uint32_t machineIndex,

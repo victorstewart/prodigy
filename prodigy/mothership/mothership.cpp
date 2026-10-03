@@ -9415,6 +9415,10 @@ private:
       {
         return false;
       }
+      if (mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, virtualTopology, failure) == false)
+      {
+        return false;
+      }
 
       AddMachines request = {};
       if (mothershipBuildClusterBootstrapRequest(cluster, request, failure) == false)

@@ -491,11 +491,28 @@ int main(int argc, char *argv[])
   suite.expect(prodigyLoadBundleExpectedSHA256Hex(preparedBundle.bundlePath, publishedPreparedDigest, &failure) &&
                    publishedPreparedDigest == bundleDigest,
                "prepared_bundle_published_sidecar_matches_digest");
-  suite.expect(::unlink(preparedBundle.bundlePath.c_str()) == 0 &&
-                   Filesystem::openWriteAtClose(-1, preparedBundle.bundlePath, bundleBytes) == int(bundleBytes.size()),
+  String preparedReplacementPath = {};
+  preparedReplacementPath.assign(tempDirectory);
+  preparedReplacementPath.append("/prepared-bundle-replacement"_ctv);
+  std::error_code preparedReplacementCopyError = {};
+  suite.expect(std::filesystem::copy_file(
+                   std::filesystem::path(preparedBundle.bundlePath.c_str()),
+                   std::filesystem::path(preparedReplacementPath.c_str()),
+                   std::filesystem::copy_options::none,
+                   preparedReplacementCopyError) && preparedReplacementCopyError.value() == 0,
+               "prepared_bundle_independent_replacement_is_created");
+  struct stat preparedReplacementMetadata = {};
+  suite.expect(::stat(preparedReplacementPath.c_str(), &preparedReplacementMetadata) == 0 &&
+                   (preparedReplacementMetadata.st_dev != preparedBundle.publishedBundleDevice ||
+                    preparedReplacementMetadata.st_ino != preparedBundle.publishedBundleInode) &&
+                   ::rename(preparedReplacementPath.c_str(), preparedBundle.bundlePath.c_str()) == 0,
                "prepared_bundle_published_target_is_replaced_before_stale_cleanup");
   prodigyDiscardPreparedBundleArtifact(preparedBundle);
-  suite.expect(fileExists(preparedBundlePath), "prepared_bundle_cleanup_does_not_delete_replacement");
+  struct stat survivingPreparedReplacementMetadata = {};
+  suite.expect(::stat(preparedBundlePath.c_str(), &survivingPreparedReplacementMetadata) == 0 &&
+                   survivingPreparedReplacementMetadata.st_dev == preparedReplacementMetadata.st_dev &&
+                   survivingPreparedReplacementMetadata.st_ino == preparedReplacementMetadata.st_ino,
+               "prepared_bundle_cleanup_does_not_delete_replacement");
 
   // Production's default staged path is a `_ctv` read-only String. Exercise
   // both literal-equivalent capacity and a view with no spare terminator byte.
@@ -653,15 +670,31 @@ int main(int argc, char *argv[])
   ProdigyPreparedBundleArtifact competingBundle = {};
   suite.expect(prodigyPrepareBundleArtifact(competingBundle, competingBundlePath, bundleBytes, bundleDigest, &failure),
                "prepared_bundle_competing_stage_is_verified");
-  suite.expect(::unlink(competingBundle.stageBundlePath.c_str()) == 0 &&
-                   Filesystem::openWriteAtClose(-1, competingBundle.stageBundlePath, bundleBytes) == int(bundleBytes.size()),
+  String competingReplacementPath = {};
+  competingReplacementPath.assign(tempDirectory);
+  competingReplacementPath.append("/competing-stage-replacement"_ctv);
+  std::error_code competingReplacementCopyError = {};
+  suite.expect(std::filesystem::copy_file(
+                   std::filesystem::path(competingBundle.stageBundlePath.c_str()),
+                   std::filesystem::path(competingReplacementPath.c_str()),
+                   std::filesystem::copy_options::none,
+                   competingReplacementCopyError) && competingReplacementCopyError.value() == 0,
+               "prepared_bundle_competing_replacement_is_created");
+  struct stat competingReplacementMetadata = {};
+  suite.expect(::stat(competingReplacementPath.c_str(), &competingReplacementMetadata) == 0 &&
+                   (competingReplacementMetadata.st_dev != competingBundle.stageBundleDevice ||
+                    competingReplacementMetadata.st_ino != competingBundle.stageBundleInode) &&
+                   ::rename(competingReplacementPath.c_str(), competingBundle.stageBundlePath.c_str()) == 0,
                "prepared_bundle_competing_stage_replaces_inode");
   suite.expect(prodigyPublishPreparedBundleArtifact(competingBundle, &failure) == false,
                "prepared_bundle_rejects_replaced_stage_inode");
   String competingStagePath = {};
   competingStagePath.assign(competingBundle.stageBundlePath);
   prodigyDiscardPreparedBundleArtifact(competingBundle);
-  suite.expect(fileExists(competingStagePath),
+  struct stat survivingCompetingReplacementMetadata = {};
+  suite.expect(::stat(competingStagePath.c_str(), &survivingCompetingReplacementMetadata) == 0 &&
+                   survivingCompetingReplacementMetadata.st_dev == competingReplacementMetadata.st_dev &&
+                   survivingCompetingReplacementMetadata.st_ino == competingReplacementMetadata.st_ino,
                "prepared_bundle_cleanup_preserves_competing_replacement");
 
   String stagedInstallRoot = {};

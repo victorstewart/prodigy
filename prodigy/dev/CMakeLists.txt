@@ -886,6 +886,7 @@ target_compile_definitions(prodigy_machine_pinger_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_replication_credentials_unit PUBLIC
    PRODIGY_DEBUG=1
+   PRODIGY_TEST_APP_ARTIFACT="${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
    PRODIGY_TEST_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT="${PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT}"
 )
 target_compile_definitions(prodigy_pairing_parser_adversarial_unit PUBLIC PRODIGY_DEBUG=1)
@@ -1324,7 +1325,9 @@ add_dependencies(prodigy_bundle_artifact_unit prodigy_bundle prodigy_bundle_sha2
 add_dependencies(prodigy_pingpong_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_isolation_container_artifact prodigy_bundle)
 add_dependencies(prodigy_pingpong_unready_container_artifact prodigy_bundle)
-add_dependencies(prodigy_brain_replication_credentials_unit prodigy_mothership_tunnel_provider_artifact)
+add_dependencies(prodigy_brain_replication_credentials_unit
+   prodigy_mothership_tunnel_provider_artifact
+   prodigy_pingpong_container_artifact)
 foreach(_prodigy_artifact_test IN ITEMS
    prodigy_artifact_io_unit
    prodigy_mothership_artifact_responsiveness_unit
@@ -1833,7 +1836,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_switchboard_ring_publication_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_switchboard_ring_publication_unit
    )
-   set_tests_properties(prodigy_switchboard_ring_publication_unit PROPERTIES TIMEOUT 15)
+   # The serial 30-workload slow-map and QUIC batches need more than 15s once
+   # pending relative timers are submitted before blocking routing calls.
+   # Their per-callback, control-P95, and control-max deadlines remain asserted.
+   set_tests_properties(prodigy_switchboard_ring_publication_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_container_storage_layout_unit

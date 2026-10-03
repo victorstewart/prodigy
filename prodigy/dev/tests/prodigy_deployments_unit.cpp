@@ -3989,6 +3989,24 @@ int main(void)
         suite.expect(
             stringContains(verificationFailure, "mothership tunnel-provider contract header"),
             "system_container_store_reports_app_blob_contract_mismatch");
+
+        std::filesystem::path nonDirectoryParent = filesystemPathFromString(systemStoreRoot.path) / "not-a-directory";
+        const bool nonDirectoryFixtureWritten = writeFileFixture(nonDirectoryParent, "not-a-directory");
+        suite.expect(nonDirectoryFixtureWritten, "system_container_store_nondirectory_parent_fixture_written");
+        if (nonDirectoryFixtureWritten)
+        {
+          String nonDirectoryStoreRoot = stringFromFilesystemPath(nonDirectoryParent / "system-store");
+          suite.expect(
+              ContainerStore::systemStore(tunnelDigest,
+                                          tunnelPayload.size(),
+                                          tunnelPayload,
+                                          &verificationFailure,
+                                          &nonDirectoryStoreRoot) == false,
+              "system_container_store_rejects_nondirectory_parent");
+          suite.expect(
+              stringContains(verificationFailure, "failed to create system container store"),
+              "system_container_store_reports_nondirectory_parent");
+        }
       }
     }
   }
