@@ -59,7 +59,10 @@ endforeach()
 foreach(required
       "validatePendingElasticAddressOperations"
       "captureDurableElasticAddressOperations"
-      "commitPendingElasticAddressStateChange(false)"
+      "commitPendingElasticAddressStateChangeAsync("
+      "commitMasterAuthorityStateChangeAsync(std::move(completion), advanceGeneration)"
+      "durable && weAreMaster && masterAuthorityEpoch == authorityEpoch"
+      "masterAuthorityRuntimeState.generation == operationGeneration"
       "pendingElasticAddressOperationHasMajority"
       "reconcilePendingElasticAddressAssignments"
       "durableElasticOperationTransitions"

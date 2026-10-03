@@ -143,12 +143,12 @@ int main()
     suite.expect(prepared.prepared == false, "artifact_io_rejection_has_no_prepared_metadata");
 
     // Positive storage proof requires the packaged Discombobulator artifact,
-    // never a hand-assembled header or synthetic rootfs. The Ring executor
-    // tests below remain runnable when a build has not provided this fixture.
+    // never a hand-assembled header or synthetic rootfs. Missing positive
+    // coverage must fail the test even when the executor cases can still run.
     const char *fixturePath = ::getenv("PRODIGY_TEST_APP_ARTIFACT");
     if (fixturePath == nullptr || fixturePath[0] == 0)
     {
-      dprintf(STDERR_FILENO, "SKIP: artifact_io_positive_fixture_requires_PRODIGY_TEST_APP_ARTIFACT\n");
+      suite.expect(false, "artifact_io_positive_fixture_requires_PRODIGY_TEST_APP_ARTIFACT");
     }
     else
     {

@@ -23,6 +23,10 @@ public:
     if (condition)
     {
       basics_log("PASS: %s\n", name);
+      if (const char *trace = std::getenv("PRODIGY_TEST_TRACE"); trace && std::strcmp(trace, "1") == 0)
+      {
+        std::fprintf(stderr, "PASS: %s\n", name);
+      }
     }
     else
     {
@@ -127,6 +131,8 @@ public:
   uint32_t retirementTopologyPersistCalls = 0;
   ClusterTopology retirementTopology = {};
   bool failRuntimeStatePersist = false;
+  bool holdRuntimeStatePersist = false;
+  Vector<PersistenceCompletion> pendingRuntimeStatePersistence;
 
   void enableMachineRetirementAuthority(void)
   {
@@ -139,6 +145,11 @@ public:
   void testReapRetiringMachines(void)
   {
     reapRetiringMachines();
+  }
+
+  void testEvacuateFailedMachineContainers(Machine *machine)
+  {
+    evacuateFailedMachineContainers(machine);
   }
 
   bool testActiveBrainRegistrationsReadyForMasterElection(void)
@@ -580,6 +591,33 @@ public:
     return failRuntimeStatePersist == false;
   }
 
+  void persistLocalRuntimeStateAsync(PersistenceCompletion completion = {}) override
+  {
+    if (holdRuntimeStatePersist)
+    {
+      pendingRuntimeStatePersistence.push_back(std::move(completion));
+      return;
+    }
+    const bool durable = persistLocalRuntimeState();
+    if (completion)
+    {
+      completion(durable);
+    }
+  }
+
+  void finishRuntimeStatePersistence(bool durable)
+  {
+    Vector<PersistenceCompletion> pending = std::move(pendingRuntimeStatePersistence);
+    pendingRuntimeStatePersistence.clear();
+    for (PersistenceCompletion& completion : pending)
+    {
+      if (completion)
+      {
+        completion(durable);
+      }
+    }
+  }
+
   void checkMetroReachabilityForMasterFailover(bool& connectedMajority, bool& reachableSwitchMajority) override
   {
     metroReachabilityChecks += 1;
@@ -947,6 +985,76 @@ public:
     }
   }
 };
+
+class ArtifactIOExecQuiesceWaiter final : public TimeoutDispatcher {
+public:
+  ProdigyArtifactIO *artifactIO = nullptr;
+  TimeoutPacket retry = {};
+  bool complete = false;
+  bool timedOut = false;
+  uint32_t retries = 0;
+
+  explicit ArtifactIOExecQuiesceWaiter(ProdigyArtifactIO *owner) : artifactIO(owner)
+  {
+    retry.dispatcher = this;
+  }
+
+  void queue(TimeoutPacket& packet, uint64_t milliseconds)
+  {
+    packet.clear();
+    packet.setTimeoutMs(milliseconds);
+    Ring::queueTimeout(&packet);
+  }
+
+  void dispatchTimeout(TimeoutPacket *packet) override
+  {
+    if (packet == &retry)
+    {
+      if (artifactIO != nullptr && artifactIO->quiesceForExec())
+      {
+        complete = true;
+        Ring::exit = true;
+      }
+      else if (++retries < 500)
+      {
+        queue(retry, 1);
+      }
+      else
+      {
+        timedOut = true;
+        Ring::exit = true;
+      }
+    }
+  }
+
+  bool wait(void)
+  {
+    if (artifactIO == nullptr) return false;
+    if (artifactIO->quiesceForExec()) return true;
+    queue(retry, 1);
+    Ring::exit = false;
+    Ring::start();
+    Ring::exit = false;
+    return complete && timedOut == false;
+  }
+};
+
+static bool quiesceBrainArtifactIOForTest(BrainBase& brain)
+{
+  if (brain.artifactIO == nullptr)
+  {
+    return true;
+  }
+
+  ArtifactIOExecQuiesceWaiter waiter(brain.artifactIO.get());
+  if (waiter.wait() == false)
+  {
+    return false;
+  }
+
+  brain.artifactIO.reset();
+  return true;
+}
 
 class RingExitDeadline final : public TimeoutDispatcher {
 public:
@@ -1576,6 +1684,10 @@ static void runInitialConnectFailureRetryFixture(TestSuite& suite)
   brain.nBrains = 3;
   brain.weAreMaster = false;
   brain.noMasterYet = false;
+  brain.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+  brain.localBrainPeerAddressText = "127.0.0.1"_ctv;
+  brain.localBrainPeerAddresses.push_back(
+      ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
 
   BrainView *peer = makePeer(uint128_t(0x31f1), 101, IPAddress("127.0.0.18", false).v4, "127.0.0.18");
   peer->registrationFresh = false;
@@ -1641,8 +1753,13 @@ static void runInitialConnectFailureRetryFixture(TestSuite& suite)
     }
     suite.expect(brain.testHasBrainReconnectWaiter(peer) == false,
                  "initial_connect_failure_retry_waiter_dispatch_consumes_waiter");
-    suite.expect(peer->isFixedFile && peer->fslot >= 0 && peer->connectAttemptPending(),
-                 "initial_connect_failure_retry_waiter_dispatch_arms_new_connect");
+    const IPAddress loopbackSource("127.0.0.1", false);
+    suite.expect(peer->saddrLen == sizeof(struct sockaddr_in) &&
+                     peer->saddr<struct sockaddr_in>()->sin_family == AF_INET &&
+                     peer->saddr<struct sockaddr_in>()->sin_addr.s_addr == loopbackSource.v4,
+                 "initial_connect_failure_retry_configures_loopback_source");
+    const bool retryArmed = peer->isFixedFile && peer->fslot >= 0 && peer->connectAttemptPending();
+    suite.expect(retryArmed, "initial_connect_failure_retry_waiter_dispatch_arms_new_connect");
   }
 
   if (peer->isFixedFile)
@@ -2564,6 +2681,112 @@ int main(void)
     }
   };
 
+  auto runMachineDecommissionFailedDrainSnapshotFixture = [&]() -> void {
+    BrainBase *savedBrain = thisBrain;
+    TestBrain brain = {};
+    Mesh mesh = {};
+    brain.mesh = &mesh;
+    thisBrain = &brain;
+
+    Machine machine = {};
+    ApplicationDeployment first = {};
+    ApplicationDeployment second = {};
+    ApplicationDeployment firstSuccessor = {};
+    ApplicationDeployment secondSuccessor = {};
+    first.plan = makeDeploymentPlan(6092, 1);
+    second.plan = makeDeploymentPlan(6093, 1);
+    firstSuccessor.state = DeploymentState::deploying;
+    secondSuccessor.state = DeploymentState::deploying;
+    first.next = &firstSuccessor;
+    second.next = &secondSuccessor;
+    brain.deployments.insert_or_assign(first.plan.config.deploymentID(), &first);
+    brain.deployments.insert_or_assign(second.plan.config.deploymentID(), &second);
+
+    auto addHealthyContainer = [&](ApplicationDeployment& deployment, uint128_t uuid) {
+      ContainerView *container = new ContainerView();
+      container->uuid = uuid;
+      container->applicationID = deployment.plan.config.applicationID;
+      container->deploymentID = deployment.plan.config.deploymentID();
+      container->lifetime = ApplicationLifetime::base;
+      container->state = ContainerState::healthy;
+      container->machine = &machine;
+      deployment.containers.insert(container);
+      machine.upsertContainerIndexEntry(container->deploymentID, container);
+      brain.containers.insert_or_assign(container->uuid, container);
+    };
+    addHealthyContainer(first, uint128_t(609201));
+    addHealthyContainer(second, uint128_t(609301));
+
+    brain.testEvacuateFailedMachineContainers(&machine);
+    suite.expect(machine.containersByDeploymentID.size() == 0 && first.containers.empty() &&
+                     second.containers.empty() && brain.containers.empty(),
+                 "machine_decommission_failed_drain_snapshots_all_deployments");
+
+    brain.deployments.clear();
+    thisBrain = savedBrain;
+  };
+
+  auto runMachineDecommissionEvacuationReceiptFixture = [&]() -> void {
+    BrainBase *savedBrain = thisBrain;
+    NoopBrainIaaS provider = {};
+    TestBrain brain = {};
+    brain.iaas = &provider;
+    brain.enableMachineRetirementAuthority();
+    thisBrain = &brain;
+    ScopedRing scopedRing = {};
+
+    Rack *rack = new Rack();
+    rack->uuid = 6094;
+    Machine *machine = new Machine();
+    machine->uuid = uint128_t(609401);
+    machine->state = MachineState::decommissioning;
+    machine->rack = rack;
+    machine->rackUUID = rack->uuid;
+    machine->neuron.machine = machine;
+    rack->machines.insert(machine);
+    brain.racks.insert_or_assign(rack->uuid, rack);
+    brain.machines.insert(machine);
+    brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
+    brain.neurons.insert(&machine->neuron);
+
+    brain.decommissionMachine(machine);
+    auto retirement = brain.retiringMachinesByNeuron.find(&machine->neuron);
+    if (retirement != brain.retiringMachinesByNeuron.end())
+    {
+      retirement->second.closeQueued = true;
+      retirement->second.ringCloseObserved = true;
+    }
+    NeuronView *retiringNeuron = &machine->neuron;
+    const uint32_t rackUUID = rack->uuid;
+
+    brain.holdRuntimeStatePersist = true;
+    brain.testReapRetiringMachines();
+    suite.expect(brain.pendingRuntimeStatePersistence.size() == 1 &&
+                     brain.retiringMachinesByNeuron.contains(retiringNeuron) && brain.racks.contains(rackUUID),
+                 "machine_decommission_held_evacuation_receipt_retains_physical_machine");
+
+    brain.weAreMaster = false;
+    brain.finishRuntimeStatePersistence(false);
+    suite.expect(brain.pendingRuntimeStatePersistence.empty() && brain.retiringMachinesByNeuron.contains(retiringNeuron) &&
+                     brain.retiredMachineIdentities.size() == 1 &&
+                     brain.retiredMachineIdentities.begin()->second.evacuationComplete == false,
+                 "machine_decommission_failed_evacuation_receipt_retains_physical_machine");
+
+    brain.weAreMaster = true;
+    brain.holdRuntimeStatePersist = true;
+    brain.testReapRetiringMachines();
+    suite.expect(brain.pendingRuntimeStatePersistence.size() == 1 &&
+                     brain.retiringMachinesByNeuron.contains(retiringNeuron),
+                 "machine_decommission_successful_evacuation_receipt_waits_before_physical_reap");
+
+    brain.holdRuntimeStatePersist = false;
+    brain.finishRuntimeStatePersistence(true);
+    suite.expect(brain.retiringMachinesByNeuron.empty() && brain.racks.empty(),
+                 "machine_decommission_successful_evacuation_receipt_allows_physical_reap");
+
+    thisBrain = savedBrain;
+  };
+
   auto runMachineDecommissionSuspendedDrainFixture = [&]() -> void {
     BrainBase *savedBrain = thisBrain;
     NoopBrainIaaS provider = {};
@@ -2578,6 +2801,8 @@ int main(void)
 
     DeploymentPlan plan = makeDeploymentPlan(6091, 1);
     plan.canaryCount = 0;
+    plan.hasApiCredentialPolicy = true;
+    plan.apiCredentialPolicy.applicationID = plan.config.applicationID;
     ApplicationDeployment *deployment = new ApplicationDeployment();
     deployment->plan = plan;
     deployment->state = DeploymentState::running;
@@ -3007,6 +3232,11 @@ int main(void)
       runMachineDecommissionSuspendedDrainFixture();
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (std::strcmp(testOnly, "machine-decommission-evacuation-receipt") == 0)
+    {
+      runMachineDecommissionEvacuationReceiptFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "should-we-connect-family-fallback") == 0)
     {
       TestBrain familyFallbackBrain = {};
@@ -3139,6 +3369,7 @@ int main(void)
     BrainView fdPeer = {};
     fdPeer.private4 = IPAddress("10.0.0.24", false).v4;
     fdPeer.fd = 11;
+    fdPeer.connected = true;
     brain.testInitializeBrainPeerIfNeeded(&fdPeer);
     suite.expect(fdPeer.connectTimeoutMs == BrainBase::controlPlaneConnectTimeoutMs(BrainBase::controlPlaneDevModeEnabled()), "initialize_brain_peer_fd_present_configures_timeout_before_skip");
     suite.expect(fdPeer.fd == 11, "initialize_brain_peer_fd_present_preserves_fd");
@@ -3674,6 +3905,7 @@ int main(void)
     follower.nBrains = 3;
     follower.boottimens = 525;
     follower.version = 5;
+    follower.brainConfig.clusterUUID = uint128_t(0x5251);
     follower.overrideRetirementTopology = true;
     follower.retirementTopology.version = 1;
     follower.retirementTopology.machines.push_back(identity);
@@ -3813,11 +4045,12 @@ int main(void)
 
     oldPeer->version = 5;
     brain.failRuntimeStatePersist = true;
-    suite.expect(brain.journalMachineRetirement(aliases, false, identityID) == false &&
-                     provider.providerFenceActive == false &&
-                     provider.providerFenceTransitions.size() == 2 &&
-                     provider.providerFenceTransitions[0] &&
-                     provider.providerFenceTransitions[1] == false,
+    bool failedAdmissionReceipt = false;
+    suite.expect(brain.journalMachineRetirement(
+                     aliases, false, identityID,
+                     [&](bool durable) { failedAdmissionReceipt = durable == false; }) &&
+                     failedAdmissionReceipt && brain.retiredMachineIdentities.empty() &&
+                     provider.providerFenceActive == false && provider.providerFenceTransitions.empty(),
                  "machine_retirement_provider_fence_rolls_back_failed_admission");
 
     brain.failRuntimeStatePersist = false;
@@ -4101,12 +4334,12 @@ int main(void)
     brain.machines.insert(machine);
     brain.machinesByUUID.insert_or_assign(machine->uuid, machine);
     brain.neurons.insert(&machine->neuron);
-    brain.machineRetirementFenceFailuresRemaining = 1;
+    brain.machineRetirementFenceFailuresRemaining = 2;
 
     brain.decommissionMachine(machine);
     suite.expect(brain.machines.contains(machine) == false && brain.retiringMachinesByNeuron.contains(&machine->neuron),
                  "machine_decommission_fence_failure_quarantines_logically");
-    suite.expect(Ring::socketIsClosing(&machine->neuron) == false && brain.machineRetirementFenceCreateCalls == 1,
+    suite.expect(Ring::socketIsClosing(&machine->neuron) == false && brain.machineRetirementFenceCreateCalls == 2,
                  "machine_decommission_fence_failure_defers_physical_close");
 
     ApplicationDeployment unrelatedDeployment = {};
@@ -4115,7 +4348,7 @@ int main(void)
     brain.deployments.insert_or_assign(unrelatedDeployment.plan.config.deploymentID(), &unrelatedDeployment);
 
     brain.testReapRetiringMachines();
-    suite.expect(Ring::socketIsClosing(&machine->neuron) && brain.machineRetirementFenceCreateCalls == 2,
+    suite.expect(Ring::socketIsClosing(&machine->neuron) && brain.machineRetirementFenceCreateCalls == 3,
                  "machine_decommission_fence_failure_retries_close");
 
     deadline.arm();
@@ -4301,6 +4534,8 @@ int main(void)
     thisBrain = savedBrain;
   }
 
+  runMachineDecommissionFailedDrainSnapshotFixture();
+  runMachineDecommissionEvacuationReceiptFixture();
   runMachineDecommissionSuspendedDrainFixture();
 
   {
@@ -4445,6 +4680,40 @@ int main(void)
     }
 
     return true;
+  };
+
+  auto createLoopbackBrainListener = [&](int& listenerFD) -> bool {
+    listenerFD = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listenerFD < 0)
+    {
+      return false;
+    }
+
+    int reuse = 1;
+    (void)::setsockopt(listenerFD, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(uint16_t(ReservedPorts::brain));
+    address.sin_addr.s_addr = IPAddress("127.0.0.1", false).v4;
+    if (::bind(listenerFD, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) != 0 ||
+        ::listen(listenerFD, SOMAXCONN) != 0)
+    {
+      ::close(listenerFD);
+      listenerFD = -1;
+      return false;
+    }
+
+    return true;
+  };
+
+  auto reportBrainPeerReconnectState = [](const char *fixture, BrainView& peer) {
+    const int savedErrno = errno;
+    std::fprintf(stderr,
+                 "DIAG: %s fixed=%d fslot=%d fd=%d daddrLen=%u saddrLen=%u pendingConnect=%d closing=%d errno=%d(%s)\n",
+                 fixture, int(peer.isFixedFile), peer.fslot, peer.fd,
+                 unsigned(peer.daddrLen), unsigned(peer.saddrLen), int(peer.connectAttemptPending()),
+                 int(Ring::socketIsClosing(&peer)), savedErrno, strerror(savedErrno));
+    std::fflush(stderr);
   };
 
   {
@@ -4831,8 +5100,17 @@ int main(void)
 
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = uint128_t(0x1);
+    brain.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+    brain.localBrainPeerAddressText = "127.0.0.1"_ctv;
+    brain.localBrainPeerAddresses.push_back(
+        ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+    int listenerFD = -1;
+    suite.expect(createLoopbackBrainListener(listenerFD),
+                 "brain_close_handler_dead_connector_retry_binds_loopback_brain_listener");
 
-    BrainView *peer = makePeer(uint128_t(0x21e1), 0, IPAddress("10.0.0.181", false).v4, "10.0.0.181");
+    BrainView *peer = makePeer(uint128_t(0x21e1), 0, IPAddress("127.0.0.1", false).v4, "127.0.0.1");
     peer->weConnectToIt = true;
     peer->reconnectAfterClose = true;
     peer->connectTimeoutMs = 250;
@@ -4867,9 +5145,16 @@ int main(void)
     }
 
     suite.expect(brain.testHasBrainReconnectWaiter(peer) == false, "brain_close_handler_dead_connector_retry_clears_reconnect_waiter");
-    suite.expect(peer->isFixedFile, "brain_close_handler_dead_connector_retry_reinstalls_fixed_slot");
-    suite.expect(peer->fslot >= 0, "brain_close_handler_dead_connector_retry_keeps_slot_armed");
-    suite.expect(peer->connectAttemptPending(), "brain_close_handler_dead_connector_retry_submits_connect_attempt");
+    const bool reinstalledFixedSlot = peer->isFixedFile;
+    const bool slotArmed = peer->fslot >= 0;
+    const bool connectSubmitted = peer->connectAttemptPending();
+    if (!reinstalledFixedSlot || !slotArmed || !connectSubmitted)
+    {
+      reportBrainPeerReconnectState("brain_close_handler_dead_connector_retry", *peer);
+    }
+    suite.expect(reinstalledFixedSlot, "brain_close_handler_dead_connector_retry_reinstalls_fixed_slot");
+    suite.expect(slotArmed, "brain_close_handler_dead_connector_retry_keeps_slot_armed");
+    suite.expect(connectSubmitted, "brain_close_handler_dead_connector_retry_submits_connect_attempt");
     suite.expect(peer->reconnectAfterClose, "brain_close_handler_dead_connector_retry_keeps_reconnect_policy_armed");
     suite.expect(peer->nConnectionAttempts == 0, "brain_close_handler_dead_connector_retry_resets_attempt_counter");
     suite.expect(peer->nAttemptsBudget == 0, "brain_close_handler_dead_connector_retry_clears_attempt_budget");
@@ -4882,6 +5167,11 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+    if (listenerFD >= 0)
+    {
+      ::close(listenerFD);
+    }
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -5266,6 +5556,7 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x2221);
     brain.hasCompletedInitialMasterElection = true;
     brain.weAreMaster = false;
     brain.noMasterYet = false;
@@ -5274,41 +5565,38 @@ int main(void)
 
     BrainView *masterPeer = makePeer(uint128_t(0x222), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
     masterPeer->connected = true;
-    masterPeer->isFixedFile = true;
-    masterPeer->fslot = 38;
     masterPeer->isMasterBrain = true;
+    masterPeer->registrationFresh = true;
     brain.brains.insert(masterPeer);
 
     BrainView *followerPeer = makePeer(uint128_t(0x332), 21, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
     followerPeer->connected = true;
-    followerPeer->isFixedFile = true;
-    followerPeer->fslot = 39;
     followerPeer->isMasterMissing = true;
+    followerPeer->registrationFresh = true;
     brain.brains.insert(followerPeer);
 
-    const char *socketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
-    suite.expect(socketPath != nullptr, "brain_missing_master_prior_peer_vote_has_mothership_socket");
-    int existingListenerFD = -1;
-    if (socketPath != nullptr)
-    {
-      suite.expect(createUnixListener(String(socketPath), existingListenerFD),
-                   "brain_missing_master_prior_peer_vote_creates_existing_listener");
-    }
+    int masterPeerFD = -1;
+    int followerPeerFD = -1;
+    const bool masterInstalled = installBrainPeerSocket(brain, *masterPeer, masterPeerFD);
+    const bool followerInstalled = installBrainPeerSocket(brain, *followerPeer, followerPeerFD);
+    suite.expect(masterInstalled, "brain_missing_master_prior_peer_vote_installs_master_socket");
+    suite.expect(followerInstalled, "brain_missing_master_prior_peer_vote_installs_follower_socket");
 
-    brain.testBrainMissing(masterPeer);
+    if (masterInstalled && followerInstalled)
+    {
+      brain.testBrainMissing(masterPeer);
+    }
 
     suite.expect(masterPeer->quarantined, "brain_missing_master_prior_peer_vote_quarantines_missing_master");
     suite.expect(brain.weAreMaster, "brain_missing_master_prior_peer_vote_derives_self_master");
     suite.expect(brain.noMasterYet == false, "brain_missing_master_prior_peer_vote_clears_no_master");
 
+    cleanupBrainPeerSocket(*masterPeer, masterPeerFD);
+    cleanupBrainPeerSocket(*followerPeer, followerPeerFD);
     brain.brains.erase(masterPeer);
     brain.brains.erase(followerPeer);
     delete masterPeer;
     delete followerPeer;
-    if (existingListenerFD >= 0)
-    {
-      ::close(existingListenerFD);
-    }
   });
 
   {
@@ -5493,6 +5781,8 @@ int main(void)
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     suite.expect(brain.shouldWeConnectToBrain(nullptr) == false, "connector_order_rejects_null_peer");
 
     brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
@@ -5504,11 +5794,14 @@ int main(void)
     peer.peerAddress = IPAddress("10.0.0.20", false);
 
     suite.expect(brain.shouldWeConnectToBrain(&peer), "connector_order_renders_peer_address_without_text");
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
     brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
 
@@ -5519,13 +5812,16 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     IPAddress savedPrivate4 = neuron.private4;
+    const uint128_t savedNeuronUUID = neuron.uuid;
     neuron.private4 = IPAddress("10.0.0.10", false);
+    neuron.uuid = 0;
 
     BrainView *peer = makePeer(uint128_t(0x080), 1, IPAddress("10.0.0.20", false).v4);
     brain.brains.insert(peer);
@@ -5535,11 +5831,14 @@ int main(void)
     brain.brains.erase(peer);
     delete peer;
     neuron.private4 = savedPrivate4;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     brain.localBrainPeerAddress = IPAddress("10.0.0.29", false);
     brain.localBrainPeerAddressText = "10.0.0.29"_ctv;
 
@@ -5563,6 +5862,7 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -5584,6 +5884,8 @@ int main(void)
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     brain.localBrainPeerAddress = IPAddress("fd00:10::29", true);
     brain.localBrainPeerAddressText = "fd00:10::29"_ctv;
 
@@ -5620,6 +5922,7 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -5857,6 +6160,7 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x5050);
 
     BrainView *staleCandidate = makePeer(uint128_t(0x050), 0, IPAddress("10.0.0.13", false).v4);
     staleCandidate->connected = false;
@@ -6740,6 +7044,8 @@ int main(void)
     brain.noMasterYet = false;
     brain.boottimens = 10;
     brain.version = 77;
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = uint128_t(0x7000);
     brain.localBrainPeerAddress = IPAddress("127.0.0.20", false);
     brain.localBrainPeerAddressText = "127.0.0.20"_ctv;
     brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"127.0.0.20"_ctv, 32});
@@ -6770,6 +7076,7 @@ int main(void)
 
     brain.brains.erase(peer);
     delete peer;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -6935,6 +7242,7 @@ int main(void)
   }
 
   {
+    ScopedRing scopedRing = {};
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 2;
@@ -6942,9 +7250,10 @@ int main(void)
 
     BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
     peer->connected = true;
-    peer->isFixedFile = true;
-    peer->fslot = 43;
     brain.brains.insert(peer);
+    int peerFD = -1;
+    const bool installed = installBrainPeerSocket(brain, *peer, peerFD);
+    suite.expect(installed, "registration_without_designated_master_installs_socket");
 
     String buffer = {};
     Message *message = buildBrainMessage(
@@ -6954,12 +7263,21 @@ int main(void)
         int64_t(20),
         uint64_t(9),
         uint128_t(0));
-    brain.testBrainHandler(peer, message);
+    if (installed)
+    {
+      brain.testBrainHandler(peer, message);
+    }
 
     suite.expect(peer->isMasterBrain, "registration_without_designated_master_derives_master");
     suite.expect(brain.noMasterYet == false, "registration_without_designated_master_clears_no_master_flag");
-    suite.expect(peer->wBuffer.size() > 0 && BrainTopic(reinterpret_cast<Message *>(peer->wBuffer.data())->topic) == BrainTopic::reconcileState, "registration_without_designated_master_queues_reconcile_state");
+    bool sawReconcileState = false;
+    forEachMessageInBuffer(peer->wBuffer, [&](Message *queued) {
+      sawReconcileState = sawReconcileState || BrainTopic(queued->topic) == BrainTopic::reconcileState;
+    });
+    suite.expect(peer->pendingSend && sawReconcileState,
+                 "registration_without_designated_master_queues_reconcile_state");
 
+    cleanupBrainPeerSocket(*peer, peerFD);
     brain.brains.erase(peer);
     delete peer;
   }
@@ -7039,6 +7357,13 @@ int main(void)
 
     suite.expect(sawRegistration, "registration_self_master_claim_echoes_registration");
     suite.expect(echoedMasterUUID == neuron.uuid, "registration_self_master_claim_echoes_self_master_uuid");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_self_master_claim_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_self_master_claim_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(peer);
     delete peer;
@@ -7087,6 +7412,7 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
+    brain.brainConfig.clusterUUID = uint128_t(0x7363);
 
     brain.testSelfElectAsMaster("unit-test");
 
@@ -7128,6 +7454,7 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
+    brain.brainConfig.clusterUUID = uint128_t(0x7404);
 
     brain.testSelfElectAsMaster("unit-test");
 
@@ -7169,6 +7496,7 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 5;
+    brain.brainConfig.clusterUUID = uint128_t(0x7445);
 
     brain.testSelfElectAsMaster("unit-test");
 
@@ -7329,6 +7657,7 @@ int main(void)
   }
 
   {
+    ScopedRing scopedRing = {};
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.weAreMaster = true;
@@ -7351,14 +7680,18 @@ int main(void)
         uint128_t(0));
     brain.testBrainHandler(peer, message);
 
-    bool sawUpdateBundle = false;
-    forEachMessageInBuffer(peer->wBuffer, [&](Message *queued) {
-      if (BrainTopic(queued->topic) == BrainTopic::updateBundle)
-      {
-        sawUpdateBundle = true;
-      }
-    });
-    suite.expect(sawUpdateBundle, "registration_master_late_join_queues_bundle_update");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_master_late_join_starts_artifact_io");
+    suite.expect(peer->installedBundleReadPending,
+                 "registration_master_late_join_admits_installed_bundle_read");
+    suite.expect(peer->transitionAfterBundleEcho == false,
+                 "registration_master_late_join_defers_transition_until_durable_bundle_queue");
+    if (brain.artifactIO != nullptr)
+    {
+      const bool artifactIOQuiesced = quiesceBrainArtifactIOForTest(brain);
+      suite.expect(artifactIOQuiesced,
+                   "registration_master_late_join_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(peer);
     delete peer;
@@ -7430,7 +7763,7 @@ int main(void)
         buffer,
         BrainTopic::relinquishMasterStatus,
         uint8_t(1),
-        uint128_t(peer->private4));
+        peer->uuid);
     brain.testBrainHandler(peer, message);
 
     suite.expect(peer->isMasterBrain, "relinquish_status_designated_peer_elects_peer");
@@ -7478,6 +7811,13 @@ int main(void)
 
     suite.expect(brain.weAreMaster, "registration_pending_designated_master_elects_self");
     suite.expect(brain.persistCalls == 1, "registration_pending_designated_master_self_persists");
+    suite.expect(brain.artifactIO != nullptr,
+                 "registration_pending_designated_master_starts_artifact_io_for_older_bundle");
+    if (brain.artifactIO != nullptr)
+    {
+      suite.expect(quiesceBrainArtifactIOForTest(brain),
+                   "registration_pending_designated_master_quiesces_artifact_io_before_ring_shutdown");
+    }
 
     brain.brains.erase(peer);
     delete peer;
@@ -7488,6 +7828,7 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x7800);
 
     BrainView *peerA = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.11", false).v4);
     peerA->connected = true;
@@ -7519,6 +7860,7 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x7900);
     brain.hasCompletedInitialMasterElection = true;
 
     BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4);
@@ -7547,6 +7889,7 @@ int main(void)
     ProdigyPersistentMasterAuthorityPackage package = {};
     package.runtimeState.hasCompletedInitialMasterElection = true;
     brain.applyPersistentMasterAuthorityPackage(package);
+    brain.brainConfig.clusterUUID = uint128_t(0x7a00);
 
     BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
     peer->connected = true;
@@ -7638,6 +7981,13 @@ int main(void)
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
     brain.boottimens = 10;
+    brain.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+    brain.localBrainPeerAddressText = "127.0.0.1"_ctv;
+    brain.localBrainPeerAddresses.push_back(
+        ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+    int listenerFD = -1;
+    suite.expect(createLoopbackBrainListener(listenerFD),
+                 "self_elect_as_master_rearms_connector_peers_binds_loopback_brain_listener");
 
     BrainView *activeConnectorPeer = makePeer(uint128_t(0x210), 20, IPAddress("10.0.0.11", false).v4);
     activeConnectorPeer->weConnectToIt = true;
@@ -7649,7 +7999,7 @@ int main(void)
     activeConnectorPeer->nAttemptsBudget = 7;
     brain.brains.insert(activeConnectorPeer);
 
-    BrainView *inactiveConnectorPeer = makePeer(uint128_t(0x220), 21, IPAddress("10.0.0.12", false).v4);
+    BrainView *inactiveConnectorPeer = makePeer(uint128_t(0x220), 21, IPAddress("127.0.0.1", false).v4);
     inactiveConnectorPeer->weConnectToIt = true;
     inactiveConnectorPeer->connected = false;
     inactiveConnectorPeer->reconnectAfterClose = false;
@@ -7670,7 +8020,14 @@ int main(void)
     suite.expect(inactiveConnectorPeer->nConnectionAttempts == 0, "self_elect_as_master_rearms_connector_peers_resets_inactive_peer_attempts");
     suite.expect(inactiveConnectorPeer->nAttemptsBudget == 9, "self_elect_as_master_rearms_connector_peers_preserves_inactive_peer_budget");
     suite.expect(inactiveConnectorPeer->attemptDeadlineMs == 12'345, "self_elect_as_master_rearms_connector_peers_preserves_inactive_peer_deadline");
-    suite.expect(inactiveConnectorPeer->fd >= 0, "self_elect_as_master_rearms_connector_peers_recreates_inactive_peer_socket");
+    const bool inactivePeerRearmed = inactiveConnectorPeer->isFixedFile && inactiveConnectorPeer->fslot >= 0 &&
+                                     inactiveConnectorPeer->daddrLen > 0;
+    if (!inactivePeerRearmed)
+    {
+      reportBrainPeerReconnectState("self_elect_as_master_rearms_connector_peers", *inactiveConnectorPeer);
+    }
+    suite.expect(inactivePeerRearmed,
+                 "self_elect_as_master_rearms_connector_peers_recreates_inactive_peer_socket");
 
     brain.brains.erase(activeConnectorPeer);
     brain.brains.erase(inactiveConnectorPeer);
@@ -7681,6 +8038,10 @@ int main(void)
     }
     delete activeConnectorPeer;
     delete inactiveConnectorPeer;
+    if (listenerFD >= 0)
+    {
+      ::close(listenerFD);
+    }
   });
 
   withUniqueMothershipSocket("self_elect_as_master_preserves_active_accepted_peer_socket_dir_created", [&] {
@@ -8638,6 +8999,7 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.nBrains = 3;
     brain.boottimens = 10;
+    brain.brainConfig.clusterUUID = uint128_t(0x8900);
     brain.hasCompletedInitialMasterElection = true;
 
     BrainView *peer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.12", false).v4);
@@ -8768,6 +9130,8 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.boottimens = 10;
 
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     neuron.private4 = IPAddress("10.0.0.11", false);
 
     BrainView *peer = makePeer(uint128_t(0x300), 20, IPAddress("10.0.0.12", false).v4);
@@ -8788,6 +9152,7 @@ int main(void)
     brain.brains.erase(peer);
     delete peer;
     neuron.private4 = IPAddress("10.0.0.10", false);
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -8819,6 +9184,8 @@ int main(void)
     brain.iaas = new NoopBrainIaaS();
     brain.boottimens = 10;
 
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = 0;
     neuron.private4 = IPAddress("10.0.0.11", false);
 
     BrainView *lowerPeer = makePeer(uint128_t(0x200), 20, IPAddress("10.0.0.10", false).v4);
@@ -8846,6 +9213,7 @@ int main(void)
     delete lowerPeer;
     delete incompletePeer;
     neuron.private4 = IPAddress("10.0.0.10", false);
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
@@ -10311,7 +10679,6 @@ int main(void)
     brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
     brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
     brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"10.0.0.10"_ctv, 0});
-
     BrainView *peer = makePeer(uint128_t(0x220), 20, IPAddress("10.0.0.11", false).v4);
     peer->quarantined = true;
     peer->weConnectToIt = false;
@@ -10332,6 +10699,8 @@ int main(void)
     brain.localBrainPeerAddress = IPAddress("10.0.0.10", false);
     brain.localBrainPeerAddressText = "10.0.0.10"_ctv;
     brain.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"10.0.0.10"_ctv, 0});
+    const uint128_t savedNeuronUUID = neuron.uuid;
+    neuron.uuid = uint128_t(0x300);
 
     BrainView *peer = makePeer(uint128_t(0x220), 21, IPAddress("10.0.0.9", false).v4);
     peer->quarantined = true;
@@ -10345,6 +10714,7 @@ int main(void)
     suite.expect(peer->peerAddressText.size() == 0, "brain_found_non_connector_does_not_configure_connect_address");
 
     delete peer;
+    neuron.uuid = savedNeuronUUID;
   }
 
   {
