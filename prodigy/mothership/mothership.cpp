@@ -16811,10 +16811,21 @@ private:
 
   void runUpdateProdigy(int argc, char *argv[])
   {
-    if (argc < 2)
+    uint8_t brainConcurrency = 1;
+    if (argc != 2 && argc != 4)
     {
-      basics_log("too few arguments. ex: updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
+      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle] [--brain-concurrency 1|2]\n");
       exit(EXIT_FAILURE);
+    }
+    if (argc == 4)
+    {
+      if (std::strcmp(argv[2], "--brain-concurrency") != 0 ||
+          (std::strcmp(argv[3], "1") != 0 && std::strcmp(argv[3], "2") != 0))
+      {
+        basics_log("updateProdigy requires --brain-concurrency 1 or 2\n");
+        exit(EXIT_FAILURE);
+      }
+      brainConcurrency = uint8_t(argv[3][0] - '0');
     }
 
     String inputPath;
@@ -16870,7 +16881,68 @@ private:
 
     if (socket.connect() == 0)
     {
+      // Inspect capability before submitting an artifact. The installed master,
+      // not the proposed bundle, owns the rollout. Older coordinators cannot
+      // honor this option and must never silently fall back to a larger batch.
+      Message::construct(socket.wBuffer, MothershipTopic::pullClusterReport);
+      if (socket.send() == false)
+      {
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+      Message *reportMessage = socket.recvExpectedTopic(MothershipTopic::pullClusterReport, 1024);
+      ClusterStatusReport report = {};
+      String serializedReport = {};
+      if (reportMessage != nullptr)
+      {
+        uint8_t *reportArgs = reportMessage->args;
+        Message::extractToStringView(reportArgs, serializedReport);
+      }
+      if (reportMessage == nullptr || BitseryEngine::deserializeSafe(serializedReport, report) == false)
+      {
+        basics_log("updateProdigy success=0 failure=unable to verify installed Brain upgrade capability\n");
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+      uint32_t brainCount = 0;
+      uint32_t masterCount = 0;
+      for (const MachineStatusReport& machine : report.machineReports)
+      {
+        if (!machine.isBrain) continue;
+        ++brainCount;
+        if (machine.currentMaster) ++masterCount;
+        const std::string_view versionText(
+            reinterpret_cast<const char *>(machine.runningProdigyVersion.data()),
+            machine.runningProdigyVersion.size());
+        uint64_t installedVersion = 0;
+        bool validVersion = !versionText.empty();
+        for (char digit : versionText)
+        {
+          if (digit < '0' || digit > '9' || installedVersion > (UINT64_MAX - uint64_t(digit - '0')) / 10)
+          {
+            validVersion = false;
+            break;
+          }
+          installedVersion = installedVersion * 10 + uint64_t(digit - '0');
+        }
+        if (!validVersion || installedVersion < ProdigyUpdateSelfConcurrencyMinimumVersion)
+        {
+          basics_log("updateProdigy success=0 failure=configurable Brain concurrency requires every installed Brain to run version %llu or newer; legacy rollout was not started\n",
+                     static_cast<unsigned long long>(ProdigyUpdateSelfConcurrencyMinimumVersion));
+          socket.close();
+          exit(EXIT_FAILURE);
+        }
+      }
+      if (brainCount == 0 || masterCount != 1)
+      {
+        basics_log("updateProdigy success=0 failure=cluster report does not identify one current master and its Brains\n");
+        socket.close();
+        exit(EXIT_FAILURE);
+      }
+
       uint32_t headerOffset = Message::appendHeader(socket.wBuffer, MothershipTopic::updateProdigy);
+      Message::appendValue(socket.wBuffer, String(ProdigyUpdateSelfConcurrencyRequestTag));
+      Message::append(socket.wBuffer, brainConcurrency);
       Message::appendFile(socket.wBuffer, bundlePath);
       Message::finish(socket.wBuffer, headerOffset);
 
@@ -16907,8 +16979,8 @@ private:
         exit(EXIT_FAILURE);
       }
 
-      basics_log("updateProdigy success=1 staged=1 bytes=%u path=%s sha256=%s\n",
-                 bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
+      basics_log("updateProdigy success=1 staged=1 brainConcurrency=%u bytes=%u path=%s sha256=%s\n",
+                 unsigned(brainConcurrency), bundleSize, bundlePath.c_str(), actualBundleDigest.c_str());
       socket.close();
     }
     else
@@ -19255,7 +19327,7 @@ int main(int argc, char *argv[])
     message.append("\tex: applicationReport local Radar\n");
     message.append("taskReport [target: local|clusterName|clusterUUID] [application name] [versionID]\n");
     message.append("\tfetches a retained task execution report\n");
-    message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle]\n");
+    message.append("updateProdigy [target: local|clusterName|clusterUUID] [path to prodigy binary or bundle] [--brain-concurrency 1|2]\n");
     message.append("\tpushes the exact prodigy bundle this mothership build was compiled to approve, and rejects any other bundle before dispatch\n");
     message.append("reserveApplicationID [target: local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns an applicationID for an application name\n");

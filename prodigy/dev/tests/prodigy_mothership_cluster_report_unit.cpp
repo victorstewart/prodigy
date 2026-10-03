@@ -10,6 +10,7 @@
 #include <prodigy/build.identity.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/wire.h>
+#include <prodigy/ingress.validation.h>
 
 #include <atomic>
 #include <cerrno>
@@ -385,43 +386,57 @@ static bool sendAllFragmented(int fd, const String& frame, size_t chunkSize, use
 
 static bool recvOneMessageFrame(int fd, String& frame, String& failure)
 {
-  MothershipWireHeader header = {};
-  if (readExact(fd, reinterpret_cast<uint8_t *>(&header), sizeof(header), failure) == false)
+  // A registered-cluster CLI connection subscribes to credential-expiry
+  // notifications before its first ordinary request.  This fixture is the
+  // control peer for several commands, so consume that one out-of-band request
+  // and return the command frame each caller is validating.
+  for (uint32_t frameCount = 0; frameCount < 2; ++frameCount)
   {
-    return false;
-  }
-
-  if (header.size < sizeof(Message))
-  {
-    failure.assign("received framed message smaller than Message header"_ctv);
-    return false;
-  }
-
-  frame.clear();
-  frame.append(reinterpret_cast<uint8_t *>(&header), sizeof(header));
-
-  uint32_t remaining = header.size - uint32_t(sizeof(header));
-  if (remaining == 0)
-  {
-    failure.clear();
-    return true;
-  }
-
-  uint8_t scratch[4096];
-  while (remaining > 0)
-  {
-    uint32_t chunk = (remaining < sizeof(scratch)) ? remaining : uint32_t(sizeof(scratch));
-    if (readExact(fd, scratch, chunk, failure) == false)
+    MothershipWireHeader header = {};
+    if (readExact(fd, reinterpret_cast<uint8_t *>(&header), sizeof(header), failure) == false)
     {
       return false;
     }
 
-    frame.append(scratch, chunk);
-    remaining -= chunk;
+    if (header.size < sizeof(Message))
+    {
+      failure.assign("received framed message smaller than Message header"_ctv);
+      return false;
+    }
+
+    frame.clear();
+    frame.append(reinterpret_cast<uint8_t *>(&header), sizeof(header));
+
+    uint32_t remaining = header.size - uint32_t(sizeof(header));
+    uint8_t scratch[4096];
+    while (remaining > 0)
+    {
+      uint32_t chunk = (remaining < sizeof(scratch)) ? remaining : uint32_t(sizeof(scratch));
+      if (readExact(fd, scratch, chunk, failure) == false)
+      {
+        return false;
+      }
+
+      frame.append(scratch, chunk);
+      remaining -= chunk;
+    }
+
+    Message *message = reinterpret_cast<Message *>(frame.data());
+    if (MothershipTopic(message->topic) != MothershipTopic::credentialExpiryNotices)
+    {
+      failure.clear();
+      return true;
+    }
+    if (ProdigyIngressValidation::validateMothershipPayload(
+            message->topic, message->args, message->terminal()) == false)
+    {
+      failure.assign("invalid credential expiry subscription request"_ctv);
+      return false;
+    }
   }
 
-  failure.clear();
-  return true;
+  failure.assign("credential expiry subscription was not followed by an operation request"_ctv);
+  return false;
 }
 
 static bool createUnixListener(ScopedUnixListener& listener, String& failure)
@@ -815,9 +830,10 @@ static String buildDeployPlanJSON(uint16_t applicationID, MachineCpuArchitecture
   int written = std::snprintf(
       buffer,
       sizeof(buffer),
-      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":1,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
+      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"apiCredentials\":{\"applicationID\":%u,\"requiredCredentialNames\":[]},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":1,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
       unsigned(applicationID),
-      machineCpuArchitectureName(architecture));
+      machineCpuArchitectureName(architecture),
+      unsigned(applicationID));
 
   String json = {};
   if (written > 0)
@@ -1553,9 +1569,10 @@ int main(void)
         deployExitCode);
     suite.expect(ranDeploy, "deploy_smoke_runs_mothership_deploy");
     suite.expect(deployExitCode == EXIT_SUCCESS, "deploy_smoke_mothership_deploy_exit_success");
-    if (ranDeploy == false || deployExitCode != EXIT_SUCCESS)
+    if (ranDeploy == false || deployExitCode != EXIT_SUCCESS || deployServer.failure.size() > 0)
     {
-      basics_log("deploy smoke mothership output:\n%s\n", deployOutput.c_str());
+      writeFailureDetail("detail deploy_smoke_output:\n", deployOutput);
+      writeFailureDetail("detail deploy_smoke_server_failure:\n", deployServer.failure);
     }
 
     deployServer.stopRequested.store(true);
@@ -1668,9 +1685,11 @@ int main(void)
         testClusterDeployExitCode);
     suite.expect(ranTestClusterDeploy, "deploy_test_cluster_runs_mothership_deploy");
     suite.expect(testClusterDeployExitCode == EXIT_SUCCESS, "deploy_test_cluster_returns_after_initial_okay");
-    if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS)
+    if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS ||
+        testClusterServer.failure.size() > 0)
     {
-      basics_log("deploy test cluster mothership output:\n%s\n", testClusterDeployOutput.c_str());
+      writeFailureDetail("detail deploy_test_cluster_output:\n", testClusterDeployOutput);
+      writeFailureDetail("detail deploy_test_cluster_server_failure:\n", testClusterServer.failure);
     }
 
     testClusterServer.stopRequested.store(true);
@@ -1704,6 +1723,123 @@ int main(void)
   suite.expect(ranAlias, "run_legacy_alias_command");
   suite.expect(aliasExitCode == EXIT_FAILURE, "legacy_alias_exit_failure");
   suite.expect(stringContains(aliasOutput, "operation invalid"), "legacy_alias_reports_invalid_operation");
+
+  // Reject an invalid rollout limit before resolving an artifact or opening a
+  // control connection. Only the exact supported choices are accepted.
+  for (const char *limit : {"0", "3", "-1", "1x", "01", "4294967297"})
+  {
+    String output = {};
+    int exitCode = -1;
+    suite.expect(runMothershipCommand(binaryPath, dbRoot,
+        {"updateProdigy", "cluster-report-test", "/nonexistent-upgrade-artifact", "--brain-concurrency", limit},
+        output, exitCode), "run_invalid_brain_upgrade_concurrency");
+    suite.expect(exitCode == EXIT_FAILURE && stringContains(output, "requires --brain-concurrency 1 or 2"),
+                 "invalid_brain_upgrade_concurrency_rejected_before_artifact");
+  }
+  for (const char *limit : {"1", "2"})
+  {
+    String output = {};
+    int exitCode = -1;
+    suite.expect(runMothershipCommand(binaryPath, dbRoot,
+        {"updateProdigy", "cluster-report-test", "/nonexistent-upgrade-artifact", "--brain-concurrency", limit},
+        output, exitCode), "run_valid_brain_upgrade_concurrency");
+    suite.expect(exitCode == EXIT_FAILURE && stringContains(output, "path is inaccessible"),
+                 "valid_brain_upgrade_concurrency_reaches_artifact_validation");
+  }
+
+  String upgradeBundle = PRODIGY_TEST_BINARY_DIR;
+  upgradeBundle.append('/');
+  upgradeBundle.append(prodigyBundleFilename(nametagCurrentBuildMachineArchitecture()));
+  // Exercise the real CLI against a bounded control peer and the real built
+  // bundle. The legacy case must close after its read-only capability report.
+  for (unsigned scenario = 0; scenario < 4; ++scenario)
+  {
+    const bool legacy = scenario == 3;
+    const uint8_t expectedLimit = scenario == 2 ? 2 : 1;
+    ControlServerState upgradeServer = {};
+    bool sawUpdate = false;
+    std::thread upgradeThread([&] {
+      int clientFD = -1;
+      if (!acceptNextClient(listener.fd, upgradeServer, clientFD)) return;
+      timeval timeout = {.tv_sec = 10, .tv_usec = 0};
+      (void)::setsockopt(clientFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+      auto exchange = [&]() -> bool {
+        String frame = {}, failure = {};
+        if (!recvOneMessageFrame(clientFD, frame, failure)) return false;
+        auto *request = reinterpret_cast<Message *>(frame.data());
+        if (MothershipTopic(request->topic) != MothershipTopic::pullClusterReport) return false;
+        upgradeServer.sawPullClusterReport = true;
+        ClusterStatusReport report = {};
+        report.nMachines = 1;
+        MachineStatusReport machine = {};
+        machine.isBrain = true;
+        machine.currentMaster = true;
+        machine.controlPlaneReachable = true;
+        machine.runtimeReady = true;
+        machine.runningProdigyVersion = legacy ? String("19"_ctv) : String("21"_ctv);
+        report.machineReports.push_back(std::move(machine));
+        String payload = {}, response = {};
+        BitseryEngine::serialize(payload, report);
+        Message::construct(response, MothershipTopic::pullClusterReport, payload);
+        if (!sendAll(clientFD, response, failure)) return false;
+        frame.clear();
+        if (legacy)
+        {
+          char next;
+          return ::recv(clientFD, &next, 1, 0) == 0;
+        }
+        if (!recvOneMessageFrame(clientFD, frame, failure)) return false;
+        request = reinterpret_cast<Message *>(frame.data());
+        if (MothershipTopic(request->topic) != MothershipTopic::updateProdigy ||
+            !ProdigyIngressValidation::validateMothershipPayload(request->topic, request->args, request->terminal())) return false;
+        uint8_t *cursor = request->args;
+        String tag = {}, bundle = {};
+        uint8_t limit = 0;
+        Message::extractToStringView(cursor, tag);
+        Message::extractArg<ArgumentNature::fixed>(cursor, limit);
+        Message::extractToStringView(cursor, bundle);
+        if (!tag.equals(String(ProdigyUpdateSelfConcurrencyRequestTag)) || limit != expectedLimit ||
+            bundle.size() != Filesystem::fileSize(upgradeBundle) || cursor != request->terminal()) return false;
+        sawUpdate = true;
+        MothershipResponse result = {};
+        result.success = true;
+        payload.clear();
+        response.clear();
+        BitseryEngine::serialize(payload, result);
+        Message::construct(response, MothershipTopic::updateProdigy, payload);
+        return sendAll(clientFD, response, failure);
+      };
+      if (!exchange()) upgradeServer.failure = "upgrade capability or request exchange failed"_ctv;
+      (void)::shutdown(clientFD, SHUT_RDWR);
+      ::close(clientFD);
+    });
+    std::vector<std::string> arguments = {"updateProdigy", "cluster-report-test", std::string(upgradeBundle.c_str())};
+    if (scenario != 0)
+    {
+      arguments.push_back("--brain-concurrency");
+      arguments.push_back(expectedLimit == 1 ? "1" : "2");
+    }
+    String output = {};
+    int exitCode = -1;
+    bool ran = runMothershipCommand(binaryPath, dbRoot, arguments, output, exitCode);
+    upgradeServer.stopRequested.store(true);
+    upgradeThread.join();
+    const bool capabilityChecked = ran && upgradeServer.failure.empty() &&
+        upgradeServer.sawPullClusterReport;
+    const bool expectedOutcome = legacy
+        ? (exitCode == EXIT_FAILURE && !sawUpdate && stringContains(output, "legacy rollout was not started"))
+        : (exitCode == EXIT_SUCCESS && sawUpdate);
+    if (capabilityChecked == false || expectedOutcome == false)
+    {
+      String label = {};
+      label.snprintf<"detail upgrade_cli_scenario_{itoa}_output:\n"_ctv>(scenario);
+      writeFailureDetail(label.c_str(), output);
+      label.snprintf<"detail upgrade_cli_scenario_{itoa}_server_failure:\n"_ctv>(scenario);
+      writeFailureDetail(label.c_str(), upgradeServer.failure);
+    }
+    suite.expect(capabilityChecked, "upgrade_cli_checks_installed_capability");
+    suite.expect(expectedOutcome, "upgrade_cli_preserves_requested_concurrency_or_refuses_legacy");
+  }
 
   String legacyUpdateOutput = {};
   int legacyUpdateExitCode = -1;
@@ -1764,6 +1900,7 @@ int main(void)
   suite.expect(ranHelp, "run_help_command");
   suite.expect(helpExitCode == EXIT_SUCCESS, "help_exit_success");
   suite.expect(stringContains(helpOutput, "clusterReport [target: local|clusterName|clusterUUID]"), "help_includes_cluster_report");
+  suite.expect(stringContains(helpOutput, "[--brain-concurrency 1|2]"), "help_includes_brain_upgrade_concurrency");
   suite.expect(stringMissing(helpOutput, "configureTestCluster"), "help_omits_configure_test_cluster_backdoor");
   suite.expect(stringContains(helpOutput, "setLocalClusterMembership [name|clusterUUID] [json]"), "help_includes_set_local_cluster_membership");
   suite.expect(stringContains(helpOutput, "setTestClusterMachineCount [name|clusterUUID] [json]"), "help_includes_set_test_cluster_machine_count");

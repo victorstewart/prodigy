@@ -279,7 +279,6 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::upsertMachineSchemas:
     case MothershipTopic::deltaMachineBudget:
     case MothershipTopic::deleteMachineSchema:
-    case MothershipTopic::updateProdigy:
     case MothershipTopic::measureApplication:
     case MothershipTopic::addMachines:
     case MothershipTopic::reserveApplicationID:
@@ -299,6 +298,19 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullContainerLogs:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case MothershipTopic::updateProdigy:
+      {
+        String first = {};
+        if (!extractVariableStringView(cursor, terminal, first)) return false;
+        // Preserve the legacy single-bundle shape. A tagged request has an
+        // exact trailing layout, which legacy ingress rejects before staging.
+        if (!first.equals(String(ProdigyUpdateSelfConcurrencyRequestTag))) return cursor == terminal;
+        uint8_t concurrency = 0;
+        return extractFixed(cursor, terminal, concurrency) &&
+               concurrency >= ProdigyUpdateSelfMinimumConcurrency &&
+               concurrency <= ProdigyUpdateSelfMaximumConcurrency &&
+               consumeVariable(cursor, terminal) && cursor == terminal;
       }
     case MothershipTopic::spinApplication:
       {

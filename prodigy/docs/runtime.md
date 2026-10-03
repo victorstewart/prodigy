@@ -14,7 +14,7 @@ Runtime tests manipulate namespaces, BPF, cgroups, mounts, and containers. On ma
 
 ## Updates and special modes
 
-`updateProdigy` uses an approved bundle and waits for cluster control-path recovery. Update execution requires the configured Brain and switch majorities. Bundle approval, credentials, and identity are in [Security](security.md).
+`updateProdigy` uses an approved bundle and coordinates cluster control-path recovery. `--brain-concurrency 1|2` selects the maximum follower Brains upgrading at once (default `1`); the master upgrades last, and worker Neurons remain serial. The installed Brain fleet must run version 21 or newer to honor this option. Update execution requires the configured Brain and switch majorities. See [Inspect and update a cluster](run-clusters/inspect-and-update.md) for recovery gates and legacy-fleet limits. Bundle approval, credentials, and identity are in [Security](security.md).
 
 `mothershipConnectivity.kind=tunnelProvider` is a master-Brain system-container mode, never a normal application deployment. It has private namespaces, no capabilities, a read-only rootfs, gateway-mediated control, and allowlist-only egress; misconfiguration fails closed rather than falling back to SSH.
 

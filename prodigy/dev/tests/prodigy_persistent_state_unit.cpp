@@ -1532,6 +1532,12 @@ int main(void)
   followerBoot.bootNs = 444;
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerBootNsByPeerKey.push_back(followerBoot);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerRebootedPeerKeys.push_back(storedLocalBrainState.uuid + 6);
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerConcurrency =
+      ProdigyUpdateSelfMinimumConcurrency;
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.push_back(
+      storedLocalBrainState.uuid + 5);
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(
+      storedLocalBrainState.uuid + 6);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.localMachineUUID = storedLocalBrainState.uuid;
   NeuronContainerBootstrap retainedBootstrap = {};
   retainedBootstrap.plan.uuid = 0x901234;
@@ -2359,6 +2365,14 @@ int main(void)
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
                  "load_snapshot_restores_exact_private_inventory");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerConcurrency ==
+                ProdigyUpdateSelfMinimumConcurrency &&
+            loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys ==
+                storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys &&
+            loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys ==
+                storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys,
+        "load_snapshot_restores_serial_update_follower_progress");
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
                  "load_snapshot_restores_all_machine_private_inventory");

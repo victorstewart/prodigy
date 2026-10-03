@@ -11856,6 +11856,227 @@ static void testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(Test
   suite.expect(peerBTransitionFrames == 1, "update_self_bundle_echo_queues_transition_for_peer_b");
 }
 
+static void testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(TestSuite& suite)
+{
+  ScopedRing scopedRing = {};
+
+  auto setAuthorityAcknowledgement = [](TestBrain& brain, BrainView& peer) {
+    String serialized = {};
+    String digest = {};
+    if (brain.serializeCurrentMasterAuthorityTransition(serialized, digest) == false) return false;
+    Brain::MasterAuthorityReplicationPeerState& tracking =
+        brain.masterAuthorityReplicationByPeer[&peer];
+    tracking.uuid = peer.uuid;
+    tracking.bootNs = peer.boottimens;
+    tracking.ioGeneration = peer.ioGeneration;
+    tracking.transportEpoch = peer.transportEpoch;
+    tracking.fileSlot = peer.fslot;
+    tracking.acknowledgedGeneration = brain.masterAuthorityRuntimeState.generation;
+    tracking.acknowledgedTransitionDigest = digest;
+    return true;
+  };
+
+  auto configureFollower = [](BrainView& peer, Machine& machine, uint128_t peerUUID,
+                              uint64_t bootNs, int fslot) {
+    machine.uuid = peerUUID + 0x1000;
+    machine.runtimeReady = true;
+    peer.uuid = peerUUID;
+    peer.boottimens = bootNs;
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.registrationFresh = true;
+    peer.fslot = fslot;
+    peer.machine = &machine;
+  };
+
+  TestBrain serial = {};
+  serial.nBrains = 3;
+  serial.weAreMaster = true;
+  serial.noMasterYet = false;
+  String failure = {};
+  suite.require(serial.configureUpdateSelfFollowerConcurrency(1, &failure),
+                "update_self_serial_concurrency_configures_before_start");
+  serial.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  serial.updateSelfExpectedEchos = 2;
+  serial.masterAuthorityRuntimeStateDurable = true;
+  serial.durableMasterAuthorityRuntimeStateGeneration = serial.masterAuthorityRuntimeState.generation;
+
+  Machine serialMachineA = {};
+  Machine serialMachineB = {};
+  BrainView serialPeerA = {};
+  BrainView serialPeerB = {};
+  configureFollower(serialPeerA, serialMachineA, 0x8011, 801, 81);
+  configureFollower(serialPeerB, serialMachineB, 0x8012, 802, 82);
+  serial.brains.insert(&serialPeerA);
+  serial.brains.insert(&serialPeerB);
+  serial.persistedMachineInventoryUploaded.insert(serialMachineA.uuid);
+  serial.persistedMachineInventoryUploaded.insert(serialMachineB.uuid);
+  serial.updateSelfFollowerBootNsByPeerKey.insert_or_assign(serialPeerA.uuid, 800);
+  serial.updateSelfFollowerBootNsByPeerKey.insert_or_assign(serialPeerB.uuid, 800);
+
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfTransitionIssuedPeerKeys.size() == 1 &&
+                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerA.uuid),
+               "update_self_serial_concurrency_issues_only_first_sorted_follower");
+
+  // A reboot registration followed by a disconnect/reconnect is not a recovery
+  // receipt.  The first slot remains occupied until this peer also acknowledges
+  // the current authority and its current inventory is available.
+  serialPeerA.wBuffer.clear();
+  serialPeerA.pendingSend = false;
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfTransitionIssuedPeerKeys.size() == 1 &&
+                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid) == false,
+               "update_self_serial_retries_recovered_unsent_slot_without_opening_another");
+
+  serial.updateSelfFollowerRebootedPeerKeys.insert(serialPeerA.uuid);
+  serialPeerA.connected = false;
+  serial.driveUpdateSelfFollowerTransitions();
+  serialPeerA.connected = true;
+  suite.require(setAuthorityAcknowledgement(serial, serialPeerA),
+                "update_self_serial_fixture_serializes_current_authority");
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfTransitionIssuedPeerKeys.size() == 1 &&
+                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid) == false,
+               "update_self_serial_reconnect_and_generic_inventory_do_not_free_slot");
+
+  ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
+  witness.machineUUID = serialMachineA.uuid;
+  witness.bundleRegistered = true;
+  serial.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfFollowerReadyPeerKeys.contains(serialPeerA.uuid) &&
+                   serial.updateSelfTransitionIssuedPeerKeys.size() == 1,
+               "update_self_serial_readiness_checkpoint_waits_for_new_authority_ack");
+  suite.require(setAuthorityAcknowledgement(serial, serialPeerA),
+                "update_self_serial_acknowledges_durable_readiness_checkpoint");
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfFollowerReadyPeerKeys.contains(serialPeerA.uuid) &&
+                   serial.updateSelfTransitionIssuedPeerKeys.size() == 2 &&
+                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid),
+               "update_self_serial_witness_authority_ack_and_inventory_free_next_slot");
+
+  serial.masterAuthorityRuntimeState.generation += 1;
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfFollowerReadyPeerKeys.contains(serialPeerA.uuid) &&
+                   serial.updateSelfTransitionIssuedPeerKeys.size() == 2,
+               "update_self_serial_readiness_checkpoint_does_not_flap_after_authority_advance");
+
+  failure.clear();
+  suite.expect(serial.configureUpdateSelfFollowerConcurrency(1, &failure) &&
+                   serial.configureUpdateSelfFollowerConcurrency(2, &failure) == false &&
+                   serial.updateSelfFollowerConcurrency == 1,
+               "update_self_same_digest_retry_rejects_different_active_concurrency");
+
+  // A request retry reaches the Mothership handler after artifact publication.
+  // It must resume the exact durable coordinator rather than call
+  // beginUpdateSelfBundle and discard the occupied serial slot.
+  TestBrain retry = {};
+  retry.nBrains = 3;
+  retry.weAreMaster = true;
+  retry.noMasterYet = false;
+  suite.require(retry.configureUpdateSelfFollowerConcurrency(1, &failure),
+                "update_self_handler_retry_configures_serial_policy");
+  retry.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  retry.updateSelfExpectedEchos = 2;
+  const String retryBundle = "same-digest-handler-retry"_ctv;
+  suite.require(prodigyComputeSHA256Hex(retryBundle, retry.updateSelfWorkerExpectedBundleSHA256, &failure),
+                "update_self_handler_retry_computes_digest");
+  Machine retryMachineA = {};
+  Machine retryMachineB = {};
+  BrainView retryPeerA = {};
+  BrainView retryPeerB = {};
+  configureFollower(retryPeerA, retryMachineA, 0x8031, 831, 91);
+  configureFollower(retryPeerB, retryMachineB, 0x8032, 832, 92);
+  retryPeerA.version = ProdigyUpdateSelfConcurrencyMinimumVersion;
+  retryPeerB.version = ProdigyUpdateSelfConcurrencyMinimumVersion;
+  retry.brains.insert(&retryPeerA);
+  retry.brains.insert(&retryPeerB);
+  retry.updateSelfFollowerBootNsByPeerKey.insert_or_assign(retryPeerA.uuid, 800);
+  retry.updateSelfFollowerBootNsByPeerKey.insert_or_assign(retryPeerB.uuid, 800);
+  retry.updateSelfTransitionIssuedPeerKeys.insert(retryPeerA.uuid);
+  retry.updateSelfFollowerReadyPeerKeys.insert(retryPeerA.uuid);
+
+  Mothership retryMothership = {};
+  retryMothership.isFixedFile = true;
+  retryMothership.fslot = 93;
+  retry.activeMotherships.insert(&retryMothership);
+  String retryRequest = {};
+  Message *retryMessage = buildMothershipMessage(
+      retryRequest, MothershipTopic::updateProdigy,
+      String(ProdigyUpdateSelfConcurrencyRequestTag), uint8_t(1), retryBundle);
+  auto retryPending = std::make_shared<Brain::PendingMothershipUpdateArtifact>();
+  retryPending->stream = &retryMothership;
+  retryPending->streamIncarnation = retryMothership.connectionIncarnation;
+  retryPending->authorityEpoch = retry.masterAuthorityEpoch;
+  retryPending->requestFrame = String(
+      reinterpret_cast<uint8_t *>(retryMessage), retryMessage->size, Copy::yes, retryMessage->size);
+  retryPending->digest = retry.updateSelfWorkerExpectedBundleSHA256;
+  retryPending->phase = Brain::PendingMothershipUpdateArtifact::Phase::published;
+  retryPending->fsyncSucceeded = true;
+  retryPending->hasExplicitFollowerConcurrency = true;
+  retryPending->requestedFollowerConcurrency = 1;
+  retry.pendingMothershipUpdateArtifact = retryPending;
+  retry.mothershipHandler(&retryMothership, retryMessage);
+  bool retryAccepted = false;
+  forEachMessageInBuffer(retryMothership.wBuffer, [&](Message *frame) {
+    if (MothershipTopic(frame->topic) != MothershipTopic::updateProdigy) return;
+    uint8_t *cursor = frame->args;
+    String payload = {};
+    Message::extractToStringView(cursor, payload);
+    MothershipResponse response = {};
+    retryAccepted = BitseryEngine::deserializeSafe(payload, response) && response.success;
+  });
+  suite.expect(retryAccepted && retry.pendingMothershipUpdateArtifact == nullptr,
+               "update_self_handler_same_digest_retry_returns_success");
+  suite.expect(retry.updateSelfState == Brain::UpdateSelfState::waitingForFollowerReboots &&
+                   retry.updateSelfExpectedEchos == 2 &&
+                   retry.updateSelfTransitionIssuedPeerKeys.size() == 1 &&
+                   retry.updateSelfTransitionIssuedPeerKeys.contains(retryPeerA.uuid) &&
+                   retry.updateSelfTransitionIssuedPeerKeys.contains(retryPeerB.uuid) == false,
+               "update_self_handler_same_digest_retry_preserves_serial_coordinator");
+  retry.activeMotherships.erase(&retryMothership);
+  retry.brains.erase(&retryPeerA);
+  retry.brains.erase(&retryPeerB);
+
+  TestBrain batch = {};
+  batch.nBrains = 4;
+  suite.require(batch.configureUpdateSelfFollowerConcurrency(2, &failure),
+                "update_self_batch_concurrency_configures_before_start");
+  batch.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+  batch.updateSelfExpectedEchos = 3;
+
+  Machine batchMachineA = {};
+  Machine batchMachineB = {};
+  Machine batchMachineC = {};
+  BrainView batchPeerA = {};
+  BrainView batchPeerB = {};
+  BrainView batchPeerC = {};
+  configureFollower(batchPeerA, batchMachineA, 0x8021, 821, 83);
+  configureFollower(batchPeerB, batchMachineB, 0x8022, 822, 84);
+  configureFollower(batchPeerC, batchMachineC, 0x8023, 823, 85);
+  for (BrainView *peer : {&batchPeerA, &batchPeerB, &batchPeerC}) batch.brains.insert(peer);
+  for (Machine *machine : {&batchMachineA, &batchMachineB, &batchMachineC})
+  {
+    batch.persistedMachineInventoryUploaded.insert(machine->uuid);
+  }
+  for (uint128_t peerKey : {batchPeerA.uuid, batchPeerB.uuid, batchPeerC.uuid})
+  {
+    batch.updateSelfFollowerBootNsByPeerKey.insert_or_assign(peerKey, 800);
+  }
+
+  batch.driveUpdateSelfFollowerTransitions();
+  suite.expect(batch.updateSelfTransitionIssuedPeerKeys.size() == 2 &&
+                   batch.updateSelfTransitionIssuedPeerKeys.contains(batchPeerA.uuid) &&
+                   batch.updateSelfTransitionIssuedPeerKeys.contains(batchPeerB.uuid) &&
+                   batch.updateSelfTransitionIssuedPeerKeys.contains(batchPeerC.uuid) == false,
+               "update_self_batch_concurrency_issues_two_sorted_followers");
+
+  serial.brains.erase(&serialPeerA);
+  serial.brains.erase(&serialPeerB);
+  for (BrainView *peer : {&batchPeerA, &batchPeerB, &batchPeerC}) batch.brains.erase(peer);
+}
+
 static void testUpdateSelfPeerRegistrationCreditsBootNsChange(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -30253,6 +30474,11 @@ int main(void)
     testNeuronRecvDispatchesPairingAndCredentialMessages(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "update-self-concurrency") == 0)
+  {
+    testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "update-self-relinquish") == 0)
   {
     testUpdateSelfRelinquishRetriesLostAckWithoutRepeatingPeerElection(suite);
@@ -30608,6 +30834,7 @@ int main(void)
     testKnownUUIDsOwnConnectorAndFailoverBeforeAddresses(suite);
     testAuthoritativeBrainPeerCandidatesRejectAmbientAdvertisement(suite);
     testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
+    testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(suite);
     testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
     testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
     testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
@@ -30830,6 +31057,7 @@ int main(void)
   testKnownUUIDsOwnConnectorAndFailoverBeforeAddresses(suite);
   testAuthoritativeBrainPeerCandidatesRejectAmbientAdvertisement(suite);
   testUpdateSelfBundleEchoTransitionsFollowersAndQueuesTransition(suite);
+  testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(suite);
   testUpdateSelfPeerRegistrationCreditsBootNsChange(suite);
   testUpdateSelfPeerRegistrationCreditsReconnectWithoutBootNsChange(suite);
   testMaybeRelinquishMasterSelectsLowestPeerKey(suite);
