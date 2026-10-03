@@ -250,6 +250,12 @@ then
          [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
          exec "${script_dir}/prodigy_dev_placement_runtime_qualification.sh" "${prodigy_bin}" "${mothership_bin}" "${deploy_container_zstd}" "${deploy_plan_json}"
          ;;
+      retained-follower)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec bash "${script_dir}/prodigy_dev_storage_multidrive_resize_smoke.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" follower-retained 0 \
+            "$(dirname "${prodigy_bin}")/prodigy.$(uname -m).bundle.tar.zst"
+         ;;
       *) fail "unknown runtime qualification scenario: ${runtime_qualification}" ;;
    esac
 fi

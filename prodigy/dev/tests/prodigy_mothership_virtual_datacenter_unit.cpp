@@ -380,6 +380,7 @@ nsenter() {
     *) return 1 ;;
   esac
 }
+
 fault_link_set "$workspace" 700 vp1 down
 fault_link_set "$workspace" 700 vp1 up
 printf '701\n' > "$workspace/virtual-datacenter.identity"
@@ -582,6 +583,8 @@ int main(void)
   suite.expect(mothershipVDCParseUnsigned(overflow, overflow + sizeof(overflow) - 1, parsed) == false, "recovery_identity_rejects_overflow");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(1, 1) == false, "recovery_rejects_only_brain");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 3) == false, "recovery_rejects_second_brain");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 3, false, true), "recovery_allows_test_only_three_brain_follower");
+  suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 3, false, true) == false, "recovery_rejects_test_follower_zero_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(0, 1) == false, "recovery_rejects_zero_machine_index");
   suite.expect(mothershipVDCRecoveryTargetIsSupported(2, 1), "recovery_allows_worker_after_brains");
 
@@ -614,14 +617,37 @@ int main(void)
   recovery.expectedIncompleteWorkerBundle = recovery.expectedOldBundle;
   recovery.previousBootSHA256 = recovery.expectedOldBundle;
   recovery.successorBootSHA256 = recovery.successorBundle;
+  recovery.testOnlyFollowerReplacement = true;
+  recovery.selectedMachineUUID.assign("11111111111111111111111111111111"_ctv);
+  recovery.masterMachineUUID.assign("22222222222222222222222222222222"_ctv);
+  recovery.witnessMachineUUID.assign("33333333333333333333333333333333"_ctv);
+  recovery.preflightReportSHA256.assign("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  recovery.commissionedBrains[0] = {923, 11, 21, 31};
+  recovery.commissionedBrains[1] = {929, 12, 22, 32};
+  recovery.commissionedBrains[2] = {937, 13, 23, 33};
+  recovery.version = 3;
+  suite.expect(mothershipVDCTestFollowerRecoveryMatches(recovery, recovery.clusterUUID, 2,
+                                                         recovery.expectedOldBundle, recovery.successorBundle),
+               "recovery_accepts_exact_test_follower_retry_binding");
+  suite.expect(mothershipVDCTestFollowerRecoveryMatches(recovery, recovery.clusterUUID, 2,
+                                                         recovery.successorBundle, recovery.expectedOldBundle) == false,
+               "recovery_rejects_test_follower_retry_with_reversed_bundle_binding");
   char recoveryDirectory[] = "./vdc-recovery-unit.XXXXXX";
   const bool directoryCreated = ::mkdtemp(recoveryDirectory) != nullptr;
   suite.expect(directoryCreated, "recovery_creates_scoped_test_directory");
   if (directoryCreated)
   {
     String directory(recoveryDirectory);
+    MothershipVDCBundleRecovery legacyRecovery = recovery;
+    legacyRecovery.version = 2;
+    suite.expect(mothershipVDCWriteRecovery(directory, legacyRecovery, &failure), "recovery_preserves_v2_journal_writer");
+    MothershipVDCBundleRecovery restored = recovery;
+    suite.expect(mothershipVDCReadRecovery(directory, restored) && restored.version == 2 &&
+                 restored.expectedOldBundle == legacyRecovery.expectedOldBundle && restored.testOnlyFollowerReplacement == false &&
+                 restored.selectedMachineUUID.empty() && restored.preflightReportSHA256.empty() &&
+                 restored.commissionedBrains[0].pid == 0,
+                 "recovery_reads_existing_v2_journal_without_v3_tail");
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure), "recovery_durably_writes_intent");
-    MothershipVDCBundleRecovery restored = {};
     suite.expect(mothershipVDCReadRecovery(directory, restored) && restored.clusterUUID == recovery.clusterUUID &&
                  restored.operationID == recovery.operationID && restored.runtimeIdentity == recovery.runtimeIdentity &&
                  restored.machineIndex == 2 && restored.phase == MothershipVDCRecoveryPhase::ready &&
@@ -631,8 +657,12 @@ int main(void)
                  restored.expectedOldBundle == recovery.expectedOldBundle && restored.successorBundle == recovery.successorBundle &&
                  restored.expectedIncompleteWorkerBundle == recovery.expectedIncompleteWorkerBundle &&
                  restored.previousBootSHA256 == recovery.previousBootSHA256 && restored.successorBootSHA256 == recovery.successorBootSHA256 &&
-                 restored.providerArguments[0] == cluster.test.workspaceRoot, "recovery_preserves_distinct_runtime_and_process_identity");
-    recovery.version = 3;
+                 restored.providerArguments[0] == cluster.test.workspaceRoot && restored.testOnlyFollowerReplacement &&
+                 restored.selectedMachineUUID == recovery.selectedMachineUUID && restored.masterMachineUUID == recovery.masterMachineUUID &&
+                 restored.witnessMachineUUID == recovery.witnessMachineUUID && restored.preflightReportSHA256 == recovery.preflightReportSHA256 &&
+                 mothershipVDCSameProcess(restored.commissionedBrains[2], recovery.commissionedBrains[2]),
+                 "recovery_preserves_test_follower_preflight_and_process_identity");
+    recovery.version = 4;
     suite.expect(mothershipVDCWriteRecovery(directory, recovery, &failure) && mothershipVDCReadRecovery(directory, restored) == false,
                  "recovery_rejects_unknown_journal_version");
     String path = {}; mothershipVirtualDatacenterPath(directory, "operation", path);
@@ -667,7 +697,6 @@ int main(void)
   recovery.providerArguments[11] = "/tmp/another-cluster.sock"_ctv;
   suite.expect(mothershipVDCPrepareSupersessionBoot(originalBoot, recovery, successorBoot, &failure) == false,
                "recovery_rejects_bootstrap_control_identity_mismatch");
-
   // Signal only this test's own child. A stale start-time must not affect it.
   pid_t child = ::fork();
   if (child == 0) { while (true) ::pause(); }

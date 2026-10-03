@@ -10,9 +10,10 @@
 // Workers retain the live Brain as their plan owner. A sole Brain requires
 // the authenticated checkpoint path plus an exact incomplete-update receipt.
 static inline bool mothershipVDCRecoveryTargetIsSupported(uint32_t machineIndex, uint32_t brainCount,
-    bool checkpointedSupersession = false)
+    bool checkpointedSupersession = false, bool testOnlyFollowerReplacement = false)
 {
-  return machineIndex > brainCount || (checkpointedSupersession && machineIndex == 1 && brainCount == 1);
+  return machineIndex > brainCount || (checkpointedSupersession && machineIndex == 1 && brainCount == 1) ||
+         (testOnlyFollowerReplacement && brainCount == 3 && machineIndex >= 1 && machineIndex <= brainCount);
 }
 
 // The provider keeps resource plumbing. Mothership owns the exact process
@@ -43,6 +44,9 @@ static void serialize(S&& serializer, MothershipVDCProcessIdentity& identity)
 
 class MothershipVDCBundleRecovery {
 public:
+  // Version three binds the test-only three-Brain follower preflight to the
+  // same retained provider transaction.  It is deliberately not a production
+  // rollout or authority-admission record.
   uint8_t version = 2;
   uint128_t clusterUUID = 0;
   uint128_t operationID = 0;
@@ -54,6 +58,10 @@ public:
   String expectedIncompleteWorkerBundle, previousBootSHA256, successorBootSHA256;
   String providerCgroup, workerCgroup;
   String providerArguments[12];
+  bool testOnlyFollowerReplacement = false;
+  String selectedMachineUUID, masterMachineUUID, witnessMachineUUID;
+  String preflightReportSHA256;
+  MothershipVDCProcessIdentity commissionedBrains[3];
 };
 
 template <typename S>
@@ -79,6 +87,15 @@ static void serialize(S&& serializer, MothershipVDCBundleRecovery& operation)
   serializer.text1b(operation.providerCgroup, 4096);
   serializer.text1b(operation.workerCgroup, 4096);
   for (String& argument : operation.providerArguments) serializer.text1b(argument, 4096);
+  if (operation.version == 3)
+  {
+    serializer.value1b(operation.testOnlyFollowerReplacement);
+    serializer.text1b(operation.selectedMachineUUID, 64);
+    serializer.text1b(operation.masterMachineUUID, 64);
+    serializer.text1b(operation.witnessMachineUUID, 64);
+    serializer.text1b(operation.preflightReportSHA256, 64);
+    for (MothershipVDCProcessIdentity& brain : operation.commissionedBrains) serializer.object(brain);
+  }
 }
 
 static inline bool mothershipVDCRead(const String& path, String& output, uint64_t maximum = 65536)
@@ -224,12 +241,30 @@ static inline bool mothershipVDCWriteRecovery(const String& directory, Mothershi
 
 static inline bool mothershipVDCReadRecovery(const String& directory, MothershipVDCBundleRecovery& operation)
 {
+  // A caller may reuse an object that previously held a v3 tail.  A v2 record
+  // has no such bytes, so clear it before decoding rather than retaining stale
+  // preflight identity fields in memory.
+  operation = {};
   String path = {}, serialized = {};
   mothershipVirtualDatacenterPath(directory, "operation", path);
   return mothershipVDCRead(path, serialized) && BitseryEngine::deserializeSafe(serialized, operation) &&
-         operation.version == 2 && operation.clusterUUID != 0 && operation.operationID != 0 &&
+         (operation.version == 2 || operation.version == 3) && operation.clusterUUID != 0 && operation.operationID != 0 &&
          operation.runtimeIdentity > 1 && operation.machineIndex > 0 &&
          operation.phase <= MothershipVDCRecoveryPhase::complete;
+}
+
+static inline bool mothershipVDCTestFollowerRecoveryMatches(const MothershipVDCBundleRecovery& operation,
+                                                            uint128_t clusterUUID, uint32_t machineIndex,
+                                                            const String& sourceBundle, const String& successorBundle)
+{
+  if (operation.version != 3 || operation.testOnlyFollowerReplacement == false || operation.clusterUUID != clusterUUID ||
+      operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(sourceBundle) == false ||
+      operation.successorBundle.equals(successorBundle) == false || operation.selectedMachineUUID.empty() ||
+      operation.masterMachineUUID.empty() || operation.witnessMachineUUID.empty() || operation.preflightReportSHA256.empty() ||
+      operation.selectedMachineUUID.equals(operation.masterMachineUUID) ||
+      operation.selectedMachineUUID.equals(operation.witnessMachineUUID) ||
+      operation.masterMachineUUID.equals(operation.witnessMachineUUID)) return false;
+  return true;
 }
 
 // Prepare through the boot-state owner before stopping anything. The caller

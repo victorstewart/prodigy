@@ -3906,14 +3906,26 @@ static bool mothershipVDCCaptureLocalCheckpoint(MothershipVDCBundleRecovery& ope
 
 static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyCluster& cluster,
     const String& bundlePath, const String& successorSHA, uint32_t machineIndex,
-    const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA, String *failure)
+    const String& expectedOldSHA, const String& expectedIncompleteWorkerSHA,
+    const MothershipVDCBundleRecovery *followerPreflight, uint128_t *completedOperationID, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
-  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains, expectedIncompleteWorkerSHA.empty() == false) == false)
+  const bool followerReplacement = followerPreflight != nullptr;
+  // A follower retains its unchanged boot record and restarts under the old
+  // master, which remains the plan owner.  Bootstrap supersession/checkpoint
+  // is reserved for the existing sole-Brain path.
+  if (mothershipVDCRecoveryTargetIsSupported(machineIndex, cluster.nBrains, expectedIncompleteWorkerSHA.empty() == false,
+                                              followerReplacement) == false)
     return reject("Brain replacement is unsupported without an authoritative local-container checkpoint");
-  if (expectedIncompleteWorkerSHA.empty() == false && (machineIndex != 1 || cluster.nBrains != 1 ||
+  if (followerReplacement && expectedIncompleteWorkerSHA.empty() == false)
+    return reject("test follower replacement must retain its original boot without an incomplete-update receipt");
+  if (expectedIncompleteWorkerSHA.empty() == false && ((!followerReplacement && (machineIndex != 1 || cluster.nBrains != 1)) ||
       prodigyIsSHA256HexDigest(expectedIncompleteWorkerSHA) == false || expectedIncompleteWorkerSHA.equals(successorSHA)))
     return reject("incomplete bundle supersession requires the sole Brain and a distinct expected pending digest");
+  if (followerReplacement && (cluster.nBrains != 3 || machineIndex > 3 || machineIndex == 0 ||
+      mothershipVDCTestFollowerRecoveryMatches(*followerPreflight, cluster.clusterUUID, machineIndex,
+                                               expectedOldSHA, successorSHA) == false))
+    return reject("test follower replacement preflight is incomplete or differs from retained recovery request");
   String lockPath = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery.lock", lockPath);
   struct CloseFD { int fd = -1; ~CloseFD() { if (fd >= 0) ::close(fd); } } lock;
@@ -3923,7 +3935,9 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   String recoveryRoot = {}, directory = {}, directoryName = {};
   mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery", recoveryRoot);
   if (::mkdir(recoveryRoot.c_str(), 0700) != 0 && errno != EEXIST) return reject("cannot create provider recovery owner");
-  directoryName.snprintf<"machine{itoa}-{}-{}"_ctv>(uint64_t(machineIndex), expectedOldSHA, successorSHA);
+  String recoveryPrefix = {};
+  if (followerReplacement) recoveryPrefix.assign("follower-"_ctv);
+  directoryName.snprintf<"{}machine{itoa}-{}-{}"_ctv>(recoveryPrefix, uint64_t(machineIndex), expectedOldSHA, successorSHA);
   mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
   String activePath = {}, active = {};
   MothershipVDCProcessIdentity refusedWorker = {}, refusedSupervisor = {};
@@ -4008,9 +4022,15 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   if (::access(operationPath.c_str(), F_OK) == 0)
   {
     if (mothershipVDCReadRecovery(directory, operation) == false || operation.clusterUUID != cluster.clusterUUID ||
-        operation.machineIndex != machineIndex || operation.expectedOldBundle.equals(expectedOldSHA) == false ||
+        operation.machineIndex != machineIndex || operation.testOnlyFollowerReplacement != followerReplacement ||
+        operation.expectedOldBundle.equals(expectedOldSHA) == false ||
         operation.expectedIncompleteWorkerBundle.equals(expectedIncompleteWorkerSHA) == false ||
-        operation.successorBundle.equals(successorSHA) == false) return reject("provider recovery operation identity mismatch");
+        operation.successorBundle.equals(successorSHA) == false ||
+        (followerReplacement && (operation.selectedMachineUUID != followerPreflight->selectedMachineUUID ||
+                                 operation.masterMachineUUID != followerPreflight->masterMachineUUID ||
+                                 operation.witnessMachineUUID != followerPreflight->witnessMachineUUID ||
+                                 operation.preflightReportSHA256 != followerPreflight->preflightReportSHA256)))
+      return reject("provider recovery operation identity mismatch");
   }
   else
   {
@@ -4020,6 +4040,15 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     operation.expectedOldBundle = expectedOldSHA;
     operation.successorBundle = successorSHA;
     operation.expectedIncompleteWorkerBundle = expectedIncompleteWorkerSHA;
+    if (followerReplacement)
+    {
+      operation.version = 3;
+      operation.testOnlyFollowerReplacement = true;
+      operation.selectedMachineUUID = followerPreflight->selectedMachineUUID;
+      operation.masterMachineUUID = followerPreflight->masterMachineUUID;
+      operation.witnessMachineUUID = followerPreflight->witnessMachineUUID;
+      operation.preflightReportSHA256 = followerPreflight->preflightReportSHA256;
+    }
     uint64_t supervisorPID = 0;
     if (mothershipVDCReadNumber(pidPath, supervisorPID) == false || mothershipVDCReadProcess(supervisorPID, operation.supervisor) == false)
       return reject("retained provider process identity unavailable");
@@ -4045,7 +4074,14 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
       while (end != terminal && *end != '\n') ++end;
       uint64_t worker = 0;
       if (end == terminal || mothershipVDCParseUnsigned(cursor, end, worker) == false || worker < 2) return reject("retained worker inventory is malformed");
-      if (index == machineIndex && mothershipVDCReadProcess(worker, operation.worker) == false) return reject("selected worker identity unavailable");
+      if (followerReplacement && index <= 3 &&
+          mothershipVDCReadProcess(worker, operation.commissionedBrains[index - 1]) == false)
+        return reject("commissioned Brain process identity unavailable");
+      if (index == machineIndex)
+      {
+        if (followerReplacement) operation.worker = operation.commissionedBrains[index - 1];
+        else if (mothershipVDCReadProcess(worker, operation.worker) == false) return reject("selected worker identity unavailable");
+      }
       cursor = end + 1;
     }
     if (cursor != terminal) return reject("retained worker inventory has unexpected entries");
@@ -4063,6 +4099,18 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     expectedWorker.append(leaf);
     if (operation.workerCgroup.equals(expectedWorker) == false || operation.worker.networkNamespace == operation.supervisor.networkNamespace)
       return reject("selected worker does not own the expected isolated machine cgroup");
+    if (followerReplacement)
+    {
+      for (uint32_t index = 1; index <= 3; ++index)
+      {
+        String brainRoot = {}, observedBundle = {};
+        brainRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(index));
+        if (mothershipVDCProcessMatches(operation.commissionedBrains[index - 1]) == false ||
+            fileDigest(brainRoot, "prodigy.bundle.tar.zst", observedBundle) == false ||
+            observedBundle.equals(expectedOldSHA) == false)
+          return reject("commissioned Brain source artifact or process identity differs from exact legacy fixture");
+      }
+    }
     if (fileDigest(installedRoot, "prodigy.bundle.tar.zst", installedDigest) == false || installedDigest.equals(expectedOldSHA) == false ||
         fileDigest(installedRoot, "prodigy", operation.oldExecutable) == false || executableMatches(operation.worker, operation.oldExecutable) == false)
       return reject("selected worker installed bundle or executable differs from expected old artifact");
@@ -4080,7 +4128,28 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
           mothershipVDCDurableWrite(directory, "previous-boot.json", originalBoot, failure) == false ||
           mothershipVDCDurableWrite(directory, "successor-boot.json", successorBoot, failure) == false) return false;
     }
+    else if (followerReplacement &&
+             prodigyComputeFileSHA256Hex(bootPath, operation.previousBootSHA256, failure) == false)
+    {
+      return false;
+    }
     if (save() == false) return false;
+  }
+  // Before this test-only transaction takes the irreversible provider handoff,
+  // all three identities captured from the initial authenticated 19b fixture
+  // must still be live.  A completed retry is handled by the command's durable
+  // query path and never reaches this admission check.
+  if (followerReplacement && operation.phase < MothershipVDCRecoveryPhase::committed)
+  {
+    for (uint32_t member = 1; member <= 3; ++member)
+    {
+      String root = {}, observedBundle = {};
+      root.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(member));
+      if (mothershipVDCProcessMatches(operation.commissionedBrains[member - 1]) == false ||
+          fileDigest(root, "prodigy.bundle.tar.zst", observedBundle) == false ||
+          observedBundle.equals(operation.expectedOldBundle) == false)
+        return reject("commissioned Brain identity changed before retained follower handoff");
+    }
   }
   if (refusedWorker.pid > 1 &&
       (operation.phase != MothershipVDCRecoveryPhase::accepted ||
@@ -4125,7 +4194,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     if (mothershipVDCReadProcessFile(operation.supervisor.pid, "cgroup", currentCgroup) == false || currentCgroup.equals(operation.providerCgroup) == false ||
         executableMatches(operation.worker, operation.oldExecutable) == false)
       return reject("retained process identity changed before provider handoff");
-    if (expectedIncompleteWorkerSHA.empty() == false)
+    if (expectedIncompleteWorkerSHA.empty() == false || followerReplacement)
     {
       String observedBootSHA = {};
       if (prodigyComputeFileSHA256Hex(bootPath, observedBootSHA, failure) == false || observedBootSHA.equals(operation.previousBootSHA256) == false)
@@ -4308,6 +4377,7 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   if (executableMatches(operation.replacement, operation.successorExecutable) == false) return reject("replacement runtime identity no longer matches completed recovery");
   operation.phase = MothershipVDCRecoveryPhase::complete;
   if (save() == false || mothershipVDCDurableWrite(directory, "complete", directoryName, failure) == false) return false;
+  if (completedOperationID) *completedOperationID = operation.operationID;
   if (failure) failure->clear();
   return true;
 }
@@ -8419,6 +8489,11 @@ private:
 
     Mothership *owner = nullptr;
     MothershipTunnelGatewayAuth tunnelProviderGatewayAuth;
+    // This is command-scoped test input, deliberately not cluster state.  A
+    // persisted cluster always resolves its normal release sibling on later
+    // reconciliation.
+    String testInitialBundlePath;
+    String testInitialBundleSHA256;
 
     class SeedProvisioningProgressPrinter final : public BrainIaaSMachineProvisioningProgressSink {
     private:
@@ -8646,9 +8721,12 @@ private:
 
   public:
 
-    explicit ClusterCreateHooks(Mothership *mothership, MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {})
+    explicit ClusterCreateHooks(Mothership *mothership, MothershipTunnelGatewayAuth tunnelProviderGatewayAuth = {},
+                                String initialTestBundlePath = {}, String initialTestBundleSHA256 = {})
         : owner(mothership),
-          tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth))
+          tunnelProviderGatewayAuth(std::move(tunnelProviderGatewayAuth)),
+          testInitialBundlePath(std::move(initialTestBundlePath)),
+          testInitialBundleSHA256(std::move(initialTestBundleSHA256))
     {}
 
     bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
@@ -9274,13 +9352,31 @@ private:
           return false;
         }
 
-        String localProdigyPath = {};
         String bundlePath = {};
-        if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
-            prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false ||
+        String approvedDigest = {};
+        if (testInitialBundlePath.empty())
+        {
+          String localProdigyPath = {};
+          if (resolveLocalProdigyExecutablePath(localProdigyPath, failure) == false ||
+              prodigyResolveBundleArtifactInput(localProdigyPath, cluster.architecture, bundlePath, failure) == false)
+          {
+            finalizeTiming();
+            return false;
+          }
+        }
+        else
+        {
+          bundlePath = testInitialBundlePath;
+        }
+        if (prodigyApproveBundleArtifact(bundlePath, approvedDigest, failure) == false ||
+            (testInitialBundleSHA256.empty() == false && approvedDigest.equals(testInitialBundleSHA256) == false) ||
             mothershipProvisionVirtualDatacenterSeed(cluster, topology, request, runtimeEnvironment, bundlePath, failure) == false ||
             mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterSeedRuntimeFilename, failure) == false)
         {
+          if (failure && failure->empty() && testInitialBundleSHA256.empty() == false)
+          {
+            failure->assign("test initial bundle changed after create admission"_ctv);
+          }
           finalizeTiming();
           return false;
         }
@@ -10711,13 +10807,154 @@ private:
     if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
         prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
         prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA) ||
-        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA, &failure) == false)
+        mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, incompleteWorkerSHA,
+                                                 nullptr, nullptr, &failure) == false)
     {
       basics_log("recoverTestClusterBundle accepted=0 failure=%s\n", failure.empty() ? "recovery identity validation failed" : failure.c_str());
       exit(EXIT_FAILURE);
     }
     basics_log("recoverTestClusterBundle accepted=1 phase=workerReplaced machineIndex=%u successorSHA256=%s applicationHealthAttested=0\n",
                unsigned(index), successorSHA.c_str());
+  }
+
+  // This is deliberately a disposable, exact-runtime19b fixture operation.
+  // It does not admit a production rollout, attest application health or prove
+  // an authority quorum after the retained process is replaced.
+  void runRecoverTestClusterFollowerBrain(int argc, char *argv[])
+  {
+    if (argc != 4)
+    {
+      basics_log("recoverTestClusterFollowerBrain expects [name|clusterUUID] [approved bundle] [nonmaster machine index] [exact runtime19b bundle SHA256]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}; identity.assign(argv[0]);
+    String input = {}; input.assign(argv[1]);
+    String oldSHA = {}; oldSHA.assign(argv[3]);
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    uint64_t index = 0;
+    // A completed transaction is queried from its durable owner before a new
+    // report is requested.  The selected member now runs the successor, so a
+    // second report cannot be expected to reproduce the initial 19b snapshot.
+    if (loadClusterForScopedMutation("recoverTestClusterFollowerBrain", identity, cluster, failure) &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.nBrains == 3 &&
+        cluster.test.machineCount == 3 && mothershipParseUnsignedArgument(argv[2], 3, index) && index > 0 &&
+        prodigyIsSHA256HexDigest(oldSHA))
+    {
+      MachineCpuArchitecture completedArchitecture = MachineCpuArchitecture::unknown;
+      String completedBundle = {}, completedSHA = {};
+      if (resolveProdigyBundleTargetArchitecture(argv[0], completedArchitecture, &failure) &&
+          prodigyResolveBundleArtifactInput(input, completedArchitecture, completedBundle, &failure) &&
+          prodigyApproveBundleArtifact(completedBundle, completedSHA, &failure) && completedSHA.equals(oldSHA) == false)
+      {
+        String recoveryRoot = {}, directoryName = {}, directory = {};
+        mothershipVirtualDatacenterPath(cluster.test.workspaceRoot, "virtual-datacenter.recovery", recoveryRoot);
+        directoryName.snprintf<"follower-machine{itoa}-{}-{}"_ctv>(index, oldSHA, completedSHA);
+        mothershipVirtualDatacenterPath(recoveryRoot, directoryName.c_str(), directory);
+        MothershipVDCBundleRecovery completed = {};
+        if (mothershipVDCReadRecovery(directory, completed) &&
+            mothershipVDCTestFollowerRecoveryMatches(completed, cluster.clusterUUID, uint32_t(index), oldSHA, completedSHA))
+        {
+          const bool wasComplete = completed.phase == MothershipVDCRecoveryPhase::complete;
+          uint128_t resumedOperationID = 0;
+          String noIncompleteBundle = {};
+          if (mothershipRecoverVirtualDatacenterBundle(cluster, completedBundle, completedSHA, uint32_t(index), oldSHA, noIncompleteBundle,
+                                                       &completed, &resumedOperationID, &failure) == false)
+          {
+            basics_log("recoverTestClusterFollowerBrain accepted=0 resumed=1 failure=%s\n", failure.empty() ? "retained follower recovery could not resume" : failure.c_str());
+            exit(EXIT_FAILURE);
+          }
+          completed.operationID = resumedOperationID;
+          String operationText = {}; operationText.assignItoh(completed.operationID);
+          basics_log("recoverTestClusterFollowerBrain accepted=1 resumed=1 phase=%s operationID=%s machineIndex=%u sourceSHA256=%s successorSHA256=%s applicationHealthAttested=0 quorumAttested=0\n",
+                     wasComplete ? "complete" : "workerReplaced",
+                     operationText.c_str(), unsigned(index), oldSHA.c_str(), completedSHA.c_str());
+          return;
+        }
+      }
+    }
+    // The initial admission below starts from a fresh legacy fixture only.
+    failure.clear(); cluster = {}; index = 0;
+    if (loadClusterForScopedMutation("recoverTestClusterFollowerBrain", identity, cluster, failure) == false ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.nBrains != 3 ||
+        cluster.test.machineCount != 3 || mothershipParseUnsignedArgument(argv[2], 3, index) == false ||
+        index == 0 || prodigyIsSHA256HexDigest(oldSHA) == false || configureControlTarget(argv[0], &failure) == false ||
+        socket.connect() != 0)
+    {
+      socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "invalid exact legacy test fixture request" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message::construct(socket.wBuffer, MothershipTopic::pullClusterReport);
+    if (socket.send() == false)
+    {
+      failure = socket.ioFailureDetail(); socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "cluster report request failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullClusterReport, 1024);
+    if (response == nullptr)
+    {
+      failure = socket.ioFailureDetail(); socket.close();
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "cluster report unavailable" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String serializedReport = {}; uint8_t *args = response->args;
+    Message::extractToStringView(args, serializedReport);
+    ClusterStatusReport report = {};
+    MothershipVDCBundleRecovery preflight = {};
+    bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(serializedReport, report) &&
+                 prodigyComputeSHA256Hex(serializedReport, preflight.preflightReportSHA256, &failure) &&
+                 report.hasTopology && report.topology.machines.size() == 3 && report.machineReports.size() == 3 && cluster.topology.machines.size() == 3;
+    uint32_t masters = 0;
+    for (uint32_t member = 0; valid && member < 3; ++member)
+    {
+      const ClusterMachine& topologyMachine = report.topology.machines[member];
+      String uuid = {}; uuid.assignItoh(topologyMachine.uuid);
+      const MachineStatusReport *status = nullptr;
+      for (const MachineStatusReport& candidate : report.machineReports)
+        if (candidate.machineUUID.equals(uuid)) { status = &candidate; break; }
+      if (topologyMachine.uuid == 0 || cluster.topology.machines[member].uuid != topologyMachine.uuid || status == nullptr || status->isBrain == false ||
+          status->state.equals("healthy"_ctv) == false || status->controlPlaneReachable == false ||
+          status->runtimeReady == false || status->runningProdigyVersion.equals("19"_ctv) == false)
+      { valid = false; break; }
+      if (status->currentMaster) { ++masters; preflight.masterMachineUUID = uuid; }
+      else if (member + 1 == index) preflight.selectedMachineUUID = uuid;
+      else preflight.witnessMachineUUID = uuid;
+    }
+    socket.close();
+    if (!valid || masters != 1 || preflight.selectedMachineUUID.empty() || preflight.witnessMachineUUID.empty() ||
+        preflight.selectedMachineUUID.equals(preflight.masterMachineUUID) || preflight.witnessMachineUUID.equals(preflight.masterMachineUUID))
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=authenticated report is not an exact healthy runtime19b master-plus-two-follower fixture\n");
+      exit(EXIT_FAILURE);
+    }
+    preflight.clusterUUID = cluster.clusterUUID;
+    preflight.version = 3;
+    preflight.machineIndex = uint32_t(index);
+    preflight.expectedOldBundle = oldSHA;
+    preflight.testOnlyFollowerReplacement = true;
+    MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;
+    String bundle = {}, successorSHA = {};
+    if (resolveProdigyBundleTargetArchitecture(argv[0], architecture, &failure) == false ||
+        prodigyResolveBundleArtifactInput(input, architecture, bundle, &failure) == false ||
+        prodigyApproveBundleArtifact(bundle, successorSHA, &failure) == false || successorSHA.equals(oldSHA))
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "test follower recovery validation failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    preflight.successorBundle = successorSHA;
+    uint128_t operationID = 0;
+    String noIncompleteBundle = {};
+    if (mothershipRecoverVirtualDatacenterBundle(cluster, bundle, successorSHA, uint32_t(index), oldSHA, noIncompleteBundle,
+                                                 &preflight, &operationID, &failure) == false)
+    {
+      basics_log("recoverTestClusterFollowerBrain accepted=0 failure=%s\n", failure.empty() ? "test follower recovery validation failed" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    String operationText = {}; operationText.assignItoh(operationID);
+    basics_log("recoverTestClusterFollowerBrain accepted=1 phase=workerReplaced operationID=%s machineIndex=%u sourceSHA256=%s successorSHA256=%s applicationHealthAttested=0 quorumAttested=0\n",
+               operationText.c_str(), unsigned(index), oldSHA.c_str(), successorSHA.c_str());
   }
 
   void runProbeTestCluster(int argc, char *argv[])
@@ -16519,9 +16756,9 @@ private:
 
   void runCreateCluster(int argc, char *argv[])
   {
-    if (argc < 1)
+    if (argc < 1 || argc > 2)
     {
-      basics_log("too few arguments. ex: createCluster [json|-|@path]\n");
+      basics_log("usage: createCluster [json|-|@path] [optional test initial bundle]\n");
       exit(EXIT_FAILURE);
     }
 
@@ -16532,6 +16769,12 @@ private:
     MothershipProviderCredential dnsProviderCredentialOverride = {};
     bool hasProviderCredentialOverride = false;
     bool hasDNSProviderCredentialOverride = false;
+    const bool hasTestInitialBundleInput = argc == 2;
+    String testInitialBundleInput = {};
+    if (hasTestInitialBundleInput)
+    {
+      testInitialBundleInput.assign(argv[1]);
+    }
 
     String json;
     if (resolveJSONArgument("createCluster", argv[0], json) == false)
@@ -17128,6 +17371,29 @@ private:
     }
 
     String failure;
+
+    // A test fixture may select an exact, independently built initial runtime.
+    // Keep it transient: neither the request nor the registry record gains a
+    // release path, and non-test clusters cannot use it.  This admission must
+    // precede tunnel preparation and inline-credential persistence.  Require an
+    // explicit archive: a caller-selected input must never fall through to the
+    // Mothership's installed-bundle resolver.
+    String testInitialBundlePath = {};
+    String testInitialBundleSHA256 = {};
+    if (hasTestInitialBundleInput)
+    {
+      if (testInitialBundleInput.empty() ||
+          request.deploymentMode != MothershipClusterDeploymentMode::test ||
+          prodigyIsZstdFile(testInitialBundleInput) == false ||
+          prodigyApproveBundleArtifact(testInitialBundleInput, testInitialBundleSHA256, &failure) == false)
+      {
+        if (failure.empty()) failure.assign("test initial bundle requires deploymentMode=test and an approved nonempty explicit zstd archive"_ctv);
+        basics_log("createCluster success=0 failure=%s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+      testInitialBundlePath = testInitialBundleInput;
+    }
+
     if (request.mothershipConnectivity.kind == MothershipConnectivityKind::tunnelProvider)
     {
       ensureClusterUUIDForCreate(request);
@@ -17219,7 +17485,7 @@ private:
       }
     }
 
-    ClusterCreateHooks hooks(this, std::move(tunnelProviderGatewayAuth));
+    ClusterCreateHooks hooks(this, std::move(tunnelProviderGatewayAuth), std::move(testInitialBundlePath), std::move(testInitialBundleSHA256));
     MothershipClusterCreateTimingSummary timingSummary = {};
     if (mothershipStandUpCluster(stored, credentialPtr, hooks, &timingSummary, &failure, dnsCredentialPtr) == false)
     {
@@ -19912,6 +20178,7 @@ public:
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
+        {"recoverTestClusterFollowerBrain", &Mothership::runRecoverTestClusterFollowerBrain},
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -19973,7 +20240,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -20006,10 +20273,11 @@ int main(int argc, char *argv[])
     message.append("recommendClusterForApplications [json]\n");
     message.append("\trecommends the cheapest AWS/GCP/Azure cluster for a required country and billingModel=hourly|spot, optionally under budget, across providers=[\"all\"] or an explicit provider set\n");
     message.append("\taccepts required minMachines plus optional ingressGBPerHour and egressGBPerHour, and now considers up to three distinct machine types per recommendation\n");
-    message.append("createCluster [json|-|@path]\n");
+    message.append("createCluster [json|-|@path] [optional test initial bundle]\n");
     message.append("\tcreates a managed Prodigy cluster record, assigns a clusterUUID, and uses providerCredentialName or an inline providerCredentialOverride secret block\n");
     message.append("\toptionally enables one cluster DNS provider and ACME with dnsProvider plus acme.accountEmail/acme.termsAgreed; see prodigy/docs/dns-providers.md\n");
     message.append("\tdeploymentMode=test creates a Mothership-managed virtual datacenter\n");
+    message.append("\tan optional test initial bundle is a transient, approved explicit .zst archive used only to seed a test virtual datacenter\n");
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
@@ -20019,6 +20287,8 @@ int main(int argc, char *argv[])
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
+    message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256]\n");
+    message.append("\ttest-only exact-runtime19b three-Brain follower replacement; receipt does not attest application health or quorum\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");

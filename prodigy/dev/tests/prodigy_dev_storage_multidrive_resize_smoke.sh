@@ -10,21 +10,30 @@ upgrade_bundle="${6:-}"
 case "${test_mode}" in
    resize) host_network=true ;;
    mount-only) host_network=false ;;
-   legacy-handoff|legacy-recovery|legacy-recovery-zero|initial-health-zero|provider-handoff|bootstrap-supersession) host_network=false ;;
-   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, legacy-recovery-zero, initial-health-zero, provider-handoff or bootstrap-supersession mode" >&2; exit 2 ;;
+   legacy-handoff|legacy-recovery|legacy-recovery-zero|initial-health-zero|provider-handoff|bootstrap-supersession|follower-retained) host_network=false ;;
+   *) echo "error: expected resize, mount-only, legacy-handoff, legacy-recovery, legacy-recovery-zero, initial-health-zero, provider-handoff, bootstrap-supersession or follower-retained mode" >&2; exit 2 ;;
 esac
 is_handoff=0
-[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != legacy-recovery-zero && "${test_mode}" != initial-health-zero && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession ]] || is_handoff=1
+[[ "${test_mode}" != legacy-handoff && "${test_mode}" != legacy-recovery && "${test_mode}" != legacy-recovery-zero && "${test_mode}" != initial-health-zero && "${test_mode}" != provider-handoff && "${test_mode}" != bootstrap-supersession && "${test_mode}" != follower-retained ]] || is_handoff=1
 [[ "${storage_devices}" == 0 || "${storage_devices}" == 2 ]] || { echo "error: expected zero or two storage devices" >&2; exit 2; }
 [[ "${test_mode}" != resize || "${storage_devices}" == 2 ]] || { echo "error: resize requires two storage devices" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${storage_devices}" == 0 ]] || { echo "error: legacy handoff requires zero storage devices" >&2; exit 2; }
 [[ "${test_mode}" == initial-health-zero || "${is_handoff}" == 0 || -s "${upgrade_bundle}" ]] || { echo "error: handoff update modes require an exact upgrade bundle" >&2; exit 2; }
 [[ "${is_handoff}" == 0 || "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: legacy handoff requires the sealed successor runtime hash" >&2; exit 2; }
-if [[ "${test_mode}" == provider-handoff || "${test_mode}" == bootstrap-supersession ]]; then
+if [[ "${test_mode}" == provider-handoff || "${test_mode}" == bootstrap-supersession || "${test_mode}" == follower-retained ]]; then
    old_bundle_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_BUNDLE_SHA256:-}"
    [[ "${old_bundle_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: handoff mode requires sealed old bundle SHA" >&2; exit 2; }
-   create_mothership_bin="${PRODIGY_STORAGE_HANDOFF_CREATE_MOTHERSHIP_BIN:-}"
-   [[ -x "${create_mothership_bin}" ]] || { echo "error: handoff mode requires executable sealed predecessor Mothership" >&2; exit 2; }
+   if [[ "${test_mode}" != follower-retained ]]; then
+      create_mothership_bin="${PRODIGY_STORAGE_HANDOFF_CREATE_MOTHERSHIP_BIN:-}"
+      [[ -x "${create_mothership_bin}" ]] || { echo "error: handoff mode requires executable sealed predecessor Mothership" >&2; exit 2; }
+   fi
+fi
+if [[ "${test_mode}" == follower-retained ]]; then
+   old_runtime_sha="${PRODIGY_STORAGE_HANDOFF_EXPECTED_OLD_RUNTIME_SHA256:-}"
+   [[ "${old_runtime_sha}" =~ ^[0-9a-f]{64}$ ]] || { echo "error: follower-retained requires sealed old Prodigy executable SHA" >&2; exit 2; }
+   initial_bundle="${PRODIGY_STORAGE_HANDOFF_INITIAL_BUNDLE:-}"
+   command -v sha256sum >/dev/null 2>&1 || { echo "error: follower-retained requires sha256sum" >&2; exit 2; }
+   [[ -s "${initial_bundle}" && "$(sha256sum "${initial_bundle}" | awk '{print $1}')" == "${old_bundle_sha}" ]] || { echo "error: follower-retained requires the sealed old initial bundle" >&2; exit 2; }
 fi
 if [[ "${test_mode}" == bootstrap-supersession ]]; then
    interrupted_bundle="${PRODIGY_STORAGE_HANDOFF_INTERRUPTED_BUNDLE:-}"
@@ -68,7 +77,13 @@ MOTHERSHIP_BIN="$(readlink -f "${MOTHERSHIP_BIN}" 2>/dev/null || printf '%s' "${
 PINGPONG_BIN="$(readlink -f "${PINGPONG_BIN}" 2>/dev/null || printf '%s' "${PINGPONG_BIN}")"
 target_arch="$(prodigy_dev_detect_target_arch)"
 
-tmpdir="$(mktemp -d)"
+if [[ "${test_mode}" == follower-retained && -n "${PRODIGY_STORAGE_HANDOFF_EVIDENCE_ROOT:-}" ]]
+then
+   [[ -d "${PRODIGY_STORAGE_HANDOFF_EVIDENCE_ROOT}" ]] || { echo "error: follower-retained evidence root does not exist" >&2; exit 2; }
+   tmpdir="$(mktemp -d "${PRODIGY_STORAGE_HANDOFF_EVIDENCE_ROOT%/}/follower-retained.XXXXXX")"
+else
+   tmpdir="$(mktemp -d)"
+fi
 workspace_root="${tmpdir}/workspace"
 manifest_path="${workspace_root}/test-cluster-manifest.json"
 cluster_name="storage-multidrive-$(date -u +%Y%m%d-%H%M%S)"
@@ -208,6 +223,7 @@ then
 fi
 deployment_id=$(( (application_id << 48) | version_id ))
 machine_count=1
+brain_count=1
 application_type=stateless
 is_stateful=false
 expected_healthy=1
@@ -219,6 +235,13 @@ if [[ "${is_handoff}" == 1 ]]
 then
    # Match the retained release topology: one controller and three workers.
    machine_count=4
+   if [[ "${test_mode}" == follower-retained ]]
+   then
+      # This fixture is intentionally the exact master-plus-two-followers
+      # topology accepted by recoverTestClusterFollowerBrain.
+      machine_count=3
+      brain_count=3
+   fi
    if [[ "$test_mode" == bootstrap-supersession ]]
    then
       # Three replicas on three machines force one live application onto the
@@ -248,7 +271,7 @@ read -r -d '' CREATE_REQUEST <<EOF || true
   "name": "${cluster_name}",
   "deploymentMode": "test",
   "autoscaleIntervalSeconds": 3,
-  "nBrains": 1,
+  "nBrains": ${brain_count},
   "machineSchemas": [
     {
       "schema": "bootstrap",
@@ -269,9 +292,21 @@ read -r -d '' CREATE_REQUEST <<EOF || true
 EOF
 
 create_mothership_bin="${create_mothership_bin:-${MOTHERSHIP_BIN}}"
+create_arguments=("${CREATE_REQUEST}")
+create_environment=()
+if [[ "${test_mode}" == follower-retained ]]; then
+   # Mothership validates and installs the exact old bundle through its normal
+   # seed-first provider. The harness never stages or launches an old runtime.
+   create_arguments+=("${initial_bundle}")
+   # Hold failed creation only until this harness's EXIT trap observes it and
+   # requests Mothership removal. This also covers interruption during create.
+   create_environment+=(PRODIGY_MOTHERSHIP_KEEP_FAILED_TEST_CLUSTER=1)
+   cluster_created=1
+   archive_workspace=1
+fi
 if ! env \
-   PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
-   "${create_mothership_bin}" createCluster "${CREATE_REQUEST}" \
+   PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" "${create_environment[@]}" \
+   "${create_mothership_bin}" createCluster "${create_arguments[@]}" \
    >"${create_log}" 2>&1
 then
    echo "FAIL: createCluster test cluster failed"
@@ -373,6 +408,14 @@ then
 fi
 
 plan_json="${tmpdir}/storage.plan.json"
+# Use the runtime's app/slot/group prefix layout so group zero preserves five
+# distinct stateful roles, as in the topology-upgrade fixture.
+group_mask=$(( (1 << 10) - 1 ))
+client_prefix=$(( (application_id << 48) | (1 << 40) | group_mask ))
+sibling_prefix=$(( (application_id << 48) | (2 << 40) | group_mask ))
+cousin_prefix=$(( (application_id << 48) | (3 << 40) | group_mask ))
+seeding_prefix=$(( (application_id << 48) | (4 << 40) | group_mask ))
+sharding_prefix=$(( (application_id << 48) | (5 << 40) | group_mask ))
 cat > "${plan_json}" <<EOF
 {
   "config": {
@@ -388,12 +431,16 @@ cat > "${plan_json}" <<EOF
     "sTilHealthcheck": 3,
     "sTilKillable": 30
   },
+  "apiCredentials": {
+    "applicationID": ${application_id},
+    "requiredCredentialNames": []
+  },
   "useHostNetworkNamespace": ${host_network},
   "minimumSubscriberCapacity": 1024,
   "isStateful": ${is_stateful},
   "stateful": {
-    "clientPrefix": 601, "siblingPrefix": 602, "cousinPrefix": 603,
-    "seedingPrefix": 604, "shardingPrefix": 605,
+    "clientPrefix": ${client_prefix}, "siblingPrefix": ${sibling_prefix}, "cousinPrefix": ${cousin_prefix},
+    "seedingPrefix": ${seeding_prefix}, "shardingPrefix": ${sharding_prefix},
     "allowUpdateInPlace": true, "seedingAlways": false,
     "neverShard": true, "allMasters": false
   },
@@ -427,7 +474,7 @@ python3 - "${plan_json}" "${test_mode}" <<'PY'
 import json, sys
 with open(sys.argv[1]) as stream:
     plan = json.load(stream)
-if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'legacy-recovery-zero', 'initial-health-zero', 'provider-handoff', 'bootstrap-supersession'):
+if sys.argv[2] in ('legacy-handoff', 'legacy-recovery', 'legacy-recovery-zero', 'initial-health-zero', 'provider-handoff', 'bootstrap-supersession', 'follower-retained'):
     plan.pop('stateless')
     plan['verticalScalers'] = []
 else:
@@ -532,9 +579,10 @@ then
    archive_workspace=1
    observe_handoff()
    {
-      python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" "${test_mode}" <<'PY'
+      python3 - "${manifest_path}" "${PINGPONG_BIN}" "${handoff_id}" "$1" "${tmpdir}" "${PRODIGY_STORAGE_HANDOFF_EXPECTED_RUNTIME_SHA256}" "${test_mode}" "${follower_machine_index:-0}" "${old_runtime_sha:-}" "${old_bundle_sha:-}" "${follower_target_bundle_sha:-}" <<'PY'
 import hashlib, json, pathlib, re, sys
-manifest, executable, identity, phase, output, runtime_hash, mode = sys.argv[1:]
+manifest, executable, identity, phase, output, runtime_hash, mode, selected_machine, source_runtime_hash, source_bundle_hash, target_bundle_hash = sys.argv[1:]
+selected_machine = int(selected_machine)
 root = pathlib.Path(output)
 nodes = json.loads(pathlib.Path(manifest).read_text())['nodes']
 expected_binary = hashlib.sha256(pathlib.Path(executable).read_bytes()).hexdigest()
@@ -542,10 +590,27 @@ before = json.loads((root / 'handoff-before.json').read_text()) if phase != 'bef
 records = []
 for node in nodes:
     parent = pathlib.Path('/proc') / str(node['pid'])
-    if phase not in ('before', 'provider-step'):
-        assert hashlib.sha256((parent / 'exe').read_bytes()).hexdigest() == runtime_hash, 'machine has wrong runtime bytes'
+    observed_runtime = hashlib.sha256((parent / 'exe').read_bytes()).hexdigest()
+    bundle_candidates = [parent / 'root/root/prodigy/prodigy.bundle.tar.zst',
+                         pathlib.Path(manifest).parent / 'machines' / str(node['index']) / 'root/prodigy/prodigy.bundle.tar.zst']
+    installed_bundle = next((candidate for candidate in bundle_candidates if candidate.is_file()), None)
+    if mode == 'follower-retained':
+        assert installed_bundle is not None, 'installed Prodigy bundle is not readable from the retained fixture'
+        observed_bundle = hashlib.sha256(installed_bundle.read_bytes()).hexdigest()
+    if mode == 'follower-retained' and phase == 'before':
+        assert observed_runtime == source_runtime_hash, 'fixture is not running the sealed runtime19b executable'
+        assert observed_bundle == source_bundle_hash, 'fixture does not contain the sealed runtime19b bundle'
+    if phase == 'follower-step':
+        prior = next((record for record in before if record['machineIndex'] == node['index']), None)
+        assert prior is not None, 'missing source runtime record for machine'
+        expected_runtime = runtime_hash if node['index'] == selected_machine else prior['runtimeSHA256']
+        expected_bundle = target_bundle_hash if node['index'] == selected_machine else prior['bundleSHA256']
+        assert observed_runtime == expected_runtime, 'follower replacement changed an unexpected runtime image'
+        assert observed_bundle == expected_bundle, 'follower replacement changed an unexpected installed bundle'
+    elif phase not in ('before', 'provider-step'):
+        assert observed_runtime == runtime_hash, 'machine has wrong runtime bytes'
     children = []
-    if mode in ('provider-handoff', 'bootstrap-supersession'):
+    if mode in ('provider-handoff', 'bootstrap-supersession', 'follower-retained'):
         for leaf in (parent / 'root/sys/fs/cgroup/containers.slice').glob('*.slice/leaf/cgroup.procs'):
             children.extend(leaf.read_text().split())
     else:
@@ -579,9 +644,9 @@ for node in nodes:
                            == (metadata.st_dev, metadata.st_ino)]
             assert matches, 'live storage does not match a known owner'
             storage_relative = matches[0]
-        elif phase in ('upgraded', 'recovered', 'provider-step'):
+        elif phase in ('upgraded', 'recovered', 'provider-step', 'follower-step'):
             storage_relative = pathlib.Path(next(r['storageRelativePath'] for r in before if r['uuid'] == uuid))
-        if phase in ('before', 'upgraded', 'recovered', 'provider-step'):
+        if phase in ('before', 'upgraded', 'recovered', 'provider-step', 'follower-step'):
             original = owner / storage_relative
             assert (original.stat().st_dev, original.stat().st_ino) == (metadata.st_dev, metadata.st_ino)
         else:
@@ -594,12 +659,14 @@ for node in nodes:
                             device=metadata.st_dev, inode=metadata.st_ino, uid=metadata.st_uid, storageRelativePath=str(storage_relative),
                             networkNamespace=str((child / 'ns/net').readlink()),
                             cgroup=(child / 'cgroup').read_text(),
+                            runtimeSHA256=observed_runtime,
+                            bundleSHA256=observed_bundle if mode == 'follower-retained' else '',
                             applicationSHA256=expected_binary))
 assert len(records) == 3, f'expected three real fixture replicas, got {len(records)}'
 if mode == 'bootstrap-supersession' and phase == 'before':
     assert any(r['machineIndex'] == 1 for r in records), 'checkpoint fixture must include a Brain-local application'
 
-if phase in ('upgraded', 'recovered', 'provider-step'):
+if phase in ('upgraded', 'recovered', 'provider-step', 'follower-step'):
     assert sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in records) == \
            sorted((r['pid'], r['starttime'], r['uuid'], r['device'], r['inode'], r['networkNamespace'], r['cgroup']) for r in before), 'bundle upgrade changed live app/storage/network owners'
 if phase == 'after':
@@ -755,7 +822,117 @@ PY_HANDOFF_WAIT
       echo "PASS: direct-runtime initial 3/0 health recovery, durable idempotent operation and three-replica storage readback"
       exit 0
    fi
-   if [[ "${test_mode}" == provider-handoff ]]; then
+   if [[ "${test_mode}" == follower-retained ]]; then
+      # This is deliberately an initial mechanics/storage experiment. It does
+      # not claim uninterrupted traffic, a controller quorum history, or a
+      # production follower-replacement protocol.
+      env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+         timeout 8s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/follower-before-cluster.log" 2>&1
+      follower_machine_index="$(python3 - "${tmpdir}/follower-before-cluster.log" "${tmpdir}/handoff-before.json" "${manifest_path}" <<'PY_FOLLOWER_SELECT'
+import json, pathlib, re, sys
+report, before = map(pathlib.Path, sys.argv[1:3])
+nodes = json.loads(pathlib.Path(sys.argv[3]).read_text())['nodes']
+by_address = {node['ipv4']: int(node['index']) for node in nodes}
+assert len(by_address) == 3, 'fixture has duplicate machine addresses'
+text = report.read_text()
+blocks = re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)', text)
+records = json.loads(before.read_text())
+actual = {int(record['machineIndex']) for record in records}
+assert len(blocks) == 3 and len(actual) == 3, 'fixture is not three machines with three live replicas'
+candidates = []
+seen = set()
+masters = 0
+for block in blocks:
+    identity = re.search(r'(?m)^[ \t]*identity uuid=(0x[0-9a-f]+) .*sshAddress=(\S+)', block)
+    assert identity and identity.group(2) in by_address, 'reported machine is outside fixture'
+    index = by_address[identity.group(2)]
+    assert index not in seen, 'report repeats a fixture machine'
+    seen.add(index)
+    lifecycle = re.search(r'(?m)^[ \t]*lifecycle .*currentMaster=(\d)\b', block)
+    assert lifecycle and lifecycle.group(1) in ('0', '1'), 'missing master identity'
+    masters += int(lifecycle.group(1))
+    if lifecycle.group(1) == '0' and index in actual:
+        candidates.append(index)
+assert candidates and masters == 1, 'fixture needs one master and an observed nonmaster replica'
+print(min(candidates))
+PY_FOLLOWER_SELECT
+)"
+      [[ "${follower_machine_index}" =~ ^[123]$ ]] || { echo "FAIL: could not select an observed nonmaster fixture replica" >&2; exit 1; }
+      for retry in initial retry
+      do
+         env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+            "${MOTHERSHIP_BIN}" recoverTestClusterFollowerBrain "${cluster_name}" "${upgrade_bundle}" \
+            "${follower_machine_index}" "${old_bundle_sha}" >"${tmpdir}/follower-${retry}.log" 2>&1
+         python3 - "${tmpdir}/follower-${retry}.log" "${tmpdir}/follower-initial-receipt.json" \
+            "${follower_machine_index}" "${old_bundle_sha}" <<'PY_FOLLOWER_RECEIPT'
+import json, pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+line = next((line for line in text.splitlines() if line.startswith('recoverTestClusterFollowerBrain accepted=')), '')
+fields = dict(re.findall(r'(\w+)=([^\s]*)', line))
+assert fields.get('accepted') == '1', line
+assert fields.get('machineIndex') == sys.argv[3], line
+assert fields.get('sourceSHA256') == sys.argv[4], line
+assert re.fullmatch(r'[0-9a-f]{64}', fields.get('successorSHA256', '')), line
+assert re.fullmatch(r'0x[0-9a-f]{1,32}', fields.get('operationID', '')) and int(fields['operationID'], 16) != 0, line
+receipt = dict(operationID=fields['operationID'], machineIndex=fields['machineIndex'],
+               sourceSHA256=fields['sourceSHA256'], successorSHA256=fields['successorSHA256'])
+path = pathlib.Path(sys.argv[2])
+if path.exists():
+    assert json.loads(path.read_text()) == receipt, 'retry changed follower operation/member/target receipt'
+else:
+    path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
+print('FOLLOWER_RECOVERY_RECEIPT_PASS', pathlib.Path(sys.argv[1]).name, receipt['operationID'])
+PY_FOLLOWER_RECEIPT
+      done
+      follower_target_bundle_sha="$(python3 - "${tmpdir}/follower-initial-receipt.json" <<'PY_FOLLOWER_TARGET'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())['successorSHA256'])
+PY_FOLLOWER_TARGET
+)"
+      observe_handoff follower-step >"${tmpdir}/follower-owner-observe.log" 2>&1 || {
+         echo "FAIL: retained follower replacement changed a live application/storage owner" >&2; exit 1;
+      }
+      follower_final_cluster_ready()
+      {
+         python3 - "${tmpdir}/follower-after-cluster.log" "${tmpdir}/follower-before-cluster.log" <<'PY_FOLLOWER_FINAL'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+blocks = re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)', text)
+assert len(blocks) == 3, 'final report does not contain all three machines'
+def identities(report):
+    return set(re.findall(r'(?m)^[ \t]*identity uuid=(0x[0-9a-f]+) ', report))
+assert len(identities(text)) == 3 and identities(text) == identities(pathlib.Path(sys.argv[2]).read_text()), 'commissioned member identities changed'
+masters = 0
+for index, block in enumerate(blocks, 1):
+    state = re.search(r'^[ \t]*Machine: state=(\S+) role=brain ', block, re.M)
+    lifecycle = re.search(r'(?m)^[ \t]*lifecycle controlPlaneReachable=(\d) runtimeReady=(\d) currentMaster=(\d)', block)
+    assert state and state.group(1) == 'healthy', 'follower fixture lost a healthy Brain'
+    assert lifecycle and lifecycle.group(1, 2) == ('1', '1'), 'follower fixture is not control-plane/runtime ready'
+    masters += int(lifecycle.group(3))
+assert masters == 1, 'follower fixture does not report exactly one current master'
+print('FOLLOWER_FINAL_REPORT_PASS masters=1')
+PY_FOLLOWER_FINAL
+      }
+      final_ready=0
+      follower_ready_deadline=$((SECONDS + 90))
+      while (( SECONDS < follower_ready_deadline ))
+      do
+         if env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+               timeout 15s "${MOTHERSHIP_BIN}" clusterReport "${cluster_name}" >"${tmpdir}/follower-after-cluster.log" 2>&1 &&
+            env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
+               timeout 8s "${MOTHERSHIP_BIN}" applicationReport "${cluster_name}" Nametag >"${tmpdir}/follower-after-application.log" 2>&1 &&
+            follower_final_cluster_ready &&
+            report_version_ready "${tmpdir}/follower-after-application.log" "${version_id}" 3 3 running
+         then
+            final_ready=1
+            break
+         fi
+         sleep 0.5
+      done
+      [[ "${final_ready}" == 1 ]] || { echo "FAIL: follower fixture did not recover full three-Brain readiness with three non-crashing replicas" >&2; exit 1; }
+      echo "PASS: initial follower-retained mechanics/storage experiment selectedMachine=${follower_machine_index} replicas=3"
+      exit 0
+   elif [[ "${test_mode}" == provider-handoff ]]; then
       for machine_index in 2 3 4 1; do
          env PRODIGY_MOTHERSHIP_TIDESDB_PATH="${mothership_db_path}" \
             "${MOTHERSHIP_BIN}" recoverTestClusterBundle "${cluster_name}" "${upgrade_bundle}" "${machine_index}" "${old_bundle_sha}" >>"${tmpdir}/upgrade.log" 2>&1
