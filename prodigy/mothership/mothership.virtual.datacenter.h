@@ -167,6 +167,230 @@ static inline bool mothershipVirtualDatacenterPairBoundaryDescriptorValid(
 }
 
 
+// The provider has no retirement authority.  This is a typed observation of
+// its current pair-router state, bound to the descriptor Mothership admitted.
+class MothershipVirtualDatacenterPairDrainObservation {
+public:
+  uint32_t version = 1;
+  String operationID;
+  String sourceClusterUUID;
+  String targetClusterUUID;
+  String sourceRuntimeIdentity;
+  String targetRuntimeIdentity;
+  uint32_t sourceMachineIndex = 0;
+  uint32_t targetMachineIndex = 0;
+  bool selectedTarget = false;
+  bool drainCapability = false;
+  uint64_t sourceFlows = 0;
+  uint64_t targetFlows = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipVirtualDatacenterPairDrainObservation& observation)
+{
+  serializer.value4b(observation.version);
+  serializer.text1b(observation.operationID, 34);
+  serializer.text1b(observation.sourceClusterUUID, 34);
+  serializer.text1b(observation.targetClusterUUID, 34);
+  serializer.text1b(observation.sourceRuntimeIdentity, 32);
+  serializer.text1b(observation.targetRuntimeIdentity, 32);
+  serializer.value4b(observation.sourceMachineIndex);
+  serializer.value4b(observation.targetMachineIndex);
+  serializer.value1b(observation.selectedTarget);
+  serializer.value1b(observation.drainCapability);
+  serializer.value8b(observation.sourceFlows);
+  serializer.value8b(observation.targetFlows);
+}
+
+static inline bool mothershipVirtualDatacenterPairDrainObservationBoundValid(
+    const MothershipVirtualDatacenterPairBoundaryDescriptor& boundary,
+    const MothershipVirtualDatacenterPairDrainObservation& observation, String *failure = nullptr)
+{
+  auto reject = [&](const char *reason) -> bool { if (failure) failure->assign(reason); return false; };
+  if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(boundary, failure)) return false;
+  if (observation.version != 1 || observation.operationID != boundary.operationID ||
+      observation.sourceClusterUUID != boundary.sourceClusterUUID || observation.targetClusterUUID != boundary.targetClusterUUID ||
+      observation.sourceRuntimeIdentity != boundary.sourceRuntimeIdentity || observation.targetRuntimeIdentity != boundary.targetRuntimeIdentity ||
+      observation.sourceMachineIndex != boundary.sourceMachineIndex || observation.targetMachineIndex != boundary.targetMachineIndex)
+    return reject("pair drain observation does not match the admitted boundary");
+  if (failure) failure->clear();
+  return true;
+}
+
+static inline bool mothershipVirtualDatacenterParsePairDrainUnsigned(const String& text, uint64_t& value)
+{
+  if (text.empty() || (text.size() > 1 && text[0] == '0')) return false;
+  uint64_t parsed = 0;
+  for (char byte : text)
+  {
+    if (byte < '0' || byte > '9' || parsed > (UINT64_MAX - uint64_t(byte - '0')) / 10) return false;
+    parsed = parsed * 10 + uint64_t(byte - '0');
+  }
+  value = parsed;
+  return true;
+}
+
+static inline bool mothershipVirtualDatacenterParsePairDrainObservation(
+    const String& output, const MothershipVirtualDatacenterPairBoundaryDescriptor& expected,
+    MothershipVirtualDatacenterPairDrainObservation& observation, String *failure = nullptr)
+{
+  auto reject = [&](const char *reason) -> bool { observation = {}; if (failure) failure->assign(reason); return false; };
+  if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(expected, failure)) return false;
+  constexpr const char prefix[] = "PAIR_BOUNDARY";
+  const char *cursor = reinterpret_cast<const char *>(output.data()), *terminal = reinterpret_cast<const char *>(output.data()) + output.size();
+  auto match = [&](const char *text) {
+    for (; *text != 0; ++text) { if (cursor == terminal || *cursor++ != *text) return false; }
+    return true;
+  };
+  auto field = [&](const char *name, String& value) {
+    if (cursor == terminal || *cursor++ != ' ' || !match(name) || cursor == terminal || *cursor++ != '=') return false;
+    const char *begin = cursor;
+    while (cursor != terminal && *cursor != ' ' && *cursor != '\n' && *cursor != '\r')
+    {
+      const unsigned char byte = static_cast<unsigned char>(*cursor);
+      if (byte < 0x21 || byte > 0x7e) return false;
+      ++cursor;
+    }
+    if (cursor == begin) return false;
+    value.clear(); value.append(begin, uint64_t(cursor - begin));
+    return true;
+  };
+  String operation = {}, sourceCluster = {}, targetCluster = {}, sourceRuntime = {}, targetRuntime = {};
+  String sourceMachine = {}, targetMachine = {}, selected = {}, capability = {}, sourceFlows = {}, targetFlows = {};
+  if (!match(prefix) || !field("operationID", operation) || !field("sourceClusterUUID", sourceCluster) ||
+      !field("targetClusterUUID", targetCluster) || !field("sourceRuntimeIdentity", sourceRuntime) ||
+      !field("targetRuntimeIdentity", targetRuntime) || !field("sourceMachineIndex", sourceMachine) ||
+      !field("targetMachineIndex", targetMachine) || !field("selected", selected) ||
+      !field("drainCapability", capability) || !field("sourceFlows", sourceFlows) || !field("targetFlows", targetFlows))
+    return reject("pair drain observation is malformed");
+  if (cursor != terminal)
+  {
+    if (*cursor == '\n') ++cursor;
+    else if (*cursor == '\r' && cursor + 1 != terminal && cursor[1] == '\n') cursor += 2;
+    else return reject("pair drain observation has invalid line ending");
+  }
+  if (cursor != terminal) return reject("pair drain observation has trailing data");
+  uint64_t sourceIndex = 0, targetIndex = 0, selectedValue = 0, capabilityValue = 0, sourceCount = 0, targetCount = 0;
+  if (!mothershipVirtualDatacenterParsePairDrainUnsigned(sourceMachine, sourceIndex) || sourceIndex > UINT32_MAX ||
+      !mothershipVirtualDatacenterParsePairDrainUnsigned(targetMachine, targetIndex) || targetIndex > UINT32_MAX ||
+      !mothershipVirtualDatacenterParsePairDrainUnsigned(selected, selectedValue) || (selectedValue != 1 && selectedValue != 2) ||
+      !mothershipVirtualDatacenterParsePairDrainUnsigned(capability, capabilityValue) || capabilityValue != 1 ||
+      !mothershipVirtualDatacenterParsePairDrainUnsigned(sourceFlows, sourceCount) ||
+      !mothershipVirtualDatacenterParsePairDrainUnsigned(targetFlows, targetCount))
+    return reject("pair drain observation has invalid counters or selector");
+  observation.version = 1; observation.operationID = std::move(operation);
+  observation.sourceClusterUUID = std::move(sourceCluster); observation.targetClusterUUID = std::move(targetCluster);
+  observation.sourceRuntimeIdentity = std::move(sourceRuntime); observation.targetRuntimeIdentity = std::move(targetRuntime);
+  observation.sourceMachineIndex = uint32_t(sourceIndex); observation.targetMachineIndex = uint32_t(targetIndex);
+  observation.selectedTarget = selectedValue == 2; observation.drainCapability = true;
+  observation.sourceFlows = sourceCount; observation.targetFlows = targetCount;
+  if (!mothershipVirtualDatacenterPairDrainObservationBoundValid(expected, observation, failure)) { observation = {}; return false; }
+  return true;
+}
+
+
+class MothershipVirtualDatacenterPairGuestResetFence {
+public:
+  String operationID;
+  String descriptorSHA256;
+  String bootID;
+  String guestID;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipVirtualDatacenterPairGuestResetFence& fence)
+{
+  serializer.text1b(fence.operationID, 34);
+  serializer.text1b(fence.descriptorSHA256, 64);
+  serializer.text1b(fence.bootID, 36);
+  serializer.text1b(fence.guestID, 128);
+}
+
+static inline bool mothershipVirtualDatacenterBootIDValid(const String& value)
+{
+  if (value.size() != 36) return false;
+  bool nonzero = false;
+  for (uint32_t i = 0; i < value.size(); ++i)
+  {
+    if (i == 8 || i == 13 || i == 18 || i == 23) { if (value[i] != '-') return false; }
+    else
+    {
+      if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) return false;
+      nonzero = nonzero || value[i] != '0';
+    }
+  }
+  return nonzero;
+}
+
+static inline bool mothershipVirtualDatacenterPairDescriptorSHA256(
+    const MothershipVirtualDatacenterPairBoundaryDescriptor& boundary, String& digest)
+{
+  if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(boundary)) return false;
+  String encoded = {}, value = {};
+  auto line = [&](const String& field) { encoded.append(field); encoded.append("\n"_ctv); };
+  value.assign(mothershipVirtualDatacenterPairBoundaryRoot); value.append("/"_ctv); value.append(boundary.operationID); line(value);
+  line(boundary.operationID); line(boundary.sourceClusterUUID); line(boundary.targetClusterUUID);
+  line(boundary.sourceWorkspace); line(boundary.sourceRuntimeIdentity);
+  value.clear(); value.assignItoa(boundary.sourceMachineIndex); line(value); line(boundary.sourceMachinePrivate4);
+  line(boundary.targetWorkspace); line(boundary.targetRuntimeIdentity);
+  value.clear(); value.assignItoa(boundary.targetMachineIndex); line(value); line(boundary.targetMachinePrivate4);
+  line(boundary.endpointIPv4); value.clear(); value.assignItoa(boundary.endpointPort); line(value);
+  return prodigyComputeSHA256Hex(encoded, digest);
+}
+
+static inline bool mothershipVirtualDatacenterPairGuestResetFenceValid(
+    const MothershipVirtualDatacenterPairGuestResetFence& fence,
+    const MothershipVirtualDatacenterPairBoundaryDescriptor& boundary)
+{
+  if (fence.operationID != boundary.operationID || !mothershipVirtualDatacenterBootIDValid(fence.bootID) ||
+      fence.guestID.empty() || fence.guestID.size() > 128) return false;
+  for (uint32_t i = 0; i < fence.guestID.size(); ++i)
+  {
+    const char ch = fence.guestID[i];
+    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+          (i > 0 && (ch == '-' || ch == '_' || ch == '.')))) return false;
+  }
+  String digest = {};
+  return mothershipVirtualDatacenterPairDescriptorSHA256(boundary, digest) && digest == fence.descriptorSHA256;
+}
+
+// One bounded provider line; no caller-supplied reset assertion is accepted.
+// Completion additionally names the observed post-reset kernel boot.
+static inline bool mothershipVirtualDatacenterParsePairGuestResetObservation(
+    const String& output, const MothershipVirtualDatacenterPairBoundaryDescriptor& boundary,
+    MothershipVirtualDatacenterPairGuestResetFence& fence, String *completedBootID = nullptr)
+{
+  fence = {};
+  if (completedBootID) completedBootID->clear();
+  MothershipVirtualDatacenterPairGuestResetFence parsed = {};
+  String parsedCompletion = {};
+  if (output.empty() || output.size() > 512) return false;
+  const char *cursor = reinterpret_cast<const char *>(output.data());
+  const char *end = cursor + output.size();
+  auto match = [&](const char *literal) {
+    size_t n = std::strlen(literal);
+    if (size_t(end - cursor) < n || std::memcmp(cursor, literal, n) != 0) return false;
+    cursor += n; return true;
+  };
+  auto field = [&](const char *name, String& value) {
+    if (!match(" ") || !match(name) || !match("=")) return false;
+    const char *begin = cursor;
+    while (cursor < end && *cursor > ' ' && *cursor < 127) ++cursor;
+    if (cursor == begin) return false;
+    value.append(begin, uint64_t(cursor - begin)); return true;
+  };
+  if (!match(completedBootID ? "PAIR_GUEST_RESET_COMPLETE" : "PAIR_GUEST_RESET") ||
+      !field("operationID", parsed.operationID) || !field("descriptorSHA256", parsed.descriptorSHA256) ||
+      !field("bootID", parsed.bootID) || !field("guestID", parsed.guestID) ||
+      (completedBootID && !field("completedBootID", parsedCompletion))) return false;
+  if (cursor < end && *cursor == '\n') ++cursor;
+  if (cursor != end || !mothershipVirtualDatacenterPairGuestResetFenceValid(parsed, boundary) ||
+      (completedBootID && (!mothershipVirtualDatacenterBootIDValid(parsedCompletion) || parsedCompletion == parsed.bootID))) return false;
+  fence = std::move(parsed);
+  if (completedBootID) *completedBootID = std::move(parsedCompletion);
+  return true;
+}
+
 static inline void mothershipVirtualDatacenterPath(const String& workspaceRoot, const char *name, String& path)
 {
   path.assign(workspaceRoot);

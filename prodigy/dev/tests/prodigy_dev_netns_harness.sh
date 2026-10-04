@@ -256,6 +256,15 @@ then
             "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" follower-retained 0 \
             "$(dirname "${prodigy_bin}")/prodigy.$(uname -m).bundle.tar.zst"
          ;;
+      pair-admission|pair-admission-master-crash|pair-admission-cold|pair-admission-source-crash)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         pair_admission_mode="admission"
+         [[ "${runtime_qualification}" == pair-admission-master-crash ]] && pair_admission_mode="admission-master-crash"
+         [[ "${runtime_qualification}" == pair-admission-cold ]] && pair_admission_mode="admission-cold"
+         [[ "${runtime_qualification}" == pair-admission-source-crash ]] && pair_admission_mode="admission-source-crash"
+         exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" "${pair_admission_mode}"
+         ;;
       pair-endpoint)
          [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
          exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \

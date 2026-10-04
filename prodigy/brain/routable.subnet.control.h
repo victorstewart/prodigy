@@ -526,6 +526,10 @@ inline void Brain::acknowledgeMasterAuthorityTransition(
   tracking.sentTransitionDigestsByGeneration.erase(digestIt);
   reconcilePendingElasticAddressAssignments();
   reconcilePendingElasticAddressReleases();
+  resumeStatelessDeploymentsAfterAuthorityAcknowledgement();
+  // Resume the ordinary plan/blob owner only after this peer has ACKed the
+  // exact v3 authority receipt carrying its normalized plan.
+  replayUnacknowledgedDeploymentsToRegisteredBrain(peer);
   reapRetiringMachines();
   maybeTransitionFollowersForUpdateSelf();
   maybeRelinquishMasterForUpdateSelf();

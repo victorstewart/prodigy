@@ -6907,6 +6907,7 @@ public:
   // Reconcile pending work and close target deficits after master/brain recovery.
   void recoverAfterReboot(void)
   {
+    if (thisBrain->deploymentLaunchFenced(plan.config.deploymentID())) return;
     if (thisBrain != nullptr && thisBrain->statefulServingDecisionExists(plan.config.deploymentID()) &&
         !thisBrain->restoreStatefulServingDecision(this)) return;
     autoscaleTrace("deployment recovery inspect deploymentID=%llu state=%u containers=%llu topologyPhase=%u lockedGroups=%llu\n",
@@ -9286,6 +9287,7 @@ public:
 
   void schedule(CoroutineStack *waiter = nullptr)
   {
+    if (thisBrain->deploymentLaunchFenced(plan.config.deploymentID())) co_return;
     // A failed deployment remains owned by its failure path. Late health or
     // credential callbacks must not resume queued construction or destruction.
     if (state == DeploymentState::failed && operatorCancellationOwnsTransition == false)
@@ -11122,6 +11124,7 @@ public:
 
   void deploy(void)
   {
+    if (thisBrain->deploymentLaunchFenced(plan.config.deploymentID())) co_return;
     if (plan.isStateful)
     {
       prodigyLogDeployHeapSnapshot(

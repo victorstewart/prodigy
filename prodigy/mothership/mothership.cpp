@@ -1,4 +1,6 @@
 #include <arpa/inet.h>
+#include <chrono>
+#include <prodigy/container.retirement.h>
 #include <limits.h>
 #include <services/debug.h>
 #include <cctype>
@@ -13,6 +15,7 @@
 #include <libssh2/libssh2.h>
 #include <linux/capability.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <simdjson.h>
 #include <signal.h>
 #include <string_view>
@@ -33,6 +36,7 @@
 #include <prodigy/containerstore.h>
 #include <prodigy/dns.providers.h>
 #include <prodigy/iaas/runtime/runtime.h>
+#include <prodigy/ingress.validation.h>
 #include <prodigy/persistent.state.h>
 #include <prodigy/remote.bootstrap.h>
 #include <prodigy/routable.address.helpers.h>
@@ -3569,13 +3573,11 @@ static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String 
   return true;
 }
 
-static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *failure = nullptr)
+static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *output, String *failure)
 {
   int providerFD = -1;
-  if (mothershipCreateVirtualDatacenterProviderFD(providerFD, failure) == false)
-  {
-    return false;
-  }
+  if (output) output->clear();
+  if (mothershipCreateVirtualDatacenterProviderFD(providerFD, failure) == false) return false;
 
   String providerPath = {};
   providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
@@ -3583,63 +3585,131 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
   argv.reserve(arguments.size() + 3);
   argv.push_back(const_cast<char *>("/bin/bash"));
   argv.push_back(const_cast<char *>(providerPath.c_str()));
-  for (String& argument : arguments)
-  {
-    argv.push_back(const_cast<char *>(argument.c_str()));
-  }
+  for (String& argument : arguments) argv.push_back(const_cast<char *>(argument.c_str()));
   argv.push_back(nullptr);
 
+  int stdoutPipe[2] = {-1, -1};
+  if (output && ::pipe2(stdoutPipe, O_CLOEXEC) != 0)
+  {
+    ::close(providerFD);
+    if (failure) failure->snprintf<"failed to create virtual datacenter provider output pipe: {}"_ctv>(String(std::strerror(errno)));
+    return false;
+  }
   pid_t pid = ::fork();
   if (pid == 0)
   {
+    if (output && (::dup2(stdoutPipe[1], STDOUT_FILENO) < 0)) _exit(127);
+    if (output) { ::close(stdoutPipe[0]); ::close(stdoutPipe[1]); }
     ::execv("/bin/bash", argv.data());
     _exit(127);
   }
+  ::close(providerFD);
+  if (output) ::close(stdoutPipe[1]);
   if (pid < 0)
   {
-    ::close(providerFD);
-    if (failure)
-    {
-      failure->snprintf<"failed to launch virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
-    }
+    if (output) ::close(stdoutPipe[0]);
+    if (failure) failure->snprintf<"failed to launch virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
     return false;
   }
-  ::close(providerFD);
 
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0)
+  if (output == nullptr)
   {
-    if (errno == EINTR)
+    while (::waitpid(pid, &status, 0) < 0)
     {
-      continue;
+      if (errno == EINTR) continue;
+      if (failure) failure->snprintf<"failed to wait for virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
+      return false;
     }
-    if (failure)
-    {
-      failure->snprintf<"failed to wait for virtual datacenter provider: {}"_ctv>(String(std::strerror(errno)));
-    }
-    return false;
   }
-
+  else
+  {
+    bool outputClosed = false, failedCapture = false, childKilled = false, exited = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto closeOutput = [&]() { if (!outputClosed) { ::close(stdoutPipe[0]); outputClosed = true; } };
+    auto stopChild = [&]() { if (!childKilled && !exited) { (void)::kill(pid, SIGKILL); childKilled = true; } };
+    const int flags = ::fcntl(stdoutPipe[0], F_GETFL, 0);
+    if (flags < 0 || ::fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK) != 0)
+    {
+      failedCapture = true; closeOutput(); stopChild();
+    }
+    while (!exited)
+    {
+      if (!failedCapture && !outputClosed)
+      {
+        uint8_t buffer[4096];
+        for (;;)
+        {
+          const ssize_t count = ::read(stdoutPipe[0], buffer, sizeof(buffer));
+          if (count > 0)
+          {
+            if (output->size() + uint64_t(count) > 64 * 1024)
+            {
+              output->clear(); failedCapture = true; closeOutput(); stopChild(); break;
+            }
+            output->append(buffer, uint64_t(count));
+            continue;
+          }
+          if (count == 0) { closeOutput(); break; }
+          if (errno == EINTR) continue;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+          failedCapture = true; closeOutput(); stopChild(); break;
+        }
+      }
+      const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+      if (waited == pid) { exited = true; break; }
+      if (waited < 0 && errno != EINTR) { failedCapture = true; closeOutput(); break; }
+      if (std::chrono::steady_clock::now() >= deadline)
+      {
+        failedCapture = true; closeOutput(); stopChild();
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+        exited = true;
+        break;
+      }
+      if (!failedCapture && !outputClosed)
+      {
+        pollfd descriptor = {stdoutPipe[0], POLLIN | POLLHUP | POLLERR, 0};
+        (void)::poll(&descriptor, 1, 50);
+      }
+      else
+      {
+        ::usleep(1000);
+      }
+    }
+    if (!outputClosed && !failedCapture)
+    {
+      while (!outputClosed && std::chrono::steady_clock::now() < deadline)
+      {
+        uint8_t buffer[4096]; const ssize_t count = ::read(stdoutPipe[0], buffer, sizeof(buffer));
+        if (count > 0 && output->size() + uint64_t(count) <= 64 * 1024) { output->append(buffer, uint64_t(count)); continue; }
+        if (count == 0) { closeOutput(); break; }
+        if (count > 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) { output->clear(); failedCapture = true; closeOutput(); break; }
+        pollfd descriptor = {stdoutPipe[0], POLLIN | POLLHUP | POLLERR, 0}; (void)::poll(&descriptor, 1, 50);
+      }
+      if (!outputClosed) { failedCapture = true; closeOutput(); }
+    }
+    if (failedCapture)
+    {
+      if (failure) failure->assign("virtual datacenter provider output is unavailable or exceeds 64 KiB"_ctv);
+      return false;
+    }
+  }
   if (WIFEXITED(status) == false || WEXITSTATUS(status) != 0)
   {
     if (failure)
     {
-      if (WIFSIGNALED(status))
-      {
-        failure->snprintf<"virtual datacenter provider terminated by signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
-      }
-      else
-      {
-        failure->snprintf<"virtual datacenter provider failed status={itoa}"_ctv>(uint64_t(WEXITSTATUS(status)));
-      }
+      if (WIFSIGNALED(status)) failure->snprintf<"virtual datacenter provider terminated by signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
+      else failure->snprintf<"virtual datacenter provider failed status={itoa}"_ctv>(uint64_t(WEXITSTATUS(status)));
     }
     return false;
   }
-  if (failure)
-  {
-    failure->clear();
-  }
+  if (failure) failure->clear();
   return true;
+}
+
+static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *failure = nullptr)
+{
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), nullptr, failure);
 }
 
 class MothershipVDCApplicationIdentity {
@@ -11184,8 +11254,47 @@ private:
     return true;
   }
 
+  bool readTestPairClusterStatus(const MothershipProdigyCluster& cluster,
+                                ClusterStatusReport& report, String& failure)
+  {
+    report = {};
+    socket.close();
+    String targetName = cluster.name;
+    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullClusterReport);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullClusterReport, 1024);
+    bool valid = response != nullptr;
+    if (valid)
+    {
+      uint8_t *args = response->args;
+      String encoded = {};
+      valid = ProdigyIngressValidation::extractVariableStringView(args, response->terminal(), encoded) &&
+              args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report);
+    }
+    socket.close();
+    if (!valid) failure.assign("current whole destination cluster observation is unavailable"_ctv);
+    return valid;
+  }
+
+  bool testPairWholeDestinationReady(const MothershipTestPairBoundaryRecord& record,
+                                     const MothershipProdigyCluster& target, String& failure)
+  {
+    // Each call obtains current observations through the authenticated target
+    // control connection. A prior healthy report is never stored as permission
+    // to select traffic or request source retirement.
+    ClusterStatusReport clusterReport = {};
+    DeploymentIdentityReport deploymentReport = {};
+    return readTestPairClusterStatus(target, clusterReport, failure) &&
+           readDeploymentIdentity(target, record.targetDeploymentID, deploymentReport, failure) &&
+           MothershipClusterRegistry::testPairWholeDestinationReady(record, clusterReport, deploymentReport, &failure);
+  }
+
   bool runTestPairProvider(const MothershipTestPairBoundaryRecord& record, const char *action,
-                           const Vector<String>& extra, String& failure)
+                           const Vector<String>& extra, String& failure,
+                           MothershipVirtualDatacenterPairDrainObservation *observation = nullptr,
+                           MothershipVirtualDatacenterPairGuestResetFence *resetFence = nullptr,
+                           String *completedBootID = nullptr)
   {
     const auto& d = record.boundary;
     if (!mothershipVirtualDatacenterPairBoundaryDescriptorValid(d, &failure)) return false;
@@ -11200,7 +11309,418 @@ private:
     args.emplace_back(); args.back().assignItoa(d.targetMachineIndex); args.push_back(d.targetMachinePrivate4);
     args.push_back(d.endpointIPv4); args.emplace_back(); args.back().assignItoa(d.endpointPort);
     for (const String& value : extra) args.push_back(value);
-    return mothershipRunVirtualDatacenterProvider(std::move(args), &failure);
+    if (observation == nullptr && resetFence == nullptr) return mothershipRunVirtualDatacenterProvider(std::move(args), &failure);
+    String output = {};
+    const bool providerSucceeded = mothershipRunVirtualDatacenterProvider(std::move(args), &output, &failure);
+    if (!output.empty()) std::fwrite(output.data(), 1, output.size(), stdout);
+    if (resetFence)
+    {
+      if (providerSucceeded && mothershipVirtualDatacenterParsePairGuestResetObservation(output, d, *resetFence, completedBootID)) return true;
+      if (failure.empty()) failure.assign("guest reset observation is unavailable or does not bind the recorded pair"_ctv);
+      return false;
+    }
+    return providerSucceeded && mothershipVirtualDatacenterParsePairDrainObservation(output, d, *observation, &failure);
+  }
+
+  bool observeAndRecordTestPairSourceDrain(MothershipTestPairBoundaryRecord& record, String& failure)
+  {
+    if (record.version != 3 || record.closed || record.selectorGeneration != 1)
+    {
+      failure.assign("source drain requires an open migration with the destination selected"_ctv);
+      return false;
+    }
+    MothershipProdigyCluster source = {}, target = {};
+    { auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) ||
+          !registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure)) return false; }
+    auto currentBoundary = record.boundary;
+    String expected = {}, current = {};
+    if (!bindTestPairRuntimes(source, target, currentBoundary, failure)) return false;
+    BitseryEngine::serialize(expected, record.boundary); BitseryEngine::serialize(current, currentBoundary);
+    if (expected != current) { failure.assign("paired runtime identity changed"_ctv); return false; }
+    // Re-read the complete destination on every attempt; the durable drain
+    // receipt is evidence of progress, never permission for a later retirement.
+    if (!testPairWholeDestinationReady(record, target, failure)) return false;
+    MothershipVirtualDatacenterPairDrainObservation observation = {};
+    if (!runTestPairProvider(record, "drain", {}, failure, &observation) ||
+        !observation.selectedTarget || !observation.drainCapability || observation.sourceFlows != 0)
+    {
+      if (failure.empty()) failure.assign("source connections have not drained"_ctv);
+      return false;
+    }
+    auto registry = openClusterRegistry();
+    MothershipTestPairBoundaryRecord updated = {};
+    if (!registry.recordTestPairSourceDrain(record, observation, updated, &failure)) return false;
+    record = std::move(updated);
+    return true;
+  }
+
+  bool bindTestPairRuntimes(const MothershipProdigyCluster& source,
+                            const MothershipProdigyCluster& target,
+                            MothershipVirtualDatacenterPairBoundaryDescriptor& d, String& failure)
+  {
+    if (source.deploymentMode != MothershipClusterDeploymentMode::test ||
+        target.deploymentMode != MothershipClusterDeploymentMode::test ||
+        source.test.enableFakeIpv4Boundary || target.test.enableFakeIpv4Boundary ||
+        source.nBrains != 3 || target.nBrains != 3 || source.test.machineCount != 3 || target.test.machineCount != 3 ||
+        source.clusterUUID == target.clusterUUID)
+    {
+      failure.assign("paired admission requires two independent three-Brain test clusters"_ctv);
+      return false;
+    }
+    d.sourceClusterUUID.assignItoh(source.clusterUUID); d.targetClusterUUID.assignItoh(target.clusterUUID);
+    d.sourceWorkspace = source.test.workspaceRoot; d.targetWorkspace = target.test.workspaceRoot;
+    String path = {};
+    mothershipVirtualDatacenterPath(d.sourceWorkspace, "virtual-datacenter.identity", path);
+    bool valid = mothershipReadProcFile(path, d.sourceRuntimeIdentity);
+    mothershipVirtualDatacenterPath(d.targetWorkspace, "virtual-datacenter.identity", path);
+    valid = valid && mothershipReadProcFile(path, d.targetRuntimeIdentity);
+    while (!d.sourceRuntimeIdentity.empty() && d.sourceRuntimeIdentity[d.sourceRuntimeIdentity.size() - 1] == '\n') d.sourceRuntimeIdentity.resize(d.sourceRuntimeIdentity.size() - 1);
+    while (!d.targetRuntimeIdentity.empty() && d.targetRuntimeIdentity[d.targetRuntimeIdentity.size() - 1] == '\n') d.targetRuntimeIdentity.resize(d.targetRuntimeIdentity.size() - 1);
+    d.sourceParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.sourceRuntimeIdentity);
+    d.targetParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.targetRuntimeIdentity);
+    String private6 = {}, public6 = {};
+    mothershipVirtualDatacenterMachineAddresses(d.sourceMachineIndex, source.datacenterFragment, false, d.sourceMachinePrivate4, private6, public6);
+    mothershipVirtualDatacenterMachineAddresses(d.targetMachineIndex, target.datacenterFragment, false, d.targetMachinePrivate4, private6, public6);
+    return valid && mothershipVirtualDatacenterPairBoundaryDescriptorValid(d, &failure);
+  }
+
+  bool readStatelessAdmissionReceipt(Message *response, MothershipTopic expected,
+                                     StatelessDeploymentAdmissionReceipt& receipt, String& failure)
+  {
+    if (!response || MothershipTopic(response->topic) != expected)
+    {
+      failure.assign("stateless admission outcome is unavailable; resume the same paired operation"_ctv);
+      return false;
+    }
+    uint8_t *args = response->args;
+    String serialized = {};
+    if (!ProdigyIngressValidation::extractVariableStringView(args, response->terminal(), serialized) ||
+        args != response->terminal() || !BitseryEngine::deserializeSafe(serialized, receipt) || receipt.version != 2)
+    {
+      failure.assign("stateless admission receipt is malformed"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool admitTestPairTarget(MothershipTestPairBoundaryRecord& record, const String& artifactPath, String& failure)
+  {
+    if (!record.guestResetFence.bootID.empty())
+    { failure.assign("test pair awaits guest reset cleanup"_ctv); return false; }
+    if ((record.version != 2 && record.version != 3) || record.closed)
+    {
+      failure.assign("operation has no open paired target request"_ctv);
+      return false;
+    }
+    MothershipProdigyCluster target = {}, source = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure) ||
+          !registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure)) return false;
+    }
+    auto observedBoundary = record.boundary;
+    if (!bindTestPairRuntimes(source, target, observedBoundary, failure)) return false;
+    String expectedBytes = {}, observedBytes = {};
+    BitseryEngine::serialize(expectedBytes, record.boundary); BitseryEngine::serialize(observedBytes, observedBoundary);
+    if (expectedBytes != observedBytes)
+    {
+      failure.assign("paired cluster runtime identity changed"_ctv);
+      return false;
+    }
+    String digest = {}; uint64_t bytes = 0;
+    if (!mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) ||
+        !prodigyComputeFileSHA256Hex(artifactPath, digest, &bytes, &failure) ||
+        digest != record.targetBlobSHA256 || bytes != record.targetBlobBytes)
+    {
+      if (failure.empty()) failure.assign("target artifact differs from paired request"_ctv);
+      return false;
+    }
+    uint128_t operationID = 0;
+    if (!prodigyParseCanonicalHex128(record.boundary.operationID, operationID)) return false;
+    socket.close();
+    if (!configureControlTarget(target.name.c_str(), &failure) || !socket.ensureConnected()) return false;
+    const int64_t admissionDeadlineMs = Time::now<TimeResolution::ms>() + 30'000;
+    StatelessDeploymentAdmissionReceipt receipt = {};
+    auto queryAdmission = [&]() {
+      Message::construct(socket.wBuffer, MothershipTopic::pullStatelessDeploymentAdmission, uint8_t(1), operationID);
+      if (!socket.send()) { failure = socket.ioFailureDetail(); return false; }
+      receipt = {};
+      return readStatelessAdmissionReceipt(socket.recvExpectedTopic(MothershipTopic::pullStatelessDeploymentAdmission),
+                                           MothershipTopic::pullStatelessDeploymentAdmission, receipt, failure);
+    };
+    bool valid = queryAdmission();
+    // Machine readiness does not establish current Brain peer capabilities.
+    // After election or reconnect, observe their authenticated negotiation
+    // within the same bounded admission window before sending any mutation.
+    for (uint32_t polls = 0; polls < 300 && valid && receipt.supported && !receipt.peersCapable &&
+           Time::now<TimeResolution::ms>() < admissionDeadlineMs; ++polls)
+    {
+      ::usleep(100'000);
+      valid = queryAdmission();
+    }
+    if (valid && (!receipt.supported || !receipt.peersCapable || receipt.currentAuthorityGeneration == 0 ||
+                  receipt.currentMasterUUID == 0 || receipt.currentMasterBootNs <= 0))
+    {
+      failure = receipt.failure;
+      if (failure.empty()) failure.assign("current target authority has not acknowledged stateless admission capability"_ctv);
+      valid = false;
+    }
+    if (valid && (!receipt.accepted || !receipt.live))
+    {
+      ProdigyStatelessDeploymentAdmissionRequest request = {};
+      request.operationID = operationID; request.clusterUUID = target.clusterUUID;
+      request.expectedAuthorityGeneration = receipt.currentAuthorityGeneration;
+      request.expectedMasterUUID = receipt.currentMasterUUID; request.expectedMasterBootNs = receipt.currentMasterBootNs;
+      request.requestPlanSHA256 = record.targetRequestPlanSHA256;
+      request.artifactSHA256 = record.targetBlobSHA256; request.artifactBytes = record.targetBlobBytes;
+      String header = {}; BitseryEngine::serialize(header, request);
+      uint32_t offset = Message::appendHeader(socket.wBuffer, MothershipTopic::admitStatelessDeployment);
+      Message::appendValue(socket.wBuffer, header); Message::appendValue(socket.wBuffer, record.targetRequestPlan);
+      Message::appendFile(socket.wBuffer, artifactPath); Message::finish(socket.wBuffer, offset);
+      valid = socket.send();
+      if (valid) valid = readStatelessAdmissionReceipt(socket.recvExpectedTopic(MothershipTopic::admitStatelessDeployment),
+                                                       MothershipTopic::admitStatelessDeployment, receipt, failure);
+      else failure.assign("target admission send outcome is unknown; resume the same paired operation"_ctv);
+    }
+    // A local commit is provisional until the target's commissioned peers
+    // acknowledge the same authority snapshot. Poll the existing operation;
+    // never persist its acceptance identity or repeat launch while it is pending.
+    for (uint32_t polls = 0; polls < 300 && valid && !receipt.accepted && receipt.failure.empty() && receipt.launchPending &&
+           MothershipClusterRegistry::testPairTargetAdmissionIdentityMatches(record, receipt) &&
+           Time::now<TimeResolution::ms>() < admissionDeadlineMs; ++polls)
+    {
+      ::usleep(100'000);
+      valid = queryAdmission();
+    }
+    socket.close();
+    if (valid && !receipt.accepted)
+    {
+      failure = receipt.failure;
+      if (failure.empty()) failure.assign("target admission is not durably acknowledged by its peers; resume the same paired operation"_ctv);
+      valid = false;
+    }
+    if (valid)
+    {
+      auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {};
+      valid = registry.recordTestPairTargetAdmission(record, receipt, updated, &failure);
+      if (valid) record = std::move(updated);
+    }
+    return valid;
+  }
+
+  void runAdmitTestPairTarget(int argc, char *argv[])
+  {
+    String failure = {}; TestPairLifecycleLock lock; MothershipTestPairBoundaryRecord record = {};
+    bool valid = argc == 2 && lockTestPairLifecycle(lock, failure);
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure); }
+    valid = valid && admitTestPairTarget(record, String(argv[1]), failure);
+    basics_log("admitTestPairTarget success=%u accepted=%u migrationQualified=0 failure=%s\n", unsigned(valid), unsigned(valid), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  bool readPairedSourceRetirementReceipt(Message *response, MothershipTopic expected,
+                                         PairedSourceRetirementReceipt& receipt, String& failure)
+  {
+    uint8_t *args = response ? response->args : nullptr;
+    String encoded = {};
+    if (!response || MothershipTopic(response->topic) != expected ||
+        !ProdigyIngressValidation::extractVariableStringView(args, response->terminal(), encoded) ||
+        args != response->terminal() || !BitseryEngine::deserializeSafe(encoded, receipt) || receipt.version != 1)
+    {
+      failure.assign("source retirement outcome is unavailable; resume the same paired operation"_ctv);
+      return false;
+    }
+    if (!receipt.failure.empty()) { failure = receipt.failure; return false; }
+    return true;
+  }
+
+  void runRetireTestPairSource(int argc, char *argv[])
+  {
+    String failure = {};
+    TestPairLifecycleLock lock;
+    MothershipTestPairBoundaryRecord record = {};
+    MothershipProdigyCluster source = {}, target = {};
+    PairedSourceRetirementReceipt receipt = {};
+    uint128_t operationID = 0;
+    bool valid = argc == 1 && lockTestPairLifecycle(lock, failure);
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure) &&
+              registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) &&
+              registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure) &&
+              prodigyParseCanonicalHex128(record.boundary.operationID, operationID);
+    }
+    if (valid)
+    {
+      auto currentBoundary = record.boundary;
+      String expected = {}, current = {};
+      valid = bindTestPairRuntimes(source, target, currentBoundary, failure);
+      BitseryEngine::serialize(expected, record.boundary); BitseryEngine::serialize(current, currentBoundary);
+      if (valid && expected != current) { failure.assign("paired runtime identity changed"_ctv); valid = false; }
+    }
+    if (valid && !record.guestResetFence.bootID.empty())
+    { failure.assign("test pair awaits guest reset cleanup"_ctv); valid = false; }
+    // A saved healthy or drained observation cannot authorize this command.
+    valid = valid && observeAndRecordTestPairSourceDrain(record, failure);
+    const int64_t deadlineMs = Time::now<TimeResolution::ms>() + 30'000;
+    auto connectSource = [&]() {
+      socket.close();
+      return configureControlTarget(source.name.c_str(), &failure) && socket.ensureConnected();
+    };
+    auto query = [&]() {
+      Message::construct(socket.wBuffer, MothershipTopic::pullPairedSourceRetirement, uint8_t(1), operationID);
+      if (!socket.send()) { failure = socket.ioFailureDetail(); return false; }
+      receipt = {};
+      return readPairedSourceRetirementReceipt(socket.recvExpectedTopic(MothershipTopic::pullPairedSourceRetirement),
+                                               MothershipTopic::pullPairedSourceRetirement, receipt, failure);
+    };
+    valid = valid && connectSource() && query();
+    for (uint32_t polls = 0; valid && receipt.supported && !receipt.peersCapable && polls < 300 &&
+         Time::now<TimeResolution::ms>() < deadlineMs; ++polls)
+    {
+      ::usleep(100'000); valid = query();
+    }
+    if (valid && (!receipt.supported || !receipt.peersCapable || receipt.currentAuthorityGeneration == 0 ||
+                  receipt.currentMasterUUID == 0 || receipt.currentMasterBootNs <= 0))
+    {
+      failure.assign("current source authority has not acknowledged paired retirement capability"_ctv); valid = false;
+    }
+    auto matchesFence = [&]() {
+      ProdigyPairedSourceRetirementFence fence = {};
+      if (!BitseryEngine::deserializeSafe(receipt.sealedFence, fence) || !prodigyPairedSourceRetirementFenceValid(fence) ||
+          fence.operationID != operationID || fence.sourceClusterUUID != source.clusterUUID ||
+          fence.targetClusterUUID != target.clusterUUID || fence.sourceDeploymentID != record.sourceDeploymentID ||
+          fence.targetDeploymentID != record.targetDeploymentID || fence.sourceNormalizedPlanSHA256 != record.sourcePlanSHA256 ||
+          fence.sourceBlobSHA256 != record.sourceBlobSHA256)
+      {
+        failure.assign("source retirement fence conflicts with the paired operation"_ctv); return false;
+      }
+      return true;
+    };
+    if (valid && !receipt.sealedFence.empty()) valid = matchesFence();
+    if (valid && receipt.sealedFence.empty())
+    {
+      DeploymentIdentityReport sourceReport = {};
+      valid = readDeploymentIdentity(source, record.sourceDeploymentID, sourceReport, failure) &&
+              sourceReport.profileEligible && !sourceReport.isStateful &&
+              sourceReport.canonicalPlanSHA256 == record.sourcePlanSHA256 &&
+              sourceReport.containerBlobSHA256 == record.sourceBlobSHA256 && sourceReport.containerBlobBytes != 0;
+      if (!valid && failure.empty()) failure.assign("live source differs from the paired operation"_ctv);
+      // Capability negotiation may have consumed time. Revalidate immediately
+      // before requesting the durable fence, then acquire the current source tuple.
+      valid = valid && observeAndRecordTestPairSourceDrain(record, failure) && connectSource() && query();
+      if (valid && !receipt.sealedFence.empty()) valid = matchesFence();
+      if (valid && receipt.sealedFence.empty())
+      {
+        if (!receipt.supported || !receipt.peersCapable || receipt.currentAuthorityGeneration == 0 ||
+            receipt.currentMasterUUID == 0 || receipt.currentMasterBootNs <= 0)
+        {
+          failure.assign("source authority changed before retirement preparation"_ctv); valid = false;
+        }
+      }
+      if (valid && receipt.sealedFence.empty())
+      {
+        ProdigyPairedSourceRetirementRequest request = {};
+        request.operationID = operationID;
+        request.sourceClusterUUID = source.clusterUUID; request.targetClusterUUID = target.clusterUUID;
+        request.sourceDeploymentID = record.sourceDeploymentID; request.targetDeploymentID = record.targetDeploymentID;
+        request.expectedAuthorityGeneration = receipt.currentAuthorityGeneration;
+        request.expectedMasterUUID = receipt.currentMasterUUID; request.expectedMasterBootNs = receipt.currentMasterBootNs;
+        request.sourceNormalizedPlanSHA256 = record.sourcePlanSHA256;
+        request.sourceBlobSHA256 = record.sourceBlobSHA256; request.sourceBlobBytes = sourceReport.containerBlobBytes;
+        String encoded = {}; BitseryEngine::serialize(encoded, request);
+        Message::construct(socket.wBuffer, MothershipTopic::preparePairedSourceRetirement, encoded);
+        valid = socket.send() && readPairedSourceRetirementReceipt(
+          socket.recvExpectedTopic(MothershipTopic::preparePairedSourceRetirement),
+          MothershipTopic::preparePairedSourceRetirement, receipt, failure);
+      }
+    }
+    // Neuron honors the application's shutdown grace (up to 120 seconds).
+    // Start a separate terminal window after preparation, allowing that grace
+    // plus 30 seconds for destruction and durable peer acknowledgements.
+    const int64_t terminalDeadlineMs = Time::now<TimeResolution::ms>() + 150'000;
+    bool reportedSealed = false;
+    for (uint32_t polls = 0; valid && !receipt.terminal && polls < 1500 &&
+         Time::now<TimeResolution::ms>() < terminalDeadlineMs; ++polls)
+    {
+      if (!receipt.sealedFence.empty() && !matchesFence()) { valid = false; break; }
+      if (receipt.sealed && !reportedSealed)
+      {
+        basics_log("retireTestPairSource progress=sealed terminal=0\n");
+        std::fflush(stdout);
+        reportedSealed = true;
+      }
+      ::usleep(100'000); valid = query();
+    }
+    if (valid) valid = receipt.sealed && receipt.terminal && matchesFence();
+    socket.close();
+    if (!valid && failure.empty()) failure.assign("source retirement is pending; resume the same paired operation"_ctv);
+    basics_log("retireTestPairSource success=%u sealed=%u terminal=%u migrationQualified=0 failure=%s\n",
+               unsigned(valid), unsigned(receipt.sealed), unsigned(receipt.terminal), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runPrepareTestPairMigration(int argc, char *argv[])
+  {
+    String failure = {}; TestPairLifecycleLock lock;
+    bool valid = argc == 10 && lockTestPairLifecycle(lock, failure);
+    MothershipTestPairBoundaryRecord requested = {}, recorded = {};
+    requested.version = 3;
+    MothershipProdigyCluster source = {}, target = {};
+    DeploymentPlan plan = {}; String artifactPath = {}; bool returnAfterOkay = false;
+    uint128_t op = 0; uint64_t si = 0, ti = 0, port = 0;
+    auto& d = requested.boundary;
+    if (valid)
+    {
+      d.operationID.assign(argv[2]); d.endpointIPv4.assign(argv[6]);
+      valid = prodigyParseCanonicalHex128(d.operationID, op) && op != 0 &&
+              mothershipParseUnsignedArgument(argv[3], UINT64_MAX, requested.sourceDeploymentID) && requested.sourceDeploymentID != 0 &&
+              mothershipParseUnsignedArgument(argv[4], 3, si) && si > 0 &&
+              mothershipParseUnsignedArgument(argv[5], 3, ti) && ti > 0 &&
+              mothershipParseUnsignedArgument(argv[7], UINT16_MAX, port) && port > 0;
+      d.sourceMachineIndex = uint32_t(si); d.targetMachineIndex = uint32_t(ti); d.endpointPort = uint16_t(port);
+    }
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), source, &failure) &&
+              registry.getClusterByIdentity(String(argv[1]), target, &failure);
+    }
+    valid = valid && bindTestPairRuntimes(source, target, d, failure) &&
+                    prepareDeploymentPlan(argv[1], argv[8], argv[9], plan, artifactPath, returnAfterOkay, failure);
+    socket.close();
+    if (valid && (!prodigyStatelessDeploymentAdmissionPlanEligible(plan) || plan.wormholes[0].externalPort != d.endpointPort))
+    {
+      failure.assign("paired target requires the supported secret-free stateless TCP profile"_ctv); valid = false;
+    }
+    DeploymentIdentityReport observed = {};
+    valid = valid && testPairDeploymentReady(source, requested.sourceDeploymentID, d.sourceMachineIndex,
+                                             d.endpointIPv4, d.endpointPort, observed, failure);
+    if (valid)
+    {
+      requested.sourcePlanSHA256 = observed.canonicalPlanSHA256; requested.sourceBlobSHA256 = observed.containerBlobSHA256;
+      requested.targetDeploymentID = plan.config.deploymentID();
+      BitseryEngine::serialize(requested.targetRequestPlan, plan);
+      valid = prodigyComputeSHA256Hex(requested.targetRequestPlan, requested.targetRequestPlanSHA256, &failure) &&
+              mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) &&
+              prodigyComputeFileSHA256Hex(artifactPath, requested.targetBlobSHA256, &requested.targetBlobBytes, &failure);
+    }
+    if (valid)
+    {
+      ClusterStatusReport targetReport = {};
+      auto& intent = requested.targetReadinessIntent;
+      valid = readTestPairClusterStatus(target, targetReport, failure) && targetReport.hasTopology &&
+              mothershipBuildTestPairTargetReadinessIntent(targetReport.topology, d.targetMachinePrivate4, intent);
+      if (!valid && failure.empty()) failure.assign("paired target commissioned topology is unavailable or unsupported"_ctv);
+    }
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.admitTestPairBoundary(requested, recorded, &failure); }
+    // The immutable pair is durable before any target launch request. A lost
+    // response leaves this owner open; admitTestPairTarget queries the same op.
+    valid = valid && admitTestPairTarget(recorded, artifactPath, failure);
+    basics_log("prepareTestPairMigration success=%u targetAccepted=%u migrationQualified=0 failure=%s\n", unsigned(valid), unsigned(valid), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
   }
 
   void runPrepareTestPairBoundary(int argc, char *argv[])
@@ -11236,21 +11756,7 @@ private:
                      testPairDeploymentReady(target, requested.targetDeploymentID, uint32_t(ti), d.endpointIPv4, uint16_t(port), tr, failure);
     if (valid)
     {
-      d.sourceClusterUUID.assignItoh(source.clusterUUID);
-      d.targetClusterUUID.assignItoh(target.clusterUUID);
-      d.sourceWorkspace = source.test.workspaceRoot; d.targetWorkspace = target.test.workspaceRoot;
-      String path = {};
-      mothershipVirtualDatacenterPath(d.sourceWorkspace, "virtual-datacenter.identity", path);
-      valid = mothershipReadProcFile(path, d.sourceRuntimeIdentity);
-      mothershipVirtualDatacenterPath(d.targetWorkspace, "virtual-datacenter.identity", path);
-      valid = valid && mothershipReadProcFile(path, d.targetRuntimeIdentity);
-      while (!d.sourceRuntimeIdentity.empty() && d.sourceRuntimeIdentity[d.sourceRuntimeIdentity.size() - 1] == '\n') d.sourceRuntimeIdentity.resize(d.sourceRuntimeIdentity.size() - 1);
-      while (!d.targetRuntimeIdentity.empty() && d.targetRuntimeIdentity[d.targetRuntimeIdentity.size() - 1] == '\n') d.targetRuntimeIdentity.resize(d.targetRuntimeIdentity.size() - 1);
-      d.sourceParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.sourceRuntimeIdentity);
-      d.targetParentNamespace.snprintf<"pvd-p-{}"_ctv>(d.targetRuntimeIdentity);
-      String private6 = {}, public6 = {};
-      mothershipVirtualDatacenterMachineAddresses(uint32_t(si), source.datacenterFragment, false, d.sourceMachinePrivate4, private6, public6);
-      mothershipVirtualDatacenterMachineAddresses(uint32_t(ti), target.datacenterFragment, false, d.targetMachinePrivate4, private6, public6);
+      valid = bindTestPairRuntimes(source, target, d, failure);
       requested.sourcePlanSHA256 = sr.canonicalPlanSHA256; requested.targetPlanSHA256 = tr.canonicalPlanSHA256;
       requested.sourceBlobSHA256 = sr.containerBlobSHA256; requested.targetBlobSHA256 = tr.containerBlobSHA256;
       if (valid) { auto registry = openClusterRegistry(); valid = registry.admitTestPairBoundary(requested, recorded, &failure); }
@@ -11262,10 +11768,13 @@ private:
 
   void runPairBoundary(int argc, char *argv[])
   {
-    if (argc != 2) { basics_log("pairBoundary expects operationID query|selectTarget|drain|remove|crashOwner\n"); exit(EXIT_FAILURE); }
+    if (argc != 2) { basics_log("pairBoundary expects operationID prepare|query|selectTarget|drain|remove|crashOwner|armGuestReset\n"); exit(EXIT_FAILURE); }
+    const bool prepare = std::strcmp(argv[1], "prepare") == 0;
     const bool select = std::strcmp(argv[1], "selectTarget") == 0;
     const bool remove = std::strcmp(argv[1], "remove") == 0;
-    if (!select && !remove && std::strcmp(argv[1], "query") != 0 && std::strcmp(argv[1], "drain") != 0 && std::strcmp(argv[1], "crashOwner") != 0) exit(EXIT_FAILURE);
+    const bool drain = std::strcmp(argv[1], "drain") == 0;
+    const bool armReset = std::strcmp(argv[1], "armGuestReset") == 0;
+    if (!prepare && !select && !remove && !armReset && std::strcmp(argv[1], "query") != 0 && std::strcmp(argv[1], "drain") != 0 && std::strcmp(argv[1], "crashOwner") != 0) exit(EXIT_FAILURE);
     String failure = {};
     TestPairLifecycleLock lock;
     if (!lockTestPairLifecycle(lock, failure)) { basics_log("pairBoundary success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
@@ -11278,18 +11787,58 @@ private:
       if (!remove) exit(EXIT_FAILURE);
       return;
     }
-    if (valid && select)
+    if (valid && !record.guestResetFence.bootID.empty() && !armReset && !remove)
     {
+      failure.assign("test pair awaits guest reset cleanup"_ctv); valid = false;
+    }
+    if (valid && (prepare || select))
+    {
+      if (record.version >= 2 && record.targetAdmissionReceipt.empty())
+      {
+        failure.assign("paired target admission is not durably recorded"_ctv); valid = false;
+      }
       MothershipProdigyCluster source = {}, target = {};
-      { auto registry = openClusterRegistry(); valid = registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) && registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure); }
+      { auto registry = openClusterRegistry(); valid = valid && registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) && registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure); }
       DeploymentIdentityReport sr = {}, tr = {};
       valid = valid && testPairDeploymentReady(source, record.sourceDeploymentID, record.boundary.sourceMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, sr, failure) &&
                        testPairDeploymentReady(target, record.targetDeploymentID, record.boundary.targetMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, tr, failure) &&
                        sr.canonicalPlanSHA256 == record.sourcePlanSHA256 && tr.canonicalPlanSHA256 == record.targetPlanSHA256 &&
                        sr.containerBlobSHA256 == record.sourceBlobSHA256 && tr.containerBlobSHA256 == record.targetBlobSHA256;
-      if (valid) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, 1, false, updated, &failure); if (valid) record = updated; }
+      // V3 adds the P6 whole-destination fixture intent.  Legacy v2 records
+      // retain their original endpoint selection semantics; only retirement
+      // is fail-closed to the v3 drain/readiness protocol.
+      if (valid && select && record.version >= 3)
+        valid = testPairWholeDestinationReady(record, target, failure);
+      if (valid && select) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, 1, false, updated, &failure); if (valid) record = updated; }
     }
-    valid = valid && runTestPairProvider(record, argv[1], {}, failure);
+    if (valid && armReset)
+    {
+      MothershipVirtualDatacenterPairGuestResetFence fence = {};
+      valid = (record.version == 3 || record.version == 4) &&
+              runTestPairProvider(record, argv[1], {}, failure, nullptr, &fence);
+      if (valid)
+      {
+        auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {};
+        valid = registry.recordTestPairGuestResetFence(record, fence, updated, &failure);
+        if (valid) record = std::move(updated);
+      }
+    }
+    else if (valid && remove && !record.guestResetFence.bootID.empty())
+    {
+      MothershipVirtualDatacenterPairGuestResetFence observed = {};
+      String completedBootID = {}, expected = {}, actual = {};
+      valid = runTestPairProvider(record, argv[1], {}, failure, nullptr, &observed, &completedBootID);
+      BitseryEngine::serialize(expected, record.guestResetFence); BitseryEngine::serialize(actual, observed);
+      if (valid && expected != actual) { failure.assign("guest reset completion differs from armed operation"_ctv); valid = false; }
+      if (valid)
+      {
+        auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {};
+        valid = registry.recordTestPairGuestResetCompletion(record, completedBootID, updated, &failure);
+        if (valid) record = std::move(updated);
+      }
+    }
+    else if (valid && drain && record.version >= 2) valid = observeAndRecordTestPairSourceDrain(record, failure);
+    else valid = valid && runTestPairProvider(record, argv[1], {}, failure);
     if (valid && remove) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, record.selectorGeneration, true, updated, &failure); }
     basics_log("pairBoundary success=%u operation=%s migrationQualified=0 failure=%s\n", unsigned(valid), argv[1], failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
@@ -11303,7 +11852,7 @@ private:
     bool valid = argc == 4 && mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deployment) && deployment > 0 &&
                  mothershipParseUnsignedArgument(argv[2], 1024, count) && count > 0 &&
                  mothershipParseUnsignedArgument(argv[3], 60000, interval) && (count - 1) * interval <= 50000;
-    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure) && !record.closed && (deployment == record.sourceDeploymentID || deployment == record.targetDeploymentID); }
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure) && !record.closed && record.guestResetFence.bootID.empty() && (deployment == record.sourceDeploymentID || deployment == record.targetDeploymentID); }
     Vector<String> extra = {};
     if (valid) { for (int index = 1; index != 4; ++index) extra.emplace_back(argv[index]); valid = runTestPairProvider(record, "probe", extra, failure); }
     basics_log("probePairBoundary success=%u failure=%s\n", unsigned(valid), failure.c_str());
@@ -20791,6 +21340,7 @@ public:
         {"acme-cleanup-dns-01",             &Mothership::runACMECleanupDNS01ChallengeHook  },
         {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
+        {"admitTestPairTarget",             &Mothership::runAdmitTestPairTarget            },
         {"applicationReport",               &Mothership::runApplicationReport              },
         {"cancelDeployment",                &Mothership::runCancelDeployment               },
         {"clusterReport",                   &Mothership::runClusterReport                  },
@@ -20816,6 +21366,7 @@ public:
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
         {"prepareTestPairBoundary",         &Mothership::runPrepareTestPairBoundary        },
+        {"prepareTestPairMigration",        &Mothership::runPrepareTestPairMigration       },
         {"printClusters",                   &Mothership::runPrintClusters                  },
         {"probePairBoundary",               &Mothership::runProbePairBoundary              },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
@@ -20834,6 +21385,7 @@ public:
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
@@ -20943,9 +21495,12 @@ int main(int argc, char *argv[])
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
+    message.append("retireTestPairSource [operationID] (test migration; fresh whole destination readiness and source drain required)\n");
+    message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] (test clusters only; target admission prerequisite)\n");
+    message.append("admitTestPairTarget [operationID] [containerBlob] (resume the same durable target admission)\n");
     message.append("prepareTestPairBoundary [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport]\n");
     message.append("\tqualifies one shared TCP endpoint between two independent three-Brain test clusters; both exact deployments must already be healthy\n");
-    message.append("pairBoundary [operationID] [query|selectTarget|drain|remove|crashOwner]\n");
+    message.append("pairBoundary [operationID] [prepare|query|selectTarget|drain|remove|crashOwner|armGuestReset]\n");
     message.append("\tobserves, selects, or removes the test endpoint; selectTarget directs new connections to the target while retaining source connections\n");
     message.append("\tcrashOwner explicitly kills the disposable endpoint supervisor to test cleanup; it interrupts this test endpoint\n");
     message.append("probePairBoundary [operationID] [expectedDeploymentID] [count] [intervalMs]\n");

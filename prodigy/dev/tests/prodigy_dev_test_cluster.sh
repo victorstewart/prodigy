@@ -217,20 +217,21 @@ case "$(uname -s)" in
             translated+=("${argument}")
          done
 
-         command=(container exec --user 0 --workdir "${guest_repo}")
+         # Hold the configured launcher's lifecycle lease for the whole test,
+         # so another build or cleanup cannot stop its guest mid-scenario.
+         command=("${launcher}" exec "${instance}" -- env -C "${guest_repo}")
          while IFS='=' read -r name _
          do
             case "${name}" in
                PRODIGY_DEV_TEST_BOUNDARY|PRODIGY_DEV_APPLE_CONTAINER_ID|PRODIGY_DEV_ALLOW_BPF_ATTACH|PRODIGY_BPF_AUTHORIZATION) ;;
-               PRODIGY_*) command+=(--env "${name}") ;;
+               PRODIGY_*) command+=("${name}=${!name}") ;;
             esac
          done < <(env)
          command+=(
-            --env "PRODIGY_DEV_TEST_BOUNDARY=apple-container"
-            --env "PRODIGY_DEV_APPLE_CONTAINER_ID=${container_name}"
-            --env "PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
-            --env "PRODIGY_BPF_AUTHORIZATION=guest-only"
-            "${container_name}"
+            "PRODIGY_DEV_TEST_BOUNDARY=apple-container"
+            "PRODIGY_DEV_APPLE_CONTAINER_ID=${container_name}"
+            "PRODIGY_DEV_ALLOW_BPF_ATTACH=1"
+            "PRODIGY_BPF_AUTHORIZATION=guest-only"
             "${guest_harness}"
             "${guest_prodigy}"
          )

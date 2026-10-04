@@ -181,18 +181,29 @@ receipt. None of these paths proves a first hop with continuous controller quoru
 Production admission must keep that requirement distinct from uninterrupted
 application traffic, and neither property may be inferred from a staged bundle.
 For the Nametag rollout, both are required: continuous controller quorum and
-uninterrupted application service. The next feasibility gate is a Mothership-owned
-single-Brain retained-runtime replacement using the existing retained-recovery
-owner. This mechanism does not yet exist as a qualified command. It must preserve
-application processes, storage, Neuron adoption and routing, support durable resume,
-and prove old/new protocol and leadership compatibility. New-only state stays
-dormant throughout the mixed-version period. Qualify followers individually, then
-the master through a proven handoff, while measuring both quorum and traffic.
+uninterrupted application service.
+
+The bounded retained-follower investigation failed its interruption gate. In the
+2026-10-03 ARM rehearsal of exact legacy source `4ba7a89`, the old master evacuated
+the stopped follower and cleared its desired container index before the candidate
+started. Original application processes, storage and retained TCX references still
+existed, but the old master's subsequent state upload contained no plans. The
+request history recorded 19 successes and 50 failures. A faster baseline passed;
+that cannot qualify interruption or resume. This source rehearsal also does not
+substitute for the actual production x86 artifact.
+
+A safe retained restart would require a durable member-specific hold in the old
+master before stopping the member. Runtime19b exposes no such operation. Private
+flag changes, reconstructed plans or a shorter test pause would bypass the owner
+or conceal the failure. The external retained-restart route is therefore closed
+as an unqualified first hop. New-only state must remain dormant in mixed fleets.
 
 Production stays on runtime19b until a qualified route satisfies both requirements.
-Full independent-cluster migration remains separate required work; it is not
-automatically the smallest first hop. If retained replacement cannot satisfy its
-gates, compare a concrete migration route. A controller gap is not a fallback.
+Independent-cluster migration is the next implementation route under investigation.
+It can leave the old controllers running during workload transfer, but it still
+needs an exact legacy-compatible source retirement path, plus workload, endpoint,
+credential and state proofs. A new-to-new local migration alone cannot qualify
+runtime19b production migration. A controller gap is not a fallback.
 
 ## Existing automated evidence
 
@@ -249,6 +260,59 @@ qualify a durable paired migration, rollback, crash-time traffic continuity,
 stateful data, WAN routing, public TLS, HTTP/2 or HTTP/3. The next gate must bind
 target admission durably before launch and use authenticated source termination
 receipts before claiming retirement. Production migration remains unavailable.
+
+The next candidate slice adds an opt-in target admission request to the existing
+Brain authority and deployment owners. Its receipt binds the operation, cluster,
+application/version, raw request plan, normalized plan and artifact bytes. The
+new state requires an explicit feature acknowledgement from every commissioned
+peer on its current authenticated connection; protocol version alone grants no
+permission. Mothership records the paired request before sending admission and
+retains the original acceptance identity across retries and leadership changes.
+The admission and its exact normalized plan must commit in the same authority
+snapshot on each peer. Sending either independently leaves a crash window:
+an admission without its plan cannot recover, while a plan without its admission
+can become an orphaned deployment after election. Ordinary artifact replication
+and launch remain gated behind that paired snapshot and their own receipts.
+These additions passed the declared local stateless qualification below. The
+ordinary deployment path and endpoint-only test do not qualify broader migration.
+
+Retirement journal version three binds a paired operation to its exact source
+plan, artifact and container cohort, retaining version-one and version-two
+encodings for existing state. Pending bootstrap material stays in the existing
+private snapshot store. A deployment fence remains after terminal kill receipts
+so recovery and scheduling cannot create replacement source UUIDs. Activation
+requires current authenticated reader acknowledgements and replication of the
+same authority snapshot before the existing Neuron retirement owner can kill.
+
+For this fixture, Mothership freezes all three destination Brain identities, the
+endpoint owner and the one declared stateless workload. Before selecting target
+traffic or requesting source retirement, it rereads the entire destination and
+requires every commissioned Brain and the exact workload to be healthy and ready.
+Topology version changes or ordering during election do not change this intent;
+changed membership or endpoint ownership does. `retireTestPairSource` additionally
+requires a fresh provider observation of the selected target and zero source
+connections. Its recorded drain receipt does not authorize a later request.
+This barrier covers only the declared fixture: application replication, stateful
+ownership, volume retirement and the legacy production route remain unqualified.
+
+During qualification, the paired source fence became sealed, but the original
+30-second caller window expired before a terminal kill acknowledgement. Terminal polling now has a separate 150-second bound for
+the supported shutdown grace and durable acknowledgements. A subsequent run
+exited 137 during drain and the Apple guest was stopped; the actor was not
+captured. The Darwin test launcher now holds the configured launcher's lifecycle
+lease throughout the scenario.
+
+The interrupted pair's cleanup has now passed. Mothership's `pairBoundary
+armGuestReset` records a prospective current-boot fence against the exact dead
+pair and both workspaces; startup remains blocked by those fences. After a
+controlled restart of the same pinned guest, the provider verifies the changed
+boot and exact receipts before closing the pair. It never reuses stale namespace,
+PID, link or cgroup identities. Cluster removal validates and removes only stale
+filesystem socket entries and the owned workspaces. Both `removeCluster` calls
+and closed-pair retry succeeded, with the original failure evidence retained.
+This recovery is a test-provider cleanup path, not a migration completion receipt.
+The nominal, `pair-admission-source-crash`, target-master and target-cold cases
+subsequently passed; their exact retained evidence is recorded below.
 
 The current coexistence scenario has passed a real local run with two independent
 three-Brain clusters, exact installed-bundle observations, separate cluster UUIDs,
@@ -307,7 +371,7 @@ unrelated application.
 | --- | --- | --- |
 | In-place, same logical cluster | Typed admission plus serial follower prerequisite exists. | In one disposable cluster, qualify admitted update and serial follower recovery under crash/partition faults; the separate coexistence scenario checks that faults do not affect an adjacent independent cluster. Then run the route on the intended logical cluster: stateless service continuity first, followed by a stateful profile only after its replication/fencing contract exists. Verify follower-at-a-time update, quorum throughout, authority handoff, restart/resume, rollback boundary from the contract, and source/target installed-byte observations. Test full and asymmetric partitions, stale/replayed observation/registration/update frames, old or disconnected peer capability, wrong cluster/role/UUID, expired/revoked/rotated credentials, and CA/leaf rotation. Stop on any duplicate writer, lost durable receipt, unbounded retry, or admission after stale evidence. |
 | Same logical cluster, LAN to cloud; cloud to cloud | Placement policy can constrain a stateless constructive successor. No relocation coordinator or traffic-move protocol exists. | First demonstrate selected-app-only placement between two admitted machine pools under the same cluster authority, with typed network faults between the pools. The two-independent-cluster scenario qualifies the separate-cluster route below. Before a real LAN-to-Vultr or cloud-to-cloud application move, prove scoped L3/L4 control and service paths, no host-network mutation, NAT directionality, IPv4/IPv6 routes, MTU/PMTU, DNS TTL/caching, TLS/SNI/client identity, service discovery, and endpoint reachability in both directions. Hold overlap capacity for destination-before-source retirement. Verify source stays live until destination health and client continuity are observed. Repeat partitions (including one-way/asymmetric), source/destination crash at each receipt, stale peer identity, credential rotation/revocation, and provider cleanup. Stateful and arbitrary-app zero-downtime moves are blocked: require a declared bridge, replicated volume history, writer lease/fence, promotion, rollback, and source-retirement proof. |
-| Independent new cluster | Planner can reject/describe this route; no authority migration or application bridge is implemented. | Block execution. Use the local two-cluster matrix only to develop and fault a future typed bridge owner. That owner must create both clusters through Mothership, preserve application identity and credentials through their owners, prove client endpoint transition, and forbid copying controller storage, runtime trees, BPF state, or container state. For a stateful workload, retain one writer and a complete container-plus-volume history across pause, sync, promotion, rollback boundary, source crash, and destination crash. |
+| Independent new cluster | The declared local test-only stateless bridge is implemented and qualified below. Authority migration, cloud/general routes, and stateful movement remain blocked. | Use the local two-cluster matrix to qualify and fault that declared bridge. It must create both clusters through Mothership, preserve application identity and credentials through their owners, prove client endpoint transition, and forbid copying controller storage, runtime trees, BPF state, or container state. |
 
 For every route, record request/response topic identities and peer TLS verification
 results. Key possession authenticates the peer credential; it does not attest to the
@@ -323,3 +387,47 @@ Geographically distributed clusters with ongoing per-datacenter database replica
 are explicitly future scope. Migration can supply reusable identity, network,
 replication and ownership-transfer mechanisms, but a one-time handoff does not
 qualify steady-state WAN consistency, quorum placement, disaster failover or latency.
+
+### P6 local stateless qualification — 2026-10-03
+
+The declared local test profile passed the finite matrix: nominal (`wHM70I`,
+206.492 s), source-master interruption (`I247l0`, 185.633 s), destination-master
+interruption (`zqWIlo`, 217.103 s), and full destination restart (`N8diFM`,
+216.694 s). Each reached terminal source retirement and Mothership cleanup of
+both clusters and the shared endpoint. A final reviewed nominal run (`iObrim`,
+202.160 s) passed using the final bundle. It recorded 31 source and 5 target
+handoff requests without failure, a source connection spanning target traffic,
+actual zero-flow drain, terminal retirement, exact retry and continued target
+traffic. The source report contained no runtime container and zero deployed and
+healthy counts. The guest was stopped after verification.
+
+Eight focused CTests, the full credential and master-UUID executables, the
+Darwin lifecycle-lease contract and harness ownership contract passed. The final
+Prodigy executable and component executables are byte-identical to the four-case
+matrix; the final Mothership change preserves v2 endpoint selection while keeping
+v3 whole-destination readiness. The final bundle SHA-256 is
+`4652caddb90bcb4a37705c3942a2e3ba6a4714a26c568e20443c9a554b974923`.
+The exact build, inputs, artifacts, requests, cleanup and review receipts are
+indexed by `.run/stateless/evidence/claims-status.json` and
+`p6-runtime-matrix-summary-20261003.md`; raw private evidence is kept locally.
+
+The final review's scheduler concern was retracted: prepare requires every
+source container to be healthy, runtime-ready and free of planned work, so an
+unfinished launch prevents sealing. No speculative scheduler change was retained.
+
+Bug provenance for this change:
+
+- Stale Brain reconnect: earliest verified combined failure is `b768168`
+  (2026-05-04). Its raw-socket component already exists in the parentless
+  `d75ab35` checkpoint (2026-04-11), so an earlier sole origin is unprovable.
+- Guest lifecycle lease bypass: raw dispatch originates at `29e8109`
+  (2026-07-14); external launcher ownership appears at `566c620` (2026-08-01).
+  The external lock implementation's introducing revision is not verified.
+- Cleanup after loss of the guest kernel: live-parent-only recovery originates
+  at `d246c4d` (2026-10-03). The prospective reset fence closes that limitation
+  without reusing stale kernel identities.
+
+This qualification covers the declared new-to-new local stateless test profile.
+Ordinary baseline/candidate load and performance, COUSIN/WAN routing, stateful
+application correctness and legacy production migration remain separate gates.
+No live Nametag or other production action was performed.

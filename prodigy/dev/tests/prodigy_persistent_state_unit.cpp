@@ -2527,7 +2527,7 @@ int main(void)
     pairedIntent.pairedTargetDeploymentID = pairedIntent.deploymentID;
     pairedIntent.bootstrap = pairedBootstrapBytes;
     ProdigyContainerRetirementJournal pairedJournal = {};
-    pairedJournal.version = ProdigyContainerRetirementJournal::currentVersion;
+    pairedJournal.version = ProdigyContainerRetirementJournal::pairedIntentVersion;
     pairedJournal.intents.push_back(pairedIntent);
     TaskExecutionRecord pairedCarrier = {};
     suite.expect(
@@ -2550,7 +2550,7 @@ int main(void)
         pairedPublicCarrier != pairedPublic.masterAuthority.runtimeState.taskExecutions.end() &&
             prodigyParsePersistentContainerRetirementDescriptor(
                 pairedPublicCarrier->second, pairedPublicJournal) &&
-            pairedPublicJournal.version == ProdigyContainerRetirementJournal::currentVersion &&
+            pairedPublicJournal.version == ProdigyContainerRetirementJournal::pairedIntentVersion &&
             pairedPublicJournal.intents.size() == 1 && pairedPublicJournal.intents[0].bootstrap.empty() &&
             pairedPublicJournal.intents[0].kind == ProdigyContainerRetirementKind::statelessPairedMigration &&
             pairedPublicJournal.intents[0].pairedOperationID == pairedIntent.pairedOperationID &&
@@ -2586,6 +2586,111 @@ int main(void)
             pairedRestoredJournal.intents[0].sameIdentity(pairedIntent) &&
             pairedRestoredJournal.intents[0].bootstrap.equals(pairedBootstrapBytes),
         "apply_snapshot_secrets_restores_v2_paired_retirement_identity_and_private_bootstrap_once");
+
+    // Version 3 adds only public paired-source authority.  The bootstrap keeps
+    // the exact established V2 private sidecar framing.
+    ProdigyPairedSourceRetirementFence pairedFence = {};
+    pairedFence.operationID = pairedIntent.pairedOperationID;
+    pairedFence.sourceClusterUUID = pairedIntent.pairedSourceClusterUUID;
+    pairedFence.targetClusterUUID = pairedIntent.pairedTargetClusterUUID;
+    pairedFence.sourceDeploymentID = pairedIntent.deploymentID;
+    pairedFence.targetDeploymentID = pairedIntent.pairedTargetDeploymentID;
+    pairedFence.sourceNormalizedPlanSHA256.assign(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+    pairedFence.sourceBlobSHA256.assign(
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"_ctv);
+    pairedFence.sourceBlobBytes = 4096;
+    pairedFence.cohort.push_back(ProdigyPairedSourceRetirementCohortMember {
+        pairedIntent.containerUUID, pairedIntent.machineUUID, pairedIntent.intentGeneration});
+    ProdigyContainerRetirementJournal pairedV3Journal = pairedJournal;
+    pairedV3Journal.version = ProdigyContainerRetirementJournal::currentVersion;
+    pairedV3Journal.pairedSourceFences.push_back(pairedFence);
+    suite.expect(prodigyValidateContainerRetirementJournal(pairedV3Journal),
+                 "persistent_snapshot_validates_v3_paired_retirement_public_fence");
+    TaskExecutionRecord pairedV3Carrier = {};
+    suite.expect(prodigyWriteContainerRetirementJournalCarrier(pairedV3Carrier, pairedV3Journal, 1'700'000'000'004),
+                 "persistent_snapshot_writes_v3_paired_retirement_carrier");
+    ProdigyPersistentBrainSnapshot pairedV3Snapshot = expectedManagedSnapshot;
+    pairedV3Snapshot.masterAuthority.runtimeState.taskExecutions.insert_or_assign(
+        pairedV3Carrier.executionID, pairedV3Carrier);
+    ProdigyPersistentBrainSnapshot pairedV3Public = {};
+    ProdigyPersistentBrainSnapshotSecrets pairedV3Secrets = {};
+    pairedFailure.clear();
+    suite.expect(prodigyExtractPersistentBrainSnapshotSecrets(
+                     std::move(pairedV3Snapshot), pairedV3Public, pairedV3Secrets, &pairedFailure),
+                 "extract_snapshot_secrets_moves_v3_paired_retirement_bootstrap_to_existing_private_sidecar");
+    String pairedV3PublicBytes = {};
+    BitseryEngine::serialize(pairedV3PublicBytes, pairedV3Public);
+    suite.expect(stringContains(pairedV3PublicBytes, "paired-retirement-bootstrap-private-secret"_ctv) == false,
+                 "extract_snapshot_secrets_keeps_v3_paired_retirement_credential_out_of_public_snapshot");
+    ProdigyPersistentBrainSnapshot pairedV3Restored = pairedV3Public;
+    suite.expect(prodigyApplyPersistentBrainSnapshotSecrets(pairedV3Restored, pairedV3Secrets, &pairedFailure),
+                 "apply_snapshot_secrets_restores_v3_paired_retirement_from_existing_private_sidecar");
+    auto pairedV3RestoredCarrier = pairedV3Restored.masterAuthority.runtimeState.taskExecutions.find(
+        prodigyContainerRetirementJournalExecutionID);
+    ProdigyContainerRetirementJournal pairedV3RestoredJournal = {};
+    suite.expect(pairedV3RestoredCarrier != pairedV3Restored.masterAuthority.runtimeState.taskExecutions.end() &&
+                     prodigyParseContainerRetirementJournalCarrier(
+                         pairedV3RestoredCarrier->second, pairedV3RestoredJournal) &&
+                     pairedV3RestoredJournal.pairedSourceFences.size() == 1 &&
+                     pairedV3RestoredJournal.pairedSourceFences[0].sameIdentity(pairedFence),
+                 "apply_snapshot_secrets_retains_v3_paired_retirement_public_fence");
+    ProdigyPersistentBrainSnapshotSecrets missingV3Sidecar = pairedV3Secrets;
+    missingV3Sidecar.containerRetirementBootstrapSecretsV2.clear();
+    pairedFailure.clear();
+    ProdigyPersistentBrainSnapshot missingV3Public = pairedV3Public;
+    suite.expect(prodigyApplyPersistentBrainSnapshotSecrets(missingV3Public, missingV3Sidecar, &pairedFailure) == false,
+                 "apply_snapshot_secrets_rejects_missing_v3_paired_retirement_private_sidecar");
+    ProdigyPersistentBrainSnapshotSecrets duplicateV3Sidecar = pairedV3Secrets;
+    duplicateV3Sidecar.containerRetirementBootstrapSecretsV2.push_back(
+        duplicateV3Sidecar.containerRetirementBootstrapSecretsV2[0]);
+    pairedFailure.clear();
+    ProdigyPersistentBrainSnapshot duplicateV3Public = pairedV3Public;
+    suite.expect(prodigyApplyPersistentBrainSnapshotSecrets(duplicateV3Public, duplicateV3Sidecar, &pairedFailure) == false,
+                 "apply_snapshot_secrets_rejects_duplicate_v3_paired_retirement_private_sidecar");
+    ProdigyPersistentBrainSnapshotSecrets wrongV2SidecarIdentity = pairedV3Secrets;
+    ++wrongV2SidecarIdentity.containerRetirementBootstrapSecretsV2[0].pairedOperationID;
+    pairedFailure.clear();
+    ProdigyPersistentBrainSnapshot wrongV2SidecarPublic = pairedV3Public;
+    suite.expect(prodigyApplyPersistentBrainSnapshotSecrets(
+                     wrongV2SidecarPublic, wrongV2SidecarIdentity, &pairedFailure) == false,
+                 "apply_snapshot_secrets_rejects_wrong_v2_private_sidecar_identity_for_v3_retirement");
+    ProdigyContainerRetirementJournal tamperedV3Journal = pairedV3Journal;
+    tamperedV3Journal.pairedSourceFences[0].sourceDeploymentID += 1;
+    TaskExecutionRecord tamperedV3Carrier = pairedV3Carrier;
+    BitseryEngine::serialize(tamperedV3Carrier.fingerprint, tamperedV3Journal);
+    ProdigyContainerRetirementJournal parsedTamperedV3Journal = {};
+    suite.expect(prodigyParsePersistentContainerRetirementDescriptor(
+                     tamperedV3Carrier, parsedTamperedV3Journal) == false,
+                 "persistent_snapshot_descriptor_parser_rejects_v3_public_fence_tamper");
+    ProdigyContainerRetirementJournal terminalV3Journal = pairedV3Journal;
+    terminalV3Journal.intents[0].killAcked = true;
+    terminalV3Journal.intents[0].bootstrap.clear();
+    TaskExecutionRecord terminalV3Carrier = {};
+    suite.expect(prodigyWriteContainerRetirementJournalCarrier(
+                     terminalV3Carrier, terminalV3Journal, 1'700'000'000'005),
+                 "persistent_snapshot_writes_v3_terminal_retirement_fence");
+    ProdigyPersistentBrainSnapshot terminalV3Snapshot = expectedManagedSnapshot;
+    terminalV3Snapshot.masterAuthority.runtimeState.taskExecutions.insert_or_assign(
+        terminalV3Carrier.executionID, terminalV3Carrier);
+    ProdigyPersistentBrainSnapshot terminalV3Public = {};
+    ProdigyPersistentBrainSnapshotSecrets terminalV3Secrets = {};
+    pairedFailure.clear();
+    suite.expect(prodigyExtractPersistentBrainSnapshotSecrets(
+                     std::move(terminalV3Snapshot), terminalV3Public, terminalV3Secrets, &pairedFailure) &&
+                     terminalV3Secrets.containerRetirementBootstrapSecretsV2.empty() &&
+                     prodigyApplyPersistentBrainSnapshotSecrets(terminalV3Public, terminalV3Secrets, &pairedFailure),
+                 "persistent_snapshot_roundtrips_v3_terminal_fence_without_private_bootstrap");
+    auto terminalV3RestoredCarrier = terminalV3Public.masterAuthority.runtimeState.taskExecutions.find(
+        prodigyContainerRetirementJournalExecutionID);
+    ProdigyContainerRetirementJournal terminalV3RestoredJournal = {};
+    suite.expect(terminalV3RestoredCarrier != terminalV3Public.masterAuthority.runtimeState.taskExecutions.end() &&
+                     prodigyParsePersistentContainerRetirementDescriptor(
+                         terminalV3RestoredCarrier->second, terminalV3RestoredJournal) &&
+                     terminalV3RestoredJournal.intents[0].killAcked &&
+                     terminalV3RestoredJournal.pairedSourceFences.size() == 1 &&
+                     terminalV3RestoredJournal.pairedSourceFences[0].sameIdentity(pairedFence),
+                 "persistent_snapshot_terminal_v3_roundtrip_retains_public_fence");
   }
 
   String localBrainStateJSON = {};

@@ -657,6 +657,12 @@ public:
 
   ClusterTopology authoritativeTopology = {};
   bool hasAuthoritativeTopology = false;
+  String testContainerArtifactStoreRoot = {};
+
+  const String *containerArtifactStoreRoot() const override
+  {
+    return testContainerArtifactStoreRoot.empty() ? nullptr : &testContainerArtifactStoreRoot;
+  }
 
   bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
   {
@@ -30550,6 +30556,9 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 #include <prodigy/dev/tests/stateful_serving_launch_tests.h>
 #include <prodigy/dev/tests/stateful_serving_resource_tests.h>
 #include <prodigy/dev/tests/deployment_identity_tests.h>
+#include <prodigy/dev/tests/stateless_admission_tests.h>
+#include <prodigy/dev/tests/stateless_admission_behavior_tests.h>
+#include <prodigy/dev/tests/stateless_source_retirement_tests.h>
 
 int main(void)
 {
@@ -30589,6 +30598,17 @@ int main(void)
   {
     TestSuite suite;
     testDeploymentIdentityReceipt(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (getenv("PRODIGY_TEST_STATELESS_ADMISSION_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testStatelessDeploymentAdmissionContract(suite);
+    testStatelessDeploymentAdmissionBehavior(suite);
+    testPairedSourceRetirementWireContract(suite);
+    testPairedSourceRetirementLaunchFence(suite);
+    testPairedSourceRetirementPrepareGuards(suite);
+    testPairedSourceRetirementDurabilityAndPeerAck(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite;
@@ -31178,6 +31198,8 @@ int main(void)
   testUpgradeAdmissionObservedCapacityFacts(suite);
   testUpgradeAdmissionTargetBoundStagingCapacity(suite);
   testDeploymentIdentityReceipt(suite);
+  testStatelessDeploymentAdmissionContract(suite);
+  testStatelessDeploymentAdmissionBehavior(suite);
   testReplicationAcceptanceRules(suite);
   testCredentialBundleBuildAndApply(suite);
   testApiCredentialPolicyAvailability(suite);

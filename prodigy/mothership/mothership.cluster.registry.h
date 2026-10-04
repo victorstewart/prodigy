@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 
@@ -17,6 +18,56 @@
 // Local endpoint qualification is an operation of the test provider, not a
 // migration receipt. In particular, selecting the target does not authorize
 // retirement of either application or cluster.
+class MothershipTestPairTargetReadinessIntent {
+public:
+  uint32_t version = 1;
+  Vector<uint128_t> commissionedBrainUUIDs;
+  uint128_t endpointMachineUUID = 0;
+  uint32_t commissionedBrainCount = 0;
+  uint32_t declaredStatelessWorkloadCount = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTestPairTargetReadinessIntent& intent)
+{
+  serializer.value4b(intent.version);
+  serializer.container(intent.commissionedBrainUUIDs, 3, [](S& serializer, uint128_t& uuid) { serializer.value16b(uuid); });
+  serializer.value16b(intent.endpointMachineUUID);
+  serializer.value4b(intent.commissionedBrainCount);
+  serializer.value4b(intent.declaredStatelessWorkloadCount);
+}
+
+static inline bool mothershipBuildTestPairTargetReadinessIntent(const ClusterTopology& topology,
+                                                                 const String& endpointIPv4,
+                                                                 MothershipTestPairTargetReadinessIntent& intent)
+{
+  intent = {};
+  if (topology.machines.size() != 3 || endpointIPv4.empty()) return false;
+  for (uint32_t index = 0; index < topology.machines.size(); ++index)
+  {
+    if (!topology.machines[index].isBrain || topology.machines[index].uuid == 0) return false;
+    for (uint32_t other = index + 1; other < topology.machines.size(); ++other)
+      if (topology.machines[index].uuid == topology.machines[other].uuid) return false;
+    intent.commissionedBrainUUIDs.push_back(topology.machines[index].uuid);
+    for (const ClusterMachineAddress& address : topology.machines[index].addresses.privateAddresses)
+      if (address.address == endpointIPv4) intent.endpointMachineUUID = topology.machines[index].uuid;
+  }
+  if (intent.endpointMachineUUID == 0) return false;
+  std::sort(intent.commissionedBrainUUIDs.begin(), intent.commissionedBrainUUIDs.end());
+  intent.commissionedBrainCount = 3;
+  intent.declaredStatelessWorkloadCount = 1;
+  return true;
+}
+
+static inline bool mothershipTestPairTargetReadinessIntentMatchesTopology(
+    const MothershipTestPairTargetReadinessIntent& intent, const ClusterTopology& topology, const String& endpointIPv4)
+{
+  MothershipTestPairTargetReadinessIntent observed = {};
+  return mothershipBuildTestPairTargetReadinessIntent(topology, endpointIPv4, observed) &&
+         observed.commissionedBrainUUIDs == intent.commissionedBrainUUIDs &&
+         observed.endpointMachineUUID == intent.endpointMachineUUID;
+}
+
 class MothershipTestPairBoundaryRecord {
 public:
   uint32_t version = 1;
@@ -29,6 +80,25 @@ public:
   String targetBlobSHA256;
   uint64_t selectorGeneration = 0; // 0=source, 1=target; persist before effect
   bool closed = false;
+  // Version two reserves the same pair owner before destination admission.
+  // These request bytes contain only the supported secret-free stateless profile.
+  String targetRequestPlan;
+  String targetRequestPlanSHA256;
+  uint64_t targetBlobBytes = 0;
+  // The first accepted receipt is immutable. Health/current-master observations
+  // from later queries never replace the original acceptance identity.
+  String targetAdmissionReceipt;
+  // Version three binds the pair to the commissioned target topology and the
+  // fixed P6 stateless fixture shape. It deliberately stores no health receipt:
+  // selection must obtain a fresh observation.
+  MothershipTestPairTargetReadinessIntent targetReadinessIntent;
+  // The first observed zero-source-flow drain is durable audit evidence only.
+  // Target flow counts are live diagnostics and may change on a valid retry.
+  String sourceDrainObservation;
+  // Version four arms a one-way guest-reset fence before external lifecycle work.
+  MothershipVirtualDatacenterPairGuestResetFence guestResetFence;
+  // Written only after the lifecycle owner observes a different boot.
+  String guestResetCompletedBootID;
 };
 
 template <typename S>
@@ -44,6 +114,23 @@ static void serialize(S&& serializer, MothershipTestPairBoundaryRecord& record)
   serializer.text1b(record.targetBlobSHA256, 64);
   serializer.value8b(record.selectorGeneration);
   serializer.value1b(record.closed);
+  if (record.version >= 2)
+  {
+    serializer.text1b(record.targetRequestPlan, 1024 * 1024);
+    serializer.text1b(record.targetRequestPlanSHA256, 64);
+    serializer.value8b(record.targetBlobBytes);
+    serializer.text1b(record.targetAdmissionReceipt, 64 * 1024);
+  }
+  if (record.version >= 3)
+  {
+    serializer.object(record.targetReadinessIntent);
+    serializer.text1b(record.sourceDrainObservation, 64 * 1024);
+  }
+  if (record.version >= 4)
+  {
+    serializer.object(record.guestResetFence);
+    serializer.text1b(record.guestResetCompletedBootID, 128);
+  }
 }
 
 class MothershipProdigyClusterRecordV3 {
@@ -2196,21 +2283,312 @@ public:
   {
     lhs.selectorGeneration = rhs.selectorGeneration = 0;
     lhs.closed = rhs.closed = false;
+    if (lhs.version >= 2 && rhs.version >= 2)
+    {
+      lhs.targetPlanSHA256.clear(); rhs.targetPlanSHA256.clear();
+      lhs.targetAdmissionReceipt.clear(); rhs.targetAdmissionReceipt.clear();
+    }
+    if (lhs.version >= 3 && rhs.version >= 3)
+    {
+      lhs.sourceDrainObservation.clear(); rhs.sourceDrainObservation.clear();
+      // A v4 reset arm is an immutable transition over the v3 identity.
+      // Normal callers separately reject an armed record.
+      if (lhs.version == 4) { lhs.version = 3; lhs.guestResetFence = {}; lhs.guestResetCompletedBootID.clear(); }
+      if (rhs.version == 4) { rhs.version = 3; rhs.guestResetFence = {}; rhs.guestResetCompletedBootID.clear(); }
+    }
     String left = {}, right = {};
     BitseryEngine::serialize(left, lhs);
     BitseryEngine::serialize(right, rhs);
     return left == right;
   }
 
+  static bool testPairTargetAdmissionIdentityMatches(const MothershipTestPairBoundaryRecord& record,
+                                                     const StatelessDeploymentAdmissionReceipt& receipt)
+  {
+    uint128_t operation = 0, targetCluster = 0;
+    return record.version >= 2 &&
+           prodigyParseCanonicalHex128(record.boundary.operationID, operation) &&
+           prodigyParseCanonicalHex128(record.boundary.targetClusterUUID, targetCluster) &&
+           receipt.version == 2 &&
+           receipt.admission.operationID == operation && receipt.admission.clusterUUID == targetCluster &&
+           receipt.admission.deploymentID == record.targetDeploymentID &&
+           receipt.admission.applicationID == ApplicationConfig::extractApplicationID(record.targetDeploymentID) &&
+           receipt.admission.versionID == (record.targetDeploymentID & ((uint64_t(1) << 48) - 1)) &&
+           receipt.admission.requestPlanSHA256 == record.targetRequestPlanSHA256 &&
+           receipt.admission.artifactSHA256 == record.targetBlobSHA256 && receipt.admission.artifactBytes == record.targetBlobBytes &&
+           prodigyIsSHA256HexDigest(receipt.admission.normalizedPlanSHA256) &&
+           receipt.admission.acceptedAuthorityGeneration != 0 && receipt.admission.acceptedMasterUUID != 0 && receipt.admission.acceptedMasterBootNs > 0 &&
+           (record.targetPlanSHA256.empty() || record.targetPlanSHA256 == receipt.admission.normalizedPlanSHA256);
+  }
+
+  static bool testPairTargetAdmissionMatches(const MothershipTestPairBoundaryRecord& record,
+                                             const StatelessDeploymentAdmissionReceipt& receipt)
+  {
+    return receipt.accepted && receipt.supported && receipt.peersCapable && receipt.failure.empty() &&
+           receipt.currentAuthorityGeneration >= receipt.admission.acceptedAuthorityGeneration &&
+           receipt.currentMasterUUID != 0 && receipt.currentMasterBootNs > 0 &&
+           testPairTargetAdmissionIdentityMatches(record, receipt);
+  }
+
+  static bool testPairTargetReadinessIntentValid(const MothershipTestPairTargetReadinessIntent& intent)
+  {
+    return intent.version == 1 && intent.commissionedBrainCount == 3 &&
+           intent.declaredStatelessWorkloadCount == 1 && intent.commissionedBrainUUIDs.size() == 3 &&
+           intent.endpointMachineUUID != 0 && intent.commissionedBrainUUIDs[0] != 0 &&
+           intent.commissionedBrainUUIDs[0] < intent.commissionedBrainUUIDs[1] &&
+           intent.commissionedBrainUUIDs[1] < intent.commissionedBrainUUIDs[2];
+  }
+
+  static bool testPairSourceDrainObservationValid(const MothershipTestPairBoundaryRecord& record,
+                                                  const String& encoded)
+  {
+    MothershipVirtualDatacenterPairDrainObservation observation = {};
+    return record.version >= 3 && record.selectorGeneration == 1 && !record.targetAdmissionReceipt.empty() &&
+           BitseryEngine::deserializeSafe(encoded, observation) &&
+           mothershipVirtualDatacenterPairDrainObservationBoundValid(record.boundary, observation) &&
+           observation.selectedTarget && observation.drainCapability && observation.sourceFlows == 0;
+  }
+
+  // This is a pure P6 fixture predicate. The caller must obtain both reports
+  // freshly immediately before handoff or retirement; neither observation is
+  // persisted as an admission or health receipt.
+  static bool testPairWholeDestinationReady(const MothershipTestPairBoundaryRecord& record,
+                                            const ClusterStatusReport& clusterReport,
+                                            const DeploymentIdentityReport& deploymentReport,
+                                            String *failure = nullptr)
+  {
+    auto reject = [&](auto message) -> bool { if (failure) failure->assign(message); return false; };
+    if (record.version < 3 || !testPairBoundaryRecordValid(record) || record.targetAdmissionReceipt.empty())
+      return reject("paired destination readiness requires a recorded v3 admission"_ctv);
+    if (!clusterReport.hasTopology || !mothershipTestPairTargetReadinessIntentMatchesTopology(
+            record.targetReadinessIntent, clusterReport.topology, record.boundary.targetMachinePrivate4) || clusterReport.nMachines != 3 ||
+        clusterReport.machineReports.size() != 3) return reject("paired destination commissioned topology differs from intent"_ctv);
+    uint32_t masters = 0;
+    uint128_t masterUUID = 0, endpointMachineUUID = 0;
+    for (const ClusterMachine& expected : clusterReport.topology.machines)
+      for (const ClusterMachineAddress& address : expected.addresses.privateAddresses)
+        if (address.address == record.boundary.targetMachinePrivate4) endpointMachineUUID = expected.uuid;
+    if (endpointMachineUUID == 0) return reject("paired destination endpoint machine is absent from topology"_ctv);
+    for (const MachineStatusReport& machine : clusterReport.machineReports)
+    {
+      uint128_t uuid = 0;
+      if (!machine.isBrain || machine.state != "healthy"_ctv || !machine.controlPlaneReachable || !machine.runtimeReady ||
+          machine.decommissioning || machine.rebooting || machine.updatingOS || machine.hardwareFailure ||
+          !prodigyParseCanonicalHex128(machine.machineUUID, uuid) || uuid == 0) return reject("paired destination Brain is not commissioned and healthy"_ctv);
+      bool found = false;
+      for (const ClusterMachine& expected : clusterReport.topology.machines) if (expected.uuid == uuid) found = true;
+      if (!found) return reject("paired destination Brain identity differs from topology"_ctv);
+      for (const MachineStatusReport& other : clusterReport.machineReports)
+        if (&machine != &other && other.machineUUID == machine.machineUUID)
+          return reject("paired destination Brain identity is duplicated"_ctv);
+      if (machine.currentMaster) { ++masters; masterUUID = uuid; }
+    }
+    if (masters != 1 || clusterReport.nApplications != 1 || clusterReport.applicationReports.size() != 1)
+      return reject("paired destination fixture does not have one current master and one workload"_ctv);
+    const ApplicationStatusReport& application = clusterReport.applicationReports[0];
+    const uint64_t versionID = record.targetDeploymentID & ((uint64_t(1) << 48) - 1);
+    if (application.applicationID != ApplicationConfig::extractApplicationID(record.targetDeploymentID) ||
+        application.deploymentReports.size() != 1) return reject("paired destination workload identity differs from admission"_ctv);
+    const DeploymentStatusReport& deployment = application.deploymentReports[0];
+    if (deployment.versionID != versionID || deployment.state != DeploymentState::running || deployment.isStateful ||
+        deployment.nTarget != 1 || deployment.nDeployed != 1 || deployment.nHealthy != 1)
+      return reject("paired destination workload is not the declared healthy stateless fixture"_ctv);
+    StatelessDeploymentAdmissionReceipt receipt = {};
+    if (!BitseryEngine::deserializeSafe(record.targetAdmissionReceipt, receipt) ||
+        !testPairTargetAdmissionMatches(record, receipt) || deploymentReport.version != 1 ||
+        !deploymentReport.found || !deploymentReport.live ||
+        deploymentReport.clusterUUID == 0 || deploymentReport.clusterUUID != receipt.admission.clusterUUID ||
+        deploymentReport.applicationID != ApplicationConfig::extractApplicationID(record.targetDeploymentID) ||
+        deploymentReport.versionID != versionID || deploymentReport.deploymentID != record.targetDeploymentID ||
+        deploymentReport.state != DeploymentState::running || !deploymentReport.profileEligible || deploymentReport.isStateful ||
+        deploymentReport.canonicalPlanSHA256 != record.targetPlanSHA256 || deploymentReport.containerBlobSHA256 != record.targetBlobSHA256 ||
+        deploymentReport.containerBlobBytes != record.targetBlobBytes || deploymentReport.nTarget != 1 ||
+        deploymentReport.nDeployed != 1 || deploymentReport.nHealthy != 1 ||
+        deploymentReport.observedEndpointIPv4 != record.boundary.endpointIPv4 ||
+        deploymentReport.observedEndpointPort != record.boundary.endpointPort ||
+        deploymentReport.observedEndpointMachineUUID != endpointMachineUUID || deploymentReport.authorityGeneration == 0 ||
+        deploymentReport.masterUUID != masterUUID || deploymentReport.masterBootNs <= 0)
+      return reject("paired destination live deployment identity differs from admission"_ctv);
+    if (failure) failure->clear();
+    return true;
+  }
+
   static bool testPairBoundaryRecordValid(const MothershipTestPairBoundaryRecord& record)
   {
-    return record.version == 1 && record.selectorGeneration <= 1 &&
-           mothershipVirtualDatacenterPairBoundaryDescriptorValid(record.boundary) &&
-           record.sourceDeploymentID != 0 && record.targetDeploymentID != 0 &&
-           prodigyIsSHA256HexDigest(record.sourcePlanSHA256) &&
-           prodigyIsSHA256HexDigest(record.targetPlanSHA256) &&
-           prodigyIsSHA256HexDigest(record.sourceBlobSHA256) &&
-           prodigyIsSHA256HexDigest(record.targetBlobSHA256);
+    if ((record.version != 1 && record.version != 2 && record.version != 3 && record.version != 4) || record.selectorGeneration > 1 ||
+        !mothershipVirtualDatacenterPairBoundaryDescriptorValid(record.boundary) ||
+        record.sourceDeploymentID == 0 || record.targetDeploymentID == 0 ||
+        !prodigyIsSHA256HexDigest(record.sourcePlanSHA256) ||
+        !prodigyIsSHA256HexDigest(record.sourceBlobSHA256) ||
+        !prodigyIsSHA256HexDigest(record.targetBlobSHA256)) return false;
+    if (record.version == 1)
+      return prodigyIsSHA256HexDigest(record.targetPlanSHA256) && record.targetRequestPlan.empty() &&
+             record.targetRequestPlanSHA256.empty() && record.targetBlobBytes == 0 && record.targetAdmissionReceipt.empty() &&
+             record.targetReadinessIntent.version == 1 && record.targetReadinessIntent.commissionedBrainUUIDs.empty() &&
+             record.targetReadinessIntent.endpointMachineUUID == 0 && record.targetReadinessIntent.commissionedBrainCount == 0 && record.targetReadinessIntent.declaredStatelessWorkloadCount == 0 &&
+             record.sourceDrainObservation.empty() && record.guestResetFence.operationID.empty() &&
+             record.guestResetFence.descriptorSHA256.empty() && record.guestResetFence.bootID.empty() &&
+             record.guestResetFence.guestID.empty() && record.guestResetCompletedBootID.empty();
+    DeploymentPlan request = {};
+    String requestSHA = {};
+    if (record.targetRequestPlan.empty() || record.targetRequestPlan.size() > 1024 * 1024 ||
+        !BitseryEngine::deserializeSafe(record.targetRequestPlan, request) ||
+        !prodigyStatelessDeploymentAdmissionPlanEligible(request) || request.config.deploymentID() != record.targetDeploymentID ||
+        !prodigyComputeSHA256Hex(record.targetRequestPlan, requestSHA) || requestSHA != record.targetRequestPlanSHA256 ||
+        record.targetBlobBytes == 0 ||
+        (record.version == 2 && (!record.targetReadinessIntent.commissionedBrainUUIDs.empty() || record.targetReadinessIntent.endpointMachineUUID != 0 ||
+                                 record.targetReadinessIntent.commissionedBrainCount != 0 ||
+                                 record.targetReadinessIntent.declaredStatelessWorkloadCount != 0 || !record.sourceDrainObservation.empty() ||
+                                 !record.guestResetFence.operationID.empty() || !record.guestResetFence.descriptorSHA256.empty() ||
+                                 !record.guestResetFence.bootID.empty() || !record.guestResetFence.guestID.empty() ||
+                                 !record.guestResetCompletedBootID.empty())) ||
+        (record.version == 3 && (!record.guestResetFence.operationID.empty() || !record.guestResetFence.descriptorSHA256.empty() ||
+                                 !record.guestResetFence.bootID.empty() || !record.guestResetFence.guestID.empty() ||
+                                 !record.guestResetCompletedBootID.empty())) ||
+        (record.version >= 3 && !testPairTargetReadinessIntentValid(record.targetReadinessIntent))) return false;
+    if (record.version == 4 &&
+        (!mothershipVirtualDatacenterPairGuestResetFenceValid(record.guestResetFence, record.boundary) ||
+         (!record.guestResetCompletedBootID.empty() &&
+          (!mothershipVirtualDatacenterBootIDValid(record.guestResetCompletedBootID) ||
+           record.guestResetCompletedBootID == record.guestResetFence.bootID)))) return false;
+    if (record.targetAdmissionReceipt.empty())
+      return record.targetPlanSHA256.empty() && record.selectorGeneration == 0;
+    StatelessDeploymentAdmissionReceipt receipt = {};
+    return BitseryEngine::deserializeSafe(record.targetAdmissionReceipt, receipt) &&
+           testPairTargetAdmissionMatches(record, receipt) && record.targetPlanSHA256 == receipt.admission.normalizedPlanSHA256 &&
+           (record.sourceDrainObservation.empty() || testPairSourceDrainObservationValid(record, record.sourceDrainObservation));
+  }
+
+  bool recordTestPairTargetAdmission(const MothershipTestPairBoundaryRecord& expected,
+                                     const StatelessDeploymentAdmissionReceipt& receipt,
+                                     MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
+    if (recorded.closed || !recorded.guestResetFence.operationID.empty() || !testPairBoundaryIdentityMatches(recorded, expected) ||
+        !testPairTargetAdmissionMatches(recorded, receipt))
+    {
+      if (failure) failure->assign("target admission receipt conflicts with the paired request"_ctv);
+      return false;
+    }
+    if (!recorded.targetAdmissionReceipt.empty())
+    {
+      StatelessDeploymentAdmissionReceipt prior = {};
+      if (!BitseryEngine::deserializeSafe(recorded.targetAdmissionReceipt, prior) ||
+          prior.admission.acceptedAuthorityGeneration != receipt.admission.acceptedAuthorityGeneration ||
+          prior.admission.acceptedMasterUUID != receipt.admission.acceptedMasterUUID || prior.admission.acceptedMasterBootNs != receipt.admission.acceptedMasterBootNs)
+      {
+        if (failure) failure->assign("target admission original authority identity changed"_ctv);
+        return false;
+      }
+      if (failure) failure->clear();
+      return true;
+    }
+    recorded.targetPlanSHA256 = receipt.admission.normalizedPlanSHA256;
+    auto copy = receipt;
+    BitseryEngine::serialize(recorded.targetAdmissionReceipt, copy);
+    if (!testPairBoundaryRecordValid(recorded)) return false;
+    String encoded = {};
+    BitseryEngine::serialize(encoded, recorded);
+    return db.write(testPairBoundariesColumnFamily, recorded.boundary.operationID, encoded, failure);
+  }
+
+  bool recordTestPairSourceDrain(const MothershipTestPairBoundaryRecord& expected,
+                                 const MothershipVirtualDatacenterPairDrainObservation& observation,
+                                 MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
+    if (recorded.closed || !testPairBoundaryIdentityMatches(recorded, expected) ||
+        recorded.selectorGeneration != expected.selectorGeneration || recorded.sourceDrainObservation != expected.sourceDrainObservation ||
+        recorded.version < 3 || !recorded.guestResetFence.operationID.empty() || recorded.selectorGeneration != 1 || recorded.targetAdmissionReceipt.empty() ||
+        !mothershipVirtualDatacenterPairDrainObservationBoundValid(recorded.boundary, observation) ||
+        !observation.selectedTarget || !observation.drainCapability || observation.sourceFlows != 0)
+    {
+      if (failure) failure->assign("source drain observation conflicts with the paired boundary"_ctv);
+      return false;
+    }
+    if (!recorded.sourceDrainObservation.empty()) { if (failure) failure->clear(); return true; }
+    auto copy = observation;
+    BitseryEngine::serialize(recorded.sourceDrainObservation, copy);
+    if (!testPairBoundaryRecordValid(recorded)) return false;
+    String encoded = {};
+    BitseryEngine::serialize(encoded, recorded);
+    return db.write(testPairBoundariesColumnFamily, recorded.boundary.operationID, encoded, failure);
+  }
+
+  bool recordTestPairGuestResetFence(const MothershipTestPairBoundaryRecord& expected,
+                                       const MothershipVirtualDatacenterPairGuestResetFence& fence,
+                                       MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
+    const bool expectedIsBase = expected.version == 3 && expected.guestResetFence.operationID.empty() && expected.guestResetCompletedBootID.empty();
+    const bool expectedIsArmed = expected.version == 4 && expected.guestResetFence.operationID == fence.operationID &&
+                                 expected.guestResetFence.descriptorSHA256 == fence.descriptorSHA256 &&
+                                 expected.guestResetFence.bootID == fence.bootID && expected.guestResetFence.guestID == fence.guestID &&
+                                 expected.guestResetCompletedBootID.empty();
+    if (recorded.closed || (recorded.version != 3 && recorded.version != 4) ||
+        !mothershipVirtualDatacenterPairGuestResetFenceValid(fence, recorded.boundary) ||
+        !testPairBoundaryIdentityMatches(recorded, expected) ||
+        recorded.selectorGeneration != expected.selectorGeneration ||
+        recorded.targetPlanSHA256 != expected.targetPlanSHA256 || recorded.targetAdmissionReceipt != expected.targetAdmissionReceipt ||
+        recorded.sourceDrainObservation != expected.sourceDrainObservation || (!expectedIsBase && !expectedIsArmed))
+    {
+      if (failure) failure->assign("guest reset fence conflicts with the paired boundary"_ctv);
+      return false;
+    }
+    if (recorded.version == 4)
+    {
+      if (recorded.guestResetFence.operationID != fence.operationID ||
+          recorded.guestResetFence.descriptorSHA256 != fence.descriptorSHA256 ||
+          recorded.guestResetFence.bootID != fence.bootID || recorded.guestResetFence.guestID != fence.guestID ||
+          !recorded.guestResetCompletedBootID.empty())
+      {
+        if (failure) failure->assign("guest reset fence conflicts with the paired boundary"_ctv);
+        return false;
+      }
+      if (failure) failure->clear();
+      return true;
+    }
+    recorded.version = 4;
+    recorded.guestResetFence = fence;
+    recorded.guestResetCompletedBootID.clear();
+    if (!testPairBoundaryRecordValid(recorded)) return false;
+    String encoded = {};
+    BitseryEngine::serialize(encoded, recorded);
+    return db.write(testPairBoundariesColumnFamily, recorded.boundary.operationID, encoded, failure);
+  }
+
+  bool recordTestPairGuestResetCompletion(const MothershipTestPairBoundaryRecord& expected,
+                                          const String& completedBootID,
+                                          MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
+  {
+    if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
+    if (recorded.closed || recorded.version != 4 || recorded.guestResetFence.operationID.empty() ||
+        !testPairBoundaryIdentityMatches(recorded, expected) || recorded.selectorGeneration != expected.selectorGeneration ||
+        recorded.targetPlanSHA256 != expected.targetPlanSHA256 || recorded.targetAdmissionReceipt != expected.targetAdmissionReceipt ||
+        recorded.sourceDrainObservation != expected.sourceDrainObservation ||
+        recorded.guestResetFence.operationID != expected.guestResetFence.operationID ||
+        recorded.guestResetFence.descriptorSHA256 != expected.guestResetFence.descriptorSHA256 ||
+        recorded.guestResetFence.bootID != expected.guestResetFence.bootID || recorded.guestResetFence.guestID != expected.guestResetFence.guestID ||
+        !mothershipVirtualDatacenterBootIDValid(completedBootID) || completedBootID == recorded.guestResetFence.bootID)
+    {
+      if (failure) failure->assign("guest reset completion conflicts with the armed paired boundary"_ctv);
+      return false;
+    }
+    if (!recorded.guestResetCompletedBootID.empty())
+    {
+      if (recorded.guestResetCompletedBootID != completedBootID)
+      {
+        if (failure) failure->assign("guest reset completion conflicts with the armed paired boundary"_ctv);
+        return false;
+      }
+      if (failure) failure->clear();
+      return true;
+    }
+    recorded.guestResetCompletedBootID = completedBootID;
+    if (!testPairBoundaryRecordValid(recorded)) return false;
+    String encoded = {};
+    BitseryEngine::serialize(encoded, recorded);
+    return db.write(testPairBoundariesColumnFamily, recorded.boundary.operationID, encoded, failure);
   }
 
   bool loadTestPairBoundary(const String& operationID, MothershipTestPairBoundaryRecord& record,
@@ -2261,7 +2639,8 @@ public:
                             MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
   {
     recorded = {};
-    if (!testPairBoundaryRecordValid(requested) || requested.selectorGeneration != 0 || requested.closed)
+    if (!testPairBoundaryRecordValid(requested) || requested.selectorGeneration != 0 || requested.closed ||
+        (requested.version >= 2 && !requested.targetAdmissionReceipt.empty()) || requested.version == 4)
     {
       if (failure) failure->assign("invalid initial test pair boundary identity"_ctv);
       return false;
@@ -2316,7 +2695,16 @@ public:
     if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
     if (!testPairBoundaryIdentityMatches(recorded, expected) ||
         recorded.selectorGeneration != expected.selectorGeneration || recorded.closed != expected.closed ||
+        recorded.targetPlanSHA256 != expected.targetPlanSHA256 || recorded.targetAdmissionReceipt != expected.targetAdmissionReceipt ||
+        recorded.sourceDrainObservation != expected.sourceDrainObservation ||
+        recorded.guestResetFence.operationID != expected.guestResetFence.operationID ||
+        recorded.guestResetFence.descriptorSHA256 != expected.guestResetFence.descriptorSHA256 ||
+        recorded.guestResetFence.bootID != expected.guestResetFence.bootID ||
+        recorded.guestResetFence.guestID != expected.guestResetFence.guestID ||
+        recorded.guestResetCompletedBootID != expected.guestResetCompletedBootID ||
+        (recorded.version >= 2 && nextSelectorGeneration != 0 && recorded.targetAdmissionReceipt.empty()) ||
         nextSelectorGeneration < recorded.selectorGeneration || nextSelectorGeneration > 1 ||
+        (recorded.version == 4 && (nextSelectorGeneration != recorded.selectorGeneration || !closed || recorded.guestResetCompletedBootID.empty())) ||
         (recorded.closed && !closed))
     {
       if (failure) failure->assign("test pair boundary transition is stale or regresses ownership"_ctv);

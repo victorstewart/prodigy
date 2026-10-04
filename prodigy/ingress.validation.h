@@ -347,6 +347,23 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
         }
         return (cursor == terminal);
       }
+    case MothershipTopic::admitStatelessDeployment:
+      {
+        return consumeVariable(cursor, terminal) && consumeVariable(cursor, terminal) &&
+               consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case MothershipTopic::pullStatelessDeploymentAdmission:
+    case MothershipTopic::pullPairedSourceRetirement:
+      {
+        uint8_t version = 0;
+        uint128_t operationID = 0;
+        return extractFixed(cursor, terminal, version) && extractFixed(cursor, terminal, operationID) &&
+               cursor == terminal;
+      }
+    case MothershipTopic::preparePairedSourceRetirement:
+      {
+        return consumeVariable(cursor, terminal) && cursor == terminal;
+      }
     case MothershipTopic::pullUpgradeAdmissionReport:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;

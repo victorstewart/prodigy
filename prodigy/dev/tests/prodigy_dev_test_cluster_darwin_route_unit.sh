@@ -30,6 +30,8 @@ event_log="${work_root}/events"
 route_state_file="${work_root}/route-state"
 output="${work_root}/output"
 mkdir -p "${mock_bin}" "$(dirname "${subject}")" "${fixture_repo}/build"
+fixture_repo="$(cd "${fixture_repo}" && pwd -P)"
+subject="${fixture_repo}/prodigy/dev/tests/prodigy_dev_test_cluster.sh"
 
 sed \
    -e "s#/usr/sbin/netstat#${mock_bin}/netstat#g" \
@@ -74,6 +76,10 @@ case "${tool}" in
       echo "launcher ${1:-}" >> "${EVENT_LOG}"
       case "${1:-}" in
          ensure|verify) exit 0 ;;
+         exec)
+            [[ "${2:-}" == "${APPLE_LINUX_DEV_INSTANCE:-}" && "${3:-}" == -- &&
+               "${4:-}" == env && "${5:-}" == -C && "${6:-}" == /root/prodigy ]] || exit 67
+            exit "${LAUNCHER_EXEC_STATUS:-0}" ;;
          stop) exit "${LAUNCHER_STOP_STATUS:-0}" ;;
          *) exit 64 ;;
       esac
@@ -149,6 +155,9 @@ base_env=(
    "EVENT_LOG=${event_log}"
    "ROUTE_STATE_FILE=${route_state_file}"
    "TMPDIR=${work_root}/"
+   "CONTAINER_EXEC_STATUS=0"
+   "LAUNCHER_EXEC_STATUS=0"
+   "APPLE_LINUX_DEV_INSTANCE=${instance}"
 )
 status=0
 
@@ -159,7 +168,7 @@ run_case()
    : > "${event_log}"
    rm -f "${route_state_file}"
    set +e
-   env "${base_env[@]}" "ROUTE_SCENARIO=${scenario}" "CONTAINER_EXEC_STATUS=${exec_status}" \
+   env "${base_env[@]}" "ROUTE_SCENARIO=${scenario}" "LAUNCHER_EXEC_STATUS=${exec_status}" "APPLE_LINUX_DEV_INSTANCE=${instance}" \
       "${subject}" "${fixture_repo}/build/prodigy" > "${output}" 2>&1
    status=$?
    set -e
@@ -178,14 +187,14 @@ expect()
 }
 
 run_case exact
-expect 0 'launcher ensure,netstat,route get,netstat,container exec,launcher stop'
+expect 0 'launcher ensure,netstat,route get,netstat,launcher exec,launcher stop'
 
 run_case default
-expect 0 'launcher ensure,netstat,route get,route add,route get,netstat,container exec,route delete,launcher stop'
+expect 0 'launcher ensure,netstat,route get,route add,route get,netstat,launcher exec,route delete,launcher stop'
 [[ ! -e "${route_state_file}" ]] || fail "owned route survived successful cleanup"
 
 run_case default 37
-expect 37 'launcher ensure,netstat,route get,route add,route get,netstat,container exec,route delete,launcher stop'
+expect 37 'launcher ensure,netstat,route get,route add,route get,netstat,launcher exec,route delete,launcher stop'
 
 run_case exact-conflict
 expect 1 'launcher ensure,netstat,route get,launcher stop'
@@ -211,13 +220,17 @@ grep -Fq 'failed to verify the Apple Container host route' "${output}" || fail "
 # and only the foreground session may own the temporary route.
 : > "${event_log}"
 rm -f "${route_state_file}"
+set +e
 env "${base_env[@]}" ROUTE_SCENARIO=default "${subject}" --evaluation-command "${fixture_repo}" status > "${output}" 2>&1
 status=$?
+set -e
 expect 0 'launcher verify,container exec'
 
 : > "${event_log}"
+set +e
 env "${base_env[@]}" ROUTE_SCENARIO=default "${subject}" --evaluation-session "${fixture_repo}" > "${output}" 2>&1
 status=$?
+set -e
 expect 0 'launcher ensure,netstat,route get,route add,route get,netstat,container exec,container exec,route delete,launcher stop'
 [[ ! -e "${route_state_file}" ]] || fail "evaluation route survived cleanup"
 [[ ! -e "${work_root}/prodigy-evaluation-${UID}-nametag-prodigy.lock" ]] || fail "evaluation host lock survived cleanup"

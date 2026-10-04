@@ -1016,13 +1016,17 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 2;
+  constexpr static uint8_t currentVersion = 4;
 
   uint8_t version = 1;
   bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
   ProdigyMasterAuthorityRuntimeState runtimeState;
   BrainConfig brainConfig;
   Vector<BrainReplicatedContainerRuntimeState> servingRuntimeStates;
+  // Version three atomically carries the normalized plans referenced by v8
+  // admissions.  A follower can therefore never durably receive the plan
+  // without its immutable operation receipt, or the receipt without its plan.
+  Vector<DeploymentPlan> statelessAdmissionPlans;
 };
 
 template <typename S>
@@ -1031,8 +1035,10 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   serializer.value1b(transition.version);
   serializer.object(transition.runtimeState);
   serializer.object(transition.brainConfig);
-  if (transition.version == 2)
+  if (transition.version >= 2)
     serializer.container(transition.servingRuntimeStates, 4096);
+  if (transition.version >= 3)
+    serializer.container(transition.statelessAdmissionPlans, 4096);
 }
 
 // An adopted machine's explicit peer or address list is operator authority.
@@ -1496,9 +1502,20 @@ public:
     ContainerStore::PreparedAppArtifact prepared = {};
     Phase phase = Phase::preparing;
     bool taskAdmissionDurable = false;
+    bool statelessAdmission = false;
+    ProdigyStatelessDeploymentAdmissionRequest statelessAdmissionRequest = {};
+    String statelessAdmissionRequestPlanSHA256 = {};
+    bool statelessAdmissionDurable = false;
   };
 
   bytell_hash_map<uint64_t, std::shared_ptr<PendingMothershipSpinArtifact>> pendingMothershipSpinArtifacts;
+
+  struct PendingStatelessDeploymentAdmissionRequest
+  {
+    ProdigyStatelessDeploymentAdmissionRequest request;
+    String requestPlanSHA256;
+  };
+  bytell_hash_map<uint64_t, PendingStatelessDeploymentAdmissionRequest> pendingStatelessDeploymentAdmissionRequests;
 
   class PendingMothershipUpdateArtifact
   {
@@ -1519,7 +1536,7 @@ public:
     ProdigyAdmittedUpdateRequest admittedRequest = {};
     uint128_t admittedClusterUUID = 0;
     uint32_t minimumHealthyBrains = 0;
-    bool requiresContainerRetirementReader = false;
+    uint32_t requiredContainerRetirementJournalVersion = 0;
     uint32_t targetContainerRetirementJournalVersion = 0;
     String admittedTargetContractSHA256 = {};
     Phase phase = Phase::preparing;
@@ -6468,7 +6485,23 @@ public:
     ProdigyMasterAuthorityStateTransition transition;
     transition.runtimeState = masterAuthorityRuntimeState;
     transition.servingRuntimeStates = statefulServingRuntimeStates;
-    if (!transition.runtimeState.statefulServingAuthorities.empty()) transition.version = 2;
+    // A v3 admission envelope atomically binds each immutable receipt to the
+    // exact normalized plan.  A legacy receiver cannot deserialize either tail.
+    if (!transition.runtimeState.statelessDeploymentAdmissions.empty())
+    {
+      transition.version = 3;
+      for (const auto& admission : transition.runtimeState.statelessDeploymentAdmissions)
+      {
+        auto plan = deploymentPlans.find(admission.deploymentID);
+        if (plan == deploymentPlans.end() ||
+            !statelessDeploymentAdmissionMatchesPlan(admission, plan->second)) return false;
+        transition.statelessAdmissionPlans.push_back(plan->second);
+      }
+    }
+    else if (!transition.runtimeState.statefulServingAuthorities.empty()) transition.version = 2;
+    ProdigyContainerRetirementJournal retirementJournal = {};
+    if (!decodeContainerRetirementJournal(transition.runtimeState, retirementJournal)) return false;
+    if (!retirementJournal.pairedSourceFences.empty()) transition.version = 4;
     if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
           transition.servingRuntimeStates, transition.runtimeState.generation)) return false;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
@@ -6484,7 +6517,18 @@ public:
     {
       return;
     }
+    // Version-eight admission records must never be sent to a peer that has
+    // not explicitly proven it understands the tail on this TLS stream.
+    ProdigyContainerRetirementJournal replicatedRetirements = {};
+    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, replicatedRetirements)) return;
+    if ((!masterAuthorityRuntimeState.statelessDeploymentAdmissions.empty() &&
+         !statelessDeploymentAdmissionPeersCapable()) ||
+        (!replicatedRetirements.pairedSourceFences.empty() && !pairedSourceRetirementPeersCapable()))
+    {
+      return;
+    }
     if ((onlyUnacknowledged || !masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
+         !masterAuthorityRuntimeState.statelessDeploymentAdmissions.empty() ||
          masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
          masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
         (masterAuthorityRuntimeStateDurable == false ||
@@ -7021,6 +7065,256 @@ public:
     return true;
   }
 
+  bool pairedSourceRetirementPeersCapable() const
+  {
+    if (!statelessDeploymentAdmissionPeersCapable()) return false;
+    ClusterTopology topology = {};
+    if (!loadAuthoritativeClusterTopology(topology)) return false;
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      BrainView *peer = brainPeerForTopologyMember(member);
+      if (!containerRetirementPeerCapabilityCurrent(peer) ||
+          !peer->pairedSourceRetirementCapabilityAcknowledged) return false;
+    }
+    return true;
+  }
+
+  bool statelessDeploymentAdmissionPeersCapable() const
+  {
+    // Reuse the retirement owner's exact commissioned-membership proof.  A
+    // pending local receipt remains provisional through `accepted`, but an
+    // exact retry may inspect its authenticated peer cohort.
+    if (!weAreMaster || !commissionedRetirementPeersCurrent()) return false;
+    ClusterTopology topology = {};
+    if (!loadAuthoritativeClusterTopology(topology)) return false;
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      BrainView *peer = brainPeerForTopologyMember(member);
+      if (!containerRetirementPeerCapabilityCurrent(peer) ||
+          !peer->statelessDeploymentAdmissionCapabilityAcknowledged) return false;
+    }
+    return true;
+  }
+
+  // This is intentionally an observation of the existing capability fence,
+  // not a second admission predicate.  Mothership uses it only before it
+  // dispatches a new request, so an operator can distinguish a post-election
+  // peer-handshake delay from an unsupported cluster.
+  void describeStatelessDeploymentAdmissionCapabilityBlocker(String& failure) const
+  {
+    failure.clear();
+    if (!weAreMaster)
+    {
+      failure.assign("stateless admission capability unavailable: local Brain is not master"_ctv);
+      return;
+    }
+
+    ClusterTopology topology = {};
+    if (!loadAuthoritativeClusterTopology(topology))
+    {
+      failure.assign("stateless admission capability unavailable: authoritative topology is unavailable"_ctv);
+      return;
+    }
+
+    const uint32_t topologyBrains = clusterTopologyBrainCount(topology);
+    if (nBrains == 0 || topologyBrains != nBrains)
+    {
+      failure.snprintf<"stateless admission capability unavailable: topologyBrains={itoa} localBrainCount={itoa}"_ctv>(
+          topologyBrains, nBrains);
+      return;
+    }
+
+    uint32_t selfCount = 0;
+    bytell_hash_set<uint128_t> identities = {};
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain) continue;
+      if (member.uuid == 0 || !identities.insert(member.uuid).second)
+      {
+        failure.assign("stateless admission capability unavailable: topology has an invalid or duplicate Brain identity"_ctv);
+        return;
+      }
+      if (clusterMachineMatchesThisBrain(member)) ++selfCount;
+    }
+    if (selfCount != 1)
+    {
+      failure.snprintf<"stateless admission capability unavailable: topology selfBrainCount={itoa}"_ctv>(selfCount);
+      return;
+    }
+
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      BrainView *peer = brainPeerForTopologyMember(member);
+      if (containerRetirementPeerCapabilityCurrent(peer) &&
+          peer->statelessDeploymentAdmissionCapabilityAcknowledged)
+      {
+        continue;
+      }
+
+      String memberUUID = {};
+      memberUUID.assignItoh(member.uuid);
+      String peerUUID = {};
+      String tlsUUID = {};
+      String witnessUUID = {};
+      if (peer != nullptr)
+      {
+        peerUUID.assignItoh(peer->uuid);
+        tlsUUID.assignItoh(peer->tlsPeerUUID);
+        witnessUUID.assignItoh(peer->containerRetirementCapabilityUUID);
+      }
+      failure.snprintf<
+          "stateless admission capability unavailable: peer={} present={itoa} quarantined={itoa} registrationFresh={itoa} socketActive={itoa} tlsEnabled={itoa} tlsNegotiated={itoa} tlsVerified={itoa} peerUUID={} tlsUUID={} version={itoa} bootNs={itoa} ioGeneration={itoa} retirementWitness={itoa} witnessUUID={} witnessBootNs={itoa} witnessIOGeneration={itoa} admissionWitness={itoa} rawActive={itoa} closing={itoa} pendingConnect={itoa} reconnectWaiter={itoa} connector={itoa} heartbeatAgeMs={itoa}"_ctv>(
+          memberUUID,
+          unsigned(peer != nullptr),
+          unsigned(peer != nullptr && peer->quarantined),
+          unsigned(peer != nullptr && peer->registrationFresh),
+          unsigned(peer != nullptr && peerSocketActive(peer)),
+          unsigned(peer != nullptr && peer->transportTLSEnabled()),
+          unsigned(peer != nullptr && peer->isTLSNegotiated()),
+          unsigned(peer != nullptr && peer->tlsPeerVerified),
+          peerUUID,
+          tlsUUID,
+          (unsigned long long)(peer != nullptr ? peer->version : 0),
+          (long long)(peer != nullptr ? peer->boottimens : 0),
+          (unsigned long long)(peer != nullptr ? peer->ioGeneration : 0),
+          unsigned(peer != nullptr && peer->containerRetirementCapabilityAcknowledged),
+          witnessUUID,
+          (long long)(peer != nullptr ? peer->containerRetirementCapabilityBootNs : 0),
+          (unsigned long long)(peer != nullptr ? peer->containerRetirementCapabilityIOGeneration : 0),
+          unsigned(peer != nullptr && peer->statelessDeploymentAdmissionCapabilityAcknowledged),
+          unsigned(peer != nullptr && rawStreamIsActive(peer)),
+          unsigned(peer != nullptr && Ring::socketIsClosing(peer)),
+          unsigned(peer != nullptr && peer->connectAttemptPending()),
+          unsigned(peer != nullptr && brainReconnectWaiters.contains(peer)),
+          unsigned(peer != nullptr && peer->weConnectToIt),
+          (long long)(Time::msSinceBoot() - lastBrainPeerHeartbeatTickMs));
+      return;
+    }
+
+    failure.assign("stateless admission capability unavailable: commissioned peer capability predicate is not current"_ctv);
+  }
+
+  bool statelessDeploymentAdmissionIsDurable(const ProdigyStatelessDeploymentAdmission& admission) const
+  {
+    if (!masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+    {
+      return false;
+    }
+    return std::any_of(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                       masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(),
+                       [&](const auto& current) { return prodigyStatelessDeploymentAdmissionEqual(current, admission); });
+  }
+
+  // The admission record authorizes one normalized plan, not merely an ID.
+  // Keep this check next to the authority owner because the hash covers the
+  // Brain-normalized representation, which is deliberately not a wire field
+  // that Mothership may reconstruct itself.
+  bool statelessDeploymentAdmissionMatchesPlan(
+      const ProdigyStatelessDeploymentAdmission& admission, const DeploymentPlan& plan) const
+  {
+    if (!prodigyStatelessDeploymentAdmissionPlanEligible(plan) ||
+        plan.config.deploymentID() != admission.deploymentID ||
+        plan.config.applicationID != admission.applicationID ||
+        plan.config.versionID != admission.versionID ||
+        plan.config.containerBlobSHA256.equals(admission.artifactSHA256) == false ||
+        plan.config.containerBlobBytes != admission.artifactBytes)
+    {
+      return false;
+    }
+    DeploymentPlan copy = plan;
+    String serialized = {}, digest = {}, failure = {};
+    BitseryEngine::serialize(serialized, copy);
+    return prodigyComputeSHA256Hex(serialized, digest, &failure) &&
+           digest.equals(admission.normalizedPlanSHA256);
+  }
+
+  bool statelessDeploymentAdmissionPlanIsCurrent(const ProdigyStatelessDeploymentAdmission& admission) const
+  {
+    auto plan = deploymentPlans.find(admission.deploymentID);
+    return plan != deploymentPlans.end() && statelessDeploymentAdmissionMatchesPlan(admission, plan->second);
+  }
+
+  // `accepted` is a failure-tolerant receipt, not a local-disk observation.
+  // The v3 record and normalized plan must be durably acknowledged by the
+  // full commissioned cohort before Mothership may retain its accepted-master
+  // tuple for an ambiguous retry.
+  bool statelessDeploymentAdmissionReplicated(const ProdigyStatelessDeploymentAdmission& admission) const
+  {
+    return statelessDeploymentAdmissionIsDurable(admission) &&
+           statelessDeploymentAdmissionPlanIsCurrent(admission) &&
+           statelessDeploymentAdmissionAuthorityAcknowledged();
+  }
+
+  bool statelessDeploymentAdmissionsMatchPersistentPlans(
+      const Vector<ProdigyStatelessDeploymentAdmission>& admissions,
+      const bytell_hash_map<uint64_t, DeploymentPlan>& plans) const
+  {
+    for (const auto& admission : admissions)
+    {
+      auto plan = plans.find(admission.deploymentID);
+      if (plan == plans.end() || statelessDeploymentAdmissionMatchesPlan(admission, plan->second) == false)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool statelessDeploymentAdmissionTransitionPlansValid(
+      const Vector<ProdigyStatelessDeploymentAdmission>& admissions,
+      const Vector<DeploymentPlan>& plans) const
+  {
+    // The v3 tail is a closed one-to-one set.  Reject duplicates and unrelated
+    // plans rather than letting a later map insertion silently alter the
+    // receipt's normalized plan.
+    if (admissions.size() != plans.size() || admissions.size() > 4096) return false;
+    bytell_hash_set<uint64_t> planIDs;
+    for (const auto& plan : plans)
+    {
+      if (!planIDs.insert(plan.config.deploymentID()).second) return false;
+      const auto admission = std::find_if(admissions.begin(), admissions.end(), [&](const auto& candidate) {
+        return candidate.deploymentID == plan.config.deploymentID();
+      });
+      if (admission == admissions.end() ||
+          !statelessDeploymentAdmissionMatchesPlan(*admission, plan)) return false;
+    }
+    return plans.empty() == admissions.empty();
+  }
+
+
+  bool deploymentReplicationAllowedForPeer(uint64_t deploymentID, BrainView *peer) const override
+  {
+    const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+        masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& candidate) {
+          return candidate.deploymentID == deploymentID;
+        });
+    if (admission == masterAuthorityRuntimeState.statelessDeploymentAdmissions.end()) return true;
+    String serialized = {}, digest = {};
+    return peer != nullptr && statelessDeploymentAdmissionIsDurable(*admission) &&
+           statelessDeploymentAdmissionPlanIsCurrent(*admission) &&
+           serializeCurrentMasterAuthorityTransition(serialized, digest) &&
+           peerHasAcknowledgedCurrentMasterAuthority(peer, digest);
+  }
+
+  bool statelessDeploymentAdmissionAuthorityAcknowledged() const
+  {
+    if (!weAreMaster || !statelessDeploymentAdmissionPeersCapable()) return false;
+    String serialized = {}, digest = {};
+    ClusterTopology topology = {};
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest) ||
+        !loadAuthoritativeClusterTopology(topology)) return false;
+    for (const ClusterMachine& member : topology.machines)
+    {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      if (!peerHasAcknowledgedCurrentMasterAuthority(brainPeerForTopologyMember(member), digest)) return false;
+    }
+    return true;
+  }
+
   bool refreshStatefulServingMachineCapacity(const Vector<Machine *>& affected) override
   {
     if (!weAreMaster) return false;
@@ -7479,11 +7773,12 @@ public:
            peer->containerRetirementCapabilityIOGeneration == peer->ioGeneration;
   }
 
-  bool statefulTopologyRetirementPeersCapable(void) const
+  // Shared commissioned-membership proof for capability-gated authority
+  // extensions.  It deliberately excludes local durability: callers which
+  // report a provisional record must still verify the exact authenticated
+  // cohort while its local persistence receipt is pending.
+  bool commissionedRetirementPeersCurrent(void) const
   {
-    if (weAreMaster == false || masterAuthorityRuntimeStateDurable == false ||
-        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
-      return false;
     ClusterTopology topology = {};
     if (loadAuthoritativeClusterTopology(topology) == false ||
         nBrains == 0 || clusterTopologyBrainCount(topology) != nBrains)
@@ -7499,6 +7794,13 @@ public:
       if (!containerRetirementPeerCapabilityCurrent(peer)) return false;
     }
     return selfCount == 1;
+  }
+
+  bool statefulTopologyRetirementPeersCapable(void) const
+  {
+    return weAreMaster && masterAuthorityRuntimeStateDurable &&
+           durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
+           commissionedRetirementPeersCurrent();
   }
 
   bool decodeContainerRetirementJournal(const ProdigyMasterAuthorityRuntimeState& state,
@@ -7518,10 +7820,53 @@ public:
            prodigyFindContainerRetirementIntentInValidatedJournal(journal, containerUUID) != nullptr;
   }
 
+  uint32_t requiredContainerRetirementJournalReaderVersion() const
+  {
+    if (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID)) return 0;
+    ProdigyContainerRetirementJournal journal = {};
+    return decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal) ? journal.version : UINT32_MAX;
+  }
+
+  bool pairedSourceRetirementLaunchFenced(uint64_t deploymentID) const
+  {
+    ProdigyContainerRetirementJournal journal = {};
+    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return true;
+    return prodigyFindPairedSourceRetirementFenceByDeploymentInValidatedJournal(journal, deploymentID) != nullptr;
+  }
+
+  bool deploymentLaunchFenced(uint64_t deploymentID) const override
+  {
+    return pairedSourceRetirementLaunchFenced(deploymentID);
+  }
+
+  // A v4 replicated fence is accepted only when the receiving source still
+  // owns the exact public deployment identity that was sealed.
+  bool pairedSourceRetirementFencesMatchAuthoritativePlans(
+      const ProdigyContainerRetirementJournal& journal) const
+  {
+    for (const auto& fence : journal.pairedSourceFences)
+    {
+      if (fence.sourceClusterUUID != brainConfig.clusterUUID) return false;
+      auto plan = deploymentPlans.find(fence.sourceDeploymentID);
+      if (plan == deploymentPlans.end() || plan->second.isStateful ||
+          !prodigyStatelessDeploymentAdmissionPlanEligible(plan->second) ||
+          plan->second.config.containerBlobSHA256.equals(fence.sourceBlobSHA256) == false ||
+          plan->second.config.containerBlobBytes != fence.sourceBlobBytes) return false;
+      DeploymentPlan normalized = plan->second; String encoded = {}, digest = {}, failure = {};
+      BitseryEngine::serialize(encoded, normalized);
+      if (!prodigyComputeSHA256Hex(encoded, digest, &failure) ||
+          digest.equals(fence.sourceNormalizedPlanSHA256) == false) return false;
+    }
+    return true;
+  }
+
   bool containerRetirementAuthorityAcknowledged() const
   {
     if (!statefulTopologyRetirementPeersCapable() ||
         (!masterAuthorityRuntimeState.statefulServingAuthorities.empty() && !statefulServingPeersCapable())) return false;
+    ProdigyContainerRetirementJournal retirementJournal = {};
+    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, retirementJournal) ||
+        (!retirementJournal.pairedSourceFences.empty() && !pairedSourceRetirementPeersCapable())) return false;
     String serialized, digest;
     ClusterTopology topology = {};
     if (!serializeCurrentMasterAuthorityTransition(serialized, digest) ||
@@ -7646,6 +7991,136 @@ public:
     return !sources.empty() && containerRetirementAuthorityAcknowledged();
   }
 
+  bool preparePairedSourceRetirement(const ProdigyPairedSourceRetirementRequest& request,
+                                     PairedSourceRetirementReceipt& receipt)
+  {
+    receipt = {};
+    receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    receipt.currentMasterUUID = getExistingMasterUUID();
+    receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+        (findBrainViewByUUID(receipt.currentMasterUUID) ? findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+    receipt.peersCapable = pairedSourceRetirementPeersCapable();
+    if (!prodigyPairedSourceRetirementRequestValid(request) || !weAreMaster ||
+        request.sourceClusterUUID != brainConfig.clusterUUID || request.expectedAuthorityGeneration != receipt.currentAuthorityGeneration ||
+        request.expectedMasterUUID != receipt.currentMasterUUID || request.expectedMasterBootNs != receipt.currentMasterBootNs)
+    {
+      receipt.failure.assign("paired source retirement request is stale or invalid"_ctv);
+      return false;
+    }
+    ProdigyContainerRetirementJournal journal = {};
+    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal))
+    {
+      receipt.failure.assign("paired source retirement journal is invalid"_ctv);
+      return false;
+    }
+    auto existing = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, request.operationID);
+    if (existing != nullptr)
+    {
+      if (existing->sourceClusterUUID != request.sourceClusterUUID ||
+          existing->targetClusterUUID != request.targetClusterUUID ||
+          existing->sourceDeploymentID != request.sourceDeploymentID ||
+          existing->targetDeploymentID != request.targetDeploymentID ||
+          existing->sourceNormalizedPlanSHA256.equals(request.sourceNormalizedPlanSHA256) == false ||
+          existing->sourceBlobSHA256.equals(request.sourceBlobSHA256) == false ||
+          existing->sourceBlobBytes != request.sourceBlobBytes)
+      {
+        receipt.failure.assign("paired source retirement operation conflicts with sealed fence"_ctv);
+        return false;
+      }
+      BitseryEngine::serialize(receipt.sealedFence, *existing);
+      receipt.sealed = masterAuthorityRuntimeStateDurable && pairedSourceRetirementPeersCapable() &&
+                       containerRetirementAuthorityAcknowledged();
+      receipt.terminal = receipt.sealed && std::all_of(journal.intents.begin(), journal.intents.end(), [&](const auto& intent) {
+        return intent.pairedOperationID != request.operationID || intent.killAcked;
+      });
+      return receipt.sealed;
+    }
+    if (!receipt.peersCapable)
+    {
+      receipt.failure.assign("paired source retirement requires current v3 reader acknowledgements"_ctv);
+      return false;
+    }
+    if (!masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        masterAuthorityPersistencePending != 0 || pendingMothershipUpdateArtifact != nullptr ||
+        updateSelfState != UpdateSelfState::idle || !containerRetirementAuthorityAcknowledged())
+    {
+      receipt.failure.assign("paired source retirement requires settled current source authority"_ctv);
+      return false;
+    }
+    auto owner = deployments.find(request.sourceDeploymentID);
+    if (owner == deployments.end() || owner->second == nullptr || owner->second->plan.isStateful ||
+        !prodigyStatelessDeploymentAdmissionPlanEligible(owner->second->plan) ||
+        owner->second->plan.config.containerBlobSHA256.equals(request.sourceBlobSHA256) == false ||
+        owner->second->plan.config.containerBlobBytes != request.sourceBlobBytes ||
+        pairedSourceRetirementLaunchFenced(request.sourceDeploymentID))
+    {
+      receipt.failure.assign("paired source retirement source plan is not current"_ctv);
+      return false;
+    }
+    DeploymentPlan normalized = owner->second->plan;
+    String encoded = {}, digest = {}, failure = {};
+    BitseryEngine::serialize(encoded, normalized);
+    if (!prodigyComputeSHA256Hex(encoded, digest, &failure) ||
+        digest.equals(request.sourceNormalizedPlanSHA256) == false || owner->second->containers.empty())
+    {
+      receipt.failure.assign("paired source retirement source plan digest differs"_ctv);
+      return false;
+    }
+    if (masterAuthorityRuntimeState.generation >= UINT64_MAX - 1)
+    {
+      receipt.failure.assign("paired source retirement authority generation is exhausted"_ctv);
+      return false;
+    }
+    ProdigyPairedSourceRetirementFence fence = {};
+    fence.operationID = request.operationID;
+    fence.sourceClusterUUID = request.sourceClusterUUID;
+    fence.targetClusterUUID = request.targetClusterUUID;
+    fence.sourceDeploymentID = request.sourceDeploymentID;
+    fence.targetDeploymentID = request.targetDeploymentID;
+    fence.sourceNormalizedPlanSHA256 = request.sourceNormalizedPlanSHA256;
+    fence.sourceBlobSHA256 = request.sourceBlobSHA256;
+    fence.sourceBlobBytes = request.sourceBlobBytes;
+    for (ContainerView *container : owner->second->containers)
+    {
+      if (container == nullptr || container->machine == nullptr || container->uuid == 0 || container->machine->uuid == 0 ||
+          container->deploymentID != request.sourceDeploymentID || container->state != ContainerState::healthy ||
+          container->plannedWork != nullptr || !container->runtimeReady || prodigyFindContainerRetirementIntentInValidatedJournal(journal, container->uuid) != nullptr)
+      { receipt.failure.assign("paired source retirement live cohort is incomplete"_ctv); return false; }
+      ProdigyContainerRetirementIntent intent = {};
+      intent.containerUUID = container->uuid; intent.deploymentID = request.sourceDeploymentID;
+      intent.applicationID = owner->second->plan.config.applicationID; intent.machineUUID = container->machine->uuid;
+      intent.intentGeneration = masterAuthorityRuntimeState.generation + 1;
+      intent.kind = ProdigyContainerRetirementKind::statelessPairedMigration;
+      intent.pairedOperationID = request.operationID; intent.pairedSourceClusterUUID = request.sourceClusterUUID;
+      intent.pairedTargetClusterUUID = request.targetClusterUUID; intent.pairedTargetDeploymentID = request.targetDeploymentID;
+      ApplicationConfig config = owner->second->resourceConfigForContainer(container);
+      NeuronContainerBootstrap bootstrap = {}; bootstrap.plan = container->generatePlan(owner->second->plan, owner->second->nShardGroups, &config);
+      if (!applyCredentialsToContainerPlan(owner->second->plan, *container, bootstrap.plan)) { receipt.failure.assign("paired source retirement bootstrap credentials unavailable"_ctv); return false; }
+      bootstrap.plan.restartOnFailure = false; bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(owner->second->plan);
+      BitseryEngine::serialize(intent.bootstrap, bootstrap);
+      fence.cohort.push_back({intent.containerUUID, intent.machineUUID, intent.intentGeneration});
+      journal.intents.push_back(std::move(intent));
+    }
+    std::sort(fence.cohort.begin(), fence.cohort.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
+    std::sort(journal.intents.begin(), journal.intents.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
+    journal.version = ProdigyContainerRetirementJournal::currentVersion;
+    journal.pairedSourceFences.push_back(std::move(fence));
+    std::sort(journal.pairedSourceFences.begin(), journal.pairedSourceFences.end(), [](const auto& a, const auto& b) { return a.operationID < b.operationID; });
+    if (!prodigyStoreContainerRetirementJournalCarrier(masterAuthorityRuntimeState.taskExecutions, journal, Time::now<TimeResolution::ms>()))
+    { receipt.failure.assign("paired source retirement journal rejected"_ctv); return false; }
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+    commitMasterAuthorityStateChangeAsync([this, epoch, generation](bool durable) {
+      // Destruction is published only after the exact sealed authority became
+      // durable and remains this master's current generation.
+      if (!durable || masterAuthorityEpoch != epoch ||
+          masterAuthorityRuntimeState.generation != generation) return;
+      (void)reconcileContainerRetirements();
+    });
+    return false;
+  }
+
   bool containerRetirementNeuronAuthorized(const NeuronView *neuron, uint128_t machineUUID) const
   {
     if (!weAreMaster || neuron == nullptr || neuron->machine == nullptr ||
@@ -7666,6 +8141,9 @@ public:
     if (existing == nullptr || !containerRetirementNeuronAuthorized(neuron, existing->machineUUID) ||
         !containerRetirementAuthorityAcknowledged()) return false;
     if (existing->killAcked) return true;
+    if (existing->kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+      basics_log("brain paired source retirement kill acknowledged deploymentID=%llu containerUUID=%llu\n",
+          (unsigned long long)existing->deploymentID, (unsigned long long)containerUUID);
     for (auto& intent : journal.intents)
       if (intent.containerUUID == containerUUID) { intent.killAcked = true; intent.bootstrap.clear(); break; }
     if (!prodigyStoreContainerRetirementJournalCarrier(masterAuthorityRuntimeState.taskExecutions,
@@ -7681,7 +8159,8 @@ public:
     ProdigyContainerRetirementJournal journal = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return false;
     if (journal.intents.empty()) return true;
-    if (!containerRetirementAuthorityAcknowledged()) return false;
+    if (!containerRetirementAuthorityAcknowledged() ||
+        (!journal.pairedSourceFences.empty() && !pairedSourceRetirementPeersCapable())) return false;
     bool settled = true;
     for (const auto& intent : journal.intents)
     {
@@ -7699,6 +8178,26 @@ public:
       settled = false;
       Machine *machine = findMachineByUUID(intent.machineUUID);
       if (machine == nullptr || !containerRetirementNeuronAuthorized(&machine->neuron, intent.machineUUID)) continue;
+      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+      {
+        auto live = containers.find(intent.containerUUID);
+        if (live != containers.end() && live->second != nullptr && live->second->state != ContainerState::destroying)
+        {
+          ContainerView *container = live->second;
+          auto owner = deployments.find(intent.deploymentID);
+          if (container->machine != machine || container->deploymentID != intent.deploymentID ||
+              owner == deployments.end() || owner->second == nullptr || container->plannedWork != nullptr) return false;
+          // The ordinary destruction owner releases placement, capacity and
+          // routing exactly once. Keep its object alive for Neuron's kill ACK.
+          owner->second->releaseContainerPlacementCounts(container);
+          container->state = ContainerState::aboutToDestroy;
+          container->destructionWaiterDeploymentID = intent.deploymentID;
+          owner->second->waitingOnContainers.insert_or_assign(container, ContainerState::destroyed);
+          basics_log("brain paired source retirement destruction started deploymentID=%llu containerUUID=%llu\n",
+              (unsigned long long)intent.deploymentID, (unsigned long long)intent.containerUUID);
+          owner->second->destructContainer(container);
+        }
+      }
       auto observed = containerRetirementInventoryByMachine.find(intent.machineUUID);
       const bool freshInventory = machine->runtimeReady && persistedMachineInventoryUploaded.contains(intent.machineUUID) &&
           observed != containerRetirementInventoryByMachine.end() &&
@@ -7741,7 +8240,14 @@ public:
             unsigned(containerRetirementAuthorityAcknowledged()), unsigned(journalValid), size_t(journal.intents.size()));
       }
     }
-    if (!statefulTopologyRetirementActivationEnabled()) return;
+    // Paired stateless source retirements share this durable owner but do not
+    // require a stateful topology activation. Their own authority/capability
+    // predicates remain inside reconcileContainerRetirements.
+    if (!statefulTopologyRetirementActivationEnabled())
+    {
+      (void)reconcileContainerRetirements();
+      return;
+    }
     (void)reconcileContainerRetirements();
     Vector<uint64_t> owners;
     for (const auto& [id, deployment] : deployments)
@@ -7852,6 +8358,10 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
+    if (!prodigyStatelessDeploymentAdmissionsValid(restoredRuntimeState.statelessDeploymentAdmissions,
+                                                   restoredRuntimeState.generation) ||
+        !statelessDeploymentAdmissionsMatchPersistentPlans(
+            restoredRuntimeState.statelessDeploymentAdmissions, package.deploymentPlans)) return false;
     if (!prodigyValidateStatefulServingAuthorities(restoredRuntimeState.statefulServingAuthorities,
           package.servingRuntimeStates, restoredRuntimeState.generation)) return false;
     ProdigyMachineRetirementJournal retirementJournal = {};
@@ -8347,7 +8857,8 @@ public:
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
   {
-    if (!incoming.statefulServingAuthorities.empty()) return false; // Requires the paired transition payload.
+    if (!incoming.statefulServingAuthorities.empty() ||
+        !incoming.statelessDeploymentAdmissions.empty()) return false; // Requires the paired transition payload.
     PreparedMasterAuthorityRuntimeState prepared;
     return prepareReplicatedMasterAuthorityRuntimeState(incoming, prepared) &&
            applyPreparedMasterAuthorityRuntimeState(std::move(prepared), persist);
@@ -8358,6 +8869,7 @@ public:
     BrainConfig config;
     PreparedMasterAuthorityRuntimeState runtime;
     Vector<BrainReplicatedContainerRuntimeState> servingRuntimeStates;
+    Vector<DeploymentPlan> statelessAdmissionPlans;
     bool configChanged = false;
   };
 
@@ -8368,9 +8880,22 @@ public:
     const bool incomingHasPendingElasticOperations =
         incoming.runtimeState.pendingElasticAddressAssignments.empty() == false ||
         incoming.runtimeState.pendingElasticAddressReleases.empty() == false;
-    if (!incoming.supportedVersion() ||
+    ProdigyContainerRetirementJournal incomingRetirements = {};
+    const bool incomingRetirementsValid = decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements);
+    if (!incoming.supportedVersion() || !incomingRetirementsValid ||
+        !prodigyStatelessDeploymentAdmissionsValid(incoming.runtimeState.statelessDeploymentAdmissions,
+                                                    incoming.runtimeState.generation) ||
         (incoming.version == 1 && (!incoming.runtimeState.statefulServingAuthorities.empty() ||
+                                  !incoming.runtimeState.statelessDeploymentAdmissions.empty() ||
                                   !incoming.servingRuntimeStates.empty())) ||
+        (!incoming.runtimeState.statelessDeploymentAdmissions.empty() &&
+         (incoming.version < 3 ||
+          !statelessDeploymentAdmissionTransitionPlansValid(
+              incoming.runtimeState.statelessDeploymentAdmissions, incoming.statelessAdmissionPlans))) ||
+        (incoming.runtimeState.statelessDeploymentAdmissions.empty() &&
+         !incoming.statelessAdmissionPlans.empty()) ||
+        (!incomingRetirements.pairedSourceFences.empty() &&
+         (incoming.version < 4 || !pairedSourceRetirementFencesMatchAuthoritativePlans(incomingRetirements))) ||
         !prodigyValidateStatefulServingAuthorities(incoming.runtimeState.statefulServingAuthorities,
               incoming.servingRuntimeStates, incoming.runtimeState.generation) ||
         validatePendingElasticAddressOperations(incoming.runtimeState, &incoming.brainConfig) == false ||
@@ -8415,8 +8940,24 @@ public:
       if (next == incoming.runtimeState.statefulServingAuthorities.end() || next->revision < previous.revision ||
           (next->revision == previous.revision && *next != previous)) return false;
     }
+    // Target-admission receipts are immutable operation identities.  A newer
+    // authority generation may add one, but it cannot erase or rewrite an
+    // accepted receipt and thereby make the deployment ID reusable.
+    for (const auto& previous : masterAuthorityRuntimeState.statelessDeploymentAdmissions)
+    {
+      const auto next = std::find_if(incoming.runtimeState.statelessDeploymentAdmissions.begin(),
+          incoming.runtimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+            return admission.operationID == previous.operationID;
+          });
+      if (next == incoming.runtimeState.statelessDeploymentAdmissions.end() ||
+          prodigyStatelessDeploymentAdmissionEqual(previous, *next) == false)
+      {
+        return false;
+      }
+    }
     if (!prepareReplicatedMasterAuthorityRuntimeState(incoming.runtimeState, prepared.runtime, &ownedIncoming)) return false;
     prepared.servingRuntimeStates = incoming.servingRuntimeStates;
+    prepared.statelessAdmissionPlans = incoming.statelessAdmissionPlans;
     prepared.config = std::move(ownedIncoming);
     prepared.configChanged = configChanged;
     return true;
@@ -8439,6 +8980,12 @@ public:
     }
     BrainConfig previousConfig = std::move(brainConfig);
     auto previousServing = std::move(statefulServingRuntimeStates);
+    const auto previousPlans = deploymentPlans;
+    // This transition was durably captured with these plans.  Project them
+    // immediately before runtime recovery sees its receipt, never before the
+    // candidate persistence callback.
+    for (const DeploymentPlan& plan : prepared.statelessAdmissionPlans)
+      deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
     statefulServingRuntimeStates = std::move(prepared.servingRuntimeStates);
     brainConfig = std::move(prepared.config);
     if (applyPreparedMasterAuthorityRuntimeState(std::move(prepared.runtime), persist, alreadyDurable))
@@ -8452,6 +8999,7 @@ public:
     }
     brainConfig = std::move(previousConfig);
     statefulServingRuntimeStates = std::move(previousServing);
+    deploymentPlans = previousPlans;
     (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
     return false;
   }
@@ -8635,7 +9183,12 @@ public:
     candidate.brainConfig = pending->prepared.config;
     candidate.runtimeState = pending->prepared.runtime.runtimeState;
     candidate.servingRuntimeStates = pending->prepared.servingRuntimeStates;
-    if (!candidate.runtimeState.statefulServingAuthorities.empty()) candidate.version = 2;
+    candidate.statelessAdmissionPlans = pending->prepared.statelessAdmissionPlans;
+    ProdigyContainerRetirementJournal candidateRetirements = {};
+    if (!decodeContainerRetirementJournal(candidate.runtimeState, candidateRetirements)) return true;
+    if (!candidateRetirements.pairedSourceFences.empty()) candidate.version = 4;
+    else if (!candidate.runtimeState.statelessDeploymentAdmissions.empty()) candidate.version = 3;
+    else if (!candidate.runtimeState.statefulServingAuthorities.empty()) candidate.version = 2;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
@@ -8714,7 +9267,13 @@ public:
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
-            containerRetirementPeerCapabilityCurrent(peer)) &&
+            (containerRetirementPeerCapabilityCurrent(peer) && [&]() {
+              ProdigyContainerRetirementJournal journal = {};
+              return decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal) &&
+                     (journal.pairedSourceFences.empty() ||
+                      (peer->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion &&
+                       peer->pairedSourceRetirementCapabilityAcknowledged));
+            }())) &&
            (!machineRetirementJournalPresent(masterAuthorityRuntimeState) ||
             peer->version >= machineRetirementJournalMinimumPeerVersion);
   }
@@ -8920,6 +9479,9 @@ public:
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return;
     for (const auto& intent : journal.intents)
     {
+      // Followers persist the fence before acknowledging it, but cannot
+      // infer that every commissioned peer has committed the same fence.
+      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration && !intent.killAcked) continue;
       auto indexed = containers.find(intent.containerUUID);
       if (indexed == containers.end() || indexed->second == nullptr) continue;
       ContainerView *container = indexed->second;
@@ -8947,6 +9509,8 @@ public:
       // Preserve object lifetime for the existing destruction receipt owner.
       // It is no longer a serving or placement entry on this follower.
       owner->second->waitingOnContainers.insert_or_assign(container, ContainerState::destroyed);
+      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+        owner->second->rebuildRecoveredContainerCounts();
     }
   }
 
@@ -9103,7 +9667,8 @@ public:
 
   ReplicatedContainerRuntimeStateApplyResult applyReplicatedContainerRuntimeStateNow(const BrainReplicatedContainerRuntimeState& state)
   {
-    if (containerRuntimeStateRetired(masterAuthorityRuntimeState, state.plan.uuid))
+    if (containerRuntimeStateRetired(masterAuthorityRuntimeState, state.plan.uuid) ||
+        deploymentLaunchFenced(state.plan.config.deploymentID()))
     {
       return ReplicatedContainerRuntimeStateApplyResult::rejected;
     }
@@ -12242,6 +12807,7 @@ public:
   bool startDeploymentAfterAuthoritativeReplication(ApplicationDeployment *deployment)
   {
     if (isActiveMaster() == false || deployment == nullptr || deployment->state != DeploymentState::none ||
+        pairedSourceRetirementLaunchFenced(deployment->plan.config.deploymentID()) ||
         deploymentIsIndexedApplicationChainMember(deployment))
     {
       return false;
@@ -12255,6 +12821,21 @@ public:
       return false;
     }
 
+    const auto statelessAdmission = std::find_if(
+        masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+        masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+          return admission.deploymentID == deployment->plan.config.deploymentID();
+        });
+    if (statelessAdmission != masterAuthorityRuntimeState.statelessDeploymentAdmissions.end() &&
+        (!statelessDeploymentAdmissionIsDurable(*statelessAdmission) ||
+         !statelessDeploymentAdmissionPlanIsCurrent(*statelessAdmission) ||
+         !statelessDeploymentAdmissionAuthorityAcknowledged()))
+    {
+      pushSpinApplicationProgressToMothership(
+          deployment, "waiting for durable stateless admission replication to authoritative Brain peers"_ctv);
+      return false;
+    }
+
     if (deploymentDNSReady(deployment->plan.config.deploymentID()) == false)
     {
       deploymentsWaitingForDNS.insert(deployment->plan.config.deploymentID());
@@ -12264,6 +12845,50 @@ public:
 
     spinApplication(deployment);
     return true;
+  }
+
+  bool statelessDeploymentRecoveryLaunchAllowed(const ApplicationDeployment *deployment) const
+  {
+    if (deployment == nullptr || pairedSourceRetirementLaunchFenced(deployment->plan.config.deploymentID())) return false;
+    const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+        masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& candidate) {
+          return candidate.deploymentID == deployment->plan.config.deploymentID();
+        });
+    return admission == masterAuthorityRuntimeState.statelessDeploymentAdmissions.end() ||
+           (statelessDeploymentAdmissionIsDurable(*admission) &&
+            statelessDeploymentAdmissionMatchesPlan(*admission, deployment->plan) &&
+            statelessDeploymentAdmissionPlanIsCurrent(*admission) &&
+            statelessDeploymentAdmissionAuthorityAcknowledged() &&
+            deploymentReplicationAcknowledgedByAuthoritativePeers(deployment));
+  }
+
+  void resumeStatelessDeploymentsAfterAuthorityAcknowledgement()
+  {
+    if (!statelessDeploymentAdmissionAuthorityAcknowledged()) return;
+    for (const auto& [deploymentID, deployment] : deployments)
+    {
+      (void)deploymentID;
+      if (deployment == nullptr || deployment->state != DeploymentState::none) continue;
+      const bool admitted = std::any_of(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+          masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+            return admission.deploymentID == deployment->plan.config.deploymentID() &&
+                   statelessDeploymentAdmissionIsDurable(admission) &&
+                   statelessDeploymentAdmissionMatchesPlan(admission, deployment->plan) &&
+                   statelessDeploymentAdmissionPlanIsCurrent(admission);
+          });
+      if (!admitted) continue;
+      if (deploymentIsIndexedApplicationChainMember(deployment))
+      {
+        // Cold reconstruction owns an indexed NONE-state head.  It has the
+        // same admission/peer/inventory fences and must resume that object,
+        // rather than constructing a second deployment for this ID.
+        recoverDeploymentsAfterNeuronState();
+      }
+      else
+      {
+        (void)startDeploymentAfterAuthoritativeReplication(deployment);
+      }
+    }
   }
 
   bool authoritativeTopologyContainsRemoteBrainUUID(uint128_t uuid) const
@@ -14502,6 +15127,13 @@ public:
         deploymentsWaitingForDNS.insert(head->plan.config.deploymentID());
         continue;
       }
+      // A persisted stateless admission can be reconstructed before its
+      // original launch.  Inventory completion alone must not bypass the
+      // operation's durable, full-peer authority and plan/blob receipts.
+      if (!statelessDeploymentRecoveryLaunchAllowed(head))
+      {
+        continue;
+      }
       head->recoverAfterReboot();
     }
   }
@@ -15950,6 +16582,14 @@ public:
     }
 
     peer->weConnectToIt = shouldWeConnectToBrain(peer);
+    // A post-close missing waiter can cancel reconnect and create a raw
+    // socket while we are still a follower. After promotion that inert
+    // generation is not an in-flight reconnect. Reuse the same guarded
+    // cleanup as the reconnect timeout and waiter owners before redialing.
+    if (staleDisconnectedBrainPeer(peer))
+    {
+      abandonSocketGeneration(peer);
+    }
     const bool reconnectAlreadyInFlight = (rawStreamIsActive(peer) || Ring::socketIsClosing(peer) || peer->connectAttemptPending());
     if (reconnectAlreadyInFlight == false)
     {
@@ -17076,6 +17716,8 @@ public:
       return;
     }
 
+    const bool runtimeReadyBeforeInvalidation = machine->runtimeReady;
+    const bool controlActive = neuronControlStreamActive(machine);
     uint32_t headerOffset = Message::appendHeader(machine->neuron.wBuffer, NeuronTopic::stateUpload);
 
     struct local_container_subnet6 fragment = {};
@@ -17101,6 +17743,12 @@ public:
       discardPersistedMachineStateUploadInventory(machine);
       machine->runtimeReady = false;
       machine->neuron.wBuffer.resize(headerOffset);
+      std::fprintf(stderr,
+                   "brain stateUpload partial-witness-abort machineUUID=%llu localUUID=%llu epoch=%llu readyBefore=%d controlActive=%d witnesses=%zu\n",
+                   (unsigned long long)machine->uuid, (unsigned long long)updateSelfLocalMachineUUID,
+                   (unsigned long long)masterAuthorityEpoch, int(runtimeReadyBeforeInvalidation), int(controlActive),
+                   size_t(updateSelfMachineRecoveryWitnesses.size()));
+      std::fflush(stderr);
       return;
     }
     else if (machine->uuid == updateSelfLocalMachineUUID && updateSelfLocalMachineUUID != 0)
@@ -17127,6 +17775,12 @@ public:
     if (bootstraps == nullptr)
     {
       machine->neuron.wBuffer.resize(headerOffset);
+      std::fprintf(stderr,
+                   "brain stateUpload no-bootstraps machineUUID=%llu localUUID=%llu epoch=%llu readyBefore=%d controlActive=%d witnesses=%zu\n",
+                   (unsigned long long)machine->uuid, (unsigned long long)updateSelfLocalMachineUUID,
+                   (unsigned long long)masterAuthorityEpoch, int(runtimeReadyBeforeInvalidation), int(controlActive),
+                   size_t(updateSelfMachineRecoveryWitnesses.size()));
+      std::fflush(stderr);
       return;
     }
     for (const String& serializedBootstrap : *bootstraps)
@@ -17136,6 +17790,11 @@ public:
 
     Message::finish(machine->neuron.wBuffer, headerOffset);
 
+    std::fprintf(stderr,
+                 "brain stateUpload queued machineUUID=%llu bootstraps=%zu active=%d fragment=%u epoch=%llu\n",
+                 (unsigned long long)machine->uuid, size_t(bootstraps->size()), int(controlActive),
+                 unsigned(machine->fragment), (unsigned long long)masterAuthorityEpoch);
+    std::fflush(stderr);
     if (streamIsActive(&machine->neuron))
     {
       Ring::queueSend(&machine->neuron);
@@ -22529,7 +23188,28 @@ public:
         recoveredApplicationIDs.insert(plan.config.applicationID);
       }
     }
-    deploymentPlans.clear();
+    // Ordinary plans are materialized into deployment owners on promotion and
+    // therefore need not remain in the deferred-plan map.  A stateless
+    // admission receipt is different: its v3 authority envelope hashes the
+    // exact normalized plan from this map until the commissioned peers ACK it.
+    // Keep only those immutable receipt plans; retaining the whole deferred
+    // map would change the established post-election recovery ownership.
+    for (auto plan = deploymentPlans.begin(); plan != deploymentPlans.end();)
+    {
+      const auto admission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+          masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& candidate) {
+            return candidate.deploymentID == plan->first;
+          });
+      if (admission == masterAuthorityRuntimeState.statelessDeploymentAdmissions.end() ||
+          statelessDeploymentAdmissionMatchesPlan(*admission, plan->second) == false)
+      {
+        plan = deploymentPlans.erase(plan);
+      }
+      else
+      {
+        ++plan;
+      }
+    }
 
     // Rebuild every owned version for each recovered application in version
     // order before Neuron inventory can schedule.  This includes an owner that
@@ -26100,7 +26780,7 @@ public:
   }
 
   template <typename T>
-  bool rawStreamIsActive(T *stream)
+  bool rawStreamIsActive(T *stream) const
   {
     if (stream == nullptr)
     {
@@ -26177,7 +26857,6 @@ public:
                (unsigned long long)brain->queuedSendOutstandingBytes(),
                uint32_t(brain->wBuffer.outstandingBytes()),
                (unsigned long long)brain->rBuffer.outstandingBytes());
-
     if (active == false)
     {
       return;
@@ -30869,12 +31548,16 @@ public:
           bv->registrationFresh = true;
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
+          bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
+          bv->pairedSourceRetirementCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
           if (bv->version >= ProdigyBrainUpgradeCapabilityProtocolMinimumVersion)
           {
-            Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, uint64_t(7));
+            const uint64_t advertised = bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7);
+            Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
           if (bv->machine != nullptr)
@@ -31498,7 +32181,9 @@ public:
               bv->version < ProdigyBrainUpgradeCapabilityProtocolMinimumVersion) break;
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
-          Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & uint64_t(7));
+          const uint64_t supported = bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+                                     (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7);
+          Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
         }
@@ -31516,6 +32201,10 @@ public:
           {
             bv->containerRetirementCapabilityAcknowledged = true;
             bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
+            bv->statelessDeploymentAdmissionCapabilityAcknowledged =
+                bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion && (capabilities & uint64_t(8)) != 0;
+            bv->pairedSourceRetirementCapabilityAcknowledged =
+                bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion && (capabilities & uint64_t(16)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -31543,8 +32232,19 @@ public:
           }
 
           ProdigyMasterAuthorityStateTransition incoming = {};
+          ProdigyContainerRetirementJournal incomingRetirements = {};
           if (BitseryEngine::deserializeSafe(serialized, incoming) &&
               incoming.supportedVersion() &&
+              decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements) &&
+              (incomingRetirements.pairedSourceFences.empty() ||
+               (incoming.version >= 4 && containerRetirementPeerCapabilityCurrent(bv) &&
+                bv->pairedSourceRetirementCapabilityAcknowledged)) &&
+              (incoming.runtimeState.statelessDeploymentAdmissions.empty() ||
+               (incoming.version >= 3 && bv != nullptr &&
+                bv->statelessDeploymentAdmissionCapabilityAcknowledged &&
+                bv->containerRetirementCapabilityUUID == bv->uuid &&
+                bv->containerRetirementCapabilityBootNs == bv->boottimens &&
+                bv->containerRetirementCapabilityIOGeneration == bv->ioGeneration)) &&
               validatePendingElasticAddressOperations(incoming.runtimeState,
                                                       &incoming.brainConfig))
           {
@@ -31838,7 +32538,8 @@ public:
 
   void spinApplication(ApplicationDeployment *deployment)
   {
-    if (deployment != nullptr && prodigyDebugDeployHeapEnabled())
+    if (deployment == nullptr || pairedSourceRetirementLaunchFenced(deployment->plan.config.deploymentID())) return;
+    if (prodigyDebugDeployHeapEnabled())
     {
       const ProdigyDeployHeapMetrics heap = prodigyReadDeployHeapMetrics();
       PRODIGY_DEBUG_LOG(
@@ -34680,11 +35381,29 @@ public:
     const uint64_t deploymentID = pending->deploymentID;
     if (pendingMothershipSpinArtifactIsCurrent(pending))
     {
-      Message::construct(
-          pending->stream->wBuffer,
-          MothershipTopic::spinApplication,
-          uint8_t(SpinApplicationResponseCode::invalidPlan),
-          reason);
+      if (pending->statelessAdmission)
+      {
+        StatelessDeploymentAdmissionReceipt receipt = {};
+        receipt.supported = true;
+        receipt.peersCapable = statelessDeploymentAdmissionPeersCapable();
+        receipt.failure = reason;
+        receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+        receipt.currentMasterUUID = getExistingMasterUUID();
+        receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+            (findBrainViewByUUID(receipt.currentMasterUUID) ?
+             findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+        String serialized = {};
+        BitseryEngine::serialize(serialized, receipt);
+        Message::construct(pending->stream->wBuffer, MothershipTopic::admitStatelessDeployment, serialized);
+      }
+      else
+      {
+        Message::construct(
+            pending->stream->wBuffer,
+            MothershipTopic::spinApplication,
+            uint8_t(SpinApplicationResponseCode::invalidPlan),
+            reason);
+      }
       (void)flushActiveMothershipSendBuffer(pending->stream, "spin-artifact-reject");
     }
     discardPendingMothershipSpinArtifact(pending);
@@ -36589,8 +37308,7 @@ public:
                 reinterpret_cast<uint8_t *>(message), message->size, Copy::yes, message->size);
             pending->stagedBundlePath = mothershipStagedBundlePath();
             pending->admitted = admittedUpdateDispatch;
-            pending->requiresContainerRetirementReader =
-                masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID);
+            pending->requiredContainerRetirementJournalVersion = requiredContainerRetirementJournalReaderVersion();
             pending->responseTopic = admittedUpdateDispatch ? MothershipTopic::updateProdigyAdmitted : MothershipTopic::updateProdigy;
             pending->admittedRequest = admittedUpdateRequestForDispatch;
             pending->admittedClusterUUID = brainConfig.clusterUUID;
@@ -36616,7 +37334,7 @@ public:
                       {
                         pending->failure.assign("bundle artifact preparation failed"_ctv);
                       }
-                      if (pending->failure.empty() && (pending->admitted || pending->requiresContainerRetirementReader))
+                      if (pending->failure.empty() && (pending->admitted || pending->requiredContainerRetirementJournalVersion))
                       {
                         ProdigyApprovedUpgradeBundle approved = {};
                         if (!prodigyApproveBundleUpgradeContract(pending->prepared.stageBundlePath, approved, &pending->failure) ||
@@ -36626,7 +37344,7 @@ public:
                           return;
                         }
                         pending->targetContainerRetirementJournalVersion = approved.contract.containerRetirementJournalVersion;
-                        if (pending->requiresContainerRetirementReader && pending->targetContainerRetirementJournalVersion != 1)
+                        if (pending->targetContainerRetirementJournalVersion < pending->requiredContainerRetirementJournalVersion)
                         {
                           pending->failure.assign("target binary cannot read the durable container retirement journal"_ctv);
                           return;
@@ -36744,8 +37462,7 @@ public:
 
           MothershipResponse response = {};
           const String& expectedWorkerDigest = pending->digest;
-          if (masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) &&
-              pending->targetContainerRetirementJournalVersion != 1)
+          if (pending->targetContainerRetirementJournalVersion < requiredContainerRetirementJournalReaderVersion())
           {
             rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the required container retirement journal reader"_ctv);
             break;
@@ -37857,6 +38574,259 @@ public:
 
           break;
         }
+      case MothershipTopic::pullPairedSourceRetirement:
+        {
+          uint8_t requestVersion = 0; uint128_t operationID = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, requestVersion);
+          Message::extractArg<ArgumentNature::fixed>(args, operationID);
+          PairedSourceRetirementReceipt receipt = {};
+          receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+          receipt.currentMasterUUID = getExistingMasterUUID();
+          receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+              (findBrainViewByUUID(receipt.currentMasterUUID) ? findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+          receipt.peersCapable = pairedSourceRetirementPeersCapable();
+          if (args == message->terminal() && requestVersion == 1 && operationID != 0)
+          {
+            ProdigyContainerRetirementJournal journal = {};
+            if (decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal))
+              if (const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, operationID))
+              {
+                BitseryEngine::serialize(receipt.sealedFence, *fence);
+                receipt.sealed = masterAuthorityRuntimeStateDurable && receipt.peersCapable && containerRetirementAuthorityAcknowledged();
+                receipt.terminal = receipt.sealed && std::all_of(journal.intents.begin(), journal.intents.end(), [&](const auto& intent) {
+                  return intent.pairedOperationID != operationID || intent.killAcked;
+                });
+              }
+          }
+          String serialized = {}; BitseryEngine::serialize(serialized, receipt);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullPairedSourceRetirement, serialized);
+          break;
+        }
+      case MothershipTopic::preparePairedSourceRetirement:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyPairedSourceRetirementRequest request = {}; PairedSourceRetirementReceipt receipt = {};
+          if (args != message->terminal() || !BitseryEngine::deserializeSafe(encoded, request))
+            receipt.failure.assign("invalid paired source retirement request"_ctv);
+          else (void)preparePairedSourceRetirement(request, receipt);
+          String serialized = {}; BitseryEngine::serialize(serialized, receipt);
+          Message::construct(mothership->wBuffer, MothershipTopic::preparePairedSourceRetirement, serialized);
+          break;
+        }
+      case MothershipTopic::pullStatelessDeploymentAdmission:
+        {
+          uint8_t requestVersion = 0;
+          uint128_t operationID = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, requestVersion);
+          Message::extractArg<ArgumentNature::fixed>(args, operationID);
+          StatelessDeploymentAdmissionReceipt receipt = {};
+          receipt.supported = true;
+          receipt.peersCapable = statelessDeploymentAdmissionPeersCapable();
+          receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+          receipt.currentMasterUUID = getExistingMasterUUID();
+          receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+              (findBrainViewByUUID(receipt.currentMasterUUID) ? findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+          if (args == message->terminal() && requestVersion == 1 && operationID != 0)
+          {
+            for (const auto& admission : masterAuthorityRuntimeState.statelessDeploymentAdmissions)
+            {
+              if (admission.operationID == operationID)
+              {
+                receipt.admission = admission;
+                if (auto deployment = deployments.find(admission.deploymentID);
+                    deployment != deployments.end() && deployment->second != nullptr)
+                {
+                  receipt.live = deployment->second->state != DeploymentState::none;
+                  DeploymentStatusReport status = deployment->second->generateReport();
+                  receipt.nTarget = status.nTarget;
+                  receipt.nDeployed = status.nDeployed;
+                  receipt.nHealthy = status.nHealthy;
+                }
+                receipt.launchPending = !receipt.live &&
+                    (pendingMothershipSpinArtifacts.contains(admission.deploymentID) ||
+                     deploymentPlans.contains(admission.deploymentID) ||
+                     deployments.contains(admission.deploymentID));
+                receipt.accepted = statelessDeploymentAdmissionReplicated(admission);
+                break;
+              }
+            }
+            // Keep the pending-operation failure channel empty so its
+            // established poll can wait for durable authority/blob ACKs.
+            // An existing operation needs the same diagnostic after a
+            // controller failure; retain it in the owning Brain's log.
+            if (!receipt.peersCapable)
+            {
+              String blocker = {};
+              describeStatelessDeploymentAdmissionCapabilityBlocker(blocker);
+              if (receipt.admission.operationID == 0) receipt.failure = blocker;
+              else
+              {
+                String operation = {};
+                operation.assignItoh(operationID);
+                std::fprintf(stderr, "stateless admission pending operation=%s generation=%llu: %s\n",
+                             operation.c_str(),
+                             (unsigned long long)receipt.currentAuthorityGeneration,
+                             blocker.c_str());
+                std::fflush(stderr);
+              }
+            }
+          }
+          String serialized = {};
+          BitseryEngine::serialize(serialized, receipt);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullStatelessDeploymentAdmission, serialized);
+          break;
+        }
+      case MothershipTopic::admitStatelessDeployment:
+        {
+          String serializedHeader = {}, serializedPlan = {}, blob = {};
+          Message::extractToStringView(args, serializedHeader);
+          Message::extractToStringView(args, serializedPlan);
+          Message::extractToStringView(args, blob);
+          ProdigyStatelessDeploymentAdmissionRequest request = {};
+          StatelessDeploymentAdmissionReceipt receipt = {};
+          receipt.supported = true;
+          receipt.peersCapable = statelessDeploymentAdmissionPeersCapable();
+          receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+          receipt.currentMasterUUID = getExistingMasterUUID();
+          receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+              (findBrainViewByUUID(receipt.currentMasterUUID) ? findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+          auto reply = [&]() {
+            String serialized = {};
+            BitseryEngine::serialize(serialized, receipt);
+            Message::construct(mothership->wBuffer, MothershipTopic::admitStatelessDeployment, serialized);
+          };
+          if (args != message->terminal() || BitseryEngine::deserializeSafe(serializedHeader, request) == false ||
+              request.version != 1 || request.operationID == 0 || request.clusterUUID == 0 ||
+              request.expectedAuthorityGeneration == 0 || request.expectedMasterUUID == 0 ||
+              request.expectedMasterBootNs == 0 || request.requestPlanSHA256.size() != 64 ||
+              request.artifactSHA256.size() != 64 || request.artifactBytes == 0 ||
+              request.clusterUUID != brainConfig.clusterUUID || !receipt.peersCapable ||
+              request.expectedAuthorityGeneration != receipt.currentAuthorityGeneration ||
+              request.expectedMasterUUID != receipt.currentMasterUUID ||
+              request.expectedMasterBootNs != receipt.currentMasterBootNs || blob.size() != request.artifactBytes)
+          {
+            receipt.failure.assign("stateless deployment admission request is not current or supported"_ctv);
+            reply(); break;
+          }
+          DeploymentPlan plan = {};
+          String computedRequestPlanSHA256 = {}, digestFailure = {};
+          if (BitseryEngine::deserializeSafe(serializedPlan, plan) == false ||
+              !prodigyComputeSHA256Hex(serializedPlan, computedRequestPlanSHA256, &digestFailure) ||
+              computedRequestPlanSHA256.equals(request.requestPlanSHA256) == false ||
+              !prodigyStatelessDeploymentAdmissionPlanEligible(plan))
+          {
+            receipt.failure.assign("stateless deployment admission plan is invalid"_ctv);
+            reply(); break;
+          }
+          bool resumeDurablyAcceptedAdmission = false;
+          bool handledExistingStatelessAdmission = false;
+          for (const auto& existing : masterAuthorityRuntimeState.statelessDeploymentAdmissions)
+          {
+            if (existing.operationID == request.operationID)
+            {
+              if (existing.clusterUUID == request.clusterUUID && existing.requestPlanSHA256.equals(request.requestPlanSHA256) &&
+                  existing.artifactSHA256.equals(request.artifactSHA256) && existing.artifactBytes == request.artifactBytes)
+              {
+                receipt.admission = existing;
+                receipt.live = deployments.contains(existing.deploymentID) &&
+                    deployments.at(existing.deploymentID) != nullptr &&
+                    deployments.at(existing.deploymentID)->state != DeploymentState::none;
+                receipt.launchPending = !receipt.live &&
+                    (pendingMothershipSpinArtifacts.contains(existing.deploymentID) ||
+                     deploymentPlans.contains(existing.deploymentID));
+                if (!statelessDeploymentAdmissionIsDurable(existing))
+                {
+                  // The immutable record is visible but has no persistence
+                  // receipt yet.  It is a polling state, never a rejection or
+                  // a permission to create a second deployment object.
+                  handledExistingStatelessAdmission = true;
+                  reply();
+                  break;
+                }
+                if (!statelessDeploymentAdmissionPlanIsCurrent(existing))
+                {
+                  receipt.failure.assign("stateless deployment admission durable plan identity is unavailable"_ctv);
+                  reply();
+                  break;
+                }
+                if (auto live = deployments.find(existing.deploymentID);
+                    live != deployments.end() && live->second != nullptr)
+                {
+                  // Cold recovery may have reconstructed this exact durable
+                  // object in state none.  Resume its existing owner; never
+                  // create a second ApplicationDeployment for the same ID.
+                  if (live->second->state == DeploymentState::none)
+                  {
+                    if (deploymentIsIndexedApplicationChainMember(live->second))
+                      recoverDeploymentsAfterNeuronState();
+                    else
+                      (void)startDeploymentAfterAuthoritativeReplication(live->second);
+                  }
+                  receipt.live = live->second->state != DeploymentState::none;
+                  receipt.launchPending = !receipt.live;
+                  receipt.accepted = statelessDeploymentAdmissionReplicated(existing);
+                  handledExistingStatelessAdmission = true;
+                  reply();
+                  break;
+                }
+                // The operation record survives an interrupted control stream
+                // before the ordinary deployment owner materializes it.  An
+                // exact retry is the only safe way to resume that owner; do
+                // not acknowledge an unlaunched durable record as complete.
+                resumeDurablyAcceptedAdmission = !receipt.live &&
+                    pendingMothershipSpinArtifacts.contains(existing.deploymentID) == false;
+                if (!resumeDurablyAcceptedAdmission)
+                {
+                  receipt.accepted = statelessDeploymentAdmissionReplicated(existing);
+                  handledExistingStatelessAdmission = true;
+                  reply();
+                }
+              }
+              else
+              {
+                receipt.failure.assign("stateless deployment admission operation identity conflicts"_ctv);
+                reply();
+              }
+              break;
+            }
+            if (existing.deploymentID == plan.config.deploymentID())
+            {
+              receipt.failure.assign("stateless deployment admission deployment identity conflicts"_ctv);
+              reply(); break;
+            }
+          }
+          if (handledExistingStatelessAdmission || receipt.failure.size()) break;
+          if (resumeDurablyAcceptedAdmission)
+          {
+            pendingStatelessDeploymentAdmissionRequests.insert_or_assign(
+                plan.config.deploymentID(), PendingStatelessDeploymentAdmissionRequest {request, std::move(computedRequestPlanSHA256)});
+            String spinFrame = {};
+            Message::construct(spinFrame, MothershipTopic::spinApplication, plan.config.applicationID, serializedPlan, blob);
+            mothershipHandler(mothership, reinterpret_cast<Message *>(spinFrame.data()));
+            if (!pendingMothershipSpinArtifacts.contains(plan.config.deploymentID()))
+            {
+              pendingStatelessDeploymentAdmissionRequests.erase(plan.config.deploymentID());
+            }
+            break;
+          }
+          if (!deploymentIDAdmissionAllowed(plan) || pendingStatelessDeploymentAdmissionRequests.contains(plan.config.deploymentID()))
+          {
+            receipt.failure.assign("stateless deployment admission deploymentID already exists"_ctv);
+            reply(); break;
+          }
+          pendingStatelessDeploymentAdmissionRequests.insert_or_assign(
+              plan.config.deploymentID(), PendingStatelessDeploymentAdmissionRequest {request, std::move(computedRequestPlanSHA256)});
+          String spinFrame = {};
+          Message::construct(spinFrame, MothershipTopic::spinApplication, plan.config.applicationID, serializedPlan, blob);
+          mothershipHandler(mothership, reinterpret_cast<Message *>(spinFrame.data()));
+          if (!pendingMothershipSpinArtifacts.contains(plan.config.deploymentID()))
+          {
+            // A synchronous legacy preflight rejection never consumed this
+            // transient handoff; it must not poison a corrected retry.
+            pendingStatelessDeploymentAdmissionRequests.erase(plan.config.deploymentID());
+          }
+          break;
+        }
       case MothershipTopic::spinApplication:
         {
           // applicationID(2) plan{4} containerBlob{4}
@@ -37902,11 +38872,31 @@ public:
               delete deployment;
               return;
             }
-            Message::construct(
-                mothership->wBuffer,
-                MothershipTopic::spinApplication,
-                uint8_t(SpinApplicationResponseCode::invalidPlan),
-                reasonText);
+            auto requested = pendingStatelessDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
+            if (requested != pendingStatelessDeploymentAdmissionRequests.end())
+            {
+              StatelessDeploymentAdmissionReceipt receipt = {};
+              receipt.supported = true;
+              receipt.peersCapable = statelessDeploymentAdmissionPeersCapable();
+              receipt.failure = reasonText;
+              receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+              receipt.currentMasterUUID = getExistingMasterUUID();
+              receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+                  (findBrainViewByUUID(receipt.currentMasterUUID) ?
+                   findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+              String serialized = {};
+              BitseryEngine::serialize(serialized, receipt);
+              Message::construct(mothership->wBuffer, MothershipTopic::admitStatelessDeployment, serialized);
+              pendingStatelessDeploymentAdmissionRequests.erase(requested);
+            }
+            else
+            {
+              Message::construct(
+                  mothership->wBuffer,
+                  MothershipTopic::spinApplication,
+                  uint8_t(SpinApplicationResponseCode::invalidPlan),
+                  reasonText);
+            }
             delete deployment;
           };
           auto rejectInvalidPlanFailure = [&](const String& failure, const String& fallback) {
@@ -37915,6 +38905,38 @@ public:
             reason.snprintf<"invalid plan: {}"_ctv>(detail);
             rejectInvalidPlan(reason);
           };
+
+          // An exact retry of a durable operation must run every remaining
+          // preflight and lease step against the saved normalized plan, not a
+          // newly normalized variant of the caller's raw request.
+          if (auto resume = pendingStatelessDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
+              resume != pendingStatelessDeploymentAdmissionRequests.end())
+          {
+            auto admitted = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+                  return admission.operationID == resume->second.request.operationID &&
+                         admission.requestPlanSHA256.equals(resume->second.requestPlanSHA256);
+                });
+            if (admitted != masterAuthorityRuntimeState.statelessDeploymentAdmissions.end() &&
+                statelessDeploymentAdmissionIsDurable(*admitted))
+            {
+              auto saved = deploymentPlans.find(admitted->deploymentID);
+              String serialized = {}, digest = {}, failure = {};
+              if (saved == deploymentPlans.end())
+              {
+                rejectInvalidPlan("invalid plan: durable stateless admission lost its normalized plan"_ctv);
+                return;
+              }
+              BitseryEngine::serialize(serialized, saved->second);
+              if (!prodigyComputeSHA256Hex(serialized, digest, &failure) ||
+                  digest.equals(admitted->normalizedPlanSHA256) == false)
+              {
+                rejectInvalidPlan("invalid plan: durable stateless admission normalized plan identity changed"_ctv);
+                return;
+              }
+              deployment->plan = saved->second;
+            }
+          }
 
           if (deployment->plan.config.applicationID != applicationID)
           {
@@ -37971,7 +38993,36 @@ public:
           // image, storage ownership, and replication state.  Tasks retain
           // their existing fingerprinted idempotency record; every other
           // collision must be rejected before any admission mutation.
-          if (deploymentIDAdmissionAllowed(deployment->plan) == false)
+          std::shared_ptr<PendingMothershipSpinArtifact> existingPending = {};
+          if (auto pendingIt = pendingMothershipSpinArtifacts.find(deployment->plan.config.deploymentID());
+              pendingIt != pendingMothershipSpinArtifacts.end()) existingPending = pendingIt->second;
+          const PendingStatelessDeploymentAdmissionRequest *resumingAdmission = nullptr;
+          if (auto requested = pendingStatelessDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
+              requested != pendingStatelessDeploymentAdmissionRequests.end())
+          {
+            resumingAdmission = &requested->second;
+          }
+          bool exactDurableStatelessAdmission = false;
+          if (auto existingAdmission = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                  masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+                    const bool pendingMatch = existingPending != nullptr && existingPending->statelessAdmission &&
+                        existingPending->statelessAdmissionDurable &&
+                        admission.operationID == existingPending->statelessAdmissionRequest.operationID &&
+                        admission.requestPlanSHA256.equals(existingPending->statelessAdmissionRequestPlanSHA256) &&
+                        admission.artifactSHA256.equals(existingPending->statelessAdmissionRequest.artifactSHA256) &&
+                        admission.artifactBytes == existingPending->statelessAdmissionRequest.artifactBytes;
+                    const bool resumeMatch = resumingAdmission != nullptr &&
+                        admission.operationID == resumingAdmission->request.operationID &&
+                        admission.requestPlanSHA256.equals(resumingAdmission->requestPlanSHA256) &&
+                        admission.artifactSHA256.equals(resumingAdmission->request.artifactSHA256) &&
+                        admission.artifactBytes == resumingAdmission->request.artifactBytes;
+                    return admission.deploymentID == deployment->plan.config.deploymentID() &&
+                           (pendingMatch || resumeMatch);
+                  }); existingAdmission != masterAuthorityRuntimeState.statelessDeploymentAdmissions.end())
+          {
+            exactDurableStatelessAdmission = true;
+          }
+          if (!exactDurableStatelessAdmission && deploymentIDAdmissionAllowed(deployment->plan) == false)
           {
             rejectInvalidPlan("invalid plan: deploymentID already exists"_ctv);
             return;
@@ -38207,6 +39258,24 @@ public:
             pending->streamIncarnation = mothership->connectionIncarnation;
             pending->authorityEpoch = masterAuthorityEpoch;
             pending->deploymentID = deploymentID;
+            if (auto requested = pendingStatelessDeploymentAdmissionRequests.find(deploymentID);
+                requested != pendingStatelessDeploymentAdmissionRequests.end())
+            {
+              pending->statelessAdmission = true;
+              pending->statelessAdmissionRequest = requested->second.request;
+              pending->statelessAdmissionRequestPlanSHA256 = std::move(requested->second.requestPlanSHA256);
+              pending->statelessAdmissionDurable = std::any_of(
+                  masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                  masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(),
+                  [&](const auto& admission) {
+                    return admission.operationID == pending->statelessAdmissionRequest.operationID &&
+                           admission.deploymentID == deploymentID &&
+                           admission.requestPlanSHA256.equals(pending->statelessAdmissionRequestPlanSHA256) &&
+                           admission.artifactSHA256.equals(pending->statelessAdmissionRequest.artifactSHA256) &&
+                           admission.artifactBytes == pending->statelessAdmissionRequest.artifactBytes;
+                  });
+              pendingStatelessDeploymentAdmissionRequests.erase(requested);
+            }
             pending->requestFrame = String(
                 reinterpret_cast<uint8_t *>(message), message->size, Copy::yes, message->size);
             if (const String *storeRoot = containerArtifactStoreRoot(); storeRoot != nullptr)
@@ -38472,6 +39541,144 @@ public:
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
+          if (pending->statelessAdmission && pending->statelessAdmissionDurable)
+          {
+            auto admitted = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(), [&](const auto& admission) {
+                  return admission.operationID == pending->statelessAdmissionRequest.operationID &&
+                         admission.deploymentID == deployment->plan.config.deploymentID() &&
+                         admission.requestPlanSHA256.equals(pending->statelessAdmissionRequestPlanSHA256) &&
+                         admission.artifactSHA256.equals(trustedContainerBlobSHA256) &&
+                         admission.artifactBytes == trustedContainerBlobBytes;
+                });
+            auto savedPlan = deploymentPlans.find(deployment->plan.config.deploymentID());
+            String serializedSavedPlan = {}, savedPlanSHA256 = {}, failure = {};
+            if (savedPlan != deploymentPlans.end()) BitseryEngine::serialize(serializedSavedPlan, savedPlan->second);
+            if (admitted == masterAuthorityRuntimeState.statelessDeploymentAdmissions.end() ||
+                !statelessDeploymentAdmissionIsDurable(*admitted) || savedPlan == deploymentPlans.end() ||
+                !prodigyComputeSHA256Hex(serializedSavedPlan, savedPlanSHA256, &failure) ||
+                savedPlanSHA256.equals(admitted->normalizedPlanSHA256) == false ||
+                savedPlan->second.config.containerBlobSHA256.equals(trustedContainerBlobSHA256) == false ||
+                savedPlan->second.config.containerBlobBytes != trustedContainerBlobBytes)
+            {
+              rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission durable plan identity changed"_ctv);
+              delete deployment;
+              return;
+            }
+            deployment->plan = savedPlan->second;
+          }
+          if (pending->statelessAdmission && pending->statelessAdmissionDurable == false)
+          {
+            const auto& request = pending->statelessAdmissionRequest;
+            const uint128_t currentMasterUUID = getExistingMasterUUID();
+            const int64_t currentMasterBootNs = currentMasterUUID == selfBrainUUID() ? boottimens :
+                (findBrainViewByUUID(currentMasterUUID) ? findBrainViewByUUID(currentMasterUUID)->boottimens : 0);
+            // Artifact work is asynchronous.  Recheck the exact authority
+            // snapshot that authorized staging before putting an immutable
+            // operation into the durable authority state.
+            if (!statelessDeploymentAdmissionPeersCapable() ||
+                request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+                request.expectedMasterUUID != currentMasterUUID ||
+                request.expectedMasterBootNs != currentMasterBootNs)
+            {
+              rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission authority changed during artifact staging"_ctv);
+              delete deployment;
+              return;
+            }
+            const Wormhole& endpoint = deployment->plan.wormholes[0];
+            const DistributableExternalSubnet *prefix = findRegisteredRoutablePrefix(
+                brainConfig.distributableExternalSubnets, endpoint.routablePrefixUUID);
+            if (!prodigyStatelessDeploymentAdmissionPlanEligible(deployment->plan) ||
+                prefix == nullptr || prefix->ingressScope != RoutableIngressScope::singleMachine ||
+                prefix->machineUUID == 0 ||
+                request.artifactSHA256.equals(trustedContainerBlobSHA256) == false ||
+                request.artifactBytes != trustedContainerBlobBytes)
+            {
+              rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission artifact or profile changed"_ctv);
+              delete deployment;
+              return;
+            }
+            String normalizedPlanSHA256 = {}, digestFailure = {};
+            String normalizedPlan = {};
+            BitseryEngine::serialize(normalizedPlan, deployment->plan);
+            if (!prodigyComputeSHA256Hex(normalizedPlan, normalizedPlanSHA256, &digestFailure))
+            {
+              rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission could not hash normalized plan"_ctv);
+              delete deployment;
+              return;
+            }
+            const ProdigyMasterAuthorityRuntimeState previousRuntimeState = masterAuthorityRuntimeState;
+            const bool previousDurable = masterAuthorityRuntimeStateDurable;
+            const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+            const auto previousPlans = deploymentPlans;
+            ProdigyStatelessDeploymentAdmission admission = {};
+            admission.operationID = request.operationID;
+            admission.clusterUUID = request.clusterUUID;
+            admission.deploymentID = deployment->plan.config.deploymentID();
+            admission.applicationID = deployment->plan.config.applicationID;
+            admission.versionID = deployment->plan.config.versionID;
+            admission.requestPlanSHA256 = pending->statelessAdmissionRequestPlanSHA256;
+            admission.normalizedPlanSHA256 = normalizedPlanSHA256;
+            admission.artifactSHA256 = trustedContainerBlobSHA256;
+            admission.artifactBytes = trustedContainerBlobBytes;
+            admission.acceptedAuthorityGeneration = masterAuthorityRuntimeState.generation + 1;
+            admission.acceptedMasterUUID = selfBrainUUID();
+            admission.acceptedMasterBootNs = boottimens;
+            if (!prodigyStatelessDeploymentAdmissionValid(admission))
+            {
+              rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission identity invalid"_ctv);
+              delete deployment;
+              return;
+            }
+            deploymentPlans.insert_or_assign(admission.deploymentID, deployment->plan);
+            masterAuthorityRuntimeState.statelessDeploymentAdmissions.push_back(admission);
+            const uint64_t authorityEpoch = masterAuthorityEpoch;
+            const uint64_t generation = admission.acceptedAuthorityGeneration;
+            const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+            commitMasterAuthorityStateChangeAsync(
+                [this, lifetime, pending, previousRuntimeState, previousDurable, previousDurableGeneration,
+                 previousPlans, authorityEpoch, generation, admission](bool durable) mutable {
+                  if (lifetime.expired()) return;
+                  const bool sameCandidate = masterAuthorityEpoch == authorityEpoch &&
+                      masterAuthorityRuntimeState.generation == generation &&
+                      std::any_of(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                                  masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(),
+                                  [&](const auto& candidate) {
+                                    return prodigyStatelessDeploymentAdmissionEqual(candidate, admission);
+                                  });
+                  if (!durable)
+                  {
+                    if (sameCandidate)
+                    {
+                      masterAuthorityRuntimeState = std::move(previousRuntimeState);
+                      deploymentPlans = previousPlans;
+                      masterAuthorityRuntimeStateDurable = previousDurable;
+                      durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+                    }
+                    rejectPendingMothershipSpinArtifact(pending, "stateless deployment admission was not durably recorded"_ctv);
+                    return;
+                  }
+                  // A durable receipt must never be rolled back merely because
+                  // the Mothership stream or a capability acknowledgement was
+                  // lost after the local commit.  It remains queryable and an
+                  // exact later request resumes from the saved normalized plan.
+                  if (!sameCandidate || !statelessDeploymentAdmissionIsDurable(admission) ||
+                      !statelessDeploymentAdmissionPeersCapable() ||
+                      pendingMothershipSpinArtifactIsCurrent(pending) == false)
+                  {
+                    discardPendingMothershipSpinArtifact(pending);
+                    auto current = pendingMothershipSpinArtifacts.find(pending->deploymentID);
+                    if (current != pendingMothershipSpinArtifacts.end() && current->second == pending)
+                      pendingMothershipSpinArtifacts.erase(current);
+                    return;
+                  }
+                  pending->statelessAdmissionDurable = true;
+                  mothershipHandler(pending->stream, reinterpret_cast<Message *>(pending->requestFrame.data()));
+                  (void)flushActiveMothershipSendBuffer(pending->stream, "stateless-admission-durable");
+                });
+            delete deployment;
+            return;
+          }
           if (recoveryRetryAdmission &&
               (recoveryRetryAdmission->replacementSuccessorBlobSHA256.equals(trustedContainerBlobSHA256) == false ||
                !deployments.contains(recoveryRetryAdmission->activeDeploymentID) ||
@@ -38566,7 +39773,35 @@ public:
             queueBrainDeploymentReplication(trustedSerializedPlan, containerBlob);
           }
 
-          Message::construct(mothership->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::okay));
+          if (pending->statelessAdmission)
+          {
+            StatelessDeploymentAdmissionReceipt receipt = {};
+            receipt.supported = true;
+            receipt.peersCapable = statelessDeploymentAdmissionPeersCapable();
+            receipt.accepted = exactDurableStatelessAdmission &&
+                std::any_of(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
+                            masterAuthorityRuntimeState.statelessDeploymentAdmissions.end(),
+                            [&](const auto& admission) {
+                              return admission.operationID == pending->statelessAdmissionRequest.operationID &&
+                                     statelessDeploymentAdmissionReplicated(admission);
+                            });
+            receipt.live = deployment->state != DeploymentState::none;
+            receipt.launchPending = !receipt.live;
+            receipt.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+            receipt.currentMasterUUID = getExistingMasterUUID();
+            receipt.currentMasterBootNs = receipt.currentMasterUUID == selfBrainUUID() ? boottimens :
+                (findBrainViewByUUID(receipt.currentMasterUUID) ? findBrainViewByUUID(receipt.currentMasterUUID)->boottimens : 0);
+            for (const auto& admission : masterAuthorityRuntimeState.statelessDeploymentAdmissions)
+              if (admission.operationID == pending->statelessAdmissionRequest.operationID)
+                receipt.admission = admission;
+            String serializedReceipt = {};
+            BitseryEngine::serialize(serializedReceipt, receipt);
+            Message::construct(mothership->wBuffer, MothershipTopic::admitStatelessDeployment, serializedReceipt);
+          }
+          else
+          {
+            Message::construct(mothership->wBuffer, MothershipTopic::spinApplication, uint8_t(SpinApplicationResponseCode::okay));
+          }
 
           // The deploy CLI waits for the initial okay/invalidPlan frame before it starts
           // consuming streamed progress on the same topic.
@@ -39951,6 +41186,11 @@ public:
               // Observed only: never re-advertise or schedule a journaled UUID.
               continue;
             }
+            if (deploymentLaunchFenced(plan.config.deploymentID()))
+            {
+              malformedStateUpload = true;
+              break;
+            }
             if (handleUploadedMothershipTunnelProviderContainer(neuron, plan))
             {
               continue;
@@ -40292,6 +41532,11 @@ public:
           neuron->machine->runtimeReady =
               replayMissingScheduledOwners == false &&
               neuron->machine->fragment > 0 && neuron->machine->reportedDatacenterFragment != 0 && (brainConfig.datacenterFragment == 0 || neuron->machine->reportedDatacenterFragment == brainConfig.datacenterFragment) && neuron->machine->reportedFragment == neuron->machine->fragment;
+          std::fprintf(stderr,
+                       "brain stateUpload accepted machineUUID=%llu ready=%d replayMissingScheduledOwners=%d\n",
+                       (unsigned long long)neuron->machine->uuid, int(neuron->machine->runtimeReady),
+                       int(replayMissingScheduledOwners));
+          std::fflush(stderr);
           if (replayMissingScheduledOwners)
           {
             queueNeuronStateUploadForMachine(neuron->machine);

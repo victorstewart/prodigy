@@ -1205,6 +1205,11 @@ public:
     snapshot.brainConfig = candidate.brainConfig;
     snapshot.masterAuthority.runtimeState = candidate.runtimeState;
     snapshot.masterAuthority.servingRuntimeStates = candidate.servingRuntimeStates;
+    // A v3 transition persists the admitted normalized plans in the same
+    // snapshot as their immutable receipts.  This prevents either wire order
+    // from leaving a future leader with only one half of the admission.
+    for (const DeploymentPlan& plan : candidate.statelessAdmissionPlans)
+      snapshot.masterAuthority.deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
     prodigyDeriveBrainPeersFromSnapshot(snapshot.brainPeers, snapshot);
     ProdigyPersistentBootState bootState = buildPersistentBootState(snapshot);
     const uint64_t retainedBytes = retainedBytesForSnapshot(snapshot, bootState);

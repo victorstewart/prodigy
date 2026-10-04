@@ -598,6 +598,420 @@ pair_write()
    sync -f "${path%/*}"
 }
 
+# Prospective guest-reset fences are strictly test-provider cleanup receipts.  A
+# different kernel boot ID proves the old guest's kernel resources vanished; it
+# never authorizes deletion against a new guest.
+pair_descriptor_sha256()
+{
+   command -v sha256sum >/dev/null || return 1
+   pair_descriptor | sha256sum | awk '{print $1}'
+}
+
+pair_guest_reset_identity_valid()
+{
+   local boot="$1" guest="$2"
+   [[ "$boot" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+      "$boot" != 00000000-0000-0000-0000-000000000000 &&
+      "$guest" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+pair_guest_reset_identity()
+{
+   local boot guest
+   [[ "${PRODIGY_DEV_TEST_BOUNDARY:-}" == apple-container && -r /proc/sys/kernel/random/boot_id ]] || return 1
+   boot="$(</proc/sys/kernel/random/boot_id)"
+   guest="${PRODIGY_DEV_APPLE_CONTAINER_ID:-}"
+   pair_guest_reset_identity_valid "$boot" "$guest" || return 1
+   printf '%s\t%s\n' "$boot" "$guest"
+}
+
+pair_workspace_lifecycle_lock_path()
+{
+   local digest
+   digest="$(printf '%s' "$1" | sha256sum | awk '{print $1}')" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   printf '/run/prodigy-vdc-workspace-%s.lock\n' "$digest"
+}
+
+pair_lock_workspace()
+{
+   local workspace="$1" variable="$2" path fd
+   path="$(pair_workspace_lifecycle_lock_path "$workspace")" || return 1
+   exec {fd}>"$path" || return 1
+   flock -n "$fd" || { eval "exec ${fd}>&-"; return 1; }
+   printf -v "$variable" '%s' "$fd"
+}
+
+pair_unlock_workspace()
+{
+   local fd="$1"
+   [[ "$fd" =~ ^[0-9]+$ ]] || return 1
+   flock -u "$fd" || return 1
+   eval "exec ${fd}>&-"
+}
+
+pair_workspace_fence_path()
+{
+   printf '%s/virtual-datacenter.pair-guest-reset\n' "$1"
+}
+
+pair_regular_root_receipt()
+{
+   local path="$1" uid mode
+   [[ -f "$path" && ! -L "$path" ]] || return 1
+   uid="$(stat -Lc %u "$path")"; mode="$(stat -Lc %a "$path")"
+   [[ "$uid" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+   (( (8#$mode & 022) == 0 ))
+}
+
+pair_receipt_exact()
+{
+   local path="$1" expected="$2"
+   pair_regular_root_receipt "$path" || return 1
+   python3 - "$path" "$expected" <<'PAIR_RECEIPT_EXACT'
+import pathlib,sys
+assert pathlib.Path(sys.argv[1]).read_bytes() == (sys.argv[2] + '\n').encode()
+PAIR_RECEIPT_EXACT
+}
+
+pair_workspace_persisted_identity()
+{
+   local workspace="$1" runtime="$2" index="$3" address="$4"
+   pair_regular_root_receipt "$workspace/virtual-datacenter.identity" &&
+      pair_regular_root_receipt "$workspace/test-cluster-manifest.json" &&
+      [[ "$(<"$workspace/virtual-datacenter.identity")" == "$runtime" ]] || return 1
+   python3 - "$workspace/test-cluster-manifest.json" "$runtime" "$index" "$address" <<'PAIR_RESET_MANIFEST'
+import json,sys
+path,runtime,index,address=sys.argv[1:]
+m=json.load(open(path, encoding='utf-8'))
+assert m['parentNamespace']=='pvd-p-'+runtime
+node=next(n for n in m['nodes'] if n['index']==int(index))
+assert node['ipv4']==address and node['namespace']=='pvd-m'+index+'-'+runtime
+PAIR_RESET_MANIFEST
+}
+
+pair_workspace_provider_dead()
+{
+   local workspace="$1" provider_pid=""
+   [[ -r "$workspace/virtual-datacenter.pid" && ! -L "$workspace/virtual-datacenter.pid" ]] || return 1
+   provider_pid="$(<"$workspace/virtual-datacenter.pid")"
+   [[ "$provider_pid" =~ ^[0-9]+$ && "$provider_pid" -gt 1 ]] || return 1
+   ! provider_process "$provider_pid" "$workspace"
+}
+
+pair_fence_text()
+{
+   local boot="$1" guest="$2" digest
+   digest="$(pair_descriptor_sha256)" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   printf 'version=1\noperationID=%s\ndescriptorSHA256=%s\nbootID=%s\nguestID=%s\nsourceWorkspace=%s\nsourceRuntime=%s\ntargetWorkspace=%s\ntargetRuntime=%s\n' \
+      "$pair_id" "$digest" "$boot" "$guest" "$pair_source_workspace" "$pair_source_runtime" "$pair_target_workspace" "$pair_target_runtime"
+}
+
+pair_fence_exact()
+{
+   local boot="$1" guest="$2" expected path
+   expected="$(pair_fence_text "$boot" "$guest")" || return 1
+   for path in "$pair_dir/guest-reset.fence" \
+               "$(pair_workspace_fence_path "$pair_source_workspace")" \
+               "$(pair_workspace_fence_path "$pair_target_workspace")"; do
+      pair_receipt_exact "$path" "$expected" || return 1
+   done
+}
+
+pair_fence_removed_exact()
+{
+   local boot="$1" guest="$2" expected workspace path
+   expected="$(pair_fence_text "$boot" "$guest")" || return 1
+   pair_receipt_exact "$pair_dir/guest-reset.fence" "$expected" || return 1
+   for workspace in "$pair_source_workspace" "$pair_target_workspace"; do
+      path="$(pair_workspace_fence_path "$workspace")"
+      if [[ -e "$path" || -L "$path" ]]; then
+         pair_receipt_exact "$path" "$expected" || return 1
+      else
+         # After phase=removed, one peer workspace may already have been
+         # deleted by its receipt-gated stop.  An extant workspace may not
+         # silently lose or replace its fence.
+         [[ ! -e "$workspace" && ! -L "$workspace" ]] || return 1
+      fi
+   done
+}
+
+pair_workspace_reset_flagged()
+{
+   local path
+   path="$(pair_workspace_fence_path "$1")"
+   # Presence itself is a one-way startup/cleanup block.  Validation belongs
+   # to arm/remove/stop and a malformed marker must never look absent.
+   [[ -e "$path" || -L "$path" ]]
+}
+
+pair_arm_guest_reset()
+{
+   local identity boot guest expected source_fd="" target_fd="" first second
+   [[ -f "$pair_dir/descriptor" && ! -L "$pair_dir/descriptor" && "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]] || return 1
+   [[ -f "$pair_dir/phase" && ! -L "$pair_dir/phase" ]] || return 1
+   [[ "$(<"$pair_dir/phase")" == prepared || "$(<"$pair_dir/phase")" == reset-required ]] || return 1
+   identity="$(pair_guest_reset_identity)" || return 1
+   IFS=$'\t' read -r boot guest <<<"$identity"
+   [[ -n "$boot" && -n "$guest" ]] || return 1
+   if [[ "$pair_source_workspace" < "$pair_target_workspace" ]]; then first="$pair_source_workspace"; second="$pair_target_workspace"; else first="$pair_target_workspace"; second="$pair_source_workspace"; fi
+   pair_lock_workspace "$first" source_fd || return 1
+   pair_lock_workspace "$second" target_fd || { pair_unlock_workspace "$source_fd"; return 1; }
+   pair_owner_dead || { pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1; }
+   pair_workspace_provider_dead "$pair_source_workspace" && pair_workspace_provider_dead "$pair_target_workspace" &&
+      pair_workspace_persisted_identity "$pair_source_workspace" "$pair_source_runtime" "$pair_source_index" "$pair_source_ip" &&
+      pair_workspace_persisted_identity "$pair_target_workspace" "$pair_target_runtime" "$pair_target_index" "$pair_target_ip" || {
+      pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1; }
+   expected="$(pair_fence_text "$boot" "$guest")" || { pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1; }
+   # A partial same-boot arm is completed idempotently. Any different content,
+   # including a boot change before commit, remains non-authoritative.
+   for path in "$pair_dir/guest-reset.fence" \
+               "$(pair_workspace_fence_path "$pair_source_workspace")" \
+               "$(pair_workspace_fence_path "$pair_target_workspace")"; do
+      if [[ -e "$path" || -L "$path" ]]; then
+         if ! pair_receipt_exact "$path" "$expected"; then
+            pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1
+         fi
+      else
+         pair_write "$path" "$expected"
+      fi
+   done
+   pair_fence_exact "$boot" "$guest" || { pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1; }
+   pair_write "$pair_dir/phase" reset-required
+   pair_fence_exact "$boot" "$guest" && [[ "$(<"$pair_dir/phase")" == reset-required ]] || {
+      pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"; return 1; }
+   pair_unlock_workspace "$target_fd"; pair_unlock_workspace "$source_fd"
+   printf 'PAIR_GUEST_RESET operationID=%s descriptorSHA256=%s bootID=%s guestID=%s\n' \
+      "$pair_id" "$(pair_descriptor_sha256)" "$boot" "$guest"
+}
+
+pair_guest_reset_absence_proven()
+{
+   local identity boot guest fenced_boot fenced_guest expected
+   [[ -f "$pair_dir/phase" && "$(<"$pair_dir/phase")" == reset-required ]] || return 1
+   pair_owner_dead || return 1
+   identity="$(pair_guest_reset_identity)" || return 1
+   IFS=$'\t' read -r boot guest <<<"$identity"
+   [[ -n "$boot" && -n "$guest" ]] || return 1
+   [[ -r "$pair_dir/guest-reset.fence" && ! -L "$pair_dir/guest-reset.fence" ]] || return 1
+   fenced_boot="$(sed -n 's/^bootID=//p' "$pair_dir/guest-reset.fence")"
+   fenced_guest="$(sed -n 's/^guestID=//p' "$pair_dir/guest-reset.fence")"
+   [[ "$fenced_boot" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+      "$fenced_boot" != 00000000-0000-0000-0000-000000000000 &&
+      "$fenced_guest" == "$guest" && "$boot" != "$fenced_boot" ]] || return 1
+   pair_fence_exact "$fenced_boot" "$guest" || return 1
+   pair_workspace_provider_dead "$pair_source_workspace" && pair_workspace_provider_dead "$pair_target_workspace" || return 1
+   expected="$(pair_fence_text "$fenced_boot" "$guest")" || return 1
+   local absence_text="${expected}"$'\n'"currentBootID=${boot}"
+   pair_write "$pair_dir/guest-reset-absence" "$absence_text"
+   pair_receipt_exact "$pair_dir/guest-reset-absence" "$absence_text" || return 1
+   pair_reset_armed_boot="$fenced_boot"
+   pair_reset_completed_boot="$boot"
+   pair_reset_guest="$guest"
+   pair_reset_descriptor_sha256="$(pair_descriptor_sha256)" || return 1
+}
+
+pair_guest_reset_completion_line()
+{
+   # Either create a receipt immediately after the first changed boot or replay
+   # its retained completed boot after later reboots.  A later boot cannot
+   # rewrite the operation-bound completion observation.
+   local identity current guest armed expected absence_text completed phase
+   phase="$(<"$pair_dir/phase")"
+   if [[ "$phase" == reset-required ]]; then
+      pair_guest_reset_absence_proven || return 1
+   elif [[ "$phase" != removed ]]; then
+      return 1
+   fi
+   identity="$(pair_guest_reset_identity)" || return 1
+   IFS=$'\t' read -r current guest <<<"$identity"
+   armed="$(sed -n 's/^bootID=//p' "$pair_dir/guest-reset.fence")"
+   expected="$(pair_fence_text "$armed" "$guest")" || return 1
+   if [[ "$phase" == reset-required ]]; then
+      pair_fence_exact "$armed" "$guest" || return 1
+   else
+      pair_fence_removed_exact "$armed" "$guest" || return 1
+   fi
+   pair_regular_root_receipt "$pair_dir/guest-reset-absence" || return 1
+   absence_text="$(<"$pair_dir/guest-reset-absence")"
+   completed="$(sed -n 's/^currentBootID=//p' "$pair_dir/guest-reset-absence")"
+   [[ "$armed" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+      "$armed" != 00000000-0000-0000-0000-000000000000 &&
+      "$completed" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+      "$completed" != 00000000-0000-0000-0000-000000000000 &&
+      "$completed" != "$armed" && "$current" != "$armed" &&
+      "$absence_text" == "${expected}"$'\n'"currentBootID=${completed}" ]] || return 1
+   pair_receipt_exact "$pair_dir/guest-reset-absence" "$absence_text" || return 1
+   pair_reset_armed_boot="$armed"
+   pair_reset_completed_boot="$completed"
+   pair_reset_guest="$guest"
+   pair_reset_descriptor_sha256="$(pair_descriptor_sha256)" || return 1
+   printf 'PAIR_GUEST_RESET_COMPLETE operationID=%s descriptorSHA256=%s bootID=%s guestID=%s completedBootID=%s\n' \
+      "$pair_id" "$pair_reset_descriptor_sha256" "$pair_reset_armed_boot" "$pair_reset_guest" "$pair_reset_completed_boot"
+}
+
+workspace_has_mountpoint_beneath()
+{
+   local workspace="$1" target inventory
+   inventory="$(findmnt -rn -o TARGET)" || return 2
+   while IFS= read -r target; do
+      [[ "$target" == "$workspace" || "$target" == "$workspace/"* ]] && return 0
+   done <<<"$inventory"
+   return 1
+}
+
+workspace_reset_tombstone_cleanup()
+{
+   local workspace socket manifest
+   workspace="$1"; socket="$2"; manifest="$workspace/test-cluster-manifest.json"
+   # This is filesystem-only cleanup after a changed-boot receipt.  Python uses
+   # dirfds/O_NOFOLLOW and refuses a live or ambiguous Unix socket pathname.
+   pair_regular_root_receipt "$manifest" || return 1
+   python3 - "$workspace" "$manifest" "$socket" <<'PAIR_RESET_TOMBSTONE'
+import errno,json,os,pathlib,stat,sys
+workspace,manifest_path,socket_path=sys.argv[1:]
+manifest=json.loads(pathlib.Path(manifest_path).read_text(encoding='utf-8'))
+assert manifest.get('workspaceRoot') == workspace
+assert manifest.get('controlSocketPath') == socket_path
+parent,name=os.path.split(socket_path)
+assert name == 'mothership.sock' and parent and os.path.dirname(parent)
+
+def safely_vanished(pid, error):
+    if error.errno not in (errno.ENOENT, errno.ESRCH): return False
+    proc=f'/proc/{pid}'
+    try:
+        stat_line=pathlib.Path(proc+'/stat').read_text(encoding='ascii').rstrip('\n')
+    except OSError:
+        return not os.path.exists(proc)
+    try:
+        state=stat_line.rsplit(') ',1)[1].split()[0]
+    except (IndexError, ValueError):
+        return False
+    return state in ('Z','X','x') and not os.path.exists(proc+'/ns/net')
+
+def no_live_socket():
+    # Each active process namespace must be readable and structurally valid;
+    # only a confirmed vanished/zombie process may disappear during scanning.
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit(): continue
+        path=f'/proc/{entry.name}/net/unix'
+        try:
+            with open(path, encoding='ascii', errors='strict') as f:
+                header=f.readline()
+                if not header.startswith('Num       RefCount Protocol Flags    Type St Inode'):
+                    raise RuntimeError('malformed /proc net/unix header')
+                for line in f:
+                    fields=line.rstrip('\n').split()
+                    if len(fields) >= 8 and fields[-1] == socket_path:
+                        return False
+        except OSError as error:
+            if safely_vanished(entry.name, error): continue
+            raise
+    return True
+
+def root_private_directory(st):
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700
+
+def root_socket(st):
+    return stat.S_ISSOCK(st.st_mode) and st.st_uid == 0 and not (stat.S_IMODE(st.st_mode) & 0o022)
+
+try:
+    grand=os.path.dirname(parent); dirname=os.path.basename(parent)
+    grandfd=os.open(grand, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+except FileNotFoundError:
+    raise SystemExit(0) # parent directory already absent: idempotent retry.
+try:
+    try:
+        dirfd=os.open(dirname, os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW, dir_fd=grandfd)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    try:
+        before_dir=os.fstat(dirfd)
+        assert root_private_directory(before_dir)
+        entries=os.listdir(dirfd)
+        if name in entries:
+            assert entries == [name]
+            before_socket=os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            assert root_socket(before_socket)
+        else:
+            assert entries == []
+            before_socket=None
+        assert no_live_socket()
+        # Recheck both identities after the last live-socket observation.
+        assert os.fstat(dirfd).st_dev == before_dir.st_dev and os.fstat(dirfd).st_ino == before_dir.st_ino
+        if before_socket is not None:
+            now=os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+            assert now.st_dev == before_socket.st_dev and now.st_ino == before_socket.st_ino and root_socket(now)
+            assert no_live_socket()
+            os.unlink(name, dir_fd=dirfd)
+        assert os.listdir(dirfd) == []
+        parent_now=os.stat(dirname, dir_fd=grandfd, follow_symlinks=False)
+        assert parent_now.st_dev == before_dir.st_dev and parent_now.st_ino == before_dir.st_ino and root_private_directory(parent_now)
+        os.rmdir(dirname, dir_fd=grandfd)
+    finally:
+        os.close(dirfd)
+finally:
+    os.close(grandfd)
+PAIR_RESET_TOMBSTONE
+}
+
+workspace_reset_only_cleanup()
+{
+   local workspace="$1" socket="$2" mount_status
+   workspace_guest_reset_stop_safe "$workspace" || return 1
+   # A reset receipt proves old kernel objects absent. This branch never names
+   # retained PID/cgroup/netlink/mount targets; it may remove only a verified
+   # stale filesystem socket tombstone through workspace_reset_tombstone_cleanup.
+   if workspace_has_mountpoint_beneath "$workspace"; then
+      return 1
+   else
+      mount_status=$?
+      [[ "$mount_status" == 1 ]] || return 1
+   fi
+   workspace_reset_tombstone_cleanup "$workspace" "$socket" || return 1
+   [[ -d "$workspace" && ! -L "$workspace" ]] || return 1
+   rm -rf -- "$workspace"
+}
+
+
+workspace_guest_reset_stop_safe()
+{
+   local workspace="$1" path operation pair_path fence_boot guest current absence identity current_guest fence_text absence_text completed
+   local -a descriptor_args=()
+   path="$(pair_workspace_fence_path "$workspace")"
+   pair_regular_root_receipt "$path" || return 1
+   operation="$(sed -n 's/^operationID=//p' "$path")"
+   fence_boot="$(sed -n 's/^bootID=//p' "$path")"
+   guest="$(sed -n 's/^guestID=//p' "$path")"
+   [[ "$operation" =~ ^0x[0-9a-f]{2,32}$ && "$fence_boot" =~ ^[0-9a-f-]{36}$ ]] || return 1
+   pair_path="/mnt/prodigy-vdc-pairs/${operation}"
+   [[ -d "$pair_path" && ! -L "$pair_path" && -r "$pair_path/phase" && "$(<"$pair_path/phase")" == removed &&
+      -f "$pair_path/descriptor" && ! -L "$pair_path/descriptor" ]] || return 1
+   mapfile -t descriptor_args < "$pair_path/descriptor"
+   [[ "${#descriptor_args[@]}" == 14 ]] || return 1
+   pair_parse "${descriptor_args[@]}" || return 1
+   [[ "$pair_dir" == "$pair_path" && "$(pair_descriptor)" == "$(<"$pair_path/descriptor")" ]] || return 1
+   [[ "$workspace" == "$pair_source_workspace" || "$workspace" == "$pair_target_workspace" ]] || return 1
+   identity="$(pair_guest_reset_identity)" || return 1
+   IFS=$'\t' read -r current current_guest <<<"$identity"
+   [[ "$current_guest" == "$guest" && "$current" != "$fence_boot" ]] || return 1
+   pair_fence_removed_exact "$fence_boot" "$guest" || return 1
+   # The current workspace marker must be the exact bound copy selected by
+   # this parsed descriptor; only an absent already-deleted peer is permitted.
+   # descriptor, never merely a receipt with the same operation text.
+   fence_text="$(pair_fence_text "$fence_boot" "$guest")" || return 1
+   pair_receipt_exact "$path" "$fence_text" || return 1
+   absence="$pair_path/guest-reset-absence"
+   pair_regular_root_receipt "$absence" || return 1
+   absence_text="$(<"$absence")"
+   completed="$(sed -n 's/^currentBootID=//p' "$absence")"
+   [[ "$completed" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ &&
+      "$completed" != 00000000-0000-0000-0000-000000000000 && "$completed" != "$fence_boot" &&
+      "$absence_text" == "${fence_text}"$'\n'"currentBootID=${completed}" ]] || return 1
+   pair_receipt_exact "$absence" "$absence_text"
+}
+
 pair_owner_live()
 {
    [[ -f "$pair_dir/owner" && ! -L "$pair_dir/owner" ]] || return 1
@@ -606,6 +1020,19 @@ pair_owner_live()
    local current
    current="$(awk '{sub(/^.*\) /, ""); print $20}' "/proc/$pair_pid/stat")"
    [[ "$current" == "$pair_start" && "$(stat -Lc %i "/proc/$pair_pid/ns/mnt")" == "$pair_mount" ]]
+}
+
+pair_owner_dead()
+{
+   local owner_pid owner_start owner_mount extra current
+   [[ -e "$pair_dir/owner" ]] || return 0
+   pair_regular_root_receipt "$pair_dir/owner" || return 1
+   read -r owner_pid owner_start owner_mount extra < "$pair_dir/owner"
+   [[ -z "$extra" && "$owner_pid" =~ ^[1-9][0-9]*$ && "$owner_pid" -gt 1 &&
+      "$owner_start" =~ ^[0-9]+$ && "$owner_mount" =~ ^[0-9]+$ ]] || return 1
+   [[ -r "/proc/$owner_pid/stat" && -e "/proc/$owner_pid/ns/mnt" ]] || return 0
+   current="$(awk '{sub(/^.*\) /, ""); print $20}' "/proc/$owner_pid/stat")" || return 1
+   [[ "$current" != "$owner_start" || "$(stat -Lc %i "/proc/$owner_pid/ns/mnt")" != "$owner_mount" ]]
 }
 
 pair_parent_identity()
@@ -698,8 +1125,9 @@ PAIR_COUNT
 )"
    local source target
    read -r source target <<< "$counts"
-   printf 'PAIR_BOUNDARY operationID=%s selected=%s drainCapability=1 sourceFlows=%s targetFlows=%s\n' \
-      "$pair_id" "$selected" "$source" "$target"
+   printf 'PAIR_BOUNDARY operationID=%s sourceClusterUUID=%s targetClusterUUID=%s sourceRuntimeIdentity=%s targetRuntimeIdentity=%s sourceMachineIndex=%s targetMachineIndex=%s selected=%s drainCapability=1 sourceFlows=%s targetFlows=%s\n' \
+      "$pair_id" "$pair_source_uuid" "$pair_target_uuid" "$pair_source_runtime" "$pair_target_runtime" \
+      "$pair_source_index" "$pair_target_index" "$selected" "$source" "$target"
    [[ "${1:-query}" != drain || ( "$selected" == 2 && "$source" == 0 ) ]]
 }
 
@@ -851,6 +1279,14 @@ pair_recover_remove()
 {
    pair_parse "$@"
    [[ "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
+   # A reset-required pair can only be closed after a new guest boot proves
+   # its old kernel resources absent.  Do not bind or mutate stale namespaces.
+   if [[ "$(<"$pair_dir/phase")" == reset-required ]]; then
+      pair_guest_reset_completion_line >/dev/null || return 1
+      pair_write "$pair_dir/phase" removed
+      pair_guest_reset_completion_line
+      return
+   fi
    # Never race a still-live owner, including one which is still preparing.
    if pair_owner_live; then return 1; fi
    pair_require_no_clients
@@ -953,7 +1389,28 @@ pair_action()
    # directory proves that no provider effect for this identity was issued.
    if [[ "$action" == remove && ! -e "$pair_dir" ]]; then return; fi
    [[ -r "$pair_dir/descriptor" && "$(pair_descriptor)" == "$(<"$pair_dir/descriptor")" ]]
-   if [[ "$action" == remove && -f "$pair_dir/phase" && "$(<"$pair_dir/phase")" == removed ]]; then return; fi
+   if [[ "$action" == armGuestReset ]]; then
+      pair_arm_guest_reset
+      return
+   fi
+   if [[ "$action" == remove && -f "$pair_dir/phase" && "$(<"$pair_dir/phase")" == removed ]]; then
+      if [[ -e "$pair_dir/guest-reset-absence" || -L "$pair_dir/guest-reset-absence" ]]; then
+         pair_guest_reset_completion_line
+      else
+         return 0
+      fi
+      return
+   fi
+   if [[ "$(<"$pair_dir/phase")" == reset-required ]]; then
+      # No query, selection, probe, or crash can turn a reset fence into a
+      # live pair.  A changed boot closes without entering a namespace or
+      # touching any retained link/cgroup/socket identity.
+      [[ "$action" == remove ]] || return 1
+      pair_guest_reset_completion_line >/dev/null || return 1
+      pair_write "$pair_dir/phase" removed
+      pair_guest_reset_completion_line
+      return
+   fi
    if ! pair_owner_live; then
       [[ "$action" == remove ]] || return 1
       exec unshare --mount --propagation private -- bash "$0" --pair-recover-remove "$@"
@@ -1024,6 +1481,8 @@ pair_launch()
 {
    pair_parse "$@"
    [[ "$#" == 14 ]]
+   pair_workspace_reset_flagged "$pair_source_workspace" && return 1
+   pair_workspace_reset_flagged "$pair_target_workspace" && return 1
    mkdir -p -m 0700 /mnt/prodigy-vdc-pairs
    [[ ! -L /mnt/prodigy-vdc-pairs ]]
    if [[ -d "$pair_dir" ]]; then
@@ -1045,18 +1504,23 @@ pair_launch()
    return 1
 }
 
-stop_datacenter()
+stop_datacenter_locked()
 {
    [[ "$#" -eq 2 && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
    local control_socket_path="$2"
    command -v find >/dev/null
+   command -v findmnt >/dev/null
    command -v flock >/dev/null
    command -v ip >/dev/null
    command -v realpath >/dev/null
    command -v seq >/dev/null
    command -v tr >/dev/null
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
+   if pair_workspace_reset_flagged "${workspace}"; then
+      workspace_reset_only_cleanup "${workspace}" "${control_socket_path}"
+      return
+   fi
    local pid_path="${workspace}/virtual-datacenter.pid"
    local provider_pid="" runtime_identity="" retained_cgroup_root="" retained_scope=""
    [[ ! -r "${pid_path}" ]] || provider_pid="$(<"${pid_path}")"
@@ -1107,6 +1571,18 @@ stop_datacenter()
    rm -rf -- "${workspace}"
 }
 
+
+stop_datacenter()
+{
+   [[ "$#" -eq 2 && "${EUID}" -eq 0 ]] || return 2
+   local workspace="$1" lifecycle_fd="" status
+   valid_workspace "${workspace}" || return 2
+   pair_lock_workspace "${workspace}" lifecycle_fd || return 1
+   stop_datacenter_locked "$@"; status=$?
+   pair_unlock_workspace "$lifecycle_fd" || return 1
+   return "$status"
+}
+
 launch_datacenter()
 {
    [[ "$#" -eq 12 && "${EUID}" -eq 0 ]] || return 2
@@ -1117,8 +1593,18 @@ launch_datacenter()
    command -v realpath >/dev/null
    command -v setsid >/dev/null
    command -v tr >/dev/null
-   stop_datacenter "${workspace}" "${control_socket_path}"
-   mkdir -p "${workspace%/*}" "${workspace}"
+   # Hold the pre-fork slice under the same workspace flock.  Release before
+   # spawning --serve so no lock descriptor crosses an exec boundary; --serve
+   # reacquires it after its mount-namespace reexec before runtime effects.
+   local lifecycle_fd=""
+   pair_lock_workspace "${workspace}" lifecycle_fd || return 1
+   if pair_workspace_reset_flagged "${workspace}"; then
+      pair_unlock_workspace "$lifecycle_fd"
+      return 1
+   fi
+   stop_datacenter_locked "${workspace}" "${control_socket_path}" || { pair_unlock_workspace "$lifecycle_fd"; return 1; }
+   mkdir -p "${workspace%/*}" "${workspace}" || { pair_unlock_workspace "$lifecycle_fd"; return 1; }
+   pair_unlock_workspace "$lifecycle_fd" || return 1
    setsid nohup bash "$0" --serve "$@" > "${workspace}/virtual-datacenter.log" 2>&1 < /dev/null &
 }
 
@@ -1249,6 +1735,16 @@ if [[ "$(stat -Lc %i /proc/self/ns/net)" != "${host_netns_inode}" ]]
 then
    echo "virtual datacenter provider did not start in the declared host network namespace" >&2
    exit 2
+fi
+
+# This is deliberately after the initial mount-namespace reexec.  It closes the
+# launch/arm race until the provider has published its durable identity/runtime.
+workspace_startup_lock_fd=""
+pair_lock_workspace "${workspace}" workspace_startup_lock_fd || exit 1
+if pair_workspace_reset_flagged "${workspace}"
+then
+   pair_unlock_workspace "${workspace_startup_lock_fd}"
+   exit 1
 fi
 
 pid="$$"
@@ -1866,6 +2362,8 @@ recovery_hold()
 }
 
 publish_runtime
+pair_unlock_workspace "${workspace_startup_lock_fd}"
+workspace_startup_lock_fd=""
 
 while true
 do

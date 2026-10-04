@@ -83,7 +83,7 @@ if (NOT DEFINED RELEASE_POLICY OR RELEASE_POLICY STREQUAL "")
 "  \"manifestVersion\": 1,\n"
 "  \"releaseID\": \"local-build-unqualified\",\n"
 "  \"prodigySHA256\": \"${PRODIGY_SHA256}\",\n"
-"  \"containerRetirementJournalVersion\": 1,\n"
+"  \"containerRetirementJournalVersion\": 3,\n"
 "  \"mothershipSHA256\": \"${MOTHERSHIP_SHA256}\",\n"
 "  \"architecture\": \"${ARCHITECTURE}\",\n"
 "  \"binaryVersion\": \"unknown\",\n"

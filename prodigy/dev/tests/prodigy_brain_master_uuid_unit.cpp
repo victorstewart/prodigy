@@ -1800,6 +1800,103 @@ static void runInitialConnectFailureRetryFixture(TestSuite& suite)
   delete peer;
 }
 
+// A canonical connector can lose a prior master after its close CQE has
+// already armed reconnect and missing waiters. When that missing waiter fires,
+// it cancels the reconnect waiter and configures a raw socket while still a
+// follower. Promotion then makes heartbeat convergence responsible for retiring
+// that stale raw generation and rearming the canonical connect.
+static void runPromotedCanonicalConnectorRecoveryFixture(TestSuite& suite, TestNeuron& neuron)
+{
+  ScopedRing scopedRing = {};
+
+  TestBrain brain = {};
+  brain.iaas = new NoopBrainIaaS();
+  brain.nBrains = 3;
+  brain.weAreMaster = false;
+  brain.noMasterYet = false;
+  brain.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+  brain.localBrainPeerAddressText = "127.0.0.1"_ctv;
+  brain.localBrainPeerAddresses.push_back(
+      ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+
+  const uint128_t savedNeuronUUID = neuron.uuid;
+  neuron.uuid = uint128_t(0x490f);
+  BrainView *peer = makePeer(uint128_t(0xa977), 102, IPAddress("127.0.0.18", false).v4, "127.0.0.18");
+  peer->connected = true;
+  peer->isMasterBrain = true;
+  peer->existingMasterUUID = peer->uuid;
+  peer->weConnectToIt = brain.testShouldWeConnectToBrain(peer);
+  peer->connectTimeoutMs = 250;
+  peer->nDefaultAttemptsBudget = 4;
+  brain.brains.insert(peer);
+
+  suite.expect(peer->weConnectToIt,
+               "promoted_canonical_connector_recovery_lower_uuid_owns_outbound_link");
+
+  int pair[2] = {-1, -1};
+  int peerFD = -1;
+  const bool installed = (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+  suite.expect(installed,
+               "promoted_canonical_connector_recovery_installs_prior_master_transport");
+  if (installed)
+  {
+    peer->fd = pair[0];
+    peerFD = pair[1];
+    Ring::installFDIntoFixedFileSlot(peer);
+    suite.expect(peer->isFixedFile && peer->fslot >= 0,
+                 "promoted_canonical_connector_recovery_installs_prior_master_fixed_slot");
+    RingInterface *previousInterfacer = Ring::interfacer;
+    auto previousLifecycler = Ring::lifecycler;
+    Ring::interfacer = &brain;
+    Ring::lifecycler = nullptr;
+    Ring::queueClose(peer);
+    RingExitDeadline closeDeadline(40);
+    Ring::exit = false;
+    closeDeadline.arm();
+    Ring::start();
+    Ring::exit = false;
+    Ring::interfacer = previousInterfacer;
+    Ring::lifecycler = previousLifecycler;
+
+    TimeoutPacket *missingWaiter = brain.testGetBrainWaiter(peer);
+    suite.expect(closeDeadline.fired,
+                 "promoted_canonical_connector_recovery_runs_post_close_wait_window");
+    suite.expect(missingWaiter != nullptr && brain.testHasBrainReconnectWaiter(peer),
+                 "promoted_canonical_connector_recovery_close_arms_missing_and_reconnect_waiters");
+    if (missingWaiter != nullptr)
+    {
+      brain.testDispatchTimeout(missingWaiter);
+    }
+
+    suite.expect(peer->quarantined && peer->fd >= 0 && peer->isFixedFile == false &&
+                     peer->connectAttemptPending() == false && brain.testHasBrainReconnectWaiter(peer) == false,
+                 "promoted_canonical_connector_recovery_missing_waiter_leaves_stale_raw_generation");
+
+    brain.weAreMaster = true;
+    brain.testRunBrainPeerHeartbeatTick();
+    suite.expect(peer->connectAttemptPending() || brain.testHasBrainReconnectWaiter(peer),
+                 "promoted_canonical_connector_recovery_promoted_heartbeat_rearms_canonical_connect");
+  }
+
+  brain.testEraseBrainWaiter(peer);
+  brain.testEraseBrainReconnectWaiter(peer);
+  if (peer->isFixedFile)
+  {
+    Ring::uninstallFromFixedFileSlot(peer);
+  }
+  else if (peer->fd >= 0)
+  {
+    ::close(peer->fd);
+  }
+  if (peerFD >= 0)
+  {
+    ::close(peerFD);
+  }
+  brain.brains.erase(peer);
+  delete peer;
+  neuron.uuid = savedNeuronUUID;
+}
+
 static bool queuedRegistrationAdvertisesMaster(String& buffer, uint128_t& advertisedMasterUUID)
 {
   bool found = false;
@@ -3244,6 +3341,11 @@ int main(void)
       runInitialConnectFailureRetryFixture(suite);
       return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (std::strcmp(testOnly, "promoted-canonical-connector-recovery") == 0)
+    {
+      runPromotedCanonicalConnectorRecoveryFixture(suite, neuron);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "restored-deployment-chain") == 0)
     {
       runRestoredDeploymentChainFixtures();
@@ -3301,6 +3403,7 @@ int main(void)
 
   runStrandedFollowerReconnectFixture(suite);
   runInitialConnectFailureRetryFixture(suite);
+  runPromotedCanonicalConnectorRecoveryFixture(suite, neuron);
   runGhostMasterRegistrationFixtures(suite);
   withUniqueMothershipSocket("direct_master_claim_reconciliation_socket_dir_created", [&] {
     runDirectMasterClaimReconciliationFixtures(suite);

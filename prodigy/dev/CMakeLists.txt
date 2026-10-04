@@ -2409,6 +2409,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_CONTAINER_RETIREMENT_ONLY=1
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
    set_tests_properties(prodigy_container_retirement_authority_unit PROPERTIES TIMEOUT 30)
+   add_test(NAME prodigy_stateless_admission_behavior_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_STATELESS_ADMISSION_ONLY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
+   set_tests_properties(prodigy_stateless_admission_behavior_unit PROPERTIES TIMEOUT 60)
    add_test(NAME prodigy_mothership_upgrade_contract_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_contract_unit)
    add_test(NAME prodigy_mothership_upgrade_admission_registry_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_admission_registry_unit)
    add_test(

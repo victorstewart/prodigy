@@ -59,7 +59,15 @@ enum class MothershipTopic : uint16_t {
   updateProdigyAdmitted,
   // Versioned identity receipt for cross-cluster coordinators.  Appended so
   // older controllers reject the request rather than decoding a shifted frame.
-  pullDeploymentIdentity
+  pullDeploymentIdentity,
+  // Opt-in, versioned durable admission for the restricted cross-cluster
+  // stateless target profile.  Legacy spinApplication remains unchanged.
+  admitStatelessDeployment,
+  pullStatelessDeploymentAdmission,
+  // Source-side retirement sealing is independently framed so legacy
+  // controllers reject it instead of interpreting an admission payload.
+  preparePairedSourceRetirement,
+  pullPairedSourceRetirement
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -140,6 +148,14 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "updateProdigyAdmitted";
     case MothershipTopic::pullDeploymentIdentity:
       return "pullDeploymentIdentity";
+    case MothershipTopic::admitStatelessDeployment:
+      return "admitStatelessDeployment";
+    case MothershipTopic::pullStatelessDeploymentAdmission:
+      return "pullStatelessDeploymentAdmission";
+    case MothershipTopic::preparePairedSourceRetirement:
+      return "preparePairedSourceRetirement";
+    case MothershipTopic::pullPairedSourceRetirement:
+      return "pullPairedSourceRetirement";
   }
 
   return "unknown";

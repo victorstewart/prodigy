@@ -73,6 +73,8 @@ public:
   bool placementPolicyCapabilityAcknowledged = false;
   bool containerRetirementCapabilityAcknowledged = false;
   bool statefulServingAuthorityCapabilityAcknowledged = false;
+  bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
+  bool pairedSourceRetirementCapabilityAcknowledged = false;
   uint128_t containerRetirementCapabilityUUID = 0;
   int64_t containerRetirementCapabilityBootNs = 0;
   uint64_t containerRetirementCapabilityIOGeneration = 0;
@@ -140,6 +142,8 @@ public:
     placementPolicyCapabilityAcknowledged = false;
     containerRetirementCapabilityAcknowledged = false;
     statefulServingAuthorityCapabilityAcknowledged = false;
+    statelessDeploymentAdmissionCapabilityAcknowledged = false;
+    pairedSourceRetirementCapabilityAcknowledged = false;
     containerRetirementCapabilityUUID = 0;
     containerRetirementCapabilityBootNs = 0;
     containerRetirementCapabilityIOGeneration = 0;
@@ -691,6 +695,14 @@ public:
   virtual uint64_t containerLaunchAuthorityEpoch(void) const
   {
     return canControlNeurons() ? 1 : 0;
+  }
+
+  // A durable source-retirement fence blocks every scheduler and ingress path
+  // from assigning a replacement UUID for that deployment.
+  virtual bool deploymentLaunchFenced(uint64_t deploymentID) const
+  {
+    (void)deploymentID;
+    return false;
   }
 
   virtual bool workerBundleUpgradeTransitionPending(const Machine *machine) const
@@ -1275,11 +1287,21 @@ public:
     return false;
   }
 
+  virtual bool deploymentReplicationAllowedForPeer(uint64_t deploymentID, BrainView *brain) const
+  {
+    (void)deploymentID;
+    (void)brain;
+    return true;
+  }
+
   bool queueBrainDeploymentReplicationToPeer(
       BrainView *brain,
       StringType auto&& serializedPlan,
       StringType auto&& containerBlob)
   {
+    DeploymentPlan deploymentPlan = {};
+    if (BitseryEngine::deserializeSafe(serializedPlan, deploymentPlan) == false ||
+        !deploymentReplicationAllowedForPeer(deploymentPlan.config.deploymentID(), brain)) return false;
     const uint64_t appendBytes = (uint64_t(serializedPlan.size()) + uint64_t(containerBlob.size()) + brainPeerReplicationFrameHeadroomBytes);
     if (allowBrainPeerReplicationAppend(brain, appendBytes, "replicateDeployment-live"_ctv) == false)
     {
@@ -1309,7 +1331,8 @@ public:
 
   bool queueBrainDeploymentReplicationFromStoreToPeer(BrainView *brain, const String& serializedPlan, uint64_t deploymentID, uint64_t containerBlobBytes)
   {
-    if (brain == nullptr || brain->canQueueSend() == false) return false;
+    if (brain == nullptr || brain->canQueueSend() == false ||
+        !deploymentReplicationAllowedForPeer(deploymentID, brain)) return false;
     const uint32_t transportEpoch = brain->transportEpoch;
     auto queued = brain->queuedStoreArtifactTransportEpochs.find(deploymentID);
     if (queued != brain->queuedStoreArtifactTransportEpochs.end())

@@ -244,7 +244,7 @@ static inline bool mothershipParseUpgradeContract(const String& json,
   if (retirementVersion.error() != simdjson::NO_SUCH_FIELD)
   {
     uint64_t value = 0;
-    if (retirementVersion.get_uint64().get(value) != simdjson::SUCCESS || value > 1)
+    if (retirementVersion.get_uint64().get(value) != simdjson::SUCCESS || value > 3)
     {
       if (failure) failure->assign("unsupported container retirement journal reader"_ctv);
       return false;

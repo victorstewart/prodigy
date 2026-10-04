@@ -103,14 +103,15 @@ int main(void)
   const MothershipUpgradeEnvelope envelope = validEnvelope(json);
   suite.expect(mothershipParseUpgradeContract(json, envelope, contract, &failure), "parse_authenticated_explicit_contract");
   suite.expect(contract.containerRetirementJournalVersion == 0, "missing_retirement_reader_is_legacy_unsupported");
-  for (const char *version : {"0", "1", "2", "-1", "\"1\""})
+  for (const char *version : {"0", "1", "2", "3", "4", "-1", "\"1\""})
   {
     std::string modified(reinterpret_cast<const char *>(json.data()), json.size());
     modified.insert(modified.rfind('}'), std::string(",\"containerRetirementJournalVersion\":") + version);
     String declared = {}; declared.assign(modified.data(), modified.size());
     MothershipUpgradeContract reader = {};
     const bool accepted = mothershipParseUpgradeContract(declared, validEnvelope(declared), reader, &failure);
-    const bool valid = std::string(version) == "0" || std::string(version) == "1";
+    const bool valid = std::string(version) == "0" || std::string(version) == "1" ||
+                       std::string(version) == "2" || std::string(version) == "3";
     suite.expect(accepted == valid && (!accepted || reader.containerRetirementJournalVersion == uint32_t(version[0] - '0')),
                  "retirement_reader_version_is_explicit_and_bounded");
   }

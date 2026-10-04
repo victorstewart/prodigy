@@ -160,6 +160,7 @@ endforeach()
 foreach(_required IN ITEMS
    "Darwin)"
    "container exec"
+   [["${launcher}" exec "${instance}" -- env -C "${guest_repo}"]]
    [["${launcher}" ensure "${instance}"]]
    [["${launcher}" stop "${instance}"]]
    [[/usr/bin/sudo /sbin/route -n add -net "${apple_route_prefix}" "${apple_guest_ipv4}" -mtu "${apple_route_mtu}"]]
@@ -210,6 +211,8 @@ set(_pair_endpoint "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_pair_endpoint_
 file(READ "${_pair_endpoint}" _pair_endpoint_source)
 foreach(_required IN ITEMS
    "prepareTestPairBoundary"
+   "prepareTestPairMigration"
+   "admitTestPairTarget"
    "pairBoundary"
    "probePairBoundary"
    "registerRoutableSubnet"

@@ -2597,22 +2597,6 @@ static inline void prodigyApplyPersistentBootStateSecrets(
   state.bootstrapSshHostKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshHostPrivateKeyOpenSSH;
 }
 
-static bool prodigyPersistentContainerRetirementDescriptorValid(
-    const ProdigyContainerRetirementIntent& intent)
-{
-  if (!intent.bootstrap.empty())
-  {
-    return false;
-  }
-
-  // A public pending descriptor deliberately omits its private bootstrap.  Use
-  // the journal's immutable identity validator without treating that omission
-  // as an invalid pending intent.
-  ProdigyContainerRetirementIntent immutableIdentity = intent;
-  immutableIdentity.killAcked = true;
-  return prodigyContainerRetirementIntentValid(immutableIdentity);
-}
-
 static bool prodigyParsePersistentContainerRetirementDescriptor(
     const TaskExecutionRecord& carrier, ProdigyContainerRetirementJournal& journal)
 {
@@ -2626,17 +2610,17 @@ static bool prodigyParsePersistentContainerRetirementDescriptor(
   {
     return false;
   }
-  uint128_t previousUUID = 0;
-  for (const ProdigyContainerRetirementIntent& intent : journal.intents)
+  // Public descriptors deliberately omit every bootstrap.  Validate the
+  // complete journal (including v3 paired fences/cohorts) through the single
+  // authoritative validator after converting that omission to terminal form.
+  // This preserves identity checks without accepting a malformed public fence.
+  ProdigyContainerRetirementJournal bootstrapOmittedJournal = journal;
+  for (auto& intent : bootstrapOmittedJournal.intents)
   {
-    if (!prodigyPersistentContainerRetirementDescriptorValid(intent) ||
-        (previousUUID != 0 && intent.containerUUID <= previousUUID))
-    {
-      return false;
-    }
-    previousUUID = intent.containerUUID;
+    if (!intent.bootstrap.empty()) return false;
+    intent.killAcked = true;
   }
-  return true;
+  return prodigyValidateContainerRetirementJournal(bootstrapOmittedJournal);
 }
 
 static bool prodigyPersistentWriteContainerRetirementDescriptor(
@@ -3247,7 +3231,8 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
     {
       const ProdigyContainerRetirementIntent *intent =
           prodigyFindContainerRetirementIntentInValidatedJournal(journal, retirementSecrets.containerUUID);
-      if (journal.version != ProdigyContainerRetirementJournal::currentVersion ||
+      if ((journal.version != ProdigyContainerRetirementJournal::pairedIntentVersion &&
+           journal.version != ProdigyContainerRetirementJournal::currentVersion) ||
           intent == nullptr || intent->killAcked || !retirementSecrets.matches(*intent))
       {
         if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar identity differs"_ctv);

@@ -106,11 +106,41 @@ static ProdigyContainerRetirementIntent makePairedStatelessIntent(uint128_t uuid
 static ProdigyContainerRetirementJournal makePairedStatelessJournal(uint32_t count = 1)
 {
   ProdigyContainerRetirementJournal journal = {};
-  journal.version = ProdigyContainerRetirementJournal::currentVersion;
+  journal.version = ProdigyContainerRetirementJournal::pairedIntentVersion;
   for (uint32_t index = 0; index < count; ++index)
   {
     journal.intents.push_back(makePairedStatelessIntent(uint128_t(index) + 1));
   }
+  return journal;
+}
+
+static ProdigyContainerRetirementJournal makePairedSourceFenceJournal(uint32_t count = 2)
+{
+  ProdigyContainerRetirementJournal journal = {};
+  journal.version = ProdigyContainerRetirementJournal::currentVersion;
+  ProdigyPairedSourceRetirementFence fence = {};
+  fence.operationID = 0x990001;
+  fence.sourceClusterUUID = 0x990002;
+  fence.targetClusterUUID = 0x990003;
+  fence.sourceDeploymentID = (uint64_t(7) << 48) | 41;
+  fence.targetDeploymentID = fence.sourceDeploymentID;
+  fence.sourceNormalizedPlanSHA256.assign(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+  fence.sourceBlobSHA256.assign(
+      "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"_ctv);
+  fence.sourceBlobBytes = 4096;
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    ProdigyContainerRetirementIntent intent = makePairedStatelessIntent(uint128_t(index) + 1);
+    intent.pairedOperationID = fence.operationID;
+    intent.pairedSourceClusterUUID = fence.sourceClusterUUID;
+    intent.pairedTargetClusterUUID = fence.targetClusterUUID;
+    intent.pairedTargetDeploymentID = fence.targetDeploymentID;
+    intent.deploymentID = fence.sourceDeploymentID;
+    journal.intents.push_back(intent);
+    fence.cohort.push_back({intent.containerUUID, intent.machineUUID, intent.intentGeneration});
+  }
+  journal.pairedSourceFences.push_back(std::move(fence));
   return journal;
 }
 
@@ -214,7 +244,7 @@ static void testMalformedTrailingAndVersionRejected(TestSuite& suite)
                "container_retirement_oversized_carrier_rejected_before_decode");
 
   ProdigyContainerRetirementJournal wrongVersion = journal;
-  wrongVersion.version = 3;
+  wrongVersion.version = 4;
   suite.expect(prodigyWriteContainerRetirementJournalCarrier(carrier, wrongVersion, 1) == false,
                "container_retirement_version_rejected");
 }
@@ -237,14 +267,14 @@ static void testV1CompatibilityAndV2PairedStatelessFraming(TestSuite& suite)
   ProdigyContainerRetirementJournal decodedV2 = {};
   LegacyContainerRetirementJournalReader legacyReader = {};
   suite.expect(prodigyContainerRetirementJournalVersionSupported(
-                   ProdigyContainerRetirementJournal::currentVersion, 1) == false &&
+                   ProdigyContainerRetirementJournal::pairedIntentVersion, 1) == false &&
                    prodigyContainerRetirementJournalVersionSupported(
-                       ProdigyContainerRetirementJournal::currentVersion,
+                       ProdigyContainerRetirementJournal::pairedIntentVersion,
                        ProdigyContainerRetirementJournal::currentVersion) &&
                    prodigyWriteContainerRetirementJournalCarrier(v2Carrier, v2, 1) &&
                    prodigyParseContainerRetirementJournalCarrier(v2Carrier, decodedV2) &&
                    BitseryEngine::deserializeSafe(v2Carrier.fingerprint, legacyReader) == false &&
-                   decodedV2.version == ProdigyContainerRetirementJournal::currentVersion &&
+                   decodedV2.version == ProdigyContainerRetirementJournal::pairedIntentVersion &&
                    decodedV2.intents[0].sameIdentity(v2.intents[0]) &&
                    decodedV2.intents[0].bootstrap.equals(v2.intents[0].bootstrap),
                "container_retirement_v2_paired_framing_and_legacy_reader_rejection");
@@ -253,6 +283,113 @@ static void testV1CompatibilityAndV2PairedStatelessFraming(TestSuite& suite)
   accidentalV1.version = ProdigyContainerRetirementJournal::legacyVersion;
   suite.expect(prodigyValidateContainerRetirementJournal(accidentalV1) == false,
                "container_retirement_v1_rejects_v2_identity_without_silent_drop");
+}
+
+static void testV3PairedSourceFenceContract(TestSuite& suite)
+{
+  ProdigyContainerRetirementJournal current = makePairedSourceFenceJournal();
+  TaskExecutionRecord carrier = {};
+  ProdigyContainerRetirementJournal decoded = {};
+  const auto *byOperation = prodigyFindPairedSourceRetirementFenceByOperation(current, 0x990001);
+  const auto *byDeployment = prodigyFindPairedSourceRetirementFenceByDeployment(
+      current, current.intents[0].deploymentID);
+  suite.expect(prodigyValidateContainerRetirementJournal(current) &&
+                   prodigyWriteContainerRetirementJournalCarrier(carrier, current, 1) &&
+                   prodigyParseContainerRetirementJournalCarrier(carrier, decoded) &&
+                   byOperation != nullptr && byDeployment == byOperation &&
+                   byOperation->cohort.size() == current.intents.size(),
+               "container_retirement_v3_fence_roundtrip_and_exact_lookup");
+
+  ProdigyContainerRetirementJournal missingIntent = current;
+  missingIntent.intents.pop_back();
+  suite.expect(prodigyValidateContainerRetirementJournal(missingIntent) == false,
+               "container_retirement_v3_fence_rejects_missing_cohort_intent");
+
+  ProdigyContainerRetirementJournal mismatchedMachine = current;
+  mismatchedMachine.pairedSourceFences[0].cohort[0].machineUUID += 1;
+  suite.expect(prodigyValidateContainerRetirementJournal(mismatchedMachine) == false,
+               "container_retirement_v3_fence_rejects_mismatched_cohort_machine");
+
+  ProdigyContainerRetirementJournal unsealedIntent = current;
+  auto extra = makePairedStatelessIntent(9);
+  extra.pairedOperationID = current.pairedSourceFences[0].operationID;
+  extra.pairedSourceClusterUUID = current.pairedSourceFences[0].sourceClusterUUID;
+  extra.pairedTargetClusterUUID = current.pairedSourceFences[0].targetClusterUUID;
+  extra.pairedTargetDeploymentID = current.pairedSourceFences[0].targetDeploymentID;
+  extra.deploymentID = current.pairedSourceFences[0].sourceDeploymentID;
+  unsealedIntent.intents.push_back(std::move(extra));
+  suite.expect(prodigyValidateContainerRetirementJournal(unsealedIntent) == false,
+               "container_retirement_v3_fence_rejects_unsealed_paired_intent");
+
+  ProdigyContainerRetirementJournal terminal = current;
+  terminal.intents[0].killAcked = true;
+  terminal.intents[0].bootstrap.clear();
+  ProdigyContainerRetirementJournal merged = {};
+  suite.expect(prodigyMergeContainerRetirementJournal(current, terminal, merged) &&
+                   merged.pairedSourceFences[0].sameIdentity(current.pairedSourceFences[0]),
+               "container_retirement_v3_fence_retained_across_terminal_ack");
+
+  ProdigyContainerRetirementJournal changedFence = terminal;
+  changedFence.pairedSourceFences[0].sourceBlobBytes += 1;
+  suite.expect(prodigyMergeContainerRetirementJournal(terminal, changedFence, merged) == false,
+               "container_retirement_v3_fence_rewrite_rejected");
+
+  ProdigyContainerRetirementJournal removedFence = terminal;
+  removedFence.pairedSourceFences.clear();
+  suite.expect(prodigyMergeContainerRetirementJournal(terminal, removedFence, merged) == false,
+               "container_retirement_v3_fence_removal_rejected");
+
+  // Fences are ordered only by opaque operation ID.  Their source deployment
+  // IDs are unique but intentionally need not share that ordering.
+  ProdigyContainerRetirementJournal twoFences = current;
+  twoFences.pairedSourceFences[0].operationID = 0x100;
+  twoFences.pairedSourceFences[0].sourceDeploymentID = (uint64_t(7) << 48) | 42;
+  twoFences.intents[0].pairedOperationID = 0x100;
+  twoFences.intents[1].pairedOperationID = 0x100;
+  twoFences.intents[0].deploymentID = twoFences.pairedSourceFences[0].sourceDeploymentID;
+  twoFences.intents[1].deploymentID = twoFences.pairedSourceFences[0].sourceDeploymentID;
+  for (uint32_t index = 0; index < 2; ++index)
+  {
+    NeuronContainerBootstrap bootstrap = {};
+    BitseryEngine::deserializeSafe(twoFences.intents[index].bootstrap, bootstrap);
+    bootstrap.plan.config.versionID = 42;
+    BitseryEngine::serialize(twoFences.intents[index].bootstrap, bootstrap);
+  }
+  ProdigyPairedSourceRetirementFence second = twoFences.pairedSourceFences[0];
+  second.operationID = 0x200;
+  second.sourceDeploymentID = (uint64_t(7) << 48) | 41;
+  second.sourceNormalizedPlanSHA256.assign(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  second.cohort.clear();
+  for (uint128_t uuid = 3; uuid <= 4; ++uuid)
+  {
+    ProdigyContainerRetirementIntent intent = makePairedStatelessIntent(uuid);
+    intent.pairedOperationID = second.operationID;
+    intent.pairedSourceClusterUUID = second.sourceClusterUUID;
+    intent.pairedTargetClusterUUID = second.targetClusterUUID;
+    intent.pairedTargetDeploymentID = second.targetDeploymentID;
+    intent.deploymentID = second.sourceDeploymentID;
+    twoFences.intents.push_back(intent);
+    second.cohort.push_back({intent.containerUUID, intent.machineUUID, intent.intentGeneration});
+  }
+  twoFences.pairedSourceFences.push_back(std::move(second));
+  suite.expect(prodigyValidateContainerRetirementJournal(twoFences),
+               "container_retirement_v3_fences_accept_independent_operation_deployment_order");
+
+  ProdigyContainerRetirementJournal duplicateSourceDeployment = twoFences;
+  duplicateSourceDeployment.pairedSourceFences[1].sourceDeploymentID =
+      duplicateSourceDeployment.pairedSourceFences[0].sourceDeploymentID;
+  for (uint32_t index = 2; index < 4; ++index)
+  {
+    duplicateSourceDeployment.intents[index].deploymentID =
+        duplicateSourceDeployment.pairedSourceFences[1].sourceDeploymentID;
+    NeuronContainerBootstrap bootstrap = {};
+    BitseryEngine::deserializeSafe(duplicateSourceDeployment.intents[index].bootstrap, bootstrap);
+    bootstrap.plan.config.versionID = 42;
+    BitseryEngine::serialize(duplicateSourceDeployment.intents[index].bootstrap, bootstrap);
+  }
+  suite.expect(prodigyValidateContainerRetirementJournal(duplicateSourceDeployment) == false,
+               "container_retirement_v3_fences_reject_duplicate_source_deployment_binding");
 }
 
 static void testPairedStatelessValidationAndMonotonicity(TestSuite& suite)
@@ -428,6 +565,7 @@ int main(void)
   testCarrierRoundTripAndExactLookup(suite);
   testMalformedTrailingAndVersionRejected(suite);
   testV1CompatibilityAndV2PairedStatelessFraming(suite);
+  testV3PairedSourceFenceContract(suite);
   testPairedStatelessValidationAndMonotonicity(suite);
   testIdentityAndMonotonicAckFences(suite);
   testBootstrapSemanticOrderAndTrailingFences(suite);
