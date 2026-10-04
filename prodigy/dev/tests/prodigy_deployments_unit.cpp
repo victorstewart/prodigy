@@ -11511,7 +11511,13 @@ int main(void)
   }
 
   {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
     ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
     deployment.state = DeploymentState::running;
     deployment.nTargetBase = 2;
     deployment.nTargetSurge = 0;
@@ -11539,6 +11545,8 @@ int main(void)
 
     suite.expect(deployment.nDeployedBase == 2, "recoverAfterReboot_rebuilds_deployed_counts");
     suite.expect(deployment.nHealthyBase == 1, "recoverAfterReboot_rebuilds_healthy_counts");
+
+    thisBrain = savedBrain;
   }
 
   {
@@ -11742,12 +11750,20 @@ int main(void)
   }
 
   {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+
     ApplicationDeployment deployment;
+    seedCommonPlan(deployment, false);
     deployment.state = DeploymentState::failed;
     deployment.nDeployedBase = 7;
     deployment.nHealthyBase = 5;
     deployment.recoverAfterReboot();
     suite.expect(deployment.nDeployedBase == 7 && deployment.nHealthyBase == 5, "recoverAfterReboot_skips_failed_state");
+
+    thisBrain = savedBrain;
   }
 
   {

@@ -660,6 +660,8 @@ add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
 add_executable(prodigy_mothership_addmachines_progress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_addmachines_progress_unit.cpp)
 add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
+add_executable(prodigy_mothership_provider_capture_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_capture_unit.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
+target_include_directories(prodigy_mothership_provider_capture_unit PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_include_directories(prodigy_mothership_pricing_unit PRIVATE "${CMAKE_BINARY_DIR}/generated")
 target_include_directories(prodigy_mothership_unix_connect_unit PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_executable(prodigy_mothership_virtual_datacenter_unit
@@ -765,6 +767,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_create_unit
    prodigy_mothership_addmachines_progress_unit
    prodigy_mothership_unix_connect_unit
+   prodigy_mothership_provider_capture_unit
    prodigy_mothership_virtual_datacenter_unit
    prodigy_pair_boundary_cleanup_unit
    prodigy_mothership_neuron_checkpoint_unit
@@ -871,6 +874,7 @@ set(PRODIGY_CARES_TARGETS
    prodigy_mothership_host_runtime_unit
    prodigy_mothership_pricing_unit
    prodigy_mothership_unix_connect_unit
+   prodigy_mothership_provider_capture_unit
 )
 foreach(prodigy_target IN LISTS PRODIGY_CARES_TARGETS)
    depos_link(${prodigy_target} PRIVATE cares::cares)
@@ -1014,6 +1018,7 @@ target_compile_options(prodigy_brain_machine_lifecycle_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_elastic_address_operations_unit PUBLIC -O2)
 target_compile_options(prodigy_command_capture_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_pricing_unit PUBLIC -O0 -fno-lto)
+target_compile_options(prodigy_mothership_provider_capture_unit PRIVATE -O0 -fno-lto)
 target_compile_options(prodigy_provider_rack_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_provider_elastic_address_unit PUBLIC -O0 -fno-lto)
 target_compile_options(prodigy_machine_hardware_unit PUBLIC -O2)
@@ -1058,6 +1063,7 @@ endif()
 
 target_link_options(prodigy_gcp_provider_unit PRIVATE -fno-lto)
 target_link_options(prodigy_mothership_pricing_unit PRIVATE -fno-lto)
+target_link_options(prodigy_mothership_provider_capture_unit PRIVATE -fno-lto)
 target_link_options(prodigy_provider_rack_unit PRIVATE -fno-lto)
 target_link_options(prodigy_provider_elastic_address_unit PRIVATE -fno-lto)
 
@@ -2439,6 +2445,17 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_mothership_addmachines_progress_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_addmachines_progress_unit
    )
+
+   add_test(
+      NAME prodigy_mothership_provider_capture_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_provider_capture_unit
+   )
+   set_tests_properties(prodigy_mothership_provider_capture_unit PROPERTIES TIMEOUT 10)
+   add_test(
+      NAME prodigy_mothership_probe_traffic_unit
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_probe_traffic_unit.py
+   )
+   set_tests_properties(prodigy_mothership_probe_traffic_unit PROPERTIES TIMEOUT 15)
 
    add_test(
       NAME prodigy_mothership_unix_connect_unit

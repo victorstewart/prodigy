@@ -27,6 +27,7 @@ mkdir -p "${repo_root}/.run"
 
 runner_mode=oneshot
 runtime_qualification=
+ordinary_observer_mothership=
 two_cluster_coexistence=0
 workspace_root=
 manifest_path=
@@ -139,6 +140,9 @@ do
       --runtime-qualification=*)
          runtime_qualification="${1#*=}"
          ;;
+      --ordinary-observer-mothership=*)
+         ordinary_observer_mothership="${1#*=}"
+         ;;
       --two-cluster-coexistence=*)
          two_cluster_coexistence="${1#*=}"
          ;;
@@ -240,6 +244,16 @@ then
    export PRODIGY_DEV_TEST_MACHINE_MEMORY_MB="${test_machine_memory_mb}"
    export PRODIGY_DEV_TEST_MACHINE_STORAGE_MB="${test_machine_storage_mb}"
    case "${runtime_qualification}" in
+      ordinary)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         ordinary_args=()
+         if [[ -n "${ordinary_observer_mothership}" ]]; then
+            [[ -x "${ordinary_observer_mothership}" ]] || fail "ordinary observer is not executable"
+            ordinary_args+=(--observer-mothership "${ordinary_observer_mothership}")
+         fi
+         exec bash "${script_dir}/prodigy_dev_ordinary_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
+            "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" "${ordinary_args[@]}"
+         ;;
       stateful-topology)
          exec bash "${script_dir}/prodigy_dev_stateful_topology_upgrade_matrix.sh" "${prodigy_bin}" "${mothership_bin}" "$(dirname "${prodigy_bin}")/prodigy_pingpong_container_noport"
          ;;

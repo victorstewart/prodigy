@@ -3573,7 +3573,103 @@ static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String 
   return true;
 }
 
-static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *output, String *failure)
+static bool mothershipAppendVirtualDatacenterProviderOutput(
+    String& output, const uint8_t *bytes, uint64_t count, uint64_t maximumOutputBytes)
+{
+  const uint64_t available = output.size() < maximumOutputBytes ? maximumOutputBytes - output.size() : 0;
+  const uint64_t retained = std::min(count, available);
+  if (retained) output.append(bytes, retained);
+  return retained == count;
+}
+
+static bool mothershipCaptureVirtualDatacenterProviderOutput(
+    int outputFD, pid_t pid, String& output, String *failure,
+    uint64_t maximumOutputBytes, uint64_t timeoutMilliseconds,
+    bool killProcessGroup, int& status)
+{
+  bool outputClosed = false, failedCapture = false, childKilled = false, exited = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMilliseconds);
+  auto closeOutput = [&]() { if (!outputClosed) { ::close(outputFD); outputClosed = true; } };
+  // The child establishes its own group before exec. We deliberately do not race
+  // a parent setpgid against a fast child exit; kill(-pid) safely becomes ESRCH.
+  auto stopChild = [&]() {
+    if (!childKilled && (!exited || killProcessGroup))
+    {
+      (void)::kill(killProcessGroup ? -pid : pid, SIGKILL);
+      childKilled = true;
+    }
+  };
+  const int flags = ::fcntl(outputFD, F_GETFL, 0);
+  if (flags < 0 || ::fcntl(outputFD, F_SETFL, flags | O_NONBLOCK) != 0)
+  {
+    failedCapture = true; closeOutput(); stopChild();
+  }
+  while (!exited)
+  {
+    if (!failedCapture && !outputClosed)
+    {
+      uint8_t buffer[4096];
+      for (;;)
+      {
+        const ssize_t count = ::read(outputFD, buffer, sizeof(buffer));
+        if (count > 0)
+        {
+          if (!mothershipAppendVirtualDatacenterProviderOutput(output, buffer, uint64_t(count), maximumOutputBytes))
+          { failedCapture = true; closeOutput(); stopChild(); break; }
+          continue;
+        }
+        if (count == 0) { closeOutput(); break; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        failedCapture = true; closeOutput(); stopChild(); break;
+      }
+    }
+    const pid_t waited = ::waitpid(pid, &status, WNOHANG);
+    if (waited == pid) { exited = true; break; }
+    if (waited < 0 && errno != EINTR) { failedCapture = true; closeOutput(); stopChild(); break; }
+    if (std::chrono::steady_clock::now() >= deadline)
+    {
+      failedCapture = true; closeOutput(); stopChild();
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+      exited = true;
+      break;
+    }
+    if (!failedCapture && !outputClosed)
+    {
+      pollfd descriptor = {outputFD, POLLIN | POLLHUP | POLLERR, 0};
+      (void)::poll(&descriptor, 1, 50);
+    }
+    else ::usleep(1000);
+  }
+  if (!outputClosed && !failedCapture)
+  {
+    while (!outputClosed && std::chrono::steady_clock::now() < deadline)
+    {
+      uint8_t buffer[4096]; const ssize_t count = ::read(outputFD, buffer, sizeof(buffer));
+      if (count > 0)
+      {
+        if (!mothershipAppendVirtualDatacenterProviderOutput(output, buffer, uint64_t(count), maximumOutputBytes))
+        { failedCapture = true; closeOutput(); stopChild(); break; }
+        continue;
+      }
+      if (count == 0) { closeOutput(); break; }
+      if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+      { failedCapture = true; closeOutput(); stopChild(); break; }
+      pollfd descriptor = {outputFD, POLLIN | POLLHUP | POLLERR, 0}; (void)::poll(&descriptor, 1, 50);
+    }
+    if (!outputClosed) { failedCapture = true; closeOutput(); stopChild(); }
+  }
+  if (failedCapture)
+  {
+    if (failure) failure->assign("virtual datacenter provider capture failed; retained output prefix is bounded"_ctv);
+    return false;
+  }
+  return true;
+}
+
+static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, String *output, String *failure,
+                                                    uint64_t maximumOutputBytes = 64 * 1024, uint64_t timeoutMilliseconds = 30'000,
+                                                    bool killProcessGroup = false)
 {
   int providerFD = -1;
   if (output) output->clear();
@@ -3598,6 +3694,7 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
   pid_t pid = ::fork();
   if (pid == 0)
   {
+    if (killProcessGroup && ::setpgid(0, 0) != 0) _exit(127);
     if (output && (::dup2(stdoutPipe[1], STDOUT_FILENO) < 0)) _exit(127);
     if (output) { ::close(stdoutPipe[0]); ::close(stdoutPipe[1]); }
     ::execv("/bin/bash", argv.data());
@@ -3624,76 +3721,11 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
   }
   else
   {
-    bool outputClosed = false, failedCapture = false, childKilled = false, exited = false;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    auto closeOutput = [&]() { if (!outputClosed) { ::close(stdoutPipe[0]); outputClosed = true; } };
-    auto stopChild = [&]() { if (!childKilled && !exited) { (void)::kill(pid, SIGKILL); childKilled = true; } };
-    const int flags = ::fcntl(stdoutPipe[0], F_GETFL, 0);
-    if (flags < 0 || ::fcntl(stdoutPipe[0], F_SETFL, flags | O_NONBLOCK) != 0)
-    {
-      failedCapture = true; closeOutput(); stopChild();
-    }
-    while (!exited)
-    {
-      if (!failedCapture && !outputClosed)
-      {
-        uint8_t buffer[4096];
-        for (;;)
-        {
-          const ssize_t count = ::read(stdoutPipe[0], buffer, sizeof(buffer));
-          if (count > 0)
-          {
-            if (output->size() + uint64_t(count) > 64 * 1024)
-            {
-              output->clear(); failedCapture = true; closeOutput(); stopChild(); break;
-            }
-            output->append(buffer, uint64_t(count));
-            continue;
-          }
-          if (count == 0) { closeOutput(); break; }
-          if (errno == EINTR) continue;
-          if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          failedCapture = true; closeOutput(); stopChild(); break;
-        }
-      }
-      const pid_t waited = ::waitpid(pid, &status, WNOHANG);
-      if (waited == pid) { exited = true; break; }
-      if (waited < 0 && errno != EINTR) { failedCapture = true; closeOutput(); break; }
-      if (std::chrono::steady_clock::now() >= deadline)
-      {
-        failedCapture = true; closeOutput(); stopChild();
-        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
-        exited = true;
-        break;
-      }
-      if (!failedCapture && !outputClosed)
-      {
-        pollfd descriptor = {stdoutPipe[0], POLLIN | POLLHUP | POLLERR, 0};
-        (void)::poll(&descriptor, 1, 50);
-      }
-      else
-      {
-        ::usleep(1000);
-      }
-    }
-    if (!outputClosed && !failedCapture)
-    {
-      while (!outputClosed && std::chrono::steady_clock::now() < deadline)
-      {
-        uint8_t buffer[4096]; const ssize_t count = ::read(stdoutPipe[0], buffer, sizeof(buffer));
-        if (count > 0 && output->size() + uint64_t(count) <= 64 * 1024) { output->append(buffer, uint64_t(count)); continue; }
-        if (count == 0) { closeOutput(); break; }
-        if (count > 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) { output->clear(); failedCapture = true; closeOutput(); break; }
-        pollfd descriptor = {stdoutPipe[0], POLLIN | POLLHUP | POLLERR, 0}; (void)::poll(&descriptor, 1, 50);
-      }
-      if (!outputClosed) { failedCapture = true; closeOutput(); }
-    }
-    if (failedCapture)
-    {
-      if (failure) failure->assign("virtual datacenter provider output is unavailable or exceeds 64 KiB"_ctv);
-      return false;
-    }
+    if (!mothershipCaptureVirtualDatacenterProviderOutput(
+            stdoutPipe[0], pid, *output, failure, maximumOutputBytes,
+            timeoutMilliseconds, killProcessGroup, status)) return false;
   }
+
   if (WIFEXITED(status) == false || WEXITSTATUS(status) != 0)
   {
     if (failure)
@@ -4703,6 +4735,31 @@ static bool mothershipProbeVirtualDatacenterProvider(
   arguments.emplace_back();
   arguments.back().assignItoa(sourceMachineIndex);
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
+static bool mothershipProbeTrafficVirtualDatacenterProvider(
+    const MothershipProdigyCluster& cluster, const String& address, uint16_t port,
+    const String& payload, const String& expected, uint32_t requestTimeoutMs,
+    uint32_t sourceMachineIndex, uint32_t clients, uint32_t requestsPerClient,
+    uint32_t intervalMs, String& output, String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--probe-traffic"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot); arguments.push_back(address);
+  arguments.emplace_back(); arguments.back().assignItoa(port);
+  arguments.push_back(payload); arguments.push_back(expected);
+  for (uint64_t value : {uint64_t(requestTimeoutMs), uint64_t(sourceMachineIndex),
+                         uint64_t(clients), uint64_t(requestsPerClient), uint64_t(intervalMs)})
+  { arguments.emplace_back(); arguments.back().assignItoa(value); }
+  const uint64_t plannedWorkMs = intervalMs == 0 ?
+      uint64_t(requestsPerClient) * requestTimeoutMs :
+      uint64_t(requestsPerClient - 1) * intervalMs + requestTimeoutMs;
+  // Include the fixed 100ms common origin before the provider's cleanup allowance.
+  const uint64_t worstCaseMs = plannedWorkMs + 100;
+  // 60,000 JSON request receipts fit below this fixed capture cap. The provider
+  // emits each receipt as it completes and cannot outlive 20 minutes.
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), &output, failure,
+                                                 32 * 1024 * 1024, worstCaseMs + 10'000, true);
 }
 
 static bool mothershipParseUnsignedArgument(const char *text, uint64_t maximum, uint64_t& value)
@@ -11903,6 +11960,51 @@ private:
       exit(EXIT_FAILURE);
     }
     basics_log("probeTestCluster success=1 identity=%s address=%s port=%u\n", identity.c_str(), address.c_str(), unsigned(port));
+  }
+
+  void runProbeTestClusterTraffic(int argc, char *argv[])
+  {
+    if (argc != 10)
+    {
+      basics_log("wrong number of arguments. ex: probeTestClusterTraffic [name|clusterUUID] [address] [port] [payload] [expected] [requestTimeoutMs] [sourceMachineIndex: 0=datacenter] [clients] [requestsPerClient] [intervalMs]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}; identity.assign(argv[0]);
+    String failure = {}, address = {}, payload = {}, expected = {}, output = {};
+    MothershipProdigyCluster cluster = {};
+    if (loadClusterForScopedMutation("probeTestClusterTraffic", identity, cluster, failure) == false ||
+        cluster.deploymentMode != MothershipClusterDeploymentMode::test)
+    {
+      basics_log("probeTestClusterTraffic success=0 identity=%s failure=%s\n", identity.c_str(), failure.size() ? failure.c_str() : "probeTestClusterTraffic requires deploymentMode=test");
+      exit(EXIT_FAILURE);
+    }
+    address.assign(argv[1]); payload.assign(argv[3]); expected.assign(argv[4]);
+    uint8_t addressBytes[16] = {};
+    uint64_t port = 0, requestTimeoutMs = 0, sourceMachineIndex = 0, clients = 0, requestsPerClient = 0, intervalMs = 0;
+    const bool valid = (::inet_pton(AF_INET, address.c_str(), addressBytes) == 1 || ::inet_pton(AF_INET6, address.c_str(), addressBytes) == 1) &&
+        payload.size() <= 4096 && expected.size() <= 4096 &&
+        mothershipParseUnsignedArgument(argv[2], UINT16_MAX, port) && port != 0 &&
+        mothershipParseUnsignedArgument(argv[5], 5000, requestTimeoutMs) && requestTimeoutMs != 0 &&
+        mothershipParseUnsignedArgument(argv[6], cluster.test.machineCount, sourceMachineIndex) &&
+        mothershipParseUnsignedArgument(argv[7], 4, clients) && clients == 4 &&
+        mothershipParseUnsignedArgument(argv[8], 15000, requestsPerClient) && requestsPerClient != 0 &&
+        mothershipParseUnsignedArgument(argv[9], 1000, intervalMs) &&
+        clients * requestsPerClient <= 60000 &&
+        (intervalMs == 0 ? requestsPerClient * requestTimeoutMs :
+         (requestsPerClient - 1) * intervalMs + requestTimeoutMs) + 100 <= 1'201'000;
+    if (!valid)
+    {
+      basics_log("probeTestClusterTraffic success=0 identity=%s failure=invalid bounded traffic specification\n", identity.c_str());
+      exit(EXIT_FAILURE);
+    }
+    const bool succeeded = mothershipProbeTrafficVirtualDatacenterProvider(
+        cluster, address, uint16_t(port), payload, expected, uint32_t(requestTimeoutMs), uint32_t(sourceMachineIndex),
+        uint32_t(clients), uint32_t(requestsPerClient), uint32_t(intervalMs), output, &failure);
+    if (!output.empty()) std::fwrite(output.data(), 1, output.size(), stdout);
+    basics_log("probeTestClusterTraffic success=%u identity=%s attempts=%llu clients=%llu requestsPerClient=%llu intervalMs=%llu failure=%s\n",
+               unsigned(succeeded), identity.c_str(), (unsigned long long)(clients * requestsPerClient),
+               (unsigned long long)clients, (unsigned long long)requestsPerClient, (unsigned long long)intervalMs, failure.c_str());
+    if (!succeeded) exit(EXIT_FAILURE);
   }
 
   bool loadRemoteClusterMutationTarget(const char *operationName, const char *identityArg, MothershipProdigyCluster& controlCluster, String& failure)
@@ -21370,6 +21472,7 @@ public:
         {"printClusters",                   &Mothership::runPrintClusters                  },
         {"probePairBoundary",               &Mothership::runProbePairBoundary              },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
+        {"probeTestClusterTraffic",         &Mothership::runProbeTestClusterTraffic        },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
         {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
         {"pullProviderCredentials",         &Mothership::runPullProviderCredentials        },
@@ -21495,6 +21598,8 @@ int main(int argc, char *argv[])
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
+    message.append("probeTestClusterTraffic [name|clusterUUID] [address] [port] [payload] [expected] [requestTimeoutMs] [sourceMachineIndex] [clients] [requestsPerClient] [intervalMs]\n");
+    message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
     message.append("retireTestPairSource [operationID] (test migration; fresh whole destination readiness and source drain required)\n");
     message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] (test clusters only; target admission prerequisite)\n");
     message.append("admitTestPairTarget [operationID] [containerBlob] (resume the same durable target admission)\n");

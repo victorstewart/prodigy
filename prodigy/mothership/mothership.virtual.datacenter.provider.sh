@@ -506,6 +506,119 @@ fault_datacenter()
    return 1
 }
 
+
+probe_namespace_for_source()
+{
+   [[ "$#" -eq 2 ]] || return 2
+   local workspace="$1" source_index="$2" provider_pid="" runtime_identity="" namespace=""
+   valid_workspace "${workspace}" || return 2
+   provider_pid="$(<"${workspace}/virtual-datacenter.pid")"
+   provider_process "${provider_pid}" "${workspace}" || return 1
+   runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${provider_pid}")" || return 1
+   namespace="pvd-p-${runtime_identity}"
+   if [[ "${source_index}" != 0 ]]
+   then
+      local -a machine_pids=()
+      mapfile -t machine_pids < "${workspace}/virtual-datacenter.runtime"
+      [[ "${source_index}" =~ ^[0-9]+$ && "${source_index}" -ge 1 && "${source_index}" -le "${#machine_pids[@]}" ]] || return 2
+      namespace="pvd-m${source_index}-${runtime_identity}"
+   fi
+   printf '%s\n' "${provider_pid}" "${namespace}"
+}
+
+probe_traffic_datacenter()
+{
+   [[ "$#" -eq 10 && "${EUID}" -eq 0 ]] || return 2
+   local workspace="$1" address="$2" port="$3" payload="$4" expected="$5" request_timeout_ms="$6" source_index="$7" clients="$8" requests_per_client="$9" interval_ms="${10}"
+   [[ "${address}" =~ ^[0-9A-Fa-f:.]+$ && "${port}" =~ ^[0-9]+$ && "${port}" -ge 1 && "${port}" -le 65535 &&
+      "${request_timeout_ms}" =~ ^[0-9]+$ && "${request_timeout_ms}" -ge 1 && "${request_timeout_ms}" -le 5000 &&
+      "${clients}" == 4 && "${requests_per_client}" =~ ^[1-9][0-9]*$ && "${requests_per_client}" -le 15000 &&
+      "${interval_ms}" =~ ^[0-9]+$ && "${interval_ms}" -le 1000 ]] || return 2
+   local planned_work_ms=""
+   if (( interval_ms == 0 ))
+   then planned_work_ms=$(( requests_per_client * request_timeout_ms ))
+   else planned_work_ms=$(( (requests_per_client - 1) * interval_ms + request_timeout_ms ))
+   fi
+   local client_bound_ms=$(( planned_work_ms + 100 )) # fixed common worker origin
+   (( clients * requests_per_client <= 60000 && client_bound_ms <= 1201000 )) || return 2
+   [[ "${#payload}" -le 4096 && "${#expected}" -le 4096 ]] || return 2
+   command -v ip >/dev/null && command -v nsenter >/dev/null && command -v timeout >/dev/null && command -v python3 >/dev/null || return 1
+   local probe_namespace_output=""
+   probe_namespace_output="$(probe_namespace_for_source "${workspace}" "${source_index}")" || return $?
+   local -a probe_namespace=()
+   mapfile -t probe_namespace <<< "${probe_namespace_output}"
+   [[ "${#probe_namespace[@]}" -eq 2 ]] || return 1
+   local provider_pid="${probe_namespace[0]}" namespace="${probe_namespace[1]}"
+   local outer_timeout_ms=$(( client_bound_ms + 10000 )) timeout_seconds=""
+   printf -v timeout_seconds '%d.%03d' "$((outer_timeout_ms / 1000))" "$((outer_timeout_ms % 1000))"
+   nsenter -t "${provider_pid}" -m -- ip netns exec "${namespace}" timeout --foreground "${timeout_seconds}" python3 - \
+      "${address}" "${port}" "${payload}" "${expected}" "${request_timeout_ms}" "${clients}" "${requests_per_client}" "${interval_ms}" <<'PROBE_TRAFFIC'
+import json, socket, sys, threading, time
+address, port, payload, expected, timeout_ms, clients, per_client, interval_ms = sys.argv[1:]
+port=int(port); timeout_ns=int(timeout_ms)*1_000_000; clients=int(clients); per_client=int(per_client); interval_ms=int(interval_ms); interval_ns=interval_ms*1_000_000
+origin=time.monotonic_ns()+100_000_000
+results=[]; output_lock=threading.Lock()
+def close(sock):
+    if sock is not None:
+        try: sock.close()
+        except OSError: pass
+    return None
+def worker(client):
+    sock=None; connection=0; buffer=b''
+    for sequence in range(per_client):
+        scheduled=origin + sequence*interval_ns
+        remaining=scheduled-time.monotonic_ns()
+        if remaining > 0: time.sleep(remaining/1e9)
+        start=time.monotonic_ns(); deadline=(scheduled+timeout_ns) if interval_ns else (start+timeout_ns); success=False; outcome='connect'
+        try:
+            if sock is None:
+                remaining=(deadline-time.monotonic_ns())/1e9
+                if remaining <= 0: raise socket.timeout()
+                sock=socket.create_connection((address,port), remaining); connection+=1; buffer=b''
+            while True:
+                remaining=(deadline-time.monotonic_ns())/1e9
+                if remaining <= 0: raise socket.timeout()
+                sock.settimeout(remaining)
+                sock.sendall((payload+'\n').encode())
+                break
+            while b'\n' not in buffer:
+                if len(buffer) >= 4096:
+                    outcome='response'; raise ValueError()
+                remaining=(deadline-time.monotonic_ns())/1e9
+                if remaining <= 0: raise socket.timeout()
+                sock.settimeout(remaining)
+                chunk=sock.recv(min(4096-len(buffer),4096))
+                if not chunk: raise EOFError()
+                buffer+=chunk
+            line,buffer=buffer.split(b'\n',1)
+            if line.decode(errors='replace') == expected: success=True; outcome='pong'
+            else: outcome='unexpected'; sock=close(sock); buffer=b''
+        except socket.timeout:
+            outcome='timeout'; sock=close(sock); buffer=b''
+        except EOFError:
+            outcome='eof'; sock=close(sock); buffer=b''
+        except ValueError:
+            sock=close(sock); buffer=b''
+        except OSError:
+            outcome='connect' if sock is None else 'write'; sock=close(sock); buffer=b''
+        end=time.monotonic_ns()
+        item={'type':'request','client':client,'sequence':sequence,'scheduledNs':scheduled,'startNs':start,'endNs':end,
+              'latencyNs':end-start,'success':success,'outcome':outcome,'connection':connection}
+        with output_lock:
+            results.append(item)
+            print(json.dumps(item,separators=(',',':')), flush=True)
+    close(sock)
+threads=[threading.Thread(target=worker,args=(client,)) for client in range(clients)]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+successes=sum(item['success'] for item in results)
+print(json.dumps({'type':'summary','summary':True,'clients':clients,'requestsPerClient':per_client,'attempts':len(results),
+                  'successes':successes,'failures':len(results)-successes,'intervalMs':interval_ms},separators=(',',':')), flush=True)
+sys.exit(0 if len(results)==clients*per_client and successes==len(results) else 1)
+PROBE_TRAFFIC
+}
+
+
 probe_datacenter()
 {
    [[ "$#" -eq 7 && "${EUID}" -eq 0 ]] || return 2
@@ -1647,6 +1760,11 @@ case "${1:-}" in
    --probe)
       shift
       probe_datacenter "$@"
+      exit
+      ;;
+   --probe-traffic)
+      shift
+      probe_traffic_datacenter "$@"
       exit
       ;;
    --serve-adopt)
