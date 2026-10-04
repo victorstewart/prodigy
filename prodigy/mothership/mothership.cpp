@@ -62,6 +62,7 @@
 #include <prodigy/mothership/mothership.gcp.host.operations.h>
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
+#include <prodigy/mothership/mothership.additional.ingress.retire.h>
 #include <prodigy/types.h>
 #include <switchboard/host.tcx.retention.h>
 
@@ -7891,6 +7892,36 @@ private:
     String payload = {}; BitseryEngine::serialize(payload, inventory);
     String encoded = {}; Base64::encode(payload.data(), payload.size(), encoded);
     basics_log("offlineDNSCleanupInventory success=1 payload=%s\n", encoded.c_str());
+  }
+
+  // This is intentionally a local, explicitly witnessed repair command.  The
+  // caller's guarded SSH transport selects the registered machine; the command
+  // itself cannot select a host or discover an attachment to remove.
+  void runRetireAdditionalIngressLocal(int argc, char *argv[])
+  {
+    if (argc != 8)
+    {
+      basics_log("retireAdditionalIngressLocal requires bootID interface ifindex programID tag mapCount localSubnetMapID subnet\n");
+      exit(EXIT_FAILURE);
+    }
+    MothershipAdditionalIngressRetirement request = {};
+    request.bootID.assign(argv[0]); request.interfaceName.assign(argv[1]);
+    uint64_t value = 0;
+    const bool valid = mothershipParseUnsignedArgument(argv[2], UINT32_MAX, value) && (request.ifindex = uint32_t(value)) != 0 &&
+        mothershipParseUnsignedArgument(argv[3], UINT32_MAX, value) && (request.programID = uint32_t(value)) != 0 &&
+        mothershipAdditionalIngressRetirementHex(argv[4], request.tag, sizeof(request.tag)) &&
+        mothershipParseUnsignedArgument(argv[5], UINT32_MAX, value) && (request.mapCount = uint32_t(value)) != 0 &&
+        mothershipParseUnsignedArgument(argv[6], UINT32_MAX, value) && (request.localSubnetMapID = uint32_t(value)) != 0 &&
+        mothershipAdditionalIngressRetirementHex(argv[7], request.subnet, sizeof(request.subnet));
+    String failure = {};
+    if (!valid || !mothershipRetireAdditionalIngressLocal(request, &failure))
+    {
+      basics_log("retireAdditionalIngressLocal success=0 failure=%s\n", failure.size() ? failure.c_str() : "invalid arguments");
+      exit(EXIT_FAILURE);
+    }
+    basics_log("retireAdditionalIngressLocal success=1 bootID=%s interface=%s ifindex=%u programID=%u tag=%s mapCount=%u localSubnetMapID=%u subnet=%s\n",
+               request.bootID.c_str(), request.interfaceName.c_str(), request.ifindex, request.programID,
+               argv[4], request.mapCount, request.localSubnetMapID, argv[7]);
   }
 
   bool stopAndWipeLocalProdigyInstance(const MothershipProdigyCluster& cluster, String& failure)
@@ -18969,10 +19000,21 @@ private:
 
   void runUpdateProdigy(int argc, char *argv[])
   {
-    if (argc != 3)
+    uint8_t brainConcurrency = 0;
+    if (argc != 3 && argc != 5)
     {
-      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
+      basics_log("usage: updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2]\n");
       exit(EXIT_FAILURE);
+    }
+    if (argc == 5)
+    {
+      if (std::strcmp(argv[3], "--brain-concurrency") != 0 ||
+          (std::strcmp(argv[4], "1") != 0 && std::strcmp(argv[4], "2") != 0))
+      {
+        basics_log("updateProdigy requires --brain-concurrency 1 or 2\n");
+        exit(EXIT_FAILURE);
+      }
+      brainConcurrency = uint8_t(argv[4][0] - '0');
     }
 
     String inputPath = {}, operationText = {};
@@ -19129,6 +19171,8 @@ private:
     request.nonce = report.observationNonce;
     request.requiredStagingBytes = observationRequest.requiredStagingBytes;
     request.requiresEmptyWorkloadSet = input.emptyIsolatedTestCluster;
+    request.version = brainConcurrency == 0 ? 1 : 2;
+    request.brainConcurrency = brainConcurrency;
     String serializedRequest = {};
     BitseryEngine::serialize(serializedRequest, request);
     if (socket.connect() != 0)
@@ -19163,8 +19207,9 @@ private:
       socket.close(); basics_log("updateProdigy success=0 failure=%s\n", response.failure.empty() ? "admitted update rejected" : response.failure.c_str());
       exit(EXIT_FAILURE);
     }
-    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s\n",
-               size_t(targetBundleBytes.size()), approvedBundle.bundleSHA256.c_str(), operationText.c_str());
+    basics_log("updateProdigy success=1 staged=1 bytes=%zu sha256=%s operationID=%s brainConcurrency=%u\n",
+               size_t(targetBundleBytes.size()), approvedBundle.bundleSHA256.c_str(), operationText.c_str(),
+               unsigned(brainConcurrency == 0 ? 1 : brainConcurrency));
     socket.close();
   }
 
@@ -21488,6 +21533,7 @@ public:
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
@@ -21618,6 +21664,8 @@ int main(int argc, char *argv[])
     message.append("\tremote clusters only; removes one machine schema budget row by schema and reconciles any excess created machines away\n");
     message.append("removeCluster [name|clusterUUID]\n");
     message.append("\tremoves one managed Prodigy cluster record\n");
+    message.append("retireAdditionalIngressLocal [bootID] [interface] [ifindex] [programID] [tagHex] [mapCount] [localSubnetMapID] [subnetHex]\n");
+    message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
@@ -21634,7 +21682,7 @@ int main(int argc, char *argv[])
     message.append("\tfetches a retained task execution report\n");
     message.append("planUpgrade [target] [approved target bundle] [approved source bundle] [operationID canonical hex]\n");
     message.append("\treads a versioned Brain admission report and records an immutable no-dispatch compatibility decision\n");
-    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex]\n");
+    message.append("updateProdigy [target: local|clusterName|clusterUUID] [approved bundle] [operationID canonical hex] [--brain-concurrency 1|2]\n");
     message.append("\tdispatches only an approved retained snapshot through the typed Brain-side operation binding\n");
     message.append("inspectUpgradeBundle [path to prodigy binary or bundle]\n");
     message.append("\tread-only: verifies the approved flat bundle and prints its embedded upgrade compatibility policy\n");

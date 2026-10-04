@@ -687,6 +687,25 @@ public:
   ProdigyMasterAuthorityRuntimeState state;
 };
 
+// Both parent histories wrote version six, but assigned it different tails.
+// Keep byte-exact fixtures here so the merged reader cannot accidentally start
+// accepting either dialect based on its payload contents.
+class DivergentMainV6RuntimeStateWire {
+public:
+  ProdigyMasterAuthorityRuntimeState state;
+};
+
+class P6PlacementV6RuntimeStateWire {
+public:
+  ProdigyMasterAuthorityRuntimeState state;
+};
+
+class P6RuntimeStateWire {
+public:
+  uint64_t version = 7;
+  ProdigyMasterAuthorityRuntimeState state;
+};
+
 class LegacyPersistentMasterAuthorityPackageWire {
 public:
   ProdigyPersistentMasterAuthorityPackage package;
@@ -724,6 +743,37 @@ static void serializeLegacyRuntimeStateFields(S&& serializer, ProdigyMasterAutho
 }
 
 template <typename S>
+static void serializeVersionFourRuntimeStateFields(S&& serializer, ProdigyMasterAuthorityRuntimeState& state)
+{
+  serializer.value8b(state.generation);
+  serializer.value1b(state.hasCompletedInitialMasterElection);
+  serializer.object(state.transportTLSAuthority);
+  serializer.value8b(state.nextMintedClientTlsGeneration);
+  serializer.value8b(state.nextTlsResumptionGeneration);
+  serializer.value8b(state.nextPendingAddMachinesOperationID);
+  serializer.value8b(state.nextPendingElasticAddressOperationID);
+  serializer.value8b(state.nextDNSIntentRevision);
+  serializer.object(state.tlsResumptionSnapshotsByWormhole);
+  serializer.object(state.pendingAddMachinesOperations);
+  serializer.object(state.pendingAutonomousProvisioningOperations);
+  serializer.object(state.pendingElasticAddressAssignments);
+  serializer.object(state.pendingElasticAddressReleases);
+  serializer.object(state.statefulWorkerTopologyUpgradeOperations);
+  serializer.object(state.deferredStatefulScaleIntents);
+  serializer.object(state.materializedStatefulRecoveryOperations);
+  serializer.object(state.apiCredentialExpiryNotices);
+  serializer.object(state.materializedStatefulRecoveryRetries);
+  serializer.object(state.machineSchemas);
+  serializer.object(state.routableResourceLeases);
+  serializer.object(state.publicTlsCertificates);
+  serializer.object(state.privateTlsVaultLifecycles);
+  serializer.object(state.taskExecutions);
+  serializer.object(state.mothershipTunnelProviderDesiredState);
+  serializer.object(state.updateSelf);
+  serializer.object(state.updateSelf.machineRecoveryWitnesses);
+}
+
+template <typename S>
 static void serialize(S&& serializer, LegacyRuntimeStateWire& wire)
 {
   serializeLegacyRuntimeStateFields<false>(serializer, wire.state);
@@ -738,6 +788,49 @@ static void serialize(S&& serializer, VersionOneRuntimeStateWire& wire)
   serializer.value8b(marker);
   serializer.value8b(version);
   serializeLegacyRuntimeStateFields<true>(serializer, wire.state);
+}
+
+template <typename S>
+static void serialize(S&& serializer, DivergentMainV6RuntimeStateWire& wire)
+{
+  constexpr uint64_t versionMarker = UINT64_MAX;
+  uint64_t marker = versionMarker;
+  uint64_t version = 6;
+  bool hasContainerRuntimeStates = false;
+  serializer.value8b(marker);
+  serializer.value8b(version);
+  serializer.value1b(hasContainerRuntimeStates);
+  serializeVersionFourRuntimeStateFields(serializer, wire.state);
+  serializer.value1b(wire.state.updateSelfFollowerConcurrency);
+  serializer.object(wire.state.updateSelfFollowerTransitionIssuedPeerKeys);
+  serializer.object(wire.state.updateSelfFollowerReadyPeerKeys);
+}
+
+template <typename S>
+static void serialize(S&& serializer, P6PlacementV6RuntimeStateWire& wire)
+{
+  constexpr uint64_t versionMarker = UINT64_MAX;
+  uint64_t marker = versionMarker;
+  uint64_t version = 6;
+  serializer.value8b(marker);
+  serializer.value8b(version);
+  serializeVersionFourRuntimeStateFields(serializer, wire.state);
+  serializer.container(wire.state.deploymentPlacementPolicies, 4096);
+}
+
+// Frozen standalone P6 framing: no container-presence byte precedes generation.
+// Package framing derives its container slots from the enclosing package type.
+template <typename S>
+static void serialize(S&& serializer, P6RuntimeStateWire& wire)
+{
+  uint64_t marker = UINT64_MAX;
+  serializer.value8b(marker);
+  serializer.value8b(wire.version);
+  serializeVersionFourRuntimeStateFields(serializer, wire.state);
+  serializer.container(wire.state.deploymentPlacementPolicies, 4096);
+  serializer.container(wire.state.statefulServingAuthorities, 4096);
+  if (wire.version >= 8)
+    serializer.container(wire.state.statelessDeploymentAdmissions, 4096);
 }
 
 template <typename S>
@@ -924,15 +1017,67 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
   suite.expect(prodigyDeploymentPlacementPolicyValid(placement),
                "deployment_placement_policy_accepts_canonical_sorted_record");
   v5Package.runtimeState.deploymentPlacementPolicies.push_back(placement);
-  String v6PackageBytes = {};
-  BitseryEngine::serialize(v6PackageBytes, v5Package);
-  ProdigyPersistentMasterAuthorityPackage v6Decoded = {};
-  suite.expect(BitseryEngine::deserializeSafe(v6PackageBytes, v6Decoded) &&
-                   v6Decoded.runtimeState.deploymentPlacementPolicies.size() == 1 &&
-                   prodigyDeploymentPlacementPolicyValid(v6Decoded.runtimeState.deploymentPlacementPolicies[0]) &&
-                   v6Decoded.runtimeState.deploymentPlacementPolicies[0].operationID.equals(placement.operationID) &&
-                   v6Decoded.containerRuntimeStates.size() == 1,
-               "persistent_master_authority_package_roundtrips_v6_placement_policy");
+  String v7PackageBytes = {};
+  BitseryEngine::serialize(v7PackageBytes, v5Package);
+  ProdigyPersistentMasterAuthorityPackage v7Decoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(v7PackageBytes, v7Decoded) &&
+                   v7Decoded.runtimeState.deploymentPlacementPolicies.size() == 1 &&
+                   prodigyDeploymentPlacementPolicyValid(v7Decoded.runtimeState.deploymentPlacementPolicies[0]) &&
+                   v7Decoded.runtimeState.deploymentPlacementPolicies[0].operationID.equals(placement.operationID) &&
+                   v7Decoded.runtimeState.statefulServingAuthorities.empty() &&
+                   v7Decoded.containerRuntimeStates.size() == 1,
+               "persistent_master_authority_package_promotes_placement_only_to_v7");
+  ProdigyMasterAuthorityRuntimeState placementOnly = {};
+  placementOnly.deploymentPlacementPolicies.push_back(placement);
+  String placementOnlyBytes = {};
+  BitseryEngine::serialize(placementOnlyBytes, placementOnly);
+  uint64_t placementOnlyMarker = 0, placementOnlyVersion = 0;
+  if (placementOnlyBytes.size() >= sizeof(placementOnlyMarker) + sizeof(placementOnlyVersion))
+  {
+    memcpy(&placementOnlyMarker, placementOnlyBytes.data(), sizeof(placementOnlyMarker));
+    memcpy(&placementOnlyVersion, placementOnlyBytes.data() + sizeof(placementOnlyMarker), sizeof(placementOnlyVersion));
+  }
+  suite.expect(placementOnlyMarker == UINT64_MAX && placementOnlyVersion == 7,
+               "placement_only_runtime_state_never_emits_rejected_v6_layout");
+
+  for (uint64_t p6Version : {uint64_t(7), uint64_t(8)})
+  {
+    P6RuntimeStateWire p6 = {};
+    p6.version = p6Version;
+    p6.state = placementOnly;
+    p6.state.generation = 0x12345678;
+    String p6Bytes = {};
+    BitseryEngine::serialize(p6Bytes, p6);
+    ProdigyMasterAuthorityRuntimeState p6Decoded = {};
+    suite.expect(BitseryEngine::deserializeSafe(p6Bytes, p6Decoded) && p6Decoded == p6.state,
+                 "merged_runtime_reader_preserves_frozen_p6_v7_v8_framing");
+    if (p6Version == 7)
+    {
+      String mergedBytes = {};
+      BitseryEngine::serialize(mergedBytes, p6.state);
+      suite.expect(mergedBytes.equals(p6Bytes), "merged_v7_writer_preserves_frozen_p6_bytes");
+    }
+  }
+
+  DivergentMainV6RuntimeStateWire mainV6 = {};
+  mainV6.state.generation = 24;
+  mainV6.state.updateSelfFollowerConcurrency = ProdigyUpdateSelfMinimumConcurrency;
+  mainV6.state.updateSelfFollowerTransitionIssuedPeerKeys.push_back(uint128_t(0x101));
+  mainV6.state.updateSelfFollowerReadyPeerKeys.push_back(uint128_t(0x202));
+  String mainV6Bytes = {};
+  BitseryEngine::serialize(mainV6Bytes, mainV6);
+  ProdigyMasterAuthorityRuntimeState rejectedV6 = {};
+  suite.expect(BitseryEngine::deserializeSafe(mainV6Bytes, rejectedV6) == false,
+               "master_authority_runtime_state_rejects_divergent_main_v6_concurrency_fixture");
+
+  P6PlacementV6RuntimeStateWire p6V6 = {};
+  p6V6.state.generation = 24;
+  p6V6.state.deploymentPlacementPolicies.push_back(placement);
+  String p6V6Bytes = {};
+  BitseryEngine::serialize(p6V6Bytes, p6V6);
+  rejectedV6 = {};
+  suite.expect(BitseryEngine::deserializeSafe(p6V6Bytes, rejectedV6) == false,
+               "master_authority_runtime_state_rejects_p6_placement_v6_fixture");
 
   String truncated = bothBytes;
   truncated.resize(8);
@@ -941,7 +1086,7 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                "master_authority_runtime_state_rejects_truncated_version_marker");
 
   String unknownVersion = bothBytes;
-  uint64_t unsupportedVersion = 7;
+  uint64_t unsupportedVersion = 10;
   memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,
@@ -1552,6 +1697,12 @@ int main(void)
   followerBoot.bootNs = 444;
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerBootNsByPeerKey.push_back(followerBoot);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.followerRebootedPeerKeys.push_back(storedLocalBrainState.uuid + 6);
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerConcurrency =
+      ProdigyUpdateSelfMinimumConcurrency;
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.push_back(
+      storedLocalBrainState.uuid + 5);
+  storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys.push_back(
+      storedLocalBrainState.uuid + 6);
   storedSnapshot.masterAuthority.runtimeState.updateSelf.localMachineUUID = storedLocalBrainState.uuid;
   NeuronContainerBootstrap retainedBootstrap = {};
   retainedBootstrap.plan.uuid = 0x901234;
@@ -1681,6 +1832,58 @@ int main(void)
   }
   storedSnapshot.masterAuthority.runtimeState.statefulServingAuthorities.push_back(
       std::move(servingAuthority));
+  ProdigyDeploymentPlacementPolicy persistedPlacement = {};
+  persistedPlacement.applicationID = storedPlan.config.applicationID;
+  persistedPlacement.versionID = storedPlan.config.versionID;
+  persistedPlacement.operationID.assign("00000000-0000-4000-8000-000000000901"_ctv);
+  persistedPlacement.eligibleMachineUUIDs.push_back(runtimeContainerState.machineUUID);
+  persistedPlacement.eligibleMachineUUIDs.push_back(servingRuntimeState.machineUUID);
+  suite.expect(prodigyDeploymentPlacementPolicyValid(persistedPlacement),
+               "persistent_snapshot_builds_valid_p6_placement_tail");
+  storedSnapshot.masterAuthority.runtimeState.deploymentPlacementPolicies.push_back(persistedPlacement);
+  DeploymentPlan persistedAdmissionPlan = {};
+  persistedAdmissionPlan.config.type = ApplicationType::stateless;
+  persistedAdmissionPlan.config.applicationID = uint16_t(applicationID + 1);
+  persistedAdmissionPlan.config.versionID = 78;
+  persistedAdmissionPlan.config.containerBlobSHA256.assign(
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv);
+  persistedAdmissionPlan.config.containerBlobBytes = 4096;
+  persistedAdmissionPlan.isStateful = false;
+  persistedAdmissionPlan.stateless.nBase = 1;
+  persistedAdmissionPlan.hasApiCredentialPolicy = true;
+  persistedAdmissionPlan.apiCredentialPolicy.applicationID = persistedAdmissionPlan.config.applicationID;
+  Wormhole persistedAdmissionEndpoint = {};
+  persistedAdmissionEndpoint.source = ExternalAddressSource::registeredRoutablePrefix;
+  persistedAdmissionEndpoint.routablePrefixUUID = uint128_t(0x901241);
+  persistedAdmissionEndpoint.layer4 = IPPROTO_TCP;
+  persistedAdmissionEndpoint.externalPort = 443;
+  persistedAdmissionEndpoint.containerPort = 8443;
+  persistedAdmissionPlan.wormholes.push_back(persistedAdmissionEndpoint);
+  suite.expect(prodigyStatelessDeploymentAdmissionPlanEligible(persistedAdmissionPlan),
+               "persistent_snapshot_builds_valid_p6_admission_plan");
+  String persistedAdmissionPlanBytes = {}, persistedAdmissionPlanSHA256 = {}, persistedAdmissionHashFailure = {};
+  BitseryEngine::serialize(persistedAdmissionPlanBytes, persistedAdmissionPlan);
+  suite.expect(prodigyComputeSHA256Hex(
+                   persistedAdmissionPlanBytes, persistedAdmissionPlanSHA256, &persistedAdmissionHashFailure),
+               "persistent_snapshot_hashes_p6_admission_plan");
+  storedSnapshot.masterAuthority.deploymentPlans.insert_or_assign(
+      persistedAdmissionPlan.config.deploymentID(), persistedAdmissionPlan);
+  ProdigyStatelessDeploymentAdmission persistedAdmission = {};
+  persistedAdmission.operationID = uint128_t(0x901240);
+  persistedAdmission.clusterUUID = storedSnapshot.brainConfig.clusterUUID;
+  persistedAdmission.deploymentID = persistedAdmissionPlan.config.deploymentID();
+  persistedAdmission.applicationID = persistedAdmissionPlan.config.applicationID;
+  persistedAdmission.versionID = persistedAdmissionPlan.config.versionID;
+  persistedAdmission.requestPlanSHA256.assign(persistedAdmissionPlanSHA256);
+  persistedAdmission.normalizedPlanSHA256.assign(persistedAdmissionPlanSHA256);
+  persistedAdmission.artifactSHA256.assign(persistedAdmissionPlan.config.containerBlobSHA256);
+  persistedAdmission.artifactBytes = persistedAdmissionPlan.config.containerBlobBytes;
+  persistedAdmission.acceptedAuthorityGeneration = storedSnapshot.masterAuthority.runtimeState.generation;
+  persistedAdmission.acceptedMasterUUID = storedLocalBrainState.uuid;
+  persistedAdmission.acceptedMasterBootNs = 91;
+  suite.expect(prodigyStatelessDeploymentAdmissionValid(persistedAdmission),
+               "persistent_snapshot_builds_valid_p6_admission_tail");
+  storedSnapshot.masterAuthority.runtimeState.statelessDeploymentAdmissions.push_back(persistedAdmission);
   for (uint128_t machineUUID : {uint128_t(0x901001), uint128_t(0x901002), uint128_t(0x901003)})
   {
     ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
@@ -2819,9 +3022,29 @@ int main(void)
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps,
                  "load_snapshot_restores_exact_private_inventory");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerConcurrency ==
+                ProdigyUpdateSelfMinimumConcurrency &&
+            loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys ==
+                storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys &&
+            loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys ==
+                storedSnapshot.masterAuthority.runtimeState.updateSelfFollowerReadyPeerKeys,
+        "load_snapshot_restores_serial_update_follower_progress");
     suite.expect(loadedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses ==
                      storedSnapshot.masterAuthority.runtimeState.updateSelf.machineRecoveryWitnesses,
                  "load_snapshot_restores_all_machine_private_inventory");
+    suite.expect(
+        loadedSnapshot.masterAuthority.runtimeState.deploymentPlacementPolicies.size() == 1 &&
+            loadedSnapshot.masterAuthority.runtimeState.deploymentPlacementPolicies[0].operationID.equals(
+                persistedPlacement.operationID) &&
+            loadedSnapshot.masterAuthority.runtimeState.statefulServingAuthorities.size() == 1 &&
+            loadedSnapshot.masterAuthority.runtimeState.statelessDeploymentAdmissions.size() == 1 &&
+            prodigyStatelessDeploymentAdmissionEqual(
+                loadedSnapshot.masterAuthority.runtimeState.statelessDeploymentAdmissions[0], persistedAdmission) &&
+            loadedSnapshot.masterAuthority.runtimeState.taskExecutions.contains(retirementCarrier.executionID) &&
+            loadedSnapshot.masterAuthority.runtimeState.updateSelfFollowerConcurrency ==
+                ProdigyUpdateSelfMinimumConcurrency,
+        "load_snapshot_roundtrips_v9_p6_retirement_placement_serving_admission_and_concurrency_tails");
     suite.expect(
         loadedSnapshot.masterAuthority.containerRuntimeStates.size() == 1 &&
             prodigyPersistentContainerRuntimeStateEqual(

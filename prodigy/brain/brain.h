@@ -1223,7 +1223,14 @@ public:
   bytell_hash_map<uint128_t, int64_t> updateSelfFollowerBootNsByPeerKey;
   bytell_hash_set<uint128_t> updateSelfFollowerReconnectedPeerKeys;
   bytell_hash_set<uint128_t> updateSelfFollowerRebootedPeerKeys;
+  // Zero preserves the legacy all-follower transition. Explicit requests use
+  // one or two and do not free a slot until this peer is fully recovered.
+  uint8_t updateSelfFollowerConcurrency = 0;
   bytell_hash_set<uint128_t> updateSelfTransitionIssuedPeerKeys;
+  bytell_hash_set<uint128_t> updateSelfFollowerReadyPeerKeys;
+  // Delivery is connection-local. The durable issued set is replayed after a
+  // coordinator restart or a lost peer transport without opening another slot.
+  bytell_hash_set<uint128_t> updateSelfTransitionSentPeerKeys;
   bytell_hash_set<uint128_t> updateSelfRelinquishIssuedPeerKeys;
   String updateSelfWorkerExpectedBundleSHA256;
   String updateSelfWorkerFailure;
@@ -1539,6 +1546,8 @@ public:
     uint32_t requiredContainerRetirementJournalVersion = 0;
     uint32_t targetContainerRetirementJournalVersion = 0;
     String admittedTargetContractSHA256 = {};
+    bool hasExplicitFollowerConcurrency = false;
+    uint8_t requestedFollowerConcurrency = 0;
     Phase phase = Phase::preparing;
   };
 
@@ -2284,6 +2293,47 @@ public:
     updateSelfMachineRecoveryWitnesses = state.machineRecoveryWitnesses;
   }
 
+  void restoreUpdateSelfFollowerConcurrencyState(
+      const ProdigyMasterAuthorityRuntimeState& state)
+  {
+    updateSelfFollowerConcurrency = state.updateSelfFollowerConcurrency;
+    updateSelfTransitionIssuedPeerKeys.clear();
+    updateSelfFollowerReadyPeerKeys.clear();
+    updateSelfTransitionSentPeerKeys.clear();
+    for (uint128_t peerKey : state.updateSelfFollowerTransitionIssuedPeerKeys)
+    {
+      updateSelfTransitionIssuedPeerKeys.insert(peerKey);
+    }
+    for (uint128_t peerKey : state.updateSelfFollowerReadyPeerKeys)
+    {
+      updateSelfFollowerReadyPeerKeys.insert(peerKey);
+    }
+  }
+
+  bool configureUpdateSelfFollowerConcurrency(uint8_t concurrency, String *failure = nullptr)
+  {
+    if (failure != nullptr) failure->clear();
+    if (concurrency < ProdigyUpdateSelfMinimumConcurrency ||
+        concurrency > ProdigyUpdateSelfMaximumConcurrency)
+    {
+      if (failure != nullptr) failure->assign("brain concurrency must be 1 or 2"_ctv);
+      return false;
+    }
+    const bool coordinatorActive =
+        updateSelfState != UpdateSelfState::idle ||
+        (updateSelfWorkerMachineUUIDs.empty() == false &&
+         updateSelfWorkerStateUploadedMachineUUIDs.size() != updateSelfWorkerMachineUUIDs.size()) ||
+        updateSelfMachineRecoveryWitnesses.empty() == false || updateSelfLocalMachineUUID != 0;
+    if (coordinatorActive)
+    {
+      if (updateSelfFollowerConcurrency == concurrency) return true;
+      if (failure != nullptr) failure->assign("bundle upgrade already has a different brain concurrency"_ctv);
+      return false;
+    }
+    updateSelfFollowerConcurrency = concurrency;
+    return true;
+  }
+
   ProdigyPersistentUpdateSelfMachineRecoveryWitness *findUpdateSelfMachineRecoveryWitness(uint128_t machineUUID)
   {
     for (auto& witness : updateSelfMachineRecoveryWitnesses)
@@ -2497,6 +2547,15 @@ public:
     masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
     masterAuthorityRuntimeState.mothershipTunnelProviderDesiredState = {mothershipConnectivity, mothershipTunnelGatewayAuth};
     masterAuthorityRuntimeState.updateSelf = capturePersistentUpdateSelfState();
+    masterAuthorityRuntimeState.updateSelfFollowerConcurrency = updateSelfFollowerConcurrency;
+    masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys.assign(
+        updateSelfTransitionIssuedPeerKeys.begin(), updateSelfTransitionIssuedPeerKeys.end());
+    masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys.assign(
+        updateSelfFollowerReadyPeerKeys.begin(), updateSelfFollowerReadyPeerKeys.end());
+    std::sort(masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys.begin(),
+              masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys.end());
+    std::sort(masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys.begin(),
+              masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys.end());
   }
 
   void noteStatefulWorkerTopologyUpgradeRuntimeStateChanged(void) override
@@ -6505,6 +6564,9 @@ public:
     if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
           transition.servingRuntimeStates, transition.runtimeState.generation)) return false;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
+    transition.runtimeState.updateSelfFollowerConcurrency = 0;
+    transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    transition.runtimeState.updateSelfFollowerReadyPeerKeys.clear();
     ownBrainConfig(brainConfig, transition.brainConfig);
     BitseryEngine::serialize(serialized, transition);
     return prodigyComputeSHA256Hex(serialized, digest);
@@ -8307,6 +8369,15 @@ public:
     package.runtimeState.nextTlsResumptionGeneration = (nextTlsResumptionGeneration == 0) ? 1 : nextTlsResumptionGeneration;
     package.runtimeState.tlsResumptionSnapshotsByWormhole = captureTlsResumptionSnapshotsByWormhole();
     package.runtimeState.updateSelf = capturePersistentUpdateSelfState();
+    package.runtimeState.updateSelfFollowerConcurrency = updateSelfFollowerConcurrency;
+    package.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.assign(
+        updateSelfTransitionIssuedPeerKeys.begin(), updateSelfTransitionIssuedPeerKeys.end());
+    package.runtimeState.updateSelfFollowerReadyPeerKeys.assign(
+        updateSelfFollowerReadyPeerKeys.begin(), updateSelfFollowerReadyPeerKeys.end());
+    std::sort(package.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.begin(),
+              package.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.end());
+    std::sort(package.runtimeState.updateSelfFollowerReadyPeerKeys.begin(),
+              package.runtimeState.updateSelfFollowerReadyPeerKeys.end());
 
     // A Neuron process can outlive a Brain restart.  Capture the canonical
     // launch record before its state upload becomes the only recovery source:
@@ -8450,6 +8521,7 @@ public:
                                       : masterAuthorityRuntimeState.nextTlsResumptionGeneration;
     restoreTlsResumptionSnapshotsByWormhole(masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole, false);
     restorePersistentUpdateSelfState(masterAuthorityRuntimeState.updateSelf);
+    restoreUpdateSelfFollowerConcurrencyState(masterAuthorityRuntimeState);
     restoreMothershipTunnelProviderDesiredStateFromMasterAuthority();
     syncManagedMachineSchemaConfigs(previousSchemas, masterAuthorityRuntimeState.machineSchemas);
     (void)quarantinePendingElasticAddressReleasePrefixes(masterAuthorityRuntimeState);
@@ -8635,6 +8707,15 @@ public:
     // witness. A successor also durably retains that witness. Do not replicate
     // coordinator echos, peer state, or the bundle payload.
     sanitizedIncoming.updateSelf = localUpdateCoordinator;
+    sanitizedIncoming.updateSelfFollowerConcurrency = updateSelfFollowerConcurrency;
+    sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.assign(
+        updateSelfTransitionIssuedPeerKeys.begin(), updateSelfTransitionIssuedPeerKeys.end());
+    sanitizedIncoming.updateSelfFollowerReadyPeerKeys.assign(
+        updateSelfFollowerReadyPeerKeys.begin(), updateSelfFollowerReadyPeerKeys.end());
+    std::sort(sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.begin(),
+              sanitizedIncoming.updateSelfFollowerTransitionIssuedPeerKeys.end());
+    std::sort(sanitizedIncoming.updateSelfFollowerReadyPeerKeys.begin(),
+              sanitizedIncoming.updateSelfFollowerReadyPeerKeys.end());
     ProdigyMachineRetirementJournal retirementJournal = {};
     if (decodeMachineRetirementJournal(sanitizedIncoming, retirementJournal) == false)
     {
@@ -8660,8 +8741,14 @@ public:
 
     ProdigyMasterAuthorityRuntimeState comparableIncoming = sanitizedIncoming;
     comparableIncoming.updateSelf = {};
+    comparableIncoming.updateSelfFollowerConcurrency = 0;
+    comparableIncoming.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    comparableIncoming.updateSelfFollowerReadyPeerKeys.clear();
     ProdigyMasterAuthorityRuntimeState comparableCurrent = masterAuthorityRuntimeState;
     comparableCurrent.updateSelf = {};
+    comparableCurrent.updateSelfFollowerConcurrency = 0;
+    comparableCurrent.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    comparableCurrent.updateSelfFollowerReadyPeerKeys.clear();
 
     const bool shouldApply = sanitizedIncoming.generation > masterAuthorityRuntimeState.generation;
 
@@ -8722,6 +8809,7 @@ public:
          durableMasterAuthorityRuntimeStateGeneration != sanitizedIncoming.generation))
     {
       restorePersistentUpdateSelfState(localUpdateCoordinator);
+      restoreUpdateSelfFollowerConcurrencyState(sanitizedIncoming);
       masterAuthorityRuntimeStateDurable = persistLocalRuntimeState();
       if (masterAuthorityRuntimeStateDurable)
       {
@@ -8731,6 +8819,7 @@ public:
       else
       {
         restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
+        restoreUpdateSelfFollowerConcurrencyState(masterAuthorityRuntimeState);
       }
       return masterAuthorityRuntimeStateDurable;
     }
@@ -8741,6 +8830,7 @@ public:
            durableMasterAuthorityRuntimeStateGeneration == sanitizedIncoming.generation))
       {
         restorePersistentUpdateSelfState(localUpdateCoordinator);
+        restoreUpdateSelfFollowerConcurrencyState(sanitizedIncoming);
         if (alreadyDurable)
         {
           masterAuthorityRuntimeStateDurable = true;
@@ -8775,11 +8865,13 @@ public:
     // the narrow witness before that capture and restore it on every failure.
     restorePersistentUpdateSelfState(localUpdateCoordinator);
     masterAuthorityRuntimeState = std::move(sanitizedIncoming);
+    restoreUpdateSelfFollowerConcurrencyState(masterAuthorityRuntimeState);
     masterAuthorityRuntimeStateDurable = false;
     if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
     {
       masterAuthorityRuntimeState = std::move(previousRuntimeState);
       restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
+      restoreUpdateSelfFollowerConcurrencyState(masterAuthorityRuntimeState);
       masterAuthorityRuntimeStateDurable = previousDurable;
       durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
       (void)restoreRetiredMachineIdentitiesFromRuntimeState();
@@ -8797,6 +8889,7 @@ public:
     {
       masterAuthorityRuntimeState = std::move(previousRuntimeState);
       restorePersistentUpdateSelfState(previousLiveUpdateCoordinator);
+      restoreUpdateSelfFollowerConcurrencyState(masterAuthorityRuntimeState);
       masterAuthorityRuntimeStateDurable = previousDurable;
       durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
       hasCompletedInitialMasterElection = previousCompletedInitialElection;
@@ -16875,6 +16968,11 @@ public:
         peer->sendPeerHeartbeat(nowMs);
       }
     }
+    if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
+    {
+      driveUpdateSelfFollowerTransitions();
+      maybeRelinquishMasterForUpdateSelf();
+    }
     retryDeferredPeerArtifactReconciliations();
     // A bounded store-read admission can leave the reconciliation suffix
     // pending.  Reuse the existing heartbeat turn after ArtifactIO has
@@ -16933,6 +17031,7 @@ public:
 
     if (expectedUpdateFollowerReboot)
     {
+      updateSelfTransitionSentPeerKeys.erase(updateSelfPeerTrackingKey(brain));
       if (weAreMaster && brain->weConnectToIt)
       {
         armOutboundPeerReconnect(brain);
@@ -28955,7 +29054,10 @@ public:
     updateSelfFollowerBootNsByPeerKey.clear();
     updateSelfFollowerReconnectedPeerKeys.clear();
     updateSelfFollowerRebootedPeerKeys.clear();
+    updateSelfFollowerConcurrency = 0;
     updateSelfTransitionIssuedPeerKeys.clear();
+    updateSelfFollowerReadyPeerKeys.clear();
+    updateSelfTransitionSentPeerKeys.clear();
     updateSelfRelinquishIssuedPeerKeys.clear();
   }
 
@@ -29517,7 +29619,48 @@ public:
     return (bv->pendingSend == false);
   }
 
-  void queueUpdateSelfTransitionToPeer(BrainView *bv)
+  bool updateSelfFollowerHasRecovered(BrainView *bv, const String& authorityDigest) const
+  {
+    if (bv == nullptr || peerSocketActive(bv) == false || bv->registrationFresh == false ||
+        bv->machine == nullptr || bv->machine->runtimeReady == false ||
+        persistedMachineInventoryUploaded.contains(bv->machine->uuid) == false)
+    {
+      return false;
+    }
+    const uint128_t peerKey = updateSelfPeerTrackingKey(bv);
+    const auto *witness = findUpdateSelfMachineRecoveryWitness(bv->machine->uuid);
+    return peerKey != 0 && witness != nullptr && witness->bundleRegistered &&
+           machineBundleInventoryMatchesWitness(bv->machine, *witness) &&
+           updateSelfFollowerRebootedPeerKeys.contains(peerKey) &&
+           peerHasAcknowledgedCurrentMasterAuthority(bv, authorityDigest);
+  }
+
+  bool reconcileUpdateSelfFollowerReadiness(void)
+  {
+    if (updateSelfFollowerConcurrency == 0 ||
+        updateSelfState != UpdateSelfState::waitingForFollowerReboots)
+    {
+      return false;
+    }
+    String serialized, authorityDigest;
+    if (serializeCurrentMasterAuthorityTransition(serialized, authorityDigest) == false)
+    {
+      return false;
+    }
+    for (uint128_t peerKey : updateSelfTransitionIssuedPeerKeys)
+    {
+      if (updateSelfFollowerHasRecovered(findBrainViewByUpdateSelfPeerKey(peerKey), authorityDigest))
+      {
+        if (updateSelfFollowerReadyPeerKeys.insert(peerKey).second)
+        {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  void queueUpdateSelfTransitionToPeer(BrainView *bv, bool alreadyDurablyIssued = false)
   {
     if (weAreMaster == false || updateSelfPersistencePending || updateSelfPersistenceFailed) return;
     if (updateSelfState != UpdateSelfState::waitingForFollowerReboots)
@@ -29550,10 +29693,12 @@ public:
     {
       return;
     }
-    if (updateSelfTransitionIssuedPeerKeys.contains(peerKey))
+    if (updateSelfTransitionIssuedPeerKeys.contains(peerKey) && alreadyDurablyIssued == false)
     {
       return;
     }
+    if (updateSelfFollowerConcurrency == 0)
+    {
     // The follower reboot record is durable. The issued set is intentionally
     // process-local: after a master restart the first unrebooted peer is
     // deterministically retried, while a live master never has two followers
@@ -29569,12 +29714,21 @@ public:
     {
       return;
     }
+    }
+    else if (alreadyDurablyIssued == false)
+    {
+      // Explicit concurrency changes are issued only from a receipt that has
+      // durably recorded the occupied slot.
+      return;
+    }
     if (updateSelfPeerStreamDrained(bv) == false)
     {
       return;
     }
 
+    if (alreadyDurablyIssued && updateSelfTransitionSentPeerKeys.contains(peerKey)) return;
     updateSelfTransitionIssuedPeerKeys.insert(peerKey);
+    updateSelfTransitionSentPeerKeys.insert(peerKey);
     PRODIGY_DEBUG_LOG( "prodigy updateProdigy follower-transition-send private4=%u peerKey=%llu\n",
                  bv->private4,
                  (unsigned long long)peerKey);
@@ -29685,6 +29839,64 @@ public:
       return;
     }
     queueUpdateSelfTransitionToPeer(nextUpdateSelfFollowerTransitionPeer());
+  }
+
+  void driveUpdateSelfFollowerTransitions(void)
+  {
+    if (updateSelfPersistencePending || updateSelfPersistenceFailed ||
+        updateSelfState != UpdateSelfState::waitingForFollowerReboots)
+    {
+      return;
+    }
+    if (updateSelfFollowerConcurrency == 0)
+    {
+      maybeQueueUpdateSelfFollowerTransition();
+      return;
+    }
+    if (reconcileUpdateSelfFollowerReadiness())
+    {
+      persistUpdateSelfProgress([this] { driveUpdateSelfFollowerTransitions(); });
+      return;
+    }
+    String serialized, authorityDigest;
+    if (serializeCurrentMasterAuthorityTransition(serialized, authorityDigest) == false) return;
+    uint32_t occupied = 0;
+    for (uint128_t peerKey : updateSelfTransitionIssuedPeerKeys)
+    {
+      if (updateSelfFollowerReadyPeerKeys.contains(peerKey) == false ||
+          updateSelfFollowerHasRecovered(findBrainViewByUpdateSelfPeerKey(peerKey), authorityDigest) == false)
+      {
+        ++occupied;
+        queueUpdateSelfTransitionToPeer(findBrainViewByUpdateSelfPeerKey(peerKey), true);
+      }
+    }
+    if (occupied >= updateSelfFollowerConcurrency) return;
+
+    Vector<uint128_t> candidates = {};
+    for (const auto& [peerKey, bootNs] : updateSelfFollowerBootNsByPeerKey)
+    {
+      (void)bootNs;
+      if (updateSelfTransitionIssuedPeerKeys.contains(peerKey) == false)
+      {
+        candidates.push_back(peerKey);
+      }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    Vector<uint128_t> issued = {};
+    for (uint128_t peerKey : candidates)
+    {
+      if (occupied >= updateSelfFollowerConcurrency) break;
+      updateSelfTransitionIssuedPeerKeys.insert(peerKey);
+      issued.push_back(peerKey);
+      ++occupied;
+    }
+    if (issued.empty()) return;
+    persistUpdateSelfProgress([this, issued = std::move(issued)] {
+      for (uint128_t peerKey : issued)
+      {
+        queueUpdateSelfTransitionToPeer(findBrainViewByUpdateSelfPeerKey(peerKey), true);
+      }
+    });
   }
 
   void queueUpdateSelfRelinquishToPeer(BrainView *bv)
@@ -29830,7 +30042,7 @@ public:
     if (updateSelfExpectedEchos > 0)
     {
       maybeTransitionFollowersForUpdateSelf();
-      maybeQueueUpdateSelfFollowerTransition();
+      driveUpdateSelfFollowerTransitions();
       maybeRelinquishMasterForUpdateSelf();
     }
   }
@@ -29915,8 +30127,10 @@ public:
   void beginUpdateSelfBundle(uint32_t expectedPeerEchos)
   {
     bool useStagedBundleOnly = updateSelfUseStagedBundleOnly;
+    uint8_t followerConcurrency = updateSelfFollowerConcurrency;
     resetUpdateSelfState(false);
     updateSelfUseStagedBundleOnly = useStagedBundleOnly;
+    updateSelfFollowerConcurrency = followerConcurrency;
     // We're collecting echos from other brains that they received and saved the new bundle.
     updateSelfState = UpdateSelfState::waitingForBundleEchos;
     updateSelfExpectedEchos = expectedPeerEchos;
@@ -29995,11 +30209,39 @@ public:
     {
       return;
     }
-    if (updateSelfFollowerRebootedPeerKeys.size() < updateSelfExpectedEchos)
+    if (reconcileUpdateSelfFollowerReadiness())
+    {
+      persistUpdateSelfProgress([this] { maybeRelinquishMasterForUpdateSelf(); });
+      return;
+    }
+    const bytell_hash_set<uint128_t>& recoveredPeers =
+        updateSelfFollowerConcurrency == 0 ? updateSelfFollowerRebootedPeerKeys : updateSelfFollowerReadyPeerKeys;
+    if (recoveredPeers.size() < updateSelfExpectedEchos)
     {
       return;
     }
-    if (updateSelfCompletedFollowersReadyForNextTransition() == false)
+    if (updateSelfFollowerConcurrency != 0)
+    {
+      String serialized, authorityDigest;
+      if (serializeCurrentMasterAuthorityTransition(serialized, authorityDigest) == false)
+      {
+        return;
+      }
+      for (uint128_t peerKey : recoveredPeers)
+      {
+        if (updateSelfFollowerHasRecovered(
+                findBrainViewByUpdateSelfPeerKey(peerKey), authorityDigest) == false)
+        {
+          return;
+        }
+      }
+    }
+    if (updateSelfRecoveryWitnessAcknowledgedByPeers(recoveredPeers) == false)
+    {
+      return;
+    }
+    if (updateSelfFollowerConcurrency == 0 &&
+        updateSelfCompletedFollowersReadyForNextTransition() == false)
     {
       return;
     }
@@ -30018,7 +30260,7 @@ public:
       }
 
       uint128_t peerKey = updateSelfPeerTrackingKey(bv);
-      if (updateSelfFollowerRebootedPeerKeys.contains(peerKey) == false)
+      if (recoveredPeers.contains(peerKey) == false)
       {
         continue;
       }
@@ -30065,11 +30307,13 @@ public:
     updateSelfFollowerBootNsByPeerKey.clear();
     updateSelfFollowerRebootedPeerKeys.clear();
     updateSelfTransitionIssuedPeerKeys.clear();
+    updateSelfFollowerReadyPeerKeys.clear();
+    updateSelfTransitionSentPeerKeys.clear();
     updateSelfBundleBlob.clear();
     for (BrainView *peer : brains)
       if (peerSocketActive(peer) && updateSelfPeerTrackingKey(peer))
         updateSelfFollowerBootNsByPeerKey.insert_or_assign(updateSelfPeerTrackingKey(peer), peer->boottimens);
-    persistUpdateSelfProgress([this] { maybeQueueUpdateSelfFollowerTransition(); });
+    persistUpdateSelfProgress([this] { driveUpdateSelfFollowerTransitions(); });
     // Followers transition first; the master handoff and restart remain last.
   }
 
@@ -35868,9 +36112,23 @@ public:
     if (version > 0) report.masterRunningProdigyVersion.snprintf<"{itoa}"_ctv>(version);
   }
 
+  bool admittedUpdateConcurrencySupported(const ProdigyAdmittedUpdateRequest& request)
+  {
+    if (request.version == 1) return request.brainConcurrency == 0;
+    if (request.version != 2 || request.brainConcurrency < ProdigyUpdateSelfMinimumConcurrency ||
+        request.brainConcurrency > ProdigyUpdateSelfMaximumConcurrency) return false;
+    for (BrainView *peer : brains)
+      if (peer == nullptr || !peerSocketActive(peer) || !peer->registrationFresh ||
+          peer->version < ProdigyUpdateSelfConcurrencyMinimumVersion) return false;
+    return true;
+  }
+
   bool admittedUpdateObservationIsCurrent(const ProdigyAdmittedUpdateRequest& request,
                                          uint32_t minimumHealthyBrains = 0)
   {
+    // Repeat at every asynchronous publication fence: the installed peer set
+    // can change while artifact proof is running.
+    if (!admittedUpdateConcurrencySupported(request)) return false;
     MothershipUpgradeAdmissionReport report = {};
     collectUpgradeAdmissionReport(report);
     if (report.operationID != request.operationID ||
@@ -37252,10 +37510,16 @@ public:
           ProdigyAdmittedUpdateRequest request = {}; MothershipResponse response = {};
           uint128_t operationID = 0;
           auto reject = [&](const char *reason) { response.failure.assign(reason); String out = {}; BitseryEngine::serialize(out,response); Message::construct(mothership->wBuffer,MothershipTopic::updateProdigyAdmitted,out); };
-          if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedRequest, request) || request.version != 1 ||
+          if (args != message->terminal() || !BitseryEngine::deserializeSafe(serializedRequest, request) ||
+              (request.version != 1 && request.version != 2) ||
               !prodigyParseCanonicalHex128(request.operationID, operationID) || !prodigyIsSHA256HexDigest(request.sourceBundleSHA256) ||
               !prodigyIsSHA256HexDigest(request.targetBundleSHA256) || !prodigyIsSHA256HexDigest(request.targetContractSHA256) ||
-              request.requiredStagingBytes == 0) { reject("invalid admitted update request"); break; }
+              request.requiredStagingBytes == 0 ||
+              (request.version == 2 && (request.brainConcurrency < ProdigyUpdateSelfMinimumConcurrency ||
+                                        request.brainConcurrency > ProdigyUpdateSelfMaximumConcurrency)))
+          { reject("invalid admitted update request"); break; }
+          if (!admittedUpdateConcurrencySupported(request))
+          { reject("brain concurrency requires every Brain to be connected and version 24 or newer"); break; }
           if (!admittedUpdateObservationIsCurrent(request)) { reject("admitted update authority observation is stale"); break; }
           String digest = {}, failure = {}; if (!prodigyComputeSHA256Hex(targetBundle,digest,&failure) || digest != request.targetBundleSHA256) { reject("admitted update target bundle digest differs"); break; }
           String frame = {}; Message::construct(frame,MothershipTopic::updateProdigy,targetBundle);
@@ -37296,6 +37560,11 @@ public:
             sendFailure("stateful topology transition must settle before binary update"_ctv);
             break;
           }
+          if (args != message->terminal())
+          {
+            sendFailure("bundle update request framing is invalid"_ctv);
+            break;
+          }
 
           std::shared_ptr<PendingMothershipUpdateArtifact> pending = pendingMothershipUpdateArtifact;
           if (pending == nullptr)
@@ -37313,6 +37582,8 @@ public:
             pending->admittedRequest = admittedUpdateRequestForDispatch;
             pending->admittedClusterUUID = brainConfig.clusterUUID;
             pending->admittedTargetContractSHA256 = admittedUpdateContractForDispatch;
+            pending->hasExplicitFollowerConcurrency = admittedUpdateRequestForDispatch.version >= 2;
+            pending->requestedFollowerConcurrency = admittedUpdateRequestForDispatch.brainConcurrency;
             String ownedBundle(newBundle.data(), newBundle.size(), Copy::yes, newBundle.size());
             pendingMothershipUpdateArtifact = pending;
             if (pending->requestFrame.size() > UINT64_MAX - ownedBundle.size() || ensureArtifactIO() == false ||
@@ -37442,6 +37713,14 @@ public:
             sendFailure("bundle update continuation is no longer authoritative"_ctv);
             break;
           }
+          if (admittedUpdateRequestForDispatch.operationID.size() != 0 &&
+              (pending->hasExplicitFollowerConcurrency !=
+                  (admittedUpdateRequestForDispatch.version >= 2) ||
+               pending->requestedFollowerConcurrency != admittedUpdateRequestForDispatch.brainConcurrency))
+          {
+            sendFailure("admitted update retry changes Brain concurrency"_ctv);
+            break;
+          }
           if (pending->admitted && !admittedUpdateObservationIsCurrent(pending->admittedRequest, pending->minimumHealthyBrains))
           {
             rejectPendingMothershipUpdateArtifact(pending, "admitted update observation changed before publication"_ctv);
@@ -37460,8 +37739,47 @@ public:
             break;
           }
 
+          if (pending->hasExplicitFollowerConcurrency)
+          {
+            String concurrencyFailure = {};
+            if (configureUpdateSelfFollowerConcurrency(
+                    pending->requestedFollowerConcurrency, &concurrencyFailure) == false)
+            {
+              rejectPendingMothershipUpdateArtifact(pending, concurrencyFailure);
+              break;
+            }
+          }
+
           MothershipResponse response = {};
           const String& expectedWorkerDigest = pending->digest;
+          // A retry for an active concurrency-controlled bundle is a resume acknowledgement,
+          // never a second coordinator start. In particular, beginUpdateSelfBundle
+          // would discard the durable issued/readiness sets and recalculate a
+          // cohort from a transient peer view.
+          if (updateSelfFollowerConcurrency != 0 && updateSelfState != UpdateSelfState::idle &&
+              updateSelfWorkerExpectedBundleSHA256.equals(expectedWorkerDigest))
+          {
+            response.success = true;
+            String serializedResponse = {};
+            BitseryEngine::serialize(serializedResponse, response);
+            Message::construct(mothership->wBuffer, pending->responseTopic, serializedResponse);
+            if (updateSelfState == UpdateSelfState::waitingForBundleEchos)
+            {
+              queueUpdateSelfBundleToPendingPeers();
+            }
+            else if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
+            {
+              driveUpdateSelfFollowerTransitions();
+              maybeRelinquishMasterForUpdateSelf();
+            }
+            else if (updateSelfState == UpdateSelfState::waitingForRelinquishEchos)
+            {
+              for (BrainView *peer : brains) queueUpdateSelfRelinquishToPeer(peer);
+            }
+            if (pending->prepared.prepared) discardPendingMothershipUpdateArtifact(pending);
+            if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+            break;
+          }
           if (pending->targetContainerRetirementJournalVersion < requiredContainerRetirementJournalReaderVersion())
           {
             rejectPendingMothershipUpdateArtifact(pending, "target binary lacks the required container retirement journal reader"_ctv);

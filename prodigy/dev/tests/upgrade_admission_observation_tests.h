@@ -83,7 +83,24 @@ static void testAdmittedUpdateRejectsUnfencedRequests(TestSuite& suite)
   brain.machines.insert(&localMachine); brain.machinesByUUID.insert_or_assign(local.uuid, &localMachine);
   brain.persistedMachineInventoryUploaded.insert(local.uuid);
   brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(local.uuid, Vector<String>{});
+  ScopedSocketPair sockets = {};
   Mothership mothership = {};
+  if (!suite.require(sockets.create(suite, "admitted_update_rejection_socket_pair"),
+                     "admitted_update_rejection_requires_socket_pair"))
+  {
+    brain.machinesByUUID.erase(local.uuid); brain.machines.erase(&localMachine);
+    thisNeuron = previousNeuron;
+    return;
+  }
+  mothership.isFixedFile = true;
+  mothership.fslot = sockets.adoptLeftIntoFixedFileSlot();
+  if (!suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                     "admitted_update_rejection_activates_mothership"))
+  {
+    brain.machinesByUUID.erase(local.uuid); brain.machines.erase(&localMachine);
+    thisNeuron = previousNeuron;
+    return;
+  }
 
   MothershipUpgradeAdmissionReport report = {};
   brain.collectUpgradeAdmissionReport(report);
@@ -181,6 +198,70 @@ static void testAdmittedUpdateRejectsUnfencedRequests(TestSuite& suite)
   expectRejected(mutated, "admitted update authority observation is stale",
                  "admitted_update_rejects_target_binding_mismatch_before_staging");
 
+  BrainView incompatiblePeer = {};
+  incompatiblePeer.connected = true;
+  incompatiblePeer.isFixedFile = true;
+  incompatiblePeer.fslot = 97;
+  incompatiblePeer.registrationFresh = true;
+  incompatiblePeer.version = ProdigyUpdateSelfConcurrencyMinimumVersion - 1;
+  brain.brains.insert(&incompatiblePeer);
+  mutated = request;
+  mutated.version = 2;
+  mutated.brainConcurrency = ProdigyUpdateSelfMinimumConcurrency;
+  expectRejected(mutated, "brain concurrency requires every Brain to be connected and version 24 or newer",
+                 "admitted_update_v2_rejects_incompatible_connected_peer_before_staging");
+  brain.brains.erase(&incompatiblePeer);
+
+  ProdigyAdmittedUpdateRequest serialV2 = request;
+  serialV2.version = 2;
+  serialV2.brainConcurrency = ProdigyUpdateSelfMinimumConcurrency;
+  String serialV2Bytes = {};
+  BitseryEngine::serialize(serialV2Bytes, serialV2);
+  ProdigyAdmittedUpdateRequest serialV2Decoded = {};
+  suite.expect(BitseryEngine::deserializeSafe(serialV2Bytes, serialV2Decoded) &&
+                   serialV2Decoded.version == 2 &&
+                   serialV2Decoded.brainConcurrency == ProdigyUpdateSelfMinimumConcurrency,
+               "admitted_update_v2_serializes_explicit_serial_concurrency");
+  String serialFrame = {};
+  brain.mothershipHandler(&mothership,
+      buildMothershipMessage(serialFrame, MothershipTopic::updateProdigyAdmitted, serialV2Bytes, target));
+  suite.expect(brain.pendingMothershipUpdateArtifact != nullptr &&
+                   brain.pendingMothershipUpdateArtifact->hasExplicitFollowerConcurrency &&
+                   brain.pendingMothershipUpdateArtifact->requestedFollowerConcurrency ==
+                       ProdigyUpdateSelfMinimumConcurrency &&
+                   mothership.wBuffer.empty(),
+               "admitted_update_v2_serial_concurrency_passes_fresh_fence_to_async_proof");
+  suite.expect(brain.admittedUpdateObservationIsCurrent(serialV2),
+               "admitted_update_v2_serial_concurrency_remains_current_without_peers");
+  suite.expect(brain.pendingMothershipUpdateArtifactIsCurrent(brain.pendingMothershipUpdateArtifact),
+               "admitted_update_v2_retry_has_current_authenticated_connection");
+  brain.brains.insert(&incompatiblePeer);
+  suite.expect(!brain.admittedUpdateObservationIsCurrent(serialV2),
+               "admitted_update_v2_async_fence_rechecks_incompatible_peer_capability");
+  brain.brains.erase(&incompatiblePeer);
+  ProdigyAdmittedUpdateRequest conflictingRetry = serialV2;
+  conflictingRetry.brainConcurrency = ProdigyUpdateSelfMaximumConcurrency;
+  String conflictingRetryBytes = {}, conflictingRetryFrame = {};
+  BitseryEngine::serialize(conflictingRetryBytes, conflictingRetry);
+  brain.mothershipHandler(&mothership, buildMothershipMessage(
+      conflictingRetryFrame, MothershipTopic::updateProdigyAdmitted, conflictingRetryBytes, target));
+  MothershipResponse conflictingRetryResponse = {};
+  bool conflictingRetryRejected = false;
+  if (mothership.wBuffer.size() >= sizeof(Message))
+  {
+    Message *response = reinterpret_cast<Message *>(mothership.wBuffer.data());
+    String responseBytes = {}; uint8_t *args = response->args;
+    Message::extractToStringView(args, responseBytes);
+    conflictingRetryRejected = MothershipTopic(response->topic) == MothershipTopic::updateProdigyAdmitted &&
+        args == response->terminal() && BitseryEngine::deserializeSafe(responseBytes, conflictingRetryResponse) &&
+        !conflictingRetryResponse.success &&
+        conflictingRetryResponse.failure == "admitted update retry changes Brain concurrency"_ctv;
+  }
+  suite.expect(conflictingRetryRejected && brain.pendingMothershipUpdateArtifact != nullptr &&
+                   brain.transitionToNewBundleCalls == 0,
+               "admitted_update_v2_rejects_retry_that_changes_concurrency");
+  mothership.wBuffer.clear();
+
   String legacyFrame = {};
   Message::construct(legacyFrame, MothershipTopic::updateProdigy, "unapproved-bundle"_ctv);
   brain.mothershipHandler(&mothership, reinterpret_cast<Message *>(legacyFrame.data()));
@@ -203,6 +284,7 @@ static void testAdmittedUpdateRejectsUnfencedRequests(TestSuite& suite)
                  "admitted_update_rejection_quiesces_capacity_probe_io");
     brain.artifactIO.reset();
   }
+  brain.activeMotherships.erase(&mothership);
   brain.machinesByUUID.erase(local.uuid); brain.machines.erase(&localMachine);
   thisNeuron = previousNeuron;
 }
@@ -268,6 +350,8 @@ static void testAdmittedUpdateCanonicalOperationPassesFreshFence(TestSuite& suit
   request.sourceBundleSHA256 = sourceDigest; request.targetBundleSHA256 = targetDigest;
   request.targetContractSHA256 = contractDigest; request.authorityGeneration = report.authorityGeneration;
   request.masterUUID = report.masterUUID; request.masterBootNs = report.masterBootNs;
+  request.version = 2;
+  request.brainConcurrency = ProdigyUpdateSelfMaximumConcurrency;
   request.requiredStagingBytes = 1;
   ProdigyUpgradeAdmissionReportRequest capacityRequest = {};
   capacityRequest.operationID.assign(request.operationID); capacityRequest.targetBundleSHA256.assign(targetDigest);
@@ -281,8 +365,12 @@ static void testAdmittedUpdateCanonicalOperationPassesFreshFence(TestSuite& suit
   BitseryEngine::serialize(serialized, request);
   brain.mothershipHandler(&mothership,
       buildMothershipMessage(frame, MothershipTopic::updateProdigyAdmitted, serialized, target));
-  suite.expect(brain.pendingMothershipUpdateArtifact != nullptr && mothership.wBuffer.empty(),
-               "admitted_update_canonical_0x_operation_passes_fresh_fence_to_async_proof");
+  suite.expect(brain.pendingMothershipUpdateArtifact != nullptr &&
+                   brain.pendingMothershipUpdateArtifact->hasExplicitFollowerConcurrency &&
+                   brain.pendingMothershipUpdateArtifact->requestedFollowerConcurrency ==
+                       ProdigyUpdateSelfMaximumConcurrency &&
+                   mothership.wBuffer.empty(),
+               "admitted_update_v2_parallel_concurrency_passes_fresh_fence_to_async_proof");
   for (uint32_t attempt = 0; attempt < 100 && brain.pendingMothershipUpdateArtifact != nullptr; ++attempt)
     ring.runFor(20);
   String responseBytes = {};

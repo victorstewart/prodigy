@@ -1769,6 +1769,53 @@ int main(void)
   suite.expect(aliasExitCode == EXIT_FAILURE, "legacy_alias_exit_failure");
   suite.expect(stringContains(aliasOutput, "operation invalid"), "legacy_alias_reports_invalid_operation");
 
+  // Reject an invalid rollout limit before resolving an artifact or opening a
+  // control connection. Only the exact supported choices are accepted.
+  for (const char *limit : {"0", "3", "-1", "1x", "01", "4294967297"})
+  {
+    String output = {};
+    int exitCode = -1;
+    suite.expect(runMothershipCommand(binaryPath, dbRoot,
+        {"updateProdigy", "cluster-report-test", "/nonexistent-upgrade-artifact", "0x1234", "--brain-concurrency", limit},
+        output, exitCode), "run_invalid_brain_upgrade_concurrency");
+    suite.expect(exitCode == EXIT_FAILURE && stringContains(output, "requires --brain-concurrency 1 or 2"),
+                 "invalid_brain_upgrade_concurrency_rejected_before_artifact");
+  }
+  for (const char *limit : {"1", "2"})
+  {
+    String output = {};
+    int exitCode = -1;
+    suite.expect(runMothershipCommand(binaryPath, dbRoot,
+        {"updateProdigy", "cluster-report-test", "/nonexistent-upgrade-artifact", "0x1234", "--brain-concurrency", limit},
+        output, exitCode), "run_valid_brain_upgrade_concurrency");
+    suite.expect(exitCode == EXIT_FAILURE && stringContains(output, "path is inaccessible"),
+                 "valid_brain_upgrade_concurrency_reaches_artifact_validation");
+  }
+
+  String upgradeBundle = PRODIGY_TEST_BINARY_DIR;
+  upgradeBundle.append('/');
+  upgradeBundle.append(prodigyBundleFilename(nametagCurrentBuildMachineArchitecture()));
+  // Concurrency selection cannot bypass P6's durable operation admission.
+  // The real built bundle is structurally approved, but no operation record was
+  // authorized for this cluster. No update frame may be dispatched.
+  for (unsigned scenario = 0; scenario < 3; ++scenario)
+  {
+    std::vector<std::string> arguments = {
+        "updateProdigy", "cluster-report-test", std::string(upgradeBundle.c_str()), "0x1234"};
+    if (scenario != 0)
+    {
+      arguments.push_back("--brain-concurrency");
+      arguments.push_back(scenario == 1 ? "1" : "2");
+    }
+    String output = {};
+    int exitCode = -1;
+    const bool ran = runMothershipCommand(binaryPath, dbRoot, arguments, output, exitCode);
+    if (!ran || exitCode != EXIT_FAILURE || !stringContains(output, "rejected by upgrade admission"))
+      writeFailureDetail("detail upgrade_without_admission_output:", output);
+    suite.expect(ran && exitCode == EXIT_FAILURE && stringContains(output, "rejected by upgrade admission"),
+                 "upgrade_concurrency_requires_durable_admission");
+  }
+
   String legacyUpdateOutput = {};
   int legacyUpdateExitCode = -1;
   bool ranLegacyUpdate = runMothershipCommand(
@@ -1828,6 +1875,7 @@ int main(void)
   suite.expect(ranHelp, "run_help_command");
   suite.expect(helpExitCode == EXIT_SUCCESS, "help_exit_success");
   suite.expect(stringContains(helpOutput, "clusterReport [target: local|clusterName|clusterUUID]"), "help_includes_cluster_report");
+  suite.expect(stringContains(helpOutput, "[--brain-concurrency 1|2]"), "help_includes_brain_upgrade_concurrency");
   suite.expect(stringMissing(helpOutput, "configureTestCluster"), "help_omits_configure_test_cluster_backdoor");
   suite.expect(stringContains(helpOutput, "setLocalClusterMembership [name|clusterUUID] [json]"), "help_includes_set_local_cluster_membership");
   suite.expect(stringContains(helpOutput, "setTestClusterMachineCount [name|clusterUUID] [json]"), "help_includes_set_test_cluster_machine_count");

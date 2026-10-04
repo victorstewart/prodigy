@@ -1,4 +1,5 @@
 #include <prodigy/mothership/mothership.cluster.remove.h>
+#include <prodigy/mothership/mothership.additional.ingress.retire.h>
 #include <services/debug.h>
 
 #include <cstdio>
@@ -880,6 +881,38 @@ int main(void)
                  "remove_resume_finishes_after_confirmed_dns_and_offline_control");
     suite.expect(summary.dnsTeardownCompleted && hooks.removeDNSCalls == dnsCalls && hooks.stopAdoptedCalls == wipeCalls + 1,
                  "remove_resume_uses_existing_wipe_without_repeating_dns");
+  }
+
+  {
+    uint8_t parsedTag[BPF_TAG_SIZE] = {};
+    suite.expect(mothershipAdditionalIngressRetirementHex("8e35cc6f412f0231", parsedTag, sizeof(parsedTag)),
+                 "additional_ingress_retirement_accepts_exact_hex_tag");
+    suite.expect(mothershipAdditionalIngressRetirementHex("8e35cc6f412f023+", parsedTag, sizeof(parsedTag)) == false,
+                 "additional_ingress_retirement_rejects_non_hex_tag");
+    suite.expect(mothershipAdditionalIngressRetirementHex("8e35cc6f412f0231x", parsedTag, sizeof(parsedTag)) == false,
+                 "additional_ingress_retirement_rejects_wrong_tag_length");
+    suite.expect(!mothershipAdditionalIngressRetirementHex("8e35cc6f412f02+1", parsedTag, sizeof(parsedTag)),
+                 "additional_ingress_retirement_rejects_signed_hex_pair");
+    suite.expect(!mothershipAdditionalIngressRetirementHex("8e35cc6f412f02 1", parsedTag, sizeof(parsedTag)),
+                 "additional_ingress_retirement_rejects_space_hex_pair");
+    MothershipAdditionalIngressRetirement request = {};
+    request.programID = 12347; request.mapCount = 15;
+    mothershipAdditionalIngressRetirementHex("8e35cc6f412f0231", request.tag, sizeof(request.tag));
+    struct bpf_prog_info info = {};
+    info.id = request.programID; info.type = BPF_PROG_TYPE_XDP; info.nr_map_ids = request.mapCount;
+    std::strcpy(reinterpret_cast<char *>(info.name), "bal_ingress");
+    std::memcpy(info.tag, request.tag, sizeof(request.tag));
+    suite.expect(mothershipAdditionalIngressRetirementProgramMatches(request, info),
+                 "additional_ingress_retirement_accepts_exact_program_identity");
+    info.id++;
+    suite.expect(!mothershipAdditionalIngressRetirementProgramMatches(request, info),
+                 "additional_ingress_retirement_rejects_replaced_program");
+    info.id--; info.tag[0] ^= 1;
+    suite.expect(!mothershipAdditionalIngressRetirementProgramMatches(request, info),
+                 "additional_ingress_retirement_rejects_changed_program_tag");
+    info.tag[0] ^= 1; info.nr_map_ids--;
+    suite.expect(!mothershipAdditionalIngressRetirementProgramMatches(request, info),
+                 "additional_ingress_retirement_rejects_changed_map_inventory");
   }
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

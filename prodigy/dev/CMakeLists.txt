@@ -1396,7 +1396,7 @@ foreach(_prodigy_artifact_test IN ITEMS
    add_dependencies(${_prodigy_artifact_test} prodigy_pingpong_container_artifact)
 endforeach()
 add_dependencies(prodigy_mothership_unix_connect_unit prodigy_mothership_tunnel_provider)
-add_dependencies(prodigy_mothership_cluster_report_unit mothership)
+add_dependencies(prodigy_mothership_cluster_report_unit mothership prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_mothership_restart_persistence_unit mothership prodigy_bundle prodigy_bundle_sha256)
 add_dependencies(prodigy_remote_bootstrap_smoke prodigy_bundle)
 
@@ -2280,6 +2280,13 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
    )
    set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_update_self_concurrency_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=update-self-concurrency
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_update_self_concurrency_unit PROPERTIES TIMEOUT 60)
 
    add_test(
       NAME prodigy_authority_persistence_retry_unit

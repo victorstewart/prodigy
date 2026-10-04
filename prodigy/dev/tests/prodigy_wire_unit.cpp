@@ -1168,6 +1168,67 @@ int main(void)
         ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
         "neuron_bundle_stage_request_valid_for_neuron");
 
+    // The update request is explicitly framed so a new coordinator never
+    // mistakes an unframed legacy bundle for a concurrency-aware request.
+    frame.clear();
+    Message::construct(
+        frame,
+        MothershipTopic::updateProdigy,
+        ProdigyUpdateSelfConcurrencyRequestTag,
+        uint8_t(ProdigyUpdateSelfMinimumConcurrency),
+        "bundle"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+        "update_prodigy_concurrency_request_accepts_tag_limit_and_bundle");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, "bundle"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+        "update_prodigy_legacy_bundle_remains_structurally_valid");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, "wrong-update-tag"_ctv,
+                       uint8_t(ProdigyUpdateSelfMinimumConcurrency), "bundle"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) == false,
+        "update_prodigy_concurrency_request_rejects_wrong_tag");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, ProdigyUpdateSelfConcurrencyRequestTag,
+                       uint8_t(ProdigyUpdateSelfMinimumConcurrency - 1), "bundle"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) == false,
+        "update_prodigy_concurrency_request_rejects_zero_limit");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, ProdigyUpdateSelfConcurrencyRequestTag,
+                       uint8_t(ProdigyUpdateSelfMaximumConcurrency + 1), "bundle"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) == false,
+        "update_prodigy_concurrency_request_rejects_limit_above_two");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, ProdigyUpdateSelfConcurrencyRequestTag,
+                       uint8_t(ProdigyUpdateSelfMinimumConcurrency));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) == false,
+        "update_prodigy_concurrency_request_requires_bundle");
+
+    frame.clear();
+    Message::construct(frame, MothershipTopic::updateProdigy, ProdigyUpdateSelfConcurrencyRequestTag,
+                       uint8_t(ProdigyUpdateSelfMinimumConcurrency), "bundle"_ctv, "trailing"_ctv);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) == false,
+        "update_prodigy_concurrency_request_rejects_trailing_payload");
+
     ContainerLogsOperation logs = {};
     logs.requestID = 71;
     logs.applicationID = 16;

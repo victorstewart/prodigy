@@ -27,6 +27,16 @@ public:
   String failure; // string failure response
 };
 
+// A tagged updateProdigy frame cannot be mistaken for a bundle by older
+// Brains, which reject this non-artifact tag before a follower transition.
+constexpr inline auto ProdigyUpdateSelfConcurrencyRequestTag =
+    "prodigy-update-concurrency-v1"_ctv;
+constexpr inline uint8_t ProdigyUpdateSelfMinimumConcurrency = 1;
+constexpr inline uint8_t ProdigyUpdateSelfMaximumConcurrency = 2;
+// Version 24 is the first binary that understands the unambiguous v9
+// master-authority persistence tail used by explicit follower concurrency.
+constexpr inline uint64_t ProdigyUpdateSelfConcurrencyMinimumVersion = 24;
+
 // This is deliberately not an application-wide destroy request.  The exact
 // application/version/successor triple is the authority for a recovery action.
 class CancelDeploymentRequest {
@@ -5570,6 +5580,9 @@ public:
   bool requiresEmptyWorkloadSet = false;
   uint128_t masterUUID = 0;
   int64_t masterBootNs = 0;
+  // Version two binds the admitted rollout's durable Brain batch policy.
+  // Zero preserves the v1 admitted request's default behavior.
+  uint8_t brainConcurrency = 0;
 };
 template <typename S>
 static void serialize(S&& serializer, ProdigyAdmittedUpdateRequest& request)
@@ -5586,6 +5599,7 @@ static void serialize(S&& serializer, ProdigyAdmittedUpdateRequest& request)
   serializer.value8b(request.nonce);
   serializer.value8b(request.requiredStagingBytes);
   serializer.value1b(request.requiresEmptyWorkloadSet);
+  if (request.version >= 2) serializer.value1b(request.brainConcurrency);
 }
 
 class MothershipUpgradeAdmissionReport {
@@ -8043,10 +8057,15 @@ public:
   // from positional DeploymentPlan bytes.
   Vector<ProdigyDeploymentPlacementPolicy> deploymentPlacementPolicies;
   Vector<ProdigyStatelessDeploymentAdmission> statelessDeploymentAdmissions;
+  // Zero is the pre-v21 unlimited follower behavior. Explicit requests use
+  // one or two and persist their durable transition/readiness checkpoints.
+  uint8_t updateSelfFollowerConcurrency = 0;
+  Vector<uint128_t> updateSelfFollowerTransitionIssuedPeerKeys;
+  Vector<uint128_t> updateSelfFollowerReadyPeerKeys;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false)
     {
@@ -9088,7 +9107,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     Vector<BrainReplicatedContainerRuntimeState> *servingRuntimeStates)
 {
   constexpr uint64_t versionMarker = UINT64_MAX;
-  constexpr uint64_t explicitVersion = 8;
+  // Versions 6-8 are the P6 placement/serving/admission layouts. The
+  // divergent concurrency layout must never reuse version 6; version 9
+  // appends its durable transition state after the cumulative P6 tails.
+  constexpr uint64_t explicitVersion = 9;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
@@ -9098,6 +9120,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasDeploymentPlacementPolicies = false;
   bool hasStatefulServingAuthorities = false;
   bool hasStatelessDeploymentAdmissions = false;
+  bool hasExplicitUpdateSelfFollowerConcurrency = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9108,6 +9131,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     hasDeploymentPlacementPolicies = state.deploymentPlacementPolicies.empty() == false;
     hasStatefulServingAuthorities = state.statefulServingAuthorities.empty() == false;
     hasStatelessDeploymentAdmissions = state.statelessDeploymentAdmissions.empty() == false;
+    // The two merged histories used incompatible v6 layouts. Placement-only
+    // state now uses the already cumulative v7 layout with empty serving tails.
+    if (hasDeploymentPlacementPolicies) hasStatefulServingAuthorities = true;
     if (hasStatefulServingAuthorities) hasDeploymentPlacementPolicies = true;
     // Version eight is cumulative. Readers consume the v6 placement and v7
     // serving containers before the v8 admission tail, even when those older
@@ -9123,22 +9149,33 @@ static void prodigySerializeMasterAuthorityRuntimeState(
                                 (containerRuntimeStates->empty() == false || hasDeploymentPlacementPolicies);
     // Version-four framing is cumulative: emit the earlier optional fields
     // (empty when unused) so a version-three reader has an unambiguous tail.
-    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions)
+    hasExplicitUpdateSelfFollowerConcurrency = state.updateSelfFollowerConcurrency != 0;
+    if (hasExplicitUpdateSelfFollowerConcurrency)
+    {
+      // Version nine is cumulative and retains P6's v6-v8 field order.
+      hasDeploymentPlacementPolicies = true;
+      hasStatefulServingAuthorities = true;
+      hasStatelessDeploymentAdmissions = true;
+      hasContainerRuntimeStates = containerRuntimeStates != nullptr;
+    }
+    // Version-four framing is cumulative: emit the earlier optional fields
+    // (empty when unused) so a version-three reader has an unambiguous tail.
+    if (hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency)
     {
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = true;
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9158,6 +9195,15 @@ static void prodigySerializeMasterAuthorityRuntimeState(
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
         return;
       }
+      // P6 and the concurrent main line assigned different byte layouts to
+      // version six. There is no producer discriminator in the record, so a
+      // merged reader must not guess. P6's active admission records use v8;
+      // a retained v6 record requires an explicit migration before upgrade.
+      if (version == 6)
+      {
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+        return;
+      }
       hasMaterializedStatefulRecoveryOperations = true;
       hasApiCredentialExpiryNotices = version >= 2;
       hasAllMachineRecoveryWitnesses = version >= 3;
@@ -9166,6 +9212,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasDeploymentPlacementPolicies = version >= 6;
       hasStatefulServingAuthorities = version >= 7;
       hasStatelessDeploymentAdmissions = version >= 8;
+      hasExplicitUpdateSelfFollowerConcurrency = version >= 9;
     }
   }
 
@@ -9258,6 +9305,26 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.statelessDeploymentAdmissions.clear();
+  }
+  if (hasExplicitUpdateSelfFollowerConcurrency)
+  {
+    serializer.value1b(state.updateSelfFollowerConcurrency);
+    serializer.object(state.updateSelfFollowerTransitionIssuedPeerKeys);
+    serializer.object(state.updateSelfFollowerReadyPeerKeys);
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+    {
+      if (state.updateSelfFollowerConcurrency < ProdigyUpdateSelfMinimumConcurrency ||
+          state.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency)
+      {
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      }
+    }
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.updateSelfFollowerConcurrency = 0;
+    state.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    state.updateSelfFollowerReadyPeerKeys.clear();
   }
 }
 
