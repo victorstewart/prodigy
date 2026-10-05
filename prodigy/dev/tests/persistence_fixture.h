@@ -52,13 +52,15 @@ public:
   bool timedOut = false;
   bool shutdown = false;
 
-  PersistenceRing()
+  PersistenceRing() : PersistenceRing(8, 2) {}
+
+  PersistenceRing(uint32_t fixedFiles, uint32_t reservedFixedFiles)
   {
     Ring::interfacer = &dispatcher;
     Ring::lifecycler = &dispatcher;
     Ring::exit = false;
     Ring::shuttingDown = false;
-    Ring::createRing(64, 128, 8, 2, -1, -1, 8);
+    Ring::createRing(64, 128, fixedFiles, reservedFixedFiles, -1, -1, 8);
     tick.dispatcher = this;
     deadline.dispatcher = this;
     drain.dispatcher = this;

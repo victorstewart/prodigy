@@ -1590,6 +1590,525 @@ PAIR_PROBE
    esac
 }
 
+
+# Pair-control transit is deliberately separate from the existing pair
+# application boundary above.  Typed Mothership code selects and authorizes the
+# two immutable rosters; this provider only binds those saved arguments to the
+# two currently-live VDC parent namespaces.
+pair_control_parse()
+{
+   [[ "$#" -eq 12 && "${EUID}" -eq 0 ]] || return 2
+   pair_control_args=("$@")
+   pair_control_id="$1"; pair_control_first_uuid="$2"; pair_control_second_uuid="$3"
+   pair_control_first_workspace="$4"; pair_control_second_workspace="$5"
+   pair_control_first_runtime="$6"; pair_control_second_runtime="$7"
+   pair_control_first_subnet="$8"; pair_control_second_subnet="$9"
+   pair_control_first_endpoints="${10}"; pair_control_second_endpoints="${11}"; pair_control_port="${12}"
+   local identity
+   for identity in "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid"; do
+      [[ "$identity" =~ ^0x[0-9a-f]{2,32}$ && $(( ${#identity} % 2 )) == 0 && "${identity:2:2}" != 00 ]] || return 2
+   done
+   [[ "$pair_control_first_uuid" != "$pair_control_second_uuid" &&
+      "$pair_control_first_workspace" != "$pair_control_second_workspace" &&
+      "$pair_control_first_runtime" != "$pair_control_second_runtime" ]] || return 2
+   valid_workspace "$pair_control_first_workspace" && valid_workspace "$pair_control_second_workspace" || return 2
+   if ! python3 - "$pair_control_first_runtime" "$pair_control_second_runtime" \
+      "$pair_control_first_subnet" "$pair_control_second_subnet" \
+      "$pair_control_first_endpoints" "$pair_control_second_endpoints" "$pair_control_port" <<'PAIR_CONTROL_PARSE'
+import ipaddress,sys
+first_runtime,second_runtime,first_subnet,second_subnet,first_csv,second_csv,port=sys.argv[1:]
+assert all(str(int(x))==x and 1<int(x)<=2**64-1 for x in (first_runtime,second_runtime))
+assert str(int(port))==port and int(port)==315
+first_network=ipaddress.IPv6Network(first_subnet,strict=True)
+second_network=ipaddress.IPv6Network(second_subnet,strict=True)
+assert first_network.prefixlen==64 and second_network.prefixlen==64 and first_network!=second_network
+assert first_network.with_prefixlen==first_subnet and second_network.with_prefixlen==second_subnet
+def roster(value,network):
+    items=value.split(',')
+    assert 1<=len(items)<=16 and all(items)
+    addresses=[ipaddress.IPv6Address(x) for x in items]
+    assert [x.compressed for x in addresses]==items
+    assert all(x in network and x!=network.network_address for x in addresses)
+    assert len(set(addresses))==len(addresses) and addresses==sorted(addresses)
+roster(first_csv,first_network); roster(second_csv,second_network)
+PAIR_CONTROL_PARSE
+   then
+      return 2
+   fi
+   pair_control_dir="/mnt/prodigy-vdc-pair-control/$pair_control_id"
+   [[ ! -L "$pair_control_dir" ]] || return 2
+}
+
+pair_control_descriptor() { printf '%s\n' "${pair_control_args[@]}"; }
+
+pair_control_digest()
+{
+   command -v sha256sum >/dev/null || return 1
+   pair_control_descriptor | sha256sum | awk '{print $1}'
+}
+
+pair_control_tag()
+{
+   local digest
+   digest="$(pair_control_digest)" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   printf '%s\n' "${digest:0:10}"
+}
+
+
+pair_control_link_mac()
+{
+   local side="$1"
+   python3 - "$(pair_control_digest)" "$side" <<'PAIR_CONTROL_MAC'
+import hashlib,sys
+mac=b'\x02'+hashlib.sha256((sys.argv[1]+':'+sys.argv[2]).encode()).digest()[:5]
+print(':'.join(f'{byte:02x}' for byte in mac))
+PAIR_CONTROL_MAC
+}
+
+
+# The manifest remains the provider's signed-by-ownership description of its
+# own VDC.  The pair UUID is intentionally not inferred here: it is an
+# authority-level relationship checked by the typed caller before it invokes us.
+pair_control_parent_identity()
+{
+   local workspace="$1" runtime="$2" subnet="$3" endpoints="$4" provider_pid
+   pair_regular_root_receipt "$workspace/virtual-datacenter.pid" &&
+      pair_regular_root_receipt "$workspace/virtual-datacenter.identity" &&
+      pair_regular_root_receipt "$workspace/test-cluster-manifest.json" || return 1
+   provider_pid="$(<"$workspace/virtual-datacenter.pid")"
+   provider_process "$provider_pid" "$workspace" || return 1
+   [[ "$(runtime_identity_for_workspace "$workspace" "$provider_pid")" == "$runtime" ]] || return 1
+   if ! python3 - "$workspace/test-cluster-manifest.json" "$workspace" "$runtime" "$subnet" "$endpoints" <<'PAIR_CONTROL_PARENT'
+import ipaddress,json,sys
+path,workspace,runtime,subnet,csv=sys.argv[1:]
+m=json.load(open(path,encoding='utf-8'))
+assert m['workspaceRoot']==workspace
+assert m['parentNamespace']=='pvd-p-'+runtime
+assert m['privateIPv6Subnet']==subnet
+network=ipaddress.IPv6Network(subnet,strict=True)
+manifest=[]
+for node in m['nodes']:
+    address=ipaddress.IPv6Address(node['private6'])
+    assert address in network and address.compressed==node['private6']
+    manifest.append(address)
+assert len(manifest)==len(set(manifest))
+requested=[ipaddress.IPv6Address(value) for value in csv.split(',')]
+assert all(address in manifest for address in requested)
+PAIR_CONTROL_PARENT
+   then
+      return 1
+   fi
+   printf '%s\n' "$provider_pid"
+}
+
+pair_control_lock_both()
+{
+   local first second
+   if [[ "$pair_control_first_workspace" < "$pair_control_second_workspace" ]]; then
+      first="$pair_control_first_workspace"; second="$pair_control_second_workspace"
+   else
+      first="$pair_control_second_workspace"; second="$pair_control_first_workspace"
+   fi
+   pair_lock_workspace "$first" pair_control_first_lock || return 1
+   pair_lock_workspace "$second" pair_control_second_lock || {
+      pair_unlock_workspace "$pair_control_first_lock"; return 1; }
+}
+
+pair_control_unlock_both()
+{
+   pair_unlock_workspace "$pair_control_second_lock" || return 1
+   pair_unlock_workspace "$pair_control_first_lock"
+}
+
+pair_control_owner_live()
+{
+   local pair_dir="$pair_control_dir" pair_pid pair_start pair_mount
+   pair_owner_live || return 1
+   pair_control_pid="$pair_pid"; pair_control_start="$pair_start"; pair_control_mount="$pair_mount"
+}
+
+pair_control_owner_dead()
+{
+   local pair_dir="$pair_control_dir"
+   pair_owner_dead
+}
+
+pair_control_link_owned()
+{
+   local side="$1" link="$2" receipt intent
+   receipt="$pair_control_dir/$side-link"; intent="$pair_control_dir/$side-link-intent"
+   if [[ -f "$receipt" && ! -L "$receipt" ]]; then
+      [[ "$(pair_link_identity "pc-$side" "$link")" == "$(<"$receipt")" ]]
+      return
+   fi
+   # An owner can die after the veth move but before recording its ifindex.
+   # The prewritten, descriptor-bound peer MAC identifies only this incomplete
+   # link, and only before a route made it externally reachable.
+   [[ -f "$intent" && ! -L "$intent" && ! -f "$pair_control_dir/$side-route" ]] || return 1
+   ip -n "pc-$side" -d -j link show "$link" | python3 -c '
+import json,sys
+links=json.load(sys.stdin); assert len(links)==1
+link=links[0]
+assert link["linkinfo"]["info_kind"]=="veth" and link["address"]==sys.argv[1]
+' "$(<"$intent")"
+}
+
+pair_control_remove_owned_link()
+{
+   local side="$1" link="$2" present
+   if pair_link_presence "pc-$side" "$link"; then :; else
+      present=$?; [[ "$present" == 1 ]] && return 0; return 1
+   fi
+   pair_control_link_owned "$side" "$link" || return 1
+   ip -n "pc-$side" link del "$link" || {
+      if pair_link_presence "pc-$side" "$link"; then return 1; else
+         present=$?; [[ "$present" == 1 ]] && return 0; return 1
+      fi
+   }
+}
+
+pair_control_addresses()
+{
+   local digest
+   digest="$(pair_control_digest)" || return 1
+   python3 - "$digest" "$pair_control_first_subnet" "$pair_control_second_subnet" <<'PAIR_CONTROL_ADDRESSES'
+import ipaddress,sys
+digest,first,second=sys.argv[1:]
+assert len(digest)==64
+# The operation digest supplies stable, high host bits in each existing VDC
+# prefix.  The manifest validator rejects collisions with every current node.
+def endpoint(prefix,offset):
+    network=ipaddress.IPv6Network(prefix,strict=True)
+    host=(int(digest[offset:offset+16],16) | (1<<63))
+    host &= (1<<64)-1
+    assert host not in (0,1)
+    return ipaddress.IPv6Address(int(network.network_address)|host)
+first_address=endpoint(first,0); second_address=endpoint(second,16)
+assert first_address not in ipaddress.IPv6Network(second) and second_address not in ipaddress.IPv6Network(first)
+print(f'{first_address}/64 {first_address} {second_address}/64 {second_address}')
+PAIR_CONTROL_ADDRESSES
+}
+
+pair_control_cleanup_inside()
+{
+   local status=0 side other_subnet gateway link expected route
+   for side in first second; do
+      [[ -e "/run/netns/pc-$side" ]] || continue
+      if [[ "$side" == first ]]; then other_subnet="$pair_control_second_subnet"; gateway="${pair_control_first_router:-}"; link="${pair_control_first_link:-}"; else other_subnet="$pair_control_first_subnet"; gateway="${pair_control_second_router:-}"; link="${pair_control_second_link:-}"; fi
+      if [[ -e "$pair_control_dir/$side-route-intent" || -e "$pair_control_dir/$side-route" ]]; then
+         [[ -f "$pair_control_dir/$side-route-intent" && ! -L "$pair_control_dir/$side-route-intent" && -n "$gateway" ]] || { status=1; continue; }
+         expected="$(<"$pair_control_dir/$side-route-intent")"
+         [[ "$expected" == "$other_subnet via $gateway dev vdcbr0" ]] || { status=1; continue; }
+         if [[ -e "$pair_control_dir/$side-route" ]]; then
+            [[ -f "$pair_control_dir/$side-route" && ! -L "$pair_control_dir/$side-route" && "$(<"$pair_control_dir/$side-route")" == "$expected" ]] || { status=1; continue; }
+         fi
+         route="$(ip -n "pc-$side" -o -6 route show exact "$other_subnet")" || { status=1; continue; }
+         # A crash may occur after intent persistence and before route add.
+         # Empty output is a completed no-op; any other route must exactly
+         # match this operation's immutable intent before deletion.
+         if [[ -n "$route" ]]; then
+            [[ "$route" == "$expected" || "$route" == "$expected "* ]] || { status=1; continue; }
+            ip -n "pc-$side" -6 route del "$other_subnet" via "$gateway" dev vdcbr0 || status=1
+         fi
+      fi
+   done
+   # The router is owned only by this supervisor's private mount namespace.
+   if [[ -n "${pair_control_router_ns:-}" && -e "/run/netns/$pair_control_router_ns" ]]; then
+      [[ -f "$pair_control_dir/router-namespace" && "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] || status=1
+      [[ "$status" != 0 ]] || ip netns del "$pair_control_router_ns" || status=1
+   fi
+   for side in first second; do
+      [[ -e "/run/netns/pc-$side" ]] || continue
+      link="${pair_control_first_link:-}"; [[ "$side" == first ]] || link="${pair_control_second_link:-}"
+      [[ -n "$link" ]] && pair_control_remove_owned_link "$side" "$link" || status=1
+      umount "/run/netns/pc-$side" || status=1
+   done
+   [[ "$status" == 0 ]] && pair_write "$pair_control_dir/phase" removed
+   return "$status"
+}
+
+pair_control_bind_parents()
+{
+   local side workspace runtime subnet endpoints provider_pid source inode
+   for side in first second; do
+      workspace="$pair_control_first_workspace"; runtime="$pair_control_first_runtime"; subnet="$pair_control_first_subnet"; endpoints="$pair_control_first_endpoints"
+      [[ "$side" == first ]] || { workspace="$pair_control_second_workspace"; runtime="$pair_control_second_runtime"; subnet="$pair_control_second_subnet"; endpoints="$pair_control_second_endpoints"; }
+      provider_pid="$(pair_control_parent_identity "$workspace" "$runtime" "$subnet" "$endpoints")" || return 1
+      source="/proc/$provider_pid/root/run/netns/pvd-p-$runtime"
+      [[ -e "$source" ]] || return 1
+      touch "/run/netns/pc-$side"
+      mount --bind "$source" "/run/netns/pc-$side" || return 1
+      inode="$(stat -Lc %i "/run/netns/pc-$side")" || return 1
+      if [[ -e "$pair_control_dir/$side-namespace" ]]; then
+         [[ "$(<"$pair_control_dir/$side-namespace")" == "$inode" ]] || return 1
+      else
+         pair_write "$pair_control_dir/$side-namespace" "$inode"
+      fi
+   done
+}
+
+# A supervisor's retained bind mount is useful for in-owner cleanup, but it is
+# not proof that the VDC currently selected by the descriptor is still live.
+# Query therefore rebinds identity to the live provider and checks the exact
+# saved namespace inode before reporting a usable carrier.
+pair_control_current_parent_bound()
+{
+   local side="$1" workspace runtime subnet endpoints provider_pid source saved current
+   workspace="$pair_control_first_workspace"; runtime="$pair_control_first_runtime"; subnet="$pair_control_first_subnet"; endpoints="$pair_control_first_endpoints"
+   [[ "$side" == first ]] || { workspace="$pair_control_second_workspace"; runtime="$pair_control_second_runtime"; subnet="$pair_control_second_subnet"; endpoints="$pair_control_second_endpoints"; }
+   provider_pid="$(pair_control_parent_identity "$workspace" "$runtime" "$subnet" "$endpoints")" || return 1
+   source="/proc/$provider_pid/root/run/netns/pvd-p-$runtime"
+   [[ -e "$source" && -f "$pair_control_dir/$side-namespace" && ! -L "$pair_control_dir/$side-namespace" ]] || return 1
+   saved="$(<"$pair_control_dir/$side-namespace")"
+   current="$(stat -Lc %i "$source")" || return 1
+   [[ "$saved" == "$current" && "$(stat -Lc %i "/run/netns/pc-$side")" == "$saved" ]]
+}
+
+pair_control_bridge_mac()
+{
+   ip -n "pc-$1" -d -j link show vdcbr0 | python3 -c '
+import json,re,sys
+rows=json.load(sys.stdin)
+assert len(rows)==1 and rows[0]["linkinfo"]["info_kind"]=="bridge"
+mac=rows[0]["address"]
+assert re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}",mac) and int(mac[:2],16)&1==0
+print(mac)
+'
+}
+
+pair_control_firewall_digest()
+{
+   # Counter changes are expected once the carrier is live; hash only the
+   # policy and rule shape, not packet/byte counters.
+   ip netns exec "$pair_control_router_ns" ip6tables-save |
+      sed -E '/^#/d; s/\[[0-9]+:[0-9]+\]/[0:0]/g' | sha256sum | awk '{print $1}'
+}
+
+pair_control_firewall()
+{
+   local left right digest
+   # The router namespace is new, but flush explicitly so the journaled digest
+   # describes exactly the forwarding policy installed below.
+   ip netns exec "$pair_control_router_ns" ip6tables -F
+   ip netns exec "$pair_control_router_ns" ip6tables -P FORWARD DROP
+   IFS=, read -r -a pair_control_first_endpoint_array <<< "$pair_control_first_endpoints"
+   IFS=, read -r -a pair_control_second_endpoint_array <<< "$pair_control_second_endpoints"
+   for left in "${pair_control_first_endpoint_array[@]}"; do for right in "${pair_control_second_endpoint_array[@]}"; do
+      ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -s "$left" -d "$right" -p tcp --dport "$pair_control_port" -j ACCEPT
+      ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -s "$right" -d "$left" -p tcp --dport "$pair_control_port" -j ACCEPT
+   done; done
+   ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+   ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+   # NDP is link-local to each VDC bridge and router interface. It never
+   # traverses this router's FORWARD hook, so there is no broad ICMPv6 rule.
+   digest="$(pair_control_firewall_digest)" || return 1
+   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+   pair_write "$pair_control_dir/firewall-digest" "$digest"
+}
+
+pair_control_serve()
+{
+   pair_control_parse "$@" || return
+   [[ "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || return 1
+   mount --make-rprivate /
+   pair_write "$pair_control_dir/owner" "$$ $(awk '{sub(/^.*\) /, ""); print $20}' /proc/$$/stat) $(stat -Lc %i /proc/$$/ns/mnt)"
+   mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/netns
+   pair_control_router_ns=""; pair_control_first_link=""; pair_control_second_link=""
+   pair_control_first_router=""; pair_control_second_router=""
+   trap 'pair_control_cleanup_inside || true' EXIT
+   trap 'exit 0' TERM INT HUP
+   pair_control_bind_parents || return 1
+   local first_bridge_mac second_bridge_mac
+   first_bridge_mac="$(pair_control_bridge_mac first)" || return 1
+   second_bridge_mac="$(pair_control_bridge_mac second)" || return 1
+   pair_write "$pair_control_dir/first-bridge-mac" "$first_bridge_mac"
+   pair_write "$pair_control_dir/second-bridge-mac" "$second_bridge_mac"
+   local tag addresses first_mac second_mac first_link_identity second_link_identity router_namespace_inode first_route_intent second_route_intent
+   tag="$(pair_control_tag)" || return 1
+   pair_control_router_ns="pc-r-$tag"
+   pair_control_first_link="pc${tag}a"; pair_control_second_link="pc${tag}b"
+   addresses="$(pair_control_addresses)" || return 1
+   read -r pair_control_first_router_cidr pair_control_first_router pair_control_second_router_cidr pair_control_second_router <<< "$addresses" || return 1
+   # No pair may reuse a node's private IPv6 identity.  This checks the live
+   # manifest as well as the deterministic descriptor-derived router address.
+   if ! python3 - "$pair_control_first_workspace/test-cluster-manifest.json" "$pair_control_second_workspace/test-cluster-manifest.json" "$pair_control_first_router" "$pair_control_second_router" <<'PAIR_CONTROL_ROUTER_UNIQUE'
+import json,sys
+first,second,first_router,second_router=sys.argv[1:]
+all_addresses={n['private6'] for path in (first,second) for n in json.load(open(path))['nodes']}
+assert first_router not in all_addresses and second_router not in all_addresses
+PAIR_CONTROL_ROUTER_UNIQUE
+   then
+      return 1
+   fi
+   [[ -z "$(ip -n pc-first -o -6 route show exact "$pair_control_second_subnet")" && -z "$(ip -n pc-second -o -6 route show exact "$pair_control_first_subnet")" ]] || return 1
+   ip netns add "$pair_control_router_ns"
+   router_namespace_inode="$(stat -Lc %i "/run/netns/$pair_control_router_ns")" || return 1
+   pair_write "$pair_control_dir/router-namespace" "$router_namespace_inode"
+   first_mac="$(pair_control_link_mac first)" || return 1
+   second_mac="$(pair_control_link_mac second)" || return 1
+   pair_write "$pair_control_dir/first-link-intent" "$first_mac"
+   pair_write "$pair_control_dir/second-link-intent" "$second_mac"
+   ip -n "$pair_control_router_ns" link add first0 type veth peer name "$pair_control_first_link" address "$first_mac"
+   ip -n "$pair_control_router_ns" link set "$pair_control_first_link" netns pc-first
+   ip -n "$pair_control_router_ns" link add second0 type veth peer name "$pair_control_second_link" address "$second_mac"
+   ip -n "$pair_control_router_ns" link set "$pair_control_second_link" netns pc-second
+   ip -n pc-first link set "$pair_control_first_link" master vdcbr0
+   ip -n pc-second link set "$pair_control_second_link" master vdcbr0
+   first_link_identity="$(pair_link_identity pc-first "$pair_control_first_link")" || return 1
+   second_link_identity="$(pair_link_identity pc-second "$pair_control_second_link")" || return 1
+   pair_write "$pair_control_dir/first-link" "$first_link_identity"
+   pair_write "$pair_control_dir/second-link" "$second_link_identity"
+   ip -n "$pair_control_router_ns" -6 addr add "$pair_control_first_router_cidr" dev first0
+   ip -n "$pair_control_router_ns" -6 addr add "$pair_control_second_router_cidr" dev second0
+   # Install and journal the restrictive policy before either forwarding or a
+   # cross-VDC route becomes live.
+   pair_control_firewall || return 1
+   ip -n "$pair_control_router_ns" link set first0 up
+   ip -n "$pair_control_router_ns" link set second0 up
+   ip -n pc-first link set "$pair_control_first_link" up
+   ip -n pc-second link set "$pair_control_second_link" up
+   # VDC parents are created with IPv6 forwarding already enabled.  It is
+   # shared parent state, never toggled or restored by an individual pair.
+   [[ "$(ip netns exec pc-first sysctl -n net.ipv6.conf.all.forwarding)" == 1 && "$(ip netns exec pc-second sysctl -n net.ipv6.conf.all.forwarding)" == 1 ]] || return 1
+   ip netns exec "$pair_control_router_ns" sysctl -q -w net.ipv6.conf.all.forwarding=1
+   first_route_intent="$pair_control_second_subnet via $pair_control_first_router dev vdcbr0"
+   pair_write "$pair_control_dir/first-route-intent" "$first_route_intent"
+   ip -n pc-first -6 route add "$pair_control_second_subnet" via "$pair_control_first_router" dev vdcbr0
+   pair_write "$pair_control_dir/first-route" "$first_route_intent"
+   second_route_intent="$pair_control_first_subnet via $pair_control_second_router dev vdcbr0"
+   pair_write "$pair_control_dir/second-route-intent" "$second_route_intent"
+   ip -n pc-second -6 route add "$pair_control_first_subnet" via "$pair_control_second_router" dev vdcbr0
+   pair_write "$pair_control_dir/second-route" "$second_route_intent"
+   pair_write "$pair_control_dir/phase" prepared
+   while [[ ! -e "$pair_control_dir/stop" ]]; do sleep 0.2; done
+}
+
+pair_control_recover_remove()
+{
+   pair_control_parse "$@" || return
+   [[ "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || return 1
+   pair_control_owner_dead || return 1
+   mount --make-rprivate /
+   mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs /run/netns
+   # Bind only a parent whose durable namespace identity still matches the
+   # journal. A restarted/reused VDC is never a cleanup target.
+   pair_control_bind_parents || return 1
+   local tag
+   tag="$(pair_control_tag)" || return 1
+   pair_control_router_ns="pc-r-$tag"; pair_control_first_link="pc${tag}a"; pair_control_second_link="pc${tag}b"
+   local addresses
+   addresses="$(pair_control_addresses)" || return 1
+   read -r _ pair_control_first_router _ pair_control_second_router <<< "$addresses" || return 1
+   pair_control_cleanup_inside
+}
+
+pair_control_query_inside()
+{
+   [[ -f "$pair_control_dir/phase" && ! -L "$pair_control_dir/phase" && "$(<"$pair_control_dir/phase")" == prepared && ! -e "$pair_control_dir/stop" ]] || { echo "pair-control query rejected: phase" >&2; return 1; }
+   [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" &&
+      -e "/run/netns/$pair_control_router_ns" &&
+      "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] || { echo "pair-control query rejected: router-namespace" >&2; return 1; }
+   pair_control_current_parent_bound first || { echo "pair-control query rejected: first-current-parent" >&2; return 1; }
+   pair_control_current_parent_bound second || { echo "pair-control query rejected: second-current-parent" >&2; return 1; }
+   local side bridge_mac
+   for side in first second; do
+      bridge_mac="$(pair_control_bridge_mac "$side")" || return 1
+      [[ -f "$pair_control_dir/$side-bridge-mac" && ! -L "$pair_control_dir/$side-bridge-mac" &&
+         "$bridge_mac" == "$(<"$pair_control_dir/$side-bridge-mac")" ]] || {
+         echo "pair-control query rejected: $side-bridge-mac" >&2; return 1; }
+   done
+   pair_control_link_owned first "$pair_control_first_link" || { echo "pair-control query rejected: first-link" >&2; return 1; }
+   pair_control_link_owned second "$pair_control_second_link" || { echo "pair-control query rejected: second-link" >&2; return 1; }
+   [[ -f "$pair_control_dir/first-route-intent" && ! -L "$pair_control_dir/first-route-intent" &&
+      -f "$pair_control_dir/first-route" && ! -L "$pair_control_dir/first-route" &&
+      "$(<"$pair_control_dir/first-route-intent")" == "$pair_control_second_subnet via $pair_control_first_router dev vdcbr0" &&
+      "$(<"$pair_control_dir/first-route")" == "$(<"$pair_control_dir/first-route-intent")" ]] || { echo "pair-control query rejected: first-route-journal" >&2; return 1; }
+   [[ -f "$pair_control_dir/second-route-intent" && ! -L "$pair_control_dir/second-route-intent" &&
+      -f "$pair_control_dir/second-route" && ! -L "$pair_control_dir/second-route" &&
+      "$(<"$pair_control_dir/second-route-intent")" == "$pair_control_first_subnet via $pair_control_second_router dev vdcbr0" &&
+      "$(<"$pair_control_dir/second-route")" == "$(<"$pair_control_dir/second-route-intent")" ]] || { echo "pair-control query rejected: second-route-journal" >&2; return 1; }
+   [[ "$(ip -n pc-first -o -6 route show exact "$pair_control_second_subnet")" == "$(<"$pair_control_dir/first-route-intent")"* ]] || { echo "pair-control query rejected: first-route" >&2; return 1; }
+   [[ "$(ip -n pc-second -o -6 route show exact "$pair_control_first_subnet")" == "$(<"$pair_control_dir/second-route-intent")"* ]] || { echo "pair-control query rejected: second-route" >&2; return 1; }
+   [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
+      "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
+      "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || { echo "pair-control query rejected: firewall" >&2; return 1; }
+   printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
+      "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
+}
+
+pair_control_action()
+{
+   local action="$1"; shift
+   [[ "$action" == query || "$action" == remove ]] || return 2
+   pair_control_parse "$@" || return
+   if [[ "$action" == remove && ! -e "$pair_control_dir" ]]; then return 0; fi
+   [[ -r "$pair_control_dir/descriptor" && ! -L "$pair_control_dir/descriptor" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" &&
+      -f "$pair_control_dir/phase" && ! -L "$pair_control_dir/phase" ]] || return 1
+   pair_control_lock_both || return 1
+   if [[ "$(<"$pair_control_dir/phase")" == removed ]]; then pair_control_unlock_both; [[ "$action" == remove ]]; return; fi
+   if ! pair_control_owner_live; then
+      pair_control_unlock_both
+      [[ "$action" == remove ]] || return 1
+      exec unshare --mount --propagation private -- bash "$0" --pair-control-recover-remove "$@"
+   fi
+   if [[ "$action" == remove ]]; then
+      pair_write "$pair_control_dir/stop" requested
+      pair_control_unlock_both
+      for _ in $(seq 1 100); do [[ "$(<"$pair_control_dir/phase")" == removed ]] && return 0; sleep 0.1; done
+      return 1
+   fi
+   pair_control_unlock_both
+   exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside "$@"
+}
+
+pair_control_inside()
+{
+   pair_control_parse "$@" || return
+   pair_control_owner_live || { echo "pair-control query rejected: live-owner" >&2; return 1; }
+   [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$pair_control_mount" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || { echo "pair-control query rejected: owner-mount-or-descriptor" >&2; return 1; }
+   local tag
+   tag="$(pair_control_tag)" || return 1
+   pair_control_router_ns="pc-r-$tag"; pair_control_first_link="pc${tag}a"; pair_control_second_link="pc${tag}b"
+   local addresses
+   addresses="$(pair_control_addresses)" || return 1
+   read -r _ pair_control_first_router _ pair_control_second_router <<< "$addresses" || return 1
+   pair_control_query_inside
+}
+
+pair_control_launch()
+{
+   pair_control_parse "$@" || return
+   command -v ip >/dev/null && command -v ip6tables >/dev/null && command -v ip6tables-save >/dev/null && command -v sha256sum >/dev/null && command -v sed >/dev/null || return 1
+   mkdir -p -m 0700 /mnt/prodigy-vdc-pair-control
+   [[ ! -L /mnt/prodigy-vdc-pair-control ]] || return 1
+   pair_control_lock_both || return 1
+   if [[ -d "$pair_control_dir" ]]; then
+      [[ -r "$pair_control_dir/descriptor" && ! -L "$pair_control_dir/descriptor" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" && "$(<"$pair_control_dir/phase")" == prepared ]] || { pair_control_unlock_both; return 1; }
+      pair_control_owner_live || { pair_control_unlock_both; return 1; }
+      pair_control_unlock_both
+      nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside "$@"
+      return
+   fi
+   mkdir -m 0700 "$pair_control_dir" || { pair_control_unlock_both; return 1; }
+   pair_write "$pair_control_dir/descriptor" "$(pair_control_descriptor)"
+   pair_write "$pair_control_dir/phase" preparing
+   # Validate both bound parent identities before the detached supervisor can
+   # create an interface in either namespace.
+   pair_control_parent_identity "$pair_control_first_workspace" "$pair_control_first_runtime" "$pair_control_first_subnet" "$pair_control_first_endpoints" >/dev/null &&
+      pair_control_parent_identity "$pair_control_second_workspace" "$pair_control_second_runtime" "$pair_control_second_subnet" "$pair_control_second_endpoints" >/dev/null || {
+      pair_write "$pair_control_dir/phase" removed; pair_control_unlock_both; return 1; }
+   pair_control_unlock_both
+   setsid nohup unshare --mount --propagation private -- bash "$0" --pair-control-serve "$@" >"$pair_control_dir/provider.log" 2>&1 </dev/null &
+   for _ in $(seq 1 100); do
+      if [[ "$(<"$pair_control_dir/phase")" == prepared ]]; then pair_control_owner_live && return 0; fi
+      [[ "$(<"$pair_control_dir/phase")" == removed ]] && break
+      sleep 0.1
+   done
+   cat "$pair_control_dir/provider.log" >&2
+   return 1
+}
+
 pair_launch()
 {
    pair_parse "$@"
@@ -1730,6 +2249,11 @@ case "${1:-}" in
    --pair-recover-remove) shift; pair_recover_remove "$@"; exit ;;
    --pair-action) shift; pair_action "$@"; exit ;;
    --pair-inside) shift; pair_inside "$@"; exit ;;
+   --pair-control-launch) shift; pair_control_launch "$@"; exit ;;
+   --pair-control-serve) shift; pair_control_serve "$@"; exit ;;
+   --pair-control-recover-remove) shift; pair_control_recover_remove "$@"; exit ;;
+   --pair-control-action) shift; pair_control_action "$@"; exit ;;
+   --pair-control-inside) shift; pair_control_inside "$@"; exit ;;
    --bounded-log)
       shift
       bounded_machine_log "$@"
@@ -2088,6 +2612,11 @@ then
 fi
 
 ip netns exec "${parent_ns}" ip link add vdcbr0 type bridge
+# Pin the generated address before any machine can cache this gateway. Linux
+# otherwise chooses a member port's MAC again when a later transit joins.
+bridge_mac="$(ip -n "${parent_ns}" -j link show vdcbr0 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["address"])')"
+[[ "$bridge_mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]
+ip -n "${parent_ns}" link set vdcbr0 address "$bridge_mac"
 ip netns exec "${parent_ns}" ip link set dev vdcbr0 type bridge mcast_snooping 0
 ip netns exec "${parent_ns}" ip link set vdcbr0 mtu "${underlay_mtu}" gso_max_size "${underlay_mtu}" gso_max_segs 1 gro_max_size "${underlay_mtu}" gso_ipv4_max_size "${underlay_mtu}" gro_ipv4_max_size "${underlay_mtu}"
 ip netns exec "${parent_ns}" ip addr add "${private4_prefix}.1/24" dev vdcbr0
@@ -2099,6 +2628,10 @@ else
    ip netns exec "${parent_ns}" ip -6 addr add 2001:db8:100::1/64 nodad dev vdcbr0
 fi
 ip netns exec "${parent_ns}" ip link set vdcbr0 up
+# The VDC parent is the owned IPv6 router for its children and any authorized
+# pair-control transit. Individual pair operations must never toggle this
+# shared namespace setting or try to restore it during cleanup.
+ip netns exec "${parent_ns}" sysctl -q -w net.ipv6.conf.all.forwarding=1
 
 for index in $(seq 1 "${machine_count}")
 do

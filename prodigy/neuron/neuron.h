@@ -49,6 +49,7 @@
 #include <prodigy/transport.artifact.h>
 #include <prodigy/cluster.pair.projection.h>
 #include <switchboard/overlay.route.h>
+#include <switchboard/pair.control.h>
 #include <switchboard/switchboard.h>
 #include <switchboard/whitehole.route.h>
 #include <switchboard/host.tcx.retention.h>
@@ -3066,9 +3067,13 @@ public:
   bool transportPeerProjectionPersistencePending = false;
   ProdigyLocalClusterPairControlProjection clusterPairControlProjection;
   bool clusterPairControlProjectionPersistencePending = false;
+  std::unique_ptr<SwitchboardPairControlRuntime> pairControlRuntime;
 
   virtual bool installClusterPairControlProjection(const ProdigyLocalClusterPairControlProjection& projection)
-  { return prodigyLocalClusterPairControlProjectionValid(projection, true); }
+  {
+    return prodigyLocalClusterPairControlProjectionValid(projection, true) &&
+        (!pairControlRuntime || pairControlRuntime->installProjection(projection));
+  }
 
   virtual bool persistClusterPairControlProjection(
       const ProdigyLocalClusterPairControlProjection&, uint128_t peerUUID, std::function<void(bool)> completion)
@@ -3523,6 +3528,13 @@ public:
     RingDispatcher::installMultiplexee(&deferredHardwareInventoryWake, this);
     armDeferredHardwareInventoryWakePoll();
     queueBrainAccept();
+    pairControlRuntime = std::make_unique<SwitchboardPairControlRuntime>();
+    if ((clusterPairControlProjection.protocolVersion != 0 &&
+         !pairControlRuntime->installProjection(clusterPairControlProjection)) || !pairControlRuntime->start())
+    {
+      std::fprintf(stderr, "neuron pair control initialization failed\n");
+      std::abort();
+    }
     cleanupExpiredFailedContainerArtifacts();
     ensureFailedContainerArtifactGCTickQueued();
     beginDeferredHardwareInventoryCollection();
@@ -4433,7 +4445,8 @@ public:
   {
     const bool artifactsReady = !artifactIO || artifactIO->quiesceForExec();
     const bool ringsReady = !switchboard || switchboard->quiesceRingPreparationForExec();
-    return artifactsReady && ringsReady;
+    const bool pairControlReady = !pairControlRuntime || pairControlRuntime->quiesce();
+    return artifactsReady && ringsReady && pairControlReady;
   }
 
   bool quiesceContainerControlSocketsForBundleExec(void) override

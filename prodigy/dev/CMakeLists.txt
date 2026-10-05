@@ -654,6 +654,7 @@ target_compile_options(prodigy_mothership_upgrade_admission_registry_unit PRIVAT
 add_executable(prodigy_cousin_route_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_route_unit.cpp)
 add_executable(prodigy_cluster_pair_keys_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_pair_keys_unit.cpp)
 add_executable(prodigy_transport_aegis_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_aegis_unit.cpp)
+add_executable(prodigy_pair_control_ring_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pair_control_ring_unit.cpp)
 add_executable(prodigy_transport_crypto_benchmark ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_crypto_benchmark.cpp)
 target_compile_definitions(prodigy_cousin_route_unit PRIVATE PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_cluster_pair_keys_unit PRIVATE PRODIGY_DEBUG=1)
@@ -769,6 +770,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_cousin_route_unit
    prodigy_cluster_pair_keys_unit
    prodigy_transport_aegis_unit
+   prodigy_pair_control_ring_unit
    prodigy_transport_crypto_benchmark
    prodigy_mothership_tidesdb_migration_unit
    prodigy_mothership_tidesdb_migration_command_unit
@@ -2465,6 +2467,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_cluster_pair_keys_unit COMMAND $<TARGET_FILE:prodigy_cluster_pair_keys_unit>)
    add_test(NAME prodigy_transport_aegis_unit COMMAND $<TARGET_FILE:prodigy_transport_aegis_unit>)
    set_tests_properties(prodigy_transport_aegis_unit PROPERTIES TIMEOUT 30)
+   add_test(NAME prodigy_pair_control_ring_unit COMMAND $<TARGET_FILE:prodigy_pair_control_ring_unit>)
+   set_tests_properties(prodigy_pair_control_ring_unit PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
    add_test(NAME prodigy_noise_backend_unit
       COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
               "${PRODIGY_NOISE_CARGO_EXECUTABLE}" test --locked --offline --release --manifest-path "${PRODIGY_NOISE_MANIFEST}")

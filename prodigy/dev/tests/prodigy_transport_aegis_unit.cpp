@@ -242,5 +242,63 @@ int main()
     if (client.fd >= 0) { close(client.fd); client.fd = -1; }
     if (server.fd >= 0) { close(server.fd); server.fd = -1; }
   }
+  for (unsigned variant = 0; variant < 4; ++variant)
+  {
+    ProdigyTransportTLSStream client, server;
+    client.rBuffer.reserve(8192); server.rBuffer.reserve(8192);
+    client.wBuffer.reserve(16 * 1024); server.wBuffer.reserve(16 * 1024);
+    const String clientHint = variant == 1 ? String("unapproved-client-claim"_ctv) : String("pair-9/client-11"_ctv);
+    const String selectedServerHint = "pair-9/server-22"_ctv;
+    auto clientResolver = [&](const String& hint, std::array<uint8_t, 32>& key, String& context, uint128_t& peer) {
+      if (hint != selectedServerHint) return false;
+      key = psk; context.assign("pair-carrier/deferred-selection"_ctv); peer = 22; return true;
+    };
+    auto deferredServerResolver = [&](const String& hint, String& localHint,
+                                      std::array<uint8_t, 32>& key, String& context, uint128_t& peer) {
+      if (variant == 1 || hint != "pair-9/client-11"_ctv) return false;
+      if (variant == 2) { localHint.resize(513); return true; }
+      localHint.assign(selectedServerHint); key = psk;
+      context.assign("pair-carrier/deferred-selection"_ctv); peer = 11; return true;
+    };
+    const bool successVariant = variant == 0 || variant == 3;
+    bool ok = client.beginTransportAEGISWithPrelude(false, 11, clientHint, clientResolver) &&
+              server.beginTransportAEGISWithDeferredServerPrelude(22, deferredServerResolver) &&
+              connectedPair(client.fd, server.fd);
+    if (ok && successVariant)
+      expect(client.prepareTransportTLSSend() && client.encryptedBytesToSend() == 8 + clientHint.size(),
+             "fixed_prelude_initiator_first_flight_is_pga_only_until_peer_claim_resolves");
+    const String early = "must-not-arrive-before-auth"_ctv;
+    if (ok && successVariant) ok = client.wBuffer.need(early.size());
+    if (ok && successVariant) client.wBuffer.append(early);
+    bool rejected = false, earlyLeak = false;
+    const uint32_t clientSend = variant == 3 ? 8192 : 5, serverRecv = variant == 3 ? 8192 : 3;
+    const uint32_t serverSend = variant == 3 ? 8192 : 7, clientRecv = variant == 3 ? 8192 : 4;
+    for (unsigned i = 0; ok && i < 10000 && (!client.isTransportNegotiated() || !server.isTransportNegotiated()); ++i)
+    {
+      if (!pumpSocket(client, server, clientSend, serverRecv)) { rejected = true; break; }
+      if (!server.isTransportNegotiated() && !server.rBuffer.empty()) earlyLeak = true;
+      if (!pumpSocket(server, client, serverSend, clientRecv)) { rejected = true; break; }
+    }
+    if (successVariant)
+    {
+      expect(ok && !rejected && client.isTransportNegotiated() && server.isTransportNegotiated() &&
+                 client.tlsPeerUUID == 22 && server.tlsPeerUUID == 11 && !earlyLeak,
+             variant == 3 ? "deferred_server_prelude_coalesced_handshake_withholds_unauthenticated_application"
+                          : "deferred_server_prelude_fragmented_handshake_withholds_unauthenticated_application");
+      for (unsigned i = 0; ok && i < 10000 && server.rBuffer.outstandingBytes() < early.size(); ++i)
+        ok = pumpSocket(client, server, clientSend, serverRecv) && pumpSocket(server, client, serverSend, clientRecv);
+      expect(ok && server.rBuffer.outstandingBytes() == early.size() &&
+                 std::memcmp(server.rBuffer.pHead(), early.data(), early.size()) == 0,
+             "deferred_server_prelude_releases_queued_application_only_after_mutual_confirmation");
+    }
+    else
+    {
+      expect(ok && rejected && !server.tlsPeerVerified && !server.isTransportNegotiated(),
+             variant == 1 ? "deferred_server_prelude_rejects_unknown_public_claim"
+                          : "deferred_server_prelude_rejects_oversized_selected_local_claim");
+    }
+    if (client.fd >= 0) { close(client.fd); client.fd = -1; }
+    if (server.fd >= 0) { close(server.fd); server.fd = -1; }
+  }
   return failures == 0 ? 0 : 1;
 }

@@ -18410,6 +18410,119 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  bool bindPairControlBoundary(const MothershipClusterPairEnrollmentIntent& intent,
+                               MothershipPairControlBoundaryDescriptor& boundary, String& failure)
+  {
+    boundary = {};
+    boundary.operationUUID = intent.operationUUID;
+    boundary.firstClusterUUID = intent.firstClusterUUID;
+    boundary.secondClusterUUID = intent.secondClusterUUID;
+    boundary.firstEndpoints = intent.firstEndpoints;
+    boundary.secondEndpoints = intent.secondEndpoints;
+    boundary.port = mothershipPairControlBoundaryPort;
+    auto bindSide = [&](uint128_t uuid, const Vector<ClusterPairControlEndpoint>& endpoints,
+                        String& workspace, String& runtime, String& subnet) {
+      MothershipProdigyCluster cluster;
+      String identity; identity.assignItoh(uuid);
+      { auto registry = openClusterRegistry();
+        if (!registry.getClusterByIdentity(identity, cluster, &failure)) return false; }
+      if (!mothershipClusterUsesVirtualDatacenter(cluster) || cluster.test.enableFakeIpv4Boundary ||
+          cluster.datacenterFragment == 0 || endpoints.empty())
+      { failure.assign("pair-control transit requires independent test datacenters without fake IPv4 boundaries"_ctv); return false; }
+      for (const auto& endpoint : endpoints)
+      {
+        uint32_t matches = 0;
+        for (const auto& machine : cluster.topology.machines)
+        {
+          if (machine.uuid != endpoint.nodeUUID) continue;
+          for (const auto& address : machine.addresses.privateAddresses)
+          {
+            String text = address.address; uint8_t bytes[16] = {};
+            if (::inet_pton(AF_INET6, text.c_str(), bytes) == 1 &&
+                std::memcmp(bytes, endpoint.address.v6, sizeof(bytes)) == 0) ++matches;
+          }
+        }
+        if (matches != 1)
+        { failure.assign("pair-control endpoint does not bind its registered machine identity and private address"_ctv); return false; }
+      }
+      String private4, private6, public6;
+      mothershipVirtualDatacenterMachineAddresses(1, cluster.datacenterFragment, false, private4, private6, public6);
+      uint8_t network[16] = {}; char canonical[INET6_ADDRSTRLEN] = {};
+      if (::inet_pton(AF_INET6, private6.c_str(), network) != 1) return false;
+      std::memset(network + 8, 0, 8);
+      if (!::inet_ntop(AF_INET6, network, canonical, sizeof(canonical))) return false;
+      subnet.assign(canonical); subnet.append("/64"_ctv);
+      workspace = cluster.test.workspaceRoot;
+      String path;
+      mothershipVirtualDatacenterPath(workspace, "virtual-datacenter.identity", path);
+      if (!mothershipReadProcFile(path, runtime))
+      { failure.assign("pair-control datacenter runtime identity is unavailable"_ctv); return false; }
+      if (!runtime.empty() && runtime[runtime.size() - 1] == '\n') runtime.resize(runtime.size() - 1);
+      return true;
+    };
+    return bindSide(intent.firstClusterUUID, intent.firstEndpoints, boundary.firstWorkspace,
+                    boundary.firstRuntimeIdentity, boundary.firstPrivateIPv6Subnet) &&
+        bindSide(intent.secondClusterUUID, intent.secondEndpoints, boundary.secondWorkspace,
+                 boundary.secondRuntimeIdentity, boundary.secondPrivateIPv6Subnet) &&
+        mothershipPairControlBoundaryValid(boundary, &failure);
+  }
+
+  void runTestClusterPairControl(int argc, char *argv[])
+  {
+    String failure, action;
+    uint128_t operationUUID = 0;
+    TestPairLifecycleLock lock;
+    bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    if (valid) action.assign(argv[1]);
+    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv) &&
+        lockTestPairLifecycle(lock, failure);
+    MothershipClusterPairEnrollmentIntent intent;
+    if (valid) { auto registry = openClusterRegistry(); valid = registry.loadClusterPairEnrollmentIntent(operationUUID, intent, &failure); }
+    MothershipPairControlBoundaryDescriptor boundary;
+    if (valid && action == "prepare"_ctv)
+    {
+      valid = bindPairControlBoundary(intent, boundary, failure);
+      if (valid)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.recordClusterPairTestControlBoundary(boundary, false, intent, &failure);
+      }
+    }
+    else if (valid)
+    {
+      valid = intent.testControlBoundaryAdmitted;
+      boundary = intent.testControlBoundary;
+      if (!valid) failure.assign("pair-control boundary was not admitted"_ctv);
+      if (valid && action == "query"_ctv && intent.testControlBoundaryClosed)
+      { failure.assign("pair-control boundary is closed"_ctv); valid = false; }
+    }
+    if (valid && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
+    {
+      Vector<String> arguments;
+      String providerAction = action == "prepare"_ctv ? String("launch"_ctv) : action;
+      if (action != "query"_ctv)
+        valid = mothershipPairControlBoundaryArguments(boundary, providerAction, arguments, &failure) &&
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+      if (valid && action != "remove"_ctv)
+      {
+        String output;
+        valid = mothershipPairControlBoundaryArguments(boundary, "query"_ctv, arguments, &failure) &&
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &output, &failure) &&
+            mothershipPairControlBoundaryPreparedReceiptValid(boundary, output);
+        if (!valid && failure.empty()) failure.assign("pair-control provider did not prove the exact prepared boundary"_ctv);
+      }
+      if (valid && action == "remove"_ctv)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.recordClusterPairTestControlBoundary(boundary, true, intent, &failure);
+      }
+    }
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
+        (unsigned long long)operationUUID, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runCreateCluster(int argc, char *argv[])
   {
     if (argc < 1 || argc > 2)
@@ -21898,6 +22011,7 @@ public:
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
         {"taskReport",                      &Mothership::runTaskReport                     },
+        {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
         {"upsertApiCredentialSet",          &Mothership::runUpsertApiCredentialSet         },
@@ -22027,6 +22141,8 @@ int main(int argc, char *argv[])
     message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("enrollClusterPair [first cluster name|UUID] [second cluster name|UUID] [operationUUID canonical hex]\n");
     message.append("\tcreates or resumes one durable private pair enrollment intent after both clusters return qualified endpoint rosters; it waits up to 30 seconds for both active projections\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
+    message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");

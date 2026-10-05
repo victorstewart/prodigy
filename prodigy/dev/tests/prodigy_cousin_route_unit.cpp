@@ -4,6 +4,7 @@
 
 #include <prodigy/cousin.route.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
+#include <prodigy/mothership/mothership.pair.control.boundary.h>
 
 class TestSuite {
 public:
@@ -100,11 +101,9 @@ static ClusterPairControlEndpoint validPairEndpoint(uint128_t clusterUUID, uint1
   endpoint.clusterUUID = clusterUUID;
   endpoint.nodeUUID = nodeUUID;
   endpoint.role = ClusterPairControlNodeRole::switchboard;
-  endpoint.address.is6 = true;
-  endpoint.address.v6[0] = 0x20;
-  endpoint.address.v6[1] = 0x01;
+  endpoint.address = IPAddress(clusterUUID == 0x902 ? "fd42:4242:4242:1::" : "fd42:4242:4242:2::", true);
   endpoint.address.v6[15] = lastByte;
-  endpoint.port = uint16_t(24000 + lastByte);
+  endpoint.port = mothershipPairControlBoundaryPort;
   return endpoint;
 }
 
@@ -121,6 +120,25 @@ static MothershipClusterPairEnrollmentIntent validPairEnrollmentIntent(uint128_t
   intent.firstEndpoints.push_back(validPairEndpoint(intent.firstClusterUUID, 0x904, 4));
   intent.secondEndpoints.push_back(validPairEndpoint(intent.secondClusterUUID, 0x905, 5));
   return intent;
+}
+
+static MothershipPairControlBoundaryDescriptor validPairControlBoundary(
+    const MothershipClusterPairEnrollmentIntent& intent)
+{
+  MothershipPairControlBoundaryDescriptor boundary = {};
+  boundary.operationUUID = intent.operationUUID;
+  boundary.firstClusterUUID = intent.firstClusterUUID;
+  boundary.secondClusterUUID = intent.secondClusterUUID;
+  boundary.firstWorkspace = "/tmp/prodigy-control-first"_ctv;
+  boundary.secondWorkspace = "/tmp/prodigy-control-second"_ctv;
+  boundary.firstRuntimeIdentity = "4701"_ctv;
+  boundary.secondRuntimeIdentity = "4702"_ctv;
+  boundary.firstPrivateIPv6Subnet = "fd42:4242:4242:1::/64"_ctv;
+  boundary.secondPrivateIPv6Subnet = "fd42:4242:4242:2::/64"_ctv;
+  boundary.firstEndpoints = intent.firstEndpoints;
+  boundary.secondEndpoints = intent.secondEndpoints;
+  boundary.port = mothershipPairControlBoundaryPort;
+  return boundary;
 }
 
 int main(void)
@@ -430,6 +448,89 @@ int main(void)
                   pairRecorded, &failure) && pairRecorded.firstInitialProjectionDelivered &&
                   pairRecorded.firstEnrolledAuthorityGeneration == 8 && pairRecorded.secondEnrolledAuthorityGeneration == 12,
                   "pair_enrollment_records_monotonic_admission_receipt");
+  }
+
+  MothershipPairControlBoundaryDescriptor controlBoundary = validPairControlBoundary(pairIntent);
+  Vector<ClusterPairControlEndpoint> numericOrder = controlBoundary.firstEndpoints;
+  numericOrder.push_back(validPairEndpoint(pairIntent.firstClusterUUID, 0x906, 16));
+  String endpointCSV = {};
+  suite.require(mothershipPairControlBoundaryEndpointCSV(numericOrder, endpointCSV) &&
+                endpointCSV == "fd42:4242:4242:1::4,fd42:4242:4242:1::10"_ctv,
+                "pair_control_boundary_endpoint_csv_uses_numeric_ipv6_order");
+  Vector<ClusterPairControlEndpoint> duplicateAddress = numericOrder;
+  ClusterPairControlEndpoint duplicate = numericOrder[0];
+  duplicate.nodeUUID++;
+  duplicateAddress.push_back(duplicate);
+  suite.require(!mothershipPairControlBoundaryEndpointCSV(duplicateAddress, endpointCSV),
+                "pair_control_boundary_endpoint_csv_rejects_duplicate_address");
+  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, "mismatched receipt"_ctv),
+                "pair_control_boundary_rejects_mismatched_prepared_receipt");
+
+  {
+    MothershipClusterRegistry pairRegistry {String(pairDirectory)};
+    suite.require(!pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure),
+                  "pair_control_boundary_rejects_admission_before_both_deliveries_and_qualification");
+    suite.require(pairRegistry.recordClusterPairEnrollmentCompletion(pairIntent.operationUUID, 8, 12, true, true, true, true,
+                  pairRecorded, &failure) && pairRecorded.firstQualified && pairRecorded.secondQualified &&
+                  pairRecorded.firstInitialProjectionDelivered && pairRecorded.secondInitialProjectionDelivered,
+                  "pair_control_boundary_completes_qualified_delivered_enrollment");
+    suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure) &&
+                  pairRecorded.testControlBoundaryAdmitted && !pairRecorded.testControlBoundaryClosed,
+                  "pair_control_boundary_accepts_exact_qualified_delivered_rosters");
+    MothershipPairControlBoundaryDescriptor changedRuntime = controlBoundary;
+    changedRuntime.firstRuntimeIdentity = "4703"_ctv;
+    suite.require(!pairRegistry.recordClusterPairTestControlBoundary(changedRuntime, false, pairRecorded, &failure),
+                  "pair_control_boundary_rejects_changed_runtime_identity");
+    MothershipPairControlBoundaryDescriptor changedRoster = controlBoundary;
+    changedRoster.firstEndpoints[0].nodeUUID++;
+    suite.require(!pairRegistry.recordClusterPairTestControlBoundary(changedRoster, false, pairRecorded, &failure),
+                  "pair_control_boundary_rejects_changed_delivered_roster");
+  }
+  {
+    MothershipClusterRegistry pairRegistry {String(pairDirectory)};
+    suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure) &&
+                  pairRecorded.testControlBoundaryAdmitted && !pairRecorded.testControlBoundaryClosed,
+                  "pair_control_boundary_cold_reopen_preserves_exact_open_descriptor");
+    bool guardOpen = false;
+    suite.require(pairRegistry.clusterHasOpenTestPairControlBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && guardOpen &&
+                  pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.secondClusterUUID, guardOpen, &failure) && guardOpen,
+                  "pair_control_boundary_open_guard_blocks_cluster_removal");
+    suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, true, pairRecorded, &failure) &&
+                  pairRecorded.testControlBoundaryClosed,
+                  "pair_control_boundary_closes_durable_guard");
+    suite.require(pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && !guardOpen,
+                  "pair_control_boundary_closed_guard_no_longer_blocks_removal");
+    suite.require(!pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure),
+                  "pair_control_boundary_closed_descriptor_cannot_reopen");
+  }
+
+  char legacyPairDirectoryTemplate[] = "/tmp/prodigy-pair-enrollment-v1-unit-XXXXXX";
+  char *legacyPairDirectory = ::mkdtemp(legacyPairDirectoryTemplate);
+  if (!suite.require(legacyPairDirectory != nullptr, "pair_enrollment_v1_registry_test_directory_created")) return 1;
+  ScopedDirectory ownedLegacyPairDirectory {legacyPairDirectory};
+  MothershipClusterPairEnrollmentIntent legacyIntent = validPairEnrollmentIntent(0x910);
+  legacyIntent.protocolVersion = 1;
+  MothershipClusterPairEnrollmentIntent legacyRecorded = {}, legacyLoaded = {};
+  bool legacyResumed = false;
+  {
+    MothershipClusterRegistry pairRegistry {String(legacyPairDirectory)};
+    suite.require(pairRegistry.recordClusterPairEnrollmentIntent(legacyIntent, legacyRecorded, legacyResumed, &failure) && !legacyResumed &&
+                  legacyRecorded.protocolVersion == 1,
+                  "pair_control_boundary_persists_legacy_v1_enrollment_wire");
+  }
+  {
+    MothershipClusterRegistry pairRegistry {String(legacyPairDirectory)};
+    suite.require(pairRegistry.loadClusterPairEnrollmentIntent(legacyIntent.operationUUID, legacyLoaded, &failure) &&
+                  legacyLoaded.protocolVersion == 1,
+                  "pair_control_boundary_cold_loads_legacy_v1_enrollment_wire");
+    suite.require(pairRegistry.recordClusterPairEnrollmentCompletion(legacyIntent.operationUUID, 8, 12, true, true, true, true,
+                  legacyRecorded, &failure),
+                  "pair_control_boundary_completes_legacy_enrollment_before_upgrade");
+    const MothershipPairControlBoundaryDescriptor legacyBoundary = validPairControlBoundary(legacyIntent);
+    suite.require(pairRegistry.recordClusterPairTestControlBoundary(legacyBoundary, false, legacyRecorded, &failure) &&
+                  legacyRecorded.protocolVersion == MothershipClusterPairEnrollmentIntent::version &&
+                  legacyRecorded.testControlBoundaryAdmitted,
+                  "pair_control_boundary_upgrades_legacy_wire_on_admission");
   }
 
   return suite.failures == 0 ? 0 : 1;

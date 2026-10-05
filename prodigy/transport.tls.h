@@ -441,6 +441,10 @@ public:
 };
 
 class ProdigyTransportTLSStream : public TCPStream, public TLSBase {
+public:
+  using AEGISPeerResolver = std::function<bool(const String&, std::array<uint8_t, 32>&, String&, uint128_t&)>;
+  using AEGISDeferredServerPreludeResolver = std::function<bool(const String&, String&, std::array<uint8_t, 32>&, String&, uint128_t&)>;
+
 private:
 
   bool tlsEnabled = false;
@@ -454,7 +458,9 @@ private:
   uint128_t aegisLocalUUID = 0;
   uint128_t aegisExpectedPeerUUID = 0;
   String aegisLocalPrelude;
-  std::function<bool(const String&, std::array<uint8_t, 32>&, String&, uint128_t&)> aegisPeerResolver;
+  bool aegisDeferredServerPrelude = false;
+  AEGISPeerResolver aegisPeerResolver;
+  AEGISDeferredServerPreludeResolver aegisDeferredServerPreludeResolver;
   ProdigyAegisSession aegisSession;
   StreamBuffer aegisInbound;
   StreamBuffer encryptedWBuffer;
@@ -478,6 +484,8 @@ private:
     clearAEGISBuffer(encryptedWBuffer);
     clearAEGISBuffer(aegisInbound);
     aegisPeerResolver = {};
+    aegisDeferredServerPreludeResolver = {};
+    aegisDeferredServerPrelude = false;
     nEncryptedBytesToSend = 0;
     return false;
   }
@@ -525,6 +533,17 @@ private:
   {
     if (aegisFailed) return false;
     if (hasBufferedTransportCiphertext()) return true;
+    // A deferred responder has no public prelude or Noise state until it
+    // validates the initiator's bounded prelude. It must not emit application
+    // data, a fallback greeting, or a transcript fragment before that point.
+    if (!aegisPeerResolved && aegisDeferredServerPrelude)
+    {
+      nEncryptedBytesToSend = 0;
+      return true;
+    }
+    // Emit a fixed public prelude as a standalone first flight. The resolver
+    // needs the peer's corresponding PGA claim before startTransportAEGISKeys
+    // creates Noise state, so an initiator must not write Noise in this call.
     if (!aegisLocalPrelude.empty() && !aegisPreludeWritten)
     {
       const uint32_t size = aegisLocalPrelude.size();
@@ -534,15 +553,22 @@ private:
       encryptedWBuffer.append(aegisLocalPrelude);
       aegisPreludeWritten = true;
     }
-    else if (!aegisPeerResolved) return true;
-    else if (!aegisHandshakeWritten && (aegisInitiator || aegisHandshakeRead))
+    if (!aegisPeerResolved)
+    {
+      nEncryptedBytesToSend = uint32_t(encryptedWBuffer.outstandingBytes());
+      return true;
+    }
+    // After a deferred responder resolves the peer prelude, its selected PGA
+    // is already written above and the resolver has started Noise. Append the
+    // mandatory responder reply in this same ciphertext generation.
+    if (!aegisHandshakeWritten && (aegisInitiator || aegisHandshakeRead))
     {
       std::array<uint8_t, PRODIGY_NOISE_HANDSHAKE_BYTES> message = {};
       if (!aegisSession.writeHandshake(message) || !encryptedWBuffer.need(message.size())) return failTransportAEGIS();
       encryptedWBuffer.append(message.data(), message.size());
       aegisHandshakeWritten = true;
     }
-    else if (aegisSession.confirmationNeeded())
+    if (aegisSession.confirmationNeeded())
     {
       String frame = {};
       if (!aegisSession.encrypt(ProdigyAegisSession::Record::confirmation, nullptr, 0, frame) ||
@@ -550,7 +576,7 @@ private:
       encryptedWBuffer.append(frame);
       publishAEGISPeerProof();
     }
-    else if (aegisSession.authenticated() && wBuffer.outstandingBytes() != 0)
+    if (aegisSession.authenticated() && wBuffer.outstandingBytes() != 0)
     {
       const uint32_t bytes = uint32_t(std::min<uint64_t>(wBuffer.outstandingBytes(), ProdigyAegisSession::maximumPayloadBytes));
       String frame = {};
@@ -583,20 +609,32 @@ private:
         const uint8_t *header = aegisInbound.pHead();
         const uint32_t size = (uint32_t(header[4]) << 8) | header[5];
         if (header[0] != 'P' || header[1] != 'G' || header[2] != 'A' || header[3] != 1 ||
-            header[6] != 0 || header[7] != 0 || size == 0 || size > 512 || !aegisPeerResolver)
+            header[6] != 0 || header[7] != 0 || size == 0 || size > 512 ||
+            (aegisDeferredServerPrelude ? !aegisDeferredServerPreludeResolver : !aegisPeerResolver))
           return failTransportAEGIS();
         if (aegisInbound.outstandingBytes() < 8 + size) break;
         String peerPrelude = {};
         if (!peerPrelude.reserve(size)) return failTransportAEGIS();
         peerPrelude.append(header + 8, size);
         std::array<uint8_t, 32> psk = {};
-        String credentialContext = {};
+        String credentialContext = {}, selectedLocalPrelude = {};
         uint128_t peerUUID = 0;
-        bool ok = aegisPeerResolver(peerPrelude, psk, credentialContext, peerUUID);
+        bool ok = aegisDeferredServerPrelude
+            ? aegisDeferredServerPreludeResolver(peerPrelude, selectedLocalPrelude, psk, credentialContext, peerUUID)
+            : aegisPeerResolver(peerPrelude, psk, credentialContext, peerUUID);
+        if (ok && aegisDeferredServerPrelude)
+        {
+          if (selectedLocalPrelude.empty() || selectedLocalPrelude.size() > 512 ||
+              !aegisLocalPrelude.reserve(selectedLocalPrelude.size())) ok = false;
+          else aegisLocalPrelude.append(selectedLocalPrelude);
+        }
         if (ok) ok = startTransportAEGISKeys(psk.data(), credentialContext, aegisLocalUUID, peerUUID,
                                             aegisLocalPrelude, peerPrelude);
         OPENSSL_cleanse(psk.data(), psk.size());
+        if (selectedLocalPrelude.ownsMemory()) OPENSSL_cleanse(selectedLocalPrelude.data(), selectedLocalPrelude.size());
         aegisPeerResolver = {};
+        aegisDeferredServerPreludeResolver = {};
+        aegisDeferredServerPrelude = false;
         if (!ok) return failTransportAEGIS();
         aegisInbound.consume(8 + size, false);
         continue;
@@ -747,8 +785,6 @@ public:
     return startTransportAEGISKeys(psk, credentialContext, localUUID, expectedPeerUUID);
   }
 
-  using AEGISPeerResolver = std::function<bool(const String&, std::array<uint8_t, 32>&, String&, uint128_t&)>;
-
   // Only public lookup hints are sent here. The credential owner must reject
   // unknown/stale/revoked claims in the resolver; neither a prelude nor a
   // successful lookup authenticates the peer. Both exact preludes are bound
@@ -765,6 +801,23 @@ public:
         !aegisLocalPrelude.reserve(localPublicPrelude.size())) return failTransportAEGIS();
     aegisLocalPrelude.append(localPublicPrelude);
     aegisPeerResolver = std::move(resolver);
+    return true;
+  }
+
+  // Server-only variant for one listener that can terminate several approved
+  // pair credentials. The selected local public prelude is returned only
+  // after the exact bounded peer prelude resolves a credential.
+  bool beginTransportAEGISWithDeferredServerPrelude(
+      uint128_t localUUID, AEGISDeferredServerPreludeResolver resolver)
+  {
+    resetTransportState(false);
+    aegisEnabled = true;
+    aegisInitiator = false;
+    aegisLocalUUID = localUUID;
+    aegisPeerResolved = false;
+    aegisDeferredServerPrelude = true;
+    if (localUUID == 0 || !resolver) return failTransportAEGIS();
+    aegisDeferredServerPreludeResolver = std::move(resolver);
     return true;
   }
 
@@ -1085,7 +1138,9 @@ private:
     aegisLocalUUID = 0;
     aegisExpectedPeerUUID = 0;
     aegisLocalPrelude.reset();
+    aegisDeferredServerPrelude = false;
     aegisPeerResolver = {};
+    aegisDeferredServerPreludeResolver = {};
     if (resetSocket) TCPStream::reset();
     else Stream::reset();
     if (rBufferCapacity > 0)

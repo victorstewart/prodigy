@@ -19,6 +19,7 @@
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
+#include <prodigy/mothership/mothership.pair.control.boundary.h>
 
 // Local endpoint qualification is an operation of the test provider, not a
 // migration receipt. In particular, selecting the target does not authorize
@@ -266,7 +267,7 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
 // retry-safe while each Brain remains the sole runtime authority owner.
 class MothershipClusterPairEnrollmentIntent {
 public:
-  static constexpr uint32_t version = 1;
+  static constexpr uint32_t version = 2;
   uint32_t protocolVersion = version;
   uint128_t pairUUID = 0;
   uint128_t operationUUID = 0;
@@ -289,6 +290,11 @@ public:
   bool secondInitialProjectionDelivered = false;
   bool firstQualified = false;
   bool secondQualified = false;
+  // Admission is the durable permission/cleanup intent, written before any
+  // provider mutation. Only a fresh provider receipt proves it is prepared.
+  bool testControlBoundaryAdmitted = false;
+  bool testControlBoundaryClosed = false;
+  MothershipPairControlBoundaryDescriptor testControlBoundary;
 
   ~MothershipClusterPairEnrollmentIntent()
   {
@@ -305,7 +311,15 @@ static inline bool mothershipClusterPairEnrollmentIntentRootValid(const Mothersh
 
 static inline bool mothershipClusterPairEnrollmentIntentValid(const MothershipClusterPairEnrollmentIntent& intent)
 {
-  return intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version && intent.pairUUID != 0 &&
+  const auto& boundary = intent.testControlBoundary;
+  const bool validBoundary = !intent.testControlBoundaryAdmitted ? !intent.testControlBoundaryClosed :
+      intent.protocolVersion >= 2 && intent.firstQualified && intent.secondQualified &&
+      intent.firstInitialProjectionDelivered && intent.secondInitialProjectionDelivered &&
+      mothershipPairControlBoundaryValid(boundary) && boundary.operationUUID == intent.operationUUID &&
+      boundary.firstClusterUUID == intent.firstClusterUUID && boundary.secondClusterUUID == intent.secondClusterUUID &&
+      boundary.firstEndpoints == intent.firstEndpoints && boundary.secondEndpoints == intent.secondEndpoints;
+  return (intent.protocolVersion == 1 || intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version) &&
+      validBoundary && intent.pairUUID != 0 &&
       intent.operationUUID != 0 && intent.firstClusterUUID != 0 && intent.secondClusterUUID != 0 &&
       intent.firstClusterUUID < intent.secondClusterUUID && intent.rootGeneration != 0 && intent.keyEpoch != 0 &&
       intent.firstObservedAuthorityGeneration != 0 && intent.secondObservedAuthorityGeneration != 0 &&
@@ -317,7 +331,7 @@ static inline bool mothershipClusterPairEnrollmentIntentValid(const MothershipCl
 static inline bool mothershipClusterPairEnrollmentIntentScopeMatches(
     const MothershipClusterPairEnrollmentIntent& left, const MothershipClusterPairEnrollmentIntent& right)
 {
-  return left.protocolVersion == right.protocolVersion && left.operationUUID == right.operationUUID &&
+  return left.operationUUID == right.operationUUID &&
       left.firstClusterUUID == right.firstClusterUUID && left.secondClusterUUID == right.secondClusterUUID &&
       left.rootGeneration == right.rootGeneration && left.keyEpoch == right.keyEpoch &&
       left.firstEndpoints == right.firstEndpoints && left.secondEndpoints == right.secondEndpoints;
@@ -346,6 +360,12 @@ static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& int
   serializer.value1b(intent.secondInitialProjectionDelivered);
   serializer.value1b(intent.firstQualified);
   serializer.value1b(intent.secondQualified);
+  if (intent.protocolVersion >= 2)
+  {
+    serializer.value1b(intent.testControlBoundaryAdmitted);
+    serializer.value1b(intent.testControlBoundaryClosed);
+    serializer.object(intent.testControlBoundary);
+  }
 }
 
 class MothershipClusterRegistry {
@@ -2806,6 +2826,9 @@ public:
       if (!record.closed && (record.boundary.sourceClusterUUID == uuid || record.boundary.targetClusterUUID == uuid))
         found = true;
     }
+    bool controlBoundary = false;
+    if (!clusterHasOpenTestPairControlBoundary(clusterUUID, controlBoundary, failure)) return false;
+    found |= controlBoundary;
     if (failure) failure->clear();
     return true;
   }
@@ -3162,6 +3185,66 @@ public:
     Vault::secureClearString(encoded);
     if (!written) return false;
     recorded = std::move(current);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool recordClusterPairTestControlBoundary(const MothershipPairControlBoundaryDescriptor& boundary,
+                                            bool closed, MothershipClusterPairEnrollmentIntent& recorded,
+                                            String *failure = nullptr)
+  {
+    if (!mothershipPairControlBoundaryValid(boundary, failure)) return false;
+    ClusterPairEnrollmentLock lock;
+    if (!lockClusterPairEnrollment(lock, failure)) return false;
+    MothershipClusterPairEnrollmentIntent current;
+    if (!loadClusterPairEnrollmentIntent(boundary.operationUUID, current, failure)) return false;
+    if ((closed && !current.testControlBoundaryAdmitted) ||
+        (!closed && current.testControlBoundaryClosed) ||
+        (current.testControlBoundaryAdmitted && !mothershipPairControlBoundaryEqual(current.testControlBoundary, boundary)))
+    {
+      if (failure) failure->assign("pair-control boundary conflicts with its durable lifecycle"_ctv);
+      return false;
+    }
+    current.protocolVersion = MothershipClusterPairEnrollmentIntent::version;
+    current.testControlBoundary = boundary;
+    current.testControlBoundaryAdmitted = true;
+    current.testControlBoundaryClosed = closed;
+    if (!mothershipClusterPairEnrollmentIntentValid(current))
+    {
+      if (failure) failure->assign("pair-control boundary requires the exact qualified enrollment and delivered rosters"_ctv);
+      return false;
+    }
+    String key, encoded;
+    key.assignItoh(current.operationUUID);
+    BitseryEngine::serialize(encoded, current);
+    const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    Vault::secureClearString(encoded);
+    if (!written) return false;
+    recorded = std::move(current);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool clusterHasOpenTestPairControlBoundary(uint128_t clusterUUID, bool& found, String *failure = nullptr)
+  {
+    found = false;
+    Vector<String> values;
+    struct ClearValues {
+      Vector<String>& values;
+      ~ClearValues() { for (auto& value : values) Vault::secureClearString(value); }
+    } clear {values};
+    if (!db.listValues(clusterPairEnrollmentsColumnFamily, values, failure)) return false;
+    for (const auto& encoded : values)
+    {
+      MothershipClusterPairEnrollmentIntent intent;
+      if (!BitseryEngine::deserializeSafe(encoded, intent) || !mothershipClusterPairEnrollmentIntentValid(intent))
+      {
+        if (failure) failure->assign("cluster pair enrollment intent is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (intent.testControlBoundaryAdmitted && !intent.testControlBoundaryClosed &&
+          (intent.firstClusterUUID == clusterUUID || intent.secondClusterUUID == clusterUUID)) found = true;
+    }
     if (failure) failure->clear();
     return true;
   }
