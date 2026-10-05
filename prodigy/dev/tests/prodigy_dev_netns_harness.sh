@@ -284,6 +284,10 @@ then
          exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
             "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" "${pair_admission_mode}"
          ;;
+      pair-enrollment)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         exec timeout 900 bash "${script_dir}/prodigy_dev_pair_enrollment_qualification.sh" "${prodigy_bin}" "${mothership_bin}"
+         ;;
       pair-endpoint)
          [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
          exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \

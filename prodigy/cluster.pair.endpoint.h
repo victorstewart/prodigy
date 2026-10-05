@@ -57,7 +57,7 @@ static void serialize(S&& serializer, ClusterPairControlEndpoint& endpoint)
   uint64_t role = uint64_t(endpoint.role);
   serializer.value8b(role);
   endpoint.role = ClusterPairControlNodeRole(role);
-  serializer.ext(endpoint.address.v6, bitsery::ext::FixedBinarySequence<16> {});
+  for (uint8_t& byte : endpoint.address.v6) serializer.value1b(byte);
   serializer.value1b(endpoint.address.is6);
   serializer.value2b(endpoint.port);
 }

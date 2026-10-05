@@ -376,6 +376,12 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
       }
+    case MothershipTopic::enrollClusterPair:
+    case MothershipTopic::pullClusterPairEnrollment:
+      {
+        String encoded;
+        return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;
+      }
     case MothershipTopic::pullUpgradeAdmissionReport:
       {
         return consumeVariable(cursor, terminal) && cursor == terminal;
@@ -736,9 +742,13 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         if (!consumeVariable(cursor, terminal)) return false;
         if (cursor == terminal) return true;
         uint8_t projectionVersion = 0;
-        return extractFixed(cursor, terminal, projectionVersion) && projectionVersion == 1 && cursor == terminal;
+        if (!extractFixed(cursor, terminal, projectionVersion) || projectionVersion != 1) return false;
+        if (cursor == terminal) return true;
+        uint8_t pairProjectionVersion = 0;
+        return extractFixed(cursor, terminal, pairProjectionVersion) && pairProjectionVersion == 1 && cursor == terminal;
       }
     case NeuronTopic::transportCredentialPeersAck:
+    case NeuronTopic::clusterPairControlCredentialsAck:
       {
         uint128_t nonce = 0;
         uint64_t generation = 0;
@@ -944,6 +954,13 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
       {
         uint128_t nonce = 0;
         return extractFixed(cursor, terminal, nonce) && nonce != 0 && consumeVariable(cursor, terminal) && cursor == terminal;
+      }
+    case NeuronTopic::clusterPairControlCredentials:
+      {
+        uint128_t nonce = 0;
+        String encoded;
+        return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
+            extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 524288 && cursor == terminal;
       }
     case NeuronTopic::registration:
       {

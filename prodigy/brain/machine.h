@@ -69,6 +69,13 @@ public:
   String transportPeerProjectionFingerprint;
   String transportPeerProjectionAcknowledgedFingerprint;
 
+  bool clusterPairProjectionCapable = false;
+  uint128_t clusterPairProjectionNonce = 0;
+  uint64_t clusterPairProjectionGeneration = 0;
+  int64_t clusterPairProjectionSentAtMs = 0;
+  String clusterPairProjectionFingerprint;
+  String clusterPairProjectionAcknowledgedFingerprint;
+
   void reset(void) override
   {
     ProdigyArtifactStream::reset();
@@ -84,6 +91,12 @@ public:
     transportPeerProjectionSentAtMs = 0;
     transportPeerProjectionFingerprint.clear();
     transportPeerProjectionAcknowledgedFingerprint.clear();
+    clusterPairProjectionCapable = false;
+    clusterPairProjectionNonce = 0;
+    clusterPairProjectionGeneration = 0;
+    clusterPairProjectionSentAtMs = 0;
+    clusterPairProjectionFingerprint.clear();
+    clusterPairProjectionAcknowledgedFingerprint.clear();
     verifiedInstalledBundleSHA256.clear();
     verifiedInstalledBundleIOGeneration = 0;
     verifiedInstalledBundleAuthorityEpoch = 0;

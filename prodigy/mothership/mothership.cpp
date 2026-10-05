@@ -8705,6 +8705,92 @@ private:
     return true;
   }
 
+  bool requestClusterPairEnrollment(const ProdigyClusterPairEnrollmentRequest& request,
+                                    ProdigyClusterPairEnrollmentResponse& response, String& failure)
+  {
+    response = {};
+    if (socket.connect() != 0)
+    {
+      failure = socket.connectFailureDetail();
+      if (failure.empty()) failure.assign("cluster pair enrollment control connection failed"_ctv);
+      return false;
+    }
+    String serialized = {};
+    ProdigyClusterPairEnrollmentRequest requestCopy = request;
+    BitseryEngine::serialize(serialized, requestCopy);
+    Message::construct(socket.wBuffer, MothershipTopic::enrollClusterPair, serialized);
+    Vault::secureClearString(serialized);
+    if (!socket.send())
+    {
+      Vault::secureClearString(socket.wBuffer);
+      socket.close();
+      failure.assign("cluster pair enrollment request send failed"_ctv);
+      return false;
+    }
+    Message *message = socket.recvExpectedTopic(MothershipTopic::enrollClusterPair);
+    if (!message)
+    {
+      Vault::secureClearString(socket.wBuffer);
+      socket.close();
+      failure = socket.ioFailureDetail();
+      if (failure.empty()) failure.assign("cluster pair enrollment response unavailable"_ctv);
+      return false;
+    }
+    uint8_t *args = message->args;
+    String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool decoded = args == message->terminal() && BitseryEngine::deserializeSafe(encoded, response);
+    Vault::secureClearString(socket.wBuffer);
+    socket.close();
+    if (!decoded || response.protocolVersion != ProdigyClusterPairEnrollmentResponse::version || !response.success)
+    {
+      failure = response.failure;
+      if (failure.empty()) failure.assign("cluster pair enrollment response invalid or rejected"_ctv);
+      return false;
+    }
+    failure.clear();
+    return true;
+  }
+
+  bool queryClusterPairEnrollment(const MothershipProdigyCluster& cluster, uint128_t operationUUID,
+                                  ProdigyClusterPairEnrollmentResponse& response, String& failure)
+  {
+    String clusterName = cluster.name;
+    if (!configureControlTarget(clusterName.c_str(), &failure)) return false;
+    ProdigyClusterPairEnrollmentQuery query = {};
+    query.operationUUID = operationUUID;
+    if (!requestTopicRoundTrip(MothershipTopic::pullClusterPairEnrollment, query, response, failure)) return false;
+    if (response.protocolVersion != ProdigyClusterPairEnrollmentResponse::version)
+    { failure.assign("unsupported cluster pair enrollment response"_ctv); return false; }
+    return true;
+  }
+
+  static bool fillClusterPairEnrollmentRequest(const MothershipClusterPairEnrollmentIntent& intent,
+                                                bool first, uint64_t expectedAuthorityGeneration,
+                                                uint64_t creationAuthorityGeneration,
+                                                ProdigyClusterPairEnrollmentRequest& request)
+  {
+    request = {};
+    const uint128_t local = first ? intent.firstClusterUUID : intent.secondClusterUUID;
+    const uint128_t peer = first ? intent.secondClusterUUID : intent.firstClusterUUID;
+    if (local == 0 || peer == 0 || creationAuthorityGeneration == 0) return false;
+    request.expectedAuthorityGeneration = expectedAuthorityGeneration;
+    request.enrollment.pairUUID = intent.pairUUID;
+    request.enrollment.operationUUID = intent.operationUUID;
+    request.enrollment.localClusterUUID = local;
+    request.enrollment.peerClusterUUID = peer;
+    request.enrollment.rootGeneration = intent.rootGeneration;
+    request.enrollment.agreedKeyEpoch = intent.keyEpoch;
+    request.enrollment.localAuthorityGeneration = creationAuthorityGeneration;
+    request.enrollment.state = ProdigyClusterPairEnrollmentState::pending;
+    std::memcpy(request.enrollment.root, intent.root, sizeof(intent.root));
+    request.localEndpoints = first ? intent.firstEndpoints : intent.secondEndpoints;
+    request.peerEndpoints = first ? intent.secondEndpoints : intent.firstEndpoints;
+    return prodigyClusterPairEnrollmentDescriptorValid(request.enrollment) &&
+        prodigyClusterPairEndpointsValid(request.localEndpoints, local) &&
+        prodigyClusterPairEndpointsValid(request.peerEndpoints, peer);
+  }
+
   bool requestUpsertMachineSchemas(const UpsertMachineSchemas& request, UpsertMachineSchemas& response, String& failure)
   {
     bool ok = requestTopicRoundTrip(MothershipTopic::upsertMachineSchemas, request, response, failure);
@@ -18106,6 +18192,224 @@ private:
     printPricingDiagnostics(diagnostics, countryFilteredTargets, targetFailures);
   }
 
+  static bool makeClusterPairIntent(uint128_t operationUUID,
+                                    const ProdigyClusterPairEnrollmentResponse& firstProbe,
+                                    const ProdigyClusterPairEnrollmentResponse& secondProbe,
+                                    MothershipClusterPairEnrollmentIntent& intent)
+  {
+    intent = {};
+    if (operationUUID == 0 || firstProbe.localClusterUUID == 0 || secondProbe.localClusterUUID == 0 ||
+        firstProbe.localClusterUUID == secondProbe.localClusterUUID || !firstProbe.qualified || !secondProbe.qualified ||
+        firstProbe.currentAuthorityGeneration == 0 || secondProbe.currentAuthorityGeneration == 0 ||
+        !prodigyClusterPairEndpointsValid(firstProbe.localEndpoints, firstProbe.localClusterUUID) ||
+        !prodigyClusterPairEndpointsValid(secondProbe.localEndpoints, secondProbe.localClusterUUID)) return false;
+    const bool firstIsLower = firstProbe.localClusterUUID < secondProbe.localClusterUUID;
+    const auto& lower = firstIsLower ? firstProbe : secondProbe;
+    const auto& higher = firstIsLower ? secondProbe : firstProbe;
+    intent.operationUUID = operationUUID;
+    intent.firstClusterUUID = lower.localClusterUUID;
+    intent.secondClusterUUID = higher.localClusterUUID;
+    intent.firstObservedAuthorityGeneration = lower.currentAuthorityGeneration;
+    intent.secondObservedAuthorityGeneration = higher.currentAuthorityGeneration;
+    intent.firstEndpoints = lower.localEndpoints;
+    intent.secondEndpoints = higher.localEndpoints;
+    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&intent.pairUUID), sizeof(intent.pairUUID)) != 1 || intent.pairUUID == 0 ||
+        RAND_priv_bytes(intent.root, sizeof(intent.root)) != 1 || !mothershipClusterPairEnrollmentIntentRootValid(intent))
+    {
+      intent = {};
+      return false;
+    }
+    return mothershipClusterPairEnrollmentIntentValid(intent);
+  }
+
+  void runEnrollClusterPair(int argc, char *argv[])
+  {
+    String failure = {};
+    uint128_t operationUUID = 0;
+    MothershipProdigyCluster requestedFirst = {}, requestedSecond = {};
+    MothershipClusterPairEnrollmentIntent intent = {};
+    bool resumed = false;
+    bool valid = argc == 3 && prodigyParseCanonicalHex128(String(argv[2]), operationUUID) && operationUUID != 0;
+    if (valid)
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), requestedFirst, &failure) &&
+              registry.getClusterByIdentity(String(argv[1]), requestedSecond, &failure) &&
+              requestedFirst.clusterUUID != requestedSecond.clusterUUID &&
+              requestedFirst.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1 &&
+              requestedSecond.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1;
+      if (!valid && failure.empty()) failure.assign("cluster pair enrollment requires two distinct aegis-x25519-v1 clusters"_ctv);
+      if (valid)
+      {
+        String loadFailure = {};
+        if (registry.loadClusterPairEnrollmentIntent(operationUUID, intent, &loadFailure))
+        {
+          if (!((intent.firstClusterUUID == requestedFirst.clusterUUID && intent.secondClusterUUID == requestedSecond.clusterUUID) ||
+                (intent.firstClusterUUID == requestedSecond.clusterUUID && intent.secondClusterUUID == requestedFirst.clusterUUID)))
+          {
+            failure.assign("cluster pair enrollment operation conflicts with stored cluster scope"_ctv);
+            valid = false;
+          }
+          else resumed = true;
+        }
+        else if (!loadFailure.equal("record not found"_ctv))
+        {
+          failure = loadFailure;
+          valid = false;
+        }
+      }
+    }
+
+    // The zero-operation query is the pre-admission trusted endpoint probe.
+    // On a retry the operation-specific query returns the exact accepted
+    // descriptor, including its creation authority generation.
+    ProdigyClusterPairEnrollmentResponse firstProbe = {}, secondProbe = {};
+    if (valid)
+    {
+      valid = queryClusterPairEnrollment(requestedFirst, resumed ? operationUUID : 0, firstProbe, failure);
+      if (valid) valid = queryClusterPairEnrollment(requestedSecond, resumed ? operationUUID : 0, secondProbe, failure);
+    }
+    if (valid && !resumed)
+    {
+      if (!makeClusterPairIntent(operationUUID, firstProbe, secondProbe, intent))
+      {
+        failure.assign("cluster pair endpoint probe is incomplete or secure random generation failed"_ctv);
+        valid = false;
+      }
+      else
+      {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        valid = registry.recordClusterPairEnrollmentIntent(intent, intent, resumed, &failure);
+      }
+    }
+
+    auto clusterFor = [&](uint128_t uuid) -> const MothershipProdigyCluster* {
+      return requestedFirst.clusterUUID == uuid ? &requestedFirst : requestedSecond.clusterUUID == uuid ? &requestedSecond : nullptr;
+    };
+    auto queryAndValidateSide = [&](bool first, ProdigyClusterPairEnrollmentResponse& response,
+                                    uint64_t& expectedGeneration, uint64_t& creationGeneration) -> bool {
+      const uint128_t local = first ? intent.firstClusterUUID : intent.secondClusterUUID;
+      const uint128_t peer = first ? intent.secondClusterUUID : intent.firstClusterUUID;
+      const MothershipProdigyCluster *cluster = clusterFor(local);
+      if (!cluster || !queryClusterPairEnrollment(*cluster, intent.operationUUID, response, failure) ||
+          response.localClusterUUID != local || !prodigyClusterPairEndpointsValid(response.localEndpoints, local)) return false;
+      const auto& expectedLocalEndpoints = first ? intent.firstEndpoints : intent.secondEndpoints;
+      const auto& expectedPeerEndpoints = first ? intent.secondEndpoints : intent.firstEndpoints;
+      const uint64_t durableCreation = first ? intent.firstEnrolledAuthorityGeneration : intent.secondEnrolledAuthorityGeneration;
+      if (durableCreation != 0 && (!response.found || response.enrollment.localAuthorityGeneration != durableCreation))
+      {
+        failure.assign("cluster pair durable admission is missing or conflicts with its recorded generation"_ctv);
+        return false;
+      }
+      if (response.localEndpoints != expectedLocalEndpoints)
+      {
+        failure.assign("cluster pair endpoint roster changed after immutable intent"_ctv);
+        return false;
+      }
+      if (response.found)
+      {
+        if (!prodigyClusterPairEndpointsValid(response.peerEndpoints, peer) || response.peerEndpoints != expectedPeerEndpoints)
+        {
+          failure.assign("cluster pair peer endpoint roster conflicts with immutable intent"_ctv);
+          return false;
+        }
+        if (!prodigyClusterPairEnrollmentDescriptorValid(response.enrollment) ||
+            response.enrollment.pairUUID != intent.pairUUID || response.enrollment.operationUUID != intent.operationUUID ||
+            response.enrollment.localClusterUUID != local || response.enrollment.peerClusterUUID != peer ||
+            response.enrollment.rootGeneration != intent.rootGeneration || response.enrollment.agreedKeyEpoch != intent.keyEpoch ||
+            response.enrollment.state == ProdigyClusterPairEnrollmentState::revoked)
+        {
+          failure.assign("cluster pair query conflicts with immutable enrollment descriptor"_ctv);
+          return false;
+        }
+        expectedGeneration = 0;
+        creationGeneration = response.enrollment.localAuthorityGeneration;
+        return true;
+      }
+      if (response.currentAuthorityGeneration == 0 || response.currentAuthorityGeneration == UINT64_MAX || !response.qualified)
+      {
+        failure.assign("cluster pair side is not qualified for a new admission"_ctv);
+        return false;
+      }
+      expectedGeneration = response.currentAuthorityGeneration;
+      creationGeneration = response.currentAuthorityGeneration + 1;
+      return true;
+    };
+    auto recordSideObservation = [&](bool first, const ProdigyClusterPairEnrollmentResponse& response) -> bool {
+      MothershipClusterPairEnrollmentIntent updated = {};
+      MothershipClusterRegistry registry = openClusterRegistry();
+      // A pending reply is not a durable authority receipt.  Record a creation
+      // generation only after the Brain says the exact quorum transition is
+      // qualified and its initial projection is durably delivered.
+      const bool completed = response.qualified && response.initialProjectionDelivered;
+      return registry.recordClusterPairEnrollmentCompletion(intent.operationUUID,
+          first && completed ? response.enrollment.localAuthorityGeneration : 0,
+          !first && completed ? response.enrollment.localAuthorityGeneration : 0,
+          first && response.initialProjectionDelivered, !first && response.initialProjectionDelivered,
+          first && response.qualified, !first && response.qualified, updated, &failure);
+    };
+    auto admitOrObserveSide = [&](bool first, ProdigyClusterPairEnrollmentResponse& response, bool verifyExisting = false) -> bool {
+      uint64_t expectedGeneration = 0, creationGeneration = 0;
+      if (!queryAndValidateSide(first, response, expectedGeneration, creationGeneration)) return false;
+      if (response.found && !verifyExisting) return recordSideObservation(first, response);
+      const MothershipProdigyCluster *cluster = clusterFor(first ? intent.firstClusterUUID : intent.secondClusterUUID);
+      String clusterName = cluster ? cluster->name : String();
+      ProdigyClusterPairEnrollmentRequest request = {};
+      if (!cluster || !fillClusterPairEnrollmentRequest(intent, first, expectedGeneration, creationGeneration, request) ||
+          !configureControlTarget(clusterName.c_str(), &failure) || !requestClusterPairEnrollment(request, response, failure)) return false;
+      if (response.localClusterUUID != request.enrollment.localClusterUUID || !response.found ||
+          !prodigyClusterPairEnrollmentIdentityEquals(response.enrollment, request.enrollment) ||
+          response.localEndpoints != request.localEndpoints || response.peerEndpoints != request.peerEndpoints ||
+          response.enrollment.state == ProdigyClusterPairEnrollmentState::revoked)
+      {
+        failure.assign("cluster pair enrollment response does not bind the requested immutable descriptor"_ctv);
+        return false;
+      }
+      return recordSideObservation(first, response);
+    };
+
+    ProdigyClusterPairEnrollmentResponse firstResponse = {}, secondResponse = {};
+    if (valid) valid = admitOrObserveSide(true, firstResponse, true);
+    if (valid) valid = admitOrObserveSide(false, secondResponse, true);
+
+    // The two independent durable transitions include the Brain heartbeat
+    // retry cadence.  Bound this CLI call, but leave its immutable intent for
+    // the exact-operation retry when either side remains pending.
+    constexpr uint32_t qualificationPolls = 60;
+    for (uint32_t attempt = 0; valid && attempt < qualificationPolls &&
+         !(firstResponse.qualified && firstResponse.initialProjectionDelivered &&
+           secondResponse.qualified && secondResponse.initialProjectionDelivered); ++attempt)
+    {
+      ::usleep(500'000);
+      valid = admitOrObserveSide(true, firstResponse);
+      if (valid) valid = admitOrObserveSide(false, secondResponse);
+    }
+    if (valid && !(firstResponse.qualified && firstResponse.initialProjectionDelivered &&
+                   secondResponse.qualified && secondResponse.initialProjectionDelivered))
+    {
+      failure.assign("cluster pair enrollment remains pending qualified active projection; retry the same operation UUID"_ctv);
+      valid = false;
+    }
+
+    MothershipClusterPairEnrollmentIntent finalIntent = {};
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      String finalLoadFailure = {};
+      if (registry.loadClusterPairEnrollmentIntent(operationUUID, finalIntent, &finalLoadFailure) == false && valid)
+      {
+        failure = finalLoadFailure;
+        valid = false;
+      }
+    }
+    basics_log("enrollClusterPair success=%u operationUUID=%016llx%016llx resumed=%u firstQualified=%u firstProjection=%u secondQualified=%u secondProjection=%u pending=%u failure=%s\n",
+               unsigned(valid), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+               unsigned(resumed), unsigned(firstResponse.qualified), unsigned(firstResponse.initialProjectionDelivered),
+               unsigned(secondResponse.qualified), unsigned(secondResponse.initialProjectionDelivered),
+               unsigned(!(firstResponse.qualified && firstResponse.initialProjectionDelivered &&
+                          secondResponse.qualified && secondResponse.initialProjectionDelivered)), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runCreateCluster(int argc, char *argv[])
   {
     if (argc < 1 || argc > 2)
@@ -21555,6 +21859,7 @@ public:
         {"deploy",                          &Mothership::runDeploy                         },
         {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
+        {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
@@ -21720,6 +22025,8 @@ int main(int argc, char *argv[])
     message.append("\tremoves one managed Prodigy cluster record\n");
     message.append("retireAdditionalIngressLocal [bootID] [interface] [ifindex] [programID] [tagHex] [mapCount] [localSubnetMapID] [subnetHex]\n");
     message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
+    message.append("enrollClusterPair [first cluster name|UUID] [second cluster name|UUID] [operationUUID canonical hex]\n");
+    message.append("\tcreates or resumes one durable private pair enrollment intent after both clusters return qualified endpoint rosters; it waits up to 30 seconds for both active projections\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");

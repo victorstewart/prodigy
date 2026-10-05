@@ -94,6 +94,35 @@ static bool slotCoverageIsExact(const CousinRouteSlotBitmap& routeSlots, uint16_
   return true;
 }
 
+static ClusterPairControlEndpoint validPairEndpoint(uint128_t clusterUUID, uint128_t nodeUUID, uint8_t lastByte)
+{
+  ClusterPairControlEndpoint endpoint = {};
+  endpoint.clusterUUID = clusterUUID;
+  endpoint.nodeUUID = nodeUUID;
+  endpoint.role = ClusterPairControlNodeRole::switchboard;
+  endpoint.address.is6 = true;
+  endpoint.address.v6[0] = 0x20;
+  endpoint.address.v6[1] = 0x01;
+  endpoint.address.v6[15] = lastByte;
+  endpoint.port = uint16_t(24000 + lastByte);
+  return endpoint;
+}
+
+static MothershipClusterPairEnrollmentIntent validPairEnrollmentIntent(uint128_t operationUUID = 0x900)
+{
+  MothershipClusterPairEnrollmentIntent intent = {};
+  intent.pairUUID = 0x901;
+  intent.operationUUID = operationUUID;
+  intent.firstClusterUUID = 0x902;
+  intent.secondClusterUUID = 0x903;
+  intent.firstObservedAuthorityGeneration = 7;
+  intent.secondObservedAuthorityGeneration = 11;
+  for (uint32_t index = 0; index < sizeof(intent.root); ++index) intent.root[index] = uint8_t(index + 1);
+  intent.firstEndpoints.push_back(validPairEndpoint(intent.firstClusterUUID, 0x904, 4));
+  intent.secondEndpoints.push_back(validPairEndpoint(intent.secondClusterUUID, 0x905, 5));
+  return intent;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -356,6 +385,52 @@ int main(void)
                 "registry_accepts_draining_desired_state_receipts");
   suite.require(registry.cousinRouteAcknowledgedAt(drainingRoute.routeUUID, 150, acknowledged, &failure) && !acknowledged,
                 "registry_draining_receipts_are_not_current_admission_acknowledgement");
+
+  // Pair enrollment roots are Mothership-private retry material.  Reopening
+  // the registry must preserve the original root even if a caller supplied a
+  // fresh random candidate for the same immutable operation.
+  // Keep this database separate from the still-live route registry above:
+  // TidesDB takes an exclusive process-local open on a database path, and the
+  // test below intentionally opens the pair registry twice to prove a cold
+  // reopen.
+  char pairDirectoryTemplate[] = "/tmp/prodigy-pair-enrollment-unit-XXXXXX";
+  char *pairDirectory = ::mkdtemp(pairDirectoryTemplate);
+  if (!suite.require(pairDirectory != nullptr, "pair_enrollment_registry_test_directory_created")) return 1;
+  ScopedDirectory ownedPairDirectory {pairDirectory};
+  MothershipClusterPairEnrollmentIntent pairIntent = validPairEnrollmentIntent();
+  MothershipClusterPairEnrollmentIntent pairRecorded = {}, pairLoaded = {};
+  bool pairResumed = false;
+  {
+    MothershipClusterRegistry pairRegistry {String(pairDirectory)};
+    suite.require(pairRegistry.recordClusterPairEnrollmentIntent(pairIntent, pairIntent, pairResumed, &failure) && !pairResumed &&
+                  pairIntent.pairUUID != 0 && mothershipClusterPairEnrollmentIntentRootValid(pairIntent),
+                  "pair_enrollment_registry_alias_safe_initial_private_intent");
+    pairRecorded = pairIntent;
+    MothershipClusterPairEnrollmentIntent retry = pairIntent;
+    retry.pairUUID = 0x9ff;
+    for (uint32_t index = 0; index < sizeof(retry.root); ++index) retry.root[index] = uint8_t(0xa0 + index);
+    suite.require(pairRegistry.recordClusterPairEnrollmentIntent(retry, pairRecorded, pairResumed, &failure) && pairResumed &&
+                  pairRecorded.pairUUID == pairIntent.pairUUID && CRYPTO_memcmp(pairRecorded.root, pairIntent.root, sizeof(pairRecorded.root)) == 0,
+                  "pair_enrollment_same_operation_reuses_original_private_root");
+  }
+  {
+    MothershipClusterRegistry pairRegistry {String(pairDirectory)};
+    suite.require(pairRegistry.loadClusterPairEnrollmentIntent(pairIntent.operationUUID, pairLoaded, &failure) &&
+                  pairLoaded.pairUUID == pairIntent.pairUUID &&
+                  CRYPTO_memcmp(pairLoaded.root, pairIntent.root, sizeof(pairLoaded.root)) == 0,
+                  "pair_enrollment_cold_reopen_preserves_root_and_identity");
+    MothershipClusterPairEnrollmentIntent conflictingScope = pairIntent;
+    conflictingScope.secondEndpoints[0].port++;
+    suite.require(!pairRegistry.recordClusterPairEnrollmentIntent(conflictingScope, pairRecorded, pairResumed, &failure),
+                  "pair_enrollment_rejects_same_operation_changed_roster");
+    MothershipClusterPairEnrollmentIntent conflictingClusters = validPairEnrollmentIntent(pairIntent.operationUUID + 1);
+    suite.require(!pairRegistry.recordClusterPairEnrollmentIntent(conflictingClusters, pairRecorded, pairResumed, &failure),
+                  "pair_enrollment_rejects_second_operation_for_same_cluster_pair");
+    suite.require(pairRegistry.recordClusterPairEnrollmentCompletion(pairIntent.operationUUID, 8, 12, true, false, false, false,
+                  pairRecorded, &failure) && pairRecorded.firstInitialProjectionDelivered &&
+                  pairRecorded.firstEnrolledAuthorityGeneration == 8 && pairRecorded.secondEnrolledAuthorityGeneration == 12,
+                  "pair_enrollment_records_monotonic_admission_receipt");
+  }
 
   return suite.failures == 0 ? 0 : 1;
 }

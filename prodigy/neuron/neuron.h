@@ -47,6 +47,7 @@
 #include <prodigy/machine.hardware.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/transport.artifact.h>
+#include <prodigy/cluster.pair.projection.h>
 #include <switchboard/overlay.route.h>
 #include <switchboard/switchboard.h>
 #include <switchboard/whitehole.route.h>
@@ -1336,7 +1337,7 @@ protected:
     // before it advances the next worker.
     if (controlTransportCredentials.enabled)
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
-                         haveFragments(), installedBundleDigest, uint8_t(1));
+                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(1));
     else
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
                          haveFragments(), installedBundleDigest);
@@ -3063,6 +3064,20 @@ public:
   NeuronBrainControlStream *brain = nullptr;
   ProdigyTransportCredentialBootstrap controlTransportCredentials;
   bool transportPeerProjectionPersistencePending = false;
+  ProdigyLocalClusterPairControlProjection clusterPairControlProjection;
+  bool clusterPairControlProjectionPersistencePending = false;
+
+  virtual bool installClusterPairControlProjection(const ProdigyLocalClusterPairControlProjection& projection)
+  { return prodigyLocalClusterPairControlProjectionValid(projection, true); }
+
+  virtual bool persistClusterPairControlProjection(
+      const ProdigyLocalClusterPairControlProjection&, uint128_t peerUUID, std::function<void(bool)> completion)
+  { (void)peerUUID; (void)completion; return false; }
+
+  bool controlPeerCurrentlyAuthorized(uint128_t peerUUID) const
+  {
+    return controlTransportCredentials.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain);
+  }
 
   virtual bool persistTransportCredentialPeerProjection(
       const ProdigyTransportCredentialBootstrap&, std::function<void(bool)> completion)
@@ -3118,6 +3133,40 @@ public:
           reply(true);
         });
     if (!admitted) { transportPeerProjectionPersistencePending = false; reply(false); }
+  }
+
+  void receiveClusterPairControlProjection(uint128_t nonce,
+                                           const ProdigyLocalClusterPairControlProjection& projection)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (nonce == 0 || !controlTransportCredentials.enabled ||
+        projection.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+        projection.nodeUUID != controlTransportCredentials.self.nodeUUID ||
+        !controlPeerCurrentlyAuthorized(peerUUID) ||
+        !prodigyLocalClusterPairControlProjectionValid(projection, true) ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+    auto reply = [this, stream, generation, peerUUID, nonce, committed = projection.committedAuthorityGeneration](bool accepted) {
+      if (!transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+      Message::construct(stream->wBuffer, NeuronTopic::clusterPairControlCredentialsAck, nonce, committed, uint8_t(accepted));
+      Ring::queueSend(stream);
+    };
+    if (clusterPairControlProjectionPersistencePending) { reply(false); return; }
+    clusterPairControlProjectionPersistencePending = true;
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    const std::weak_ptr<uint8_t> connectionLifetime = stream->connectionLifetime;
+    const bool admitted = persistClusterPairControlProjection(projection, peerUUID,
+      [this, lifetime, connectionLifetime, stream, generation, peerUUID, projection, reply](bool durable) mutable {
+        if (lifetime.expired()) return;
+        clusterPairControlProjectionPersistencePending = false;
+        if (connectionLifetime.expired() || !transportPeerProjectionControlCurrent(stream, generation, peerUUID) ||
+            !controlPeerCurrentlyAuthorized(peerUUID)) return;
+        if (!durable || !installClusterPairControlProjection(projection)) { reply(false); return; }
+        clusterPairControlProjection = projection;
+        reply(true);
+      });
+    if (!admitted) { clusterPairControlProjectionPersistencePending = false; reply(false); }
   }
   bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
   OSUpdateProcess osUpdateProcess;
@@ -4939,6 +4988,19 @@ public:
               !prodigyTransportCredentialBootstrapValid(projection, false))
           { if (brain) queueCloseIfActive(brain); break; }
           receiveTransportCredentialPeerProjection(nonce, projection);
+          break;
+        }
+      case NeuronTopic::clusterPairControlCredentials:
+        {
+          uint128_t nonce = 0;
+          String serialized;
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractToStringView(args, serialized);
+          ProdigyLocalClusterPairControlProjection projection = {};
+          if (!BitseryEngine::deserializeSafe(serialized, projection) ||
+              !prodigyLocalClusterPairControlProjectionValid(projection, true))
+          { if (brain) queueCloseIfActive(brain); break; }
+          receiveClusterPairControlProjection(nonce, projection);
           break;
         }
       case NeuronTopic::registration:

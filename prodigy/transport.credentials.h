@@ -269,6 +269,16 @@ public:
     enabled = false;
   }
 
+  bool currentlyAuthorizes(uint128_t nodeUUID, ProdigyTransportCredentialNodeRole role) const
+  {
+    if (!enabled || !self.valid() || nodeUUID == 0) return false;
+    return std::count_if(authorizedPeers.begin(), authorizedPeers.end(), [&](const auto& peer) {
+      return peer.valid() && peer.state == ProdigyTransportCredentialEnrollmentState::active &&
+          peer.nodeUUID == nodeUUID && peer.role == role && peer.clusterUUID == self.clusterUUID &&
+          peer.authorityEpoch == self.authorityEpoch && peer.keyEpoch == self.keyEpoch;
+    }) == 1;
+  }
+
   bool resolvePeer(const ProdigyTransportCredentialPrelude& prelude,
                    ProdigyTransportCredentialEnrollment& enrollment) const
   {

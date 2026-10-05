@@ -42,6 +42,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/brain.reachability.h>
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
+#include <prodigy/cluster.pair.projection.h>
 #include <prodigy/dns.provider.h>
 #include <prodigy/debug.h>
 #include <prodigy/ingress.validation.h>
@@ -6737,7 +6738,10 @@ public:
       if (!internalTransportAEGISRequired() ||
           !prodigyValidatePersistentClusterPairEnrollmentDescriptors(
               transition.runtimeState.clusterPairEnrollments, brainConfig.clusterUUID,
-              transition.runtimeState.generation, true, false)) return false;
+              transition.runtimeState.generation, true, false) ||
+          !prodigyValidateClusterPairEnrollmentOperations(transition.runtimeState.clusterPairEnrollments,
+              transition.runtimeState.clusterPairEnrollmentOperations, transition.runtimeState.generation,
+              &transition.runtimeState.transportCredentialEnrollments)) return false;
       transition.version = 6;
     }
     if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
@@ -8014,10 +8018,11 @@ public:
            peer->containerRetirementCapabilityIOGeneration == peer->ioGeneration;
   }
 
-  bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer) const
+  bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer, bool requireOperations = false) const
   {
     return containerRetirementPeerCapabilityCurrent(peer) && peer->transportAEGISEnabled() &&
-           peer->clusterPairEnrollmentCapabilityAcknowledged;
+           peer->clusterPairEnrollmentCapabilityAcknowledged &&
+           (!requireOperations || peer->clusterPairOperationsCapabilityAcknowledged);
   }
 
   // Shared commissioned-membership proof for capability-gated authority
@@ -8792,7 +8797,9 @@ public:
         !prodigyValidatePersistentTransportCredentialEnrollmentOperations(
             incoming.transportCredentialEnrollmentOperations,
             incoming.transportCredentialEnrollments,
-            incoming.generation))
+            incoming.generation) ||
+        !prodigyValidateClusterPairEnrollmentOperations(incoming.clusterPairEnrollments,
+            incoming.clusterPairEnrollmentOperations, incoming.generation, &incoming.transportCredentialEnrollments))
     {
       return false;
     }
@@ -8812,6 +8819,19 @@ public:
            next->state == ProdigyClusterPairEnrollmentState::pending) ||
           (next->state != ProdigyClusterPairEnrollmentState::revoked &&
            !prodigyClusterPairEnrollmentRootEquals(previous, *next))) return false;
+    }
+    for (const auto& previous : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+    {
+      auto next = std::find_if(incoming.clusterPairEnrollmentOperations.begin(), incoming.clusterPairEnrollmentOperations.end(),
+          [&](const auto& operation) { return operation.operationUUID == previous.operationUUID; });
+      if (next == incoming.clusterPairEnrollmentOperations.end() || next->pairUUID != previous.pairUUID ||
+          next->protocolVersion != previous.protocolVersion || next->localAuthorityGeneration != previous.localAuthorityGeneration ||
+          next->frozenElectorate != previous.frozenElectorate || next->localEndpoints != previous.localEndpoints ||
+          next->peerEndpoints != previous.peerEndpoints || next->transitionGeneration < previous.transitionGeneration ||
+          (previous.initialProjectionDelivered && !next->initialProjectionDelivered) ||
+          ((next->pinnedMasterAuthorityEpoch != previous.pinnedMasterAuthorityEpoch ||
+            next->initialProjectionDelivered != previous.initialProjectionDelivered) &&
+           next->transitionGeneration <= previous.transitionGeneration)) return false;
     }
     ProdigyContainerRetirementJournal currentRetirements = {}, incomingRetirements = {}, mergedRetirements = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, currentRetirements) ||
@@ -9401,7 +9421,7 @@ public:
            currentPeer->ioGeneration == pending->peerGeneration &&
            currentPeer->fslot == pending->peerFileSlot &&
            (pending->prepared.runtime.runtimeState.clusterPairEnrollments.empty() ||
-            clusterPairEnrollmentPeerCapabilityCurrent(currentPeer)) &&
+            clusterPairEnrollmentPeerCapabilityCurrent(currentPeer, !pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.empty())) &&
            peerCanReplicateMasterAuthorityState(currentPeer);
   }
 
@@ -9466,7 +9486,7 @@ public:
       BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
   {
     if (!incoming.runtimeState.clusterPairEnrollments.empty() &&
-        !clusterPairEnrollmentPeerCapabilityCurrent(peer)) return true;
+        !clusterPairEnrollmentPeerCapabilityCurrent(peer, !incoming.runtimeState.clusterPairEnrollmentOperations.empty())) return true;
     if (!usesAsyncMasterAuthorityPersistence()) return false;
     // Serialize conflicting authority snapshots, while the handler continues
     // to accept heartbeats and other independent traffic. Full admission stays
@@ -9591,7 +9611,7 @@ public:
            (masterAuthorityRuntimeState.clusterPairEnrollments.empty() ||
             (masterAuthorityRuntimeStateDurable &&
              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
-             clusterPairEnrollmentPeerCapabilityCurrent(peer))) &&
+             clusterPairEnrollmentPeerCapabilityCurrent(peer, !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty()))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
@@ -17063,6 +17083,7 @@ public:
     retryDeferredPersistenceBackpressureContinuations();
     queueMasterAuthorityRuntimeStateReplication(true);
     driveTransportCredentialEnrollmentOperations();
+    driveClusterPairEnrollmentOperations();
     resumeStatefulTopologyRetirements();
     for (BrainView *peer : brains)
     {
@@ -23775,6 +23796,7 @@ public:
     // Deployment recovery still waits for healthy machine state transitions, but
     // interrupted addMachines journaling can resume immediately on promotion.
     reDriveTransportCredentialEnrollmentOperationsAfterPromotion();
+    reDriveClusterPairEnrollmentOperationsAfterPromotion();
     resumePendingAddMachinesOperations();
     reconcilePendingElasticAddressAssignments();
     reconcilePendingElasticAddressReleases();
@@ -30588,6 +30610,358 @@ public:
     return transportCredentialElectorateHasQualifiedQuorum(voters, digest);
   }
 
+  Vector<uint128_t> clusterPairCurrentElectorate() const
+  {
+    Vector<uint128_t> voters;
+    const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    if (!root.valid()) return voters;
+    for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+      if (entry.state == ProdigyTransportCredentialEnrollmentState::active &&
+          entry.role == ProdigyTransportCredentialNodeRole::brain && entry.clusterUUID == brainConfig.clusterUUID &&
+          entry.authorityEpoch == root.authorityEpoch && entry.keyEpoch == root.keyEpoch) voters.push_back(entry.nodeUUID);
+    std::sort(voters.begin(), voters.end());
+    return voters;
+  }
+
+  bool clusterPairInitialEnrollmentPending() const
+  {
+    for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+      if (!operation.initialProjectionDelivered)
+        for (const auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments)
+          if (enrollment.operationUUID == operation.operationUUID && enrollment.state != ProdigyClusterPairEnrollmentState::revoked)
+            return true;
+    // A delivered flag is itself a replicated transition. Do not admit a new
+    // credential electorate while that terminal transition is still unproven.
+    return !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty() && !clusterPairAuthorityQualified();
+  }
+
+  bool clusterPairAuthorityQualified() const
+  {
+    if (!internalTransportAEGISRequired() || !weAreMaster || masterAuthorityEpoch == 0 ||
+        masterAuthorityPersistencePending != 0 ||
+        masterAuthorityRuntimeState.clusterPairEnrollments.size() != masterAuthorityRuntimeState.clusterPairEnrollmentOperations.size() ||
+        !prodigyValidateClusterPairEnrollmentOperations(masterAuthorityRuntimeState.clusterPairEnrollments,
+            masterAuthorityRuntimeState.clusterPairEnrollmentOperations, masterAuthorityRuntimeState.generation,
+            &masterAuthorityRuntimeState.transportCredentialEnrollments)) return false;
+    String serialized, digest;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
+    bool unfinished = false;
+    for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+    {
+      auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+          masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& row) { return row.operationUUID == operation.operationUUID; });
+      if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+      if (operation.initialProjectionDelivered || enrollment->state == ProdigyClusterPairEnrollmentState::revoked) continue;
+      unfinished = true;
+      if (operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
+          !transportCredentialElectorateHasQualifiedQuorum(operation.frozenElectorate, digest)) return false;
+    }
+    return unfinished || transportCredentialElectorateHasQualifiedQuorum(clusterPairCurrentElectorate(), digest);
+  }
+
+  bool buildApprovedClusterPairEndpoints(Vector<ClusterPairControlEndpoint>& endpoints) const
+  {
+    endpoints.clear();
+    ClusterTopology topology;
+    const auto voters = clusterPairCurrentElectorate();
+    if (!internalTransportAEGISRequired() || !loadAuthoritativeClusterTopology(topology) || voters.empty()) return false;
+    for (const auto& machine : topology.machines)
+    {
+      if (!machine.isBrain) continue;
+      if (std::count(voters.begin(), voters.end(), machine.uuid) != 1) return false;
+      const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+      if (std::count_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(),
+          masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& member) {
+            return member.nodeUUID == machine.uuid && member.role == ProdigyTransportCredentialNodeRole::neuron &&
+                member.clusterUUID == brainConfig.clusterUUID && member.state == ProdigyTransportCredentialEnrollmentState::active &&
+                member.authorityEpoch == root.authorityEpoch && member.keyEpoch == root.keyEpoch;
+          }) != 1) return false;
+      ClusterPairControlEndpoint endpoint;
+      endpoint.clusterUUID = brainConfig.clusterUUID;
+      endpoint.nodeUUID = machine.uuid;
+      endpoint.port = uint16_t(ReservedPorts::clusterPairControl);
+      bool found = false;
+      for (const auto *addresses : {&machine.addresses.privateAddresses, &machine.addresses.publicAddresses})
+      {
+        for (const auto& candidate : *addresses)
+          if (ClusterMachine::parseIPAddressLiteral(candidate.address, endpoint.address) && clusterPairControlEndpointValid(endpoint))
+          { found = true; break; }
+        if (found) break;
+      }
+      if (!found) return false;
+      endpoints.push_back(endpoint);
+    }
+    std::sort(endpoints.begin(), endpoints.end(), [](const auto& a, const auto& b) { return a.nodeUUID < b.nodeUUID; });
+    return endpoints.size() == voters.size() && prodigyClusterPairEndpointsValid(endpoints, brainConfig.clusterUUID);
+  }
+
+  bool clusterPairEnrollmentReady(Vector<ClusterPairControlEndpoint>& endpoints) const
+  {
+    if (!clusterPairAuthorityQualified() || !commissionedRetirementPeersCurrent() ||
+        !buildApprovedClusterPairEndpoints(endpoints) || clusterPairInitialEnrollmentPending() ||
+        transportCredentialNewCohortIsFenced()) return false;
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
+          operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active) return false;
+    for (const auto& endpoint : endpoints)
+      if (endpoint.nodeUUID != selfBrainUUID() &&
+          !clusterPairEnrollmentPeerCapabilityCurrent(findBrainViewByUUID(endpoint.nodeUUID), true)) return false;
+    return true;
+  }
+
+  ProdigyClusterPairEnrollmentResponse queryClusterPairEnrollment(const ProdigyClusterPairEnrollmentQuery& query) const
+  {
+    ProdigyClusterPairEnrollmentResponse response;
+    response.localClusterUUID = brainConfig.clusterUUID;
+    response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    if (query.protocolVersion != ProdigyClusterPairEnrollmentQuery::version || !weAreMaster)
+    { response.failure.assign("pair enrollment requires current master and supported query"_ctv); return response; }
+    for (const auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments)
+      if (enrollment.operationUUID == query.operationUUID)
+      {
+        response.found = true;
+        response.enrollment = enrollment;
+        OPENSSL_cleanse(response.enrollment.root, sizeof(response.enrollment.root));
+        for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+          if (operation.operationUUID == query.operationUUID)
+          {
+            response.success = true;
+            response.localEndpoints = operation.localEndpoints;
+            response.peerEndpoints = operation.peerEndpoints;
+            response.qualified = enrollment.state == ProdigyClusterPairEnrollmentState::active && clusterPairAuthorityQualified();
+            response.initialProjectionDelivered = response.qualified && operation.initialProjectionDelivered;
+            return response;
+          }
+        response.failure.assign("pair enrollment has no durable operation"_ctv); return response;
+      }
+    response.success = true;
+    response.qualified = clusterPairEnrollmentReady(response.localEndpoints);
+    if (!response.qualified) response.failure.assign("pair enrollment awaits current durable quorum, credentials, topology and capabilities"_ctv);
+    return response;
+  }
+
+  bool enrollClusterPair(const ProdigyClusterPairEnrollmentRequest& request, ProdigyClusterPairEnrollmentResponse& response)
+  {
+    auto reject = [&](const char *failure) {
+      response = {}; response.localClusterUUID = brainConfig.clusterUUID;
+      response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation; response.failure.assign(failure); return false;
+    };
+    const auto& enrollment = request.enrollment;
+    if (!weAreMaster || !internalTransportAEGISRequired() || masterAuthorityEpoch == 0 ||
+        request.protocolVersion != ProdigyClusterPairEnrollmentRequest::version ||
+        !prodigyClusterPairEnrollmentDescriptorValid(enrollment) || prodigyClusterPairEnrollmentRootIsZero(enrollment) ||
+        enrollment.localClusterUUID != brainConfig.clusterUUID || enrollment.state != ProdigyClusterPairEnrollmentState::pending ||
+        enrollment.rootGeneration != 1 || enrollment.agreedKeyEpoch != 1 ||
+        !prodigyClusterPairEndpointsValid(request.localEndpoints, enrollment.localClusterUUID) ||
+        !prodigyClusterPairEndpointsValid(request.peerEndpoints, enrollment.peerClusterUUID)) return reject("invalid pair enrollment request");
+    for (const auto& previous : masterAuthorityRuntimeState.clusterPairEnrollments)
+    {
+      if (previous.operationUUID == enrollment.operationUUID)
+      {
+        if (!prodigyClusterPairEnrollmentIdentityEquals(previous, enrollment) ||
+            !prodigyClusterPairEnrollmentRootEquals(previous, enrollment) || previous.state == ProdigyClusterPairEnrollmentState::revoked)
+          return reject("pair enrollment operation conflicts with existing identity");
+        const auto op = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+            masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) { return value.operationUUID == enrollment.operationUUID; });
+        if (op == masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end() ||
+            op->localEndpoints != request.localEndpoints || op->peerEndpoints != request.peerEndpoints)
+          return reject("pair enrollment operation conflicts with endpoint roster");
+        driveClusterPairEnrollmentOperations();
+        response = queryClusterPairEnrollment({1, enrollment.operationUUID});
+        return response.success;
+      }
+      if (previous.pairUUID == enrollment.pairUUID || previous.peerClusterUUID == enrollment.peerClusterUUID)
+        return reject("cluster pair already has an immutable enrollment");
+    }
+    Vector<ClusterPairControlEndpoint> approved;
+    if (masterAuthorityRuntimeState.generation == UINT64_MAX ||
+        request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        enrollment.localAuthorityGeneration != masterAuthorityRuntimeState.generation + 1 ||
+        masterAuthorityRuntimeState.clusterPairEnrollments.size() >= ProdigyClusterPairEnrollmentMaximumRecords ||
+        !clusterPairEnrollmentReady(approved) || approved != request.localEndpoints)
+      return reject("pair enrollment awaits exact current authority and approved roster");
+    for (const auto& endpoint : request.localEndpoints)
+    {
+      uint32_t credentials = uint32_t(request.peerEndpoints.size());
+      for (const auto& previous : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+        if (std::any_of(previous.localEndpoints.begin(), previous.localEndpoints.end(),
+              [&](const auto& local) { return local.nodeUUID == endpoint.nodeUUID; }))
+          credentials += uint32_t(previous.peerEndpoints.size());
+      if (credentials > ProdigyLocalClusterPairControlProjectionMaximumCredentials)
+        return reject("pair enrollment exceeds bounded local endpoint credentials");
+    }
+    ProdigyClusterPairEnrollmentOperation operation;
+    operation.pairUUID = enrollment.pairUUID; operation.operationUUID = enrollment.operationUUID;
+    operation.localAuthorityGeneration = enrollment.localAuthorityGeneration;
+    operation.transitionGeneration = enrollment.localAuthorityGeneration;
+    operation.pinnedMasterAuthorityEpoch = masterAuthorityEpoch;
+    operation.frozenElectorate = clusterPairCurrentElectorate();
+    operation.localEndpoints = request.localEndpoints; operation.peerEndpoints = request.peerEndpoints;
+    if (!prodigyClusterPairEnrollmentOperationValid(operation, enrollment, enrollment.localAuthorityGeneration))
+      return reject("invalid pair enrollment operation");
+    masterAuthorityRuntimeState.clusterPairEnrollments.push_back(enrollment);
+    masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(std::move(operation));
+    const uint64_t epoch = masterAuthorityEpoch;
+    commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+      if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
+    });
+    response = queryClusterPairEnrollment({1, enrollment.operationUUID});
+    return response.success;
+  }
+
+  bool clusterPairProjectionNeuronAuthorized(const NeuronView *neuron) const
+  {
+    return transportPeerProjectionNeuronAuthorized(neuron) && neuron->clusterPairProjectionCapable;
+  }
+
+  bool buildLocalClusterPairControlProjection(uint128_t nodeUUID, ProdigyLocalClusterPairControlProjection& projection,
+                                               String& fingerprint) const
+  {
+    projection = {}; fingerprint.clear();
+    if (!clusterPairAuthorityQualified()) return false;
+    projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+    projection.localClusterUUID = brainConfig.clusterUUID; projection.nodeUUID = nodeUUID;
+    projection.committedAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    bool owner = false;
+    for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+    {
+      auto local = std::find_if(operation.localEndpoints.begin(), operation.localEndpoints.end(),
+          [&](const auto& endpoint) { return endpoint.nodeUUID == nodeUUID; });
+      if (local == operation.localEndpoints.end()) continue;
+      owner = true;
+      const auto row = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(), masterAuthorityRuntimeState.clusterPairEnrollments.end(),
+          [&](const auto& enrollment) { return enrollment.operationUUID == operation.operationUUID; });
+      if (row == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+      if (row->state != ProdigyClusterPairEnrollmentState::active) continue;
+      ClusterPairRoot root;
+      root.pairUUID = row->pairUUID; root.rootGeneration = row->rootGeneration;
+      root.firstClusterUUID = std::min(row->localClusterUUID, row->peerClusterUUID);
+      root.secondClusterUUID = std::max(row->localClusterUUID, row->peerClusterUUID);
+      std::memcpy(root.root.data(), row->root, root.root.size());
+      for (const auto& remote : operation.peerEndpoints)
+      {
+        ProdigyLocalClusterPairControlCredential credential;
+        credential.pairUUID = row->pairUUID; credential.rootGeneration = row->rootGeneration; credential.keyEpoch = row->agreedKeyEpoch;
+        credential.initiator = local->clusterUUID < remote.clusterUUID ? *local : remote;
+        credential.responder = local->clusterUUID < remote.clusterUUID ? remote : *local;
+        ClusterPairControlResolver resolver;
+        if (!clusterPairPrepareControlResolver(root, credential.initiator, credential.responder, *local, remote,
+            row->agreedKeyEpoch, "switchboard-pair-control-v1"_ctv, resolver)) return false;
+        credential.localClaim = resolver.localPublicClaim();
+        ClusterPairControlEndpointClaim remoteClaim;
+        if (!clusterPairParseControlEndpointClaim(credential.localClaim, remoteClaim)) return false;
+        remoteClaim.presenter = remote;
+        std::array<uint8_t, 32> key = {}; uint128_t authenticated = 0;
+        if (!clusterPairRenderControlEndpointClaim(remoteClaim, credential.remoteClaim) ||
+            !resolver.resolve(credential.remoteClaim, key, credential.canonicalContext, authenticated)) return false;
+        std::memcpy(credential.psk, key.data(), key.size()); OPENSSL_cleanse(key.data(), key.size());
+        projection.credentials.push_back(std::move(credential));
+      }
+    }
+    if (!owner || !prodigyLocalClusterPairControlProjectionValid(projection, true)) return false;
+    auto identity = projection; identity.committedAuthorityGeneration = 0;
+    String serialized; BitseryEngine::serialize(serialized, identity);
+    const bool hashed = prodigyComputeSHA256Hex(serialized, fingerprint);
+    OPENSSL_cleanse(serialized.data(), serialized.size());
+    return hashed;
+  }
+
+  void driveClusterPairControlProjections()
+  {
+    if (!clusterPairAuthorityQualified()) return;
+    const int64_t now = Time::msSinceBoot();
+    for (Machine *machine : machines)
+    {
+      if (!machine || !clusterPairProjectionNeuronAuthorized(&machine->neuron)) continue;
+      auto& neuron = machine->neuron;
+      ProdigyLocalClusterPairControlProjection projection; String fingerprint;
+      if (!buildLocalClusterPairControlProjection(machine->uuid, projection, fingerprint) ||
+          neuron.clusterPairProjectionAcknowledgedFingerprint == fingerprint) continue;
+      if (neuron.clusterPairProjectionNonce != 0 && neuron.clusterPairProjectionFingerprint == fingerprint &&
+          now - neuron.clusterPairProjectionSentAtMs < 1000) continue;
+      uint128_t nonce = 0;
+      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&nonce), sizeof(nonce)) != 1 || nonce == 0) continue;
+      String serialized; BitseryEngine::serialize(serialized, projection);
+      if (!clusterPairAuthorityQualified() || !clusterPairProjectionNeuronAuthorized(&neuron)) return;
+      neuron.clusterPairProjectionNonce = nonce;
+      neuron.clusterPairProjectionGeneration = projection.committedAuthorityGeneration;
+      neuron.clusterPairProjectionFingerprint = std::move(fingerprint);
+      neuron.clusterPairProjectionSentAtMs = now;
+      Message::construct(neuron.wBuffer, NeuronTopic::clusterPairControlCredentials, nonce, serialized);
+      OPENSSL_cleanse(serialized.data(), serialized.size());
+      Ring::queueSend(&neuron);
+    }
+  }
+
+  bool clusterPairInitialProjectionAcknowledged(const ProdigyClusterPairEnrollmentOperation& operation) const
+  {
+    for (const auto& endpoint : operation.localEndpoints)
+    {
+      Machine *machine = nullptr;
+      for (auto *candidate : machines) if (candidate && candidate->uuid == endpoint.nodeUUID) { machine = candidate; break; }
+      ProdigyLocalClusterPairControlProjection projection; String fingerprint;
+      if (!machine || !clusterPairProjectionNeuronAuthorized(&machine->neuron) ||
+          !buildLocalClusterPairControlProjection(endpoint.nodeUUID, projection, fingerprint) ||
+          machine->neuron.clusterPairProjectionAcknowledgedFingerprint != fingerprint) return false;
+    }
+    return !operation.localEndpoints.empty();
+  }
+
+  void driveClusterPairEnrollmentOperations()
+  {
+    if (!clusterPairAuthorityQualified() || masterAuthorityRuntimeState.generation == UINT64_MAX) return;
+    for (auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+    {
+      if (operation.initialProjectionDelivered || operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch) continue;
+      for (auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments)
+      {
+        if (enrollment.operationUUID != operation.operationUUID || enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
+        if (enrollment.state == ProdigyClusterPairEnrollmentState::pending)
+          enrollment.state = ProdigyClusterPairEnrollmentState::active;
+        else if (clusterPairInitialProjectionAcknowledged(operation)) operation.initialProjectionDelivered = true;
+        else continue;
+        operation.transitionGeneration = masterAuthorityRuntimeState.generation + 1;
+        const uint64_t epoch = masterAuthorityEpoch;
+        commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
+        });
+        return;
+      }
+    }
+    driveClusterPairControlProjections();
+  }
+
+  void acknowledgeClusterPairControlProjection(NeuronView *neuron, uint128_t nonce, uint64_t generation, bool accepted)
+  {
+    if (!clusterPairProjectionNeuronAuthorized(neuron) || nonce == 0 || neuron->clusterPairProjectionNonce != nonce ||
+        neuron->clusterPairProjectionGeneration != generation || !clusterPairAuthorityQualified()) return;
+    ProdigyLocalClusterPairControlProjection projection; String fingerprint;
+    if (!buildLocalClusterPairControlProjection(neuron->machine->uuid, projection, fingerprint) ||
+        fingerprint != neuron->clusterPairProjectionFingerprint) return;
+    if (accepted) neuron->clusterPairProjectionAcknowledgedFingerprint = fingerprint;
+    neuron->clusterPairProjectionNonce = 0;
+    if (accepted) driveClusterPairEnrollmentOperations();
+  }
+
+  bool reDriveClusterPairEnrollmentOperationsAfterPromotion()
+  {
+    if (!weAreMaster || masterAuthorityEpoch == 0 || masterAuthorityRuntimeState.generation == UINT64_MAX) return false;
+    bool changed = false;
+    for (auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+      if (!operation.initialProjectionDelivered && operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch)
+      {
+        operation.pinnedMasterAuthorityEpoch = masterAuthorityEpoch;
+        operation.transitionGeneration = masterAuthorityRuntimeState.generation + 1;
+        changed = true;
+      }
+    const uint64_t epoch = masterAuthorityEpoch;
+    if (changed) commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+      if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
+    });
+    else driveClusterPairEnrollmentOperations();
+    return true;
+  }
+
   bool transportPeerProjectionNeuronAuthorized(const NeuronView *neuron) const
   {
     return neuron && neuron->machine && containerRetirementNeuronAuthorized(neuron, neuron->machine->uuid) &&
@@ -30931,7 +31305,7 @@ public:
       return true;
     }
     auto failAdmission = [&]() { persisted(false); return false; };
-    if (transportCredentialNewCohortIsFenced(addMachinesOperationID) || masterAuthorityRuntimeState.generation == UINT64_MAX ||
+    if (clusterPairInitialEnrollmentPending() || transportCredentialNewCohortIsFenced(addMachinesOperationID) || masterAuthorityRuntimeState.generation == UINT64_MAX ||
         enrollments.front().authorityGeneration != masterAuthorityRuntimeState.generation + 1 ||
         masterAuthorityRuntimeState.transportCredentialEnrollments.size() + enrollments.size() > ProdigyTransportCredentialEnrollmentMaximumRecords ||
         masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() + enrollments.size() > ProdigyTransportCredentialEnrollmentMaximumRecords)
@@ -32840,6 +33214,7 @@ public:
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->pairedSourceRetirementCapabilityAcknowledged = false;
           bv->clusterPairEnrollmentCapabilityAcknowledged = false;
+          bv->clusterPairOperationsCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
@@ -32847,7 +33222,7 @@ public:
           {
             const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                      (bv->transportAEGISEnabled() ? uint64_t(32) : 0);
+                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -33474,7 +33849,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                     (bv->transportAEGISEnabled() ? uint64_t(32) : 0);
+                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -33485,6 +33860,8 @@ public:
               bv->version < ProdigyBrainUpgradeCapabilityProtocolMinimumVersion) break;
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
+          bv->clusterPairEnrollmentCapabilityAcknowledged = false;
+          bv->clusterPairOperationsCapabilityAcknowledged = false;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(1)) != 0)
             bv->placementPolicyCapabilityAcknowledged = true;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(2)) != 0 &&
@@ -33499,6 +33876,8 @@ public:
                 bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion && (capabilities & uint64_t(16)) != 0;
             bv->clusterPairEnrollmentCapabilityAcknowledged =
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(32)) != 0;
+            bv->clusterPairOperationsCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(64)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -33517,6 +33896,7 @@ public:
             {
               acknowledgeMasterAuthorityTransition(bv, acknowledgement);
               driveTransportCredentialEnrollmentOperations();
+              driveClusterPairEnrollmentOperations();
             }
             break;
           }
@@ -33533,7 +33913,7 @@ public:
               (incoming.version < 5 || (bv->transportAEGISEnabled() &&
                                        bv->isTransportNegotiated() && bv->tlsPeerVerified && bv->tlsPeerUUID == bv->uuid)) &&
               (incoming.runtimeState.clusterPairEnrollments.empty() ||
-               (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv))) &&
+               (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv, !incoming.runtimeState.clusterPairEnrollmentOperations.empty()))) &&
               decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements) &&
               (incomingRetirements.pairedSourceFences.empty() ||
                (incoming.version >= 4 && containerRetirementPeerCapabilityCurrent(bv) &&
@@ -40030,6 +40410,29 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::preparePairedSourceRetirement, serialized);
           break;
         }
+      case MothershipTopic::enrollClusterPair:
+      case MothershipTopic::pullClusterPairEnrollment:
+        {
+          String encoded; Message::extractToStringView(args, encoded);
+          ProdigyClusterPairEnrollmentResponse response;
+          if (MothershipTopic(message->topic) == MothershipTopic::enrollClusterPair)
+          {
+            ProdigyClusterPairEnrollmentRequest request;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, request))
+              (void)enrollClusterPair(request, response);
+            else response.failure.assign("invalid pair enrollment frame"_ctv);
+          }
+          else
+          {
+            ProdigyClusterPairEnrollmentQuery query;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
+              response = queryClusterPairEnrollment(query);
+            else response.failure.assign("invalid pair enrollment query"_ctv);
+          }
+          String serialized; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serialized);
+          break;
+        }
       case MothershipTopic::pullStatelessDeploymentAdmission:
         {
           uint8_t requestVersion = 0;
@@ -42202,6 +42605,15 @@ public:
           acknowledgeTransportCredentialPeerProjection(neuron, nonce, generation, accepted == 1);
           break;
         }
+      case NeuronTopic::clusterPairControlCredentialsAck:
+        {
+          uint128_t nonce = 0; uint64_t generation = 0; uint8_t accepted = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractArg<ArgumentNature::fixed>(args, generation);
+          Message::extractArg<ArgumentNature::fixed>(args, accepted);
+          acknowledgeClusterPairControlProjection(neuron, nonce, generation, accepted == 1);
+          break;
+        }
       case NeuronTopic::registration:
         {
           // bootTimeMs(8) kernel{4} osID{4} osVersionID{4} haveData(1)
@@ -42231,6 +42643,11 @@ public:
           uint8_t projectionVersion = 0;
           if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, projectionVersion);
           neuron->transportPeerProjectionCapable = projectionVersion == 1 && neuron->transportAEGISEnabled();
+          uint8_t pairProjectionVersion = 0;
+          if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, pairProjectionVersion);
+          neuron->clusterPairProjectionCapable = pairProjectionVersion == 1 && neuron->transportPeerProjectionCapable;
+          neuron->clusterPairProjectionNonce = 0;
+          neuron->clusterPairProjectionAcknowledgedFingerprint.clear();
           neuron->transportPeerProjectionIOGeneration = neuron->ioGeneration;
           neuron->transportPeerProjectionAuthorityEpoch = masterAuthorityEpoch;
           establishNeuronArtifactCapability(neuron, installedBundleDigest);
@@ -42298,6 +42715,7 @@ public:
 
           refreshNeuronControlHandshakeWatchdog(neuron, "registration");
           driveTransportCredentialEnrollmentOperations();
+          driveClusterPairEnrollmentOperations();
           sendNeuronSwitchboardStateSync(machine);
           recoverDeploymentsAfterNeuronState();
           armMachineUpdateTimerIfNeeded();

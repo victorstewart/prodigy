@@ -1939,25 +1939,23 @@ public:
   explicit ProdigyNeuron(ProdigyHostControlNetwork& hostControlNetwork)
       : hostControlNetwork(hostControlNetwork)
   {
+    if (persistentLocalBrainState.clusterPairControlProjection.protocolVersion != 0)
+    {
+      if (!prodigyLocalClusterPairControlProjectionValid(persistentLocalBrainState.clusterPairControlProjection, true) ||
+          !installClusterPairControlProjection(persistentLocalBrainState.clusterPairControlProjection))
+      {
+        std::fprintf(stderr, "prodigy startup rejected persisted cluster pair control projection\n");
+        _exit(EXIT_FAILURE);
+      }
+      clusterPairControlProjection = persistentLocalBrainState.clusterPairControlProjection;
+    }
     if (persistentLocalBrainState.transportCredentials.enabled)
     {
-      if (persistentLocalBrainState.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::neuron)
-        controlTransportCredentials = persistentLocalBrainState.transportCredentials;
-      else
+      if (!prodigyBuildLocalNeuronTransportCredentialBootstrap(
+              persistentLocalBrainState, controlTransportCredentials))
       {
-        // Brain machines also host a Neuron. Derive its separate scoped
-        // credential without placing the authority root in the Neuron owner.
-        Vector<ProdigyTransportCredentialEnrollment> ledger;
-        prodigyTransportCredentialBootstrapLedger(persistentLocalBrainState.transportCredentials, ledger);
-        ProdigyPersistentLocalBrainState localNeuron = {};
-        if (!prodigyBuildLocalTransportCredentialState(persistentLocalBrainState.transportCredentialAuthorityRoot,
-              ledger, persistentLocalBrainState.uuid, ProdigyTransportCredentialNodeRole::neuron, localNeuron,
-              persistentLocalBrainState.transportCredentials.committedAuthorityGeneration))
-        {
-          std::fprintf(stderr, "prodigy startup rejected local Neuron transport enrollment\n");
-          _exit(EXIT_FAILURE);
-        }
-        controlTransportCredentials = localNeuron.transportCredentials;
+        std::fprintf(stderr, "prodigy startup rejected local Neuron transport enrollment\n");
+        _exit(EXIT_FAILURE);
       }
     }
     runtimeAwareIaaS = new RuntimeAwareNeuronIaaS(&persistentStateStore,
@@ -1981,6 +1979,23 @@ public:
         [projection](auto& latest, String&) {
           ProdigyTransportCredentialBootstrap resultingNeuron;
           return prodigyApplyLocalTransportCredentialPeerProjection(latest, projection, resultingNeuron);
+        },
+        [completion = std::move(completion)](auto&& result) mutable {
+          if (completion) completion(result.durable);
+        });
+  }
+
+  bool persistClusterPairControlProjection(
+      const ProdigyLocalClusterPairControlProjection& projection, uint128_t peerUUID,
+      std::function<void(bool)> completion) override
+  {
+    if (!ensurePersistentWriter()) return false;
+    return persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+        [projection, peerUUID](auto& latest, String&) {
+          ProdigyTransportCredentialBootstrap localNeuron = {};
+          return prodigyBuildLocalNeuronTransportCredentialBootstrap(latest, localNeuron) &&
+              localNeuron.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain) &&
+              prodigyApplyLocalClusterPairControlProjection(latest, projection);
         },
         [completion = std::move(completion)](auto&& result) mutable {
           if (completion) completion(result.durable);

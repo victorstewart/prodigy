@@ -3118,6 +3118,118 @@ int main(void)
             futureAuthorityPairEnrollmentPublic, futureAuthorityPairEnrollmentSecrets, &pairEnrollmentFailure) == false,
         "apply_snapshot_secrets_rejects_future_local_authority_generation");
 
+    ProdigyClusterPairEnrollmentOperation pairOperation = {};
+    pairOperation.pairUUID = enrollment.pairUUID; pairOperation.operationUUID = enrollment.operationUUID;
+    pairOperation.localAuthorityGeneration = enrollment.localAuthorityGeneration;
+    pairOperation.transitionGeneration = enrollment.localAuthorityGeneration;
+    pairOperation.pinnedMasterAuthorityEpoch = 1; pairOperation.frozenElectorate = {uint128_t(1), uint128_t(2)};
+    ClusterPairControlEndpoint localEndpoint = {}, peerEndpoint = {};
+    localEndpoint.clusterUUID = enrollment.localClusterUUID; localEndpoint.nodeUUID = 1; localEndpoint.address.is6 = true; localEndpoint.address.v6[0] = 0x20; localEndpoint.port = 1;
+    peerEndpoint = localEndpoint; peerEndpoint.clusterUUID = enrollment.peerClusterUUID; peerEndpoint.nodeUUID = 2; peerEndpoint.address.v6[15] = 2;
+    pairOperation.localEndpoints = {localEndpoint}; pairOperation.peerEndpoints = {peerEndpoint};
+    ProdigyMasterAuthorityRuntimeState operationRuntime = {}; operationRuntime.generation = enrollment.localAuthorityGeneration;
+    operationRuntime.clusterPairEnrollments = {pairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments[0]};
+    operationRuntime.clusterPairEnrollmentOperations = {pairOperation};
+    String operationRuntimeBytes = {}; ProdigyMasterAuthorityRuntimeState decodedOperationRuntime = {};
+    BitseryEngine::serialize(operationRuntimeBytes, operationRuntime);
+    suite.expect(operationRuntimeBytes.empty() == false, "cluster_pair_operation_runtime_codec_writes_v12");
+    suite.expect(BitseryEngine::deserializeSafe(operationRuntimeBytes, decodedOperationRuntime) &&
+        decodedOperationRuntime.clusterPairEnrollmentOperations.size() == 1 &&
+        prodigyValidateClusterPairEnrollmentOperations(decodedOperationRuntime.clusterPairEnrollments,
+          decodedOperationRuntime.clusterPairEnrollmentOperations, decodedOperationRuntime.generation),
+        "cluster_pair_operation_runtime_codec_roundtrips_bound_operation");
+
+    ProdigyClusterPairEnrollmentResponse pairResponse = {};
+    pairResponse.success = pairResponse.found = true; pairResponse.localClusterUUID = enrollment.localClusterUUID;
+    pairResponse.currentAuthorityGeneration = enrollment.localAuthorityGeneration; pairResponse.enrollment = enrollment;
+    pairResponse.localEndpoints = {localEndpoint}; pairResponse.peerEndpoints = {peerEndpoint};
+    String pairResponseBytes = {}; ProdigyClusterPairEnrollmentResponse decodedPairResponse = {};
+    BitseryEngine::serialize(pairResponseBytes, pairResponse);
+    suite.expect(!stringContains(pairResponseBytes, runtimePairRootNeedle) &&
+        BitseryEngine::deserializeSafe(pairResponseBytes, decodedPairResponse) &&
+        decodedPairResponse.enrollment.pairUUID == enrollment.pairUUID &&
+        prodigyClusterPairEnrollmentRootIsZero(decodedPairResponse.enrollment),
+        "cluster_pair_enrollment_response_masks_and_restores_public_descriptor");
+
+    auto makeProjectionCredential = [&](uint128_t remoteUUID, uint8_t suffix) {
+      ProdigyLocalClusterPairControlCredential credential = {};
+      credential.pairUUID = enrollment.pairUUID; credential.rootGeneration = enrollment.rootGeneration; credential.keyEpoch = enrollment.agreedKeyEpoch;
+      credential.initiator = localEndpoint; credential.responder = peerEndpoint; credential.responder.nodeUUID = remoteUUID; credential.responder.address.v6[15] = suffix;
+      ClusterPairControlEndpointClaim localClaim = {}, remoteClaim = {};
+      localClaim.pairUUID = credential.pairUUID; localClaim.rootGeneration = credential.rootGeneration; localClaim.keyEpoch = credential.keyEpoch;
+      localClaim.initiator = credential.initiator; localClaim.responder = credential.responder; localClaim.presenter = credential.initiator;
+      remoteClaim = localClaim; remoteClaim.presenter = credential.responder;
+      (void)clusterPairRenderControlEndpointClaim(localClaim, credential.localClaim);
+      (void)clusterPairRenderControlEndpointClaim(remoteClaim, credential.remoteClaim);
+      credential.canonicalContext.assign("pair-projection-context"_ctv);
+      for (uint32_t index = 0; index < sizeof(credential.psk); ++index) credential.psk[index] = uint8_t(index + suffix);
+      return credential;
+    };
+    ProdigyLocalClusterPairControlProjection projection = {};
+    projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+    projection.localClusterUUID = enrollment.localClusterUUID; projection.nodeUUID = localEndpoint.nodeUUID;
+    projection.committedAuthorityGeneration = 19;
+    projection.credentials = {makeProjectionCredential(peerEndpoint.nodeUUID, 2), makeProjectionCredential(uint128_t(3), 3)};
+    suite.expect(prodigyLocalClusterPairControlProjectionValid(projection, true),
+                 "cluster_pair_projection_accepts_multiple_remote_endpoints_for_pair");
+    ProdigyPersistentLocalBrainState projectionState = {}; projectionState.uuid = projection.nodeUUID; projectionState.ownerClusterUUID = projection.localClusterUUID;
+    suite.expect(prodigyApplyLocalClusterPairControlProjection(projectionState, projection) &&
+        prodigyApplyLocalClusterPairControlProjection(projectionState, projection),
+        "cluster_pair_projection_apply_is_monotonic_and_equal_generation_idempotent");
+    auto staleProjection = projection; --staleProjection.committedAuthorityGeneration;
+    suite.expect(!prodigyApplyLocalClusterPairControlProjection(projectionState, staleProjection),
+                 "cluster_pair_projection_apply_rejects_rollback");
+    ProdigyPersistentLocalBrainState publicProjectionState = {}; ProdigyPersistentLocalBrainStateSecrets projectionSecrets = {};
+    prodigyExtractPersistentLocalBrainStateSecrets(projectionState, publicProjectionState, projectionSecrets);
+    suite.expect(projectionSecrets.clusterPairControlCredentials.size() == 2 &&
+        prodigyLocalClusterPairControlProjectionValid(publicProjectionState.clusterPairControlProjection, false),
+        "cluster_pair_projection_extracts_private_psks");
+    String publicProjectionBytes, privateProjectionBytes;
+    BitseryEngine::serialize(publicProjectionBytes, publicProjectionState);
+    BitseryEngine::serialize(privateProjectionBytes, projectionSecrets);
+    ProdigyPersistentLocalBrainState decodedPublicProjection;
+    ProdigyPersistentLocalBrainStateSecrets decodedPrivateProjection;
+    suite.expect(BitseryEngine::deserializeSafe(publicProjectionBytes, decodedPublicProjection) &&
+        BitseryEngine::deserializeSafe(privateProjectionBytes, decodedPrivateProjection) &&
+        prodigyApplyPersistentLocalBrainStateSecrets(decodedPublicProjection, decodedPrivateProjection) &&
+        prodigyLocalClusterPairControlProjectionEqual(decodedPublicProjection.clusterPairControlProjection, projection),
+        "cluster_pair_projection_public_private_codecs_restore_exact_owner_and_keys");
+    auto staleGenerationSecrets = projectionSecrets;
+    --staleGenerationSecrets.clusterPairControlAuthorityGeneration;
+    auto staleGenerationState = publicProjectionState;
+    suite.expect(!prodigyApplyPersistentLocalBrainStateSecrets(staleGenerationState, staleGenerationSecrets) &&
+        prodigyLocalClusterPairControlProjectionEqual(staleGenerationState.clusterPairControlProjection,
+            publicProjectionState.clusterPairControlProjection),
+        "cluster_pair_projection_stale_generation_sidecar_fails_without_partial_hydration");
+    ProdigyPersistentLocalBrainState legacyProjectionState;
+    String legacyProjectionBytes;
+    BitseryEngine::serialize(legacyProjectionBytes, legacyProjectionState);
+    suite.expect(BitseryEngine::deserializeSafe(legacyProjectionBytes, decodedPublicProjection) &&
+        decodedPublicProjection.clusterPairControlProjection.protocolVersion == 0,
+        "cluster_pair_projection_legacy_decode_clears_reused_projection");
+    auto missingProjectionSecrets = projectionSecrets; missingProjectionSecrets.clusterPairControlCredentials.clear();
+    auto missingProjectionState = publicProjectionState;
+    suite.expect(!prodigyApplyPersistentLocalBrainStateSecrets(missingProjectionState, missingProjectionSecrets),
+                 "cluster_pair_projection_rejects_missing_private_psk_sidecar");
+    auto duplicateProjectionSecrets = projectionSecrets; duplicateProjectionSecrets.clusterPairControlCredentials.push_back(duplicateProjectionSecrets.clusterPairControlCredentials.front());
+    auto duplicateProjectionState = publicProjectionState;
+    suite.expect(!prodigyApplyPersistentLocalBrainStateSecrets(duplicateProjectionState, duplicateProjectionSecrets),
+                 "cluster_pair_projection_rejects_duplicate_private_psk_sidecar");
+    auto staleProjectionSecrets = projectionSecrets;
+    ++staleProjectionSecrets.clusterPairControlCredentials.front().keyEpoch;
+    auto staleProjectionState = publicProjectionState;
+    suite.expect(!prodigyApplyPersistentLocalBrainStateSecrets(staleProjectionState, staleProjectionSecrets),
+                 "cluster_pair_projection_rejects_stale_private_psk_sidecar");
+    auto orphanProjectionSecrets = projectionSecrets;
+    ++orphanProjectionSecrets.clusterPairControlCredentials.front().pairUUID;
+    auto orphanProjectionState = publicProjectionState;
+    suite.expect(!prodigyApplyPersistentLocalBrainStateSecrets(orphanProjectionState, orphanProjectionSecrets),
+                 "cluster_pair_projection_rejects_orphan_private_psk_sidecar");
+    auto restoredProjectionState = publicProjectionState;
+    suite.expect(prodigyApplyPersistentLocalBrainStateSecrets(restoredProjectionState, projectionSecrets) &&
+        prodigyLocalClusterPairControlProjectionEqual(restoredProjectionState.clusterPairControlProjection, projection),
+        "cluster_pair_projection_restores_private_psks_exactly");
+
     // A paired stateless retirement can use the same numeric deployment ID on
     // independent clusters.  Its cluster tuple, not that local ID, separates
     // identities; ensure the v2 public descriptor and private bootstrap stay

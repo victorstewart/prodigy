@@ -5,7 +5,8 @@
 enum class ReservedPorts : uint16_t {
   neuron = 312,
   brain = 313,
-  mothership = 314
+  mothership = 314,
+  clusterPairControl = 315
 };
 
 enum class ApplicationLifetime : uint8_t {
@@ -67,7 +68,9 @@ enum class MothershipTopic : uint16_t {
   // Source-side retirement sealing is independently framed so legacy
   // controllers reject it instead of interpreting an admission payload.
   preparePairedSourceRetirement,
-  pullPairedSourceRetirement
+  pullPairedSourceRetirement,
+  enrollClusterPair,
+  pullClusterPairEnrollment
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -156,6 +159,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "preparePairedSourceRetirement";
     case MothershipTopic::pullPairedSourceRetirement:
       return "pullPairedSourceRetirement";
+    case MothershipTopic::enrollClusterPair:
+      return "enrollClusterPair";
+    case MothershipTopic::pullClusterPairEnrollment:
+      return "pullClusterPairEnrollment";
   }
 
   return "unknown";
@@ -242,7 +249,9 @@ enum class NeuronTopic : uint16_t {
   updateBundle,
   transitionToNewBundle,
   transportCredentialPeers,
-  transportCredentialPeersAck
+  transportCredentialPeersAck,
+  clusterPairControlCredentials,
+  clusterPairControlCredentialsAck
 };
 
 enum class ContainerTopic : uint16_t {

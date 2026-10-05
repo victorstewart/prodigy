@@ -3,12 +3,16 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include <networking/includes.h>
 #include <types/types.containers.h>
 #include <databases/embedded/tidesdb.h>
 #include <prodigy/iaas/bootstrap.ssh.h>
 #include <prodigy/cousin.route.h>
+#include <prodigy/cluster.pair.authority.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
@@ -257,6 +261,93 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
   serializer.object(record.rejectedObservations);
 }
 
+// Private Mothership intent.  It is deliberately separate from a Brain's
+// replicated enrollment: this record makes the one-time root and pair identity
+// retry-safe while each Brain remains the sole runtime authority owner.
+class MothershipClusterPairEnrollmentIntent {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t pairUUID = 0;
+  uint128_t operationUUID = 0;
+  uint128_t firstClusterUUID = 0;
+  uint128_t secondClusterUUID = 0;
+  uint64_t rootGeneration = 1;
+  uint64_t keyEpoch = 1;
+  // Audit observations only.  They are not part of the immutable operation
+  // scope because a retry may legitimately observe a newer authority epoch.
+  uint64_t firstObservedAuthorityGeneration = 0;
+  uint64_t secondObservedAuthorityGeneration = 0;
+  // Written after the corresponding Brain admits the immutable descriptor.
+  // A retry uses this exact value rather than a later current authority view.
+  uint64_t firstEnrolledAuthorityGeneration = 0;
+  uint64_t secondEnrolledAuthorityGeneration = 0;
+  uint8_t root[ProdigyClusterPairEnrollmentRootBytes] = {};
+  Vector<ClusterPairControlEndpoint> firstEndpoints;
+  Vector<ClusterPairControlEndpoint> secondEndpoints;
+  bool firstInitialProjectionDelivered = false;
+  bool secondInitialProjectionDelivered = false;
+  bool firstQualified = false;
+  bool secondQualified = false;
+
+  ~MothershipClusterPairEnrollmentIntent()
+  {
+    OPENSSL_cleanse(root, sizeof(root));
+  }
+};
+
+static inline bool mothershipClusterPairEnrollmentIntentRootValid(const MothershipClusterPairEnrollmentIntent& intent)
+{
+  uint8_t nonzero = 0;
+  for (uint8_t byte : intent.root) nonzero |= byte;
+  return nonzero != 0;
+}
+
+static inline bool mothershipClusterPairEnrollmentIntentValid(const MothershipClusterPairEnrollmentIntent& intent)
+{
+  return intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version && intent.pairUUID != 0 &&
+      intent.operationUUID != 0 && intent.firstClusterUUID != 0 && intent.secondClusterUUID != 0 &&
+      intent.firstClusterUUID < intent.secondClusterUUID && intent.rootGeneration != 0 && intent.keyEpoch != 0 &&
+      intent.firstObservedAuthorityGeneration != 0 && intent.secondObservedAuthorityGeneration != 0 &&
+      mothershipClusterPairEnrollmentIntentRootValid(intent) &&
+      prodigyClusterPairEndpointsValid(intent.firstEndpoints, intent.firstClusterUUID) &&
+      prodigyClusterPairEndpointsValid(intent.secondEndpoints, intent.secondClusterUUID);
+}
+
+static inline bool mothershipClusterPairEnrollmentIntentScopeMatches(
+    const MothershipClusterPairEnrollmentIntent& left, const MothershipClusterPairEnrollmentIntent& right)
+{
+  return left.protocolVersion == right.protocolVersion && left.operationUUID == right.operationUUID &&
+      left.firstClusterUUID == right.firstClusterUUID && left.secondClusterUUID == right.secondClusterUUID &&
+      left.rootGeneration == right.rootGeneration && left.keyEpoch == right.keyEpoch &&
+      left.firstEndpoints == right.firstEndpoints && left.secondEndpoints == right.secondEndpoints;
+}
+
+template <typename S>
+static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& intent)
+{
+  serializer.value4b(intent.protocolVersion);
+  serializer.value16b(intent.pairUUID);
+  serializer.value16b(intent.operationUUID);
+  serializer.value16b(intent.firstClusterUUID);
+  serializer.value16b(intent.secondClusterUUID);
+  serializer.value8b(intent.rootGeneration);
+  serializer.value8b(intent.keyEpoch);
+  serializer.value8b(intent.firstObservedAuthorityGeneration);
+  serializer.value8b(intent.secondObservedAuthorityGeneration);
+  serializer.value8b(intent.firstEnrolledAuthorityGeneration);
+  serializer.value8b(intent.secondEnrolledAuthorityGeneration);
+  for (uint8_t& byte : intent.root) serializer.value1b(byte);
+  serializer.container(intent.firstEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints,
+      [](auto& nested, auto& endpoint) { nested.object(endpoint); });
+  serializer.container(intent.secondEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints,
+      [](auto& nested, auto& endpoint) { nested.object(endpoint); });
+  serializer.value1b(intent.firstInitialProjectionDelivered);
+  serializer.value1b(intent.secondInitialProjectionDelivered);
+  serializer.value1b(intent.firstQualified);
+  serializer.value1b(intent.secondQualified);
+}
+
 class MothershipClusterRegistry {
 private:
 
@@ -268,6 +359,7 @@ private:
   constexpr static auto testPairBoundariesColumnFamily = "test_pair_boundaries"_ctv;
   constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
+  constexpr static auto clusterPairEnrollmentsColumnFamily = "cluster_pair_enrollments"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -288,6 +380,24 @@ private:
     }
 
     path.assign("/tmp/prodigy-mothership/clusters"_ctv);
+  }
+
+  struct ClusterPairEnrollmentLock {
+    int fd = -1;
+    ~ClusterPairEnrollmentLock() { if (fd >= 0) ::close(fd); }
+  };
+
+  bool lockClusterPairEnrollment(ClusterPairEnrollmentLock& lock, String *failure) const
+  {
+    String path = db.path();
+    path.append(".cluster-pair-enrollment.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
+    {
+      if (failure) failure->assign("cluster pair enrollment registry lock unavailable"_ctv);
+      return false;
+    }
+    return true;
   }
 
   static bool cousinRouteReceiptKey(uint128_t routeUUID, CousinRouteHalf half, String& key)
@@ -2904,6 +3014,155 @@ public:
     }
     if (cousinRouteTerminal(next)) return true;
     if (prior.state == CousinRouteState::draining && next.state == CousinRouteState::active) return false;
+    return true;
+  }
+
+  // The flock spans lookup and write, unlike TidesDB's per-call transactions.
+  // This prevents two Mothership processes from allocating different roots for
+  // one operation before either durable record is visible.
+  bool recordClusterPairEnrollmentIntent(const MothershipClusterPairEnrollmentIntent& requested,
+                                          MothershipClusterPairEnrollmentIntent& recorded,
+                                          bool& resumed, String *failure = nullptr)
+  {
+    // `recorded` may deliberately alias `requested` at the call site.  Own the
+    // secret-bearing candidate before clearing the output.
+    MothershipClusterPairEnrollmentIntent candidate = requested;
+    recorded = {};
+    resumed = false;
+    if (!mothershipClusterPairEnrollmentIntentValid(candidate))
+    {
+      if (failure) failure->assign("cluster pair enrollment intent is invalid"_ctv);
+      return false;
+    }
+    ClusterPairEnrollmentLock lock;
+    if (!lockClusterPairEnrollment(lock, failure)) return false;
+
+    Vector<String> values = {};
+    struct ClearValues {
+      Vector<String>& values;
+      ~ClearValues()
+      {
+        for (String& value : values) Vault::secureClearString(value);
+        values.clear();
+      }
+    } clearValues {values};
+    if (!db.listValues(clusterPairEnrollmentsColumnFamily, values, failure)) return false;
+    for (const String& encoded : values)
+    {
+      MothershipClusterPairEnrollmentIntent prior = {};
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || !mothershipClusterPairEnrollmentIntentValid(prior))
+      {
+        if (failure) failure->assign("cluster pair enrollment intent is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (prior.operationUUID == candidate.operationUUID)
+      {
+        if (!mothershipClusterPairEnrollmentIntentScopeMatches(prior, candidate))
+        {
+          if (failure) failure->assign("cluster pair enrollment operation conflicts with immutable scope"_ctv);
+          return false;
+        }
+        recorded = std::move(prior);
+        resumed = true;
+        if (failure) failure->clear();
+        return true;
+      }
+      if (prior.firstClusterUUID == candidate.firstClusterUUID && prior.secondClusterUUID == candidate.secondClusterUUID)
+      {
+        if (failure) failure->assign("cluster pair already has an immutable enrollment operation"_ctv);
+        return false;
+      }
+      if (prior.pairUUID == candidate.pairUUID)
+      {
+        if (failure) failure->assign("cluster pair UUID already belongs to another enrollment operation"_ctv);
+        return false;
+      }
+    }
+
+    String key = {}, encoded = {};
+    key.assignItoh(candidate.operationUUID);
+    BitseryEngine::serialize(encoded, candidate);
+    const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    Vault::secureClearString(encoded);
+    if (!written) return false;
+    recorded = std::move(candidate);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadClusterPairEnrollmentIntent(uint128_t operationUUID,
+                                       MothershipClusterPairEnrollmentIntent& intent,
+                                       String *failure = nullptr)
+  {
+    intent = {};
+    if (operationUUID == 0)
+    {
+      if (failure) failure->assign("cluster pair enrollment operation UUID is required"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {};
+    key.assignItoh(operationUUID);
+    const bool read = db.read(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    if (!read) { Vault::secureClearString(encoded); return false; }
+    const bool valid = BitseryEngine::deserializeSafe(encoded, intent) &&
+        mothershipClusterPairEnrollmentIntentValid(intent) && intent.operationUUID == operationUUID;
+    Vault::secureClearString(encoded);
+    if (!valid)
+    {
+      intent = {};
+      if (failure) failure->assign("cluster pair enrollment intent is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool recordClusterPairEnrollmentCompletion(uint128_t operationUUID,
+                                              uint64_t firstEnrolledAuthorityGeneration,
+                                              uint64_t secondEnrolledAuthorityGeneration,
+                                              bool firstInitialProjectionDelivered,
+                                              bool secondInitialProjectionDelivered,
+                                              bool firstQualified, bool secondQualified,
+                                              MothershipClusterPairEnrollmentIntent& recorded,
+                                              String *failure = nullptr)
+  {
+    ClusterPairEnrollmentLock lock;
+    if (!lockClusterPairEnrollment(lock, failure)) return false;
+    MothershipClusterPairEnrollmentIntent current = {};
+    String key = {}, encoded = {};
+    key.assignItoh(operationUUID);
+    const bool read = db.read(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    const bool decoded = read && BitseryEngine::deserializeSafe(encoded, current) &&
+        mothershipClusterPairEnrollmentIntentValid(current) && current.operationUUID == operationUUID;
+    if (!decoded)
+    {
+      Vault::secureClearString(encoded);
+      if (read && failure) failure->assign("cluster pair enrollment intent is corrupt or unsupported"_ctv);
+      return false;
+    }
+    Vault::secureClearString(encoded);
+    auto advanceEnrollmentGeneration = [](uint64_t& currentGeneration, uint64_t observedGeneration) {
+      if (observedGeneration == 0) return true;
+      if (currentGeneration != 0 && currentGeneration != observedGeneration) return false;
+      currentGeneration = observedGeneration;
+      return true;
+    };
+    if (!advanceEnrollmentGeneration(current.firstEnrolledAuthorityGeneration, firstEnrolledAuthorityGeneration) ||
+        !advanceEnrollmentGeneration(current.secondEnrolledAuthorityGeneration, secondEnrolledAuthorityGeneration))
+    {
+      if (failure) failure->assign("cluster pair enrollment authority generation conflicts with durable admission"_ctv);
+      return false;
+    }
+    current.firstInitialProjectionDelivered |= firstInitialProjectionDelivered;
+    current.secondInitialProjectionDelivered |= secondInitialProjectionDelivered;
+    current.firstQualified |= firstQualified;
+    current.secondQualified |= secondQualified;
+    BitseryEngine::serialize(encoded, current);
+    const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    Vault::secureClearString(encoded);
+    if (!written) return false;
+    recorded = std::move(current);
+    if (failure) failure->clear();
     return true;
   }
 

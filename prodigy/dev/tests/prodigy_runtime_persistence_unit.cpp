@@ -51,6 +51,8 @@ public:
   uint32_t projectionPersistenceCalls = 0;
   bool admitProjectionPersistence = true;
   std::deque<std::function<void(bool)>> projectionReceipts;
+  uint32_t pairProjectionPersistenceCalls = 0;
+  std::deque<std::function<void(bool)>> pairProjectionReceipts;
 
   bool persistTransportCredentialPeerProjection(
       const ProdigyTransportCredentialBootstrap&, std::function<void(bool)> completion) override
@@ -67,6 +69,19 @@ public:
     auto completion = std::move(projectionReceipts.front());
     projectionReceipts.pop_front();
     completion(durable);
+  }
+
+  bool persistClusterPairControlProjection(
+      const ProdigyLocalClusterPairControlProjection&, uint128_t, std::function<void(bool)> completion) override
+  {
+    ++pairProjectionPersistenceCalls;
+    pairProjectionReceipts.push_back(std::move(completion));
+    return true;
+  }
+  void finishPairProjectionPersistence(bool durable)
+  {
+    if (pairProjectionReceipts.empty()) return;
+    auto completion = std::move(pairProjectionReceipts.front()); pairProjectionReceipts.pop_front(); completion(durable);
   }
 };
 
@@ -1143,9 +1158,143 @@ static void testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(
   stream.fd = -1;
 }
 
+static void testNeuronClusterPairControlProjectionDurabilityAndStreamFence(TestSuite& suite)
+{
+  constexpr uint128_t neuronUUID = uint128_t(0x7205), brainUUID = uint128_t(0x7204);
+  PersistenceRing ring = {}; ProjectionReceiptTestNeuron neuron = {};
+  NeuronBrainControlStream stream = {}; ProdigyTransportTLSStream remote = {};
+  reserveProjectionTransport(stream); reserveProjectionTransport(remote);
+  std::array<uint8_t, 32> psk = {}; psk.fill(0x42);
+  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "pair-projection"_ctv, neuronUUID, brainUUID) &&
+      remote.beginTransportAEGIS(false, psk.data(), "pair-projection"_ctv, brainUUID, neuronUUID) &&
+      completeProjectionTransportHandshake(remote, stream);
+  suite.expect(authenticated, "runtime_pair_projection_uses_authenticated_control_stream");
+  if (!authenticated) return;
+  stream.connected = true; stream.tlsPeerVerified = true; stream.tlsPeerUUID = brainUUID;
+  stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); neuron.brain = &stream;
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  ProdigyLocalClusterPairControlProjection projection = {};
+  projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  projection.localClusterUUID = neuron.controlTransportCredentials.self.clusterUUID;
+  projection.nodeUUID = neuronUUID; projection.committedAuthorityGeneration = 12;
+  neuron.receiveClusterPairControlProjection(0x7208, projection);
+  suite.expect(neuron.pairProjectionPersistenceCalls == 1 && neuron.clusterPairControlProjectionPersistencePending &&
+      neuron.clusterPairControlProjection.protocolVersion == 0 && stream.wBuffer.empty(),
+      "runtime_pair_projection_waits_for_durable_receipt_before_install_or_ack");
+  stream.pendingSend = true; neuron.finishPairProjectionPersistence(true);
+  suite.expect(!neuron.clusterPairControlProjectionPersistencePending &&
+      prodigyLocalClusterPairControlProjectionEqual(neuron.clusterPairControlProjection, projection) && !stream.wBuffer.empty(),
+      "runtime_pair_projection_installs_durable_empty_revocation_projection");
+  stream.wBuffer.clear(); stream.pendingSend = false; neuron.clusterPairControlProjection = {};
+  neuron.receiveClusterPairControlProjection(0x7209, projection); stream.pendingSend = true; neuron.finishPairProjectionPersistence(false);
+  bool failedAck = false;
+  if (!stream.wBuffer.empty())
+  {
+    auto *message = reinterpret_cast<Message *>(stream.wBuffer.data());
+    if (message->topic == uint16_t(NeuronTopic::clusterPairControlCredentialsAck) &&
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()))
+    {
+      uint8_t *args = message->args; uint128_t nonce = 0; uint64_t generation = 0; uint8_t accepted = 1;
+      Message::extractArg<ArgumentNature::fixed>(args, nonce);
+      Message::extractArg<ArgumentNature::fixed>(args, generation);
+      Message::extractArg<ArgumentNature::fixed>(args, accepted);
+      failedAck = nonce == uint128_t(0x7209) && generation == projection.committedAuthorityGeneration && accepted == 0;
+    }
+  }
+  suite.expect(neuron.clusterPairControlProjection.protocolVersion == 0 && failedAck,
+      "runtime_pair_projection_failed_receipt_does_not_install");
+  stream.wBuffer.clear(); stream.pendingSend = false;
+  neuron.receiveClusterPairControlProjection(0x7210, projection); ++stream.ioGeneration; neuron.finishPairProjectionPersistence(true);
+  suite.expect(neuron.clusterPairControlProjection.protocolVersion == 0 && stream.wBuffer.empty(),
+      "runtime_pair_projection_stale_generation_cannot_install_or_ack");
+  ProdigyLocalClusterPairControlProjection foreign = projection; ++foreign.nodeUUID;
+  neuron.receiveClusterPairControlProjection(0x7211, foreign);
+  suite.expect(neuron.pairProjectionPersistenceCalls == 3,
+      "runtime_pair_projection_rejects_foreign_local_owner_before_persistence");
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  neuron.controlTransportCredentials.authorizedPeers.clear();
+  neuron.receiveClusterPairControlProjection(0x7212, projection);
+  suite.expect(neuron.pairProjectionPersistenceCalls == 3,
+      "runtime_pair_projection_rejects_old_authenticated_stream_removed_from_roster");
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  neuron.receiveClusterPairControlProjection(0x7213, projection);
+  neuron.controlTransportCredentials.authorizedPeers.clear();
+  neuron.finishPairProjectionPersistence(true);
+  suite.expect(neuron.clusterPairControlProjection.protocolVersion == 0 && stream.wBuffer.empty(),
+      "runtime_pair_projection_revocation_before_receipt_cannot_install_or_ack");
+  ::close(stream.fd); stream.fd = -1;
+}
+
+static void testProductionPairProjectionWriterUsesColocatedNeuronAuthority(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_pair_colocated_writer_starts");
+  if (!io) return;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io);
+  livePersistentWriter = writer;
+  ProdigyTransportCredentialAuthorityRoot authority;
+  authority.authorityEpoch = 7; authority.keyEpoch = 9; authority.authorityGeneration = 10;
+  std::memset(authority.root, 0x63, sizeof(authority.root));
+  Vector<ProdigyTransportCredentialEnrollment> ledger;
+  auto ownBrain = projectionEnrollment(0x7303, 0x7301, 10);
+  auto ownNeuron = ownBrain; ownNeuron.operationUUID = 0x7304;
+  ownNeuron.role = ProdigyTransportCredentialNodeRole::neuron;
+  auto otherBrain = ownBrain; otherBrain.operationUUID = 0x7305; otherBrain.nodeUUID = 0x7302;
+  ledger.push_back(ownBrain); ledger.push_back(ownNeuron); ledger.push_back(otherBrain);
+  persistentLocalBrainState = {};
+  const bool built = prodigyBuildLocalTransportCredentialState(authority, ledger, ownBrain.nodeUUID,
+      ProdigyTransportCredentialNodeRole::brain, persistentLocalBrainState, 10);
+  suite.expect(built, "runtime_pair_colocated_writer_has_real_dual_role_state");
+  bool ownDurable = false, revocationDurable = false, removedRejected = false;
+  ProdigyHostControlNetwork network;
+  if (built)
+  {
+    ProdigyNeuron neuron(network);
+    ProdigyLocalClusterPairControlProjection projection;
+    projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+    projection.localClusterUUID = ownBrain.clusterUUID; projection.nodeUUID = ownBrain.nodeUUID;
+    projection.committedAuthorityGeneration = 11;
+    const bool admitted = neuron.persistClusterPairControlProjection(projection, ownBrain.nodeUUID, [&](bool durable) {
+      ownDurable = durable;
+      if (!durable) { Ring::exit = true; return; }
+      auto revoke = neuron.controlTransportCredentials;
+      OPENSSL_cleanse(revoke.self.secret, sizeof(revoke.self.secret));
+      revoke.committedAuthorityGeneration = 12;
+      revoke.authorizedPeers.erase(std::remove_if(revoke.authorizedPeers.begin(), revoke.authorizedPeers.end(),
+          [&](const auto& peer) { return peer.nodeUUID == otherBrain.nodeUUID; }), revoke.authorizedPeers.end());
+      if (!neuron.persistTransportCredentialPeerProjection(revoke, [&](bool removed) {
+        revocationDurable = removed;
+        auto forbidden = projection; forbidden.committedAuthorityGeneration = 13;
+        removedRejected = !neuron.persistClusterPairControlProjection(forbidden, otherBrain.nodeUUID,
+            [&](bool) { suite.expect(false, "runtime_pair_revoked_writer_must_not_persist"); });
+        Ring::exit = true;
+      })) Ring::exit = true;
+    });
+    suite.expect(admitted, "runtime_pair_colocated_master_writer_admits_own_neuron");
+    if (admitted) { ring.armDeadline(3000); Ring::start(); }
+    suite.expect(!ring.timedOut && ownDurable && revocationDurable && removedRejected &&
+        persistentLocalBrainState.clusterPairControlProjection.committedAuthorityGeneration == 11,
+        "runtime_pair_colocated_master_durable_and_revoked_foreign_sender_rejected");
+  }
+  suite.expect(writer->drainForExec(), "runtime_pair_colocated_writer_drains");
+  writer.reset(); livePersistentWriter.reset();
+  io->stop(); ring.drainStoppedIO(); io.reset();
+  (void)network.shutdown(); store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentLocalBrainState restored;
+  suite.expect(reopened.loadLocalBrainState(restored) && restored.clusterPairControlProjection.committedAuthorityGeneration == 11,
+      "runtime_pair_colocated_writer_cold_restore_preserves_only_authorized_projection");
+  reopened.close(); persistentLocalBrainState = {};
+}
+
 int main(void)
 {
   TestSuite suite;
+  testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
+  testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "reentrant-update-persistence") == 0)
   {

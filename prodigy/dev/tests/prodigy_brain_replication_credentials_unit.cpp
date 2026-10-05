@@ -31275,6 +31275,244 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   }
 
   {
+    // A pair operation is a separate durable authority record.  Its first
+    // projection must cross pending and active exact-transition quorums before
+    // any local Neuron can receive a derived pair-control credential.
+    ScopedRing pairRing = {};
+    TransportCredentialCohortTestBrain pairBrain = {};
+    configureAuthority(pairBrain, 100, 191);
+    pairBrain.nBrains = 3;
+
+    auto pairTopologyMachine = [&](uint128_t uuid, const char *address) {
+      ClusterMachine value = {};
+      value.uuid = uuid;
+      value.isBrain = true;
+      prodigyAppendUniqueClusterMachineAddress(value.addresses.privateAddresses, address, 64, String());
+      return value;
+    };
+    pairBrain.authoritativeTopology.machines = {
+        pairTopologyMachine(selfUUID, "fd00:9a::1"),
+        pairTopologyMachine(peerAUUID, "fd00:9a::2"),
+        pairTopologyMachine(peerBUUID, "fd00:9a::3")};
+    pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a71, selfUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 100));
+    pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a72, peerAUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 100));
+    pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a73, peerBUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 100));
+
+    BrainView pairPeerA = {}, pairPeerB = {};
+    suite.require(authenticatePeer(pairBrain, pairPeerA, peerAUUID) &&
+                      authenticatePeer(pairBrain, pairPeerB, peerBUUID),
+                  "cluster_pair_owner_authenticates_exact_brain_electorate");
+    auto acknowledgePairCapabilities = [&](BrainView& peer, uint64_t capabilities) {
+      peer.version = ProdigyBinaryVersion;
+      String frame = {};
+      pairBrain.brainHandler(&peer, buildBrainMessage(frame,
+          BrainTopic::acknowledgeCapabilities, capabilities));
+    };
+    acknowledgePairCapabilities(pairPeerA, uint64_t(2 | 32));
+    acknowledgePairCapabilities(pairPeerB, uint64_t(2 | 32));
+
+    Machine selfMachine = {}, peerAMachine = {}, peerBMachine = {};
+    auto configurePairNeuron = [&](Machine& machine, uint128_t uuid, int slot) {
+      machine.uuid = uuid;
+      machine.neuron.machine = &machine;
+      machine.neuron.connected = true;
+      machine.neuron.isFixedFile = true;
+      machine.neuron.fslot = slot;
+      machine.neuron.ioGeneration = 1;
+      pairBrain.machines.insert(&machine);
+      pairBrain.neurons.insert(&machine.neuron);
+      const auto& authority = pairBrain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+      const auto& ledger = pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments;
+      const auto local = std::find_if(ledger.begin(), ledger.end(), [&](const auto& row) {
+        return row.nodeUUID == uuid && row.role == ProdigyTransportCredentialNodeRole::neuron;
+      });
+      if (local == ledger.end()) return false;
+      ProdigyTransportCredentialPrelude claim = {};
+      claim.operationUUID = local->operationUUID;
+      claim.nodeUUID = local->nodeUUID;
+      claim.authorityEpoch = local->authorityEpoch;
+      claim.keyEpoch = local->keyEpoch;
+      claim.authorityGeneration = local->authorityGeneration;
+      claim.role = local->role;
+      String prelude = {};
+      ProdigyTransportTLSStream remote = {};
+      reserveTransportStream(machine.neuron);
+      reserveTransportStream(remote);
+      if (!prodigyRenderTransportCredentialPrelude(claim, prelude) ||
+          !pairBrain.beginInternalControlTransport(&machine.neuron, false,
+              ProdigyTransportCredentialNodeRole::neuron, uuid) ||
+          !remote.beginTransportAEGISWithPrelude(true, uuid, prelude,
+              [&authority, &ledger, uuid](const String& claimed, std::array<uint8_t, 32>& psk,
+                                           String& context, uint128_t& authenticatedUUID) {
+                return prodigyResolveBrainTransportCredentialPeer(authority, ledger, uuid,
+                    ProdigyTransportCredentialNodeRole::neuron, claimed, "brain-neuron"_ctv,
+                    psk.data(), context, authenticatedUUID);
+              }) ||
+          !completeTransportHandshake(machine.neuron, remote)) return false;
+      machine.neuron.transportPeerProjectionCapable = true;
+      machine.neuron.transportPeerProjectionIOGeneration = machine.neuron.ioGeneration;
+      machine.neuron.transportPeerProjectionAuthorityEpoch = pairBrain.masterAuthorityEpoch;
+      machine.neuron.clusterPairProjectionCapable = true;
+      return machine.neuron.transportAEGISEnabled() && machine.neuron.isTransportNegotiated() &&
+             machine.neuron.tlsPeerVerified && machine.neuron.tlsPeerUUID == uuid;
+    };
+    suite.require(configurePairNeuron(selfMachine, selfUUID, 41) &&
+                      configurePairNeuron(peerAMachine, peerAUUID, 42) &&
+                      configurePairNeuron(peerBMachine, peerBUUID, 43),
+                  "cluster_pair_owner_authenticates_all_private_ipv6_roster_neurons");
+
+    Vector<ClusterPairControlEndpoint> localRoster = {};
+    suite.require(!pairBrain.clusterPairEnrollmentReady(localRoster),
+                  "cluster_pair_owner_rejects_new_operation_for_legacy_capability_only_peers");
+    acknowledgePairCapabilities(pairPeerA, uint64_t(2 | 32 | 64));
+    acknowledgePairCapabilities(pairPeerB, uint64_t(2 | 32 | 64));
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA) &&
+                      pairBrain.clusterPairEnrollmentReady(localRoster) && localRoster.size() == 3,
+                  "cluster_pair_owner_requires_current_authenticated_operation_capabilities_and_quorum");
+
+    auto remoteEndpoint = [&](uint128_t uuid, const char *address) {
+      ClusterPairControlEndpoint endpoint = {};
+      endpoint.clusterUUID = uint128_t(0x9b99);
+      endpoint.nodeUUID = uuid;
+      endpoint.port = uint16_t(ReservedPorts::clusterPairControl);
+      return ClusterMachine::parseIPAddressLiteral(address, endpoint.address) ? endpoint : ClusterPairControlEndpoint {};
+    };
+    Vector<ClusterPairControlEndpoint> remoteRoster = {
+        remoteEndpoint(0x9b01, "fd00:9b::1"), remoteEndpoint(0x9b02, "fd00:9b::2")};
+    ProdigyClusterPairEnrollmentRequest request = {};
+    request.expectedAuthorityGeneration = pairBrain.masterAuthorityRuntimeState.generation;
+    request.enrollment.pairUUID = 0x9b10;
+    request.enrollment.localClusterUUID = clusterUUID;
+    request.enrollment.peerClusterUUID = 0x9b99;
+    request.enrollment.operationUUID = 0x9b11;
+    request.enrollment.rootGeneration = 1;
+    request.enrollment.agreedKeyEpoch = 1;
+    request.enrollment.localAuthorityGeneration = request.expectedAuthorityGeneration + 1;
+    request.enrollment.state = ProdigyClusterPairEnrollmentState::pending;
+    for (uint32_t byte = 0; byte < sizeof(request.enrollment.root); ++byte)
+      request.enrollment.root[byte] = uint8_t(0xc0 + byte);
+    request.localEndpoints = localRoster;
+    request.peerEndpoints = remoteRoster;
+
+    ProdigyClusterPairEnrollmentResponse response = {};
+    auto staleRequest = request;
+    --staleRequest.expectedAuthorityGeneration;
+    suite.expect(!pairBrain.enrollClusterPair(staleRequest, response) &&
+                     pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty(),
+                 "cluster_pair_owner_rejects_stale_authority_generation_before_persistence");
+
+    pairBrain.holdRuntimePersistence = true;
+    suite.require(pairBrain.enrollClusterPair(request, response) && response.found &&
+                      pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.size() == 1 &&
+                      pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                          ProdigyClusterPairEnrollmentState::pending,
+                  "cluster_pair_owner_persists_exact_pending_enrollment_and_operation_together");
+    auto changedRoot = request;
+    changedRoot.enrollment.root[0] ^= 1;
+    auto changedRoster = request;
+    changedRoster.peerEndpoints.back() = remoteEndpoint(0x9b02, "fd00:9b::9");
+    suite.expect(!pairBrain.enrollClusterPair(changedRoot, response) &&
+                     !pairBrain.enrollClusterPair(changedRoster, response) &&
+                     pairBrain.enrollClusterPair(request, response),
+                 "cluster_pair_owner_accepts_only_exact_operation_replay_and_immutable_root_roster");
+    const auto pendingQuery = pairBrain.queryClusterPairEnrollment({1, request.enrollment.operationUUID});
+    suite.expect(pendingQuery.success && pendingQuery.found &&
+                     prodigyClusterPairEnrollmentRootIsZero(pendingQuery.enrollment) &&
+                     pendingQuery.localEndpoints == localRoster && pendingQuery.peerEndpoints == remoteRoster,
+                 "cluster_pair_owner_query_returns_immutable_roster_without_pair_root");
+    pairBrain.finishRuntimePersistence(true);
+    suite.expect(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                     ProdigyClusterPairEnrollmentState::pending,
+                 "cluster_pair_owner_pending_waits_for_its_exact_qualified_transition_ack");
+
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_owner_records_pending_transition_quorum_ack");
+    pairBrain.driveClusterPairEnrollmentOperations();
+    suite.expect(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                     ProdigyClusterPairEnrollmentState::active,
+                 "cluster_pair_owner_activates_only_after_pending_exact_majority");
+    pairBrain.finishRuntimePersistence(true);
+    ProdigyLocalClusterPairControlProjection projection = {};
+    String fingerprint = {};
+    suite.expect(!pairBrain.buildLocalClusterPairControlProjection(selfUUID, projection, fingerprint),
+                 "cluster_pair_owner_active_intent_waits_for_second_exact_majority_before_projection");
+
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_owner_records_active_transition_quorum_ack");
+    pairBrain.driveClusterPairEnrollmentOperations();
+    suite.require(pairBrain.buildLocalClusterPairControlProjection(selfUUID, projection, fingerprint) &&
+                      projection.credentials.size() == remoteRoster.size(),
+                  "cluster_pair_owner_builds_derived_projection_only_after_active_exact_majority");
+    auto& operation = pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+    suite.expect(!operation.initialProjectionDelivered && selfMachine.neuron.clusterPairProjectionNonce != 0 &&
+                     peerAMachine.neuron.clusterPairProjectionNonce != 0 && peerBMachine.neuron.clusterPairProjectionNonce != 0,
+                 "cluster_pair_owner_does_not_mark_initial_delivery_before_neuron_durable_receipts");
+
+    // A promotion callback captured for an older master epoch must not release
+    // the active operation after a second promotion supersedes it.
+    ++pairBrain.masterAuthorityEpoch;
+    suite.require(pairBrain.reDriveClusterPairEnrollmentOperationsAfterPromotion(),
+                  "cluster_pair_owner_restamps_unfinished_operation_on_promotion");
+    const uint64_t restampedEpoch = operation.pinnedMasterAuthorityEpoch;
+    ++pairBrain.masterAuthorityEpoch;
+    pairBrain.finishRuntimePersistence(true);
+    suite.expect(operation.pinnedMasterAuthorityEpoch == restampedEpoch &&
+                     !operation.initialProjectionDelivered,
+                 "cluster_pair_owner_stale_promotion_persistence_callback_cannot_release_projection");
+    suite.require(pairBrain.reDriveClusterPairEnrollmentOperationsAfterPromotion(),
+                  "cluster_pair_owner_restamps_again_for_current_master_epoch");
+    pairBrain.finishRuntimePersistence(true);
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_owner_records_current_epoch_active_quorum_ack");
+    // Registration capability observations are bound to the master epoch.
+    // Simulate the current authenticated Neuron registrations before allowing
+    // the restamped owner to issue replacement projection nonces.
+    for (NeuronView *neuron : {&selfMachine.neuron, &peerAMachine.neuron, &peerBMachine.neuron})
+    {
+      neuron->transportPeerProjectionAuthorityEpoch = pairBrain.masterAuthorityEpoch;
+      neuron->clusterPairProjectionNonce = 0;
+      neuron->clusterPairProjectionAcknowledgedFingerprint.clear();
+    }
+    pairBrain.driveClusterPairEnrollmentOperations();
+
+    auto acknowledgePairProjection = [&](Machine& machine) {
+      pairBrain.acknowledgeClusterPairControlProjection(&machine.neuron,
+          machine.neuron.clusterPairProjectionNonce, machine.neuron.clusterPairProjectionGeneration, true);
+    };
+    acknowledgePairProjection(selfMachine);
+    acknowledgePairProjection(peerAMachine);
+    suite.expect(!operation.initialProjectionDelivered,
+                 "cluster_pair_owner_requires_every_approved_neuron_durable_projection_receipt");
+    acknowledgePairProjection(peerBMachine);
+    suite.expect(operation.initialProjectionDelivered,
+                 "cluster_pair_owner_marks_initial_projection_only_after_actual_neuron_receipts");
+    pairBrain.finishRuntimePersistence(true);
+
+    String encoded = {}, digest = {};
+    ProdigyMasterAuthorityStateTransition replicated = {};
+    suite.require(pairBrain.serializeCurrentMasterAuthorityTransition(encoded, digest) &&
+                      BitseryEngine::deserializeSafe(encoded, replicated),
+                  "cluster_pair_owner_serializes_operation_with_private_pair_root_transition");
+    auto erasedOperation = replicated;
+    ++erasedOperation.runtimeState.generation;
+    erasedOperation.runtimeState.clusterPairEnrollmentOperations.clear();
+    Brain::PreparedMasterAuthorityTransition prepared = {};
+    suite.expect(!pairBrain.prepareReplicatedMasterAuthorityTransition(erasedOperation, prepared),
+                 "cluster_pair_owner_replication_cannot_erase_durable_operation");
+    auto mutatedOperation = replicated;
+    ++mutatedOperation.runtimeState.generation;
+    mutatedOperation.runtimeState.clusterPairEnrollmentOperations.front().frozenElectorate.pop_back();
+    suite.expect(!pairBrain.prepareReplicatedMasterAuthorityTransition(mutatedOperation, prepared),
+                 "cluster_pair_owner_replication_cannot_mutate_frozen_operation_electorate");
+  }
+
+  {
     // The projection ACK is accepted only from the currently authenticated
     // Neuron control stream. Keep this isolated from the enrollment operation
     // fixture below because the ACK path deliberately drives its owner.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <prodigy/cluster.pair.projection.h>
+
 #include <algorithm>
 #include <limits.h>
 #include <cstring>
@@ -340,6 +342,7 @@ public:
   // Authenticated provisioning seeds this only on Brain machines. Subsequent
   // authority changes are owned by the replicated master-authority package.
   ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
+  ProdigyLocalClusterPairControlProjection clusterPairControlProjection;
 
   bool transportTLSConfigured(void) const
   {
@@ -427,6 +430,31 @@ static inline void prodigyTransportCredentialBootstrapLedger(
   });
 }
 
+// A Brain host persists its Brain credential and authority root, while its
+// colocated Neuron needs the separately enrolled Neuron credential derived
+// from the same combined ledger. Keep that derivation in one owner so every
+// local authorization check sees the same role-scoped view.
+static inline bool prodigyBuildLocalNeuronTransportCredentialBootstrap(
+    const ProdigyPersistentLocalBrainState& state,
+    ProdigyTransportCredentialBootstrap& neuron)
+{
+  neuron = {};
+  if (!prodigyLocalTransportCredentialStateValid(state) || !state.transportCredentials.enabled) return false;
+  if (state.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::neuron)
+  {
+    neuron = state.transportCredentials;
+    return true;
+  }
+  Vector<ProdigyTransportCredentialEnrollment> ledger;
+  prodigyTransportCredentialBootstrapLedger(state.transportCredentials, ledger);
+  ProdigyPersistentLocalBrainState localNeuron = {};
+  if (!prodigyBuildLocalTransportCredentialState(state.transportCredentialAuthorityRoot, ledger, state.uuid,
+        ProdigyTransportCredentialNodeRole::neuron, localNeuron,
+        state.transportCredentials.committedAuthorityGeneration)) return false;
+  neuron = std::move(localNeuron.transportCredentials);
+  return true;
+}
+
 // The control projection always describes the Neuron role. A Brain host's
 // durable local record instead owns its separate Brain credential and root.
 // Preserve that owner while updating the approved public Brain peer list.
@@ -441,15 +469,8 @@ static inline bool prodigyApplyLocalTransportCredentialPeerProjection(
   ProdigyTransportCredentialBootstrap currentNeuron, updatedNeuron;
   const bool brainRole = state.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain;
   Vector<ProdigyTransportCredentialEnrollment> ledger;
-  if (brainRole)
-  {
-    prodigyTransportCredentialBootstrapLedger(state.transportCredentials, ledger);
-    ProdigyPersistentLocalBrainState localNeuron;
-    if (!prodigyBuildLocalTransportCredentialState(state.transportCredentialAuthorityRoot, ledger, state.uuid,
-          ProdigyTransportCredentialNodeRole::neuron, localNeuron, state.transportCredentials.committedAuthorityGeneration)) return false;
-    currentNeuron = std::move(localNeuron.transportCredentials);
-  }
-  else currentNeuron = state.transportCredentials;
+  if (!prodigyBuildLocalNeuronTransportCredentialBootstrap(state, currentNeuron)) return false;
+  if (brainRole) prodigyTransportCredentialBootstrapLedger(state.transportCredentials, ledger);
   if (!prodigyApplyTransportCredentialPeerProjection(currentNeuron, projection, updatedNeuron)) return false;
   if (!brainRole) candidate.transportCredentials = updatedNeuron;
   else
@@ -487,14 +508,16 @@ static inline bool prodigyApplyLocalTransportCredentialPeerProjection(
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
 {
+  using Serializer = std::remove_cvref_t<S>;
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  { state.transportCredentials = {}; state.transportCredentialAuthorityRoot = {}; state.clusterPairControlProjection = {}; }
   serializer.value16b(state.uuid);
   serializer.value16b(state.ownerClusterUUID);
   serializer.object(state.transportTLS);
-  using Serializer = std::remove_cvref_t<S>;
   constexpr uint64_t markerValue = 0x41454749534c3031ULL;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    if (state.transportCredentials.enabled)
+    if (state.transportCredentials.enabled || state.clusterPairControlProjection.protocolVersion != 0)
     {
       uint64_t marker = markerValue;
       serializer.value8b(marker);
@@ -513,6 +536,25 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
     }
     serializer.object(state.transportCredentials);
     serializer.object(state.transportCredentialAuthorityRoot);
+  }
+  constexpr uint64_t pairMarker = 0x5041495250524a31ULL;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (state.clusterPairControlProjection.protocolVersion != 0)
+    {
+      uint64_t marker = pairMarker; serializer.value8b(marker);
+      ProdigyLocalClusterPairControlProjection publicProjection = state.clusterPairControlProjection;
+      for (auto& credential : publicProjection.credentials) OPENSSL_cleanse(credential.psk, sizeof(credential.psk));
+      serializer.object(publicProjection);
+    }
+  }
+  else if (!serializer.adapter().isCompletedSuccessfully())
+  {
+    uint64_t marker = 0; serializer.value8b(marker);
+    if (marker != pairMarker) { serializer.adapter().error(bitsery::ReaderError::InvalidData); return; }
+    serializer.object(state.clusterPairControlProjection);
+    if (!prodigyLocalClusterPairControlProjectionValid(state.clusterPairControlProjection, false))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
 }
 
@@ -2893,10 +2935,13 @@ public:
   String localKeyPem;
   ProdigyTransportNodeCredential transportNodeCredential;
   ProdigyTransportCredentialAuthorityRoot transportAuthorityRoot;
+  uint128_t clusterPairControlClusterUUID = 0, clusterPairControlNodeUUID = 0;
+  uint64_t clusterPairControlAuthorityGeneration = 0;
+  Vector<ProdigyLocalClusterPairControlCredential> clusterPairControlCredentials;
 
   bool empty(void) const
   {
-    return clusterRootKeyPem.size() == 0 && localKeyPem.size() == 0 && transportNodeCredential.nodeUUID == 0 && transportAuthorityRoot.authorityEpoch == 0;
+    return clusterRootKeyPem.size() == 0 && localKeyPem.size() == 0 && transportNodeCredential.nodeUUID == 0 && transportAuthorityRoot.authorityEpoch == 0 && clusterPairControlAuthorityGeneration == 0 && clusterPairControlCredentials.empty();
   }
 
   void clear(void)
@@ -2906,18 +2951,23 @@ public:
     OPENSSL_cleanse(transportNodeCredential.secret, sizeof(transportNodeCredential.secret));
     transportNodeCredential = {};
     transportAuthorityRoot = {};
+    for (auto& credential : clusterPairControlCredentials) OPENSSL_cleanse(credential.psk, sizeof(credential.psk));
+    clusterPairControlCredentials.clear();
+    clusterPairControlClusterUUID = clusterPairControlNodeUUID = 0;
+    clusterPairControlAuthorityGeneration = 0;
   }
 };
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentLocalBrainStateSecrets& secrets)
 {
+  using Serializer = std::remove_cvref_t<S>;
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value) secrets.clear();
   serializer.text1b(secrets.clusterRootKeyPem, UINT32_MAX);
   serializer.text1b(secrets.localKeyPem, UINT32_MAX);
-  using Serializer = std::remove_cvref_t<S>;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    if (secrets.transportNodeCredential.nodeUUID != 0)
+    if (secrets.transportNodeCredential.nodeUUID != 0 || secrets.clusterPairControlAuthorityGeneration != 0)
     {
       serializer.object(secrets.transportNodeCredential);
       serializer.object(secrets.transportAuthorityRoot);
@@ -2927,6 +2977,21 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainStateSecrets& s
   {
     serializer.object(secrets.transportNodeCredential);
     serializer.object(secrets.transportAuthorityRoot);
+  }
+  bool pairTail = secrets.clusterPairControlAuthorityGeneration != 0;
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    pairTail = !serializer.adapter().isCompletedSuccessfully();
+  if (pairTail)
+  {
+    uint64_t marker = 0x5041495250534b31ULL;
+    serializer.value8b(marker);
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (marker != 0x5041495250534b31ULL) { serializer.adapter().error(bitsery::ReaderError::InvalidData); return; }
+    serializer.value16b(secrets.clusterPairControlClusterUUID);
+    serializer.value16b(secrets.clusterPairControlNodeUUID);
+    serializer.value8b(secrets.clusterPairControlAuthorityGeneration);
+    serializer.container(secrets.clusterPairControlCredentials, ProdigyLocalClusterPairControlProjectionMaximumCredentials,
+        [](auto& nested, auto& credential) { nested.object(credential); });
   }
 }
 
@@ -3308,6 +3373,15 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
   {
     return false;
   }
+  if (!prodigyValidateClusterPairEnrollmentOperations(
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollmentOperations,
+          snapshot.masterAuthority.runtimeState.generation,
+          &snapshot.masterAuthority.runtimeState.transportCredentialEnrollments))
+  {
+    if (failure) failure->assign("persistent brain snapshot cluster pair operation is malformed"_ctv);
+    return false;
+  }
   if (!prodigyValidatePersistentTransportCredentialEnrollments(
           snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
           &snapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot,
@@ -3575,6 +3649,15 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   const ProdigyTransportCredentialAuthorityRoot *transportAuthorityRoot =
       secrets.transportCredentialAuthorityRootSecrets.empty() ? nullptr :
       &secrets.transportCredentialAuthorityRootSecrets[0].root;
+  if (!prodigyValidateClusterPairEnrollmentOperations(
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollmentOperations,
+          snapshot.masterAuthority.runtimeState.generation,
+          &snapshot.masterAuthority.runtimeState.transportCredentialEnrollments))
+  {
+    if (failure) failure->assign("persistent brain snapshot cluster pair operation is malformed"_ctv);
+    return false;
+  }
   if (!prodigyValidatePersistentTransportCredentialEnrollments(
           snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
           transportAuthorityRoot,
@@ -4073,6 +4156,14 @@ static inline void prodigyExtractPersistentLocalBrainStateSecrets(
     OPENSSL_cleanse(publicState.transportCredentials.self.secret, sizeof(publicState.transportCredentials.self.secret));
     OPENSSL_cleanse(publicState.transportCredentialAuthorityRoot.root, sizeof(publicState.transportCredentialAuthorityRoot.root));
   }
+  if (state.clusterPairControlProjection.protocolVersion != 0)
+  {
+    secrets.clusterPairControlClusterUUID = state.clusterPairControlProjection.localClusterUUID;
+    secrets.clusterPairControlNodeUUID = state.clusterPairControlProjection.nodeUUID;
+    secrets.clusterPairControlAuthorityGeneration = state.clusterPairControlProjection.committedAuthorityGeneration;
+    secrets.clusterPairControlCredentials = state.clusterPairControlProjection.credentials;
+    for (auto& credential : publicState.clusterPairControlProjection.credentials) OPENSSL_cleanse(credential.psk, sizeof(credential.psk));
+  }
 }
 
 static inline bool prodigyApplyPersistentLocalBrainStateSecrets(
@@ -4101,10 +4192,45 @@ static inline bool prodigyApplyPersistentLocalBrainStateSecrets(
   if (candidate.transportCredentials.enabled) candidate.transportCredentials.self = secrets.transportNodeCredential;
   candidate.transportCredentialAuthorityRoot = suppliedRoot;
   if (!prodigyLocalTransportCredentialStateValid(candidate)) return false;
-  state.transportTLS.clusterRootKeyPem = secrets.clusterRootKeyPem;
-  state.transportTLS.localKeyPem = secrets.localKeyPem;
-  if (state.transportCredentials.enabled) state.transportCredentials.self = secrets.transportNodeCredential;
-  state.transportCredentialAuthorityRoot = suppliedRoot;
+  if (state.clusterPairControlProjection.protocolVersion != 0)
+  {
+    if (state.clusterPairControlProjection.localClusterUUID != state.ownerClusterUUID ||
+        state.clusterPairControlProjection.nodeUUID != state.uuid ||
+        secrets.clusterPairControlClusterUUID != state.ownerClusterUUID || secrets.clusterPairControlNodeUUID != state.uuid ||
+        secrets.clusterPairControlAuthorityGeneration != state.clusterPairControlProjection.committedAuthorityGeneration) return false;
+    if (secrets.clusterPairControlCredentials.size() != state.clusterPairControlProjection.credentials.size()) return false;
+    auto projection = state.clusterPairControlProjection;
+    for (uint32_t index = 0; index < projection.credentials.size(); ++index)
+    {
+      const auto& supplied = secrets.clusterPairControlCredentials[index];
+      auto& credential = projection.credentials[index];
+      if (credential.pairUUID != supplied.pairUUID || credential.rootGeneration != supplied.rootGeneration || credential.keyEpoch != supplied.keyEpoch || credential.localClaim != supplied.localClaim || credential.remoteClaim != supplied.remoteClaim || credential.canonicalContext != supplied.canonicalContext || credential.initiator != supplied.initiator || credential.responder != supplied.responder) return false;
+      std::memcpy(credential.psk, supplied.psk, sizeof(credential.psk));
+    }
+    if (!prodigyLocalClusterPairControlProjectionValid(projection, true)) return false;
+    candidate.clusterPairControlProjection = std::move(projection);
+  }
+  else if (!secrets.clusterPairControlCredentials.empty() || secrets.clusterPairControlAuthorityGeneration != 0 ||
+      secrets.clusterPairControlClusterUUID != 0 || secrets.clusterPairControlNodeUUID != 0) return false;
+  candidate.transportTLS.clusterRootKeyPem = secrets.clusterRootKeyPem;
+  candidate.transportTLS.localKeyPem = secrets.localKeyPem;
+  state = std::move(candidate);
+  return true;
+}
+
+static inline bool prodigyApplyLocalClusterPairControlProjection(
+    ProdigyPersistentLocalBrainState& state, const ProdigyLocalClusterPairControlProjection& incoming)
+{
+  if (!prodigyLocalTransportCredentialStateValid(state) ||
+      !prodigyLocalClusterPairControlProjectionValid(incoming, true) ||
+      incoming.localClusterUUID != state.ownerClusterUUID || incoming.nodeUUID != state.uuid) return false;
+  const auto& current = state.clusterPairControlProjection;
+  if (current.protocolVersion != 0) {
+    if (incoming.committedAuthorityGeneration < current.committedAuthorityGeneration) return false;
+    if (incoming.committedAuthorityGeneration == current.committedAuthorityGeneration)
+      return prodigyLocalClusterPairControlProjectionEqual(incoming, current);
+  }
+  state.clusterPairControlProjection = incoming;
   return true;
 }
 
