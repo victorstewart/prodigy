@@ -25,7 +25,7 @@ enum class ClusterPairKeyPurpose : uint8_t {
   pairControl = 3,
 };
 
-enum class ClusterPairKeyScope : uint8_t { serviceRoute = 1, pairControl = 2, nodeRoleCredential = 3 };
+enum class ClusterPairKeyScope : uint8_t { serviceRoute = 1, pairControl = 2, nodeRoleCredential = 3, pairControlEndpoint = 4 };
 
 struct ClusterPairRoot {
   uint128_t pairUUID = 0;
@@ -140,6 +140,9 @@ static inline bool clusterPairKeyContextValid(const ClusterPairKeyContext& conte
            context.senderNodeUUID == 0 && context.receiverNodeUUID == 0 && context.senderRole == 0 && context.receiverRole == 0;
   if (context.scope == ClusterPairKeyScope::nodeRoleCredential)
     return context.logicalWorkloadUUID == 0 && context.logicalServiceUUID == 0 && context.slots.empty() && context.purpose == ClusterPairKeyPurpose::switchboardAdmissionControl &&
+           context.senderNodeUUID != 0 && context.receiverNodeUUID != 0 && context.senderRole != 0 && context.receiverRole != 0;
+  if (context.scope == ClusterPairKeyScope::pairControlEndpoint)
+    return context.logicalWorkloadUUID == 0 && context.logicalServiceUUID == 0 && context.slots.empty() && context.purpose == ClusterPairKeyPurpose::pairControl &&
            context.senderNodeUUID != 0 && context.receiverNodeUUID != 0 && context.senderRole != 0 && context.receiverRole != 0;
   return false;
 }

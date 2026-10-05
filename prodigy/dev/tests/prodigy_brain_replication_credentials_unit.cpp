@@ -31168,6 +31168,113 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                 "transport_credential_owner_aegis_peer_authenticates_exact_voter");
 
   {
+    ProdigyClusterPairEnrollment pair = {};
+    pair.pairUUID = 0xb101;
+    pair.localClusterUUID = clusterUUID;
+    pair.peerClusterUUID = 0xb102;
+    pair.operationUUID = 0xb103;
+    pair.rootGeneration = 1;
+    pair.agreedKeyEpoch = 1;
+    pair.localAuthorityGeneration = 10;
+    pair.state = ProdigyClusterPairEnrollmentState::active;
+    for (uint32_t byte = 0; byte < sizeof(pair.root); ++byte) pair.root[byte] = uint8_t(0xa0 + byte);
+    brain.masterAuthorityRuntimeState.clusterPairEnrollments = {pair};
+    String encoded = {}, digest = {};
+    ProdigyMasterAuthorityStateTransition decoded = {};
+    suite.require(brain.serializeCurrentMasterAuthorityTransition(encoded, digest) &&
+                      BitseryEngine::deserializeSafe(encoded, decoded),
+                  "cluster_pair_private_transition_round_trip");
+    suite.expect(decoded.version == 6 && decoded.runtimeState.clusterPairEnrollments.size() == 1 &&
+                     prodigyClusterPairEnrollmentsEqual(decoded.runtimeState.clusterPairEnrollments, {pair}) &&
+                     decoded.runtimeState.transportCredentialAuthorityRoot.valid(),
+                 "cluster_pair_private_transition_restores_both_separate_root_domains");
+    auto missingRoot = decoded;
+    auto& missingRootBytes = missingRoot.runtimeState.clusterPairEnrollments.front().root;
+    OPENSSL_cleanse(missingRootBytes, sizeof(missingRootBytes));
+    String invalidEnvelope = {};
+    suite.expect(BitseryEngine::serialize(invalidEnvelope, missingRoot) == 0 && invalidEnvelope.empty(),
+                 "cluster_pair_private_transition_rejects_missing_root_before_writing");
+    String truncated = encoded;
+    truncated.resize(truncated.size() - 1);
+    ProdigyMasterAuthorityStateTransition rejected = {};
+    suite.expect(!BitseryEngine::deserializeSafe(truncated, rejected),
+                 "cluster_pair_private_transition_rejects_truncated_root_sidecar");
+    auto legacy = decoded;
+    legacy.version = 5;
+    String legacyBytes = {};
+    BitseryEngine::serialize(legacyBytes, legacy);
+    suite.require(BitseryEngine::deserializeSafe(legacyBytes, rejected),
+                  "cluster_pair_private_transition_legacy_fixture_decodes_public_only");
+    suite.expect(rejected.runtimeState.clusterPairEnrollments.size() == 1 &&
+                     prodigyClusterPairEnrollmentRootIsZero(rejected.runtimeState.clusterPairEnrollments.front()),
+                 "cluster_pair_private_transition_never_embeds_root_in_legacy_runtime");
+
+    TransportCredentialDeliveryTestBrain receiver = {};
+    configureAuthority(receiver, 9, 80);
+    receiver.weAreMaster = false;
+    Brain::PreparedMasterAuthorityTransition prepared = {};
+    suite.expect(!receiver.prepareReplicatedMasterAuthorityTransition(rejected, prepared),
+                 "cluster_pair_private_transition_rejects_legacy_enrollment_envelope");
+    suite.expect(receiver.prepareReplicatedMasterAuthorityTransition(decoded, prepared),
+                 "cluster_pair_private_transition_accepts_current_bound_private_root");
+    suite.expect(!receiver.applyReplicatedMasterAuthorityRuntimeState(decoded.runtimeState, false),
+                 "cluster_pair_private_transition_rejects_bare_runtime_application");
+
+    receiver.masterAuthorityRuntimeState = decoded.runtimeState;
+    auto next = decoded;
+    ++next.runtimeState.generation;
+    next.runtimeState.clusterPairEnrollments.clear();
+    suite.expect(!receiver.prepareReplicatedMasterAuthorityTransition(next, prepared),
+                 "cluster_pair_private_transition_rejects_erased_pair");
+    next = decoded;
+    ++next.runtimeState.generation;
+    next.runtimeState.clusterPairEnrollments.front().root[0] ^= 1;
+    suite.expect(!receiver.prepareReplicatedMasterAuthorityTransition(next, prepared),
+                 "cluster_pair_private_transition_rejects_silent_root_replacement");
+    next = decoded;
+    ++next.runtimeState.generation;
+    next.runtimeState.clusterPairEnrollments.front().state = ProdigyClusterPairEnrollmentState::pending;
+    suite.expect(!receiver.prepareReplicatedMasterAuthorityTransition(next, prepared),
+                 "cluster_pair_private_transition_rejects_active_to_pending_rollback");
+    next = decoded;
+    ++next.runtimeState.generation;
+    auto& revoked = next.runtimeState.clusterPairEnrollments.front();
+    revoked.state = ProdigyClusterPairEnrollmentState::revoked;
+    OPENSSL_cleanse(revoked.root, sizeof(revoked.root));
+    suite.expect(receiver.prepareReplicatedMasterAuthorityTransition(next, prepared),
+                 "cluster_pair_private_transition_accepts_rootless_revocation");
+    receiver.masterAuthorityRuntimeState = next.runtimeState;
+    ++decoded.runtimeState.generation;
+    ++decoded.runtimeState.generation;
+    suite.expect(!receiver.prepareReplicatedMasterAuthorityTransition(decoded, prepared),
+                 "cluster_pair_private_transition_rejects_revoked_pair_resurrection");
+
+    suite.expect(!brain.peerCanReceiveMasterAuthorityState(&peerA),
+                 "cluster_pair_private_transition_waits_for_explicit_peer_capability");
+    peerA.version = ProdigyBinaryVersion;
+    String capabilityFrame = {};
+    brain.brainHandler(&peerA, buildBrainMessage(capabilityFrame,
+        BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32)));
+    suite.expect(brain.peerCanReceiveMasterAuthorityState(&peerA),
+                 "cluster_pair_private_transition_accepts_authenticated_current_capability");
+    brain.masterAuthorityRuntimeStateDurable = false;
+    suite.expect(!brain.peerCanReceiveMasterAuthorityState(&peerA),
+                 "cluster_pair_private_transition_waits_for_local_durability");
+    brain.masterAuthorityRuntimeStateDurable = true;
+    ++peerA.ioGeneration;
+    suite.expect(!brain.peerCanReceiveMasterAuthorityState(&peerA),
+                 "cluster_pair_private_transition_rejects_previous_stream_capability");
+    --peerA.ioGeneration;
+    brain.brainHandler(&peerA, buildBrainMessage(capabilityFrame,
+        BrainTopic::acknowledgeCapabilities, uint64_t(2)));
+    suite.expect(!brain.peerCanReceiveMasterAuthorityState(&peerA),
+                 "cluster_pair_private_transition_rejects_capability_withdrawal");
+    peerA.version = 0;
+    peerA.containerRetirementCapabilityAcknowledged = false;
+    brain.masterAuthorityRuntimeState.clusterPairEnrollments.clear();
+  }
+
+  {
     // The projection ACK is accepted only from the currently authenticated
     // Neuron control stream. Keep this isolated from the enrollment operation
     // fixture below because the ACK path deliberately drives its owner.

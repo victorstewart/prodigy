@@ -1016,7 +1016,7 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 5;
+  constexpr static uint8_t currentVersion = 6;
 
   uint8_t version = 1;
   bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
@@ -1032,6 +1032,17 @@ public:
 template <typename S>
 static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& transition)
 {
+  using Serializer = std::remove_cvref_t<S>;
+  Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> roots;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    if (transition.version >= 6)
+    {
+      auto descriptors = transition.runtimeState.clusterPairEnrollments;
+      // Validate before writing the envelope's first byte. The writer has no
+      // error adapter; an invalid candidate must emit no transition at all.
+      if (!prodigyExtractPersistentClusterPairEnrollmentRoots(descriptors,
+              transition.brainConfig.clusterUUID, transition.runtimeState.generation, roots)) return;
+    }
   serializer.value1b(transition.version);
   serializer.object(transition.runtimeState);
   serializer.object(transition.brainConfig);
@@ -1043,6 +1054,19 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   // The shared runtime codec remains suitable for public snapshot descriptors.
   if (transition.version >= 5)
     serializer.object(transition.runtimeState.transportCredentialAuthorityRoot);
+  // Pair roots use the same private sidecar binding as durable snapshots.
+  // Shared runtime descriptors retain their zero root slots, including when
+  // serialized independently of this authenticated Brain-only envelope.
+  if (transition.version >= 6)
+  {
+    serializer.container(roots, ProdigyClusterPairEnrollmentMaximumRecords,
+        [](auto& nested, auto& root) { nested.object(root); });
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (!prodigyHydratePersistentClusterPairEnrollmentRoots(
+              transition.runtimeState.clusterPairEnrollments, roots,
+              transition.brainConfig.clusterUUID, transition.runtimeState.generation))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
 }
 
 // An adopted machine's explicit peer or address list is operator authority.
@@ -6708,6 +6732,14 @@ public:
               transition.runtimeState.transportCredentialEnrollments, transition.runtimeState.generation)) return false;
       transition.version = 5;
     }
+    if (!transition.runtimeState.clusterPairEnrollments.empty())
+    {
+      if (!internalTransportAEGISRequired() ||
+          !prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+              transition.runtimeState.clusterPairEnrollments, brainConfig.clusterUUID,
+              transition.runtimeState.generation, true, false)) return false;
+      transition.version = 6;
+    }
     if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
           transition.servingRuntimeStates, transition.runtimeState.generation)) return false;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
@@ -6736,7 +6768,7 @@ public:
     {
       return;
     }
-    if ((onlyUnacknowledged || internalTransportAEGISRequired() || !masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
+    if ((onlyUnacknowledged || internalTransportAEGISRequired() || !masterAuthorityRuntimeState.clusterPairEnrollments.empty() || !masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
          !masterAuthorityRuntimeState.statelessDeploymentAdmissions.empty() ||
          masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
          masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
@@ -7982,6 +8014,12 @@ public:
            peer->containerRetirementCapabilityIOGeneration == peer->ioGeneration;
   }
 
+  bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer) const
+  {
+    return containerRetirementPeerCapabilityCurrent(peer) && peer->transportAEGISEnabled() &&
+           peer->clusterPairEnrollmentCapabilityAcknowledged;
+  }
+
   // Shared commissioned-membership proof for capability-gated authority
   // extensions.  It deliberately excludes local durability: callers which
   // report a provisional record must still verify the exact authenticated
@@ -8743,7 +8781,10 @@ public:
       const BrainConfig *validationConfig = nullptr)
   {
     const BrainConfig& credentialConfig = validationConfig != nullptr ? *validationConfig : brainConfig;
-    if (!prodigyValidatePersistentTransportCredentialEnrollments(
+    if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+            incoming.clusterPairEnrollments, credentialConfig.clusterUUID,
+            incoming.generation, true, false) ||
+        !prodigyValidatePersistentTransportCredentialEnrollments(
             incoming.transportCredentialEnrollments,
             &incoming.transportCredentialAuthorityRoot,
             credentialConfig.clusterUUID,
@@ -8754,6 +8795,23 @@ public:
             incoming.generation))
     {
       return false;
+    }
+    // Enrollment identities and revoked tombstones survive later authority
+    // revisions. A new generation alone cannot resurrect or silently rekey a
+    // pair. Rotation must acquire its own explicit agreement before extending
+    // this transition rule.
+    for (const auto& previous : masterAuthorityRuntimeState.clusterPairEnrollments)
+    {
+      auto next = std::find_if(incoming.clusterPairEnrollments.begin(), incoming.clusterPairEnrollments.end(),
+          [&](const auto& enrollment) { return enrollment.pairUUID == previous.pairUUID; });
+      if (next == incoming.clusterPairEnrollments.end() ||
+          !prodigyClusterPairEnrollmentIdentityEquals(previous, *next) ||
+          (previous.state == ProdigyClusterPairEnrollmentState::revoked &&
+           next->state != ProdigyClusterPairEnrollmentState::revoked) ||
+          (previous.state == ProdigyClusterPairEnrollmentState::active &&
+           next->state == ProdigyClusterPairEnrollmentState::pending) ||
+          (next->state != ProdigyClusterPairEnrollmentState::revoked &&
+           !prodigyClusterPairEnrollmentRootEquals(previous, *next))) return false;
     }
     ProdigyContainerRetirementJournal currentRetirements = {}, incomingRetirements = {}, mergedRetirements = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, currentRetirements) ||
@@ -9110,7 +9168,7 @@ public:
 
   bool applyReplicatedMasterAuthorityRuntimeState(const ProdigyMasterAuthorityRuntimeState& incoming, bool persist = true)
   {
-    if (!incoming.statefulServingAuthorities.empty() ||
+    if (!incoming.clusterPairEnrollments.empty() || !incoming.statefulServingAuthorities.empty() ||
         !incoming.statelessDeploymentAdmissions.empty()) return false; // Requires the paired transition payload.
     PreparedMasterAuthorityRuntimeState prepared;
     return prepareReplicatedMasterAuthorityRuntimeState(incoming, prepared) &&
@@ -9136,6 +9194,8 @@ public:
     ProdigyContainerRetirementJournal incomingRetirements = {};
     const bool incomingRetirementsValid = decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements);
     if (!incoming.supportedVersion() || !incomingRetirementsValid ||
+        (!incoming.runtimeState.clusterPairEnrollments.empty() &&
+         (incoming.version < 6 || !internalTransportAEGISRequired())) ||
         ((!incoming.runtimeState.transportCredentialEnrollments.empty() ||
           !incoming.runtimeState.transportCredentialEnrollmentOperations.empty() ||
           incoming.runtimeState.transportCredentialAuthorityRoot.authorityEpoch != 0) && incoming.version < 5) ||
@@ -9340,6 +9400,8 @@ public:
            currentPeer->boottimens == pending->peerBootTime &&
            currentPeer->ioGeneration == pending->peerGeneration &&
            currentPeer->fslot == pending->peerFileSlot &&
+           (pending->prepared.runtime.runtimeState.clusterPairEnrollments.empty() ||
+            clusterPairEnrollmentPeerCapabilityCurrent(currentPeer)) &&
            peerCanReplicateMasterAuthorityState(currentPeer);
   }
 
@@ -9403,6 +9465,8 @@ public:
   bool beginReplicatedMasterAuthorityTransition(
       BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
   {
+    if (!incoming.runtimeState.clusterPairEnrollments.empty() &&
+        !clusterPairEnrollmentPeerCapabilityCurrent(peer)) return true;
     if (!usesAsyncMasterAuthorityPersistence()) return false;
     // Serialize conflicting authority snapshots, while the handler continues
     // to accept heartbeats and other independent traffic. Full admission stays
@@ -9447,6 +9511,7 @@ public:
     else if (!candidate.runtimeState.statelessDeploymentAdmissions.empty()) candidate.version = 3;
     else if (!candidate.runtimeState.statefulServingAuthorities.empty()) candidate.version = 2;
     if (!candidate.runtimeState.transportCredentialEnrollments.empty()) candidate.version = 5;
+    if (!candidate.runtimeState.clusterPairEnrollments.empty()) candidate.version = 6;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
@@ -9523,6 +9588,10 @@ public:
   bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (masterAuthorityRuntimeState.clusterPairEnrollments.empty() ||
+            (masterAuthorityRuntimeStateDurable &&
+             durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
+             clusterPairEnrollmentPeerCapabilityCurrent(peer))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
@@ -32770,13 +32839,15 @@ public:
           bv->containerRetirementCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->pairedSourceRetirementCapabilityAcknowledged = false;
+          bv->clusterPairEnrollmentCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
           if (bv->version >= ProdigyBrainUpgradeCapabilityProtocolMinimumVersion)
           {
-            const uint64_t advertised = bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
-                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7);
+            const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
+                                      (bv->transportAEGISEnabled() ? uint64_t(32) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -33401,8 +33472,9 @@ public:
               bv->version < ProdigyBrainUpgradeCapabilityProtocolMinimumVersion) break;
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
-          const uint64_t supported = bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
-                                     (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7);
+          const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+                                     (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
+                                     (bv->transportAEGISEnabled() ? uint64_t(32) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -33425,6 +33497,8 @@ public:
                 bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion && (capabilities & uint64_t(8)) != 0;
             bv->pairedSourceRetirementCapabilityAcknowledged =
                 bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion && (capabilities & uint64_t(16)) != 0;
+            bv->clusterPairEnrollmentCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(32)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -33458,6 +33532,8 @@ public:
               incoming.supportedVersion() &&
               (incoming.version < 5 || (bv->transportAEGISEnabled() &&
                                        bv->isTransportNegotiated() && bv->tlsPeerVerified && bv->tlsPeerUUID == bv->uuid)) &&
+              (incoming.runtimeState.clusterPairEnrollments.empty() ||
+               (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv))) &&
               decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements) &&
               (incomingRetirements.pairedSourceFences.empty() ||
                (incoming.version >= 4 && containerRetirementPeerCapabilityCurrent(bv) &&

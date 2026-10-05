@@ -3037,6 +3037,120 @@ static bool prodigyValidatePersistentClusterPairEnrollmentDescriptors(
   return true;
 }
 
+// Keep pair roots out of the public runtime codec.  The caller owns the
+// private sidecar/envelope storage; this helper only binds each root to one
+// already-validated immutable descriptor and clears the public copy after the
+// complete candidate sidecar has been assembled.
+static bool prodigyExtractPersistentClusterPairEnrollmentRoots(
+    Vector<ProdigyClusterPairEnrollment>& enrollments,
+    uint128_t localClusterUUID,
+    uint64_t runtimeAuthorityGeneration,
+    Vector<ProdigyPersistentClusterPairEnrollmentRootSecret>& roots,
+    String *failure = nullptr)
+{
+  if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+          enrollments, localClusterUUID, runtimeAuthorityGeneration, true, false, failure))
+    return false;
+
+  Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> candidateRoots = {};
+  for (const ProdigyClusterPairEnrollment& enrollment : enrollments)
+  {
+    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
+    ProdigyPersistentClusterPairEnrollmentRootSecret rootSecret = {};
+    rootSecret.pairUUID = enrollment.pairUUID;
+    rootSecret.localClusterUUID = enrollment.localClusterUUID;
+    rootSecret.peerClusterUUID = enrollment.peerClusterUUID;
+    rootSecret.operationUUID = enrollment.operationUUID;
+    rootSecret.rootGeneration = enrollment.rootGeneration;
+    rootSecret.agreedKeyEpoch = enrollment.agreedKeyEpoch;
+    rootSecret.localAuthorityGeneration = enrollment.localAuthorityGeneration;
+    std::memcpy(rootSecret.root, enrollment.root, sizeof(rootSecret.root));
+    candidateRoots.push_back(std::move(rootSecret));
+  }
+
+  for (ProdigyClusterPairEnrollment& enrollment : enrollments)
+    prodigyClearPersistentSecretBytes(enrollment.root, sizeof(enrollment.root));
+  roots = std::move(candidateRoots);
+  if (failure) failure->clear();
+  return true;
+}
+
+// Validate all public descriptors and sidecars before changing any enrollment.
+// This is shared by snapshot loading and authenticated Brain transition intake.
+static bool prodigyHydratePersistentClusterPairEnrollmentRoots(
+    Vector<ProdigyClusterPairEnrollment>& enrollments,
+    const Vector<ProdigyPersistentClusterPairEnrollmentRootSecret>& roots,
+    uint128_t localClusterUUID,
+    uint64_t runtimeAuthorityGeneration,
+    String *failure = nullptr)
+{
+  if (enrollments.size() > ProdigyClusterPairEnrollmentMaximumRecords ||
+      roots.size() > ProdigyClusterPairEnrollmentMaximumRecords)
+  {
+    if (failure) failure->assign("persistent brain snapshot has too many cluster pair enrollment records"_ctv);
+    return false;
+  }
+  if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+          enrollments, localClusterUUID, runtimeAuthorityGeneration, false, false, failure))
+    return false;
+
+  Vector<ProdigyClusterPairEnrollment> hydrated = enrollments;
+  for (uint32_t left = 0; left < hydrated.size(); ++left)
+  {
+    const ProdigyClusterPairEnrollment& enrollment = hydrated[left];
+    uint32_t matches = 0;
+    const ProdigyPersistentClusterPairEnrollmentRootSecret *matched = nullptr;
+    for (const auto& rootSecret : roots)
+    {
+      if (rootSecret.matches(enrollment))
+      {
+        ++matches;
+        matched = &rootSecret;
+      }
+    }
+    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked)
+    {
+      if (matches != 0)
+      {
+        if (failure) failure->assign("persistent brain snapshot revoked cluster pair enrollment has a root"_ctv);
+        return false;
+      }
+      continue;
+    }
+    if (matches != 1 || matched == nullptr || matched->rootIsZero())
+    {
+      if (failure) failure->assign("persistent brain snapshot cluster pair enrollment has no unique private root"_ctv);
+      return false;
+    }
+  }
+  for (const auto& rootSecret : roots)
+  {
+    uint32_t matches = 0;
+    for (const auto& enrollment : hydrated)
+      matches += enrollment.state != ProdigyClusterPairEnrollmentState::revoked && rootSecret.matches(enrollment);
+    if (matches != 1 || rootSecret.rootIsZero())
+    {
+      if (failure) failure->assign("persistent brain snapshot cluster pair root is orphaned or stale"_ctv);
+      return false;
+    }
+  }
+  for (ProdigyClusterPairEnrollment& enrollment : hydrated)
+  {
+    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
+    for (const auto& rootSecret : roots)
+    {
+      if (rootSecret.matches(enrollment))
+      {
+        std::memcpy(enrollment.root, rootSecret.root, sizeof(enrollment.root));
+        break;
+      }
+    }
+  }
+  enrollments = std::move(hydrated);
+  if (failure) failure->clear();
+  return true;
+}
+
 static bool prodigyValidatePersistentTransportCredentialEnrollmentOperations(
     const Vector<ProdigyTransportCredentialEnrollmentOperation>& operations,
     const Vector<ProdigyTransportCredentialEnrollment>& enrollments,
@@ -3221,24 +3335,16 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
   }
   publicSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot = {};
 
-  auto& enrollments = publicSnapshot.masterAuthority.runtimeState.clusterPairEnrollments;
-  for (ProdigyClusterPairEnrollment& enrollment : enrollments)
+  if (!prodigyExtractPersistentClusterPairEnrollmentRoots(
+          publicSnapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          publicSnapshot.brainConfig.clusterUUID,
+          publicSnapshot.masterAuthority.runtimeState.generation,
+          secrets.clusterPairEnrollmentRootSecrets,
+          failure))
   {
-    if (enrollment.state != ProdigyClusterPairEnrollmentState::revoked)
-    {
-      ProdigyPersistentClusterPairEnrollmentRootSecret rootSecret = {};
-      rootSecret.pairUUID = enrollment.pairUUID;
-      rootSecret.localClusterUUID = enrollment.localClusterUUID;
-      rootSecret.peerClusterUUID = enrollment.peerClusterUUID;
-      rootSecret.operationUUID = enrollment.operationUUID;
-      rootSecret.rootGeneration = enrollment.rootGeneration;
-      rootSecret.agreedKeyEpoch = enrollment.agreedKeyEpoch;
-      rootSecret.localAuthorityGeneration = enrollment.localAuthorityGeneration;
-      std::memcpy(rootSecret.root, enrollment.root, sizeof(rootSecret.root));
-      secrets.clusterPairEnrollmentRootSecrets.push_back(rootSecret);
-      rootSecret.clear();
-    }
-    prodigyClearPersistentSecretBytes(enrollment.root, sizeof(enrollment.root));
+    secrets.clear();
+    publicSnapshot = {};
+    return false;
   }
 
   secrets.localContainerBootstraps =
@@ -3480,76 +3586,13 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
           snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
           snapshot.masterAuthority.runtimeState.generation, failure)) return false;
 
-  auto& enrollments = snapshot.masterAuthority.runtimeState.clusterPairEnrollments;
-  if (enrollments.size() > ProdigyClusterPairEnrollmentMaximumRecords ||
-      secrets.clusterPairEnrollmentRootSecrets.size() > ProdigyClusterPairEnrollmentMaximumRecords)
-  {
-    if (failure) failure->assign("persistent brain snapshot has too many cluster pair enrollment records"_ctv);
-    return false;
-  }
-  if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
-          enrollments,
+  if (!prodigyHydratePersistentClusterPairEnrollmentRoots(
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          secrets.clusterPairEnrollmentRootSecrets,
           snapshot.brainConfig.clusterUUID,
           snapshot.masterAuthority.runtimeState.generation,
-          false,
-          false,
           failure))
-  {
     return false;
-  }
-  for (uint32_t left = 0; left < enrollments.size(); ++left)
-  {
-    const ProdigyClusterPairEnrollment& enrollment = enrollments[left];
-    uint32_t matches = 0;
-    const ProdigyPersistentClusterPairEnrollmentRootSecret *matched = nullptr;
-    for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
-    {
-      if (rootSecret.matches(enrollment))
-      {
-        ++matches;
-        matched = &rootSecret;
-      }
-    }
-    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked)
-    {
-      if (matches != 0)
-      {
-        if (failure) failure->assign("persistent brain snapshot revoked cluster pair enrollment has a root"_ctv);
-        return false;
-      }
-      continue;
-    }
-    if (matches != 1 || matched == nullptr || matched->rootIsZero())
-    {
-      if (failure) failure->assign("persistent brain snapshot cluster pair enrollment has no unique private root"_ctv);
-      return false;
-    }
-  }
-  for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
-  {
-    uint32_t matches = 0;
-    for (const auto& enrollment : enrollments)
-      matches += enrollment.state != ProdigyClusterPairEnrollmentState::revoked && rootSecret.matches(enrollment);
-    if (matches != 1 || rootSecret.rootIsZero())
-    {
-      if (failure) failure->assign("persistent brain snapshot cluster pair root is orphaned or stale"_ctv);
-      return false;
-    }
-  }
-  // All descriptors and every private root now agree. Hydrate only after
-  // completing this pass so a later bad record cannot expose earlier roots.
-  for (ProdigyClusterPairEnrollment& enrollment : enrollments)
-  {
-    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
-    for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
-    {
-      if (rootSecret.matches(enrollment))
-      {
-        std::memcpy(enrollment.root, rootSecret.root, sizeof(enrollment.root));
-        break;
-      }
-    }
-  }
 
   if (transportAuthorityRoot != nullptr)
     snapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot = *transportAuthorityRoot;

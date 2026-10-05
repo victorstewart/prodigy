@@ -2875,6 +2875,67 @@ int main(void)
             preEnrollmentRuntimeStateRestored.clusterPairEnrollments.empty(),
         "cluster_pair_enrollment_runtime_state_preserves_pre_v10_bytes");
 
+    // Runtime versions 10 and 11 retain the fixed-width root row for wire
+    // compatibility, but must mask it in every public runtime serialization.
+    ProdigyMasterAuthorityRuntimeState runtimeWithPairEnrollment = {};
+    runtimeWithPairEnrollment.generation = enrollment.localAuthorityGeneration;
+    runtimeWithPairEnrollment.clusterPairEnrollments.push_back(enrollment);
+    String runtimeWithPairEnrollmentBytes = {};
+    BitseryEngine::serialize(runtimeWithPairEnrollmentBytes, runtimeWithPairEnrollment);
+    String runtimePairRootNeedle = {};
+    runtimePairRootNeedle.assign(reinterpret_cast<const char *>(enrollment.root), sizeof(enrollment.root));
+    ProdigyMasterAuthorityRuntimeState decodedRuntimeWithPairEnrollment = {};
+    suite.expect(
+        !stringContains(runtimeWithPairEnrollmentBytes, runtimePairRootNeedle) &&
+            prodigyClusterPairEnrollmentRootEquals(
+                runtimeWithPairEnrollment.clusterPairEnrollments[0], enrollment) &&
+            BitseryEngine::deserializeSafe(runtimeWithPairEnrollmentBytes, decodedRuntimeWithPairEnrollment) &&
+            decodedRuntimeWithPairEnrollment.clusterPairEnrollments.size() == 1 &&
+            prodigyClusterPairEnrollmentIdentityEquals(
+                decodedRuntimeWithPairEnrollment.clusterPairEnrollments[0], enrollment) &&
+            prodigyClusterPairEnrollmentRootIsZero(
+                decodedRuntimeWithPairEnrollment.clusterPairEnrollments[0]),
+        "cluster_pair_runtime_codec_masks_fixed_root_slot");
+    String malformedRuntimeWithPairEnrollmentBytes = runtimeWithPairEnrollmentBytes;
+    uint64_t maskedRootOffset = UINT64_MAX;
+    for (uint64_t offset = 0; offset + sizeof(enrollment.root) <= malformedRuntimeWithPairEnrollmentBytes.size(); ++offset)
+    {
+      bool allZero = true;
+      for (uint32_t index = 0; index < sizeof(enrollment.root); ++index)
+      {
+        if (malformedRuntimeWithPairEnrollmentBytes[offset + index] != '\0')
+        {
+          allZero = false;
+          break;
+        }
+      }
+      if (allZero) maskedRootOffset = offset;
+    }
+    if (maskedRootOffset != UINT64_MAX)
+      std::memcpy(malformedRuntimeWithPairEnrollmentBytes.data() + maskedRootOffset,
+                  enrollment.root, sizeof(enrollment.root));
+    ProdigyMasterAuthorityRuntimeState malformedRuntimeWithPairEnrollment = {};
+    suite.expect(
+        maskedRootOffset != UINT64_MAX &&
+            BitseryEngine::deserializeSafe(
+                malformedRuntimeWithPairEnrollmentBytes, malformedRuntimeWithPairEnrollment) == false,
+        "cluster_pair_runtime_codec_rejects_nonzero_public_root_slot");
+
+    Vector<ProdigyClusterPairEnrollment> helperPublicEnrollments = {enrollment};
+    Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> helperRoots = {};
+    String pairEnrollmentHelperFailure = {};
+    suite.expect(
+        prodigyExtractPersistentClusterPairEnrollmentRoots(
+            helperPublicEnrollments, enrollment.localClusterUUID,
+            enrollment.localAuthorityGeneration, helperRoots, &pairEnrollmentHelperFailure) &&
+            helperRoots.size() == 1 &&
+            prodigyClusterPairEnrollmentRootIsZero(helperPublicEnrollments[0]) &&
+            prodigyHydratePersistentClusterPairEnrollmentRoots(
+                helperPublicEnrollments, helperRoots, enrollment.localClusterUUID,
+                enrollment.localAuthorityGeneration, &pairEnrollmentHelperFailure) &&
+            prodigyClusterPairEnrollmentRootEquals(helperPublicEnrollments[0], enrollment),
+        "cluster_pair_root_helpers_extract_and_hydrate_exact_identity");
+
     ProdigyPersistentBrainSnapshot pairEnrollmentSnapshot = expectedManagedSnapshot;
     pairEnrollmentSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.push_back(enrollment);
     ProdigyPersistentBrainSnapshot pairEnrollmentPublic = {};

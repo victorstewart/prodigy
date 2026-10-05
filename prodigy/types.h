@@ -9365,8 +9365,32 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   }
   if (hasClusterPairEnrollments)
   {
-    serializer.container(state.clusterPairEnrollments, ProdigyClusterPairEnrollmentMaximumRecords,
-        [](auto& nested, ProdigyClusterPairEnrollment& enrollment) { nested.object(enrollment); });
+    // Versions 10 and 11 reserve this fixed-width root slot for compatibility,
+    // but the public runtime record must never carry its private root.  The
+    // authenticated transition and snapshot sidecar bind that material by the
+    // immutable descriptor instead.
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    {
+      serializer.container(state.clusterPairEnrollments, ProdigyClusterPairEnrollmentMaximumRecords,
+          [](auto& nested, ProdigyClusterPairEnrollment& enrollment) {
+            ProdigyClusterPairEnrollment publicEnrollment = enrollment;
+            OPENSSL_cleanse(publicEnrollment.root, sizeof(publicEnrollment.root));
+            nested.object(publicEnrollment);
+          });
+    }
+    else
+    {
+      serializer.container(state.clusterPairEnrollments, ProdigyClusterPairEnrollmentMaximumRecords,
+          [](auto& nested, ProdigyClusterPairEnrollment& enrollment) { nested.object(enrollment); });
+      for (const ProdigyClusterPairEnrollment& enrollment : state.clusterPairEnrollments)
+      {
+        if (!prodigyClusterPairEnrollmentRootIsZero(enrollment))
+        {
+          serializer.adapter().error(bitsery::ReaderError::InvalidData);
+          return;
+        }
+      }
+    }
   }
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {

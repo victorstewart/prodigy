@@ -75,6 +75,7 @@ public:
   bool statefulServingAuthorityCapabilityAcknowledged = false;
   bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
   bool pairedSourceRetirementCapabilityAcknowledged = false;
+  bool clusterPairEnrollmentCapabilityAcknowledged = false;
   uint128_t containerRetirementCapabilityUUID = 0;
   int64_t containerRetirementCapabilityBootNs = 0;
   uint64_t containerRetirementCapabilityIOGeneration = 0;
@@ -144,6 +145,7 @@ public:
     statefulServingAuthorityCapabilityAcknowledged = false;
     statelessDeploymentAdmissionCapabilityAcknowledged = false;
     pairedSourceRetirementCapabilityAcknowledged = false;
+    clusterPairEnrollmentCapabilityAcknowledged = false;
     containerRetirementCapabilityUUID = 0;
     containerRetirementCapabilityBootNs = 0;
     containerRetirementCapabilityIOGeneration = 0;
