@@ -31499,6 +31499,20 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     suite.require(pairBrain.serializeCurrentMasterAuthorityTransition(encoded, digest) &&
                       BitseryEngine::deserializeSafe(encoded, replicated),
                   "cluster_pair_owner_serializes_operation_with_private_pair_root_transition");
+    String v1RuntimeBytes = {};
+    ProdigyMasterAuthorityRuntimeState v1RuntimeRoundTrip = {};
+    uint64_t v1Marker = 0, v1Version = 0;
+    if (!suite.require(BitseryEngine::serialize(v1RuntimeBytes, replicated.runtimeState) > 0 &&
+                      BitseryEngine::deserializeSafe(v1RuntimeBytes, v1RuntimeRoundTrip) &&
+                      v1RuntimeBytes.size() >= sizeof(v1Marker) + sizeof(v1Version),
+                  "cluster_pair_revoke_owner_serializes_untouched_v1_operation_runtime")) return;
+    std::memcpy(&v1Marker, v1RuntimeBytes.data(), sizeof(v1Marker));
+    std::memcpy(&v1Version, v1RuntimeBytes.data() + sizeof(v1Marker), sizeof(v1Version));
+    suite.expect(v1Marker == UINT64_MAX && v1Version == 12 &&
+                     v1RuntimeRoundTrip.clusterPairEnrollmentOperations.size() == 1 &&
+                     v1RuntimeRoundTrip.clusterPairEnrollmentOperations.front().protocolVersion ==
+                         ProdigyClusterPairEnrollmentOperation::legacyVersion,
+                 "cluster_pair_revoke_owner_untouched_enrollment_retains_runtime_v12_operation_v1_wire");
     auto erasedOperation = replicated;
     ++erasedOperation.runtimeState.generation;
     erasedOperation.runtimeState.clusterPairEnrollmentOperations.clear();
@@ -31510,6 +31524,160 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     mutatedOperation.runtimeState.clusterPairEnrollmentOperations.front().frozenElectorate.pop_back();
     suite.expect(!pairBrain.prepareReplicatedMasterAuthorityTransition(mutatedOperation, prepared),
                  "cluster_pair_owner_replication_cannot_mutate_frozen_operation_electorate");
+
+    // Revocation is an independent v2 operation phase. It captures the
+    // current electorate, never the enrollment electorate, and only releases
+    // empty projections after a new exact-transition majority.
+    acknowledgePairCapabilities(pairPeerA, uint64_t(2 | 32 | 64));
+    acknowledgePairCapabilities(pairPeerB, uint64_t(2 | 32 | 64));
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_revoke_owner_records_pre_admission_exact_quorum");
+    const auto preRevocationQuery = pairBrain.queryClusterPairAuthorityRevocation({1, request.enrollment.operationUUID});
+    suite.expect(preRevocationQuery.success && preRevocationQuery.found &&
+                     preRevocationQuery.currentAuthorityGeneration == pairBrain.masterAuthorityRuntimeState.generation &&
+                     !preRevocationQuery.qualifiedRevoked && !preRevocationQuery.projectionsWithdrawn,
+                 "cluster_pair_revoke_owner_query_reports_admitted_active_identity_before_revocation");
+    ProdigyClusterPairAuthorityRevokeRequest revoke = {};
+    revoke.expectedAuthorityGeneration = pairBrain.masterAuthorityRuntimeState.generation;
+    revoke.pairUUID = request.enrollment.pairUUID;
+    revoke.operationUUID = request.enrollment.operationUUID;
+    ProdigyClusterPairAuthorityRevokeResponse revokeResponse = {};
+    auto staleRevoke = revoke;
+    --staleRevoke.expectedAuthorityGeneration;
+    suite.expect(!pairBrain.revokeClusterPairAuthority(staleRevoke, revokeResponse),
+                 "cluster_pair_revoke_owner_rejects_stale_generation_before_admission");
+    suite.expect(!pairBrain.revokeClusterPairAuthority(revoke, revokeResponse),
+                 "cluster_pair_revoke_owner_rejects_one_of_three_revocation_capabilities");
+    acknowledgePairCapabilities(pairPeerA, uint64_t(2 | 32 | 64 | 128));
+    suite.require(pairBrain.revokeClusterPairAuthority(revoke, revokeResponse) && revokeResponse.found,
+                  "cluster_pair_revoke_owner_admits_two_of_three_authenticated_capabilities");
+    auto& revocationOperation = pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+    suite.expect(revocationOperation.protocolVersion == ProdigyClusterPairEnrollmentOperation::version &&
+                     revocationOperation.revocationRequested && !revocationOperation.projectionsWithdrawn &&
+                     revocationOperation.revocationFrozenElectorate == pairBrain.clusterPairCurrentElectorate() &&
+                     !prodigyClusterPairEnrollmentRootIsZero(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front()),
+                 "cluster_pair_revoke_owner_keeps_root_until_durable_frozen_electorate_quorum");
+    suite.expect(pairBrain.revokeClusterPairAuthority(revoke, revokeResponse) &&
+                     pairBrain.pendingRuntimePersistence.size() == 1,
+                 "cluster_pair_revoke_owner_exact_replay_is_idempotent_without_second_persist");
+    pairBrain.finishRuntimePersistence(true);
+    suite.expect(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                     ProdigyClusterPairEnrollmentState::active &&
+                     !prodigyClusterPairEnrollmentRootIsZero(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front()),
+                 "cluster_pair_revoke_owner_waits_for_revocation_transition_ack_before_root_erasure");
+
+    // Simulate a promotion while the revocation quorum is absent. The first
+    // held callback belongs to the old epoch and cannot make it usable.
+    ++pairBrain.masterAuthorityEpoch;
+    suite.require(pairBrain.reDriveClusterPairEnrollmentOperationsAfterPromotion(),
+                  "cluster_pair_revoke_owner_redrives_pending_revocation_after_promotion");
+    const uint64_t staleRevocationEpoch = revocationOperation.revocationPinnedMasterAuthorityEpoch;
+    ++pairBrain.masterAuthorityEpoch;
+    pairBrain.finishRuntimePersistence(true);
+    suite.expect(revocationOperation.revocationPinnedMasterAuthorityEpoch == staleRevocationEpoch &&
+                     pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                         ProdigyClusterPairEnrollmentState::active,
+                 "cluster_pair_revoke_owner_stale_promotion_callback_cannot_erase_root");
+    suite.require(pairBrain.reDriveClusterPairEnrollmentOperationsAfterPromotion(),
+                  "cluster_pair_revoke_owner_redrives_under_current_master_epoch");
+    pairBrain.finishRuntimePersistence(true);
+    for (NeuronView *neuron : {&selfMachine.neuron, &peerAMachine.neuron, &peerBMachine.neuron})
+      neuron->transportPeerProjectionAuthorityEpoch = pairBrain.masterAuthorityEpoch;
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_revoke_owner_records_current_frozen_electorate_ack");
+    pairBrain.driveClusterPairEnrollmentOperations();
+    suite.expect(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().state ==
+                     ProdigyClusterPairEnrollmentState::revoked &&
+                     prodigyClusterPairEnrollmentRootIsZero(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front()) &&
+                     !revocationOperation.projectionsWithdrawn,
+                 "cluster_pair_revoke_owner_zeroes_root_only_after_current_qualified_majority");
+    pairBrain.finishRuntimePersistence(true);
+    auto parkedRevoke = pairBrain.queryClusterPairAuthorityRevocation({1, revoke.operationUUID});
+    suite.expect(parkedRevoke.success && parkedRevoke.found && !parkedRevoke.qualifiedRevoked &&
+                     !parkedRevoke.projectionsWithdrawn,
+                 "cluster_pair_revoke_owner_withholds_empty_projection_release_until_revoked_transition_ack");
+
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_revoke_owner_records_revoked_transition_exact_ack");
+    pairBrain.driveClusterPairEnrollmentOperations();
+    suite.expect(selfMachine.neuron.clusterPairProjectionNonce != 0 &&
+                     peerAMachine.neuron.clusterPairProjectionNonce != 0 &&
+                     peerBMachine.neuron.clusterPairProjectionNonce != 0,
+                 "cluster_pair_revoke_owner_issues_empty_projections_only_after_revoked_quorum");
+    acknowledgePairProjection(selfMachine);
+    acknowledgePairProjection(peerAMachine);
+    suite.expect(!revocationOperation.projectionsWithdrawn,
+                 "cluster_pair_revoke_owner_requires_all_local_empty_projection_receipts");
+    acknowledgePairProjection(peerBMachine);
+    suite.expect(revocationOperation.projectionsWithdrawn,
+                 "cluster_pair_revoke_owner_marks_withdrawal_only_after_all_empty_projection_receipts");
+    pairBrain.finishRuntimePersistence(true);
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_revoke_owner_records_terminal_withdrawal_exact_ack");
+    auto terminalRevoke = pairBrain.queryClusterPairAuthorityRevocation({1, revoke.operationUUID});
+    suite.expect(terminalRevoke.success && terminalRevoke.found && terminalRevoke.qualifiedRevoked &&
+                     terminalRevoke.projectionsWithdrawn &&
+                     prodigyClusterPairEnrollmentRootIsZero(terminalRevoke.enrollment),
+                 "cluster_pair_revoke_owner_reports_only_qualified_durable_revocation_and_withdrawal");
+    String terminalTransitionBytes = {}, terminalTransitionDigest = {};
+    ProdigyMasterAuthorityStateTransition terminalTransition = {};
+    suite.require(pairBrain.serializeCurrentMasterAuthorityTransition(terminalTransitionBytes, terminalTransitionDigest) &&
+                      BitseryEngine::deserializeSafe(terminalTransitionBytes, terminalTransition),
+                  "cluster_pair_revoke_owner_serializes_terminal_v2_transition");
+    TransportCredentialCohortTestBrain preRevocationReplica = {};
+    configureAuthority(preRevocationReplica, 100, 191);
+    preRevocationReplica.masterAuthorityRuntimeState = replicated.runtimeState;
+    auto pendingAdmission = terminalTransition;
+    pendingAdmission.runtimeState.clusterPairEnrollmentOperations.front().projectionsWithdrawn = false;
+    Brain::PreparedMasterAuthorityTransition revocationPrepared = {};
+    suite.require(preRevocationReplica.prepareReplicatedMasterAuthorityTransition(pendingAdmission, revocationPrepared),
+                  "cluster_pair_revoke_owner_replica_accepts_pending_revocation_with_incoming_voter_roster");
+    auto minorityAdmission = pendingAdmission;
+    minorityAdmission.runtimeState.clusterPairEnrollmentOperations.front().revocationFrozenElectorate.pop_back();
+    suite.expect(!preRevocationReplica.prepareReplicatedMasterAuthorityTransition(minorityAdmission, revocationPrepared),
+                 "cluster_pair_revoke_owner_replica_rejects_first_revocation_with_noncurrent_voter_roster");
+    String v2RuntimeBytes = {};
+    ProdigyMasterAuthorityRuntimeState v2RuntimeRoundTrip = {};
+    uint64_t v2Marker = 0, v2Version = 0;
+    if (!suite.require(BitseryEngine::serialize(v2RuntimeBytes, pairBrain.masterAuthorityRuntimeState) > 0 &&
+                      BitseryEngine::deserializeSafe(v2RuntimeBytes, v2RuntimeRoundTrip) &&
+                      v2RuntimeBytes.size() >= sizeof(v2Marker) + sizeof(v2Version),
+                  "cluster_pair_revoke_owner_serializes_v2_tombstone_runtime")) return;
+    std::memcpy(&v2Marker, v2RuntimeBytes.data(), sizeof(v2Marker));
+    std::memcpy(&v2Version, v2RuntimeBytes.data() + sizeof(v2Marker), sizeof(v2Version));
+    suite.expect(v2Marker == UINT64_MAX && v2Version == 13 &&
+                     v2RuntimeRoundTrip.clusterPairEnrollmentOperations.size() == 1 &&
+                     v2RuntimeRoundTrip.clusterPairEnrollmentOperations.front().revocationRequested &&
+                     v2RuntimeRoundTrip.clusterPairEnrollmentOperations.front().projectionsWithdrawn &&
+                     v2RuntimeRoundTrip.clusterPairEnrollmentOperations.front().revocationFrozenElectorate ==
+                         revocationOperation.revocationFrozenElectorate &&
+                     v2RuntimeRoundTrip.clusterPairEnrollments.front().state == ProdigyClusterPairEnrollmentState::revoked,
+                 "cluster_pair_revoke_owner_runtime_v13_round_trips_tombstone_and_frozen_electorate");
+    String masqueradingV12 = v2RuntimeBytes;
+    const uint64_t forgedV12 = 12;
+    std::memcpy(masqueradingV12.data() + sizeof(uint64_t), &forgedV12, sizeof(forgedV12));
+    ProdigyMasterAuthorityRuntimeState rejectedV12 = {};
+    suite.expect(!BitseryEngine::deserializeSafe(masqueradingV12, rejectedV12),
+                 "cluster_pair_revoke_owner_rejects_v2_operation_in_legacy_runtime_v12_envelope");
+
+    // Completed withdrawal returns to the current electorate. It must not
+    // retain an old membership fence after a later promotion or roster change.
+    ++pairBrain.masterAuthorityEpoch;
+    const uint64_t completedRevocationEpoch = revocationOperation.revocationPinnedMasterAuthorityEpoch;
+    suite.require(pairBrain.reDriveClusterPairEnrollmentOperationsAfterPromotion(),
+                  "cluster_pair_revoke_owner_redrives_completed_tombstone_without_mutating_audit_fence");
+    pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments[2].state =
+        ProdigyTransportCredentialEnrollmentState::revoked;
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA),
+                  "cluster_pair_revoke_owner_records_current_roster_ack_after_promotion");
+    terminalRevoke = pairBrain.queryClusterPairAuthorityRevocation({1, revoke.operationUUID});
+    suite.expect(terminalRevoke.qualifiedRevoked && terminalRevoke.projectionsWithdrawn &&
+                     revocationOperation.revocationPinnedMasterAuthorityEpoch == completedRevocationEpoch,
+                 "cluster_pair_revoke_owner_completed_tombstone_uses_current_roster_not_historical_fence");
+    auto resurrected = replicated;
+    ++resurrected.runtimeState.generation;
+    suite.expect(!pairBrain.prepareReplicatedMasterAuthorityTransition(resurrected, prepared),
+                 "cluster_pair_revoke_owner_rejects_replayed_active_root_after_tombstone");
   }
 
   {

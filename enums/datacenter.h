@@ -70,7 +70,9 @@ enum class MothershipTopic : uint16_t {
   preparePairedSourceRetirement,
   pullPairedSourceRetirement,
   enrollClusterPair,
-  pullClusterPairEnrollment
+  pullClusterPairEnrollment,
+  revokeClusterPair,
+  pullClusterPairRevocation
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -163,6 +165,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "enrollClusterPair";
     case MothershipTopic::pullClusterPairEnrollment:
       return "pullClusterPairEnrollment";
+    case MothershipTopic::revokeClusterPair:
+      return "revokeClusterPair";
+    case MothershipTopic::pullClusterPairRevocation:
+      return "pullClusterPairRevocation";
   }
 
   return "unknown";

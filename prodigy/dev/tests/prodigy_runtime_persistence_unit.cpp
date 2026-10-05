@@ -149,6 +149,118 @@ static ProdigyTransportCredentialBootstrap projectionCredentialBootstrap(uint128
   return bootstrap;
 }
 
+static ClusterPairControlEndpoint runtimePairControlEndpoint(
+    uint128_t clusterUUID, uint128_t nodeUUID, const char *address)
+{
+  ClusterPairControlEndpoint endpoint = {};
+  endpoint.clusterUUID = clusterUUID;
+  endpoint.nodeUUID = nodeUUID;
+  endpoint.role = ClusterPairControlNodeRole::switchboard;
+  endpoint.address = IPAddress(address, true);
+  endpoint.port = uint16_t(ReservedPorts::clusterPairControl);
+  return endpoint;
+}
+
+static bool buildRuntimePairControlProjections(
+    uint128_t localNodeUUID, uint128_t remoteNodeUUID,
+    ProdigyLocalClusterPairControlProjection& local,
+    ProdigyLocalClusterPairControlProjection& remote)
+{
+  constexpr uint128_t localClusterUUID = 0x7101, remoteClusterUUID = 0x7201;
+  ClusterPairRoot root = {};
+  root.pairUUID = 0x72a1;
+  root.firstClusterUUID = localClusterUUID;
+  root.secondClusterUUID = remoteClusterUUID;
+  root.rootGeneration = 1;
+  for (uint32_t index = 0; index < root.root.size(); ++index) root.root[index] = uint8_t(0x81 + index);
+
+  const auto initiator = runtimePairControlEndpoint(localClusterUUID, localNodeUUID, "fd00:ffff:1234::1");
+  const auto responder = runtimePairControlEndpoint(remoteClusterUUID, remoteNodeUUID, "fd00:ffff:1234::2");
+  ClusterPairControlResolver localResolver = {}, remoteResolver = {};
+  if (!clusterPairPrepareControlResolver(root, initiator, responder, initiator, responder, 1,
+                                         "runtime-persistence-pair-control"_ctv, localResolver) ||
+      !clusterPairPrepareControlResolver(root, initiator, responder, responder, initiator, 1,
+                                         "runtime-persistence-pair-control"_ctv, remoteResolver)) return false;
+
+  std::array<uint8_t, 32> localKey = {}, remoteKey = {};
+  String localContext = {}, remoteContext = {};
+  uint128_t localPeer = 0, remotePeer = 0;
+  if (!localResolver.resolve(remoteResolver.localPublicClaim(), localKey, localContext, localPeer) ||
+      !remoteResolver.resolve(localResolver.localPublicClaim(), remoteKey, remoteContext, remotePeer) ||
+      localPeer != remoteNodeUUID || remotePeer != localNodeUUID) return false;
+
+  local = {};
+  local.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  local.localClusterUUID = localClusterUUID;
+  local.nodeUUID = localNodeUUID;
+  local.committedAuthorityGeneration = 12;
+  remote = {};
+  remote.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  remote.localClusterUUID = remoteClusterUUID;
+  remote.nodeUUID = remoteNodeUUID;
+  remote.committedAuthorityGeneration = 12;
+
+  ProdigyLocalClusterPairControlCredential localCredential = {}, remoteCredential = {};
+  localCredential.pairUUID = root.pairUUID;
+  localCredential.rootGeneration = root.rootGeneration;
+  localCredential.keyEpoch = 1;
+  localCredential.initiator = initiator;
+  localCredential.responder = responder;
+  localCredential.localClaim = localResolver.localPublicClaim();
+  localCredential.remoteClaim = remoteResolver.localPublicClaim();
+  localCredential.canonicalContext = std::move(localContext);
+  std::memcpy(localCredential.psk, localKey.data(), localKey.size());
+  remoteCredential.pairUUID = root.pairUUID;
+  remoteCredential.rootGeneration = root.rootGeneration;
+  remoteCredential.keyEpoch = 1;
+  remoteCredential.initiator = initiator;
+  remoteCredential.responder = responder;
+  remoteCredential.localClaim = remoteResolver.localPublicClaim();
+  remoteCredential.remoteClaim = localResolver.localPublicClaim();
+  remoteCredential.canonicalContext = std::move(remoteContext);
+  std::memcpy(remoteCredential.psk, remoteKey.data(), remoteKey.size());
+  OPENSSL_cleanse(localKey.data(), localKey.size());
+  OPENSSL_cleanse(remoteKey.data(), remoteKey.size());
+  local.credentials.push_back(std::move(localCredential));
+  remote.credentials.push_back(std::move(remoteCredential));
+  return prodigyLocalClusterPairControlProjectionValid(local, true) &&
+      prodigyLocalClusterPairControlProjectionValid(remote, true);
+}
+
+static bool runPairControlUntil(PersistenceRing& ring, const std::function<bool()>& complete, uint64_t timeoutMs)
+{
+  uint64_t elapsedMs = 0;
+  bool timedOut = false;
+  Ring::exit = false;
+  ring.tickAction = [&] {
+    if (complete()) { Ring::exit = true; return; }
+    elapsedMs += 5;
+    if (elapsedMs >= timeoutMs) { timedOut = true; Ring::exit = true; return; }
+    ring.armTick(5);
+  };
+  ring.armTick(1);
+  Ring::start();
+  ring.tickAction = {};
+  Ring::exit = false;
+  return !timedOut && complete();
+}
+
+static bool runPairControlFor(PersistenceRing& ring, uint64_t durationMs)
+{
+  uint64_t elapsedMs = 0;
+  Ring::exit = false;
+  ring.tickAction = [&] {
+    elapsedMs += 5;
+    if (elapsedMs >= durationMs) { Ring::exit = true; return; }
+    ring.armTick(5);
+  };
+  ring.armTick(1);
+  Ring::start();
+  ring.tickAction = {};
+  Ring::exit = false;
+  return elapsedMs >= durationMs;
+}
+
 template <typename... Args>
 static Message *runtimePersistenceMessage(String& buffer, NeuronTopic topic, Args&&...args)
 {
@@ -1225,6 +1337,93 @@ static void testNeuronClusterPairControlProjectionDurabilityAndStreamFence(TestS
   ::close(stream.fd); stream.fd = -1;
 }
 
+static void testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(TestSuite& suite)
+{
+  if (const char *enabled = std::getenv("PRODIGY_TEST_PAIR_CONTROL_RING");
+      enabled == nullptr || std::strcmp(enabled, "1") != 0)
+  {
+    suite.expect(true, "runtime_pair_restart_activation_ring_subcase_skipped_without_provisioned_ipv6");
+    return;
+  }
+
+  constexpr uint128_t neuronUUID = uint128_t(0x7215), brainUUID = uint128_t(0x7214), remoteNodeUUID = uint128_t(0x7216);
+  PersistenceRing ring = {};
+  ProjectionReceiptTestNeuron neuron = {};
+  NeuronBrainControlStream stream = {};
+  ProdigyTransportTLSStream remoteBrain = {};
+  SwitchboardPairControlRuntime remoteCarrier = {};
+  ProdigyLocalClusterPairControlProjection cached = {}, remoteProjection = {};
+  const bool projectionsBuilt = buildRuntimePairControlProjections(neuronUUID, remoteNodeUUID, cached, remoteProjection);
+  suite.expect(projectionsBuilt, "runtime_pair_restart_builds_complementary_cached_projection");
+  if (!projectionsBuilt) return;
+
+  reserveProjectionTransport(stream);
+  reserveProjectionTransport(remoteBrain);
+  std::array<uint8_t, 32> controlPSK = {};
+  controlPSK.fill(0x44);
+  const bool authenticated = stream.beginTransportAEGIS(true, controlPSK.data(), "pair-restart-projection"_ctv, neuronUUID, brainUUID) &&
+      remoteBrain.beginTransportAEGIS(false, controlPSK.data(), "pair-restart-projection"_ctv, brainUUID, neuronUUID) &&
+      completeProjectionTransportHandshake(remoteBrain, stream);
+  suite.expect(authenticated, "runtime_pair_restart_fresh_master_control_stream_is_authenticated");
+  if (!authenticated) return;
+
+  stream.connected = true;
+  stream.tlsPeerVerified = true;
+  stream.tlsPeerUUID = brainUUID;
+  stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  neuron.brain = &stream;
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  neuron.clusterPairControlProjection = cached;
+
+  const bool remoteInstalled = remoteCarrier.installProjection(remoteProjection);
+  const bool remoteStarted = remoteInstalled && remoteCarrier.start();
+  const bool localStarted = remoteStarted && neuron.startClusterPairControlRuntime();
+  suite.expect(remoteInstalled && remoteStarted && localStarted,
+               "runtime_pair_restart_starts_remote_carrier_and_empty_local_runtime");
+
+  // A saved credential set may fence rollback, but it must not open a carrier
+  // until the current authenticated Brain durably republishes it.
+  const bool cachedStayedInactive = localStarted && runPairControlFor(ring, 1500) &&
+      neuron.pairControlRuntime != nullptr && neuron.pairControlRuntime->readyCount() == 0 && remoteCarrier.readyCount() == 0;
+  suite.expect(cachedStayedInactive, "runtime_pair_restart_cached_projection_does_not_activate_before_fresh_delivery");
+
+  if (localStarted)
+  {
+    stream.pendingSend = true;
+    neuron.receiveClusterPairControlProjection(0x7217, cached);
+    const bool awaitingDurability = neuron.clusterPairControlProjectionPersistencePending &&
+        neuron.pairProjectionPersistenceCalls == 1 && neuron.pairControlRuntime->readyCount() == 0;
+    neuron.finishPairProjectionPersistence(true);
+    const bool activated = awaitingDurability && runPairControlUntil(ring, [&] {
+      return neuron.pairControlRuntime->readyCount() == 1 && remoteCarrier.readyCount() == 1;
+    }, 4000);
+    suite.expect(activated, "runtime_pair_restart_fresh_authenticated_durable_projection_activates_carrier");
+
+    ProdigyLocalClusterPairControlProjection revoked = {};
+    revoked.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+    revoked.localClusterUUID = cached.localClusterUUID;
+    revoked.nodeUUID = cached.nodeUUID;
+    revoked.committedAuthorityGeneration = cached.committedAuthorityGeneration + 1;
+    stream.pendingSend = true;
+    neuron.receiveClusterPairControlProjection(0x7218, revoked);
+    const bool revocationAwaitingDurability = neuron.clusterPairControlProjectionPersistencePending &&
+        neuron.pairProjectionPersistenceCalls == 2;
+    neuron.finishPairProjectionPersistence(true);
+    const bool revokedInactive = revocationAwaitingDurability && runPairControlUntil(ring, [&] {
+      return neuron.pairControlRuntime->readyCount() == 0 && remoteCarrier.readyCount() == 0;
+    }, 4000);
+    suite.expect(revokedInactive, "runtime_pair_restart_durable_empty_revocation_stays_inactive");
+  }
+
+  const bool quiesced = runPairControlUntil(ring, [&] {
+    const bool local = !neuron.pairControlRuntime || neuron.pairControlRuntime->quiesce();
+    return local && remoteCarrier.quiesce();
+  }, 3000);
+  suite.expect(quiesced, "runtime_pair_restart_quiesces_all_started_carriers");
+  ::close(stream.fd);
+  stream.fd = -1;
+}
+
 static void testProductionPairProjectionWriterUsesColocatedNeuronAuthority(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -1295,6 +1494,7 @@ int main(void)
   TestSuite suite;
   testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
   testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
+  testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(suite);
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "reentrant-update-persistence") == 0)
   {

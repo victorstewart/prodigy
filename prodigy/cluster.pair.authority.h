@@ -10,15 +10,23 @@ constexpr inline uint32_t ProdigyClusterPairEnrollmentOperationMaximumEndpoints 
 
 class ProdigyClusterPairEnrollmentOperation {
 public:
-  static constexpr uint32_t version = 1;
-  uint32_t protocolVersion = version;
+  static constexpr uint32_t version = 2;
+  static constexpr uint32_t legacyVersion = 1;
+  uint32_t protocolVersion = legacyVersion;
   uint128_t pairUUID = 0;
   uint128_t operationUUID = 0;
   uint64_t localAuthorityGeneration = 0;
   uint64_t transitionGeneration = 0;
   uint64_t pinnedMasterAuthorityEpoch = 0;
   bool initialProjectionDelivered = false;
+  // v2 only.  Enrollment voters remain immutable; revocation separately
+  // captures the live electorate that authorized its first admission.
+  bool revocationRequested = false;
+  bool projectionsWithdrawn = false;
+  uint64_t revocationTransitionGeneration = 0;
+  uint64_t revocationPinnedMasterAuthorityEpoch = 0;
   Vector<uint128_t> frozenElectorate;
+  Vector<uint128_t> revocationFrozenElectorate;
   Vector<ClusterPairControlEndpoint> localEndpoints;
   Vector<ClusterPairControlEndpoint> peerEndpoints;
 };
@@ -47,7 +55,8 @@ static inline bool prodigyClusterPairEnrollmentOperationValid(
     const ProdigyClusterPairEnrollmentOperation& operation,
     const ProdigyClusterPairEnrollment& enrollment, uint64_t runtimeGeneration)
 {
-  if (operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::version ||
+  if ((operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::legacyVersion &&
+       operation.protocolVersion != ProdigyClusterPairEnrollmentOperation::version) ||
       operation.pairUUID != enrollment.pairUUID || operation.operationUUID != enrollment.operationUUID ||
       operation.localAuthorityGeneration != enrollment.localAuthorityGeneration ||
       operation.localAuthorityGeneration == 0 || operation.transitionGeneration < operation.localAuthorityGeneration ||
@@ -61,6 +70,22 @@ static inline bool prodigyClusterPairEnrollmentOperationValid(
   {
     if (operation.frozenElectorate[left] == 0 || (left && operation.frozenElectorate[left - 1] >= operation.frozenElectorate[left])) return false;
   }
+  if (operation.protocolVersion == ProdigyClusterPairEnrollmentOperation::legacyVersion)
+    return !operation.revocationRequested && !operation.projectionsWithdrawn &&
+        operation.revocationTransitionGeneration == 0 && operation.revocationPinnedMasterAuthorityEpoch == 0 &&
+        operation.revocationFrozenElectorate.empty();
+  if (!operation.revocationRequested)
+    return !operation.projectionsWithdrawn && operation.revocationTransitionGeneration == 0 &&
+        operation.revocationPinnedMasterAuthorityEpoch == 0 && operation.revocationFrozenElectorate.empty() &&
+        enrollment.state != ProdigyClusterPairEnrollmentState::revoked;
+  if (operation.revocationPinnedMasterAuthorityEpoch == 0 ||
+      operation.revocationTransitionGeneration < operation.localAuthorityGeneration ||
+      operation.revocationTransitionGeneration > runtimeGeneration || operation.revocationFrozenElectorate.empty() ||
+      operation.revocationFrozenElectorate.size() > ProdigyTransportCredentialEnrollmentMaximumRecords ||
+      (operation.projectionsWithdrawn && enrollment.state != ProdigyClusterPairEnrollmentState::revoked)) return false;
+  for (uint32_t left = 0; left < operation.revocationFrozenElectorate.size(); ++left)
+    if (operation.revocationFrozenElectorate[left] == 0 ||
+        (left && operation.revocationFrozenElectorate[left - 1] >= operation.revocationFrozenElectorate[left])) return false;
   return true;
 }
 
@@ -71,8 +96,19 @@ static void serialize(S&& serializer, ProdigyClusterPairEnrollmentOperation& ope
   serializer.value16b(operation.operationUUID); serializer.value8b(operation.localAuthorityGeneration);
   serializer.value8b(operation.transitionGeneration); serializer.value8b(operation.pinnedMasterAuthorityEpoch);
   serializer.value1b(operation.initialProjectionDelivered);
+  if (operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version) {
+    serializer.value1b(operation.revocationRequested); serializer.value1b(operation.projectionsWithdrawn);
+    serializer.value8b(operation.revocationTransitionGeneration); serializer.value8b(operation.revocationPinnedMasterAuthorityEpoch);
+  } else {
+    operation.revocationRequested = false; operation.projectionsWithdrawn = false;
+    operation.revocationTransitionGeneration = 0; operation.revocationPinnedMasterAuthorityEpoch = 0;
+    operation.revocationFrozenElectorate.clear();
+  }
   serializer.container(operation.frozenElectorate, ProdigyTransportCredentialEnrollmentMaximumRecords,
       [](auto& nested, uint128_t& voter) { nested.value16b(voter); });
+  if (operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version)
+    serializer.container(operation.revocationFrozenElectorate, ProdigyTransportCredentialEnrollmentMaximumRecords,
+        [](auto& nested, uint128_t& voter) { nested.value16b(voter); });
   serializer.container(operation.localEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints,
       [](auto& nested, auto& endpoint) { nested.object(endpoint); });
   serializer.container(operation.peerEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints,
@@ -107,6 +143,32 @@ static inline bool prodigyValidateClusterPairEnrollmentOperations(
   return true;
 }
 
+class ProdigyClusterPairAuthorityRevokeRequest {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t pairUUID = 0;
+  uint128_t operationUUID = 0;
+};
+class ProdigyClusterPairAuthorityRevokeQuery {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t operationUUID = 0;
+};
+class ProdigyClusterPairAuthorityRevokeResponse {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  bool success = false, found = false, qualifiedRevoked = false, projectionsWithdrawn = false;
+  uint128_t localClusterUUID = 0;
+  uint64_t currentAuthorityGeneration = 0;
+  ProdigyClusterPairEnrollment enrollment;
+  Vector<ClusterPairControlEndpoint> localEndpoints, peerEndpoints;
+  String failure;
+};
+
 class ProdigyClusterPairEnrollmentRequest {
 public:
   static constexpr uint32_t version = 1; uint32_t protocolVersion = version; uint64_t expectedAuthorityGeneration = 0;
@@ -119,6 +181,30 @@ public:
   uint128_t localClusterUUID = 0; uint64_t currentAuthorityGeneration = 0; ProdigyClusterPairEnrollment enrollment;
   Vector<ClusterPairControlEndpoint> localEndpoints, peerEndpoints; String failure;
 };
+template <typename S> static void serialize(S&& serializer, ProdigyClusterPairAuthorityRevokeRequest& request) {
+  serializer.value4b(request.protocolVersion); serializer.value8b(request.expectedAuthorityGeneration);
+  serializer.value16b(request.pairUUID); serializer.value16b(request.operationUUID);
+}
+template <typename S> static void serialize(S&& serializer, ProdigyClusterPairAuthorityRevokeQuery& query) {
+  serializer.value4b(query.protocolVersion); serializer.value16b(query.operationUUID);
+}
+template <typename S> static void serialize(S&& serializer, ProdigyClusterPairAuthorityRevokeResponse& response) {
+  serializer.value4b(response.protocolVersion); serializer.value1b(response.success); serializer.value1b(response.found);
+  serializer.value1b(response.qualifiedRevoked); serializer.value1b(response.projectionsWithdrawn);
+  serializer.value16b(response.localClusterUUID); serializer.value8b(response.currentAuthorityGeneration);
+  ProdigyClusterPairEnrollment publicEnrollment = response.enrollment;
+  if constexpr (ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value) {
+    OPENSSL_cleanse(publicEnrollment.root, sizeof(publicEnrollment.root)); serializer.object(publicEnrollment);
+  } else {
+    serializer.object(publicEnrollment);
+    if (!prodigyClusterPairEnrollmentRootIsZero(publicEnrollment)) serializer.adapter().error(bitsery::ReaderError::InvalidData);
+    response.enrollment = std::move(publicEnrollment);
+  }
+  serializer.container(response.localEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});
+  serializer.container(response.peerEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});
+  serializer.text1b(response.failure, 1024);
+}
+
 template <typename S> static void serialize(S&& serializer, ProdigyClusterPairEnrollmentRequest& request) {
   serializer.value4b(request.protocolVersion); serializer.value8b(request.expectedAuthorityGeneration); serializer.object(request.enrollment);
   serializer.container(request.localEndpoints, ProdigyClusterPairEnrollmentOperationMaximumEndpoints, [](auto& n, auto& e){n.object(e);});

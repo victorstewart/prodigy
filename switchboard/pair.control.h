@@ -64,6 +64,11 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   void retire(Connection& connection)
   {
     if (connection.closing) return;
+    if (connection.ready)
+      std::fprintf(stderr, "switchboard pair-control closed local=%016llx%016llx peer=%016llx%016llx pair=%016llx%016llx\n",
+          (unsigned long long)(projection.nodeUUID >> 64), (unsigned long long)projection.nodeUUID,
+          (unsigned long long)(connection.remote.nodeUUID >> 64), (unsigned long long)connection.remote.nodeUUID,
+          (unsigned long long)(connection.credential.pairUUID >> 64), (unsigned long long)connection.credential.pairUUID);
     connection.closing = true; connection.ready = false;
     Ring::queueClose(&connection);
   }

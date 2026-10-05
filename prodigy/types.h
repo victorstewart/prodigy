@@ -9134,8 +9134,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // appends its durable transition state after the cumulative P6 tails.
   // Version 10 appends cluster-pair enrollment descriptors; version 11
   // appends internal transport credential enrollment descriptors; version 12
-  // appends durable pair-enrollment operations.
-  constexpr uint64_t explicitVersion = 12;
+  // appends durable pair-enrollment operations; version 13 permits their
+  // revocation tail while older readers reject before consuming that layout.
+  constexpr uint64_t explicitVersion = 13;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9151,6 +9152,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasClusterPairEnrollments = false;
   bool hasTransportCredentialEnrollments = false;
   bool hasClusterPairEnrollmentOperations = false;
+  bool permitsClusterPairRevocationOperations = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9209,7 +9211,9 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasClusterPairEnrollmentOperations ? 12 : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      const bool hasPairRevocationOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; });
+      uint64_t version = hasClusterPairEnrollmentOperations ? (hasPairRevocationOperations ? 13 : 12) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
                           (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))));
@@ -9253,6 +9257,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasClusterPairEnrollments = version >= 10;
       hasTransportCredentialEnrollments = version >= 11;
       hasClusterPairEnrollmentOperations = version >= 12;
+      permitsClusterPairRevocationOperations = version >= 13;
     }
   }
 
@@ -9415,6 +9420,11 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   {
     serializer.container(state.clusterPairEnrollmentOperations, ProdigyClusterPairEnrollmentMaximumRecords,
         [](auto& nested, ProdigyClusterPairEnrollmentOperation& operation) { nested.object(operation); });
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (!permitsClusterPairRevocationOperations &&
+          std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
+              [](const auto& operation) { return operation.protocolVersion >= 2; }))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {

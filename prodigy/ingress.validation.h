@@ -378,6 +378,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
       }
     case MothershipTopic::enrollClusterPair:
     case MothershipTopic::pullClusterPairEnrollment:
+    case MothershipTopic::revokeClusterPair:
+    case MothershipTopic::pullClusterPairRevocation:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;

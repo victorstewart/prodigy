@@ -243,7 +243,7 @@ if(_two_cluster_option EQUAL -1 OR _two_cluster_dispatch EQUAL -1)
 endif()
 
 file(READ "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_pair_enrollment_qualification.sh" _pair_control_source)
-foreach(_required IN ITEMS "enrollClusterPair" "testClusterPairControl" "faultTestCluster" "removeCluster")
+foreach(_required IN ITEMS "enrollClusterPair" "revokeClusterPair" "testClusterPairControl" "faultTestCluster" "removeCluster")
    string(FIND "${_pair_control_source}" "${_required}" _position)
    if(_position EQUAL -1)
       message(FATAL_ERROR "pair-control qualification must use Mothership lifecycle: ${_required}")

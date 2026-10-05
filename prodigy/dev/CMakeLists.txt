@@ -2465,6 +2465,10 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_mothership_upgrade_admission_registry_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_admission_registry_unit)
    add_test(NAME prodigy_cousin_route_unit COMMAND $<TARGET_FILE:prodigy_cousin_route_unit>)
    add_test(NAME prodigy_cluster_pair_keys_unit COMMAND $<TARGET_FILE:prodigy_cluster_pair_keys_unit>)
+   add_test(NAME prodigy_transport_credential_authority_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_TRANSPORT_CREDENTIALS_ONLY=1
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
+   set_tests_properties(prodigy_transport_credential_authority_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_transport_aegis_unit COMMAND $<TARGET_FILE:prodigy_transport_aegis_unit>)
    set_tests_properties(prodigy_transport_aegis_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_pair_control_ring_unit COMMAND $<TARGET_FILE:prodigy_pair_control_ring_unit>)

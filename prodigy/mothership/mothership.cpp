@@ -18410,6 +18410,86 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  void runRevokeClusterPair(int argc, char *argv[])
+  {
+    String failure;
+    uint128_t operationUUID = 0;
+    MothershipClusterPairEnrollmentIntent intent;
+    MothershipProdigyCluster first, second;
+    bool valid = argc == 1 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadClusterPairEnrollmentIntent(operationUUID, intent, &failure);
+      String firstID, secondID;
+      firstID.assignItoh(intent.firstClusterUUID); secondID.assignItoh(intent.secondClusterUUID);
+      if (valid) valid = registry.getClusterByIdentity(firstID, first, &failure) &&
+                         registry.getClusterByIdentity(secondID, second, &failure);
+    }
+    auto bindResponse = [&](bool firstSide, const ProdigyClusterPairAuthorityRevokeResponse& response) {
+      const uint128_t local = firstSide ? intent.firstClusterUUID : intent.secondClusterUUID;
+      const uint128_t peer = firstSide ? intent.secondClusterUUID : intent.firstClusterUUID;
+      const auto& enrollment = response.enrollment;
+      if (response.protocolVersion != ProdigyClusterPairAuthorityRevokeResponse::version ||
+          !response.success || !response.found || response.localClusterUUID != local ||
+          response.currentAuthorityGeneration == 0 || !prodigyClusterPairEnrollmentDescriptorValid(enrollment) ||
+          !prodigyClusterPairEnrollmentRootIsZero(enrollment) || enrollment.pairUUID != intent.pairUUID ||
+          enrollment.operationUUID != intent.operationUUID || enrollment.localClusterUUID != local ||
+          enrollment.peerClusterUUID != peer || enrollment.rootGeneration != intent.rootGeneration ||
+          ((firstSide ? intent.firstEnrolledAuthorityGeneration : intent.secondEnrolledAuthorityGeneration) != 0 &&
+           enrollment.localAuthorityGeneration != (firstSide ? intent.firstEnrolledAuthorityGeneration : intent.secondEnrolledAuthorityGeneration)) ||
+          enrollment.agreedKeyEpoch < intent.keyEpoch ||
+          (response.qualifiedRevoked && enrollment.state != ProdigyClusterPairEnrollmentState::revoked) ||
+          (response.projectionsWithdrawn && !response.qualifiedRevoked) ||
+          response.localEndpoints != (firstSide ? intent.firstEndpoints : intent.secondEndpoints) ||
+          response.peerEndpoints != (firstSide ? intent.secondEndpoints : intent.firstEndpoints))
+      {
+        failure.assign("pair revocation response conflicts with the enrolled pair identity"_ctv);
+        return false;
+      }
+      return true;
+    };
+    auto querySide = [&](bool firstSide, ProdigyClusterPairAuthorityRevokeResponse& response) {
+      String name = firstSide ? first.name : second.name;
+      ProdigyClusterPairAuthorityRevokeQuery query;
+      query.operationUUID = operationUUID;
+      return configureControlTarget(name.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::pullClusterPairRevocation, query, response, failure) &&
+          bindResponse(firstSide, response);
+    };
+    auto revokeSide = [&](bool firstSide, ProdigyClusterPairAuthorityRevokeResponse& response) {
+      if (!querySide(firstSide, response)) return false;
+      ProdigyClusterPairAuthorityRevokeRequest request;
+      request.pairUUID = intent.pairUUID; request.operationUUID = operationUUID;
+      request.expectedAuthorityGeneration = response.currentAuthorityGeneration;
+      return requestTopicRoundTrip(MothershipTopic::revokeClusterPair, request, response, failure) &&
+          bindResponse(firstSide, response);
+    };
+    ProdigyClusterPairAuthorityRevokeResponse firstResponse, secondResponse;
+    if (valid) valid = revokeSide(true, firstResponse);
+    if (valid) valid = revokeSide(false, secondResponse);
+    auto complete = [&] {
+      return firstResponse.qualifiedRevoked && firstResponse.projectionsWithdrawn &&
+             secondResponse.qualifiedRevoked && secondResponse.projectionsWithdrawn;
+    };
+    for (uint32_t attempt = 0; valid && !complete() && attempt < 60; ++attempt)
+    {
+      ::usleep(500'000);
+      valid = querySide(true, firstResponse);
+      if (valid) valid = querySide(false, secondResponse);
+    }
+    if (valid && !complete())
+    {
+      failure.assign("pair revocation awaits qualified tombstones and withdrawn projections; retry the enrollment operation UUID"_ctv);
+      valid = false;
+    }
+    basics_log("revokeClusterPair success=%u operationUUID=%016llx%016llx firstRevoked=%u firstWithdrawn=%u secondRevoked=%u secondWithdrawn=%u pending=%u failure=%s\n",
+        unsigned(valid), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        unsigned(firstResponse.qualifiedRevoked), unsigned(firstResponse.projectionsWithdrawn),
+        unsigned(secondResponse.qualifiedRevoked), unsigned(secondResponse.projectionsWithdrawn), unsigned(!complete()), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   bool bindPairControlBoundary(const MothershipClusterPairEnrollmentIntent& intent,
                                MothershipPairControlBoundaryDescriptor& boundary, String& failure)
   {
@@ -22007,6 +22087,7 @@ public:
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
         {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
+        {"revokeClusterPair",               &Mothership::runRevokeClusterPair              },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
@@ -22141,6 +22222,8 @@ int main(int argc, char *argv[])
     message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("enrollClusterPair [first cluster name|UUID] [second cluster name|UUID] [operationUUID canonical hex]\n");
     message.append("\tcreates or resumes one durable private pair enrollment intent after both clusters return qualified endpoint rosters; it waits up to 30 seconds for both active projections\n");
+    message.append("revokeClusterPair [enrollment operationUUID canonical hex]\n");
+    message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
     message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");

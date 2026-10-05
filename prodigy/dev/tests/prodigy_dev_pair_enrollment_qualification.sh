@@ -215,6 +215,35 @@ enrollment_complete() {
     rg -q 'firstQualified=1 firstProjection=1 secondQualified=1 secondProjection=1 pending=0' "$log"
 }
 
+revocation_complete() {
+  ok "$1" revokeClusterPair &&
+    rg -q 'firstRevoked=1 firstWithdrawn=1 secondRevoked=1 secondWithdrawn=1 pending=0' "$1"
+}
+
+check_revoked_control() {
+  python3 - "$ROOT" "$1" <<'PY_REVOKED'
+import json,pathlib,re,sys,time
+root=pathlib.Path(sys.argv[1]); phase=sys.argv[2]
+offsets=json.loads((root/'pair-control-revoke-offsets.json').read_text())
+initial=json.loads((root/'pair-control-initial.json').read_text())
+expected={tuple(x) for x in initial['expected']}; pairs=set(initial['pairUUIDs'])
+deadline=time.monotonic()+10
+while True:
+    closed=set()
+    for name,offset in offsets.items():
+        with pathlib.Path(name).open('rb') as stream:
+            stream.seek(offset); data=stream.read().decode(errors='replace')
+        assert 'switchboard pair-control ready ' not in data, 'revoked pair authenticated again'
+        for own,peer,pair in re.findall(r'switchboard pair-control closed local=([0-9a-f]{32}) peer=([0-9a-f]{32}) pair=([0-9a-f]{32})',data):
+            assert pair in pairs
+            closed.add((own,peer))
+    if expected <= closed: break
+    if time.monotonic()>=deadline: raise SystemExit(f'pair revocation missing closed directions: {sorted(expected-closed)}')
+    time.sleep(.2)
+(root/('pair-control-'+phase+'.json')).write_text(json.dumps({'expected':sorted(expected),'closed':sorted(closed),'pairUUIDs':sorted(pairs),'newReadyConnections':0},indent=2)+'\n')
+PY_REVOKED
+}
+
 wait_pair_control() {
   local phase=$1
   python3 - "$ROOT" "$FIRST_MANIFEST" "$SECOND_MANIFEST" "$phase" "${OLD_MASTER_UUID:-}" <<'PY_CONTROL'
@@ -329,6 +358,42 @@ m report-first-final 8 "$ROOT/first-final-cluster-report.log" clusterReport "$FI
 ready "$ROOT/first-final-cluster-report.log"
 m report-second-final 8 "$ROOT/second-final-cluster-report.log" clusterReport "$SECOND"
 ready "$ROOT/second-final-cluster-report.log"
+
+# Withdraw through the ordinary authority owner, then prove the terminal
+# decision remains effective across replay and another whole-machine crash.
+python3 - "$ROOT" "$FIRST_MANIFEST" "$SECOND_MANIFEST" <<'PY_OFFSETS'
+import json,pathlib,sys
+logs=[pathlib.Path(node['stdoutLog']) for name in sys.argv[2:] for node in json.loads(pathlib.Path(name).read_text())['nodes']]
+(pathlib.Path(sys.argv[1])/'pair-control-revoke-offsets.json').write_text(json.dumps({str(path):path.stat().st_size for path in logs}))
+PY_OFFSETS
+m revoke 45 "$ROOT/revoke.log" revokeClusterPair "$OPERATION"
+revocation_complete "$ROOT/revoke.log"
+m revoke-retry 45 "$ROOT/revoke-retry.log" revokeClusterPair "$OPERATION"
+revocation_complete "$ROOT/revoke-retry.log"
+check_revoked_control revoked
+if m reenroll-revoked 45 "$ROOT/reenroll-revoked.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION"; then
+  echo 'FAIL: revoked pair enrollment unexpectedly succeeded' >&2
+  exit 1
+fi
+rg -q 'enrollClusterPair success=0 .*failure=.*immutable enrollment descriptor' "$ROOT/reenroll-revoked.log"
+IFS=$'\t' read -r REVOKED_MASTER_INDEX REVOKED_MASTER_UUID REVOKED_MASTER_BOOT < <(master_identity "$ROOT/first-final-cluster-report.log")
+[[ "$REVOKED_MASTER_INDEX" =~ ^[1-3]$ ]]
+m revoked-master-fault 45 "$ROOT/revoked-master-fault.log" faultTestCluster "$FIRST" crash "$REVOKED_MASTER_INDEX" 12000 0 0 0
+ok "$ROOT/revoked-master-fault.log" faultTestCluster
+wait_ready "$FIRST" first-after-revocation-fault
+python3 - "$ROOT/first-after-revocation-fault-cluster-report.log" "$REVOKED_MASTER_UUID" "$REVOKED_MASTER_BOOT" <<'PY_RESTART'
+import pathlib,re,sys
+for block in re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)',pathlib.Path(sys.argv[1]).read_text()):
+    identity=re.search(r'(?m)^[ \t]*identity uuid=(\S+)',block)
+    boot=re.search(r'\bbootTimeMs=([0-9]+)',block)
+    if identity and identity[1]==sys.argv[2] and boot:
+        assert boot[1]!=sys.argv[3], 'revoked master did not change incarnation'
+        break
+else: raise SystemExit('revoked master missing after recovery')
+PY_RESTART
+m revoke-after-master-fault 45 "$ROOT/revoke-after-master-fault.log" revokeClusterPair "$OPERATION"
+revocation_complete "$ROOT/revoke-after-master-fault.log"
+check_revoked_control revoked-after-master-fault
 copy_cluster_logs first "$FIRST_MANIFEST"
 copy_cluster_logs second "$SECOND_MANIFEST"
 

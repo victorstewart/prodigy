@@ -8018,11 +8018,13 @@ public:
            peer->containerRetirementCapabilityIOGeneration == peer->ioGeneration;
   }
 
-  bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer, bool requireOperations = false) const
+  bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer, bool requireOperations = false,
+                                                 bool requireRevocation = false) const
   {
     return containerRetirementPeerCapabilityCurrent(peer) && peer->transportAEGISEnabled() &&
            peer->clusterPairEnrollmentCapabilityAcknowledged &&
-           (!requireOperations || peer->clusterPairOperationsCapabilityAcknowledged);
+           (!requireOperations || peer->clusterPairOperationsCapabilityAcknowledged) &&
+           (!requireRevocation || peer->clusterPairRevocationCapabilityAcknowledged);
   }
 
   // Shared commissioned-membership proof for capability-gated authority
@@ -8825,13 +8827,43 @@ public:
       auto next = std::find_if(incoming.clusterPairEnrollmentOperations.begin(), incoming.clusterPairEnrollmentOperations.end(),
           [&](const auto& operation) { return operation.operationUUID == previous.operationUUID; });
       if (next == incoming.clusterPairEnrollmentOperations.end() || next->pairUUID != previous.pairUUID ||
-          next->protocolVersion != previous.protocolVersion || next->localAuthorityGeneration != previous.localAuthorityGeneration ||
+          !((next->protocolVersion == previous.protocolVersion) ||
+            (previous.protocolVersion == ProdigyClusterPairEnrollmentOperation::legacyVersion &&
+             next->protocolVersion == ProdigyClusterPairEnrollmentOperation::version && next->revocationRequested)) ||
+          next->localAuthorityGeneration != previous.localAuthorityGeneration ||
           next->frozenElectorate != previous.frozenElectorate || next->localEndpoints != previous.localEndpoints ||
           next->peerEndpoints != previous.peerEndpoints || next->transitionGeneration < previous.transitionGeneration ||
+          next->revocationTransitionGeneration < previous.revocationTransitionGeneration ||
           (previous.initialProjectionDelivered && !next->initialProjectionDelivered) ||
           ((next->pinnedMasterAuthorityEpoch != previous.pinnedMasterAuthorityEpoch ||
             next->initialProjectionDelivered != previous.initialProjectionDelivered) &&
-           next->transitionGeneration <= previous.transitionGeneration)) return false;
+           next->transitionGeneration <= previous.transitionGeneration) ||
+          (previous.revocationRequested && (!next->revocationRequested ||
+            next->revocationFrozenElectorate != previous.revocationFrozenElectorate ||
+            (previous.projectionsWithdrawn && !next->projectionsWithdrawn))) ||
+          ((!previous.revocationRequested && next->revocationRequested) &&
+           (next->protocolVersion != ProdigyClusterPairEnrollmentOperation::version ||
+            next->revocationFrozenElectorate.empty())) ||
+          ((next->revocationRequested &&
+            (next->revocationPinnedMasterAuthorityEpoch != previous.revocationPinnedMasterAuthorityEpoch ||
+             next->projectionsWithdrawn != previous.projectionsWithdrawn ||
+             (previous.revocationRequested == false && next->revocationRequested))) &&
+           next->revocationTransitionGeneration <= previous.revocationTransitionGeneration)) return false;
+      if (!previous.revocationRequested && next->revocationRequested && !next->projectionsWithdrawn)
+      {
+        // A follower may receive membership and revocation in one catchup
+        // snapshot. Pending revocation freezes that incoming voter roster;
+        // completed tombstones retain it only as historical audit evidence.
+        Vector<uint128_t> incomingVoters;
+        const auto& root = incoming.transportCredentialAuthorityRoot;
+        for (const auto& member : incoming.transportCredentialEnrollments)
+          if (member.state == ProdigyTransportCredentialEnrollmentState::active &&
+              member.role == ProdigyTransportCredentialNodeRole::brain && member.clusterUUID == brainConfig.clusterUUID &&
+              member.authorityEpoch == root.authorityEpoch && member.keyEpoch == root.keyEpoch)
+            incomingVoters.push_back(member.nodeUUID);
+        std::sort(incomingVoters.begin(), incomingVoters.end());
+        if (next->revocationFrozenElectorate != incomingVoters) return false;
+      }
     }
     ProdigyContainerRetirementJournal currentRetirements = {}, incomingRetirements = {}, mergedRetirements = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, currentRetirements) ||
@@ -9421,7 +9453,9 @@ public:
            currentPeer->ioGeneration == pending->peerGeneration &&
            currentPeer->fslot == pending->peerFileSlot &&
            (pending->prepared.runtime.runtimeState.clusterPairEnrollments.empty() ||
-            clusterPairEnrollmentPeerCapabilityCurrent(currentPeer, !pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.empty())) &&
+            clusterPairEnrollmentPeerCapabilityCurrent(currentPeer, !pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.empty(),
+                std::any_of(pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.begin(), pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.end(),
+                    [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version && operation.revocationRequested; }))) &&
            peerCanReplicateMasterAuthorityState(currentPeer);
   }
 
@@ -9486,7 +9520,9 @@ public:
       BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
   {
     if (!incoming.runtimeState.clusterPairEnrollments.empty() &&
-        !clusterPairEnrollmentPeerCapabilityCurrent(peer, !incoming.runtimeState.clusterPairEnrollmentOperations.empty())) return true;
+        !clusterPairEnrollmentPeerCapabilityCurrent(peer, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
+                std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
+                    [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version && operation.revocationRequested; }))) return true;
     if (!usesAsyncMasterAuthorityPersistence()) return false;
     // Serialize conflicting authority snapshots, while the handler continues
     // to accept heartbeats and other independent traffic. Full admission stays
@@ -9611,7 +9647,8 @@ public:
            (masterAuthorityRuntimeState.clusterPairEnrollments.empty() ||
             (masterAuthorityRuntimeStateDurable &&
              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
-             clusterPairEnrollmentPeerCapabilityCurrent(peer, !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty()))) &&
+             clusterPairEnrollmentPeerCapabilityCurrent(peer, !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty(),
+                clusterPairRevocationOperationsPresent()))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
@@ -30623,13 +30660,50 @@ public:
     return voters;
   }
 
+  bool clusterPairRevocationOperationsPresent() const
+  {
+    return std::any_of(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+                       masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(),
+                       [](const auto& operation) {
+                         return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version &&
+                             operation.revocationRequested;
+                       });
+  }
+
+  bool clusterPairRevocationElectorateCapable(const Vector<uint128_t>& electorate) const
+  {
+    if (electorate.empty() || std::find(electorate.begin(), electorate.end(), selfBrainUUID()) == electorate.end()) return false;
+    uint32_t capable = 1;
+    for (uint128_t voter : electorate) {
+      if (voter == selfBrainUUID()) continue;
+      if (clusterPairEnrollmentPeerCapabilityCurrent(findBrainViewByUUID(voter), true, true)) ++capable;
+    }
+    // Admission needs a current authenticated capability quorum; the full
+    // roster remains frozen and must later ACK the exact v2 transition only
+    // to the ordinary majority threshold.
+    return capable >= uint32_t(electorate.size() / 2) + 1;
+  }
+
+  bool clusterPairRevocationQualified(const ProdigyClusterPairEnrollmentOperation& operation,
+                                      const ProdigyClusterPairEnrollment& enrollment,
+                                      const String& transitionDigest) const
+  {
+    return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version &&
+        operation.revocationRequested && operation.pairUUID == enrollment.pairUUID &&
+        operation.operationUUID == enrollment.operationUUID &&
+        operation.revocationPinnedMasterAuthorityEpoch == masterAuthorityEpoch &&
+        transportCredentialElectorateHasQualifiedQuorum(operation.revocationFrozenElectorate, transitionDigest);
+  }
+
   bool clusterPairInitialEnrollmentPending() const
   {
-    for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
+    for (const auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations) {
+      if (operation.revocationRequested && !operation.projectionsWithdrawn) return true;
       if (!operation.initialProjectionDelivered)
         for (const auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments)
           if (enrollment.operationUUID == operation.operationUUID && enrollment.state != ProdigyClusterPairEnrollmentState::revoked)
             return true;
+    }
     // A delivered flag is itself a replicated transition. Do not admit a new
     // credential electorate while that terminal transition is still unproven.
     return !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty() && !clusterPairAuthorityQualified();
@@ -30651,6 +30725,12 @@ public:
       auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
           masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& row) { return row.operationUUID == operation.operationUUID; });
       if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+      if (operation.revocationRequested) {
+        if (operation.projectionsWithdrawn) continue;
+        unfinished = true;
+        if (!clusterPairRevocationQualified(operation, *enrollment, digest)) return false;
+        continue;
+      }
       if (operation.initialProjectionDelivered || enrollment->state == ProdigyClusterPairEnrollmentState::revoked) continue;
       unfinished = true;
       if (operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
@@ -30738,6 +30818,86 @@ public:
     response.qualified = clusterPairEnrollmentReady(response.localEndpoints);
     if (!response.qualified) response.failure.assign("pair enrollment awaits current durable quorum, credentials, topology and capabilities"_ctv);
     return response;
+  }
+
+  ProdigyClusterPairAuthorityRevokeResponse queryClusterPairAuthorityRevocation(
+      const ProdigyClusterPairAuthorityRevokeQuery& query) const
+  {
+    ProdigyClusterPairAuthorityRevokeResponse response;
+    response.localClusterUUID = brainConfig.clusterUUID;
+    response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    if (query.protocolVersion != ProdigyClusterPairAuthorityRevokeQuery::version || !weAreMaster) {
+      response.failure.assign("pair revocation requires current master and supported query"_ctv);
+      return response;
+    }
+    for (const auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments) {
+      if (enrollment.operationUUID != query.operationUUID) continue;
+      response.found = true; response.enrollment = enrollment;
+      OPENSSL_cleanse(response.enrollment.root, sizeof(response.enrollment.root));
+      auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+          masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+            return value.operationUUID == query.operationUUID;
+          });
+      if (operation == masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end()) {
+        response.failure.assign("pair revocation has no durable operation"_ctv); return response;
+      }
+      response.success = true; response.localEndpoints = operation->localEndpoints; response.peerEndpoints = operation->peerEndpoints;
+      String serialized, digest;
+      response.qualifiedRevoked = enrollment.state == ProdigyClusterPairEnrollmentState::revoked &&
+          serializeCurrentMasterAuthorityTransition(serialized, digest) &&
+          (operation->projectionsWithdrawn ? clusterPairAuthorityQualified() :
+              clusterPairRevocationQualified(*operation, enrollment, digest));
+      response.projectionsWithdrawn = response.qualifiedRevoked && operation->projectionsWithdrawn;
+      return response;
+    }
+    response.success = true;
+    return response;
+  }
+
+  bool revokeClusterPairAuthority(const ProdigyClusterPairAuthorityRevokeRequest& request,
+                                  ProdigyClusterPairAuthorityRevokeResponse& response)
+  {
+    auto reject = [&](const char *failure) {
+      response = {}; response.localClusterUUID = brainConfig.clusterUUID;
+      response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+      response.failure.assign(failure); return false;
+    };
+    if (!weAreMaster || !internalTransportAEGISRequired() || masterAuthorityEpoch == 0 ||
+        request.protocolVersion != ProdigyClusterPairAuthorityRevokeRequest::version ||
+        request.pairUUID == 0 || request.operationUUID == 0) return reject("invalid pair revocation request");
+    auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == request.pairUUID && value.operationUUID == request.operationUUID;
+        });
+    auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+          return value.pairUUID == request.pairUUID && value.operationUUID == request.operationUUID;
+        });
+    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end() ||
+        operation == masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end())
+      return reject("pair revocation identity was not admitted");
+    if (operation->protocolVersion >= ProdigyClusterPairEnrollmentOperation::version && operation->revocationRequested) {
+      driveClusterPairEnrollmentOperations();
+      response = queryClusterPairAuthorityRevocation({1, request.operationUUID});
+      return response.success;
+    }
+    if (enrollment->state == ProdigyClusterPairEnrollmentState::revoked ||
+        !clusterPairAuthorityQualified() || request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        masterAuthorityRuntimeState.generation == UINT64_MAX) return reject("pair revocation awaits exact current qualified authority");
+    Vector<uint128_t> electorate = clusterPairCurrentElectorate();
+    if (!clusterPairRevocationElectorateCapable(electorate))
+      return reject("pair revocation requires a current AEGIS revocation-capable voter majority");
+    operation->protocolVersion = ProdigyClusterPairEnrollmentOperation::version;
+    operation->revocationRequested = true; operation->projectionsWithdrawn = false;
+    operation->revocationFrozenElectorate = std::move(electorate);
+    operation->revocationPinnedMasterAuthorityEpoch = masterAuthorityEpoch;
+    operation->revocationTransitionGeneration = masterAuthorityRuntimeState.generation + 1;
+    const uint64_t epoch = masterAuthorityEpoch;
+    commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+      if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
+    });
+    response = queryClusterPairAuthorityRevocation({1, request.operationUUID});
+    return response.success;
   }
 
   bool enrollClusterPair(const ProdigyClusterPairEnrollmentRequest& request, ProdigyClusterPairEnrollmentResponse& response)
@@ -30912,10 +31072,29 @@ public:
     if (!clusterPairAuthorityQualified() || masterAuthorityRuntimeState.generation == UINT64_MAX) return;
     for (auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
     {
-      if (operation.initialProjectionDelivered || operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch) continue;
       for (auto& enrollment : masterAuthorityRuntimeState.clusterPairEnrollments)
       {
-        if (enrollment.operationUUID != operation.operationUUID || enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
+        if (enrollment.operationUUID != operation.operationUUID) continue;
+        if (operation.revocationRequested) {
+          String serialized, digest;
+          if (!serializeCurrentMasterAuthorityTransition(serialized, digest) ||
+              !clusterPairRevocationQualified(operation, enrollment, digest)) continue;
+          if (enrollment.state != ProdigyClusterPairEnrollmentState::revoked) {
+            enrollment.state = ProdigyClusterPairEnrollmentState::revoked;
+            OPENSSL_cleanse(enrollment.root, sizeof(enrollment.root));
+            operation.revocationTransitionGeneration = masterAuthorityRuntimeState.generation + 1;
+          } else if (!operation.projectionsWithdrawn && clusterPairInitialProjectionAcknowledged(operation)) {
+            operation.projectionsWithdrawn = true;
+            operation.revocationTransitionGeneration = masterAuthorityRuntimeState.generation + 1;
+          } else continue;
+          const uint64_t epoch = masterAuthorityEpoch;
+          commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+            if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
+          });
+          return;
+        }
+        if (operation.initialProjectionDelivered || operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
+            enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
         if (enrollment.state == ProdigyClusterPairEnrollmentState::pending)
           enrollment.state = ProdigyClusterPairEnrollmentState::active;
         else if (clusterPairInitialProjectionAcknowledged(operation)) operation.initialProjectionDelivered = true;
@@ -30947,13 +31126,19 @@ public:
   {
     if (!weAreMaster || masterAuthorityEpoch == 0 || masterAuthorityRuntimeState.generation == UINT64_MAX) return false;
     bool changed = false;
-    for (auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations)
-      if (!operation.initialProjectionDelivered && operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch)
-      {
+    for (auto& operation : masterAuthorityRuntimeState.clusterPairEnrollmentOperations) {
+      if (operation.revocationRequested && !operation.projectionsWithdrawn &&
+          operation.revocationPinnedMasterAuthorityEpoch != masterAuthorityEpoch) {
+        operation.revocationPinnedMasterAuthorityEpoch = masterAuthorityEpoch;
+        operation.revocationTransitionGeneration = masterAuthorityRuntimeState.generation + 1;
+        changed = true;
+      } else if (!operation.revocationRequested && !operation.initialProjectionDelivered &&
+                 operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch) {
         operation.pinnedMasterAuthorityEpoch = masterAuthorityEpoch;
         operation.transitionGeneration = masterAuthorityRuntimeState.generation + 1;
         changed = true;
       }
+    }
     const uint64_t epoch = masterAuthorityEpoch;
     if (changed) commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
       if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveClusterPairEnrollmentOperations();
@@ -33215,6 +33400,7 @@ public:
           bv->pairedSourceRetirementCapabilityAcknowledged = false;
           bv->clusterPairEnrollmentCapabilityAcknowledged = false;
           bv->clusterPairOperationsCapabilityAcknowledged = false;
+          bv->clusterPairRevocationCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
@@ -33222,7 +33408,7 @@ public:
           {
             const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64) : 0);
+                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -33849,7 +34035,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64) : 0);
+                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -33862,6 +34048,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           bv->clusterPairEnrollmentCapabilityAcknowledged = false;
           bv->clusterPairOperationsCapabilityAcknowledged = false;
+          bv->clusterPairRevocationCapabilityAcknowledged = false;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(1)) != 0)
             bv->placementPolicyCapabilityAcknowledged = true;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(2)) != 0 &&
@@ -33878,6 +34065,8 @@ public:
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(32)) != 0;
             bv->clusterPairOperationsCapabilityAcknowledged =
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(64)) != 0;
+            bv->clusterPairRevocationCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(128)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -33913,7 +34102,9 @@ public:
               (incoming.version < 5 || (bv->transportAEGISEnabled() &&
                                        bv->isTransportNegotiated() && bv->tlsPeerVerified && bv->tlsPeerUUID == bv->uuid)) &&
               (incoming.runtimeState.clusterPairEnrollments.empty() ||
-               (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv, !incoming.runtimeState.clusterPairEnrollmentOperations.empty()))) &&
+               (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
+                    std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
+                        [](const auto& operation) { return operation.protocolVersion >= ProdigyClusterPairEnrollmentOperation::version && operation.revocationRequested; })))) &&
               decodeContainerRetirementJournal(incoming.runtimeState, incomingRetirements) &&
               (incomingRetirements.pairedSourceFences.empty() ||
                (incoming.version >= 4 && containerRetirementPeerCapabilityCurrent(bv) &&
@@ -40428,6 +40619,29 @@ public:
             if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
               response = queryClusterPairEnrollment(query);
             else response.failure.assign("invalid pair enrollment query"_ctv);
+          }
+          String serialized; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serialized);
+          break;
+        }
+      case MothershipTopic::revokeClusterPair:
+      case MothershipTopic::pullClusterPairRevocation:
+        {
+          String encoded; Message::extractToStringView(args, encoded);
+          ProdigyClusterPairAuthorityRevokeResponse response;
+          if (MothershipTopic(message->topic) == MothershipTopic::revokeClusterPair)
+          {
+            ProdigyClusterPairAuthorityRevokeRequest request;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, request))
+              (void)revokeClusterPairAuthority(request, response);
+            else response.failure.assign("invalid pair revocation frame"_ctv);
+          }
+          else
+          {
+            ProdigyClusterPairAuthorityRevokeQuery query;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
+              response = queryClusterPairAuthorityRevocation(query);
+            else response.failure.assign("invalid pair revocation query"_ctv);
           }
           String serialized; BitseryEngine::serialize(serialized, response);
           Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serialized);

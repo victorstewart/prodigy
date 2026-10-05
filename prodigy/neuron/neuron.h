@@ -3075,6 +3075,16 @@ public:
         (!pairControlRuntime || pairControlRuntime->installProjection(projection));
   }
 
+  bool startClusterPairControlRuntime()
+  {
+    if (pairControlRuntime) return false;
+    pairControlRuntime = std::make_unique<SwitchboardPairControlRuntime>();
+    // The saved projection fences rollback, but may have been revoked while
+    // this node was offline. Only a fresh durable current-master projection
+    // may activate its credentials on this process incarnation.
+    return pairControlRuntime->start();
+  }
+
   virtual bool persistClusterPairControlProjection(
       const ProdigyLocalClusterPairControlProjection&, uint128_t peerUUID, std::function<void(bool)> completion)
   { (void)peerUUID; (void)completion; return false; }
@@ -3528,9 +3538,7 @@ public:
     RingDispatcher::installMultiplexee(&deferredHardwareInventoryWake, this);
     armDeferredHardwareInventoryWakePoll();
     queueBrainAccept();
-    pairControlRuntime = std::make_unique<SwitchboardPairControlRuntime>();
-    if ((clusterPairControlProjection.protocolVersion != 0 &&
-         !pairControlRuntime->installProjection(clusterPairControlProjection)) || !pairControlRuntime->start())
+    if (!startClusterPairControlRuntime())
     {
       std::fprintf(stderr, "neuron pair control initialization failed\n");
       std::abort();
