@@ -28272,6 +28272,98 @@ static void testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(TestSuit
   brain.machines.erase(&machine);
 }
 
+static void testBrainHealthyRecoveryCancelsStaleSshRemediation(TestSuite& suite)
+{
+  class FenceFailureBrain final : public TestBrain {
+  public:
+    bool failFence = true;
+    uint32_t fenceCalls = 0;
+
+  protected:
+    int createMachineRetirementFenceFD(void) override
+    {
+      fenceCalls += 1;
+      if (failFence)
+      {
+        errno = EMFILE;
+        return -1;
+      }
+      return TestBrain::createMachineRetirementFenceFD();
+    }
+  };
+  FenceFailureBrain brain = {};
+  Machine machine = {};
+  machine.uuid = uint128_t(0x52131);
+  machine.state = MachineState::neuronRebooting;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+  bool staleRestartExecuted = false;
+  MachineSSH *ssh = new MachineSSH();
+  ssh->machine = &machine;
+  ssh->reconnectAfterClose = true;
+  ssh->registerAction(SSHAction::restartProdigy, [&] { staleRestartExecuted = true; });
+  brain.sshs.insert(ssh);
+  {
+    // This isolated ring is destroyed before its Brain and streams. It lets
+    // the real recheck timeout and close CQE own socket retirement.
+    ScopedAsyncMothershipRing ring = {};
+    RingDispatcher::installMultiplexee(ssh, &brain);
+    brain.handleMachineStateChange(&machine, MachineState::healthy);
+
+    suite.expect(machine.state == MachineState::healthy,
+                 "healthy_recovery_promotes_machine_before_stale_ssh_close");
+    suite.expect(ssh->remediationCanceled && ssh->reconnectAfterClose == false,
+                 "healthy_recovery_fences_stale_ssh_remediation");
+    suite.expect(brain.machineRetirementRecheckArmed,
+                 "healthy_recovery_fence_failure_arms_existing_recheck");
+
+    // A successful CQE arriving after state-upload recovery must not execute
+    // the remediation action or demote the machine.
+    brain.connectHandler(ssh, 0);
+    suite.expect(staleRestartExecuted == false,
+                 "healthy_recovery_ignores_late_ssh_connect_success");
+    suite.expect(machine.state == MachineState::healthy,
+                 "healthy_recovery_late_ssh_connect_success_preserves_healthy");
+
+    // The failed branch is equally stale and must not escalate to unresponsive.
+    brain.connectHandler(ssh, -ECONNREFUSED);
+    brain.pollHandler(ssh, 0);
+    suite.expect(machine.state == MachineState::healthy,
+                 "healthy_recovery_ignores_late_ssh_callbacks");
+
+    brain.failFence = false;
+    ring.runFor(1200);
+    suite.expect(brain.fenceCalls >= 2,
+                 "healthy_recovery_recheck_retries_canceled_ssh_close_after_fence_failure");
+    suite.expect(machine.state == MachineState::healthy,
+                 "healthy_recovery_recheck_preserves_healthy_state");
+    suite.expect(brain.sshs.contains(ssh) == false,
+                 "healthy_recovery_real_close_completion_retires_stale_ssh");
+  }
+
+  brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&machine);
+
+  // The retry owner remains untouched while the machine is still missing.
+  // testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted covers its
+  // actual missing-state escalation path without creating a live test socket.
+  TestBrain missingBrain = {};
+  Machine missingMachine = {};
+  missingMachine.state = MachineState::missing;
+  MachineSSH *missingSSH = new MachineSSH();
+  missingSSH->machine = &missingMachine;
+  missingSSH->reconnectAfterClose = true;
+  missingBrain.sshs.insert(missingSSH);
+  missingBrain.reapRetiringMachines();
+  suite.expect(missingMachine.state == MachineState::missing &&
+                   missingSSH->remediationCanceled == false &&
+                   missingBrain.sshs.contains(missingSSH),
+               "still_missing_machine_keeps_ssh_remediation_unfenced");
+  missingBrain.sshs.erase(missingSSH);
+  delete missingSSH;
+}
+
 static void testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(TestSuite& suite)
 {
   ScopedRing scopedRing = {};
@@ -31736,6 +31828,7 @@ int main(void)
   testRecoveredRuntimeDefersStatelessRecoveryUntilInventoryBarrier(suite);
   testBrainNeuronHandlerReportsHardwareFailureAndDecommissionsMachine(suite);
   testBrainMachineStateMissingEscalatesWhenSshBudgetExhausted(suite);
+  testBrainHealthyRecoveryCancelsStaleSshRemediation(suite);
   testBrainSoftEscalationTimeoutPromotesMachineToHardReboot(suite);
   testBrainHardRebootTimeoutMarksHardwareFailureAndDecommissionsMachine(suite);
   testBrainNeuronHandlerAppliesMachineHardwareProfile(suite);

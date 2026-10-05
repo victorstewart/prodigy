@@ -87,11 +87,16 @@ public:
 
   SSHAction action;
   stdext::inplace_function<void(), 128> callback;
+  // A recovered machine can outlive the SSH restart which was started while it
+  // was missing.  Keep that asynchronous operation allocated until its close
+  // completion, but make later connect/close CQEs inert.
+  bool remediationCanceled = false;
 
   void reset(void) override
   {
     SSHClient::reset();
     Reconnector::reset();
+    remediationCanceled = false;
   }
 
   void restartProdigy(void);

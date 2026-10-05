@@ -15890,6 +15890,17 @@ public:
         return;
       }
 
+      // A recovered Neuron cancels the SSH remediation but must leave its
+      // outstanding I/O object alive until the matching close CQE.  Ignore a
+      // connect completion that raced with that cancellation: it must neither
+      // restart the recovered process nor re-escalate the machine.
+      if (ssh->remediationCanceled)
+      {
+        ssh->reconnectAfterClose = false;
+        (void)queueMachineSSHCloseWithFence(ssh);
+        return;
+      }
+
       if (result == 0) // connected to brain
       {
         if (Ring::socketIsClosing(ssh))
@@ -17540,6 +17551,16 @@ public:
 
       ssh->cancelSuspended();
 
+      // Do not let a delayed close of a canceled missing-machine remediation
+      // overwrite a healthy state.  The close CQE is its lifetime boundary.
+      if (ssh->remediationCanceled)
+      {
+        sshs.erase(ssh);
+        RingDispatcher::eraseMultiplexee(ssh);
+        delete ssh;
+        co_return;
+      }
+
       if (ssh->shouldReconnect())
       {
         ssh->recreateSocket();
@@ -17570,6 +17591,16 @@ public:
     {
       ssh->reconnectAfterClose = false;
       (void)queueMachineRetirementSSHClose(ssh);
+      return;
+    }
+
+    // A recovered machine owns the state transition.  A late poll CQE from
+    // its canceled SSH remediation must only drive that stream to its close
+    // completion, never resume the stale SSH coroutine.
+    if (ssh->remediationCanceled)
+    {
+      ssh->reconnectAfterClose = false;
+      (void)queueMachineSSHCloseWithFence(ssh);
       return;
     }
 
@@ -24520,7 +24551,10 @@ public:
   {
     if (machineRetirementRecheckArmed ||
         (retiringMachinesByNeuron.empty() && retiringMachineSSHs.empty() &&
-         retiredMachineIdentities.empty()))
+         retiredMachineIdentities.empty() &&
+         std::none_of(sshs.begin(), sshs.end(), [](const MachineSSH *ssh) {
+           return ssh != nullptr && ssh->remediationCanceled;
+         })))
     {
       return;
     }
@@ -24570,7 +24604,7 @@ public:
     return true;
   }
 
-  bool queueMachineRetirementSSHClose(MachineSSH *ssh)
+  bool queueMachineSSHCloseWithFence(MachineSSH *ssh)
   {
     if (ssh == nullptr || Ring::socketIsClosing(ssh))
     {
@@ -24582,9 +24616,13 @@ public:
       if (fenceFD < 0)
       {
         const int failure = errno;
-        basics_log("machine SSH retirement fence failed errno=%d error=%s\n",
+        basics_log("machine SSH close fence failed errno=%d error=%s\n",
                    failure,
                    strerror(failure));
+        // Do not strand a recovered machine's canceled remediation when a
+        // transient descriptor allocation failure prevents its close fence.
+        // The existing retirement recheck owns retrying this same close path.
+        armMachineRetirementRecheck();
         return false;
       }
       ssh->isFixedFile = false;
@@ -24592,6 +24630,11 @@ public:
     }
     Ring::queueClose(ssh);
     return true;
+  }
+
+  bool queueMachineRetirementSSHClose(MachineSSH *ssh)
+  {
+    return queueMachineSSHCloseWithFence(ssh);
   }
 
   void quarantineMachineSSHs(uint64_t identityID, const ClusterMachine& identity)
@@ -24778,6 +24821,13 @@ public:
 
   void reapRetiringMachines(void)
   {
+    // A healthy machine can cancel an SSH remediation before that stream owns
+    // a usable fd. Retry its ordinary close fence independently of retirement
+    // authority/persistence; the close CQE remains its sole delete boundary.
+    for (MachineSSH *ssh : sshs)
+      if (ssh != nullptr && ssh->remediationCanceled)
+        (void)queueMachineSSHCloseWithFence(ssh);
+
     if (machineRetirementPersistencePending)
     {
       armMachineRetirementRecheck();
@@ -24901,7 +24951,10 @@ public:
       }
     }
     if (retiringMachinesByNeuron.empty() == false || retiringMachineSSHs.empty() == false ||
-        retiredMachineIdentities.empty() == false)
+        retiredMachineIdentities.empty() == false ||
+        std::any_of(sshs.begin(), sshs.end(), [](const MachineSSH *ssh) {
+          return ssh != nullptr && ssh->remediationCanceled;
+        }))
     {
       armMachineRetirementRecheck();
     }
@@ -28373,6 +28426,23 @@ public:
     {
       case MachineState::healthy:
         {
+          // A healthy recovery makes a missing-machine remediation stale.
+          // Keep its SSH object alive until its own close CQE, but fence every
+          // later completion from changing this machine back to rebooting or
+          // unresponsive.
+          for (MachineSSH *ssh : sshs)
+          {
+            if (ssh == nullptr || ssh->machine != machine)
+            {
+              continue;
+            }
+            ssh->remediationCanceled = true;
+            ssh->reconnectAfterClose = false;
+            ssh->cancelPendingConnect();
+            ssh->cancelSuspended();
+            (void)queueMachineSSHCloseWithFence(ssh);
+          }
+
           // clear transient flags and counters when returning to healthy
           if (workerBundleUpgradeTransitionPending(machine) == false)
           {
