@@ -1702,6 +1702,13 @@ static inline bool prodigyRemoteBootstrapShouldAwaitControlSocket(const ClusterM
 // The identity, topology, and transport credentials are the portable part of
 // remote bootstrap.  Keep them in one builder so a typed provider can install
 // the exact same first-boot state without impersonating the SSH executor.
+class ProdigyInitialTransportCredentialProjection {
+public:
+  ProdigyTransportCredentialAuthorityRoot authority;
+  Vector<ProdigyTransportCredentialEnrollment> ledger;
+  uint64_t committedAuthorityGeneration = 0;
+};
+
 static inline bool prodigyBuildRemoteBootstrapBootMaterial(
     const ClusterMachine& clusterMachine,
     const AddMachines& request,
@@ -1709,7 +1716,8 @@ static inline bool prodigyBuildRemoteBootstrapBootMaterial(
     const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
     String& bootJSON,
     String& transportTLSJSON,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const ProdigyInitialTransportCredentialProjection *transportProjection = nullptr)
 {
   bootJSON.clear();
   transportTLSJSON.clear();
@@ -1724,6 +1732,14 @@ static inline bool prodigyBuildRemoteBootstrapBootMaterial(
   ClusterTopology bootTopology = {};
   if (prodigyBuildRemoteBootstrapTransportTLSState(clusterMachine, topology, localState, bootTopology, failure) == false)
   {
+    return false;
+  }
+  if (transportProjection != nullptr &&
+      !prodigyBuildLocalTransportCredentialState(transportProjection->authority, transportProjection->ledger,
+          localState.uuid, clusterMachine.isBrain ? ProdigyTransportCredentialNodeRole::brain :
+              ProdigyTransportCredentialNodeRole::neuron, localState, transportProjection->committedAuthorityGeneration))
+  {
+    if (failure) failure->assign("invalid initial transport credential projection"_ctv);
     return false;
   }
 
@@ -1755,7 +1771,8 @@ static inline bool prodigyBuildRemoteBootstrapBootMaterial(
   return true;
 }
 
-static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& clusterMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyRemoteBootstrapPlan& plan, String *failure = nullptr)
+static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& clusterMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyRemoteBootstrapPlan& plan, String *failure = nullptr,
+    const ProdigyInitialTransportCredentialProjection *transportProjection = nullptr)
 {
   plan = {};
   if (failure)
@@ -1859,7 +1876,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   plan.connectRetryBudgetMs = uint64_t(clusterMachine.source == ClusterMachineSource::created ? Time::minsToMs(10) : Time::minsToMs(2));
 
   if (prodigyBuildRemoteBootstrapBootMaterial(clusterMachine, request, topology, runtimeEnvironment,
-                                               plan.bootJSON, plan.transportTLSJSON, failure) == false)
+                                               plan.bootJSON, plan.transportTLSJSON, failure, transportProjection) == false)
   {
     return false;
   }

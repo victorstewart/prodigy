@@ -590,6 +590,27 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
       incoming.ownerClusterUUID = ownershipProbe.ownerClusterUUID;
     }
 
+    // The provisioning file survives process restarts. Once a private local
+    // record exists, that old seed cannot roll back a live peer revision or
+    // silently substitute another credential authority.
+    if (state.transportCredentials.enabled)
+    {
+      const auto& current = state.transportCredentials;
+      const auto& seed = incoming.transportCredentials;
+      if (!seed.enabled || seed.self.nodeUUID != current.self.nodeUUID ||
+          seed.self.clusterUUID != current.self.clusterUUID || seed.self.role != current.self.role ||
+          seed.committedAuthorityGeneration > current.committedAuthorityGeneration ||
+          (seed.committedAuthorityGeneration == current.committedAuthorityGeneration &&
+           (!prodigyTransportCredentialBootstrapSameProjection(seed, current) ||
+            CRYPTO_memcmp(seed.self.secret, current.self.secret, sizeof(seed.self.secret)) != 0)))
+      {
+        failure.assign("bootstrap transport seed conflicts with durable local authority"_ctv);
+        return false;
+      }
+      incoming.transportCredentials = current;
+      incoming.transportCredentialAuthorityRoot = state.transportCredentialAuthorityRoot;
+    }
+
     if (incoming.transportTLS.configured() == false && state.transportTLS.configured())
     {
       incoming.transportTLS = state.transportTLS;
@@ -617,7 +638,31 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
   }
 
   const ProdigyTransportTLSAuthority& persistedTransportAuthority = persistedBrainSnapshot.masterAuthority.runtimeState.transportTLSAuthority;
-  if (persistedTransportAuthority.canMintForCluster())
+  const auto& persistedInternalAuthority = persistedBrainSnapshot.masterAuthority.runtimeState;
+  if (persistedInternalAuthority.transportCredentialAuthorityRoot.authorityEpoch != 0 ||
+      !persistedInternalAuthority.transportCredentialEnrollments.empty())
+  {
+    const auto role = persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain ?
+        ProdigyTransportCredentialNodeRole::brain : ProdigyTransportCredentialNodeRole::neuron;
+    if (!prodigyBuildLocalTransportCredentialState(persistedInternalAuthority.transportCredentialAuthorityRoot,
+          persistedInternalAuthority.transportCredentialEnrollments, state.uuid, role, state, persistedInternalAuthority.generation))
+    {
+      failure.assign("current replicated authority does not authorize local transport identity"_ctv);
+      return false;
+    }
+    haveLocalState = true;
+  }
+  if (state.transportCredentials.enabled)
+  {
+    const bool bootstrapBrain = persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain;
+    if (!prodigyLocalTransportCredentialStateValid(state) ||
+        (state.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain) != bootstrapBrain)
+    {
+      failure.assign("transport credential role disagrees with local boot role"_ctv);
+      return false;
+    }
+  }
+  if (!state.transportCredentials.enabled && persistedTransportAuthority.canMintForCluster())
   {
     bool localMatchesPersistedAuthority =
         state.transportTLS.canMintForCluster() && state.transportTLS.generation == persistedTransportAuthority.generation && state.transportTLS.clusterRootCertPem == persistedTransportAuthority.clusterRootCertPem && state.transportTLS.clusterRootKeyPem == persistedTransportAuthority.clusterRootKeyPem && state.transportTLS.localCertPem.size() > 0 && state.transportTLS.localKeyPem.size() > 0;
@@ -729,7 +774,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
   const uint32_t startupClusterNodeCount =
       prodigyResolveStartupClusterNodeCount(persistentBootState, effectiveBootstrapConfig);
   const bool startupRequiresTransportTLS =
-      prodigyStartupRequiresTransportTLS(persistentBootState, effectiveBootstrapConfig);
+      !state.transportCredentials.enabled && prodigyStartupRequiresTransportTLS(persistentBootState, effectiveBootstrapConfig);
 
   if (state.transportTLSConfigured() == false && startupRequiresTransportTLS)
   {
@@ -743,7 +788,8 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
     }
   }
 
-  if (state.transportTLSConfigured() == false && persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain && startupClusterNodeCount <= 1)
+  if (!state.transportCredentials.enabled && state.transportTLSConfigured() == false &&
+      persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain && startupClusterNodeCount <= 1)
   {
     String rootCertPem = {};
     String rootKeyPem = {};
@@ -795,6 +841,8 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
 static bool prodigyClaimPersistentLocalClusterOwnership(uint128_t clusterUUID, String& failure)
 {
   failure.clear();
+  if (!livePersistentWriter.expired())
+  { failure.assign("live local ownership requires mutation persistence"_ctv); return false; }
 
   ProdigyPersistentLocalBrainState updatedState = persistentLocalBrainState;
   bool changed = false;
@@ -842,11 +890,6 @@ class ProdigyBrain : public Brain {
     return snapshotBytes + bootStateBytes;
   }
 
-  static uint64_t retainedBytesForLocal(ProdigyPersistentLocalBrainState& state)
-  {
-    return ProdigyPersistentStateWriter::retainedBytesFor(state);
-  }
-
   bool ensurePersistentWriter()
   {
     if (persistentWriter) return true;
@@ -891,7 +934,7 @@ public:
   {
     // Live callers must use the asynchronous hook below. This compatibility
     // path remains only for startup before the writer is enabled.
-    if (persistentWriter)
+    if (persistentWriter || !livePersistentWriter.expired())
     {
       if (failure) failure->assign("live cluster ownership requires async persistence"_ctv);
       return false;
@@ -911,38 +954,24 @@ public:
   bool claimLocalClusterOwnershipAsync(uint128_t clusterUUID, PersistenceCompletion completion) override
   {
     ProdigyPersistentLocalBrainState candidate = persistentLocalBrainState;
-    String failure = {};
+    String failure;
     bool changed = false;
-    if (!prodigyEnsureLocalBrainOwnedByCluster(candidate, clusterUUID, &changed, &failure))
-    {
-      return false;
-    }
-    if (!changed)
-    {
-      completion(true);
-      return true;
-    }
-    const uint64_t retainedBytes = retainedBytesForLocal(candidate);
-    if (!retainedBytes || !ensurePersistentWriter())
-    {
-      return false;
-    }
-    auto cached = std::make_shared<ProdigyPersistentLocalBrainState>(std::move(candidate));
-    if (!ProdigyPersistentStateWriter::detach(*cached)) return false;
-    auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    if (!prodigyEnsureLocalBrainOwnedByCluster(candidate, clusterUUID, &changed, &failure)) return false;
+    if (!changed) { if (completion) completion(true); return true; }
+    if (!ensurePersistentWriter()) return false;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-    const bool admitted = persistentWriter->submitLocalBrainState(*cached, retainedBytes,
-        [cached, callback, lifetime](auto&& result) mutable {
-          if (lifetime.expired()) return;
-          if (result.durable) persistentLocalBrainState = std::move(*cached);
-          if (*callback) (*callback)(result.durable);
+    return persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+        [clusterUUID](auto& latest, String& failure) {
+          return prodigyEnsureLocalBrainOwnedByCluster(latest, clusterUUID, nullptr, &failure);
+        },
+        [lifetime, completion = std::move(completion)](auto&& result) mutable {
+          if (!lifetime.expired() && completion) completion(result.durable);
         });
-    return admitted;
   }
 
   bool applyPersistedTransportTLSAuthority(void)
   {
-    if (persistentWriter) return false;
+    if (persistentWriter || !livePersistentWriter.expired()) return false;
     const ProdigyTransportTLSAuthority& authority = masterAuthorityRuntimeState.transportTLSAuthority;
     if (authority.canMintForCluster() == false)
     {
@@ -992,32 +1021,23 @@ public:
     prodigyBuildTransportTLSAuthority(persistentLocalBrainState, current);
     if (current == authority && persistentLocalBrainState.transportTLS.localCertPem.size() &&
         persistentLocalBrainState.transportTLS.localKeyPem.size()) { if (completion) completion(true); return; }
-    auto updated = std::make_shared<ProdigyPersistentLocalBrainState>(persistentLocalBrainState);
-    String failure = {};
-    if (!prodigyApplyTransportTLSAuthorityToLocalState(*updated, authority, &failure))
-    {
-      basics_log("ProdigyBrain transport tls authority prepare failed: %s\n", failure.c_str());
-      if (completion) completion(false); return;
-    }
-    const uint64_t retainedBytes = retainedBytesForLocal(*updated);
-    if (!retainedBytes || !ensurePersistentWriter()) { if (completion) completion(false); return; }
-    if (!ProdigyPersistentStateWriter::detach(*updated)) { if (completion) completion(false); return; }
+    if (!ensurePersistentWriter()) { if (completion) completion(false); return; }
     auto callback = std::make_shared<PersistenceCompletion>(std::move(completion));
+    const uint64_t epoch = masterAuthorityEpoch;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-    const bool admitted = persistentWriter->submitLocalBrainState(*updated, retainedBytes,
-        [updated, callback, lifetime](auto&& result) mutable {
+    const bool admitted = persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+        [authority](auto& latest, String& failure) { return prodigyApplyTransportTLSAuthorityToLocalState(latest, authority, &failure); },
+        [this, epoch, authority, callback, lifetime](auto&& result) mutable {
           if (lifetime.expired()) return;
-          if (!result.durable) { if (*callback) (*callback)(false); return; }
-          String failure = {};
+          if (!result.durable || masterAuthorityEpoch != epoch ||
+              !(masterAuthorityRuntimeState.transportTLSAuthority == authority))
+          { if (*callback) (*callback)(false); return; }
+          String failure;
           ProdigyTransportTLSBootstrap bootstrap = {};
-          prodigyBuildTransportTLSBootstrap(*updated, bootstrap);
-          if (!ProdigyTransportTLSRuntime::configure(bootstrap, &failure))
-          {
-            basics_log("ProdigyBrain transport tls runtime configure failed after durable state: %s\n", failure.c_str());
-            if (*callback) (*callback)(false); return;
-          }
-          persistentLocalBrainState = std::move(*updated);
-          if (*callback) (*callback)(true);
+          prodigyBuildTransportTLSBootstrap(persistentLocalBrainState, bootstrap);
+          const bool configured = ProdigyTransportTLSRuntime::configure(bootstrap, &failure);
+          if (!configured) basics_log("ProdigyBrain transport tls runtime configure failed after durable state: %s\n", failure.c_str());
+          if (*callback) (*callback)(configured);
         });
     if (!admitted && *callback) (*callback)(false);
   }
@@ -1487,7 +1507,7 @@ public:
   bool prepareForBundleExec(String& failure) override
   {
     stopMothershipTunnelProviderRuntime(mothershipTunnelProviderRuntimeState.localContainerUUID);
-    if (persistentWriter)
+    if (persistentWriter || !livePersistentWriter.expired())
     {
       failure.assign("bundle exec requires receipt-driven persistence drain"_ctv);
       return false;
@@ -1527,21 +1547,8 @@ public:
         return;
       }
       auto state = execPersistence;
-      ProdigyPersistentLocalBrainState local = persistentLocalBrainState;
-      if (!ProdigyPersistentStateWriter::detach(local))
-      {
-        execPersistence->failure.assign("final local state ownership capture failed"_ctv);
-        finish(false, execPersistence->failure);
-        return;
-      }
-      const uint64_t retainedBytes = retainedBytesForLocal(local);
-      if (!retainedBytes)
-      {
-        state->failure.assign("final local state exceeds persistence capacity"_ctv);
-        finish(false, state->failure);
-        return;
-      }
-      const bool admitted = persistentWriter->submitLocalBrainState(std::move(local), retainedBytes,
+      const bool admitted = persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+          [](auto&, String&) { return true; },
           [state, finish](auto&& result) mutable {
             state->durable = result.durable;
             state->failure = result.failure;
@@ -1644,6 +1651,23 @@ public:
     }
 
     prodigyBackfillBrainConfigSSHFromBootState(persistentBootState, brainConfig);
+
+    transportCredentialBootstrapRequired = persistentLocalBrainState.transportCredentials.enabled;
+    if (transportCredentialBootstrapRequired && masterAuthorityRuntimeState.transportCredentialEnrollments.empty())
+    {
+      if (!prodigyLocalTransportCredentialStateValid(persistentLocalBrainState) ||
+          persistentLocalBrainState.transportCredentials.self.role != ProdigyTransportCredentialNodeRole::brain)
+      {
+        std::fprintf(stderr, "prodigy startup rejected internal transport authority seed\n");
+        _exit(EXIT_FAILURE);
+      }
+      masterAuthorityRuntimeState.transportCredentialAuthorityRoot = persistentLocalBrainState.transportCredentialAuthorityRoot;
+      if (brainConfig.clusterUUID == 0) brainConfig.clusterUUID = persistentLocalBrainState.ownerClusterUUID;
+      prodigyTransportCredentialBootstrapLedger(persistentLocalBrainState.transportCredentials,
+                                                masterAuthorityRuntimeState.transportCredentialEnrollments);
+      masterAuthorityRuntimeState.generation = std::max(masterAuthorityRuntimeState.generation,
+          persistentLocalBrainState.transportCredentials.committedAuthorityGeneration);
+    }
 
     if (masterAuthorityRuntimeState.transportTLSAuthority.canMintForCluster() == false && persistentLocalBrainState.canMintTransportTLS())
     {
@@ -1915,6 +1939,27 @@ public:
   explicit ProdigyNeuron(ProdigyHostControlNetwork& hostControlNetwork)
       : hostControlNetwork(hostControlNetwork)
   {
+    if (persistentLocalBrainState.transportCredentials.enabled)
+    {
+      if (persistentLocalBrainState.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::neuron)
+        controlTransportCredentials = persistentLocalBrainState.transportCredentials;
+      else
+      {
+        // Brain machines also host a Neuron. Derive its separate scoped
+        // credential without placing the authority root in the Neuron owner.
+        Vector<ProdigyTransportCredentialEnrollment> ledger;
+        prodigyTransportCredentialBootstrapLedger(persistentLocalBrainState.transportCredentials, ledger);
+        ProdigyPersistentLocalBrainState localNeuron = {};
+        if (!prodigyBuildLocalTransportCredentialState(persistentLocalBrainState.transportCredentialAuthorityRoot,
+              ledger, persistentLocalBrainState.uuid, ProdigyTransportCredentialNodeRole::neuron, localNeuron,
+              persistentLocalBrainState.transportCredentials.committedAuthorityGeneration))
+        {
+          std::fprintf(stderr, "prodigy startup rejected local Neuron transport enrollment\n");
+          _exit(EXIT_FAILURE);
+        }
+        controlTransportCredentials = localNeuron.transportCredentials;
+      }
+    }
     runtimeAwareIaaS = new RuntimeAwareNeuronIaaS(&persistentStateStore,
                                       effectiveBootstrapConfig,
                                       persistentBootState,
@@ -1925,6 +1970,20 @@ public:
         [this](ProdigyPersistentBootState state, uint64_t retainedBytes, std::function<void(bool)> completion) {
           if (!ensurePersistentWriter()) return false;
           return prodigySubmitLiveBootState(std::move(state), retainedBytes, std::move(completion));
+        });
+  }
+
+  bool persistTransportCredentialPeerProjection(
+      const ProdigyTransportCredentialBootstrap& projection, std::function<void(bool)> completion) override
+  {
+    if (!ensurePersistentWriter()) return false;
+    return persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+        [projection](auto& latest, String&) {
+          ProdigyTransportCredentialBootstrap resultingNeuron;
+          return prodigyApplyLocalTransportCredentialPeerProjection(latest, projection, resultingNeuron);
+        },
+        [completion = std::move(completion)](auto&& result) mutable {
+          if (completion) completion(result.durable);
         });
   }
 
@@ -1977,14 +2036,8 @@ public:
     osUpdateCommand.assign(updateCommand);
     osUpdateCompletion = std::move(completion);
     const std::weak_ptr<uint8_t> lifetime = osUpdatePersistenceLifetime;
-    const uint64_t retainedBytes = ProdigyPersistentStateWriter::retainedBytesFor(persistentLocalBrainState);
-    if (!retainedBytes)
-    {
-      String failure = "local state exceeds persistence capacity"_ctv;
-      finishOSUpdatePersistence(false, std::move(failure));
-      return;
-    }
-    const bool admitted = writer->submitLocalBrainState(persistentLocalBrainState, retainedBytes,
+    const bool admitted = writer->submitLocalBrainMutation(persistentLocalBrainState,
+        [](auto&, String&) { return true; },
         [this, lifetime](auto&& result) mutable {
           if (lifetime.expired()) return;
           if (!result.durable) { finishOSUpdatePersistence(false, result.failure); return; }

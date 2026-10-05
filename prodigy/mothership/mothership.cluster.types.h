@@ -247,12 +247,26 @@ static void serialize(S&& serializer, MothershipProdigyClusterMachine& machine)
   serializer.object(machine.ownership);
 }
 
+enum class MothershipInternalTransportProfile : uint8_t {
+  tls = 0,
+  aegisX25519V1 = 1,
+};
+
+static inline bool parseMothershipInternalTransportProfile(
+    const String& value, MothershipInternalTransportProfile& profile)
+{
+  if (value == "tls"_ctv) { profile = MothershipInternalTransportProfile::tls; return true; }
+  if (value == "aegis-x25519-v1"_ctv) { profile = MothershipInternalTransportProfile::aegisX25519V1; return true; }
+  return false;
+}
+
 class MothershipProdigyCluster {
 public:
 
   String name;
   uint128_t clusterUUID = 0;
   MothershipClusterDeploymentMode deploymentMode = MothershipClusterDeploymentMode::local;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
   bool includeLocalMachine = true;
   MothershipClusterProvider provider = MothershipClusterProvider::unknown;
   MachineCpuArchitecture architecture = MachineCpuArchitecture::unknown;

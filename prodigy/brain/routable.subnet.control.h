@@ -580,8 +580,8 @@ inline bool Brain::pendingElasticAddressOperationHasMajority(uint64_t operationI
   {
     if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
         peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
-        (peer->transportTLSEnabled() &&
-         (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
+        (peer->transportEncryptionEnabled() &&
+         (peer->isTransportNegotiated() == false || peer->tlsPeerVerified == false ||
           peer->tlsPeerUUID != peer->uuid)))
     {
       continue;
@@ -593,8 +593,8 @@ inline bool Brain::pendingElasticAddressOperationHasMajority(uint64_t operationI
   {
     if (peer == nullptr || peer->quarantined || peer->registrationFresh == false ||
         peer->uuid == 0 || peer->boottimens == 0 || peerSocketActive(peer) == false ||
-        (peer->transportTLSEnabled() &&
-         (peer->isTLSNegotiated() == false || peer->tlsPeerVerified == false ||
+        (peer->transportEncryptionEnabled() &&
+         (peer->isTransportNegotiated() == false || peer->tlsPeerVerified == false ||
           peer->tlsPeerUUID != peer->uuid)))
     {
       continue;

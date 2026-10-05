@@ -38,6 +38,13 @@ enum class MachineState : uint8_t {
 class NeuronView : public RingInterface, public ProdigyArtifactStream, public CoroutineStack, public Reconnector {
 public:
 
+  NeuronView() = default;
+  // Inventory and placement planning copy Machine values. Their embedded view
+  // starts disconnected: a socket, peer proof, or record session cannot be
+  // duplicated along with machine metadata.
+  NeuronView(const NeuronView&) : NeuronView() {}
+  NeuronView& operator=(const NeuronView&) = delete;
+
   Machine *machine = nullptr;
   bool connected = false;
   bool hadSuccessfulConnection = false;
@@ -53,6 +60,15 @@ public:
   // registration frames on one still-live transport generation.
   uint64_t artifactCapabilityValidationGeneration = 0;
 
+  bool transportPeerProjectionCapable = false;
+  uint64_t transportPeerProjectionIOGeneration = 0;
+  uint64_t transportPeerProjectionAuthorityEpoch = 0;
+  uint128_t transportPeerProjectionNonce = 0;
+  uint64_t transportPeerProjectionGeneration = 0;
+  int64_t transportPeerProjectionSentAtMs = 0;
+  String transportPeerProjectionFingerprint;
+  String transportPeerProjectionAcknowledgedFingerprint;
+
   void reset(void) override
   {
     ProdigyArtifactStream::reset();
@@ -60,6 +76,14 @@ public:
     connected = false;
     hadSuccessfulConnection = false;
     artifactCapabilityPending = false;
+    transportPeerProjectionCapable = false;
+    transportPeerProjectionIOGeneration = 0;
+    transportPeerProjectionAuthorityEpoch = 0;
+    transportPeerProjectionNonce = 0;
+    transportPeerProjectionGeneration = 0;
+    transportPeerProjectionSentAtMs = 0;
+    transportPeerProjectionFingerprint.clear();
+    transportPeerProjectionAcknowledgedFingerprint.clear();
     verifiedInstalledBundleSHA256.clear();
     verifiedInstalledBundleIOGeneration = 0;
     verifiedInstalledBundleAuthorityEpoch = 0;

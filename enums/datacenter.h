@@ -240,7 +240,9 @@ enum class NeuronTopic : uint16_t {
   // Brain -> Neuron bundle staging command; Neuron echoes only after the
   // exact requested digest has been staged.
   updateBundle,
-  transitionToNewBundle
+  transitionToNewBundle,
+  transportCredentialPeers,
+  transportCredentialPeersAck
 };
 
 enum class ContainerTopic : uint16_t {

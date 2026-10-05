@@ -61,10 +61,12 @@ public:
   bool connected = false;
   bool initialMachineHardwareProfileQueued = false;
   bool transitionAfterBundleAck = false;
+  std::shared_ptr<uint8_t> connectionLifetime = std::make_shared<uint8_t>(0);
 
   void reset(void) override
   {
     ProdigyArtifactStream::reset();
+    connectionLifetime = std::make_shared<uint8_t>(0);
     connected = false;
     initialMachineHardwareProfileQueued = false;
     transitionAfterBundleAck = false;
@@ -221,6 +223,14 @@ protected:
         {
           switchboardWormholePendingFlowPinPath(path, ifindex);
         }
+        else if (name.equal("wh_pair_grants"_ctv))
+        {
+          switchboardPairAdmissionGrantPinPath(path, ifindex);
+        }
+        else if (name.equal("wh_pair_routes"_ctv))
+        {
+          switchboardPairAdmissionRoutePinPath(path, ifindex);
+        }
         else
         {
           callback(-1);
@@ -237,6 +247,7 @@ protected:
 
     TimeoutPacket tick;
     SwitchboardWormholeFlowGCCursor cursor;
+    SwitchboardPairAdmissionGCCursor pairAdmissionCursor;
     bool stopping = false;
 
     void arm(void)
@@ -275,6 +286,7 @@ protected:
         return;
       }
       (void)switchboardCleanupExpiredWormholeFlows(&map, monotonicNowNs(), cursor);
+      (void)switchboardCleanupExpiredPairAdmissionMaps(&map, monotonicNowNs(), pairAdmissionCursor);
       arm();
     }
   };
@@ -683,6 +695,18 @@ protected:
 
   virtual bool beginAcceptedBrainTransportTLS(NeuronBrainControlStream *stream)
   {
+    if (controlTransportCredentials.enabled)
+    {
+      if (!prodigyTransportCredentialBootstrapValid(controlTransportCredentials) ||
+          controlTransportCredentials.self.role != ProdigyTransportCredentialNodeRole::neuron) return false;
+      String prelude = {};
+      if (!prodigyRenderLocalTransportCredentialPrelude(controlTransportCredentials, prelude)) return false;
+      return stream->beginTransportAEGISWithPrelude(true, controlTransportCredentials.self.nodeUUID, prelude,
+          [this](const String& peer, std::array<uint8_t, 32>& psk, String& context, uint128_t& peerUUID) {
+            return prodigyResolveTransportCredentialBootstrapPeer(controlTransportCredentials, peer,
+                "brain-neuron"_ctv, psk.data(), context, peerUUID);
+          });
+    }
     return stream->beginTransportTLS(true);
   }
 
@@ -909,18 +933,25 @@ protected:
 
   bool verifyBrainTransportTLSPeer(void)
   {
-    if (brain == nullptr || brain->transportTLSEnabled() == false || brain->tlsPeerVerified)
+    if (brain != nullptr && brain->transportAEGISEnabled() && brain->tlsPeerVerified)
+    {
+      // The stream has just published the mutual proof. Preserve the same
+      // post-authentication hardware-profile kick as the TLS path.
+      (void)queueMachineHardwareProfileToBrainIfReady("transport-aegis-peer-verified");
+      return true;
+    }
+    if (brain == nullptr || brain->transportEncryptionEnabled() == false || brain->tlsPeerVerified)
     {
       return true;
     }
 
-    if (brain->isTLSNegotiated() == false)
+    if (brain->isTransportNegotiated() == false)
     {
       return true;
     }
 
     uint128_t peerUUID = 0;
-    if (ProdigyTransportTLSRuntime::extractPeerUUID(brain->ssl, peerUUID) == false)
+    if (brain->extractAuthenticatedPeerUUID(peerUUID) == false)
     {
       basics_log("neuron transport tls missing brain peer uuid fd=%d fslot=%d\n", brain->fd, brain->fslot);
       PRODIGY_DEBUG_LOG(
@@ -929,7 +960,7 @@ protected:
                    brain->fslot,
                    int(brain->pendingSend),
                    int(brain->pendingRecv),
-                   int(brain->isTLSNegotiated()));
+                   int(brain->isTransportNegotiated()));
       PRODIGY_DEBUG_FLUSH();
       return false;
     }
@@ -1303,7 +1334,12 @@ protected:
   {
     // The master uses this attestation together with the following stateUpload
     // before it advances the next worker.
-    Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID, haveFragments(), installedBundleDigest);
+    if (controlTransportCredentials.enabled)
+      Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
+                         haveFragments(), installedBundleDigest, uint8_t(1));
+    else
+      Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
+                         haveFragments(), installedBundleDigest);
   }
 
   void queueAttestedInitialBrainControlFrames(NeuronBrainControlStream *stream)
@@ -1426,7 +1462,7 @@ protected:
 
     bool brainPresent = (brain != nullptr);
     bool brainActive = (brainPresent && streamIsActive(brain));
-    bool brainAppReady = (brainPresent && brainActive && (brain->transportTLSEnabled() == false || (brain->isTLSNegotiated() && brain->tlsPeerVerified)));
+    bool brainAppReady = (brainPresent && brainActive && (brain->transportEncryptionEnabled() == false || (brain->isTransportNegotiated() && brain->tlsPeerVerified)));
     bool alreadyQueued = (brainPresent && brain->initialMachineHardwareProfileQueued);
     bool queuedHardwareProfile = false;
     if (brainPresent && brainAppReady && alreadyQueued == false && appendMachineHardwareProfileFrameIfReady(brain->wBuffer))
@@ -1457,7 +1493,7 @@ protected:
                    (brainPresent ? brain->fslot : -1),
                    int(brainPresent ? brain->pendingSend : 0),
                    int(brainPresent ? brain->pendingRecv : 0),
-                   int(brainPresent ? brain->isTLSNegotiated() : 0),
+                   int(brainPresent ? brain->isTransportNegotiated() : 0),
                    int(brainPresent ? brain->tlsPeerVerified : 0));
       PRODIGY_DEBUG_FLUSH();
     }
@@ -1475,7 +1511,7 @@ protected:
                (brainPresent ? brain->fslot : -1),
                int(brainPresent ? brain->pendingSend : 0),
                int(brainPresent ? brain->pendingRecv : 0),
-               int(brainPresent ? brain->isTLSNegotiated() : 0),
+               int(brainPresent ? brain->isTransportNegotiated() : 0),
                int(brainPresent ? brain->tlsPeerVerified : 0));
 #endif
     return queuedHardwareProfile;
@@ -1495,7 +1531,7 @@ protected:
                  (brainPresentBeforeAdopt ? brain->fslot : -1),
                  int(brainPresentBeforeAdopt ? brain->pendingSend : 0),
                  int(brainPresentBeforeAdopt ? brain->pendingRecv : 0),
-                 int(brainPresentBeforeAdopt ? brain->isTLSNegotiated() : 0),
+                 int(brainPresentBeforeAdopt ? brain->isTransportNegotiated() : 0),
                  int(brainPresentBeforeAdopt ? brain->tlsPeerVerified : 0));
     PRODIGY_DEBUG_FLUSH();
     basics_log("Neuron adopting deferred hardware inventory inventoryComplete=%d serializedBytes=%llu logicalCores=%u memoryMB=%u disks=%llu nics=%llu\n",
@@ -1526,7 +1562,7 @@ protected:
                  (brainPresent ? brain->fslot : -1),
                  int(brainPresent ? brain->pendingSend : 0),
                  int(brainPresent ? brain->pendingRecv : 0),
-                 int(brainPresent ? brain->isTLSNegotiated() : 0),
+                 int(brainPresent ? brain->isTransportNegotiated() : 0),
                  int(brainPresent ? brain->tlsPeerVerified : 0));
     PRODIGY_DEBUG_FLUSH();
 
@@ -1540,7 +1576,7 @@ protected:
                (brainPresent ? brain->fslot : -1),
                int(brainPresent ? brain->pendingSend : 0),
                int(brainPresent ? brain->pendingRecv : 0),
-               int(brainPresent ? brain->isTLSNegotiated() : 0),
+               int(brainPresent ? brain->isTransportNegotiated() : 0),
                int(brainPresent ? brain->tlsPeerVerified : 0));
 #endif
   }
@@ -1570,7 +1606,7 @@ protected:
                      (brain ? brain->fslot : -1),
                      int(brain ? brain->pendingSend : 0),
                      int(brain ? brain->pendingRecv : 0),
-                     int(brain ? brain->isTLSNegotiated() : 0),
+                     int(brain ? brain->isTransportNegotiated() : 0),
                      int(brain ? brain->tlsPeerVerified : 0));
         PRODIGY_DEBUG_FLUSH();
         return completed;
@@ -1594,7 +1630,7 @@ protected:
                    (brain ? brain->fslot : -1),
                    int(brain ? brain->pendingSend : 0),
                    int(brain ? brain->pendingRecv : 0),
-                   int(brain ? brain->isTLSNegotiated() : 0),
+                   int(brain ? brain->isTransportNegotiated() : 0),
                    int(brain ? brain->tlsPeerVerified : 0));
       PRODIGY_DEBUG_FLUSH();
       return true;
@@ -1613,7 +1649,7 @@ protected:
                  (brain ? brain->fslot : -1),
                  int(brain ? brain->pendingSend : 0),
                  int(brain ? brain->pendingRecv : 0),
-                 int(brain ? brain->isTLSNegotiated() : 0),
+                 int(brain ? brain->isTransportNegotiated() : 0),
                  int(brain ? brain->tlsPeerVerified : 0));
     PRODIGY_DEBUG_FLUSH();
     if (deferredHardwareInventoryResultReadyForAdoption(result) == false)
@@ -3025,6 +3061,64 @@ public:
   bool isBrain;
   TCPSocket brainListener;
   NeuronBrainControlStream *brain = nullptr;
+  ProdigyTransportCredentialBootstrap controlTransportCredentials;
+  bool transportPeerProjectionPersistencePending = false;
+
+  virtual bool persistTransportCredentialPeerProjection(
+      const ProdigyTransportCredentialBootstrap&, std::function<void(bool)> completion)
+  {
+    (void)completion;
+    return false;
+  }
+
+  bool transportPeerProjectionControlCurrent(NeuronBrainControlStream *stream, uint64_t generation,
+                                             uint128_t peerUUID) const
+  {
+    return brain == stream && stream != nullptr && stream->ioGeneration == generation &&
+        streamIsActive(stream) && stream->transportAEGISEnabled() && stream->isTransportNegotiated() &&
+        stream->tlsPeerVerified && stream->tlsPeerUUID == peerUUID;
+  }
+
+  void receiveTransportCredentialPeerProjection(uint128_t nonce,
+                                                const ProdigyTransportCredentialBootstrap& projection)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (nonce == 0 || !controlTransportCredentials.enabled ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+    ProdigyTransportCredentialBootstrap updated = {};
+    if (!prodigyApplyTransportCredentialPeerProjection(controlTransportCredentials, projection, updated) ||
+        std::none_of(projection.authorizedPeers.begin(), projection.authorizedPeers.end(), [&](const auto& peer) {
+          return peer.nodeUUID == peerUUID && peer.role == ProdigyTransportCredentialNodeRole::brain;
+        }))
+    { queueCloseIfActive(stream); return; }
+    auto reply = [this, stream, nonce, revision = projection.committedAuthorityGeneration](bool ready) {
+      Message::construct(stream->wBuffer, NeuronTopic::transportCredentialPeersAck, nonce, revision, uint8_t(ready));
+      Ring::queueSend(stream);
+    };
+    if (transportPeerProjectionPersistencePending) { reply(false); return; }
+    transportPeerProjectionPersistencePending = true;
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    const std::weak_ptr<uint8_t> connectionLifetime = stream->connectionLifetime;
+    const bool admitted = persistTransportCredentialPeerProjection(projection,
+        [this, lifetime, connectionLifetime, stream, generation, peerUUID, updated = std::move(updated), reply](bool durable) mutable {
+          if (lifetime.expired()) return;
+          transportPeerProjectionPersistencePending = false;
+          if (connectionLifetime.expired() || !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+          if (!durable) { reply(false); return; }
+          // The live receiver still owns this exact stream and credential
+          // identity. Publish only after the sole local-record owner commits.
+          controlTransportCredentials = std::move(updated);
+          std::fprintf(stderr, "neuron transport peer projection durable uuid=%llu generation=%llu peers=%zu\n",
+                     (unsigned long long)controlTransportCredentials.self.nodeUUID,
+                     (unsigned long long)controlTransportCredentials.committedAuthorityGeneration,
+                     size_t(controlTransportCredentials.authorizedPeers.size()));
+          std::fflush(stderr);
+          reply(true);
+        });
+    if (!admitted) { transportPeerProjectionPersistencePending = false; reply(false); }
+  }
   bytell_hash_set<NeuronBrainControlStream *> closingBrainControls;
   OSUpdateProcess osUpdateProcess;
 
@@ -4073,7 +4167,7 @@ public:
                    (unsigned long long)pendingContainerDownloads.size(),
                    int(brain ? brain->pendingSend : 0),
                    int(brain ? brain->pendingRecv : 0),
-                   int(brain ? brain->isTLSNegotiated() : 0),
+                   int(brain ? brain->isTransportNegotiated() : 0),
                    int(brain ? brain->tlsPeerVerified : 0),
                    (brain ? brain->fd : -1),
                    (brain ? brain->fslot : -1));
@@ -4141,8 +4235,8 @@ public:
     {
       return false;
     }
-    return stream->transportTLSEnabled() == false ||
-           (stream->isTLSNegotiated() && stream->tlsPeerVerified);
+    return stream->transportEncryptionEnabled() == false ||
+           (stream->isTransportNegotiated() && stream->tlsPeerVerified);
   }
 
   // The default deliberately has no policy effect.  The focused artifact unit
@@ -4396,7 +4490,7 @@ public:
     NeuronBrainControlStream *stream = operation.stream;
     return brain == stream && stream != nullptr && stream->ioGeneration == operation.streamGeneration &&
            streamIsActive(stream) && stream->tlsPeerUUID == operation.peerUUID &&
-           (stream->transportTLSEnabled() == false || (stream->isTLSNegotiated() && stream->tlsPeerVerified));
+           (stream->transportEncryptionEnabled() == false || (stream->isTransportNegotiated() && stream->tlsPeerVerified));
   }
 
   void clearPendingBundleArtifact(const std::shared_ptr<PendingReceivedBundleArtifact>& operation)
@@ -4834,6 +4928,19 @@ public:
 
     switch (NeuronTopic(message->topic))
     {
+      case NeuronTopic::transportCredentialPeers:
+        {
+          uint128_t nonce = 0;
+          String serialized;
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractToStringView(args, serialized);
+          ProdigyTransportCredentialBootstrap projection = {};
+          if (!BitseryEngine::deserializeSafe(serialized, projection) ||
+              !prodigyTransportCredentialBootstrapValid(projection, false))
+          { if (brain) queueCloseIfActive(brain); break; }
+          receiveTransportCredentialPeerProjection(nonce, projection);
+          break;
+        }
       case NeuronTopic::registration:
         {
           // requiresState(1)
@@ -6003,9 +6110,9 @@ public:
         return;
       }
 
-      if constexpr (requires (T *s) { s->transportTLSEnabled(); })
+      if constexpr (requires (T *s) { s->transportEncryptionEnabled(); })
       {
-        if (stream->transportTLSEnabled())
+        if (stream->transportEncryptionEnabled())
         {
           if (stream->decryptTransportTLS(uint32_t(result)) == false || ((void *)stream == (void *)brain && verifyBrainTransportTLSPeer() == false))
           {
@@ -6094,9 +6201,9 @@ public:
         return;
       }
 
-      if constexpr (requires (T *s) { s->transportTLSEnabled(); })
+      if constexpr (requires (T *s) { s->transportEncryptionEnabled(); })
       {
-        if (stream->transportTLSEnabled() && streamIsActive(stream) && stream->needsTransportTLSSendKick())
+        if (stream->transportEncryptionEnabled() && streamIsActive(stream) && stream->needsTransportTLSSendKick())
         {
           Ring::queueSend(stream);
         }
@@ -6127,7 +6234,7 @@ public:
                      result,
                      int(stream->pendingSend),
                      int(stream->pendingRecv),
-                     int(stream->isTLSNegotiated()),
+                     int(stream->isTransportNegotiated()),
                      int(stream->tlsPeerVerified),
                      stream->fd,
                      stream->fslot,
@@ -6261,9 +6368,9 @@ public:
       }
 
       bool queueAnotherSend = (stream->wBuffer.outstandingBytes() > 0);
-      if constexpr (requires (T *s) { s->transportTLSEnabled(); })
+      if constexpr (requires (T *s) { s->transportEncryptionEnabled(); })
       {
-        if (stream->transportTLSEnabled() && stream->needsTransportTLSSendKick())
+        if (stream->transportEncryptionEnabled() && stream->needsTransportTLSSendKick())
         {
           queueAnotherSend = true;
         }
@@ -6287,9 +6394,9 @@ public:
 
       int tlsNegotiated = 0;
       int needsSendKick = 0;
-      if constexpr (requires (T *s) { s->isTLSNegotiated(); s->needsTransportTLSSendKick(); })
+      if constexpr (requires (T *s) { s->isTransportNegotiated(); s->needsTransportTLSSendKick(); })
       {
-        tlsNegotiated = int(stream->isTLSNegotiated());
+        tlsNegotiated = int(stream->isTransportNegotiated());
         needsSendKick = int(stream->needsTransportTLSSendKick());
       }
 
@@ -6330,7 +6437,7 @@ public:
                      result,
                      int(stream->pendingSend),
                      int(stream->pendingRecv),
-                     int(stream->isTLSNegotiated()),
+                     int(stream->isTransportNegotiated()),
                      int(stream->tlsPeerVerified),
                      stream->fd,
                      stream->fslot,
@@ -6442,13 +6549,15 @@ public:
                    size_t(closingBrainControls.size()));
       PRODIGY_DEBUG_FLUSH();
 
-      if (ProdigyTransportTLSRuntime::configured() && beginAcceptedBrainTransportTLS(brain) == false)
+      if ((controlTransportCredentials.enabled || ProdigyTransportTLSRuntime::configured()) &&
+          beginAcceptedBrainTransportTLS(brain) == false)
       {
         queueCloseIfActive(brain);
         return;
       }
 
       RingDispatcher::installMultiplexee(brain, this);
+      if (brain->needsTransportTLSSendKick()) Ring::queueSend(brain);
       const uint8_t recvGenerationBefore = brain->ioGeneration;
       Ring::queueRecv(brain);
       basics_log("neuron accepted brain control recv-arm stream=%p fd=%d fslot=%d pendingSend=%d pendingRecv=%d tagBefore=%u tagAfter=%u rcap=%llu\n",
@@ -6534,7 +6643,7 @@ public:
                  closingBrain->fslot,
                  int(closingBrain->pendingSend),
                  int(closingBrain->pendingRecv),
-                 int(closingBrain->isTLSNegotiated()),
+                 int(closingBrain->isTransportNegotiated()),
                  int(closingBrain->tlsPeerVerified));
       PRODIGY_DEBUG_LOG( "neuron brain control close-live stream=%p fd=%d fslot=%d retained=%zu\n",
                    static_cast<void *>(closingBrain),

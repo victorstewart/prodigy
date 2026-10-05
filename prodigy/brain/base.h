@@ -219,8 +219,8 @@ public:
                    int(pendingSend),
                    int(pendingRecv),
                    int(Ring::socketIsClosing(this)),
-                   int(transportTLSEnabled()),
-                   int(isTLSNegotiated()),
+                   int(transportEncryptionEnabled()),
+                   int(isTransportNegotiated()),
                    uint32_t(wBuffer.outstandingBytes()));
       PRODIGY_DEBUG_FLUSH();
       return;
@@ -251,8 +251,8 @@ public:
                  fslot,
                  int(pendingSend),
                  int(pendingRecv),
-                 int(transportTLSEnabled()),
-                 int(isTLSNegotiated()),
+                 int(transportEncryptionEnabled()),
+                 int(isTransportNegotiated()),
                  unsigned(pendingSendBytes),
                  (unsigned long long)queuedSendOutstandingBytes(),
                  uint32_t(wBuffer.outstandingBytes()));
@@ -1226,7 +1226,7 @@ public:
     }
 
     const uint64_t plaintextBytes = brain->wBuffer.outstandingBytes() + brain->artifacts.pendingOutboundBytes();
-    if (brain->transportTLSEnabled())
+    if (brain->transportEncryptionEnabled())
     {
       return (plaintextBytes + brain->queuedSendOutstandingBytes());
     }
@@ -1279,7 +1279,7 @@ public:
         (unsigned long long)appendBytes,
         (unsigned long long)brainPeerReplicationBufferedBytesLimit,
         int(brain->pendingSend),
-        int(brain->transportTLSEnabled()),
+        int(brain->transportEncryptionEnabled()),
         reasonText.c_str());
 
     // This is normal bounded backpressure.  The heartbeat/reconciliation
@@ -1561,9 +1561,9 @@ inline bool BrainBase::neuronControlStreamActive(const Machine *machine)
     return false;
   }
 
-  if (machine->neuron.transportTLSEnabled())
+  if (machine->neuron.transportEncryptionEnabled())
   {
-    return machine->neuron.isTLSNegotiated() && machine->neuron.tlsPeerVerified;
+    return machine->neuron.isTransportNegotiated() && machine->neuron.tlsPeerVerified;
   }
 
   return true;

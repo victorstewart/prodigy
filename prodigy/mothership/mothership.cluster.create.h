@@ -954,6 +954,13 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     failure->clear();
   }
 
+  if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1 &&
+      cluster.deploymentMode != MothershipClusterDeploymentMode::test)
+  {
+    if (failure) failure->assign("AEGIS transport creation currently requires fresh test-cluster provisioning"_ctv);
+    return false;
+  }
+
   BrainConfig config = {};
   if (mothershipBuildClusterBrainConfig(cluster, credential, config, failure, dnsCredential) == false)
   {

@@ -496,6 +496,33 @@ int main(void)
                    topology.machines[1].uuid != topology.machines[2].uuid,
                "bootstrap_members_preserve_seed_and_allocate_distinct_peer_identities");
   const ClusterTopology assignedTopology = topology;
+  {
+    ProdigyInitialTransportCredentialProjection projection, independentProjection;
+    suite.expect(mothershipBuildInitialTransportCredentialProjection(cluster.clusterUUID, topology, projection, &failure) &&
+                     projection.ledger.size() == 5 && projection.authority.valid(),
+                 "aegis_initial_cohort_has_brain_and_hosted_neuron_scopes");
+    suite.expect(mothershipBuildInitialTransportCredentialProjection(cluster.clusterUUID + 1, topology, independentProjection, &failure) &&
+                     CRYPTO_memcmp(projection.authority.root, independentProjection.authority.root, sizeof(projection.authority.root)) != 0,
+                 "aegis_independent_clusters_have_independent_roots");
+    for (const auto& machine : topology.machines)
+    {
+      String bootJSON, privateJSON;
+      ProdigyPersistentLocalBrainState local;
+      bool built = prodigyBuildRemoteBootstrapBootMaterial(machine, bootstrapRequest, topology, runtimeEnvironment,
+                                                           bootJSON, privateJSON, &failure, &projection);
+      bool parsed = built && parseProdigyPersistentLocalBrainStateJSON(privateJSON, local, &failure);
+      suite.expect(parsed && local.transportCredentials.enabled && local.transportCredentials.self.nodeUUID == machine.uuid &&
+                       (local.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain) == machine.isBrain &&
+                       local.transportCredentialAuthorityRoot.valid() == machine.isBrain &&
+                       prodigyLocalTransportCredentialStateValid(local),
+                   "aegis_boot_material_binds_machine_role_and_keeps_root_brain_only");
+    }
+    ClusterTopology invalid = topology;
+    invalid.machines.back().uuid = invalid.machines.front().uuid;
+    suite.expect(!mothershipBuildInitialTransportCredentialProjection(cluster.clusterUUID, invalid, independentProjection, &failure) &&
+                     !independentProjection.authority.valid() && independentProjection.ledger.empty(),
+                 "aegis_initial_cohort_rejects_duplicate_machine_without_partial_secret");
+  }
   suite.expect(mothershipAssignVirtualDatacenterMachineUUIDs(seedTopology, topology, &failure) &&
                    topology == assignedTopology,
                "bootstrap_member_identity_assignment_retries_without_changing_published_ids");

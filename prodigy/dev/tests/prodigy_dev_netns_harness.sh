@@ -38,6 +38,7 @@ test_machine_memory_mb="${PRODIGY_DEV_TEST_MACHINE_MEMORY_MB:-16384}"
 test_machine_storage_mb="${PRODIGY_DEV_TEST_MACHINE_STORAGE_MB:-262144}"
 duration=10
 brain_bootstrap_family="${PRODIGY_DEV_BRAIN_BOOTSTRAP_FAMILY:-ipv4}"
+internal_transport_profile=tls
 inter_container_mtu=9000
 enable_fake_ipv4_boundary="${PRODIGY_DEV_ENABLE_FAKE_IPV4_BOUNDARY:-0}"
 mothership_bin=
@@ -139,6 +140,10 @@ do
    case "$1" in
       --runtime-qualification=*)
          runtime_qualification="${1#*=}"
+         ;;
+      --internal-transport-profile=*)
+         internal_transport_profile="${1#*=}"
+         [[ "${internal_transport_profile}" == tls || "${internal_transport_profile}" == aegis-x25519-v1 ]] || fail "unsupported internal transport profile"
          ;;
       --ordinary-observer-mothership=*)
          ordinary_observer_mothership="${1#*=}"
@@ -403,6 +408,7 @@ create_request="$(jq -nc \
    --arg name "${cluster_name}" \
    --arg workspace "${workspace_root}" \
    --arg family "${brain_bootstrap_family}" \
+   --arg transport "${internal_transport_profile}" \
    --arg fake "${enable_fake_ipv4_boundary}" \
    --arg enabled "${PRODIGY_DEV_CONFIGURE_OS_UPDATES_ENABLED:-0}" \
    --argjson machines "${machines}" \
@@ -418,6 +424,7 @@ create_request="$(jq -nc \
    '{
       name:$name,
       deploymentMode:"test",
+      internalTransportProfile:$transport,
       nBrains:$brains,
       autoscaleIntervalSeconds:$autoscale,
       machineSchemas:[{schema:"test-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],

@@ -225,6 +225,10 @@ int ct_egress(struct __sk_buff *skb)
 
       if (portalTarget == SWITCHBOARD_PORTAL_TARGET_RESOLVED)
       {
+        if (portalMeta != NULL)
+        {
+          (void)switchboardSelectPairAdmissionTarget(&pckt, portalMeta->slot, &containerID);
+        }
         __u16 targetPort = 0;
         if (portalMeta == NULL || switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false)
         {
@@ -237,7 +241,7 @@ int ct_egress(struct __sk_buff *skb)
         {
           struct portal_definition portal = {};
           if (switchboardPacketPortalDefinition(&pckt, false, &portal) == false ||
-              switchboardLearnPublicWormholeFlowIPv4(&pckt, &containerID, targetPort, &portal) == false ||
+              switchboardLearnPublicWormholeFlowIPv4(&pckt, &containerID, targetPort, &portal, portalMeta->slot) == false ||
               switchboardRewriteWormholeIPv4TargetSKB(skb, &pckt, targetPort) == false)
           {
             return NETKIT_DROP;
@@ -314,6 +318,10 @@ int ct_egress(struct __sk_buff *skb)
 
     if (portalTarget == SWITCHBOARD_PORTAL_TARGET_RESOLVED)
     {
+      if (portalMeta != NULL)
+      {
+        (void)switchboardSelectPairAdmissionTarget(&pckt, portalMeta->slot, &containerID);
+      }
       __u16 targetPort = 0;
       if (portalMeta == NULL || switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false)
       {
@@ -326,7 +334,7 @@ int ct_egress(struct __sk_buff *skb)
       {
         struct portal_definition portal = {};
         if (switchboardPacketPortalDefinition(&pckt, true, &portal) == false ||
-            switchboardLearnPublicWormholeFlowIPv6(&pckt, &containerID, targetPort, &portal) == false ||
+            switchboardLearnPublicWormholeFlowIPv6(&pckt, &containerID, targetPort, &portal, portalMeta->slot) == false ||
             switchboardRewriteWormholeIPv6TargetSKB(skb, &pckt, &containerID, targetPort) == false)
         {
           return NETKIT_DROP;

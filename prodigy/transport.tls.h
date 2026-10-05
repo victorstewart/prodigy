@@ -1,6 +1,9 @@
 #pragma once
 
+#include <prodigy/transport.aegis.h>
+
 #include <algorithm>
+#include <functional>
 
 #include <prodigy/server.state.h>
 #include <services/vault.h>
@@ -441,8 +444,202 @@ class ProdigyTransportTLSStream : public TCPStream, public TLSBase {
 private:
 
   bool tlsEnabled = false;
+  bool aegisEnabled = false;
+  bool aegisFailed = false;
+  bool aegisInitiator = false;
+  bool aegisHandshakeWritten = false;
+  bool aegisHandshakeRead = false;
+  bool aegisPreludeWritten = false;
+  bool aegisPeerResolved = true;
+  uint128_t aegisLocalUUID = 0;
+  uint128_t aegisExpectedPeerUUID = 0;
+  String aegisLocalPrelude;
+  std::function<bool(const String&, std::array<uint8_t, 32>&, String&, uint128_t&)> aegisPeerResolver;
+  ProdigyAegisSession aegisSession;
+  StreamBuffer aegisInbound;
   StreamBuffer encryptedWBuffer;
   ProdigyOpenSSLTlsTicketBinding tlsResumptionBinding = {};
+
+  static void clearAEGISBuffer(StreamBuffer& buffer)
+  {
+    if (buffer.ownsMemory() && buffer.data() != nullptr)
+      OPENSSL_cleanse(buffer.data(), buffer.reservedBytes());
+    buffer.clear();
+  }
+
+  bool failTransportAEGIS()
+  {
+    aegisFailed = true;
+    aegisSession.reset();
+    tlsPeerVerified = false;
+    tlsPeerUUID = 0;
+    clearAEGISBuffer(rBuffer);
+    clearAEGISBuffer(wBuffer);
+    clearAEGISBuffer(encryptedWBuffer);
+    clearAEGISBuffer(aegisInbound);
+    aegisPeerResolver = {};
+    nEncryptedBytesToSend = 0;
+    return false;
+  }
+
+  void publishAEGISPeerProof()
+  {
+    if (aegisSession.authenticated())
+    {
+      tlsPeerUUID = aegisExpectedPeerUUID;
+      tlsPeerVerified = true;
+    }
+  }
+
+  bool startTransportAEGISKeys(const uint8_t psk[32], const String& credentialContext,
+                              uint128_t localUUID, uint128_t peerUUID,
+                              const String& localPrelude = {}, const String& peerPrelude = {})
+  {
+    if (localUUID == 0 || peerUUID == 0 || credentialContext.empty() ||
+        credentialContext.size() + localPrelude.size() + peerPrelude.size() > PRODIGY_NOISE_MAX_PROLOGUE_BYTES - 256)
+      return failTransportAEGIS();
+    // Bind the actual asserted identity inside this owner, even if a caller's
+    // credential context omitted it. Ordering is initiator then responder.
+    constexpr uint8_t domain[] = "prodigy/aegis-stream-identities/v1";
+    String canonicalContext = {};
+    if (!canonicalContext.reserve(sizeof(domain) + 32 + 24 + credentialContext.size() + localPrelude.size() + peerPrelude.size()))
+      return failTransportAEGIS();
+    canonicalContext.append(domain, sizeof(domain));
+    const uint128_t identities[] = {aegisInitiator ? localUUID : peerUUID, aegisInitiator ? peerUUID : localUUID};
+    for (uint128_t identity : identities)
+      for (int shift = 120; shift >= 0; shift -= 8) canonicalContext.append(uint8_t(identity >> shift));
+    const String *fields[] = {&credentialContext, aegisInitiator ? &localPrelude : &peerPrelude,
+                             aegisInitiator ? &peerPrelude : &localPrelude};
+    for (const String *field : fields)
+    {
+      for (int shift = 56; shift >= 0; shift -= 8) canonicalContext.append(uint8_t(uint64_t(field->size()) >> shift));
+      canonicalContext.append(*field);
+    }
+    if (!aegisSession.begin(psk, canonicalContext, aegisInitiator)) return failTransportAEGIS();
+    aegisExpectedPeerUUID = peerUUID;
+    aegisPeerResolved = true;
+    return true;
+  }
+
+  bool prepareTransportAEGISSend()
+  {
+    if (aegisFailed) return false;
+    if (hasBufferedTransportCiphertext()) return true;
+    if (!aegisLocalPrelude.empty() && !aegisPreludeWritten)
+    {
+      const uint32_t size = aegisLocalPrelude.size();
+      const uint8_t header[] = {'P', 'G', 'A', 1, uint8_t(size >> 8), uint8_t(size), 0, 0};
+      if (!encryptedWBuffer.need(sizeof(header) + size)) return failTransportAEGIS();
+      encryptedWBuffer.append(header, sizeof(header));
+      encryptedWBuffer.append(aegisLocalPrelude);
+      aegisPreludeWritten = true;
+    }
+    else if (!aegisPeerResolved) return true;
+    else if (!aegisHandshakeWritten && (aegisInitiator || aegisHandshakeRead))
+    {
+      std::array<uint8_t, PRODIGY_NOISE_HANDSHAKE_BYTES> message = {};
+      if (!aegisSession.writeHandshake(message) || !encryptedWBuffer.need(message.size())) return failTransportAEGIS();
+      encryptedWBuffer.append(message.data(), message.size());
+      aegisHandshakeWritten = true;
+    }
+    else if (aegisSession.confirmationNeeded())
+    {
+      String frame = {};
+      if (!aegisSession.encrypt(ProdigyAegisSession::Record::confirmation, nullptr, 0, frame) ||
+          !encryptedWBuffer.need(frame.size())) return failTransportAEGIS();
+      encryptedWBuffer.append(frame);
+      publishAEGISPeerProof();
+    }
+    else if (aegisSession.authenticated() && wBuffer.outstandingBytes() != 0)
+    {
+      const uint32_t bytes = uint32_t(std::min<uint64_t>(wBuffer.outstandingBytes(), ProdigyAegisSession::maximumPayloadBytes));
+      String frame = {};
+      if (!aegisSession.encrypt(ProdigyAegisSession::Record::application, wBuffer.pHead(), bytes, frame) ||
+          !encryptedWBuffer.need(frame.size())) return failTransportAEGIS();
+      encryptedWBuffer.append(frame);
+      wBuffer.consume(bytes, false);
+    }
+    nEncryptedBytesToSend = uint32_t(encryptedWBuffer.outstandingBytes());
+    return !aegisSession.failedClosed();
+  }
+
+  bool decryptTransportAEGIS(uint32_t bytesReceived)
+  {
+    if (aegisFailed) return false;
+    // A single recv may coalesce many complete records when the application
+    // has a large read buffer. Bound incomplete framing state, not that valid
+    // coalesced read; the socket owner already bounds it by allocated space.
+    if (bytesReceived > rBuffer.remainingCapacity() ||
+        aegisInbound.outstandingBytes() > ProdigyAegisSession::maximumRecordBytes ||
+        !aegisInbound.need(bytesReceived)) return failTransportAEGIS();
+    // Ring has written ciphertext at rBuffer's tail without advancing it.
+    // Save it before decrypted application bytes overwrite the same storage.
+    aegisInbound.append(rBuffer.pTail(), bytesReceived);
+    while (aegisInbound.outstandingBytes() != 0)
+    {
+      if (!aegisPeerResolved)
+      {
+        if (aegisInbound.outstandingBytes() < 8) break;
+        const uint8_t *header = aegisInbound.pHead();
+        const uint32_t size = (uint32_t(header[4]) << 8) | header[5];
+        if (header[0] != 'P' || header[1] != 'G' || header[2] != 'A' || header[3] != 1 ||
+            header[6] != 0 || header[7] != 0 || size == 0 || size > 512 || !aegisPeerResolver)
+          return failTransportAEGIS();
+        if (aegisInbound.outstandingBytes() < 8 + size) break;
+        String peerPrelude = {};
+        if (!peerPrelude.reserve(size)) return failTransportAEGIS();
+        peerPrelude.append(header + 8, size);
+        std::array<uint8_t, 32> psk = {};
+        String credentialContext = {};
+        uint128_t peerUUID = 0;
+        bool ok = aegisPeerResolver(peerPrelude, psk, credentialContext, peerUUID);
+        if (ok) ok = startTransportAEGISKeys(psk.data(), credentialContext, aegisLocalUUID, peerUUID,
+                                            aegisLocalPrelude, peerPrelude);
+        OPENSSL_cleanse(psk.data(), psk.size());
+        aegisPeerResolver = {};
+        if (!ok) return failTransportAEGIS();
+        aegisInbound.consume(8 + size, false);
+        continue;
+      }
+      if (!aegisHandshakeRead)
+      {
+        if (aegisInbound.outstandingBytes() < PRODIGY_NOISE_HANDSHAKE_BYTES) break;
+        if (!aegisSession.readHandshake(aegisInbound.pHead(), PRODIGY_NOISE_HANDSHAKE_BYTES)) return failTransportAEGIS();
+        aegisHandshakeRead = true;
+        aegisInbound.consume(PRODIGY_NOISE_HANDSHAKE_BYTES, false);
+        continue;
+      }
+      if (!aegisSession.handshakeComplete())
+      {
+        // A responder must write message two before interpreting records.
+        if (!prepareTransportAEGISSend() || !aegisSession.handshakeComplete()) return failTransportAEGIS();
+      }
+      if (aegisInbound.outstandingBytes() < ProdigyAegisSession::headerBytes) break;
+      uint32_t frameBytes = 0;
+      if (!ProdigyAegisSession::recordSize(aegisInbound.pHead(), uint32_t(aegisInbound.outstandingBytes()), frameBytes))
+        return failTransportAEGIS();
+      if (aegisInbound.outstandingBytes() < frameBytes) break;
+      String plaintext = {};
+      ProdigyAegisSession::Record type;
+      if (!aegisSession.decrypt(aegisInbound.pHead(), frameBytes, type, plaintext)) return failTransportAEGIS();
+      aegisInbound.consume(frameBytes, false);
+      publishAEGISPeerProof();
+      if (type == ProdigyAegisSession::Record::close) return failTransportAEGIS();
+      if (type == ProdigyAegisSession::Record::application)
+      {
+        if (!tlsPeerVerified || !rBuffer.need(plaintext.size()))
+        {
+          if (plaintext.size() != 0) OPENSSL_cleanse(plaintext.data(), plaintext.size());
+          return failTransportAEGIS();
+        }
+        rBuffer.append(plaintext);
+        if (plaintext.size() != 0) OPENSSL_cleanse(plaintext.data(), plaintext.size());
+      }
+    }
+    if (aegisInbound.outstandingBytes() > ProdigyAegisSession::maximumRecordBytes) return failTransportAEGIS();
+    aegisInbound.releaseIdleCapacityAbove(2 * ProdigyAegisSession::maximumRecordBytes);
+    return true;
+  }
 
   bool harvestEncryptedOutput(void)
   {
@@ -538,6 +735,57 @@ public:
   bool tlsPeerVerified = false;
   uint128_t tlsPeerUUID = 0;
 
+  // The existing stream remains the sole send/receive owner. This explicit
+  // entry point is used only after credential policy has authorized both
+  // canonical peer identities and the PSK; there is no TLS/plaintext fallback.
+  bool beginTransportAEGIS(bool isServer, const uint8_t psk[32], const String& credentialContext,
+                           uint128_t localUUID, uint128_t expectedPeerUUID)
+  {
+    resetTransportState(false);
+    aegisEnabled = true;
+    aegisInitiator = !isServer;
+    return startTransportAEGISKeys(psk, credentialContext, localUUID, expectedPeerUUID);
+  }
+
+  using AEGISPeerResolver = std::function<bool(const String&, std::array<uint8_t, 32>&, String&, uint128_t&)>;
+
+  // Only public lookup hints are sent here. The credential owner must reject
+  // unknown/stale/revoked claims in the resolver; neither a prelude nor a
+  // successful lookup authenticates the peer. Both exact preludes are bound
+  // to the ensuing fresh Noise handshake and AEGIS confirmation.
+  bool beginTransportAEGISWithPrelude(bool isServer, uint128_t localUUID,
+                                      const String& localPublicPrelude, AEGISPeerResolver resolver)
+  {
+    resetTransportState(false);
+    aegisEnabled = true;
+    aegisInitiator = !isServer;
+    aegisLocalUUID = localUUID;
+    aegisPeerResolved = false;
+    if (localUUID == 0 || localPublicPrelude.empty() || localPublicPrelude.size() > 512 || !resolver ||
+        !aegisLocalPrelude.reserve(localPublicPrelude.size())) return failTransportAEGIS();
+    aegisLocalPrelude.append(localPublicPrelude);
+    aegisPeerResolver = std::move(resolver);
+    return true;
+  }
+
+  bool transportAEGISEnabled() const { return aegisEnabled; }
+  bool transportEncryptionEnabled() const { return tlsEnabled || aegisEnabled; }
+  bool isTransportNegotiated() const
+  {
+    return aegisEnabled ? aegisSession.authenticated() : TLSBase::isTLSNegotiated();
+  }
+  bool extractAuthenticatedPeerUUID(uint128_t& peerUUID) const
+  {
+    peerUUID = 0;
+    if (aegisEnabled)
+    {
+      if (!aegisSession.authenticated() || !tlsPeerVerified) return false;
+      peerUUID = tlsPeerUUID;
+      return peerUUID != 0;
+    }
+    return ProdigyTransportTLSRuntime::extractPeerUUID(ssl, peerUUID);
+  }
+
   const ProdigyOpenSSLTlsTicketBinding& transportTLSResumptionBinding(void) const
   {
     return tlsResumptionBinding;
@@ -550,6 +798,7 @@ public:
 
   bool beginTransportTLS(bool isServer, const ProdigyOpenSSLTlsTicketBinding *resumptionBinding = nullptr)
   {
+    if (aegisEnabled) return false;
     if (ProdigyTransportTLSRuntime::configured() == false)
     {
       std::fprintf(stderr,
@@ -642,11 +891,16 @@ public:
 
   bool needsTransportTLSSendKick(void) const
   {
+    if (aegisEnabled) return !aegisFailed && (hasBufferedTransportCiphertext() ||
+        (!aegisLocalPrelude.empty() && !aegisPreludeWritten) ||
+        (aegisPeerResolved && !aegisHandshakeWritten && (aegisInitiator || aegisHandshakeRead)) || aegisSession.confirmationNeeded() ||
+        (aegisSession.authenticated() && wBuffer.outstandingBytes() > 0));
     return tlsEnabled && (isTLSNegotiated() == false || hasBufferedTransportCiphertext() || wBuffer.outstandingBytes() > 0);
   }
 
   bool prepareTransportTLSSend(void)
   {
+    if (aegisEnabled) return prepareTransportAEGISSend();
     if (tlsEnabled == false)
     {
       return true;
@@ -696,6 +950,7 @@ public:
 
   bool decryptTransportTLS(uint32_t bytesReceived)
   {
+    if (aegisEnabled) return decryptTransportAEGIS(bytesReceived);
     if (tlsEnabled == false)
     {
       return true;
@@ -716,7 +971,7 @@ public:
 
   uint32_t nBytesToSend(void) override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       return TCPStream::nBytesToSend();
     }
@@ -737,7 +992,7 @@ public:
 
   uint8_t *pBytesToSend(void) override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       return TCPStream::pBytesToSend();
     }
@@ -752,7 +1007,7 @@ public:
 
   uint64_t queuedSendOutstandingBytes(void) const override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       return TCPStream::queuedSendOutstandingBytes();
     }
@@ -762,7 +1017,7 @@ public:
 
   void consumeSentBytes(uint32_t bytesSent, bool zeroIfConsumed) override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       TCPStream::consumeSentBytes(bytesSent, zeroIfConsumed);
       return;
@@ -774,7 +1029,7 @@ public:
 
   void noteSendQueued(void) override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       TCPStream::noteSendQueued();
       return;
@@ -785,7 +1040,7 @@ public:
 
   void noteSendCompleted(void) override
   {
-    if (tlsEnabled == false)
+    if (!transportEncryptionEnabled())
     {
       TCPStream::noteSendCompleted();
       return;
@@ -796,7 +1051,8 @@ public:
 
   void clearQueuedSendBytes(void) override
   {
-    if (tlsEnabled == false)
+    if (aegisEnabled) { (void)failTransportAEGIS(); return; }
+    if (!transportEncryptionEnabled())
     {
       TCPStream::clearQueuedSendBytes();
       return;
@@ -807,13 +1063,31 @@ public:
     nEncryptedBytesToSend = 0;
   }
 
-  void reset(void) override
+private:
+
+  void resetTransportState(bool resetSocket)
   {
     uint64_t rBufferCapacity = rBuffer.tentativeCapacity();
     uint64_t wBufferCapacity = wBuffer.tentativeCapacity();
     uint64_t encryptedWBufferCapacity = encryptedWBuffer.tentativeCapacity();
 
-    TCPStream::reset();
+    if (aegisEnabled)
+    {
+      clearAEGISBuffer(rBuffer);
+      clearAEGISBuffer(wBuffer);
+      clearAEGISBuffer(aegisInbound);
+    }
+    aegisSession.reset();
+    aegisInbound.reset();
+    aegisEnabled = aegisFailed = aegisInitiator = aegisHandshakeWritten = aegisHandshakeRead = false;
+    aegisPreludeWritten = false;
+    aegisPeerResolved = true;
+    aegisLocalUUID = 0;
+    aegisExpectedPeerUUID = 0;
+    aegisLocalPrelude.reset();
+    aegisPeerResolver = {};
+    if (resetSocket) TCPStream::reset();
+    else Stream::reset();
     if (rBufferCapacity > 0)
     {
       rBuffer.reserve(rBufferCapacity);
@@ -835,6 +1109,10 @@ public:
       encryptedWBuffer.reserve(encryptedWBufferCapacity);
     }
   }
+
+public:
+
+  void reset(void) override { resetTransportState(true); }
 
   void recreateSocket(void) override
   {

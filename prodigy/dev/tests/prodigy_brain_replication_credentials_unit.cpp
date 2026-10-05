@@ -459,6 +459,37 @@ public:
   }
 };
 
+class TransportCredentialDeliveryTestBrain : public TestBrain {
+public:
+  bool acceptTransportCredentialDelivery = true;
+  uint32_t transportCredentialDeliveryCalls = 0;
+  ProdigyTransportCredentialBootstrap lastTransportCredentialBootstrap = {};
+
+  bool deliverTransportCredentialBootstrap(const ProdigyTransportCredentialBootstrap& bootstrap) override
+  {
+    ++transportCredentialDeliveryCalls;
+    lastTransportCredentialBootstrap = bootstrap;
+    return acceptTransportCredentialDelivery;
+  }
+};
+
+class TransportCredentialCohortTestBrain final : public TransportCredentialDeliveryTestBrain {
+public:
+  ClusterTopology authoritativeTopology = {};
+  bool existingNeuronProjectionAvailable = true;
+
+  bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
+  {
+    topology = authoritativeTopology;
+    return true;
+  }
+
+  bool existingNeuronsHaveAddMachinesTransportProjection(uint64_t) const override
+  {
+    return existingNeuronProjectionAvailable;
+  }
+};
+
 class CountingTimeoutDispatcher final : public TimeoutDispatcher {
 public:
   uint32_t calls = 0;
@@ -5512,7 +5543,7 @@ static bool completeTransportHandshake(ProdigyTransportTLSStream& client, Prodig
     progressed = pumpTransportBytes(client, server) || progressed;
     progressed = pumpTransportBytes(server, client) || progressed;
 
-    if (client.isTLSNegotiated() && server.isTLSNegotiated())
+    if (client.isTransportNegotiated() && server.isTransportNegotiated())
     {
       return true;
     }
@@ -19710,15 +19741,15 @@ static void testNeuronStreamStateHelpers(TestSuite& suite)
       stream.fd = -1;
     }
 
-    stream = {};
-    stream.connected = true;
-    stream.isFixedFile = true;
-    stream.fslot = 4;
-    suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(&stream), "neuron_stream_helpers_raw_fixed_file_active");
-    suite.expect(TestNeuron::brainStreamIsActiveForTest(&stream), "neuron_stream_helpers_brain_fixed_file_connected_active");
+    NeuronBrainControlStream fixedStream = {};
+    fixedStream.connected = true;
+    fixedStream.isFixedFile = true;
+    fixedStream.fslot = 4;
+    suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(&fixedStream), "neuron_stream_helpers_raw_fixed_file_active");
+    suite.expect(TestNeuron::brainStreamIsActiveForTest(&fixedStream), "neuron_stream_helpers_brain_fixed_file_connected_active");
 
-    stream.fslot = -1;
-    suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(&stream) == false, "neuron_stream_helpers_raw_fixed_file_without_slot_inactive");
+    fixedStream.fslot = -1;
+    suite.expect(TestNeuron::rawBrainStreamIsActiveForTest(&fixedStream) == false, "neuron_stream_helpers_raw_fixed_file_without_slot_inactive");
   }
 
   {
@@ -30933,6 +30964,672 @@ static void testTopologyRestoreKeepsKnownUUIDsDistinctAcrossSharedPrivate4(TestS
 #include <prodigy/dev/tests/stateless_admission_behavior_tests.h>
 #include <prodigy/dev/tests/stateless_source_retirement_tests.h>
 
+static void testMachineInventoryCopyDoesNotCopyTransport(TestSuite& suite)
+{
+  Machine source = {};
+  source.uuid = 701;
+  source.slug.assign("transport-inventory-copy"_ctv);
+  ProdigyTransportTLSStream peer;
+  reserveTransportStream(source.neuron);
+  reserveTransportStream(peer);
+  std::array<uint8_t, 32> psk = {};
+  psk.fill(17);
+  const auto sourceGeneration = source.neuron.ioGeneration;
+  suite.require(source.neuron.beginTransportAEGIS(false, psk.data(), "inventory-copy"_ctv, 701, 702) &&
+                peer.beginTransportAEGIS(true, psk.data(), "inventory-copy"_ctv, 702, 701) &&
+                completeTransportHandshake(source.neuron, peer),
+                "machine_inventory_copy_source_authenticates");
+  suite.expect(source.neuron.ioGeneration == sourceGeneration,
+               "transport_aegis_begin_preserves_socket_generation");
+  source.neuron.connected = true;
+  source.neuron.hadSuccessfulConnection = true;
+  {
+    Machine copy = source;
+    suite.expect(copy.uuid == source.uuid && copy.slug.equals(source.slug),
+                 "machine_inventory_copy_preserves_metadata");
+    uint128_t copiedPeer = 0;
+    suite.expect(!copy.neuron.connected && !copy.neuron.hadSuccessfulConnection &&
+                 copy.neuron.fd < 0 && copy.neuron.fslot < 0 &&
+                 !copy.neuron.transportEncryptionEnabled() && !copy.neuron.tlsPeerVerified &&
+                 !copy.neuron.extractAuthenticatedPeerUUID(copiedPeer) &&
+                 copy.neuron.rBuffer.outstandingBytes() == 0 && copy.neuron.wBuffer.outstandingBytes() == 0,
+                 "machine_inventory_copy_has_fresh_disconnected_transport");
+  }
+  uint128_t authenticatedPeer = 0;
+  suite.expect(source.neuron.extractAuthenticatedPeerUUID(authenticatedPeer) && authenticatedPeer == 702,
+               "machine_inventory_copy_destruction_preserves_source_session");
+}
+
+static void testTransportCredentialDerivationSymmetry(TestSuite& suite)
+{
+  ProdigyTransportCredentialAuthorityRoot root = {};
+  root.authorityEpoch = 7; root.keyEpoch = 9; root.authorityGeneration = 11;
+  for (uint32_t i = 0; i < sizeof(root.root); ++i) root.root[i] = uint8_t(i + 1);
+  ProdigyTransportCredentialEnrollment brain = {}, neuron = {};
+  brain.operationUUID = 101; brain.nodeUUID = 44; brain.clusterUUID = 55; brain.authorityEpoch = 7; brain.keyEpoch = 9; brain.authorityGeneration = 12; brain.role = ProdigyTransportCredentialNodeRole::brain; brain.state = ProdigyTransportCredentialEnrollmentState::active;
+  neuron.operationUUID = 102; neuron.nodeUUID = 44; neuron.clusterUUID = 55; neuron.authorityEpoch = 7; neuron.keyEpoch = 9; neuron.authorityGeneration = 12; neuron.role = ProdigyTransportCredentialNodeRole::neuron; neuron.state = ProdigyTransportCredentialEnrollmentState::active;
+  Vector<ProdigyTransportCredentialEnrollment> ledger = {brain, neuron};
+  ProdigyTransportNodeCredential neuronCredential = {};
+  String localPrelude, contextA, contextB, purpose = "brain-neuron"_ctv;
+  uint8_t pskA[32] = {}, pskB[32] = {};
+  ProdigyTransportCredentialBootstrap bootstrap = {};
+  suite.expect(prodigyBuildTransportCredentialBootstrap(root, neuron, ledger, true, bootstrap) &&
+      prodigyRenderLocalTransportCredentialPrelude(bootstrap, localPrelude) &&
+      prodigyResolveBrainTransportCredentialPeer(root, ledger, brain.nodeUUID, brain.role, localPrelude, purpose, pskA, contextA, neuronCredential.nodeUUID) &&
+      prodigyDeriveTransportNodeCredential(root, neuron, neuronCredential) &&
+      prodigyDeriveTransportCredentialPSK(neuronCredential, brain.operationUUID, brain.nodeUUID, brain.role, purpose, contextB, pskB) &&
+      CRYPTO_memcmp(pskA, pskB, sizeof(pskA)) == 0 && contextA.equals(contextB),
+      "transport_credentials_same_uuid_different_roles_are_symmetric");
+  ProdigyTransportCredentialEnrollmentOperation operation = {};
+  operation.enrollment = neuron; operation.electorate = {44, 45, 46}; operation.pinnedMasterAuthorityEpoch = 3; operation.transitionGeneration = 13;
+  operation.phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+  suite.expect(operation.valid(), "transport_credentials_active_operation_accepts_unique_frozen_electorate");
+  operation.electorate.push_back(45);
+  suite.expect(!operation.valid(), "transport_credentials_pending_operation_rejects_duplicate_voter");
+}
+
+static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
+{
+  const uint128_t selfUUID = uint128_t(0x9a01);
+  const uint128_t peerAUUID = uint128_t(0x9a02);
+  const uint128_t peerBUUID = uint128_t(0x9a03);
+  const uint128_t clusterUUID = uint128_t(0x9a99);
+  TestNeuron self = {};
+  self.uuid = selfUUID;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &self;
+
+  auto enrollment = [&](uint128_t operationUUID, uint128_t nodeUUID,
+                        ProdigyTransportCredentialNodeRole role,
+                        ProdigyTransportCredentialEnrollmentState state,
+                        uint64_t authorityGeneration) {
+    ProdigyTransportCredentialEnrollment value = {};
+    value.operationUUID = operationUUID;
+    value.nodeUUID = nodeUUID;
+    value.clusterUUID = clusterUUID;
+    value.authorityEpoch = 71;
+    value.keyEpoch = 72;
+    value.authorityGeneration = authorityGeneration;
+    value.role = role;
+    value.state = state;
+    return value;
+  };
+  auto configureAuthority = [&](TransportCredentialDeliveryTestBrain& brain,
+                                uint64_t generation, uint64_t epoch) {
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    brain.masterAuthorityEpoch = epoch;
+    brain.brainConfig.clusterUUID = clusterUUID;
+    brain.masterAuthorityRuntimeState.generation = generation;
+    brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.authorityEpoch = 71;
+    brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.keyEpoch = 72;
+    brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.authorityGeneration = generation;
+    for (uint32_t byte = 0; byte < sizeof(brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.root); ++byte)
+      brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.root[byte] = uint8_t(byte + 1);
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = generation;
+    brain.masterAuthorityRuntimeState.transportCredentialEnrollments = {
+        enrollment(0x9a11, selfUUID, ProdigyTransportCredentialNodeRole::brain,
+                   ProdigyTransportCredentialEnrollmentState::active, generation),
+        enrollment(0x9a12, peerAUUID, ProdigyTransportCredentialNodeRole::brain,
+                   ProdigyTransportCredentialEnrollmentState::active, generation),
+        enrollment(0x9a13, peerBUUID, ProdigyTransportCredentialNodeRole::brain,
+                   ProdigyTransportCredentialEnrollmentState::active, generation)};
+  };
+  auto authenticatePeer = [&](TransportCredentialDeliveryTestBrain& brain,
+                              BrainView& peer, uint128_t peerUUID) {
+    peer.uuid = peerUUID;
+    peer.connected = true;
+    peer.isFixedFile = true;
+    peer.registrationFresh = true;
+    peer.fslot = int(peerUUID & 0x7fff);
+    peer.boottimens = int64_t(peerUUID);
+    peer.ioGeneration = 1;
+    peer.transportEpoch = 1;
+    brain.brains.insert(&peer);
+    const auto& ledger = brain.masterAuthorityRuntimeState.transportCredentialEnrollments;
+    const auto& authority = brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    const ProdigyTransportCredentialEnrollment& remoteEnrollment = ledger[peerUUID == peerAUUID ? 1 : 2];
+    ProdigyTransportCredentialPrelude remoteClaim = {};
+    remoteClaim.operationUUID = remoteEnrollment.operationUUID;
+    remoteClaim.nodeUUID = remoteEnrollment.nodeUUID;
+    remoteClaim.authorityEpoch = remoteEnrollment.authorityEpoch;
+    remoteClaim.keyEpoch = remoteEnrollment.keyEpoch;
+    remoteClaim.authorityGeneration = remoteEnrollment.authorityGeneration;
+    remoteClaim.role = remoteEnrollment.role;
+    String remotePrelude = {};
+    if (!prodigyRenderTransportCredentialPrelude(remoteClaim, remotePrelude)) return false;
+    ProdigyTransportTLSStream remoteStream = {};
+    reserveTransportStream(peer);
+    reserveTransportStream(remoteStream);
+    if (!brain.beginInternalControlTransport(&peer, false, ProdigyTransportCredentialNodeRole::brain, peerUUID) ||
+        !remoteStream.beginTransportAEGISWithPrelude(true, peerUUID, remotePrelude,
+        [&authority, &ledger, peerUUID](const String& claimed, std::array<uint8_t, 32>& psk,
+                                        String& context, uint128_t& authenticatedUUID) {
+          return prodigyResolveBrainTransportCredentialPeer(authority, ledger, peerUUID,
+              ProdigyTransportCredentialNodeRole::brain, claimed, "brain-brain"_ctv,
+              psk.data(), context, authenticatedUUID);
+        }) || !completeTransportHandshake(peer, remoteStream)) return false;
+    return peer.transportAEGISEnabled() && peer.isTransportNegotiated() && peer.tlsPeerVerified &&
+        peer.tlsPeerUUID == peerUUID;
+  };
+  auto acknowledgeCurrent = [&](TransportCredentialDeliveryTestBrain& brain, BrainView& peer) {
+    String serialized = {}, digest = {};
+    if (!brain.serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
+    Brain::MasterAuthorityReplicationPeerState tracking = {};
+    tracking.uuid = peer.uuid;
+    tracking.bootNs = peer.boottimens;
+    tracking.ioGeneration = peer.ioGeneration;
+    tracking.transportEpoch = peer.transportEpoch;
+    tracking.fileSlot = peer.fslot;
+    tracking.acknowledgedGeneration = brain.masterAuthorityRuntimeState.generation;
+    tracking.acknowledgedTransitionDigest = digest;
+    brain.masterAuthorityReplicationByPeer.insert_or_assign(&peer, std::move(tracking));
+    return true;
+  };
+
+  TransportCredentialDeliveryTestBrain brain = {};
+  configureAuthority(brain, 10, 81);
+  String replicatedTransitionBytes = {}, replicatedTransitionDigest = {};
+  ProdigyMasterAuthorityStateTransition replicatedTransition = {};
+  suite.require(brain.serializeCurrentMasterAuthorityTransition(replicatedTransitionBytes,
+                                                                replicatedTransitionDigest) &&
+                    BitseryEngine::deserializeSafe(replicatedTransitionBytes, replicatedTransition),
+                "transport_credential_owner_serializes_v5_authority_transition");
+  suite.expect(replicatedTransition.version == 5 &&
+                   replicatedTransition.runtimeState.transportCredentialAuthorityRoot.valid() &&
+                   replicatedTransition.runtimeState.transportCredentialEnrollments.size() == 3 &&
+                   std::memcmp(replicatedTransition.runtimeState.transportCredentialAuthorityRoot.root,
+                               brain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot.root,
+                               sizeof(replicatedTransition.runtimeState.transportCredentialAuthorityRoot.root)) == 0,
+               "transport_credential_owner_v5_transition_round_trip_preserves_private_root_and_ledger");
+  String publicRuntimeBytes = {};
+  ProdigyMasterAuthorityRuntimeState reusedPublicRuntime = brain.masterAuthorityRuntimeState;
+  BitseryEngine::serialize(publicRuntimeBytes, brain.masterAuthorityRuntimeState);
+  suite.expect(BitseryEngine::deserializeSafe(publicRuntimeBytes, reusedPublicRuntime) &&
+                   reusedPublicRuntime.transportCredentialAuthorityRoot.valid() == false &&
+                   reusedPublicRuntime.transportCredentialEnrollments.size() == 3,
+               "transport_credential_owner_public_runtime_round_trip_clears_reused_private_root");
+  ProdigyMasterAuthorityStateTransition legacyTransition = replicatedTransition;
+  legacyTransition.version = 4;
+  String legacyTransitionBytes = {};
+  ProdigyMasterAuthorityStateTransition decodedLegacyTransition = {};
+  BitseryEngine::serialize(legacyTransitionBytes, legacyTransition);
+  suite.require(BitseryEngine::deserializeSafe(legacyTransitionBytes, decodedLegacyTransition),
+                "transport_credential_owner_deserializes_legacy_transition_fixture");
+  TransportCredentialDeliveryTestBrain legacyReceiver = {};
+  configureAuthority(legacyReceiver, 9, 80);
+  legacyReceiver.weAreMaster = false;
+  suite.expect(decodedLegacyTransition.runtimeState.transportCredentialAuthorityRoot.valid() == false &&
+                   legacyReceiver.applyReplicatedMasterAuthorityTransition(decodedLegacyTransition, false) == false,
+               "transport_credential_owner_rejects_legacy_envelope_that_omits_credential_root");
+  BrainView peerA = {};
+  suite.require(authenticatePeer(brain, peerA, peerAUUID),
+                "transport_credential_owner_aegis_peer_authenticates_exact_voter");
+
+  {
+    // The projection ACK is accepted only from the currently authenticated
+    // Neuron control stream. Keep this isolated from the enrollment operation
+    // fixture below because the ACK path deliberately drives its owner.
+    const uint128_t neuronUUID = uint128_t(0x9a30);
+    ScopedRing projectionRing = {};
+    TransportCredentialDeliveryTestBrain projectionBrain = {};
+    configureAuthority(projectionBrain, 40, 91);
+    projectionBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a31, neuronUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 40));
+
+    Machine machine = {};
+    machine.uuid = neuronUUID;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = true;
+    machine.neuron.isFixedFile = true;
+    machine.neuron.fslot = 30;
+    machine.neuron.ioGeneration = 7;
+    projectionBrain.machines.insert(&machine);
+    projectionBrain.neurons.insert(&machine.neuron);
+
+    const auto& authority = projectionBrain.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    const auto& ledger = projectionBrain.masterAuthorityRuntimeState.transportCredentialEnrollments;
+    const auto& neuronEnrollment = ledger.back();
+    ProdigyTransportCredentialPrelude remoteClaim = {};
+    remoteClaim.operationUUID = neuronEnrollment.operationUUID;
+    remoteClaim.nodeUUID = neuronEnrollment.nodeUUID;
+    remoteClaim.authorityEpoch = neuronEnrollment.authorityEpoch;
+    remoteClaim.keyEpoch = neuronEnrollment.keyEpoch;
+    remoteClaim.authorityGeneration = neuronEnrollment.authorityGeneration;
+    remoteClaim.role = neuronEnrollment.role;
+    String remotePrelude = {};
+    ProdigyTransportTLSStream remoteStream = {};
+    reserveTransportStream(machine.neuron);
+    reserveTransportStream(remoteStream);
+    suite.require(prodigyRenderTransportCredentialPrelude(remoteClaim, remotePrelude) &&
+                      projectionBrain.beginInternalControlTransport(
+                          &machine.neuron, false, ProdigyTransportCredentialNodeRole::neuron, neuronUUID) &&
+                      remoteStream.beginTransportAEGISWithPrelude(
+                          true, neuronUUID, remotePrelude,
+                          [&authority, &ledger, neuronUUID](const String& claimed, std::array<uint8_t, 32>& psk,
+                                                            String& context, uint128_t& authenticatedUUID) {
+                            return prodigyResolveBrainTransportCredentialPeer(
+                                authority, ledger, neuronUUID, ProdigyTransportCredentialNodeRole::neuron, claimed,
+                                "brain-neuron"_ctv, psk.data(), context, authenticatedUUID);
+                          }) &&
+                      completeTransportHandshake(machine.neuron, remoteStream),
+                  "transport_credential_projection_ack_uses_authenticated_aegis_neuron_stream");
+    suite.require(machine.neuron.transportAEGISEnabled() && machine.neuron.isTransportNegotiated() &&
+                      machine.neuron.tlsPeerVerified && machine.neuron.tlsPeerUUID == neuronUUID,
+                  "transport_credential_projection_ack_authenticated_neuron_identity_matches_machine");
+
+    auto armProjectionAck = [&](uint128_t nonce, uint64_t generation, const String& fingerprint) {
+      machine.neuron.transportPeerProjectionCapable = true;
+      machine.neuron.transportPeerProjectionIOGeneration = machine.neuron.ioGeneration;
+      machine.neuron.transportPeerProjectionAuthorityEpoch = projectionBrain.masterAuthorityEpoch;
+      machine.neuron.transportPeerProjectionNonce = nonce;
+      machine.neuron.transportPeerProjectionGeneration = generation;
+      machine.neuron.transportPeerProjectionFingerprint = fingerprint;
+      machine.neuron.transportPeerProjectionAcknowledgedFingerprint.clear();
+    };
+
+    const uint64_t revision = projectionBrain.masterAuthorityRuntimeState.generation;
+    armProjectionAck(0x9a3201, revision, "projection-accepted"_ctv);
+    suite.require(projectionBrain.transportPeerProjectionNeuronAuthorized(&machine.neuron),
+                  "transport_credential_projection_ack_authorizes_current_authenticated_neuron_stream");
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3201, revision, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.equals("projection-accepted"_ctv),
+                 "transport_credential_projection_ack_accepts_exact_nonce_and_revision");
+
+    armProjectionAck(0x9a3202, revision, "projection-wrong-nonce"_ctv);
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3203, revision, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0x9a3202 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.empty(),
+                 "transport_credential_projection_ack_rejects_wrong_nonce");
+
+    armProjectionAck(0x9a3204, revision, "projection-wrong-revision"_ctv);
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3204, revision + 1, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0x9a3204 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.empty(),
+                 "transport_credential_projection_ack_rejects_wrong_revision");
+
+    armProjectionAck(0x9a3205, revision, "projection-io-generation"_ctv);
+    ++machine.neuron.ioGeneration;
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3205, revision, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0x9a3205 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.empty(),
+                 "transport_credential_projection_ack_rejects_changed_io_generation");
+    machine.neuron.transportPeerProjectionIOGeneration = machine.neuron.ioGeneration;
+
+    armProjectionAck(0x9a3206, revision, "projection-master-epoch"_ctv);
+    ++projectionBrain.masterAuthorityEpoch;
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3206, revision, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0x9a3206 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.empty(),
+                 "transport_credential_projection_ack_rejects_changed_master_epoch");
+    --projectionBrain.masterAuthorityEpoch;
+
+    armProjectionAck(0x9a3207, revision, "projection-no-capability"_ctv);
+    machine.neuron.transportPeerProjectionCapable = false;
+    projectionBrain.acknowledgeTransportCredentialPeerProjection(&machine.neuron, 0x9a3207, revision, true);
+    suite.expect(machine.neuron.transportPeerProjectionNonce == 0x9a3207 &&
+                     machine.neuron.transportPeerProjectionAcknowledgedFingerprint.empty(),
+                 "transport_credential_projection_ack_rejects_missing_capability");
+  }
+
+  Vector<uint128_t> voters = {selfUUID, peerAUUID, peerBUUID};
+  ProdigyTransportCredentialEnrollment target = enrollment(
+      0x9a20, uint128_t(0x9a21), ProdigyTransportCredentialNodeRole::neuron,
+      ProdigyTransportCredentialEnrollmentState::pending, 11);
+  bool completion = false;
+  brain.holdRuntimePersistence = true;
+  brain.enrollTransportCredentialAsync(target, voters, [&](bool durable) { completion = durable; });
+  suite.expect(brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() == 1 &&
+                   brain.transportCredentialDeliveryCalls == 0 && completion == false,
+               "transport_credential_owner_never_releases_before_local_durable_receipt");
+  brain.finishRuntimePersistence(true);
+  suite.expect(completion && brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                   ProdigyTransportCredentialEnrollmentOperationPhase::pending &&
+                   brain.transportCredentialDeliveryCalls == 0,
+               "transport_credential_owner_pending_requires_exact_authenticated_majority_ack");
+
+  String staleSerialized = {}, staleDigest = {};
+  suite.require(brain.serializeCurrentMasterAuthorityTransition(staleSerialized, staleDigest),
+                "transport_credential_owner_current_digest_before_ack");
+  Brain::MasterAuthorityReplicationPeerState stale = {};
+  stale.uuid = peerA.uuid;
+  stale.bootNs = peerA.boottimens;
+  stale.ioGeneration = peerA.ioGeneration;
+  stale.transportEpoch = peerA.transportEpoch;
+  stale.fileSlot = peerA.fslot;
+  stale.acknowledgedGeneration = brain.masterAuthorityRuntimeState.generation;
+  stale.acknowledgedTransitionDigest = "not-the-current-digest"_ctv;
+  brain.masterAuthorityReplicationByPeer.insert_or_assign(&peerA, stale);
+  brain.driveTransportCredentialEnrollmentOperations();
+  suite.expect(brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                   ProdigyTransportCredentialEnrollmentOperationPhase::pending,
+               "transport_credential_owner_rejects_stale_or_wrong_digest_ack");
+
+  suite.require(acknowledgeCurrent(brain, peerA), "transport_credential_owner_records_exact_pending_ack");
+  brain.driveTransportCredentialEnrollmentOperations();
+  suite.expect(brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                   ProdigyTransportCredentialEnrollmentOperationPhase::active && brain.transportCredentialDeliveryCalls == 0,
+               "transport_credential_owner_pending_becomes_active_before_virtual_delivery");
+  brain.finishRuntimePersistence(true);
+  brain.masterAuthorityReplicationByPeer[&peerA].transportEpoch += 1;
+  brain.driveTransportCredentialEnrollmentOperations();
+  suite.expect(brain.transportCredentialDeliveryCalls == 0,
+               "transport_credential_owner_rejects_replaced_connection_epoch_ack");
+  suite.require(acknowledgeCurrent(brain, peerA), "transport_credential_owner_records_exact_active_ack");
+  brain.acceptTransportCredentialDelivery = false;
+  brain.driveTransportCredentialEnrollmentOperations();
+  suite.expect(brain.transportCredentialDeliveryCalls == 1 &&
+                   brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                       ProdigyTransportCredentialEnrollmentOperationPhase::active,
+               "transport_credential_owner_failed_delivery_sink_keeps_durable_active_intent_without_loop");
+  brain.acceptTransportCredentialDelivery = true;
+  brain.driveTransportCredentialEnrollmentOperations();
+  suite.expect(brain.transportCredentialDeliveryCalls == 2 &&
+                   brain.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                       ProdigyTransportCredentialEnrollmentOperationPhase::delivered,
+               "transport_credential_owner_delivers_only_after_active_generation_quorum");
+  brain.finishRuntimePersistence(true);
+
+  TransportCredentialDeliveryTestBrain promoted = {};
+  configureAuthority(promoted, 20, 91);
+  BrainView promotedPeer = {};
+  suite.require(authenticatePeer(promoted, promotedPeer, peerAUUID),
+                "transport_credential_owner_promotion_aegis_peer_authenticates");
+  ProdigyTransportCredentialEnrollment promotedTarget = enrollment(
+      0x9a30, uint128_t(0x9a31), ProdigyTransportCredentialNodeRole::neuron,
+      ProdigyTransportCredentialEnrollmentState::active, 21);
+  promoted.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(promotedTarget);
+  ProdigyTransportCredentialEnrollmentOperation promotedOperation = {};
+  promotedOperation.enrollment = promotedTarget;
+  promotedOperation.electorate = voters;
+  promotedOperation.pinnedMasterAuthorityEpoch = 90;
+  promotedOperation.transitionGeneration = 21;
+  promotedOperation.phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+  promoted.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.push_back(promotedOperation);
+  promoted.holdRuntimePersistence = true;
+  suite.expect(promoted.reDriveTransportCredentialEnrollmentOperationsAfterPromotion() &&
+                   promoted.transportCredentialDeliveryCalls == 0,
+               "transport_credential_owner_promotion_restamps_active_intent_before_delivery");
+  promoted.finishRuntimePersistence(true);
+  promoted.driveTransportCredentialEnrollmentOperations();
+  suite.expect(promoted.transportCredentialDeliveryCalls == 0,
+               "transport_credential_owner_promotion_requires_new_epoch_quorum");
+  suite.require(acknowledgeCurrent(promoted, promotedPeer),
+                "transport_credential_owner_promotion_records_new_generation_ack");
+  promoted.driveTransportCredentialEnrollmentOperations();
+  suite.expect(promoted.transportCredentialDeliveryCalls == 1 &&
+                   promoted.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                       ProdigyTransportCredentialEnrollmentOperationPhase::delivered,
+               "transport_credential_owner_promotion_redrives_only_durable_active_intent_with_new_quorum");
+
+  TransportCredentialDeliveryTestBrain admission = {};
+  configureAuthority(admission, 30, 101);
+  ProdigyTransportCredentialEnrollment invalidVoters = enrollment(
+      0x9a40, uint128_t(0x9a41), ProdigyTransportCredentialNodeRole::neuron,
+      ProdigyTransportCredentialEnrollmentState::pending, 31);
+  bool rejected = false;
+  admission.enrollTransportCredentialAsync(invalidVoters, {selfUUID}, [&](bool accepted) { rejected = !accepted; });
+  invalidVoters.clusterUUID += 1;
+  admission.enrollTransportCredentialAsync(invalidVoters, voters, [&](bool accepted) { rejected |= !accepted; });
+  suite.expect(rejected && admission.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.empty(),
+               "transport_credential_owner_rejects_shrunk_electorate_and_wrong_cluster_before_persistence");
+  bool admitted = false;
+  bool replayed = false;
+  ProdigyTransportCredentialEnrollment exact = enrollment(
+      0x9a42, uint128_t(0x9a43), ProdigyTransportCredentialNodeRole::neuron,
+      ProdigyTransportCredentialEnrollmentState::pending, 31);
+  admission.enrollTransportCredentialAsync(exact, voters, [&](bool accepted) { admitted = accepted; });
+  admission.enrollTransportCredentialAsync(exact, voters, [&](bool accepted) { replayed = accepted; });
+  suite.expect(admitted && replayed && admission.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() == 1,
+               "transport_credential_owner_exact_pending_replay_is_idempotent_without_second_operation");
+  bool concurrentRejected = false;
+  ProdigyTransportCredentialEnrollment concurrent = enrollment(
+      0x9a44, uint128_t(0x9a45), ProdigyTransportCredentialNodeRole::brain,
+      ProdigyTransportCredentialEnrollmentState::pending, 32);
+  admission.enrollTransportCredentialAsync(concurrent, voters,
+      [&](bool accepted) { concurrentRejected = !accepted; });
+  suite.expect(concurrentRejected && admission.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() == 1,
+               "transport_credential_owner_rejects_concurrent_enrollment_before_frozen_electorate_can_change");
+
+  TransportCredentialDeliveryTestBrain saturated = {};
+  configureAuthority(saturated, 40, 111);
+  ProdigyTransportCredentialEnrollment saturatedTarget = enrollment(
+      0x9a50, uint128_t(0x9a51), ProdigyTransportCredentialNodeRole::neuron,
+      ProdigyTransportCredentialEnrollmentState::active, 41);
+  saturated.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(saturatedTarget);
+  ProdigyTransportCredentialEnrollmentOperation saturatedOperation = {};
+  saturatedOperation.enrollment = saturatedTarget;
+  saturatedOperation.electorate = voters;
+  saturatedOperation.pinnedMasterAuthorityEpoch = 110;
+  saturatedOperation.transitionGeneration = 41;
+  saturatedOperation.phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+  saturated.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.push_back(saturatedOperation);
+  saturated.masterAuthorityRuntimeState.generation = UINT64_MAX;
+  saturated.durableMasterAuthorityRuntimeStateGeneration = UINT64_MAX;
+  suite.expect(saturated.reDriveTransportCredentialEnrollmentOperationsAfterPromotion() == false &&
+                   saturated.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].pinnedMasterAuthorityEpoch == 110,
+               "transport_credential_owner_promotion_generation_saturation_preserves_unfinished_operation");
+  saturated.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].pinnedMasterAuthorityEpoch = 111;
+  BrainView saturatedPeer = {};
+  suite.require(authenticatePeer(saturated, saturatedPeer, peerAUUID),
+                "transport_credential_owner_saturation_aegis_peer_authenticates");
+  suite.require(acknowledgeCurrent(saturated, saturatedPeer),
+                "transport_credential_owner_saturation_records_current_ack");
+  saturated.driveTransportCredentialEnrollmentOperations();
+  suite.expect(saturated.transportCredentialDeliveryCalls == 0 &&
+                   saturated.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].phase ==
+                       ProdigyTransportCredentialEnrollmentOperationPhase::active,
+               "transport_credential_owner_generation_saturation_blocks_active_delivery_before_mutation");
+  saturated.masterAuthorityRuntimeState.generation = 40;
+  saturated.durableMasterAuthorityRuntimeStateGeneration = 40;
+  saturated.masterAuthorityEpoch = 0;
+  suite.expect(saturated.reDriveTransportCredentialEnrollmentOperationsAfterPromotion() == false &&
+                   saturated.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations[0].pinnedMasterAuthorityEpoch == 111,
+               "transport_credential_owner_promotion_requires_nonzero_authority_epoch");
+
+  // An addMachines journal creates one cohort: two roles for a new Brain and
+  // one Neuron role for a worker.  The three already-active Brains are the
+  // complete frozen electorate; the newly admitted Brain is never a voter.
+  auto machine = [](uint128_t uuid, bool isBrain) {
+    ClusterMachine value = {};
+    value.uuid = uuid;
+    value.isBrain = isBrain;
+    return value;
+  };
+  const uint128_t newBrainUUID = uint128_t(0x9a60);
+  const uint128_t newWorkerUUID = uint128_t(0x9a61);
+  const uint64_t addMachinesOperationID = 0x9a62;
+  TransportCredentialCohortTestBrain cohort = {};
+  configureAuthority(cohort, 60, 151);
+  cohort.authoritativeTopology.machines = {
+      machine(selfUUID, true), machine(peerAUUID, true), machine(peerBUUID, true)};
+  ProdigyPendingAddMachinesOperation pendingAddMachines = {};
+  pendingAddMachines.operationID = addMachinesOperationID;
+  pendingAddMachines.plannedTopology.machines = cohort.authoritativeTopology.machines;
+  pendingAddMachines.plannedTopology.machines.push_back(machine(newBrainUUID, true));
+  pendingAddMachines.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  pendingAddMachines.machinesToBootstrap = {machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+  cohort.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(pendingAddMachines));
+
+  bool cohortReady = false;
+  cohort.holdRuntimePersistence = true;
+  suite.expect(cohort.ensurePendingAddMachinesTransportCohort(addMachinesOperationID,
+                                                              [&](bool ready) { cohortReady = ready; }) &&
+                   cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() == 3 &&
+                   !cohortReady && cohort.transportCredentialDeliveryCalls == 0,
+               "transport_credential_add_machines_stages_common_three_role_cohort_without_delivery");
+  cohort.finishRuntimePersistence(true);
+  suite.expect(!cohortReady &&
+                   std::all_of(cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.begin(),
+                               cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.end(),
+                               [](const auto& operation) {
+                                 return operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending;
+                               }),
+               "transport_credential_add_machines_durable_staging_waits_for_pending_exact_quorum");
+  ProdigyInitialTransportCredentialProjection stagedProjection = {};
+  suite.expect(!cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), stagedProjection) &&
+                   cohort.transportCredentialDeliveryCalls == 0,
+               "transport_credential_add_machines_never_projects_or_delivers_while_staging");
+  bool prematureReceiptRejected = false;
+  cohort.markAddMachinesTransportCredentialDeliveredAsync(
+      newWorkerUUID, [&](bool durable) { prematureReceiptRejected = !durable; });
+  suite.expect(prematureReceiptRejected,
+               "transport_credential_add_machines_rejects_delivery_receipt_before_active_cohort");
+
+  BrainView cohortPeer = {};
+  suite.require(authenticatePeer(cohort, cohortPeer, peerAUUID),
+                "transport_credential_add_machines_authenticates_frozen_old_voter");
+  suite.require(acknowledgeCurrent(cohort, cohortPeer),
+                "transport_credential_add_machines_records_pending_transition_ack");
+  cohort.driveTransportCredentialEnrollmentOperations();
+  suite.expect(std::all_of(cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.begin(),
+                           cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.end(),
+                           [](const auto& operation) {
+                             return operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active;
+                           }) && !cohortReady,
+               "transport_credential_add_machines_activates_entire_cohort_atomically_before_readiness");
+  cohort.finishRuntimePersistence(true);
+  cohort.driveTransportCredentialEnrollmentOperations();
+  suite.expect(!cohortReady,
+               "transport_credential_add_machines_active_transition_requires_its_own_exact_quorum");
+  suite.require(acknowledgeCurrent(cohort, cohortPeer),
+                "transport_credential_add_machines_records_active_transition_ack");
+  cohort.existingNeuronProjectionAvailable = false;
+  cohort.driveTransportCredentialEnrollmentOperations();
+
+  ProdigyInitialTransportCredentialProjection cohortProjection = {};
+  suite.expect(!cohortReady &&
+                   !cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), cohortProjection) &&
+                   cohort.transportCredentialDeliveryCalls == 0,
+               "transport_credential_add_machines_active_quorum_waits_for_existing_neuron_projection");
+  cohort.existingNeuronProjectionAvailable = true;
+  cohort.driveTransportCredentialEnrollmentOperations();
+  suite.expect(cohortReady &&
+                   cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), cohortProjection) &&
+                   cohortProjection.authority.valid() && cohortProjection.ledger.size() == 6 &&
+                   cohort.transportCredentialDeliveryCalls == 0,
+               "transport_credential_add_machines_releases_root_projection_after_existing_neuron_projection");
+  bool workerReceiptDurable = false;
+  cohort.markAddMachinesTransportCredentialDeliveredAsync(
+      newWorkerUUID, [&](bool durable) { workerReceiptDurable = durable; });
+  suite.expect(!workerReceiptDurable,
+               "transport_credential_add_machines_worker_receipt_waits_for_durable_commit");
+  cohort.finishRuntimePersistence(true);
+  uint32_t workerDelivered = 0;
+  uint32_t brainRolesStillActive = 0;
+  for (const auto& operation : cohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+  {
+    if (operation.enrollment.nodeUUID == newWorkerUUID &&
+        operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::delivered) ++workerDelivered;
+    if (operation.enrollment.nodeUUID == newBrainUUID &&
+        operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active) ++brainRolesStillActive;
+  }
+  suite.expect(workerReceiptDurable && workerDelivered == 1 && brainRolesStillActive == 2,
+               "transport_credential_add_machines_durable_receipt_marks_only_bootstrapped_machine");
+
+  TransportCredentialCohortTestBrain partial = {};
+  configureAuthority(partial, 70, 161);
+  partial.authoritativeTopology = cohort.authoritativeTopology;
+  ProdigyPendingAddMachinesOperation partialPending = {};
+  partialPending.operationID = addMachinesOperationID;
+  partialPending.plannedTopology.machines = cohort.authoritativeTopology.machines;
+  partialPending.plannedTopology.machines.push_back(machine(newBrainUUID, true));
+  partialPending.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  partialPending.machinesToBootstrap = {machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+  partial.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(partialPending));
+  auto partialRecord = enrollment((uint128_t(addMachinesOperationID) << 64) ^ (newBrainUUID << 1) ^ 0,
+                                  newBrainUUID, ProdigyTransportCredentialNodeRole::neuron,
+                                  ProdigyTransportCredentialEnrollmentState::pending, 71);
+  partial.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(partialRecord);
+  bool partialRejected = false;
+  suite.expect(!partial.ensurePendingAddMachinesTransportCohort(addMachinesOperationID,
+                                                                 [&](bool ready) { partialRejected = !ready; }) &&
+                   partialRejected && partial.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.empty(),
+               "transport_credential_add_machines_rejects_partial_or_mixed_journal_role_set_atomically");
+
+  TransportCredentialCohortTestBrain extraRole = {};
+  configureAuthority(extraRole, 75, 166);
+  extraRole.authoritativeTopology = cohort.authoritativeTopology;
+  ProdigyPendingAddMachinesOperation extraRolePending = {};
+  extraRolePending.operationID = addMachinesOperationID;
+  extraRolePending.plannedTopology.machines = cohort.authoritativeTopology.machines;
+  extraRolePending.plannedTopology.machines.push_back(machine(newBrainUUID, true));
+  extraRolePending.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  extraRolePending.machinesToBootstrap = {machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+  extraRole.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(extraRolePending));
+  extraRole.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+      enrollment(0x9a65, newWorkerUUID, ProdigyTransportCredentialNodeRole::brain,
+                 ProdigyTransportCredentialEnrollmentState::pending, 76));
+  bool extraRoleRejected = false;
+  suite.expect(!extraRole.ensurePendingAddMachinesTransportCohort(addMachinesOperationID,
+                                                                   [&](bool ready) { extraRoleRejected = !ready; }) &&
+                   extraRoleRejected && extraRole.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.empty(),
+               "transport_credential_add_machines_rejects_extra_journal_node_role_atomically");
+
+  TransportCredentialCohortTestBrain fenced = {};
+  configureAuthority(fenced, 80, 171);
+  fenced.authoritativeTopology = cohort.authoritativeTopology;
+  ProdigyPendingAddMachinesOperation fencedPending = {};
+  fencedPending.operationID = addMachinesOperationID;
+  fencedPending.plannedTopology.machines = cohort.authoritativeTopology.machines;
+  fencedPending.plannedTopology.machines.push_back(machine(newBrainUUID, true));
+  fencedPending.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  fencedPending.machinesToBootstrap = {machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+  fenced.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(fencedPending));
+  const auto beforeFencedEnrollments = fenced.masterAuthorityRuntimeState.transportCredentialEnrollments.size();
+  bool singletonVectorRejected = false;
+  bool singletonLegacyRejected = false;
+  auto singleton = enrollment(0x9a63, uint128_t(0x9a64), ProdigyTransportCredentialNodeRole::neuron,
+                              ProdigyTransportCredentialEnrollmentState::pending, 81);
+  const bool singletonVectorAdmitted = fenced.enrollTransportCredentialCohortAsync(
+      {singleton}, voters, 0, [&](bool ready) { singletonVectorRejected = !ready; });
+  fenced.enrollTransportCredentialAsync(singleton, voters,
+      [&](bool ready) { singletonLegacyRejected = !ready; });
+  suite.expect(!singletonVectorAdmitted && singletonVectorRejected && singletonLegacyRejected &&
+                   fenced.masterAuthorityRuntimeState.transportCredentialEnrollments.size() == beforeFencedEnrollments,
+               "transport_credential_add_machines_blocks_vector_and_singleton_admission_while_journal_is_unjoined");
+
+  TransportCredentialCohortTestBrain preseeded = {};
+  configureAuthority(preseeded, 90, 181);
+  preseeded.authoritativeTopology.machines = {
+      machine(selfUUID, true), machine(peerAUUID, true), machine(peerBUUID, true)};
+  ProdigyPendingAddMachinesOperation preseededPending = {};
+  preseededPending.operationID = addMachinesOperationID;
+  preseededPending.plannedTopology.machines = preseeded.authoritativeTopology.machines;
+  preseededPending.plannedTopology.machines.push_back(machine(newBrainUUID, true));
+  preseededPending.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  preseededPending.request.readyMachines = {
+      machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+  preseeded.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+      enrollment(0x9a66, newBrainUUID, ProdigyTransportCredentialNodeRole::neuron,
+                 ProdigyTransportCredentialEnrollmentState::active, 90));
+  preseeded.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+      enrollment(0x9a67, newBrainUUID, ProdigyTransportCredentialNodeRole::brain,
+                 ProdigyTransportCredentialEnrollmentState::active, 90));
+  preseeded.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+      enrollment(0x9a68, newWorkerUUID, ProdigyTransportCredentialNodeRole::neuron,
+                 ProdigyTransportCredentialEnrollmentState::active, 90));
+  preseeded.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(preseededPending));
+  bool preseededReady = false;
+  suite.expect(preseeded.ensurePendingAddMachinesTransportCohort(addMachinesOperationID,
+                                                                  [&](bool ready) { preseededReady = ready; }) &&
+                   preseededReady && preseeded.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.empty(),
+               "transport_credential_add_machines_all_preseeded_ready_machines_bypass_new_cohort_release");
+
+  TransportCredentialDeliveryTestBrain receiver = {};
+  configureAuthority(receiver, 50, 121);
+  ProdigyMasterAuthorityRuntimeState malformed = receiver.masterAuthorityRuntimeState;
+  malformed.generation = 51;
+  malformed.transportCredentialEnrollments[0].clusterUUID += 1;
+  suite.expect(receiver.applyReplicatedMasterAuthorityRuntimeState(malformed, true) == false &&
+                   receiver.persistCalls == 0 && receiver.masterAuthorityRuntimeState.generation == 50,
+               "transport_credential_owner_rejects_malformed_replicated_credential_ledger_before_persistence");
+  thisNeuron = previousNeuron;
+}
+
 int main(void)
 {
   if (getenv("PRODIGY_TEST_STATEFUL_SERVING_AUTHORITY_ONLY") != nullptr)
@@ -30984,7 +31681,18 @@ int main(void)
     testPairedSourceRetirementDurabilityAndPeerAck(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (getenv("PRODIGY_TEST_TRANSPORT_CREDENTIALS_ONLY") != nullptr)
+  {
+    TestSuite suite;
+    testMachineInventoryCopyDoesNotCopyTransport(suite);
+    testTransportCredentialDerivationSymmetry(suite);
+    testTransportCredentialEnrollmentOwner(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   TestSuite suite;
+  testMachineInventoryCopyDoesNotCopyTransport(suite);
+  testTransportCredentialDerivationSymmetry(suite);
+  testTransportCredentialEnrollmentOwner(suite);
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "placement-policy") == 0)
   {

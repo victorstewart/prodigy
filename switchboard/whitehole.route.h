@@ -95,6 +95,13 @@ struct SwitchboardWormholeFlowGCCursor {
   SwitchboardWormholeFlowMapGCCursor pending = {};
 };
 
+struct SwitchboardPairAdmissionGCCursor {
+  switchboard_pair_admission_grant_key grantBatch = {};
+  switchboard_pair_admission_route_key routeBatch = {};
+  bool grantActive = false;
+  bool routeActive = false;
+};
+
 static inline bool switchboardPortalDefinitionEquals(const portal_definition& lhs, const portal_definition& rhs)
 {
   return lhs.port == rhs.port && lhs.proto == rhs.proto && std::memcmp(lhs.addr6, rhs.addr6, sizeof(lhs.addr6)) == 0;
@@ -176,6 +183,16 @@ static inline void switchboardWormholePendingFlowPinPath(String& path, uint32_t 
   path.snprintf<"/sys/fs/bpf/prodigy_wormhole_pending_flows_{itoa}"_ctv>(ifindex);
 }
 
+static inline void switchboardPairAdmissionGrantPinPath(String& path, uint32_t ifindex)
+{
+  path.snprintf<"/sys/fs/bpf/prodigy_pair_admission_grants_{itoa}"_ctv>(ifindex);
+}
+
+static inline void switchboardPairAdmissionRoutePinPath(String& path, uint32_t ifindex)
+{
+  path.snprintf<"/sys/fs/bpf/prodigy_pair_admission_routes_{itoa}"_ctv>(ifindex);
+}
+
 static inline uint32_t switchboardKernelMapID(int fd)
 {
   struct bpf_map_info info = {};
@@ -206,6 +223,25 @@ static inline bool switchboardWormholePendingFlowMapCompatibleFD(int fd)
          info.max_entries == WORMHOLE_PENDING_FLOW_MAX_ENTRIES;
 }
 
+static inline bool switchboardPairAdmissionGrantMapCompatibleFD(int fd)
+{
+  struct bpf_map_info info = {};
+  __u32 bytes = sizeof(info);
+  return fd >= 0 && bpf_map_get_info_by_fd(fd, &info, &bytes) == 0 && info.type == BPF_MAP_TYPE_HASH &&
+         info.key_size == sizeof(switchboard_pair_admission_grant_key) &&
+         info.value_size == sizeof(switchboard_pair_admission_grant) && info.max_entries == WORMHOLE_PENDING_FLOW_MAX_ENTRIES &&
+         (info.map_flags & BPF_F_NO_PREALLOC) != 0;
+}
+
+static inline bool switchboardPairAdmissionRouteMapCompatibleFD(int fd)
+{
+  struct bpf_map_info info = {};
+  __u32 bytes = sizeof(info);
+  return fd >= 0 && bpf_map_get_info_by_fd(fd, &info, &bytes) == 0 && info.type == BPF_MAP_TYPE_HASH &&
+         info.key_size == sizeof(switchboard_pair_admission_route_key) &&
+         info.value_size == sizeof(switchboard_pair_admission_route_policy) && info.max_entries == 1024;
+}
+
 static inline bool switchboardPinnedWormholeFlowMapsCompatible(uint32_t ifindex)
 {
   if (ifindex == 0)
@@ -214,12 +250,20 @@ static inline bool switchboardPinnedWormholeFlowMapsCompatible(uint32_t ifindex)
   }
   String establishedPath = {};
   String pendingPath = {};
+  String grantPath = {};
+  String routePath = {};
   switchboardWormholeFlowPinPath(establishedPath, ifindex);
   switchboardWormholePendingFlowPinPath(pendingPath, ifindex);
+  switchboardPairAdmissionGrantPinPath(grantPath, ifindex);
+  switchboardPairAdmissionRoutePinPath(routePath, ifindex);
   int establishedFD = bpf_obj_get(establishedPath.c_str());
   int pendingFD = bpf_obj_get(pendingPath.c_str());
+  int grantFD = bpf_obj_get(grantPath.c_str());
+  int routeFD = bpf_obj_get(routePath.c_str());
   bool compatible = switchboardWormholeEstablishedFlowMapCompatibleFD(establishedFD) &&
-                    switchboardWormholePendingFlowMapCompatibleFD(pendingFD);
+                    switchboardWormholePendingFlowMapCompatibleFD(pendingFD) &&
+                    switchboardPairAdmissionGrantMapCompatibleFD(grantFD) &&
+                    switchboardPairAdmissionRouteMapCompatibleFD(routeFD);
   if (establishedFD >= 0)
   {
     ::close(establishedFD);
@@ -228,6 +272,8 @@ static inline bool switchboardPinnedWormholeFlowMapsCompatible(uint32_t ifindex)
   {
     ::close(pendingFD);
   }
+  if (grantFD >= 0) ::close(grantFD);
+  if (routeFD >= 0) ::close(routeFD);
   return compatible;
 }
 
@@ -236,6 +282,8 @@ static inline bool switchboardProgramHasCompatibleWormholeFlowMaps(Program *prog
 {
   bool established = false;
   bool pending = false;
+  bool grants = false;
+  bool routes = false;
   if (program)
   {
     program->openMap("wh_flows"_ctv, [&](int mapFD) -> void {
@@ -244,8 +292,14 @@ static inline bool switchboardProgramHasCompatibleWormholeFlowMaps(Program *prog
     program->openMap("wh_pending"_ctv, [&](int mapFD) -> void {
       pending = switchboardWormholePendingFlowMapCompatibleFD(mapFD);
     });
+    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+      grants = switchboardPairAdmissionGrantMapCompatibleFD(mapFD);
+    });
+    program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+      routes = switchboardPairAdmissionRouteMapCompatibleFD(mapFD);
+    });
   }
-  return established && pending;
+  return established && pending && grants && routes;
 }
 
 template <typename Program>
@@ -375,6 +429,69 @@ static inline bool switchboardCleanupExpiredWormholeFlows(Program *program,
     *deletedCount = deleted;
   }
   return establishedCleaned && pendingCleaned;
+}
+
+template <typename Program>
+static inline bool switchboardCleanupExpiredPairAdmissionMaps(Program *program,
+                                                              uint64_t nowNs,
+                                                              SwitchboardPairAdmissionGCCursor& cursor,
+                                                              uint32_t *deletedCount = nullptr)
+{
+  if (program == nullptr || nowNs == 0)
+  {
+    return false;
+  }
+  uint32_t deleted = 0;
+  bool grantsCleaned = false;
+  bool routesCleaned = false;
+  program->openMap("wh_pair_routes"_ctv, [&](int routeFD) -> void {
+    if (switchboardPairAdmissionRouteMapCompatibleFD(routeFD) == false) return;
+    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+      if (switchboardPairAdmissionGrantMapCompatibleFD(mapFD) == false) return;
+      static thread_local std::array<switchboard_pair_admission_grant_key, WORMHOLE_FLOW_GC_BATCH_SIZE> keys = {};
+      static thread_local std::array<switchboard_pair_admission_grant, WORMHOLE_FLOW_GC_BATCH_SIZE> values = {};
+      switchboard_pair_admission_grant_key next = {};
+      __u32 count = WORMHOLE_FLOW_GC_BATCH_SIZE;
+      int result = bpf_map_lookup_batch(mapFD, cursor.grantActive ? &cursor.grantBatch : nullptr, &next,
+                                        keys.data(), values.data(), &count, nullptr);
+      if (result != 0 && errno != ENOENT) return;
+      for (__u32 i = 0; i < count; ++i)
+      {
+        const switchboard_pair_admission_grant& grant = values[i];
+        const __u32 state = grant.state;
+        bool reclaim = state != SWITCHBOARD_PAIR_ADMISSION_CONSUMED ? grant.expires_at_ns <= nowNs
+                                                                      : grant.consumed_expires_at_ns <= nowNs;
+        switchboard_pair_admission_route_key routeKey = {grant.pair_uuid_hi, grant.pair_uuid_lo, grant.route_uuid_hi, grant.route_uuid_lo};
+        switchboard_pair_admission_route_policy route = {};
+        bool routeCurrent = bpf_map_lookup_elem(routeFD, &routeKey, &route) == 0 &&
+                            route.expires_at_ns > nowNs && route.state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED &&
+                            route.route_generation == grant.route_generation && route.root_generation == grant.root_generation &&
+                            route.key_epoch == grant.key_epoch;
+        if (reclaim || routeCurrent == false)
+          deleted += bpf_map_delete_elem(mapFD, &keys[i]) == 0 ? 1u : 0u;
+      }
+      cursor.grantActive = result == 0 && count != 0;
+      if (cursor.grantActive) cursor.grantBatch = next;
+      grantsCleaned = true;
+    });
+  });
+  program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+    if (switchboardPairAdmissionRouteMapCompatibleFD(mapFD) == false) return;
+    static thread_local std::array<switchboard_pair_admission_route_key, 1024> keys = {};
+    static thread_local std::array<switchboard_pair_admission_route_policy, 1024> values = {};
+    switchboard_pair_admission_route_key next = {};
+    __u32 count = 1024;
+    int result = bpf_map_lookup_batch(mapFD, cursor.routeActive ? &cursor.routeBatch : nullptr, &next,
+                                      keys.data(), values.data(), &count, nullptr);
+    if (result != 0 && errno != ENOENT) return;
+    for (__u32 i = 0; i < count; ++i)
+      if (values[i].expires_at_ns <= nowNs) deleted += bpf_map_delete_elem(mapFD, &keys[i]) == 0 ? 1u : 0u;
+    cursor.routeActive = result == 0 && count != 0;
+    if (cursor.routeActive) cursor.routeBatch = next;
+    routesCleaned = true;
+  });
+  if (deletedCount) *deletedCount = deleted;
+  return grantsCleaned && routesCleaned;
 }
 
 template <typename Program>
@@ -509,7 +626,9 @@ static inline bool switchboardPinWormholeFlowMaps(Program *program, uint32_t ifi
 {
   return switchboardProgramHasCompatibleWormholeFlowMaps(program) &&
          switchboardPinProgramMap(program, ifindex, "wh_flows", switchboardWormholeFlowPinPath) &&
-         switchboardPinProgramMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath);
+         switchboardPinProgramMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath) &&
+         switchboardPinProgramMap(program, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath) &&
+         switchboardPinProgramMap(program, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath);
 }
 
 static inline bool switchboardReusePinnedWormholeFlowMaps(struct bpf_object *obj, uint32_t ifindex, Vector<int>& inner_map_fds)
@@ -519,7 +638,9 @@ static inline bool switchboardReusePinnedWormholeFlowMaps(struct bpf_object *obj
     return false;
   }
   return switchboardReusePinnedProgramMap(obj, ifindex, "wh_flows", switchboardWormholeFlowPinPath, inner_map_fds) &&
-         switchboardReusePinnedProgramMap(obj, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath, inner_map_fds);
+         switchboardReusePinnedProgramMap(obj, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath, inner_map_fds) &&
+         switchboardReusePinnedProgramMap(obj, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath, inner_map_fds) &&
+         switchboardReusePinnedProgramMap(obj, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath, inner_map_fds);
 }
 
 template <typename Program>
@@ -527,5 +648,7 @@ static inline bool switchboardProgramUsesPinnedWormholeFlowMaps(Program *program
 {
   return switchboardProgramHasCompatibleWormholeFlowMaps(program) &&
          switchboardProgramUsesPinnedMap(program, ifindex, "wh_flows", switchboardWormholeFlowPinPath) &&
-         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath);
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pending", switchboardWormholePendingFlowPinPath) &&
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_grants", switchboardPairAdmissionGrantPinPath) &&
+         switchboardProgramUsesPinnedMap(program, ifindex, "wh_pair_routes", switchboardPairAdmissionRoutePinPath);
 }

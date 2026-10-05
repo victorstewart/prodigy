@@ -34,6 +34,7 @@
 #define WORMHOLE_FLOW_TCP_ESTABLISHED_NS (5ULL * 24ULL * 60ULL * 60ULL * 1000ULL * 1000ULL * 1000ULL)
 #define WORMHOLE_FLOW_UDP_IDLE_NS (300ULL * 1000ULL * 1000ULL * 1000ULL)
 #define WORMHOLE_FLOW_CLOSE_NS (15ULL * 1000ULL * 1000ULL * 1000ULL)
+#define WORMHOLE_PAIR_ADMISSION_CONSUMED_NS WORMHOLE_FLOW_TCP_ESTABLISHED_NS
 #define WORMHOLE_PUBLIC_INGRESS_L3_MTU 1500U
 // clang-format on
 
@@ -46,6 +47,7 @@
 // packet_description flags:
 // tcp packet had syn flag set (tcp initial packet)
 #define F_SYN_SET (1 << 0)
+#define F_ACK_SET (1 << 1)
 
 #define INIT_JHASH_SEED 0x4a5b6c7d
 #define INIT_JHASH_SEED_V6 0xe8f9a0b1

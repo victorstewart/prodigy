@@ -17,6 +17,11 @@ struct flow_key {
   __u8 proto;
 };
 
+struct switchboard_pair_admission_grant_key {
+  struct flow_key flow;
+  __u32 portal_slot;
+};
+
 struct switchboard_wormhole_flow_key {
   struct flow_key flow;
   __u64 owner_generation;
@@ -38,4 +43,5 @@ static inline struct switchboard_wormhole_flow_key switchboardWormholeFlowMapKey
 struct packet_description {
   struct flow_key flow;
   __u8 flags;
+  __be32 tcp_sequence;
 };

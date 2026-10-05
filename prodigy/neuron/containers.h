@@ -1606,6 +1606,74 @@ public:
     return ok;
   }
 
+  // These methods own only the local BPF-map write.  Callers must have already
+  // authenticated and bound the pair-control record; this layer deliberately
+  // has no parser or plaintext control command that could manufacture a grant.
+  static bool installVerifiedPairAdmissionRoute(BPFProgram *program,
+                                                const switchboard_pair_admission_route_key& routeKey,
+                                                const switchboard_pair_admission_route_policy& route)
+  {
+    if (program == nullptr || route.state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE || route.expires_at_ns == 0)
+    {
+      return false;
+    }
+    bool routeInstalled = false;
+    program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+      routeInstalled = mapFD >= 0 && bpf_map_update_elem(mapFD, &routeKey, &route, BPF_ANY) == 0;
+    });
+    return routeInstalled;
+  }
+
+  static bool installVerifiedPairAdmissionGrant(BPFProgram *program,
+                                                const switchboard_pair_admission_grant_key& key,
+                                                const switchboard_pair_admission_grant& grant)
+  {
+    if (program == nullptr || grant.state != SWITCHBOARD_PAIR_ADMISSION_PENDING || grant.initial_syn_sequence != 0 ||
+        grant.expires_at_ns == 0 || grant.target_container[0] == 0 || grant.target_container[4] == 0)
+    {
+      return false;
+    }
+    const uint32_t machine = (uint32_t(grant.target_container[1]) << 16) |
+                             (uint32_t(grant.target_container[2]) << 8) | uint32_t(grant.target_container[3]);
+    if (machine == 0 || machine != grant.target_machine_fragment)
+    {
+      return false;
+    }
+    switchboard_pair_admission_route_key routeKey = {grant.pair_uuid_hi, grant.pair_uuid_lo, grant.route_uuid_hi, grant.route_uuid_lo};
+    switchboard_pair_admission_route_policy route = {};
+    bool routeCurrent = false;
+    bool grantInstalled = false;
+    program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+      routeCurrent = mapFD >= 0 && bpf_map_lookup_elem(mapFD, &routeKey, &route) == 0 &&
+                     route.state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE && route.expires_at_ns >= grant.expires_at_ns &&
+                     route.route_generation == grant.route_generation && route.root_generation == grant.root_generation &&
+                     route.key_epoch == grant.key_epoch;
+    });
+    if (routeCurrent == false)
+    {
+      return false;
+    }
+    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+      grantInstalled = mapFD >= 0 && bpf_map_update_elem(mapFD, &key, &grant, BPF_NOEXIST) == 0;
+    });
+    return grantInstalled;
+  }
+
+  static bool revokeVerifiedPairAdmissionRoute(BPFProgram *program,
+                                               const switchboard_pair_admission_route_key& key,
+                                               const switchboard_pair_admission_route_policy& revoked)
+  {
+    if (program == nullptr || revoked.state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED)
+    {
+      return false;
+    }
+    bool updated = false;
+    program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+      updated = mapFD >= 0 && bpf_map_update_elem(mapFD, &key, &revoked, BPF_ANY) == 0;
+    });
+    return updated;
+  }
+
   template <typename Key, StringType MapName>
   static bool syncBPFSet(BPFProgram *program, MapName&& mapName, const Vector<Key>& desired)
   {

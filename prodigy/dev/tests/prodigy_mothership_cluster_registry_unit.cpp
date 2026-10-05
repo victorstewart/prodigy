@@ -1389,17 +1389,71 @@ int main(void)
 
   {
     String failure = {};
-    String encodedV4 = {};
+    String encodedOriginal = {};
     {
       TidesDB database(dbPath);
-      bool readV4 = database.read("clusters"_ctv, "local-homelab"_ctv, encodedV4, &failure);
+      bool readV4 = database.read("clusters"_ctv, "local-homelab"_ctv, encodedOriginal, &failure);
       suite.expect(readV4, "adopted_uuid_v4_record_read");
       suite.expect(failure.size() == 0, "adopted_uuid_v4_record_read_no_failure");
     }
+    constexpr auto v5Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv;
     constexpr auto v4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
-    bool hasV4Header = encodedV4.size() >= v4Header.size() &&
-                       std::memcmp(encodedV4.data(), v4Header.data(), v4Header.size()) == 0;
-    suite.expect(hasV4Header, "adopted_uuid_v4_record_header");
+    bool hasV4Header = encodedOriginal.size() >= v4Header.size() &&
+                       std::memcmp(encodedOriginal.data(), v4Header.data(), v4Header.size()) == 0;
+    suite.expect(hasV4Header, "tls_profile_retains_v4_record_header");
+
+    MothershipProdigyClusterRecordV5 aegisRecord = {};
+    aegisRecord.cluster = storedLocalAdopted;
+    aegisRecord.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
+    for (const auto& machine : storedLocalAdopted.machines)
+    {
+      aegisRecord.adoptedMachineRackUUIDs.push_back(machine.rackUUID);
+      aegisRecord.adoptedMachineUUIDs.push_back(machine.uuid);
+    }
+    String aegisPayload = {};
+    BitseryEngine::serialize(aegisPayload, aegisRecord);
+    String aegisEncoded = {};
+    aegisEncoded.append(v5Header);
+    aegisEncoded.append(aegisPayload);
+    String profileDbPath;
+    profileDbPath.snprintf<"{}/transport-profile"_ctv>(dbPath);
+    auto writeProfile = [&](const String& encoded) {
+      failure.clear();
+      TidesDB database(profileDbPath);
+      return database.write("clusters"_ctv, "local-homelab"_ctv, encoded, &failure);
+    };
+    auto readProfile = [&](MothershipProdigyCluster& value) {
+      failure.clear();
+      MothershipClusterRegistry registry(profileDbPath);
+      return registry.getCluster("local-homelab"_ctv, value, &failure);
+    };
+    suite.expect(writeProfile(aegisEncoded),
+                 "aegis_profile_v5_record_written");
+    MothershipProdigyCluster aegisLoaded = {};
+    suite.expect(readProfile(aegisLoaded) &&
+                     aegisLoaded.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1,
+                 "aegis_profile_v5_roundtrip");
+
+    aegisRecord.internalTransportProfile = MothershipInternalTransportProfile(99);
+    BitseryEngine::serialize(aegisPayload, aegisRecord);
+    aegisEncoded.assign(v5Header);
+    aegisEncoded.append(aegisPayload);
+    suite.expect(writeProfile(aegisEncoded) &&
+                     !readProfile(aegisLoaded),
+                 "aegis_profile_v5_rejects_unknown_profile");
+    MothershipProdigyClusterRecordV4 legacyProfileRecord;
+    legacyProfileRecord.cluster = storedLocalAdopted;
+    legacyProfileRecord.cluster.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
+    legacyProfileRecord.adoptedMachineRackUUIDs = aegisRecord.adoptedMachineRackUUIDs;
+    legacyProfileRecord.adoptedMachineUUIDs = aegisRecord.adoptedMachineUUIDs;
+    BitseryEngine::serialize(aegisPayload, legacyProfileRecord);
+    aegisEncoded.assign(v4Header);
+    aegisEncoded.append(aegisPayload);
+    suite.expect(writeProfile(aegisEncoded) &&
+                     readProfile(aegisLoaded) &&
+                     aegisLoaded.internalTransportProfile == MothershipInternalTransportProfile::tls,
+                 "aegis_profile_v4_defaults_tls");
+    failure.clear();
 
     MothershipProdigyClusterRecordV4 malformedRecord = {};
     malformedRecord.cluster = storedLocalAdopted;

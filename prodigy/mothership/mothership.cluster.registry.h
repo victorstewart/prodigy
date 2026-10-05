@@ -8,6 +8,7 @@
 #include <types/types.containers.h>
 #include <databases/embedded/tidesdb.h>
 #include <prodigy/iaas/bootstrap.ssh.h>
+#include <prodigy/cousin.route.h>
 #include <prodigy/mothership/mothership.cluster.reconcile.h>
 #include <prodigy/mothership/mothership.cluster.test.h>
 #include <prodigy/mothership/mothership.cluster.types.h>
@@ -148,6 +149,23 @@ public:
   Vector<uint128_t> adoptedMachineUUIDs;
 };
 
+class MothershipProdigyClusterRecordV5 {
+public:
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV5& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+  serializer.value1b(record.internalTransportProfile);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV4& record)
 {
@@ -248,9 +266,12 @@ private:
   constexpr static auto clustersByUUIDColumnFamily = "clusters_by_uuid"_ctv;
   constexpr static auto upgradeAdmissionsColumnFamily = "upgrade_admissions"_ctv;
   constexpr static auto testPairBoundariesColumnFamily = "test_pair_boundaries"_ctv;
+  constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
+  constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
+  constexpr static auto clusterRecordV5Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -267,6 +288,15 @@ private:
     }
 
     path.assign("/tmp/prodigy-mothership/clusters"_ctv);
+  }
+
+  static bool cousinRouteReceiptKey(uint128_t routeUUID, CousinRouteHalf half, String& key)
+  {
+    if (routeUUID == 0 || !cousinRouteHalfValid(half)) return false;
+    key.assignItoh(routeUUID);
+    if (half == CousinRouteHalf::source) key.append('S');
+    else key.append('D');
+    return true;
   }
 
   static bool requireRootBootstrapSSHUser(const MothershipProdigyCluster& cluster, String *failure = nullptr)
@@ -390,6 +420,26 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV5Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV5Header.size(), serialized.size() - clusterRecordV5Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV5 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
+          record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
+          (record.internalTransportProfile != MothershipInternalTransportProfile::tls &&
+           record.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)) return false;
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      record.cluster.internalTransportProfile = record.internalTransportProfile;
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
     if (recordHasHeader(serialized, clusterRecordV4Header))
     {
       String payload = {};
@@ -408,6 +458,7 @@ private:
         record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
       }
       cluster = std::move(record.cluster);
+      cluster.internalTransportProfile = MothershipInternalTransportProfile::tls;
       return true;
     }
 
@@ -444,8 +495,9 @@ private:
 
   static void serializeClusterValue(const MothershipProdigyCluster& cluster, String& serialized)
   {
-    MothershipProdigyClusterRecordV4 record = {};
+    MothershipProdigyClusterRecordV5 record = {};
     record.cluster = cluster;
+    record.internalTransportProfile = cluster.internalTransportProfile;
     record.adoptedMachineRackUUIDs.reserve(cluster.machines.size());
     record.adoptedMachineUUIDs.reserve(cluster.machines.size());
     for (const MothershipProdigyClusterMachine& machine : cluster.machines)
@@ -455,8 +507,21 @@ private:
     }
 
     String payload = {};
-    BitseryEngine::serialize(payload, record);
-    serialized.assign(clusterRecordV4Header);
+    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::tls)
+    {
+      // Ordinary TLS clusters retain the record understood by older binaries.
+      MothershipProdigyClusterRecordV4 legacy;
+      legacy.cluster = std::move(record.cluster);
+      legacy.adoptedMachineRackUUIDs = std::move(record.adoptedMachineRackUUIDs);
+      legacy.adoptedMachineUUIDs = std::move(record.adoptedMachineUUIDs);
+      BitseryEngine::serialize(payload, legacy);
+      serialized.assign(clusterRecordV4Header);
+    }
+    else
+    {
+      BitseryEngine::serialize(payload, record);
+      serialized.assign(clusterRecordV5Header);
+    }
     serialized.append(payload);
   }
 
@@ -2829,6 +2894,291 @@ public:
     return true;
   }
 
+  static bool cousinRouteTransitionAllowed(const CousinRouteRecord& prior, const CousinRouteRecord& next)
+  {
+    if (prior.routeUUID != next.routeUUID || next.generation <= prior.generation ||
+        cousinRouteScopeMatches(prior, next) == false || cousinRouteTerminal(prior) ||
+        cousinRouteKeyEpochTransitionValid(prior, next) == false)
+    {
+      return false;
+    }
+    if (cousinRouteTerminal(next)) return true;
+    if (prior.state == CousinRouteState::draining && next.state == CousinRouteState::active) return false;
+    return true;
+  }
+
+  bool recordCousinRoute(const CousinRouteRecord& requested,
+                         CousinRouteRecord& recorded,
+                         bool& resumed,
+                         String *failure = nullptr)
+  {
+    recorded = {};
+    resumed = false;
+    if (!cousinRouteStructurallyValid(requested))
+    {
+      if (failure) failure->assign("cousin route record is invalid"_ctv);
+      return false;
+    }
+    if (!requested.priorOperationUUIDs.empty())
+    {
+      if (failure) failure->assign("cousin route operation history is registry-owned"_ctv);
+      return false;
+    }
+
+    String key = {};
+    key.assignItoh(requested.routeUUID);
+    String encoded = {}, readFailure = {};
+    CousinRouteRecord prior = {};
+    bool replacing = false;
+    if (db.read(cousinRoutesColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || !cousinRouteStructurallyValid(prior) ||
+          prior.routeUUID != requested.routeUUID)
+      {
+        if (failure) failure->assign("cousin route record is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (cousinRouteOperationUUIDWasUsed(prior, requested.operationUUID))
+      {
+        if (requested.operationUUID != prior.operationUUID)
+        {
+          if (failure) failure->assign("cousin route operation UUID was already consumed by a superseded generation"_ctv);
+          return false;
+        }
+        if (!cousinRouteExactMatches(prior, requested))
+        {
+          if (failure) failure->assign("cousin route operation identity conflicts with immutable record"_ctv);
+          return false;
+        }
+        recorded = prior;
+        resumed = true;
+        if (failure) failure->clear();
+        return true;
+      }
+      if (requested.generation < prior.generation)
+      {
+        if (failure) failure->assign("cousin route generation is stale"_ctv);
+        return false;
+      }
+      if (requested.generation == prior.generation)
+      {
+        if (failure) failure->assign("cousin route generation conflicts with existing record"_ctv);
+        return false;
+      }
+      if (!cousinRouteTransitionAllowed(prior, requested))
+      {
+        if (failure) failure->assign("cousin route transition regresses scope or terminal tombstone"_ctv);
+        return false;
+      }
+      if (prior.priorOperationUUIDs.size() >= cousinRouteMaximumPriorOperationUUIDs)
+      {
+        if (failure) failure->assign("cousin route operation history reached its generation cap"_ctv);
+        return false;
+      }
+      replacing = true;
+    }
+    else if (!readFailure.equal("record not found"_ctv))
+    {
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    else if (requested.generation != 1 || requested.state != CousinRouteState::active)
+    {
+      if (failure) failure->assign("initial cousin route must be active generation one"_ctv);
+      return false;
+    }
+
+    CousinRouteRecord copy = requested;
+    if (replacing)
+    {
+      copy.priorOperationUUIDs = prior.priorOperationUUIDs;
+      if (!cousinRouteRememberPriorOperationUUID(copy, prior.operationUUID))
+      {
+        if (failure) failure->assign("cousin route operation history cannot accept a prior operation UUID"_ctv);
+        return false;
+      }
+    }
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(cousinRoutesColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(copy);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadCousinRoute(uint128_t routeUUID, CousinRouteRecord& route, String *failure = nullptr)
+  {
+    route = {};
+    if (routeUUID == 0)
+    {
+      if (failure) failure->assign("cousin route UUID is required"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {};
+    key.assignItoh(routeUUID);
+    if (!db.read(cousinRoutesColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, route) || !cousinRouteStructurallyValid(route) || route.routeUUID != routeUUID)
+    {
+      route = {};
+      if (failure) failure->assign("cousin route record is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadUsableCousinRoute(uint128_t routeUUID, int64_t nowMs, CousinRouteRecord& route, String *failure = nullptr)
+  {
+    if (!loadCousinRoute(routeUUID, route, failure)) return false;
+    if (!cousinRouteUsableAt(route, nowMs))
+    {
+      route = {};
+      if (failure) failure->assign("cousin route is expired, unavailable, or terminal"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool recordCousinRouteApplyReceipt(const CousinRouteApplyReceipt& requested,
+                                     CousinRouteApplyReceipt& recorded,
+                                     bool& resumed,
+                                     String *failure = nullptr)
+  {
+    recorded = {};
+    resumed = false;
+    if (!cousinRouteApplyReceiptStructurallyValid(requested))
+    {
+      if (failure) failure->assign("cousin route receipt is structurally invalid"_ctv);
+      return false;
+    }
+    CousinRouteRecord route = {};
+    if (!loadCousinRoute(requested.routeUUID, route, failure)) return false;
+    if (!cousinRouteApplyReceiptMatchesCurrentRoute(requested, route))
+    {
+      if (failure) failure->assign("cousin route receipt does not bind the current route"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {}, readFailure = {};
+    if (!cousinRouteReceiptKey(requested.routeUUID, requested.localHalf, key))
+    {
+      if (failure) failure->assign("cousin route receipt key is invalid"_ctv);
+      return false;
+    }
+    if (db.read(cousinRouteReceiptsColumnFamily, key, encoded, &readFailure))
+    {
+      CousinRouteApplyReceipt prior = {};
+      if (!BitseryEngine::deserializeSafe(encoded, prior) || !cousinRouteApplyReceiptStructurallyValid(prior) ||
+          prior.routeUUID != requested.routeUUID || prior.localHalf != requested.localHalf)
+      {
+        if (failure) failure->assign("cousin route receipt is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (requested.localRuntimeRevision < prior.localRuntimeRevision)
+      {
+        if (failure) failure->assign("cousin route receipt local runtime revision is stale"_ctv);
+        return false;
+      }
+      if (requested.localRuntimeRevision == prior.localRuntimeRevision)
+      {
+        if (!cousinRouteApplyReceiptExactMatches(prior, requested))
+        {
+          if (failure) failure->assign("cousin route receipt local runtime revision conflicts"_ctv);
+          return false;
+        }
+        recorded = prior;
+        resumed = true;
+        if (failure) failure->clear();
+        return true;
+      }
+    }
+    else if (!readFailure.equal("record not found"_ctv))
+    {
+      if (failure) *failure = readFailure;
+      return false;
+    }
+    CousinRouteApplyReceipt copy = requested;
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(cousinRouteReceiptsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(copy);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadCousinRouteApplyReceipt(uint128_t routeUUID,
+                                   CousinRouteHalf half,
+                                   CousinRouteApplyReceipt& receipt,
+                                   String *failure = nullptr)
+  {
+    receipt = {};
+    String key = {}, encoded = {};
+    if (!cousinRouteReceiptKey(routeUUID, half, key))
+    {
+      if (failure) failure->assign("cousin route receipt key is invalid"_ctv);
+      return false;
+    }
+    if (!db.read(cousinRouteReceiptsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, receipt) || !cousinRouteApplyReceiptStructurallyValid(receipt) ||
+        receipt.routeUUID != routeUUID || receipt.localHalf != half)
+    {
+      receipt = {};
+      if (failure) failure->assign("cousin route receipt is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadCurrentCousinRouteApplyReceipt(uint128_t routeUUID,
+                                          CousinRouteHalf half,
+                                          CousinRouteApplyReceipt& receipt,
+                                          String *failure = nullptr)
+  {
+    CousinRouteRecord route = {};
+    if (!loadCousinRoute(routeUUID, route, failure) || !loadCousinRouteApplyReceipt(routeUUID, half, receipt, failure))
+      return false;
+    if (!cousinRouteApplyReceiptMatchesCurrentRoute(receipt, route))
+    {
+      receipt = {};
+      if (failure) failure->assign("cousin route receipt is stale for the current route"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // This is persisted acknowledgement only. Live runtime health requires a
+  // later authenticated observation from the applicable runtime owner.
+  bool cousinRouteAcknowledgedAt(uint128_t routeUUID, int64_t nowMs, bool& acknowledged, String *failure = nullptr)
+  {
+    acknowledged = false;
+    CousinRouteRecord route = {};
+    if (!loadCousinRoute(routeUUID, route, failure)) return false;
+    CousinRouteApplyReceipt source = {}, destination = {};
+    String receiptFailure = {};
+    if (!loadCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::source, source, &receiptFailure))
+    {
+      if (receiptFailure.equal("record not found"_ctv))
+      {
+        if (failure) failure->clear();
+        return true;
+      }
+      if (failure) *failure = receiptFailure;
+      return false;
+    }
+    if (!loadCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::destination, destination, &receiptFailure))
+    {
+      if (receiptFailure.equal("record not found"_ctv))
+      {
+        if (failure) failure->clear();
+        return true;
+      }
+      if (failure) *failure = receiptFailure;
+      return false;
+    }
+    acknowledged = cousinRouteReceiptsAcknowledgedAt(route, source, destination, nowMs);
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool clusterExists(const String& name, bool& exists, String *failure = nullptr)
   {
     exists = false;
@@ -2890,6 +3240,12 @@ public:
 
   bool validateClusterForUpsert(const MothershipProdigyCluster& cluster, MothershipProdigyCluster& normalizedCluster, String *failure = nullptr)
   {
+    if (cluster.internalTransportProfile != MothershipInternalTransportProfile::tls &&
+        cluster.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)
+    {
+      if (failure) failure->assign("invalid internal transport profile"_ctv);
+      return false;
+    }
     MothershipProdigyCluster candidate = cluster;
     if (normalizeClusterForStorage(candidate, failure) == false)
     {

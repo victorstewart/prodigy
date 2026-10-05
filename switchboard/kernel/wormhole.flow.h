@@ -36,6 +36,73 @@ __attribute__((__always_inline__)) static inline __u64 switchboardWormholeFlowAt
   return __sync_val_compare_and_swap((__u64 *)&state->expiresAtNs, 0, 0);
 }
 
+__attribute__((__always_inline__)) static inline bool switchboardPairAdmissionGrantCurrent(
+    const struct switchboard_pair_admission_grant *grant, __u64 now, bool permitDraining)
+{
+  if (grant == NULL)
+  {
+    return false;
+  }
+  struct switchboard_pair_admission_route_key route = {grant->pair_uuid_hi, grant->pair_uuid_lo, grant->route_uuid_hi, grant->route_uuid_lo};
+  struct switchboard_pair_admission_route_policy *policy = bpf_map_lookup_elem(&wh_pair_routes, &route);
+  if (policy == NULL || policy->expires_at_ns <= now ||
+      policy->route_generation != grant->route_generation ||
+      policy->root_generation != grant->root_generation || policy->key_epoch != grant->key_epoch)
+  {
+    return false;
+  }
+  return policy->state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE ||
+         (permitDraining && policy->state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_DRAINING);
+}
+
+__attribute__((__always_inline__)) static inline __u64 switchboardPairAdmissionConsumption(__u32 state, __be32 sequence)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return ((__u64)(__u32)sequence << 32) | state;
+#else
+  return ((__u64)state << 32) | (__u32)sequence;
+#endif
+}
+
+__attribute__((__always_inline__)) static inline __u32 switchboardPairAdmissionConsumptionState(__u64 value)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (__u32)value;
+#else
+  return (__u32)(value >> 32);
+#endif
+}
+
+__attribute__((__always_inline__)) static inline __be32 switchboardPairAdmissionConsumptionSequence(__u64 value)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  return (__be32)(value >> 32);
+#else
+  return (__be32)value;
+#endif
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardPairAdmissionFlowCurrent(
+    const struct switchboard_wormhole_flow *state, __u64 now)
+{
+  if (state == NULL)
+  {
+    return false;
+  }
+  if (state->admission_profile == SWITCHBOARD_WORMHOLE_ADMISSION_NONE)
+  {
+    return true;
+  }
+  if (state->admission_profile != SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT)
+  {
+    return false;
+  }
+  struct switchboard_pair_admission_route_policy *policy = bpf_map_lookup_elem(&wh_pair_routes, &state->admission.route);
+  return policy != NULL && policy->expires_at_ns > now && policy->route_generation == state->admission.route_generation &&
+         policy->root_generation == state->admission.root_generation && policy->key_epoch == state->admission.key_epoch &&
+         (policy->state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE || policy->state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_DRAINING);
+}
+
 __attribute__((__always_inline__)) static inline bool switchboardExtendWormholeFlow(struct switchboard_wormhole_flow *state,
                                                                                     __u64 expiresAtNs)
 {
@@ -162,6 +229,7 @@ __attribute__((__always_inline__)) static inline int switchboardRefreshEstablish
 
   __u64 now = bpf_ktime_get_ns();
   bool matches = switchboardWormholeFlowAtomicExpiry(state) > now &&
+                 switchboardPairAdmissionFlowCurrent(state, now) &&
                  switchboardWormholeFlowMatches(state, binding, container, disposition) &&
                  switchboardRefreshEstablishedWormholeState(state, now, proto, closing);
   return matches ? SWITCHBOARD_WORMHOLE_OWNER_MATCH : SWITCHBOARD_WORMHOLE_OWNER_CONFLICT;
@@ -188,6 +256,7 @@ __attribute__((__always_inline__)) static inline bool switchboardClaimPendingWor
 
   __u32 phase = switchboardWormholeFlowTransitionPhase(switchboardWormholeFlowAtomicTransition(state));
   return switchboardWormholeFlowAtomicExpiry(state) > now &&
+         switchboardPairAdmissionFlowCurrent(state, now) &&
          (phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING || phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN) &&
          switchboardWormholeFlowMatches(state, &desired->binding, desired->container, desired->disposition);
 }
@@ -207,11 +276,12 @@ __attribute__((__always_inline__)) static inline bool switchboardCurrentContaine
   return true;
 }
 
-__attribute__((__always_inline__)) static inline bool switchboardClaimWormholeFlow(const struct flow_key *key,
+__attribute__((__always_inline__)) static inline bool switchboardClaimWormholeFlowWithAdmission(const struct flow_key *key,
                                                                                    const struct switchboard_wormhole_egress_binding *binding,
                                                                                    const __u8 container[5],
                                                                                    __u8 disposition,
-                                                                                   __u8 proto)
+                                                                                   __u8 proto,
+                                                                                   const struct switchboard_pair_admission_identity *admission)
 {
   if (key == NULL || binding == NULL || container == NULL ||
       (disposition != SWITCHBOARD_WORMHOLE_FLOW_PRIVATE && disposition != SWITCHBOARD_WORMHOLE_FLOW_PUBLIC) ||
@@ -221,19 +291,36 @@ __attribute__((__always_inline__)) static inline bool switchboardClaimWormholeFl
   }
 
   __u64 now = bpf_ktime_get_ns();
-  struct switchboard_wormhole_flow desired = {};
-  bpf_memcpy(&desired.binding, binding, sizeof(desired.binding));
-  bpf_memcpy(desired.container, container, sizeof(desired.container));
-  desired.disposition = disposition;
-  desired.phase = SWITCHBOARD_WORMHOLE_FLOW_PENDING;
-  desired.expiresAtNs = now + switchboardWormholeInitialFlowLifetimeNs(proto);
+  __u32 scratchKey = 0;
+  struct switchboard_wormhole_flow *desired = bpf_map_lookup_elem(&wh_flow_scratch, &scratchKey);
+  if (desired == NULL)
+  {
+    return false;
+  }
+  bpf_memset(desired, 0, sizeof(*desired));
+  bpf_memcpy(&desired->binding, binding, sizeof(desired->binding));
+  bpf_memcpy(desired->container, container, sizeof(desired->container));
+  desired->disposition = disposition;
+  desired->admission_profile = binding->admission_profile;
+  if (admission != NULL) desired->admission = *admission;
+  desired->phase = SWITCHBOARD_WORMHOLE_FLOW_PENDING;
+  desired->expiresAtNs = now + switchboardWormholeInitialFlowLifetimeNs(proto);
 
   int established = switchboardRefreshEstablishedWormholeFlow(key, binding, container, disposition, proto, false);
   if (established != SWITCHBOARD_WORMHOLE_OWNER_ABSENT)
   {
     return established == SWITCHBOARD_WORMHOLE_OWNER_MATCH;
   }
-  return switchboardClaimPendingWormholeFlow(key, &desired);
+  return switchboardClaimPendingWormholeFlow(key, desired);
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardClaimWormholeFlow(const struct flow_key *key,
+                                                                                   const struct switchboard_wormhole_egress_binding *binding,
+                                                                                   const __u8 container[5],
+                                                                                   __u8 disposition,
+                                                                                   __u8 proto)
+{
+  return switchboardClaimWormholeFlowWithAdmission(key, binding, container, disposition, proto, NULL);
 }
 
 __attribute__((__always_inline__)) static inline bool switchboardAuthorizePendingWormholeFlow(const struct flow_key *key,
@@ -250,6 +337,7 @@ __attribute__((__always_inline__)) static inline bool switchboardAuthorizePendin
   __u64 now = bpf_ktime_get_ns();
   __u32 phase = switchboardWormholeFlowTransitionPhase(switchboardWormholeFlowAtomicTransition(state));
   return switchboardWormholeFlowAtomicExpiry(state) > now &&
+         switchboardPairAdmissionFlowCurrent(state, now) &&
          (phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING || phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN) &&
          switchboardWormholeFlowMatches(state, binding, container, disposition);
 }
@@ -275,35 +363,44 @@ __attribute__((__always_inline__)) static inline int switchboardPromoteTCPWormho
   }
 
   __u64 now = bpf_ktime_get_ns();
-  struct switchboard_wormhole_flow desired = {};
+  __u32 scratchKey = 0;
+  struct switchboard_wormhole_flow *desired = bpf_map_lookup_elem(&wh_flow_scratch, &scratchKey);
+  if (desired == NULL)
+  {
+    return SWITCHBOARD_WORMHOLE_PROMOTION_FAILED;
+  }
+  bpf_memset(desired, 0, sizeof(*desired));
   __u64 transition = switchboardWormholeFlowAtomicTransition(pending);
   bool valid = switchboardWormholeFlowTransitionPhase(transition) == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN &&
                switchboardWormholeFlowTransitionExpectedAck(transition) == acknowledgedSequence &&
                switchboardWormholeFlowAtomicExpiry(pending) > now &&
+               switchboardPairAdmissionFlowCurrent(pending, now) &&
                switchboardWormholeFlowMatches(pending, binding, container, disposition);
   if (valid)
   {
-    desired.binding = pending->binding;
-    desired.container[0] = pending->container[0];
-    desired.container[1] = pending->container[1];
-    desired.container[2] = pending->container[2];
-    desired.container[3] = pending->container[3];
-    desired.container[4] = pending->container[4];
-    desired.disposition = pending->disposition;
-    desired.phase = closing ? SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING
+    desired->binding = pending->binding;
+    desired->container[0] = pending->container[0];
+    desired->container[1] = pending->container[1];
+    desired->container[2] = pending->container[2];
+    desired->container[3] = pending->container[3];
+    desired->container[4] = pending->container[4];
+    desired->disposition = pending->disposition;
+    desired->admission_profile = pending->admission_profile;
+    desired->admission = pending->admission;
+    desired->phase = closing ? SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING
                             : SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED;
-    desired.expiresAtNs = now + switchboardWormholeFlowLifetimeNs(IPPROTO_TCP, closing);
+    desired->expiresAtNs = now + switchboardWormholeFlowLifetimeNs(IPPROTO_TCP, closing);
   }
   if (valid == false)
   {
     return SWITCHBOARD_WORMHOLE_PROMOTION_NOT_READY;
   }
 
-  if (bpf_map_update_elem(&wh_flows, &ownerKey, &desired, BPF_NOEXIST) != 0 &&
+  if (bpf_map_update_elem(&wh_flows, &ownerKey, desired, BPF_NOEXIST) != 0 &&
       switchboardRefreshEstablishedWormholeFlow(key,
-                                                &desired.binding,
-                                                desired.container,
-                                                desired.disposition,
+                                                &desired->binding,
+                                                desired->container,
+                                                desired->disposition,
                                                 IPPROTO_TCP,
                                                 closing) != SWITCHBOARD_WORMHOLE_OWNER_MATCH)
   {
@@ -381,10 +478,101 @@ __attribute__((__always_inline__)) static inline bool switchboardWormholeFlowKey
   return true;
 }
 
+__attribute__((__always_inline__)) static inline bool switchboardSelectPairAdmissionTarget(
+    const struct packet_description *packet, __u32 portalSlot, struct container_id *containerID)
+{
+  if (packet == NULL || containerID == NULL)
+  {
+    return false;
+  }
+  struct switchboard_pair_admission_grant_key key = {.flow = packet->flow, .portal_slot = portalSlot};
+  struct switchboard_pair_admission_grant *grant = bpf_map_lookup_elem(&wh_pair_grants, &key);
+  if (grant == NULL)
+  {
+    return false;
+  }
+  __u64 now = bpf_ktime_get_ns();
+  __u64 consumption = __sync_val_compare_and_swap(&grant->consumption, 0, 0);
+  __u32 consumeState = switchboardPairAdmissionConsumptionState(consumption);
+  if ((consumeState == SWITCHBOARD_PAIR_ADMISSION_CONSUMED && grant->consumed_expires_at_ns <= now) ||
+      (consumeState != SWITCHBOARD_PAIR_ADMISSION_CONSUMED &&
+       (grant->expires_at_ns <= now || consumeState != SWITCHBOARD_PAIR_ADMISSION_PENDING)) ||
+      switchboardPairAdmissionGrantCurrent(grant, now, consumeState == SWITCHBOARD_PAIR_ADMISSION_CONSUMED) == false)
+  {
+    return false;
+  }
+  __u32 machine = ((__u32)grant->target_container[1] << 16) |
+                    ((__u32)grant->target_container[2] << 8) | (__u32)grant->target_container[3];
+  if (machine == 0 || machine != grant->target_machine_fragment || grant->target_container[0] == 0 ||
+      grant->target_container[4] == 0)
+  {
+    return false;
+  }
+  bpf_memcpy(containerID->value, grant->target_container, sizeof(containerID->value));
+  containerID->hasID = true;
+  return true;
+}
+
+__attribute__((__always_inline__)) static inline bool switchboardAuthorizePairAdmission(
+    const struct packet_description *packet, __u32 portalSlot, const struct container_id *containerID,
+    const struct switchboard_wormhole_egress_binding *binding, struct switchboard_pair_admission_identity *identity)
+{
+  if (packet == NULL || containerID == NULL || containerID->hasID == false || binding == NULL || identity == NULL)
+  {
+    return false;
+  }
+  if (binding->admission_profile == SWITCHBOARD_WORMHOLE_ADMISSION_NONE)
+  {
+    bpf_memset(identity, 0, sizeof(*identity));
+    return true;
+  }
+  if (binding->admission_profile != SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT || packet->flow.proto != IPPROTO_TCP ||
+      (packet->flags & (F_SYN_SET | F_ACK_SET)) != F_SYN_SET)
+  {
+    return false;
+  }
+  struct switchboard_pair_admission_grant_key key = {.flow = packet->flow, .portal_slot = portalSlot};
+  struct switchboard_pair_admission_grant *grant = bpf_map_lookup_elem(&wh_pair_grants, &key);
+  if (grant == NULL ||
+      bpf_memcmp(grant->target_container, containerID->value, sizeof(grant->target_container)) != 0)
+  {
+    return false;
+  }
+  __u32 machine = ((__u32)containerID->value[1] << 16) | ((__u32)containerID->value[2] << 8) |
+                    (__u32)containerID->value[3];
+  if (machine == 0 || machine != grant->target_machine_fragment)
+  {
+    return false;
+  }
+  __u64 now = bpf_ktime_get_ns();
+  identity->route = (struct switchboard_pair_admission_route_key){grant->pair_uuid_hi, grant->pair_uuid_lo, grant->route_uuid_hi, grant->route_uuid_lo};
+  identity->route_generation = grant->route_generation;
+  identity->root_generation = grant->root_generation;
+  identity->key_epoch = grant->key_epoch;
+  struct switchboard_pair_admission_route_policy *policy = bpf_map_lookup_elem(&wh_pair_routes, &identity->route);
+  if (grant->expires_at_ns <= now || policy == NULL || policy->expires_at_ns <= now ||
+      policy->state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE ||
+      policy->route_generation != identity->route_generation || policy->root_generation != identity->root_generation ||
+      policy->key_epoch != identity->key_epoch)
+  {
+    return false;
+  }
+  const __u64 pending = switchboardPairAdmissionConsumption(SWITCHBOARD_PAIR_ADMISSION_PENDING, 0);
+  const __u64 consumed = switchboardPairAdmissionConsumption(SWITCHBOARD_PAIR_ADMISSION_CONSUMED, packet->tcp_sequence);
+  // This is deliberately finite: exhausted grant capacity fails closed rather
+  // than retaining an unbounded set of completed TCP sessions.
+  grant->consumed_expires_at_ns = now + WORMHOLE_PAIR_ADMISSION_CONSUMED_NS;
+  __u64 observed = __sync_val_compare_and_swap(&grant->consumption, pending, consumed);
+  bool accepted = observed == pending || (switchboardPairAdmissionConsumptionState(observed) == SWITCHBOARD_PAIR_ADMISSION_CONSUMED &&
+                                          switchboardPairAdmissionConsumptionSequence(observed) == packet->tcp_sequence);
+  return accepted;
+}
+
 __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv6(const struct packet_description *packet,
                                                                                              const struct container_id *containerID,
                                                                                              __be16 targetPort,
-                                                                                             const struct portal_definition *portal)
+                                                                                             const struct portal_definition *portal,
+                                                                                             __u32 portalSlot)
 {
   if (packet == NULL || portal == NULL ||
       portal->port != packet->flow.port16[1] || portal->proto != packet->flow.proto ||
@@ -411,17 +599,33 @@ __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv6(con
     return false;
   }
 
-  return switchboardClaimWormholeFlow(&reply,
-                                      binding,
-                                      containerID->value,
-                                      SWITCHBOARD_WORMHOLE_FLOW_PUBLIC,
-                                      packet->flow.proto);
+  int established = switchboardRefreshEstablishedWormholeFlow(&reply, binding, containerID->value,
+                                                               SWITCHBOARD_WORMHOLE_FLOW_PUBLIC, packet->flow.proto, false);
+  if (established != SWITCHBOARD_WORMHOLE_OWNER_ABSENT)
+  {
+    return established == SWITCHBOARD_WORMHOLE_OWNER_MATCH;
+  }
+
+  __u32 admissionScratchKey = 0;
+  struct switchboard_pair_admission_identity *admission = bpf_map_lookup_elem(&wh_adm_scratch, &admissionScratchKey);
+  if (admission == NULL)
+  {
+    return false;
+  }
+  bpf_memset(admission, 0, sizeof(*admission));
+  if (switchboardAuthorizePairAdmission(packet, portalSlot, containerID, binding, admission) == false)
+  {
+    return false;
+  }
+  return switchboardClaimWormholeFlowWithAdmission(&reply, binding, containerID->value,
+                                                    SWITCHBOARD_WORMHOLE_FLOW_PUBLIC, packet->flow.proto, admission);
 }
 
 __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv4(const struct packet_description *packet,
                                                                                              const struct container_id *containerID,
                                                                                              __be16 targetPort,
-                                                                                             const struct portal_definition *portal)
+                                                                                             const struct portal_definition *portal,
+                                                                                             __u32 portalSlot)
 {
   if (packet == NULL || containerID == NULL || containerID->hasID == false || portal == NULL || targetPort == 0 ||
       portal->addr4 != packet->flow.dst || portal->port != packet->flow.port16[1] ||
@@ -440,6 +644,12 @@ __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv4(con
   {
     return false;
   }
+  // Pair grants bind the IPv6 protected ingress contract. IPv4 has no
+  // equivalent authenticated counterpart encoding and fails closed.
+  if (binding->admission_profile != SWITCHBOARD_WORMHOLE_ADMISSION_NONE)
+  {
+    return false;
+  }
 
   struct flow_key translated = {};
   translated.src = packet->flow.src;
@@ -450,11 +660,26 @@ __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv4(con
   struct flow_key reply = {};
   reverse_flow_key(&translated, &reply);
 
-  return switchboardClaimWormholeFlow(&reply,
-                                      binding,
-                                      containerID->value,
-                                      SWITCHBOARD_WORMHOLE_FLOW_PUBLIC,
-                                      packet->flow.proto);
+  int established = switchboardRefreshEstablishedWormholeFlow(&reply, binding, containerID->value,
+                                                               SWITCHBOARD_WORMHOLE_FLOW_PUBLIC, packet->flow.proto, false);
+  if (established != SWITCHBOARD_WORMHOLE_OWNER_ABSENT)
+  {
+    return established == SWITCHBOARD_WORMHOLE_OWNER_MATCH;
+  }
+
+  __u32 admissionScratchKey = 0;
+  struct switchboard_pair_admission_identity *admission = bpf_map_lookup_elem(&wh_adm_scratch, &admissionScratchKey);
+  if (admission == NULL)
+  {
+    return false;
+  }
+  bpf_memset(admission, 0, sizeof(*admission));
+  if (switchboardAuthorizePairAdmission(packet, portalSlot, containerID, binding, admission) == false)
+  {
+    return false;
+  }
+  return switchboardClaimWormholeFlowWithAdmission(&reply, binding, containerID->value,
+                                                    SWITCHBOARD_WORMHOLE_FLOW_PUBLIC, packet->flow.proto, admission);
 }
 
 __attribute__((noinline)) static bool switchboardClassifyWormholeIngressIPv4(struct iphdr *iph,

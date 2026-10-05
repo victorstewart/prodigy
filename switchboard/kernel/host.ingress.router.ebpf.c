@@ -406,11 +406,12 @@ __attribute__((__always_inline__)) static inline int switchboardRouteSelectedWor
 __attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv6(struct __sk_buff *skb,
                                                                                                    struct packet_description *packet,
                                                                                                    const struct container_id *containerID,
-                                                                                                   __be16 targetPort)
+                                                                                                   __be16 targetPort,
+                                                                                                   __u32 portalSlot)
 {
   struct portal_definition portal = {};
   if (switchboardPacketPortalDefinition(packet, true, &portal) == false ||
-      switchboardLearnPublicWormholeFlowIPv6(packet, containerID, targetPort, &portal) == false ||
+      switchboardLearnPublicWormholeFlowIPv6(packet, containerID, targetPort, &portal, portalSlot) == false ||
       switchboardRewriteWormholeIPv6TargetSKB(skb, packet, containerID, targetPort) == false)
   {
     return false;
@@ -422,11 +423,12 @@ __attribute__((__always_inline__)) static inline bool switchboardLearnAndRewrite
 __attribute__((__always_inline__)) static inline bool switchboardLearnAndRewriteLocalWormholeIPv4(struct __sk_buff *skb,
                                                                                                    struct packet_description *packet,
                                                                                                    const struct container_id *containerID,
-                                                                                                   __be16 targetPort)
+                                                                                                   __be16 targetPort,
+                                                                                                   __u32 portalSlot)
 {
   struct portal_definition portal = {};
   if (switchboardPacketPortalDefinition(packet, false, &portal) == false ||
-      switchboardLearnPublicWormholeFlowIPv4(packet, containerID, targetPort, &portal) == false ||
+      switchboardLearnPublicWormholeFlowIPv4(packet, containerID, targetPort, &portal, portalSlot) == false ||
       switchboardRewriteWormholeIPv4TargetSKB(skb, packet, targetPort) == false)
   {
     return false;
@@ -477,6 +479,8 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
     return TC_ACT_SHOT;
   }
 
+  (void)switchboardSelectPairAdmissionTarget(packet, portalMeta->slot, &containerID);
+
   __u32 zeroidx = 0;
   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
@@ -486,7 +490,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv4_portal_
 
   __u16 targetPort = 0;
   if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false ||
-      switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, &containerID, targetPort) == false)
+      switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, &containerID, targetPort, portalMeta->slot) == false)
   {
     return TC_ACT_SHOT;
   }
@@ -549,6 +553,8 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
     return TC_ACT_SHOT;
   }
 
+  (void)switchboardSelectPairAdmissionTarget(packet, portalMeta->slot, &containerID);
+
   __u32 zeroidx = 0;
   struct local_container_subnet6 *localSubnet = bpf_map_lookup_elem(&lc_subnet, &zeroidx);
   if (switchboardContainerIDTargetsLocalMachine(&containerID, localSubnet) == false)
@@ -558,7 +564,7 @@ __attribute__((__always_inline__)) static inline int maybe_redirect_ipv6_portal_
 
   __u16 targetPort = 0;
   if (switchboardLookupWormholeTargetPort(portalMeta->slot, &containerID, &targetPort) == false ||
-      switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, &containerID, targetPort) == false)
+      switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, &containerID, targetPort, portalMeta->slot) == false)
   {
     return TC_ACT_SHOT;
   }
@@ -604,15 +610,23 @@ __attribute__((__always_inline__)) static inline int switchboardRedirectSelected
   // The unchanged inner destination tuple is the canonical portal identity.
   // Resolve its target-machine-local slot here; slot allocation order is not
   // a cluster-wide wire contract.
-  if (meta == NULL ||
-      switchboardLookupWormholeTargetPort(meta->slot, containerID, &targetPort) == false)
+  if (meta == NULL)
+  {
+    return TC_ACT_SHOT;
+  }
+  // The overlay header target is immutable input.  A protected admission may
+  // select its authenticated counterpart into this local routing decision.
+  struct container_id selectedContainer = *containerID;
+  (void)switchboardSelectPairAdmissionTarget(packet, meta->slot, &selectedContainer);
+  if (
+      switchboardLookupWormholeTargetPort(meta->slot, &selectedContainer, &targetPort) == false)
   {
     return TC_ACT_SHOT;
   }
 
   bool rewritten = isIPv6
-                       ? switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, containerID, targetPort)
-                       : switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, containerID, targetPort);
+                       ? switchboardLearnAndRewriteLocalWormholeIPv6(skb, packet, &selectedContainer, targetPort, meta->slot)
+                       : switchboardLearnAndRewriteLocalWormholeIPv4(skb, packet, &selectedContainer, targetPort, meta->slot);
   if (rewritten == false)
   {
     return TC_ACT_SHOT;
@@ -625,7 +639,7 @@ __attribute__((__always_inline__)) static inline int switchboardRedirectSelected
     return TC_ACT_SHOT;
   }
   null_mac_addresses(eth);
-  return redirectContainerFragment(containerID->value[4], true) ? TC_ACT_REDIRECT : TC_ACT_SHOT;
+  return redirectContainerFragment(selectedContainer.value[4], true) ? TC_ACT_REDIRECT : TC_ACT_SHOT;
 }
 
 __attribute__((__always_inline__)) static inline int maybe_redirect_wormhole_overlay_packet(struct __sk_buff *skb,

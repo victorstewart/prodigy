@@ -336,6 +336,10 @@ public:
   uint128_t uuid = 0;
   uint128_t ownerClusterUUID = 0;
   ProdigyTransportTLSMaterial transportTLS;
+  ProdigyTransportCredentialBootstrap transportCredentials;
+  // Authenticated provisioning seeds this only on Brain machines. Subsequent
+  // authority changes are owned by the replicated master-authority package.
+  ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
 
   bool transportTLSConfigured(void) const
   {
@@ -348,12 +352,168 @@ public:
   }
 };
 
+static inline bool prodigyLocalTransportCredentialStateValid(
+    const ProdigyPersistentLocalBrainState& state, bool requireSecret = true)
+{
+  const auto& bootstrap = state.transportCredentials;
+  const auto& root = state.transportCredentialAuthorityRoot;
+  uint8_t rootBytes = 0;
+  for (uint8_t byte : root.root) rootBytes |= byte;
+  const bool rootEmpty = root.authorityEpoch == 0 && root.keyEpoch == 0 && root.authorityGeneration == 0 && rootBytes == 0;
+  if (!prodigyTransportCredentialBootstrapValid(bootstrap, requireSecret)) return false;
+  if (!bootstrap.enabled) return rootEmpty;
+  if (bootstrap.self.nodeUUID != state.uuid || bootstrap.self.clusterUUID != state.ownerClusterUUID) return false;
+  if (bootstrap.self.role == ProdigyTransportCredentialNodeRole::neuron) return rootEmpty;
+  if (root.authorityEpoch != bootstrap.self.authorityEpoch || root.keyEpoch != bootstrap.self.keyEpoch ||
+      root.authorityGeneration != bootstrap.self.rootAuthorityGeneration) return false;
+  if (!requireSecret) return rootBytes == 0;
+  if (!root.valid()) return false;
+  ProdigyTransportCredentialEnrollment local = {};
+  local.operationUUID = bootstrap.self.operationUUID;
+  local.nodeUUID = state.uuid; local.clusterUUID = state.ownerClusterUUID;
+  local.authorityEpoch = bootstrap.self.authorityEpoch; local.keyEpoch = bootstrap.self.keyEpoch;
+  local.authorityGeneration = bootstrap.self.authorityGeneration;
+  local.role = bootstrap.self.role; local.state = ProdigyTransportCredentialEnrollmentState::active;
+  ProdigyTransportNodeCredential derived = {};
+  return prodigyDeriveTransportNodeCredential(root, local, derived) &&
+      CRYPTO_memcmp(derived.secret, bootstrap.self.secret, sizeof(derived.secret)) == 0;
+}
+
+static inline bool prodigyBuildLocalTransportCredentialState(
+    const ProdigyTransportCredentialAuthorityRoot& authority,
+    const Vector<ProdigyTransportCredentialEnrollment>& ledger,
+    uint128_t nodeUUID, ProdigyTransportCredentialNodeRole role,
+    ProdigyPersistentLocalBrainState& state,
+    uint64_t committedAuthorityGeneration = 0)
+{
+  const ProdigyTransportCredentialEnrollment *local = nullptr;
+  for (const auto& enrollment : ledger)
+  {
+    if (enrollment.nodeUUID == nodeUUID && enrollment.role == role &&
+        enrollment.state == ProdigyTransportCredentialEnrollmentState::active)
+    {
+      if (local != nullptr) return false;
+      local = &enrollment;
+    }
+  }
+  if (local == nullptr || (state.uuid != 0 && state.uuid != nodeUUID) ||
+      (state.ownerClusterUUID != 0 && state.ownerClusterUUID != local->clusterUUID)) return false;
+  ProdigyPersistentLocalBrainState candidate = state;
+  candidate.uuid = nodeUUID; candidate.ownerClusterUUID = local->clusterUUID;
+  if (!prodigyBuildTransportCredentialBootstrap(authority, *local, ledger, true, candidate.transportCredentials,
+      committedAuthorityGeneration)) return false;
+  candidate.transportCredentialAuthorityRoot = role == ProdigyTransportCredentialNodeRole::brain ?
+      authority : ProdigyTransportCredentialAuthorityRoot{};
+  if (!prodigyLocalTransportCredentialStateValid(candidate)) return false;
+  state = std::move(candidate);
+  return true;
+}
+
+static inline void prodigyTransportCredentialBootstrapLedger(
+    const ProdigyTransportCredentialBootstrap& bootstrap,
+    Vector<ProdigyTransportCredentialEnrollment>& ledger)
+{
+  ledger = bootstrap.authorizedPeers;
+  ProdigyTransportCredentialEnrollment self = {};
+  self.operationUUID = bootstrap.self.operationUUID; self.nodeUUID = bootstrap.self.nodeUUID;
+  self.clusterUUID = bootstrap.self.clusterUUID; self.authorityEpoch = bootstrap.self.authorityEpoch;
+  self.keyEpoch = bootstrap.self.keyEpoch; self.authorityGeneration = bootstrap.self.authorityGeneration;
+  self.role = bootstrap.self.role; self.state = ProdigyTransportCredentialEnrollmentState::active;
+  ledger.push_back(self);
+  std::sort(ledger.begin(), ledger.end(), [](const auto& lhs, const auto& rhs) {
+    if (lhs.nodeUUID != rhs.nodeUUID) return lhs.nodeUUID < rhs.nodeUUID;
+    if (lhs.role != rhs.role) return uint8_t(lhs.role) < uint8_t(rhs.role);
+    return lhs.operationUUID < rhs.operationUUID;
+  });
+}
+
+// The control projection always describes the Neuron role. A Brain host's
+// durable local record instead owns its separate Brain credential and root.
+// Preserve that owner while updating the approved public Brain peer list.
+static inline bool prodigyApplyLocalTransportCredentialPeerProjection(
+    ProdigyPersistentLocalBrainState& state,
+    const ProdigyTransportCredentialBootstrap& projection,
+    ProdigyTransportCredentialBootstrap& resultingNeuron)
+{
+  if (!prodigyLocalTransportCredentialStateValid(state) || !state.transportCredentials.enabled ||
+      projection.self.role != ProdigyTransportCredentialNodeRole::neuron) return false;
+  auto candidate = state;
+  ProdigyTransportCredentialBootstrap currentNeuron, updatedNeuron;
+  const bool brainRole = state.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain;
+  Vector<ProdigyTransportCredentialEnrollment> ledger;
+  if (brainRole)
+  {
+    prodigyTransportCredentialBootstrapLedger(state.transportCredentials, ledger);
+    ProdigyPersistentLocalBrainState localNeuron;
+    if (!prodigyBuildLocalTransportCredentialState(state.transportCredentialAuthorityRoot, ledger, state.uuid,
+          ProdigyTransportCredentialNodeRole::neuron, localNeuron, state.transportCredentials.committedAuthorityGeneration)) return false;
+    currentNeuron = std::move(localNeuron.transportCredentials);
+  }
+  else currentNeuron = state.transportCredentials;
+  if (!prodigyApplyTransportCredentialPeerProjection(currentNeuron, projection, updatedNeuron)) return false;
+  if (!brainRole) candidate.transportCredentials = updatedNeuron;
+  else
+  {
+    const ProdigyTransportCredentialEnrollment *ownBrain = nullptr;
+    for (const auto& entry : ledger)
+      if (entry.nodeUUID == state.uuid && entry.role == ProdigyTransportCredentialNodeRole::brain) ownBrain = &entry;
+    if (!ownBrain || std::none_of(projection.authorizedPeers.begin(), projection.authorizedPeers.end(),
+        [&](const auto& entry) { return entry == *ownBrain; })) return false;
+    auto& peers = candidate.transportCredentials.authorizedPeers;
+    peers.erase(std::remove_if(peers.begin(), peers.end(), [](const auto& entry) {
+      return entry.role == ProdigyTransportCredentialNodeRole::brain;
+    }), peers.end());
+    for (const auto& entry : projection.authorizedPeers)
+      if (entry.nodeUUID != state.uuid) peers.push_back(entry);
+    std::sort(peers.begin(), peers.end(), [](const auto& lhs, const auto& rhs) {
+      if (lhs.nodeUUID != rhs.nodeUUID) return lhs.nodeUUID < rhs.nodeUUID;
+      if (lhs.role != rhs.role) return uint8_t(lhs.role) < uint8_t(rhs.role);
+      return lhs.operationUUID < rhs.operationUUID;
+    });
+    candidate.transportCredentials.committedAuthorityGeneration = projection.committedAuthorityGeneration;
+    prodigyTransportCredentialBootstrapLedger(candidate.transportCredentials, ledger);
+    ProdigyPersistentLocalBrainState rebuiltNeuron;
+    if (!prodigyBuildLocalTransportCredentialState(candidate.transportCredentialAuthorityRoot, ledger, candidate.uuid,
+          ProdigyTransportCredentialNodeRole::neuron, rebuiltNeuron, projection.committedAuthorityGeneration) ||
+        !prodigyTransportCredentialBootstrapSameProjection(rebuiltNeuron.transportCredentials, updatedNeuron) ||
+        CRYPTO_memcmp(rebuiltNeuron.transportCredentials.self.secret, updatedNeuron.self.secret, sizeof(updatedNeuron.self.secret)) != 0) return false;
+  }
+  if (!prodigyLocalTransportCredentialStateValid(candidate)) return false;
+  state = std::move(candidate);
+  resultingNeuron = std::move(updatedNeuron);
+  return true;
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
 {
   serializer.value16b(state.uuid);
   serializer.value16b(state.ownerClusterUUID);
   serializer.object(state.transportTLS);
+  using Serializer = std::remove_cvref_t<S>;
+  constexpr uint64_t markerValue = 0x41454749534c3031ULL;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (state.transportCredentials.enabled)
+    {
+      uint64_t marker = markerValue;
+      serializer.value8b(marker);
+      serializer.object(state.transportCredentials);
+      serializer.object(state.transportCredentialAuthorityRoot);
+    }
+  }
+  else if (!serializer.adapter().isCompletedSuccessfully())
+  {
+    uint64_t marker = 0;
+    serializer.value8b(marker);
+    if (marker != markerValue)
+    {
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      return;
+    }
+    serializer.object(state.transportCredentials);
+    serializer.object(state.transportCredentialAuthorityRoot);
+  }
 }
 
 // This is a durable, input-independent witness that a specific bootstrap
@@ -499,6 +659,8 @@ static inline bool parseProdigyPersistentLocalBrainStateJSON(const String& json,
   bool sawRootCert = false;
   bool sawLocalCert = false;
   bool sawLocalKey = false;
+  bool sawTransportCredentials = false;
+  bool sawTransportAuthority = false;
 
   for (auto field : doc.get_object())
   {
@@ -546,6 +708,48 @@ static inline bool parseProdigyPersistentLocalBrainStateJSON(const String& json,
         {
           failure->assign("local brain state ownerClusterUUID must be 32 hex characters");
         }
+        return false;
+      }
+    }
+    else if (key == "transportAEGISBootstrap"_ctv)
+    {
+      if (sawTransportCredentials || field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        if (failure) failure->assign("transportAEGISBootstrap requires one bounded string"_ctv);
+        return false;
+      }
+      sawTransportCredentials = true;
+      String encoded = {};
+      encoded.assign(field.value.get_c_str());
+      String decoded = {};
+      const bool ok = encoded.size() <= 1024 * 1024 && Base64::decode(encoded, decoded) &&
+          BitseryEngine::deserializeSafe(decoded, parsed.transportCredentials) &&
+          parsed.transportCredentials.enabled && prodigyTransportCredentialBootstrapValid(parsed.transportCredentials);
+      Vault::secureClearString(encoded);
+      Vault::secureClearString(decoded);
+      if (!ok)
+      {
+        if (failure) failure->assign("invalid transportAEGISBootstrap"_ctv);
+        return false;
+      }
+    }
+    else if (key == "transportAEGISAuthority"_ctv)
+    {
+      if (sawTransportAuthority || field.value.type() != simdjson::dom::element_type::STRING)
+      {
+        if (failure) failure->assign("transportAEGISAuthority requires one bounded string"_ctv);
+        return false;
+      }
+      sawTransportAuthority = true;
+      String encoded = {}, decoded = {};
+      encoded.assign(field.value.get_c_str());
+      const bool ok = encoded.size() <= 512 && Base64::decode(encoded, decoded) &&
+          BitseryEngine::deserializeSafe(decoded, parsed.transportCredentialAuthorityRoot) &&
+          parsed.transportCredentialAuthorityRoot.valid();
+      Vault::secureClearString(encoded); Vault::secureClearString(decoded);
+      if (!ok)
+      {
+        if (failure) failure->assign("invalid transportAEGISAuthority"_ctv);
         return false;
       }
     }
@@ -656,6 +860,11 @@ static inline bool parseProdigyPersistentLocalBrainStateJSON(const String& json,
     return false;
   }
 
+  if (!prodigyLocalTransportCredentialStateValid(parsed))
+  {
+    if (failure) failure->assign("transport credential identity disagrees with local state"_ctv);
+    return false;
+  }
   state = parsed;
   return true;
 }
@@ -705,6 +914,26 @@ static inline void renderProdigyPersistentLocalBrainStateJSON(const ProdigyPersi
 
     json.append(",\"localKeyPem\":"_ctv);
     appendEscapedJSONString(json, state.transportTLS.localKeyPem);
+  }
+  if (state.transportCredentials.enabled)
+  {
+    String serialized = {}, encoded = {};
+    auto bootstrap = state.transportCredentials;
+    BitseryEngine::serialize(serialized, bootstrap);
+    Base64::encode(serialized, encoded);
+    json.append(",\"transportAEGISBootstrap\":"_ctv);
+    appendEscapedJSONString(json, encoded);
+    Vault::secureClearString(serialized);
+    Vault::secureClearString(encoded);
+    if (state.transportCredentialAuthorityRoot.valid())
+    {
+      auto authority = state.transportCredentialAuthorityRoot;
+      BitseryEngine::serialize(serialized, authority);
+      Base64::encode(serialized, encoded);
+      json.append(",\"transportAEGISAuthority\":"_ctv);
+      appendEscapedJSONString(json, encoded);
+      Vault::secureClearString(serialized); Vault::secureClearString(encoded);
+    }
   }
   json.append("}"_ctv);
 }
@@ -2178,6 +2407,82 @@ public:
   }
 };
 
+// The public descriptor supplies all identity fields.  This sidecar carries
+// only the corresponding root, never an independent enrollment authority.
+// It remains copyable for snapshot ownership; every copy wipes its root when
+// destroyed, including temporary and vector-reallocated copies.
+class ProdigyPersistentClusterPairEnrollmentRootSecret {
+public:
+  uint128_t pairUUID = 0;
+  uint128_t localClusterUUID = 0;
+  uint128_t peerClusterUUID = 0;
+  uint128_t operationUUID = 0;
+  uint64_t rootGeneration = 0;
+  uint64_t agreedKeyEpoch = 0;
+  uint64_t localAuthorityGeneration = 0;
+  uint8_t root[ProdigyClusterPairEnrollmentRootBytes] = {};
+
+  ~ProdigyPersistentClusterPairEnrollmentRootSecret()
+  {
+    OPENSSL_cleanse(root, sizeof(root));
+  }
+
+  bool matches(const ProdigyClusterPairEnrollment& enrollment) const
+  {
+    return pairUUID == enrollment.pairUUID &&
+           localClusterUUID == enrollment.localClusterUUID &&
+           peerClusterUUID == enrollment.peerClusterUUID &&
+           operationUUID == enrollment.operationUUID &&
+           rootGeneration == enrollment.rootGeneration &&
+           agreedKeyEpoch == enrollment.agreedKeyEpoch &&
+           localAuthorityGeneration == enrollment.localAuthorityGeneration;
+  }
+
+  bool rootIsZero(void) const
+  {
+    uint8_t aggregate = 0;
+    for (uint8_t byte : root) aggregate |= byte;
+    return aggregate == 0;
+  }
+
+  void clear(void)
+  {
+    prodigyClearPersistentSecretBytes(root, sizeof(root));
+  }
+};
+
+// The transport authority root is private snapshot material.  The public
+// ledger binds it through epoch, key epoch and the exact master-authority
+// generation; it is never reconstructed from bootstrap defaults.
+class ProdigyPersistentTransportCredentialAuthorityRootSecret {
+public:
+  ProdigyTransportCredentialAuthorityRoot root = {};
+
+  void clear(void) { OPENSSL_cleanse(root.root, sizeof(root.root)); root = {}; }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentClusterPairEnrollmentRootSecret& secret)
+{
+  serializer.value16b(secret.pairUUID);
+  serializer.value16b(secret.localClusterUUID);
+  serializer.value16b(secret.peerClusterUUID);
+  serializer.value16b(secret.operationUUID);
+  serializer.value8b(secret.rootGeneration);
+  serializer.value8b(secret.agreedKeyEpoch);
+  serializer.value8b(secret.localAuthorityGeneration);
+  for (uint8_t& byte : secret.root) serializer.value1b(byte);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPersistentTransportCredentialAuthorityRootSecret& secret)
+{
+  serializer.value8b(secret.root.authorityEpoch);
+  serializer.value8b(secret.root.keyEpoch);
+  serializer.value8b(secret.root.authorityGeneration);
+  for (uint8_t& byte : secret.root.root) serializer.value1b(byte);
+}
+
 template <typename S>
 static void serialize(S&& serializer, ProdigyPersistentTlsResumptionEpochSecret& secret)
 {
@@ -2396,10 +2701,12 @@ public:
   Vector<ProdigyPersistentContainerRuntimeStateSecrets> servingRuntimeStateSecrets;
   Vector<ProdigyPersistentContainerRetirementBootstrapSecrets> containerRetirementBootstrapSecrets;
   Vector<ProdigyPersistentContainerRetirementBootstrapSecretsV2> containerRetirementBootstrapSecretsV2;
+  Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> clusterPairEnrollmentRootSecrets;
+  Vector<ProdigyPersistentTransportCredentialAuthorityRootSecret> transportCredentialAuthorityRootSecrets;
 
   bool empty(void) const
   {
-    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty() && containerRuntimeStateSecrets.empty() && servingRuntimeStateSecrets.empty() && containerRetirementBootstrapSecrets.empty() && containerRetirementBootstrapSecretsV2.empty();
+    return bootstrapSshPrivateKeyOpenSSH.size() == 0 && bootstrapSshHostPrivateKeyOpenSSH.size() == 0 && dnsCredentialMaterial.size() == 0 && tlsVaultFactorySecretsByApp.empty() && apiCredentialSecretsByApp.empty() && tlsResumptionEpochSecrets.empty() && publicTlsCertificateSecrets.empty() && transportTLSAuthorityClusterRootKeyPem.size() == 0 && mothershipTunnelGatewayServerKeyPem.size() == 0 && pendingAddMachinesOperationSecrets.empty() && localContainerBootstraps.empty() && machineRecoveryWitnesses.empty() && containerRuntimeStateSecrets.empty() && servingRuntimeStateSecrets.empty() && containerRetirementBootstrapSecrets.empty() && containerRetirementBootstrapSecretsV2.empty() && clusterPairEnrollmentRootSecrets.empty() && transportCredentialAuthorityRootSecrets.empty();
   }
 
   void clear(void)
@@ -2475,6 +2782,13 @@ public:
       retirementSecrets.clear();
     }
     containerRetirementBootstrapSecretsV2.clear();
+    for (auto& enrollmentSecret : clusterPairEnrollmentRootSecrets)
+    {
+      enrollmentSecret.clear();
+    }
+    clusterPairEnrollmentRootSecrets.clear();
+    for (auto& authorityRoot : transportCredentialAuthorityRootSecrets) authorityRoot.clear();
+    transportCredentialAuthorityRootSecrets.clear();
   }
 };
 
@@ -2522,7 +2836,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   {
     // Preserve the established sidecar bytes until a new feature is active.
     if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty() ||
-        !secrets.containerRetirementBootstrapSecretsV2.empty())
+        !secrets.containerRetirementBootstrapSecretsV2.empty() || !secrets.clusterPairEnrollmentRootSecrets.empty() || !secrets.transportCredentialAuthorityRootSecrets.empty())
       serializer.object(secrets.servingRuntimeStateSecrets);
   }
   else if (serializer.adapter().isCompletedSuccessfully() == false)
@@ -2532,7 +2846,7 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     if (!secrets.servingRuntimeStateSecrets.empty() || !secrets.containerRetirementBootstrapSecrets.empty() ||
-        !secrets.containerRetirementBootstrapSecretsV2.empty())
+        !secrets.containerRetirementBootstrapSecretsV2.empty() || !secrets.clusterPairEnrollmentRootSecrets.empty() || !secrets.transportCredentialAuthorityRootSecrets.empty())
       serializer.object(secrets.containerRetirementBootstrapSecrets);
   }
   else if (serializer.adapter().isCompletedSuccessfully() == false)
@@ -2541,12 +2855,34 @@ static void serialize(S&& serializer, ProdigyPersistentBrainSnapshotSecrets& sec
   }
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
-    if (!secrets.containerRetirementBootstrapSecretsV2.empty())
+    if (!secrets.containerRetirementBootstrapSecretsV2.empty() || !secrets.clusterPairEnrollmentRootSecrets.empty() || !secrets.transportCredentialAuthorityRootSecrets.empty())
       serializer.object(secrets.containerRetirementBootstrapSecretsV2);
   }
   else if (serializer.adapter().isCompletedSuccessfully() == false)
   {
     serializer.object(secrets.containerRetirementBootstrapSecretsV2);
+  }
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (!secrets.clusterPairEnrollmentRootSecrets.empty() || !secrets.transportCredentialAuthorityRootSecrets.empty())
+      serializer.container(secrets.clusterPairEnrollmentRootSecrets, ProdigyClusterPairEnrollmentMaximumRecords,
+        [](auto& nested, ProdigyPersistentClusterPairEnrollmentRootSecret& secret) { nested.object(secret); });
+  }
+  else if (serializer.adapter().isCompletedSuccessfully() == false)
+  {
+    serializer.container(secrets.clusterPairEnrollmentRootSecrets, ProdigyClusterPairEnrollmentMaximumRecords,
+        [](auto& nested, ProdigyPersistentClusterPairEnrollmentRootSecret& secret) { nested.object(secret); });
+  }
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (!secrets.transportCredentialAuthorityRootSecrets.empty())
+      serializer.container(secrets.transportCredentialAuthorityRootSecrets, 1,
+        [](auto& nested, ProdigyPersistentTransportCredentialAuthorityRootSecret& secret) { nested.object(secret); });
+  }
+  else if (serializer.adapter().isCompletedSuccessfully() == false)
+  {
+    serializer.container(secrets.transportCredentialAuthorityRootSecrets, 1,
+      [](auto& nested, ProdigyPersistentTransportCredentialAuthorityRootSecret& secret) { nested.object(secret); });
   }
 }
 
@@ -2555,16 +2891,21 @@ public:
 
   String clusterRootKeyPem;
   String localKeyPem;
+  ProdigyTransportNodeCredential transportNodeCredential;
+  ProdigyTransportCredentialAuthorityRoot transportAuthorityRoot;
 
   bool empty(void) const
   {
-    return clusterRootKeyPem.size() == 0 && localKeyPem.size() == 0;
+    return clusterRootKeyPem.size() == 0 && localKeyPem.size() == 0 && transportNodeCredential.nodeUUID == 0 && transportAuthorityRoot.authorityEpoch == 0;
   }
 
   void clear(void)
   {
     prodigyClearPersistentSecretString(clusterRootKeyPem);
     prodigyClearPersistentSecretString(localKeyPem);
+    OPENSSL_cleanse(transportNodeCredential.secret, sizeof(transportNodeCredential.secret));
+    transportNodeCredential = {};
+    transportAuthorityRoot = {};
   }
 };
 
@@ -2573,6 +2914,20 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainStateSecrets& s
 {
   serializer.text1b(secrets.clusterRootKeyPem, UINT32_MAX);
   serializer.text1b(secrets.localKeyPem, UINT32_MAX);
+  using Serializer = std::remove_cvref_t<S>;
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
+  {
+    if (secrets.transportNodeCredential.nodeUUID != 0)
+    {
+      serializer.object(secrets.transportNodeCredential);
+      serializer.object(secrets.transportAuthorityRoot);
+    }
+  }
+  else if (!serializer.adapter().isCompletedSuccessfully())
+  {
+    serializer.object(secrets.transportNodeCredential);
+    serializer.object(secrets.transportAuthorityRoot);
+  }
 }
 
 static inline void prodigyExtractPersistentBootStateSecrets(
@@ -2636,12 +2991,219 @@ static bool prodigyPersistentWriteContainerRetirementDescriptor(
   return true;
 }
 
+// This persistence owner validates only descriptor/sidecar integrity. It does
+// not make an enrollment authoritative or usable for credential issuance.
+static bool prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+    const Vector<ProdigyClusterPairEnrollment>& enrollments,
+    uint128_t localClusterUUID,
+    uint64_t runtimeAuthorityGeneration,
+    bool requireHydratedRoots,
+    bool requireRevokedOnly,
+    String *failure = nullptr)
+{
+  if (enrollments.size() > ProdigyClusterPairEnrollmentMaximumRecords)
+  {
+    if (failure) failure->assign("persistent brain snapshot has too many cluster pair enrollments"_ctv);
+    return false;
+  }
+  for (uint32_t left = 0; left < enrollments.size(); ++left)
+  {
+    const ProdigyClusterPairEnrollment& enrollment = enrollments[left];
+    if (!prodigyClusterPairEnrollmentDescriptorValid(enrollment) ||
+        enrollment.localClusterUUID != localClusterUUID ||
+        enrollment.localAuthorityGeneration > runtimeAuthorityGeneration ||
+        (requireRevokedOnly && enrollment.state != ProdigyClusterPairEnrollmentState::revoked) ||
+        (requireHydratedRoots
+             ? (enrollment.state == ProdigyClusterPairEnrollmentState::revoked
+                    ? !prodigyClusterPairEnrollmentRootIsZero(enrollment)
+                    : prodigyClusterPairEnrollmentRootIsZero(enrollment))
+             : !prodigyClusterPairEnrollmentRootIsZero(enrollment)))
+    {
+      if (failure) failure->assign("persistent brain snapshot cluster pair enrollment is malformed"_ctv);
+      return false;
+    }
+    for (uint32_t right = 0; right < left; ++right)
+    {
+      if (enrollment.pairUUID == enrollments[right].pairUUID ||
+          enrollment.operationUUID == enrollments[right].operationUUID)
+      {
+        if (failure) failure->assign("persistent brain snapshot duplicate cluster pair enrollment identity"_ctv);
+        return false;
+      }
+    }
+  }
+  // Pending operations are the failover fence. Their immutable electorate is
+  // validated before any leader can re-drive delivery.
+  return true;
+}
+
+static bool prodigyValidatePersistentTransportCredentialEnrollmentOperations(
+    const Vector<ProdigyTransportCredentialEnrollmentOperation>& operations,
+    const Vector<ProdigyTransportCredentialEnrollment>& enrollments,
+    uint64_t runtimeAuthorityGeneration,
+    String *failure = nullptr)
+{
+  if (operations.size() > ProdigyTransportCredentialEnrollmentMaximumRecords) return false;
+  const ProdigyTransportCredentialEnrollmentOperation *unfinishedCohort = nullptr;
+  for (uint32_t index = 0; index < operations.size(); ++index)
+  {
+    const auto& operation = operations[index];
+    if (!operation.valid() || operation.transitionGeneration > runtimeAuthorityGeneration)
+    { if (failure) failure->assign("persistent transport credential operation is malformed"_ctv); return false; }
+    bool found = false;
+    for (const auto& enrollment : enrollments) found |= enrollment == operation.enrollment;
+    if (!found) { if (failure) failure->assign("persistent transport credential operation has no ledger enrollment"_ctv); return false; }
+    if (operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
+        operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active)
+    {
+      if ((unfinishedCohort != nullptr &&
+           (!prodigyTransportCredentialSameCohort(unfinishedCohort->enrollment, operation.enrollment) ||
+            unfinishedCohort->pinnedMasterAuthorityEpoch != operation.pinnedMasterAuthorityEpoch)) ||
+          !prodigyTransportCredentialElectorateMatches(operation.enrollment, operation.electorate, enrollments))
+      { if (failure) failure->assign("persistent transport credential operation electorate is inconsistent"_ctv); return false; }
+      unfinishedCohort = &operation;
+    }
+    const ProdigyTransportCredentialEnrollmentOperation *cohort = nullptr;
+    for (uint32_t prior = 0; prior < index; ++prior)
+    {
+      if (operations[prior].enrollment.operationUUID == operation.enrollment.operationUUID)
+      { if (failure) failure->assign("persistent duplicate transport credential operation"_ctv); return false; }
+      if (cohort == nullptr && prodigyTransportCredentialSameCohort(operations[prior].enrollment, operation.enrollment))
+        cohort = &operations[prior];
+    }
+    if (cohort != nullptr)
+    {
+      auto voters = operation.electorate;
+      auto cohortVoters = cohort->electorate;
+      std::sort(voters.begin(), voters.end());
+      std::sort(cohortVoters.begin(), cohortVoters.end());
+      const bool pending = operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending;
+      const bool cohortPending = cohort->phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending;
+      if (voters != cohortVoters || pending != cohortPending)
+      { if (failure) failure->assign("persistent transport credential cohort is partially activated or has different voters"_ctv); return false; }
+    }
+    else
+    {
+      // Terminal history cannot reconstruct the old active set after a voter
+      // is revoked, and never authorizes another release. Its recorded voters
+      // must nevertheless be real, older Brain enrollments. Unfinished
+      // operations above require the exact current pre-cohort electorate.
+      Vector<uint128_t> knownVoters;
+      for (const auto& enrollment : enrollments)
+        if (enrollment.clusterUUID == operation.enrollment.clusterUUID &&
+            enrollment.authorityEpoch == operation.enrollment.authorityEpoch &&
+            enrollment.keyEpoch == operation.enrollment.keyEpoch &&
+            enrollment.authorityGeneration < operation.enrollment.authorityGeneration &&
+            enrollment.role == ProdigyTransportCredentialNodeRole::brain &&
+            (enrollment.state == ProdigyTransportCredentialEnrollmentState::active ||
+             enrollment.state == ProdigyTransportCredentialEnrollmentState::revoked))
+          knownVoters.push_back(enrollment.nodeUUID);
+      std::sort(knownVoters.begin(), knownVoters.end());
+      for (uint128_t voter : operation.electorate)
+        if (!std::binary_search(knownVoters.begin(), knownVoters.end(), voter))
+        { if (failure) failure->assign("persistent transport credential cohort has an unknown voter"_ctv); return false; }
+    }
+  }
+  // Initial provisioning has no enrollment operations. Once a later cohort
+  // has an operation, however, every ledger member of that cohort must have
+  // its matching operation. The addMachines owner additionally checks the
+  // journal's exact role set, including targets missing from both vectors.
+  for (const auto& enrollment : enrollments)
+  {
+    bool hasCohort = false, hasOperation = false;
+    for (const auto& operation : operations)
+    {
+      hasCohort |= prodigyTransportCredentialSameCohort(enrollment, operation.enrollment);
+      hasOperation |= enrollment == operation.enrollment;
+    }
+    if (hasCohort && !hasOperation)
+    { if (failure) failure->assign("persistent transport credential cohort has an unjournaled enrollment"_ctv); return false; }
+  }
+  return true;
+}
+
+static bool prodigyValidatePersistentTransportCredentialEnrollments(
+    const Vector<ProdigyTransportCredentialEnrollment>& enrollments,
+    const ProdigyTransportCredentialAuthorityRoot *root,
+    uint128_t localClusterUUID,
+    uint64_t runtimeAuthorityGeneration,
+    String *failure = nullptr)
+{
+  if (enrollments.size() > ProdigyTransportCredentialEnrollmentMaximumRecords)
+  {
+    if (failure) failure->assign("persistent brain snapshot has too many transport credential enrollments"_ctv);
+    return false;
+  }
+  if (enrollments.empty())
+  {
+    if (root != nullptr && (root->authorityEpoch != 0 || root->keyEpoch != 0 || root->authorityGeneration != 0 ||
+        std::any_of(std::begin(root->root), std::end(root->root), [](uint8_t value) { return value != 0; })))
+    {
+      if (failure) failure->assign("persistent brain snapshot transport authority root is orphaned"_ctv);
+      return false;
+    }
+    return true;
+  }
+  if (root == nullptr || !root->valid() || root->authorityGeneration > runtimeAuthorityGeneration)
+  {
+    if (failure) failure->assign("persistent brain snapshot transport credential ledger has no current private authority root"_ctv);
+    return false;
+  }
+  for (uint32_t left = 0; left < enrollments.size(); ++left)
+  {
+    const auto& enrollment = enrollments[left];
+    if (!enrollment.valid() || enrollment.clusterUUID != localClusterUUID ||
+        enrollment.authorityGeneration > runtimeAuthorityGeneration ||
+        enrollment.authorityEpoch != root->authorityEpoch || enrollment.keyEpoch != root->keyEpoch ||
+        enrollment.authorityGeneration < root->authorityGeneration)
+    {
+      if (failure) failure->assign("persistent brain snapshot transport credential enrollment is malformed or stale"_ctv);
+      return false;
+    }
+    for (uint32_t right = 0; right < left; ++right)
+    {
+      if (enrollment.operationUUID == enrollments[right].operationUUID ||
+          (enrollment.nodeUUID == enrollments[right].nodeUUID && enrollment.role == enrollments[right].role &&
+           enrollment.state != ProdigyTransportCredentialEnrollmentState::revoked &&
+           enrollments[right].state != ProdigyTransportCredentialEnrollmentState::revoked))
+      {
+        if (failure) failure->assign("persistent brain snapshot duplicate transport credential enrollment identity"_ctv);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
     ProdigyPersistentBrainSnapshot snapshot,
     ProdigyPersistentBrainSnapshot& publicSnapshot,
     ProdigyPersistentBrainSnapshotSecrets& secrets,
     String *failure = nullptr)
 {
+  publicSnapshot = {};
+  secrets.clear();
+  if (failure) failure->clear();
+  if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation,
+          true,
+          false,
+          failure))
+  {
+    return false;
+  }
+  if (!prodigyValidatePersistentTransportCredentialEnrollments(
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
+          &snapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation,
+          failure)) return false;
+  if (!prodigyValidatePersistentTransportCredentialEnrollmentOperations(
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollmentOperations,
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
+          snapshot.masterAuthority.runtimeState.generation, failure)) return false;
   if (!prodigyValidateStatefulServingAuthorities(snapshot.masterAuthority.runtimeState.statefulServingAuthorities,
         snapshot.masterAuthority.servingRuntimeStates, snapshot.masterAuthority.runtimeState.generation))
   {
@@ -2649,8 +3211,35 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
     return false;
   }
   publicSnapshot = std::move(snapshot);
-  secrets.clear();
-  if (failure) failure->clear();
+
+  if (publicSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot.valid())
+  {
+    ProdigyPersistentTransportCredentialAuthorityRootSecret authoritySecret = {};
+    authoritySecret.root = publicSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot;
+    secrets.transportCredentialAuthorityRootSecrets.push_back(authoritySecret);
+    authoritySecret.clear();
+  }
+  publicSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot = {};
+
+  auto& enrollments = publicSnapshot.masterAuthority.runtimeState.clusterPairEnrollments;
+  for (ProdigyClusterPairEnrollment& enrollment : enrollments)
+  {
+    if (enrollment.state != ProdigyClusterPairEnrollmentState::revoked)
+    {
+      ProdigyPersistentClusterPairEnrollmentRootSecret rootSecret = {};
+      rootSecret.pairUUID = enrollment.pairUUID;
+      rootSecret.localClusterUUID = enrollment.localClusterUUID;
+      rootSecret.peerClusterUUID = enrollment.peerClusterUUID;
+      rootSecret.operationUUID = enrollment.operationUUID;
+      rootSecret.rootGeneration = enrollment.rootGeneration;
+      rootSecret.agreedKeyEpoch = enrollment.agreedKeyEpoch;
+      rootSecret.localAuthorityGeneration = enrollment.localAuthorityGeneration;
+      std::memcpy(rootSecret.root, enrollment.root, sizeof(rootSecret.root));
+      secrets.clusterPairEnrollmentRootSecrets.push_back(rootSecret);
+      rootSecret.clear();
+    }
+    prodigyClearPersistentSecretBytes(enrollment.root, sizeof(enrollment.root));
+  }
 
   secrets.localContainerBootstraps =
       std::move(publicSnapshot.masterAuthority.runtimeState.updateSelf.localContainerBootstraps);
@@ -2871,6 +3460,101 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   {
     failure->clear();
   }
+
+  if (secrets.transportCredentialAuthorityRootSecrets.size() > 1)
+  {
+    if (failure) failure->assign("persistent brain snapshot has duplicate private transport authority roots"_ctv);
+    return false;
+  }
+  const ProdigyTransportCredentialAuthorityRoot *transportAuthorityRoot =
+      secrets.transportCredentialAuthorityRootSecrets.empty() ? nullptr :
+      &secrets.transportCredentialAuthorityRootSecrets[0].root;
+  if (!prodigyValidatePersistentTransportCredentialEnrollments(
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
+          transportAuthorityRoot,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation,
+          failure)) return false;
+  if (!prodigyValidatePersistentTransportCredentialEnrollmentOperations(
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollmentOperations,
+          snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
+          snapshot.masterAuthority.runtimeState.generation, failure)) return false;
+
+  auto& enrollments = snapshot.masterAuthority.runtimeState.clusterPairEnrollments;
+  if (enrollments.size() > ProdigyClusterPairEnrollmentMaximumRecords ||
+      secrets.clusterPairEnrollmentRootSecrets.size() > ProdigyClusterPairEnrollmentMaximumRecords)
+  {
+    if (failure) failure->assign("persistent brain snapshot has too many cluster pair enrollment records"_ctv);
+    return false;
+  }
+  if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+          enrollments,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation,
+          false,
+          false,
+          failure))
+  {
+    return false;
+  }
+  for (uint32_t left = 0; left < enrollments.size(); ++left)
+  {
+    const ProdigyClusterPairEnrollment& enrollment = enrollments[left];
+    uint32_t matches = 0;
+    const ProdigyPersistentClusterPairEnrollmentRootSecret *matched = nullptr;
+    for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
+    {
+      if (rootSecret.matches(enrollment))
+      {
+        ++matches;
+        matched = &rootSecret;
+      }
+    }
+    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked)
+    {
+      if (matches != 0)
+      {
+        if (failure) failure->assign("persistent brain snapshot revoked cluster pair enrollment has a root"_ctv);
+        return false;
+      }
+      continue;
+    }
+    if (matches != 1 || matched == nullptr || matched->rootIsZero())
+    {
+      if (failure) failure->assign("persistent brain snapshot cluster pair enrollment has no unique private root"_ctv);
+      return false;
+    }
+  }
+  for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
+  {
+    uint32_t matches = 0;
+    for (const auto& enrollment : enrollments)
+      matches += enrollment.state != ProdigyClusterPairEnrollmentState::revoked && rootSecret.matches(enrollment);
+    if (matches != 1 || rootSecret.rootIsZero())
+    {
+      if (failure) failure->assign("persistent brain snapshot cluster pair root is orphaned or stale"_ctv);
+      return false;
+    }
+  }
+  // All descriptors and every private root now agree. Hydrate only after
+  // completing this pass so a later bad record cannot expose earlier roots.
+  for (ProdigyClusterPairEnrollment& enrollment : enrollments)
+  {
+    if (enrollment.state == ProdigyClusterPairEnrollmentState::revoked) continue;
+    for (const auto& rootSecret : secrets.clusterPairEnrollmentRootSecrets)
+    {
+      if (rootSecret.matches(enrollment))
+      {
+        std::memcpy(enrollment.root, rootSecret.root, sizeof(enrollment.root));
+        break;
+      }
+    }
+  }
+
+  if (transportAuthorityRoot != nullptr)
+    snapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot = *transportAuthorityRoot;
+  else
+    snapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot = {};
 
   snapshot.brainConfig.bootstrapSshKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshPrivateKeyOpenSSH;
   snapshot.brainConfig.bootstrapSshHostKeyPackage.privateKeyOpenSSH = secrets.bootstrapSshHostPrivateKeyOpenSSH;
@@ -3304,6 +3988,29 @@ static bool prodigyPersistentSnapshotServingRuntimeDescriptorsNeedNoSecrets(
   return true;
 }
 
+static bool prodigyPersistentSnapshotClusterPairEnrollmentsNeedNoSecrets(
+    const ProdigyPersistentBrainSnapshot& snapshot, String *failure = nullptr)
+{
+  if (prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+          snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation,
+          false,
+          true,
+          failure)) return true;
+  if (failure && failure->size() == 0)
+    failure->assign("persistent brain snapshot cluster pair private root sidecar is missing"_ctv);
+  return false;
+}
+
+static bool prodigyPersistentSnapshotTransportCredentialEnrollmentsNeedNoSecrets(
+    const ProdigyPersistentBrainSnapshot& snapshot, String *failure = nullptr)
+{
+  if (snapshot.masterAuthority.runtimeState.transportCredentialEnrollments.empty()) return true;
+  if (failure) failure->assign("persistent brain snapshot transport credential authority sidecar is missing"_ctv);
+  return false;
+}
+
 static inline void prodigyExtractPersistentLocalBrainStateSecrets(
     const ProdigyPersistentLocalBrainState& state,
     ProdigyPersistentLocalBrainState& publicState,
@@ -3316,14 +4023,46 @@ static inline void prodigyExtractPersistentLocalBrainStateSecrets(
   secrets.localKeyPem = state.transportTLS.localKeyPem;
   prodigyClearPersistentSecretString(publicState.transportTLS.clusterRootKeyPem);
   prodigyClearPersistentSecretString(publicState.transportTLS.localKeyPem);
+  if (state.transportCredentials.enabled)
+  {
+    secrets.transportNodeCredential = state.transportCredentials.self;
+    secrets.transportAuthorityRoot = state.transportCredentialAuthorityRoot;
+    OPENSSL_cleanse(publicState.transportCredentials.self.secret, sizeof(publicState.transportCredentials.self.secret));
+    OPENSSL_cleanse(publicState.transportCredentialAuthorityRoot.root, sizeof(publicState.transportCredentialAuthorityRoot.root));
+  }
 }
 
-static inline void prodigyApplyPersistentLocalBrainStateSecrets(
+static inline bool prodigyApplyPersistentLocalBrainStateSecrets(
     ProdigyPersistentLocalBrainState& state,
     const ProdigyPersistentLocalBrainStateSecrets& secrets)
 {
+  if (!prodigyLocalTransportCredentialStateValid(state, false)) return false;
+  if (state.transportCredentials.enabled)
+  {
+    const auto& expected = state.transportCredentials.self;
+    const auto& supplied = secrets.transportNodeCredential;
+    if (!prodigyTransportCredentialBootstrapValid(state.transportCredentials, false) || !supplied.valid() ||
+        expected.nodeUUID != state.uuid || expected.clusterUUID != state.ownerClusterUUID ||
+        expected.nodeUUID != supplied.nodeUUID || expected.clusterUUID != supplied.clusterUUID ||
+        expected.operationUUID != supplied.operationUUID || expected.role != supplied.role ||
+        expected.authorityEpoch != supplied.authorityEpoch || expected.keyEpoch != supplied.keyEpoch ||
+        expected.authorityGeneration != supplied.authorityGeneration ||
+        expected.rootAuthorityGeneration != supplied.rootAuthorityGeneration) return false;
+  }
+  else if (secrets.transportNodeCredential.nodeUUID != 0) return false;
+  const auto& expectedRoot = state.transportCredentialAuthorityRoot;
+  const auto& suppliedRoot = secrets.transportAuthorityRoot;
+  if (expectedRoot.authorityEpoch != suppliedRoot.authorityEpoch || expectedRoot.keyEpoch != suppliedRoot.keyEpoch ||
+      expectedRoot.authorityGeneration != suppliedRoot.authorityGeneration) return false;
+  ProdigyPersistentLocalBrainState candidate = state;
+  if (candidate.transportCredentials.enabled) candidate.transportCredentials.self = secrets.transportNodeCredential;
+  candidate.transportCredentialAuthorityRoot = suppliedRoot;
+  if (!prodigyLocalTransportCredentialStateValid(candidate)) return false;
   state.transportTLS.clusterRootKeyPem = secrets.clusterRootKeyPem;
   state.transportTLS.localKeyPem = secrets.localKeyPem;
+  if (state.transportCredentials.enabled) state.transportCredentials.self = secrets.transportNodeCredential;
+  state.transportCredentialAuthorityRoot = suppliedRoot;
+  return true;
 }
 
 template <typename T>
@@ -3929,7 +4668,9 @@ public:
       }
     }
     else if (prodigyPersistentSnapshotRetirementDescriptorsNeedNoSecrets(snapshot, failure) == false ||
-             prodigyPersistentSnapshotServingRuntimeDescriptorsNeedNoSecrets(snapshot, failure) == false)
+             prodigyPersistentSnapshotServingRuntimeDescriptorsNeedNoSecrets(snapshot, failure) == false ||
+             prodigyPersistentSnapshotClusterPairEnrollmentsNeedNoSecrets(snapshot, failure) == false ||
+             prodigyPersistentSnapshotTransportCredentialEnrollmentsNeedNoSecrets(snapshot, failure) == false)
     {
       return false;
     }
@@ -4093,15 +4834,31 @@ public:
         return false;
       }
 
-      prodigyApplyPersistentLocalBrainStateSecrets(state, secrets);
+      ok = prodigyApplyPersistentLocalBrainStateSecrets(state, secrets);
       secrets.clear();
+      if (!ok)
+      {
+        state = {};
+        if (failure) failure->assign("persistent local transport credential sidecar mismatch"_ctv);
+        return false;
+      }
     }
-
+    if (!prodigyLocalTransportCredentialStateValid(state))
+    {
+      state = {};
+      if (failure) failure->assign("persistent local transport credential is invalid or missing"_ctv);
+      return false;
+    }
     return true;
   }
 
   bool saveLocalBrainState(const ProdigyPersistentLocalBrainState& state, String *failure = nullptr)
   {
+    if (!prodigyLocalTransportCredentialStateValid(state))
+    {
+      if (failure) failure->assign("invalid local transport credential state"_ctv);
+      return false;
+    }
     ProdigyPersistentLocalBrainState existingState = {};
     String loadFailure = {};
     if (loadLocalBrainState(existingState, &loadFailure))

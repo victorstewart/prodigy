@@ -8792,6 +8792,8 @@ private:
     // reconciliation.
     String testInitialBundlePath;
     String testInitialBundleSHA256;
+    ProdigyInitialTransportCredentialProjection initialTransportProjection;
+    ClusterTopology initialTransportTopology;
 
     class SeedProvisioningProgressPrinter final : public BrainIaaSMachineProvisioningProgressSink {
     private:
@@ -9650,6 +9652,30 @@ private:
           return false;
         }
 
+        const ProdigyInitialTransportCredentialProjection *projection = nullptr;
+        if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1)
+        {
+          if (initialTransportProjection.authority.valid())
+          {
+            if (failure) failure->assign("initial transport cohort already provisioned by this create operation"_ctv);
+            finalizeTiming();
+            return false;
+          }
+          ProdigyPersistentLocalBrainState seedIdentity;
+          seedIdentity.ownerClusterUUID = cluster.clusterUUID;
+          ClusterTopology resolvedSeed;
+          if (!prodigyBuildRemoteBootstrapTransportTLSState(seedMachine, topology, seedIdentity, resolvedSeed, failure) ||
+              !mothershipAssignVirtualDatacenterMachineUUIDs(resolvedSeed, virtualTopology, failure) ||
+              !mothershipBuildInitialTransportCredentialProjection(cluster.clusterUUID, virtualTopology,
+                                                                    initialTransportProjection, failure))
+          {
+            finalizeTiming();
+            return false;
+          }
+          initialTransportTopology = virtualTopology;
+          projection = &initialTransportProjection;
+        }
+
         String bundlePath = {};
         String approvedDigest = {};
         if (testInitialBundlePath.empty())
@@ -9668,7 +9694,7 @@ private:
         }
         if (prodigyApproveBundleArtifact(bundlePath, approvedDigest, failure) == false ||
             (testInitialBundleSHA256.empty() == false && approvedDigest.equals(testInitialBundleSHA256) == false) ||
-            mothershipProvisionVirtualDatacenterSeed(cluster, topology, request, runtimeEnvironment, bundlePath, failure) == false ||
+            mothershipProvisionVirtualDatacenterSeed(cluster, topology, request, runtimeEnvironment, bundlePath, failure, projection) == false ||
             mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterSeedRuntimeFilename, failure) == false)
         {
           if (failure && failure->empty() && testInitialBundleSHA256.empty() == false)
@@ -10005,12 +10031,25 @@ private:
         return false;
       }
 
+      const ProdigyInitialTransportCredentialProjection *projection = nullptr;
+      if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1)
+      {
+        if (!initialTransportProjection.authority.valid() || initialTransportTopology.machines.size() != virtualTopology.machines.size() ||
+            initialTransportTopology.machines.empty() || initialTransportTopology.machines[0].uuid != seedTopology.machines[0].uuid)
+        {
+          if (failure) failure->assign("initial transport cohort is unavailable for member provisioning"_ctv);
+          return false;
+        }
+        virtualTopology = initialTransportTopology;
+        projection = &initialTransportProjection;
+      }
+
       AddMachines request = {};
       if (mothershipBuildClusterBootstrapRequest(cluster, request, failure) == false)
       {
         return false;
       }
-      if (mothershipProvisionVirtualDatacenterMembers(cluster, virtualTopology, request, runtimeEnvironment, failure) == false ||
+      if (mothershipProvisionVirtualDatacenterMembers(cluster, virtualTopology, request, runtimeEnvironment, failure, projection) == false ||
           mothershipWaitForVirtualDatacenterRuntimeReceipt(cluster, mothershipVirtualDatacenterRuntimeFilename, failure) == false)
       {
         return false;
@@ -18138,6 +18177,21 @@ private:
         if (parseMothershipClusterDeploymentMode(deploymentMode, request.deploymentMode) == false)
         {
           basics_log("createCluster.deploymentMode invalid\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+      else if (key.equal("internalTransportProfile"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("createCluster.internalTransportProfile requires string\n");
+          exit(EXIT_FAILURE);
+        }
+        String profile;
+        profile.setInvariant(field.value.get_c_str());
+        if (!parseMothershipInternalTransportProfile(profile, request.internalTransportProfile))
+        {
+          basics_log("createCluster.internalTransportProfile invalid\n");
           exit(EXIT_FAILURE);
         }
       }

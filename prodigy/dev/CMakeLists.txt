@@ -651,6 +651,12 @@ target_compile_options(prodigy_container_retirement_unit PRIVATE -O0 -fno-lto -U
 add_executable(prodigy_mothership_upgrade_contract_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_upgrade_contract_unit.cpp)
 add_executable(prodigy_mothership_upgrade_admission_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_upgrade_admission_registry_unit.cpp)
 target_compile_options(prodigy_mothership_upgrade_admission_registry_unit PRIVATE -UNDEBUG)
+add_executable(prodigy_cousin_route_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_route_unit.cpp)
+add_executable(prodigy_cluster_pair_keys_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_pair_keys_unit.cpp)
+add_executable(prodigy_transport_aegis_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_aegis_unit.cpp)
+add_executable(prodigy_transport_crypto_benchmark ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_crypto_benchmark.cpp)
+target_compile_definitions(prodigy_cousin_route_unit PRIVATE PRODIGY_DEBUG=1)
+target_compile_definitions(prodigy_cluster_pair_keys_unit PRIVATE PRODIGY_DEBUG=1)
 add_executable(prodigy_mothership_tidesdb_migration_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_unit.cpp)
 add_executable(prodigy_mothership_tidesdb_migration_command_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_tidesdb_migration_command_unit.cpp)
 target_compile_options(prodigy_mothership_tidesdb_migration_command_unit PRIVATE -UNDEBUG)
@@ -760,6 +766,10 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_container_retirement_unit
    prodigy_mothership_upgrade_contract_unit
    prodigy_mothership_upgrade_admission_registry_unit
+   prodigy_cousin_route_unit
+   prodigy_cluster_pair_keys_unit
+   prodigy_transport_aegis_unit
+   prodigy_transport_crypto_benchmark
    prodigy_mothership_tidesdb_migration_unit
    prodigy_mothership_tidesdb_migration_command_unit
    prodigy_mothership_cluster_reconcile_unit
@@ -856,6 +866,29 @@ endif()
 
 foreach(prodigy_target IN LISTS PRODIGY_ALL_BUILD_TARGETS)
    target_include_directories(${prodigy_target} PRIVATE "${PRODIGY_ROOT}")
+endforeach()
+
+# The authenticated stream owns this pinned handshake implementation; Cargo
+# only builds the static backend, while the existing C++ owner runs all I/O.
+find_program(PRODIGY_NOISE_CARGO_EXECUTABLE cargo REQUIRED)
+set(PRODIGY_NOISE_MANIFEST "${PRODIGY_ROOT}/prodigy/crypto/noise/Cargo.toml")
+set(PRODIGY_NOISE_TARGET_DIR "${CMAKE_BINARY_DIR}/noise-target")
+set(PRODIGY_NOISE_ARCHIVE "${PRODIGY_NOISE_TARGET_DIR}/release/libprodigy_noise.a")
+file(GLOB_RECURSE PRODIGY_NOISE_SOURCES CONFIGURE_DEPENDS
+   "${PRODIGY_ROOT}/prodigy/crypto/noise/*.rs"
+   "${PRODIGY_ROOT}/prodigy/crypto/noise/*.toml")
+add_custom_command(
+   OUTPUT "${PRODIGY_NOISE_ARCHIVE}"
+   COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
+           "${PRODIGY_NOISE_CARGO_EXECUTABLE}" build --locked --release --manifest-path "${PRODIGY_NOISE_MANIFEST}"
+   DEPENDS ${PRODIGY_NOISE_SOURCES} "${PRODIGY_ROOT}/prodigy/crypto/noise/Cargo.lock"
+   VERBATIM)
+add_custom_target(prodigy_noise_backend DEPENDS "${PRODIGY_NOISE_ARCHIVE}")
+add_library(prodigy_noise STATIC IMPORTED GLOBAL)
+set_target_properties(prodigy_noise PROPERTIES IMPORTED_LOCATION "${PRODIGY_NOISE_ARCHIVE}")
+add_dependencies(prodigy_noise prodigy_noise_backend)
+foreach(prodigy_target IN LISTS PRODIGY_ALL_BUILD_TARGETS)
+   target_link_libraries(${prodigy_target} PRIVATE prodigy_noise ${CMAKE_DL_LIBS})
 endforeach()
 
 set(PRODIGY_COMMON_LINK_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
@@ -2428,6 +2461,16 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_stateless_admission_behavior_unit PROPERTIES TIMEOUT 60)
    add_test(NAME prodigy_mothership_upgrade_contract_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_contract_unit)
    add_test(NAME prodigy_mothership_upgrade_admission_registry_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_upgrade_admission_registry_unit)
+   add_test(NAME prodigy_cousin_route_unit COMMAND $<TARGET_FILE:prodigy_cousin_route_unit>)
+   add_test(NAME prodigy_cluster_pair_keys_unit COMMAND $<TARGET_FILE:prodigy_cluster_pair_keys_unit>)
+   add_test(NAME prodigy_transport_aegis_unit COMMAND $<TARGET_FILE:prodigy_transport_aegis_unit>)
+   set_tests_properties(prodigy_transport_aegis_unit PROPERTIES TIMEOUT 30)
+   add_test(NAME prodigy_noise_backend_unit
+      COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
+              "${PRODIGY_NOISE_CARGO_EXECUTABLE}" test --locked --offline --release --manifest-path "${PRODIGY_NOISE_MANIFEST}")
+   set_tests_properties(prodigy_noise_backend_unit PROPERTIES TIMEOUT 180)
+
+   set_tests_properties(prodigy_cousin_route_unit prodigy_cluster_pair_keys_unit PROPERTIES TIMEOUT 30)
    add_test(
       NAME prodigy_mothership_tidesdb_migration_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_tidesdb_migration_unit

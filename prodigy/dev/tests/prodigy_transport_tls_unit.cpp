@@ -780,7 +780,8 @@ static void runFixedSlotRingTransportTLSPayload(TestSuite& suite,
                                                 const String& serverCertPem,
                                                 const String& serverKeyPem,
                                                 uint128_t clientUUID,
-                                                uint128_t serverUUID)
+                                                uint128_t serverUUID,
+                                                bool useAEGIS = false)
 {
   int clientFD = -1;
   int serverFD = -1;
@@ -827,6 +828,18 @@ static void runFixedSlotRingTransportTLSPayload(TestSuite& suite,
   interfacer.server.fslot = serverFslot;
 
   String failure = {};
+  if (useAEGIS)
+  {
+    std::array<uint8_t, 32> psk = {};
+    for (unsigned i = 0; i < psk.size(); ++i) psk[i] = uint8_t(0xa0 + i);
+    suite.expect(interfacer.client.beginTransportAEGIS(false, psk.data(), "ring-payload-test"_ctv, clientUUID, serverUUID),
+                 "ring_aegis_begin_client");
+    suite.expect(interfacer.server.beginTransportAEGIS(true, psk.data(), "ring-payload-test"_ctv, serverUUID, clientUUID),
+                 "ring_aegis_begin_server");
+    OPENSSL_cleanse(psk.data(), psk.size());
+  }
+  else
+  {
   suite.expect(
       configureTransportRuntimeForNode(clientUUID, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem, &failure),
       "ring_tls_configure_client_runtime");
@@ -838,6 +851,7 @@ static void runFixedSlotRingTransportTLSPayload(TestSuite& suite,
       "ring_tls_configure_server_runtime");
   suite.expect(failure.size() == 0, "ring_tls_configure_server_runtime_clears_failure");
   suite.expect(interfacer.server.beginTransportTLS(true), "ring_tls_begin_server");
+  }
 
   const uint32_t payloadBytes = 8u * 1024u * 1024u;
   interfacer.expectedPayload.reserve(payloadBytes);
@@ -861,8 +875,8 @@ static void runFixedSlotRingTransportTLSPayload(TestSuite& suite,
   Ring::exit = false;
   Ring::shuttingDown = false;
 
-  suite.expect(interfacer.deadlineFired == false, "ring_tls_payload_completes_before_deadline");
-  suite.expect(interfacer.completed, "ring_tls_payload_completes");
+  suite.expect(interfacer.deadlineFired == false, useAEGIS ? "ring_aegis_payload_completes_before_deadline" : "ring_tls_payload_completes_before_deadline");
+  suite.expect(interfacer.completed, useAEGIS ? "ring_aegis_payload_completes" : "ring_tls_payload_completes");
 
   close(clientFD);
   close(serverFD);
@@ -1752,6 +1766,9 @@ int main(int argc, char **argv)
       serverUUID);
 
   ProdigyTransportTLSRuntime::clear();
+  runFixedSlotRingTransportTLSPayload(
+      suite, rootCertPem, rootKeyPem, clientCertPem, clientKeyPem,
+      serverCertPem, serverKeyPem, clientUUID, serverUUID, true);
 
   if (suite.failed != 0)
   {

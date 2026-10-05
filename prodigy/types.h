@@ -12,6 +12,8 @@
 #include <services/prodigy.h>
 #include <services/vault.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/cluster.pair.enrollment.h>
+#include <prodigy/transport.credentials.h>
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
 #include <switchboard/common/constants.h>
@@ -8062,14 +8064,35 @@ public:
   uint8_t updateSelfFollowerConcurrency = 0;
   Vector<uint128_t> updateSelfFollowerTransitionIssuedPeerKeys;
   Vector<uint128_t> updateSelfFollowerReadyPeerKeys;
+  // Durable enrollment metadata only; its root is private snapshot material.
+  Vector<ProdigyClusterPairEnrollment> clusterPairEnrollments;
+  // Public enrollment ledger; its one authority root is in the snapshot sidecar.
+  Vector<ProdigyTransportCredentialEnrollment> transportCredentialEnrollments;
+  Vector<ProdigyTransportCredentialEnrollmentOperation> transportCredentialEnrollmentOperations;
+  // Never serialized in this public runtime record. Persistence extracts it to
+  // ProdigyPersistentBrainSnapshotSecrets before writing the snapshot.
+  ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
     if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
-        prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false)
+        prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
+        prodigyClusterPairEnrollmentsEqual(clusterPairEnrollments, other.clusterPairEnrollments) == false ||
+        transportCredentialEnrollments != other.transportCredentialEnrollments ||
+        transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
+        transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
+        transportCredentialAuthorityRoot.keyEpoch != other.transportCredentialAuthorityRoot.keyEpoch ||
+        transportCredentialAuthorityRoot.authorityGeneration != other.transportCredentialAuthorityRoot.authorityGeneration ||
+        CRYPTO_memcmp(transportCredentialAuthorityRoot.root, other.transportCredentialAuthorityRoot.root,
+                      ProdigyTransportCredentialAuthorityRootBytes) != 0)
     {
       return false;
+    }
+    for (uint32_t index = 0; index < transportCredentialEnrollmentOperations.size(); ++index)
+    {
+      const auto& left = transportCredentialEnrollmentOperations[index]; const auto& right = other.transportCredentialEnrollmentOperations[index];
+      if (left.enrollment != right.enrollment || left.electorate != right.electorate || left.pinnedMasterAuthorityEpoch != right.pinnedMasterAuthorityEpoch || left.transitionGeneration != right.transitionGeneration || left.phase != right.phase) return false;
     }
 
     for (const auto& [key, snapshot] : tlsResumptionSnapshotsByWormhole)
@@ -9110,8 +9133,12 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // Versions 6-8 are the P6 placement/serving/admission layouts. The
   // divergent concurrency layout must never reuse version 6; version 9
   // appends its durable transition state after the cumulative P6 tails.
-  constexpr uint64_t explicitVersion = 9;
+  // Version 10 appends cluster-pair enrollment descriptors; version 11
+  // appends internal transport credential enrollment descriptors.
+  constexpr uint64_t explicitVersion = 11;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    state.transportCredentialAuthorityRoot = {};
   bool hasMaterializedStatefulRecoveryOperations = false;
   bool hasApiCredentialExpiryNotices = false;
   bool hasAllMachineRecoveryWitnesses = false;
@@ -9121,6 +9148,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasStatefulServingAuthorities = false;
   bool hasStatelessDeploymentAdmissions = false;
   bool hasExplicitUpdateSelfFollowerConcurrency = false;
+  bool hasClusterPairEnrollments = false;
+  bool hasTransportCredentialEnrollments = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9149,7 +9178,13 @@ static void prodigySerializeMasterAuthorityRuntimeState(
                                 (containerRuntimeStates->empty() == false || hasDeploymentPlacementPolicies);
     // Version-four framing is cumulative: emit the earlier optional fields
     // (empty when unused) so a version-three reader has an unambiguous tail.
-    hasExplicitUpdateSelfFollowerConcurrency = state.updateSelfFollowerConcurrency != 0;
+    hasClusterPairEnrollments = state.clusterPairEnrollments.empty() == false;
+    hasTransportCredentialEnrollments = state.transportCredentialEnrollments.empty() == false || state.transportCredentialEnrollmentOperations.empty() == false;
+    // Version 11 retains the version-10 container even when there are no pairs.
+    if (hasTransportCredentialEnrollments) hasClusterPairEnrollments = true;
+    // Version 10 is cumulative and may use a zero concurrency placeholder
+    // while retaining the pre-v21 unlimited behavior.
+    hasExplicitUpdateSelfFollowerConcurrency = state.updateSelfFollowerConcurrency != 0 || hasClusterPairEnrollments || hasTransportCredentialEnrollments;
     if (hasExplicitUpdateSelfFollowerConcurrency)
     {
       // Version nine is cumulative and retains P6's v6-v8 field order.
@@ -9172,10 +9207,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
 
-      uint64_t version = hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9213,6 +9248,8 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasStatefulServingAuthorities = version >= 7;
       hasStatelessDeploymentAdmissions = version >= 8;
       hasExplicitUpdateSelfFollowerConcurrency = version >= 9;
+      hasClusterPairEnrollments = version >= 10;
+      hasTransportCredentialEnrollments = version >= 11;
     }
   }
 
@@ -9313,7 +9350,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     serializer.object(state.updateSelfFollowerReadyPeerKeys);
     if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
     {
-      if (state.updateSelfFollowerConcurrency < ProdigyUpdateSelfMinimumConcurrency ||
+      if ((state.updateSelfFollowerConcurrency < ProdigyUpdateSelfMinimumConcurrency && !hasClusterPairEnrollments) ||
           state.updateSelfFollowerConcurrency > ProdigyUpdateSelfMaximumConcurrency)
       {
         serializer.adapter().error(bitsery::ReaderError::InvalidData);
@@ -9325,6 +9362,27 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     state.updateSelfFollowerConcurrency = 0;
     state.updateSelfFollowerTransitionIssuedPeerKeys.clear();
     state.updateSelfFollowerReadyPeerKeys.clear();
+  }
+  if (hasClusterPairEnrollments)
+  {
+    serializer.container(state.clusterPairEnrollments, ProdigyClusterPairEnrollmentMaximumRecords,
+        [](auto& nested, ProdigyClusterPairEnrollment& enrollment) { nested.object(enrollment); });
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.clusterPairEnrollments.clear();
+  }
+  if (hasTransportCredentialEnrollments)
+  {
+    serializer.container(state.transportCredentialEnrollments, ProdigyTransportCredentialEnrollmentMaximumRecords,
+        [](auto& nested, ProdigyTransportCredentialEnrollment& enrollment) { nested.object(enrollment); });
+    serializer.container(state.transportCredentialEnrollmentOperations, ProdigyTransportCredentialEnrollmentMaximumRecords,
+        [](auto& nested, ProdigyTransportCredentialEnrollmentOperation& operation) { nested.object(operation); });
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.transportCredentialEnrollments.clear();
+    state.transportCredentialEnrollmentOperations.clear();
   }
 }
 

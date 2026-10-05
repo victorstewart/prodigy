@@ -75,6 +75,34 @@ struct switchboard_wormhole_egress_binding {
   __u16 port;
   __u8 proto;
   __u8 is_ipv6;
+  __u8 admission_profile;
+  __u16 admission_reserved;
+};
+
+enum { SWITCHBOARD_WORMHOLE_ADMISSION_NONE = 0, SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT = 1 };
+enum { SWITCHBOARD_PAIR_ADMISSION_PENDING = 1, SWITCHBOARD_PAIR_ADMISSION_CONSUMED = 2 };
+
+struct switchboard_pair_admission_grant {
+  __u64 pair_uuid_hi, pair_uuid_lo, route_uuid_hi, route_uuid_lo;
+  __u64 route_generation, root_generation, key_epoch, expires_at_ns;
+  __u8 target_container[5]; __u8 reserved[3];
+  __u32 target_machine_fragment;
+  union {
+    struct { __u32 state; __be32 initial_syn_sequence; };
+    __u64 consumption;
+  };
+  __u64 consumed_expires_at_ns;
+};
+struct switchboard_pair_admission_route_key { __u64 pair_uuid_hi, pair_uuid_lo, route_uuid_hi, route_uuid_lo; };
+struct switchboard_pair_admission_route_policy {
+  __u64 route_generation, root_generation, key_epoch, expires_at_ns;
+  __u8 state; __u8 reserved[7];
+};
+enum { SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE = 1, SWITCHBOARD_PAIR_ADMISSION_ROUTE_DRAINING = 2, SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED = 3 };
+
+struct switchboard_pair_admission_identity {
+  struct switchboard_pair_admission_route_key route;
+  __u64 route_generation, root_generation, key_epoch;
 };
 
 enum {
@@ -93,7 +121,9 @@ struct switchboard_wormhole_flow {
   struct switchboard_wormhole_egress_binding binding;
   __u8 container[5];
   __u8 disposition;
-  __u16 reserved;
+  __u8 admission_profile;
+  __u8 reserved;
+  struct switchboard_pair_admission_identity admission;
   union {
     struct {
       __u32 phase;

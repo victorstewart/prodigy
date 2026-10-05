@@ -6,6 +6,7 @@
 #include <ebpf/program.h>
 
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <switchboard/common/checksum.h>
 #include <switchboard/common/constants.h>
 #include <switchboard/common/local_container_subnet.h>
@@ -16,6 +17,7 @@
 #include <prodigy/quic.cid.generator.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <fcntl.h>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +54,57 @@ public:
     }
   }
 };
+
+static int switchboardWhiteholeLibbpfDiagnostics(enum libbpf_print_level level, const char *format, va_list args)
+{
+  if (level == LIBBPF_DEBUG || format == nullptr)
+  {
+    return 0;
+  }
+  std::fputs("libbpf: ", stderr);
+  return std::vfprintf(stderr, format, args);
+}
+
+// Basics retains verifier output internally.  Keep this narrowly scoped
+// preflight so an authorized isolated-guest run records the actual host router
+// verifier rejection without enabling global libbpf debugging.
+static bool diagnoseHostIngressRawLoad(void)
+{
+  static bool attempted = false;
+  if (attempted)
+  {
+    return true;
+  }
+  attempted = true;
+  String objectPath = {};
+  objectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  objectPath.append("/host.ingress.router.ebpf.o"_ctv);
+  std::vector<char> verifierLog(8 * 1024 * 1024, 0);
+  struct bpf_object_open_opts options = {};
+  options.sz = sizeof(options);
+  options.kernel_log_buf = verifierLog.data();
+  options.kernel_log_size = verifierLog.size();
+  options.kernel_log_level = 1;
+  struct bpf_object *object = bpf_object__open_file(objectPath.c_str(), &options);
+  long openError = object ? libbpf_get_error(object) : -errno;
+  if (object == nullptr || openError != 0)
+  {
+    std::fprintf(stderr, "host_ingress_raw_preflight_open_failed path=%s error=%ld errno=%d\n", objectPath.c_str(), openError, errno);
+    return false;
+  }
+  int result = bpf_object__load(object);
+  if (result != 0)
+  {
+    const size_t logLength = strnlen(verifierLog.data(), verifierLog.size());
+    const size_t tailOffset = logLength > 32768 ? logLength - 32768 : 0;
+    std::fprintf(stderr, "host_ingress_raw_preflight_load_failed result=%d errno=%d verifier_log_bytes=%zu tail:\n%s\n",
+                 result, errno, logLength, verifierLog.data() + tailOffset);
+    bpf_object__close(object);
+    return false;
+  }
+  bpf_object__close(object);
+  return true;
+}
 
 static uint32_t programMapID(BPFProgram& program, StringType auto&& mapName)
 {
@@ -92,6 +145,8 @@ static bool objectWhiteholeMapsUseAllocation(struct bpf_object *object, bool spa
 
 static void verifyDevelopmentWhiteholeMapAllocation(TestSuite& suite)
 {
+  suite.expect(std::strlen("wh_pair_grants") <= 15 && std::strlen("wh_pair_routes") <= 15,
+               "switchboard_pair_admission_map_names_fit_basics_loader_limit");
   String objectPath = {};
   objectPath.assign(PRODIGY_TEST_BINARY_DIR);
   objectPath.append("/host.ingress.router.ebpf.o"_ctv);
@@ -1658,10 +1713,16 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   uint32_t testIfindex = uint32_t(::getpid()) ^ 0x57484f4cu;
   String establishedPinPath = {};
   String pendingPinPath = {};
+  String grantPinPath = {};
+  String routePinPath = {};
   switchboardWormholeFlowPinPath(establishedPinPath, testIfindex);
   switchboardWormholePendingFlowPinPath(pendingPinPath, testIfindex);
+  switchboardPairAdmissionGrantPinPath(grantPinPath, testIfindex);
+  switchboardPairAdmissionRoutePinPath(routePinPath, testIfindex);
   (void)unlink(establishedPinPath.c_str());
   (void)unlink(pendingPinPath.c_str());
+  (void)unlink(grantPinPath.c_str());
+  (void)unlink(routePinPath.c_str());
   expectNamed(switchboardPinWormholeFlowMaps(&host, testIfindex), "pins_host_flow_maps");
 
   bool ingressReused = false;
@@ -1685,6 +1746,8 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   {
     (void)unlink(establishedPinPath.c_str());
     (void)unlink(pendingPinPath.c_str());
+    (void)unlink(grantPinPath.c_str());
+    (void)unlink(routePinPath.c_str());
     host.close();
     ingress.close();
     egress.close();
@@ -1693,17 +1756,34 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
 
   uint32_t hostMapID = programMapID(host, "wh_flows"_ctv);
   uint32_t hostPendingMapID = programMapID(host, "wh_pending"_ctv);
+  uint32_t hostGrantMapID = programMapID(host, "wh_pair_grants"_ctv);
+  uint32_t hostRouteMapID = programMapID(host, "wh_pair_routes"_ctv);
   expectNamed(hostMapID != 0 && programMapID(ingress, "wh_flows"_ctv) == hostMapID && programMapID(egress, "wh_flows"_ctv) == hostMapID &&
                   hostPendingMapID != 0 && programMapID(ingress, "wh_pending"_ctv) == hostPendingMapID && programMapID(egress, "wh_pending"_ctv) == hostPendingMapID,
               "shares_pending_and_established_maps_across_all_three_programs");
+  expectNamed(hostGrantMapID != 0 && hostRouteMapID != 0 &&
+                  programMapID(ingress, "wh_pair_grants"_ctv) == hostGrantMapID &&
+                  programMapID(egress, "wh_pair_grants"_ctv) == hostGrantMapID &&
+                  programMapID(ingress, "wh_pair_routes"_ctv) == hostRouteMapID &&
+                  programMapID(egress, "wh_pair_routes"_ctv) == hostRouteMapID,
+              "shares_pair_admission_maps_across_all_three_programs");
   bool establishedMapContract = false;
   bool pendingMapContract = false;
+  bool grantMapContract = false;
+  bool routeMapContract = false;
   host.openMap("wh_flows"_ctv, [&](int mapFD) -> void {
     establishedMapContract = switchboardWormholeEstablishedFlowMapCompatibleFD(mapFD);
   });
   host.openMap("wh_pending"_ctv, [&](int mapFD) -> void {
     pendingMapContract = switchboardWormholePendingFlowMapCompatibleFD(mapFD);
   });
+  host.openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+    grantMapContract = switchboardPairAdmissionGrantMapCompatibleFD(mapFD);
+  });
+  host.openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+    routeMapContract = switchboardPairAdmissionRouteMapCompatibleFD(mapFD);
+  });
+  expectNamed(grantMapContract && routeMapContract, "pair_admission_map_abi_contract");
   expectNamed(establishedMapContract && pendingMapContract,
               "uses_bounded_lru_pending_and_non_evicting_established_map_contracts");
 
@@ -2025,6 +2105,70 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   tcpReplyKey.port16[1] = htons(49'155);
   tcpReplyKey.proto = IPPROTO_TCP;
   switchboard_wormhole_flow_key tcpOwnerKey = switchboardWormholeFlowMapKey(&tcpReplyKey, tcpBinding.owner_generation);
+
+  // Pair admission is deliberately exercised through the real host router:
+  // ordinary portal traffic cannot create a protected flow without the exact
+  // flow/slot grant, and a consumed grant only accepts its original SYN.
+  switchboard_wormhole_egress_key protectedExposure = {};
+  std::memcpy(protectedExposure.container, selected, sizeof(protectedExposure.container));
+  protectedExposure.port = htons(10'443);
+  protectedExposure.proto = IPPROTO_TCP;
+  tcpBinding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, protectedExposure, tcpBinding),
+              "marks_tcp_portal_as_pair_protected");
+  clearWormholeFlows();
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_SHOT, "protected_ipv6_missing_grant_drops_before_flow_learning");
+  switchboard_pair_admission_route_key protectedRouteKey = {101, 102, 103, 104};
+  switchboard_pair_admission_route_policy protectedRoute = {};
+  protectedRoute.route_generation = 7;
+  protectedRoute.root_generation = 8;
+  protectedRoute.key_epoch = 9;
+  protectedRoute.expires_at_ns = UINT64_MAX;
+  protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  switchboard_pair_admission_grant_key protectedGrantKey = {};
+  std::memcpy(protectedGrantKey.flow.srcv6, client, sizeof(client));
+  std::memcpy(protectedGrantKey.flow.dstv6, externalTCP, sizeof(externalTCP));
+  protectedGrantKey.flow.port16[0] = htons(49'155);
+  protectedGrantKey.flow.port16[1] = htons(443);
+  protectedGrantKey.flow.proto = IPPROTO_TCP;
+  protectedGrantKey.portal_slot = 44;
+  switchboard_pair_admission_grant protectedGrant = {};
+  protectedGrant.pair_uuid_hi = 101;
+  protectedGrant.pair_uuid_lo = 102;
+  protectedGrant.route_uuid_hi = 103;
+  protectedGrant.route_uuid_lo = 104;
+  protectedGrant.route_generation = 7;
+  protectedGrant.root_generation = 8;
+  protectedGrant.key_epoch = 9;
+  protectedGrant.expires_at_ns = UINT64_MAX;
+  std::memcpy(protectedGrant.target_container, selected, sizeof(selected));
+  protectedGrant.target_machine_fragment = (uint32_t(selected[1]) << 16) | (uint32_t(selected[2]) << 8) | selected[3];
+  protectedGrant.state = SWITCHBOARD_PAIR_ADMISSION_PENDING;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, protectedGrantKey, protectedGrant),
+              "installs_exact_protected_pair_grant");
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT, "protected_ipv6_exact_syn_is_admitted");
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT, "protected_ipv6_same_syn_retransmit_is_admitted");
+  std::vector<uint8_t> differentSynInner = publicTCPInner;
+  struct tcphdr *differentSyn = reinterpret_cast<struct tcphdr *>(differentSynInner.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  differentSyn->seq = htonl(77);
+  differentSyn->check = 0;
+  struct ipv6hdr *differentSynIP = reinterpret_cast<struct ipv6hdr *>(differentSynInner.data() + sizeof(struct ethhdr));
+  differentSyn->check = checksumIPv6Transport(differentSynIP->saddr.s6_addr, differentSynIP->daddr.s6_addr, IPPROTO_TCP,
+                                               differentSyn, sizeof(*differentSyn));
+  std::vector<uint8_t> differentSynOverlay = makeWormholeIPv6OverlayFrame(differentSynInner, selected);
+  expectNamed(runHost(differentSynOverlay, hostOutput) == TC_ACT_SHOT, "protected_ipv6_different_syn_sequence_drops");
+  protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(publicTCPOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_revoked_route_drops_cached_pending_flow");
+  tcpBinding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
+  expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
+                  updateProgramMapElement(ingress, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
+                  updateProgramMapElement(egress, "wh_egress"_ctv, protectedExposure, tcpBinding),
+              "restores_ordinary_tcp_portal_profile");
 
   clearWormholeFlows();
   expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
@@ -2523,9 +2667,50 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   lookupProgramMapElement(host, "wh_flows"_ctv, ownerKey2, remaining),
               "gc_preserves_live_owner");
 
+  // The earlier packet checks deliberately leave a revoked grant behind.
+  // Isolate this count-based GC assertion from those packet fixtures.
+  clearProgramMap<switchboard_pair_admission_grant_key>(host, "wh_pair_grants"_ctv);
+  clearProgramMap<switchboard_pair_admission_route_key>(host, "wh_pair_routes"_ctv);
+  switchboard_pair_admission_grant_key admissionKey = {};
+  admissionKey.flow = replyKey;
+  admissionKey.portal_slot = 91;
+  switchboard_pair_admission_route_key admissionRouteKey = {11, 12, 13, 14};
+  switchboard_pair_admission_route_policy admissionRoute = {};
+  admissionRoute.route_generation = 1;
+  admissionRoute.root_generation = 2;
+  admissionRoute.key_epoch = 3;
+  admissionRoute.expires_at_ns = 100;
+  admissionRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  switchboard_pair_admission_grant admissionGrant = {};
+  admissionGrant.pair_uuid_hi = 11;
+  admissionGrant.pair_uuid_lo = 12;
+  admissionGrant.route_uuid_hi = 13;
+  admissionGrant.route_uuid_lo = 14;
+  admissionGrant.route_generation = 1;
+  admissionGrant.root_generation = 2;
+  admissionGrant.key_epoch = 3;
+  admissionGrant.expires_at_ns = 1;
+  admissionGrant.state = SWITCHBOARD_PAIR_ADMISSION_CONSUMED;
+  admissionGrant.consumed_expires_at_ns = 50;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant),
+              "seeds_consumed_pair_admission_for_gc");
+  SwitchboardPairAdmissionGCCursor admissionCursor = {};
+  uint32_t admissionDeleted = 0;
+  expectNamed(switchboardCleanupExpiredPairAdmissionMaps(&host, 2, admissionCursor, &admissionDeleted) && admissionDeleted == 0 &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant),
+              "gc_retains_consumed_grant_before_policy_and_session_expiry");
+  admissionRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
+                  switchboardCleanupExpiredPairAdmissionMaps(&host, 3, admissionCursor, &admissionDeleted) &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) == false,
+              "gc_reclaims_consumed_grant_after_route_revocation");
+
   clearWormholeFlows();
   (void)unlink(establishedPinPath.c_str());
   (void)unlink(pendingPinPath.c_str());
+  (void)unlink(grantPinPath.c_str());
+  (void)unlink(routePinPath.c_str());
   host.close();
   ingress.close();
   egress.close();
@@ -2959,7 +3144,14 @@ int main(int argc, char **argv)
     return 77;
   }
 
+  if (diagnoseHostIngressRawLoad() == false)
+  {
+    return 1;
+  }
+
   TestSuite suite = {};
+  // Keep verifier and map-create failures visible in isolated guest evidence.
+  libbpf_set_print(switchboardWhiteholeLibbpfDiagnostics);
   verifyDevelopmentWhiteholeMapAllocation(suite);
 
   verifyWhiteholeBindingValue(suite);

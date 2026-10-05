@@ -1,6 +1,7 @@
 #define PRODIGY_RUNTIME_PERSISTENCE_UNIT
 #include "../../prodigy.cpp"
 
+#include <array>
 #include <cstdio>
 
 #include <prodigy/dev/tests/persistence_fixture.h>
@@ -44,6 +45,94 @@ public:
     receipt = std::move(completion);
   }
 };
+
+class ProjectionReceiptTestNeuron final : public Neuron {
+public:
+  uint32_t projectionPersistenceCalls = 0;
+  bool admitProjectionPersistence = true;
+  std::deque<std::function<void(bool)>> projectionReceipts;
+
+  bool persistTransportCredentialPeerProjection(
+      const ProdigyTransportCredentialBootstrap&, std::function<void(bool)> completion) override
+  {
+    ++projectionPersistenceCalls;
+    if (!admitProjectionPersistence) return false;
+    projectionReceipts.push_back(std::move(completion));
+    return true;
+  }
+
+  void finishProjectionPersistence(bool durable)
+  {
+    if (projectionReceipts.empty()) return;
+    auto completion = std::move(projectionReceipts.front());
+    projectionReceipts.pop_front();
+    completion(durable);
+  }
+};
+
+static void reserveProjectionTransport(ProdigyTransportTLSStream& stream)
+{
+  stream.rBuffer.reserve(8192);
+  stream.wBuffer.reserve(16384);
+}
+
+static bool pumpProjectionTransport(ProdigyTransportTLSStream& from, ProdigyTransportTLSStream& to)
+{
+  const uint32_t bytes = from.nBytesToSend();
+  if (bytes == 0) return false;
+  if (to.rBuffer.remainingCapacity() < bytes) to.rBuffer.reserve(to.rBuffer.size() + bytes);
+  from.noteSendQueued();
+  std::memcpy(to.rBuffer.pTail(), from.pBytesToSend(), bytes);
+  const bool accepted = to.decryptTransportTLS(bytes);
+  from.consumeSentBytes(bytes, false);
+  from.noteSendCompleted();
+  return accepted;
+}
+
+static bool completeProjectionTransportHandshake(ProdigyTransportTLSStream& client, ProdigyTransportTLSStream& server)
+{
+  for (uint32_t round = 0; round < 128; ++round)
+  {
+    const bool progressed = pumpProjectionTransport(client, server) || pumpProjectionTransport(server, client);
+    if (client.isTransportNegotiated() && server.isTransportNegotiated()) return true;
+    if (!progressed) return false;
+  }
+  return false;
+}
+
+static ProdigyTransportCredentialEnrollment projectionEnrollment(uint128_t operationUUID, uint128_t nodeUUID,
+                                                                  uint64_t generation)
+{
+  ProdigyTransportCredentialEnrollment enrollment = {};
+  enrollment.operationUUID = operationUUID;
+  enrollment.nodeUUID = nodeUUID;
+  enrollment.clusterUUID = uint128_t(0x7101);
+  enrollment.authorityEpoch = 7;
+  enrollment.keyEpoch = 9;
+  enrollment.authorityGeneration = generation;
+  enrollment.role = ProdigyTransportCredentialNodeRole::brain;
+  enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+  return enrollment;
+}
+
+static ProdigyTransportCredentialBootstrap projectionCredentialBootstrap(uint128_t neuronUUID, uint128_t brainUUID,
+                                                                          uint64_t revision)
+{
+  ProdigyTransportCredentialBootstrap bootstrap = {};
+  bootstrap.enabled = true;
+  bootstrap.self.operationUUID = uint128_t(0x7102);
+  bootstrap.self.nodeUUID = neuronUUID;
+  bootstrap.self.clusterUUID = uint128_t(0x7101);
+  bootstrap.self.authorityEpoch = 7;
+  bootstrap.self.keyEpoch = 9;
+  bootstrap.self.authorityGeneration = 10;
+  bootstrap.self.rootAuthorityGeneration = 10;
+  bootstrap.self.role = ProdigyTransportCredentialNodeRole::neuron;
+  std::memset(bootstrap.self.secret, 0x5a, sizeof(bootstrap.self.secret));
+  bootstrap.authorizedPeers.push_back(projectionEnrollment(0x7103, brainUUID, 10));
+  bootstrap.committedAuthorityGeneration = revision;
+  return bootstrap;
+}
 
 template <typename... Args>
 static Message *runtimePersistenceMessage(String& buffer, NeuronTopic topic, Args&&...args)
@@ -958,6 +1047,102 @@ static void testDurableMaterializedRecoveryHistoricalCull(TestSuite& suite)
   thisBrain = savedBrain;
 }
 
+static void testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(TestSuite& suite)
+{
+  constexpr uint128_t neuronUUID = uint128_t(0x7105);
+  constexpr uint128_t brainUUID = uint128_t(0x7104);
+  PersistenceRing ring = {};
+  ProjectionReceiptTestNeuron neuron = {};
+  NeuronBrainControlStream stream = {};
+  ProdigyTransportTLSStream remote = {};
+  reserveProjectionTransport(stream);
+  reserveProjectionTransport(remote);
+  std::array<uint8_t, ProdigyTransportCredentialAuthorityRootBytes> psk = {};
+  psk.fill(0x31);
+  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "runtime-projection"_ctv, neuronUUID, brainUUID) &&
+      remote.beginTransportAEGIS(false, psk.data(), "runtime-projection"_ctv, brainUUID, neuronUUID) &&
+      completeProjectionTransportHandshake(remote, stream);
+  suite.expect(authenticated, "runtime_persistence_projection_uses_authenticated_aegis_control_stream");
+  if (!authenticated) return;
+  stream.connected = true;
+  stream.tlsPeerVerified = true;
+  stream.tlsPeerUUID = brainUUID;
+  stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  stream.isFixedFile = false;
+  neuron.brain = &stream;
+
+  const ProdigyTransportCredentialBootstrap original = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  ProdigyTransportCredentialBootstrap projection = original;
+  OPENSSL_cleanse(projection.self.secret, sizeof(projection.self.secret));
+  projection.committedAuthorityGeneration = 11;
+  projection.authorizedPeers.push_back(projectionEnrollment(0x7106, uint128_t(0x7107), 11));
+  neuron.controlTransportCredentials = original;
+  auto hasAck = [&](uint128_t expectedNonce, bool expectedAcceptance) {
+    if (stream.wBuffer.empty()) return false;
+    auto *message = reinterpret_cast<Message *>(stream.wBuffer.data());
+    if (message->topic != uint16_t(NeuronTopic::transportCredentialPeersAck) ||
+        !ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal())) return false;
+    uint8_t *args = message->args;
+    uint128_t nonce = 0;
+    uint64_t generation = 0;
+    uint8_t accepted = 0;
+    Message::extractArg<ArgumentNature::fixed>(args, nonce);
+    Message::extractArg<ArgumentNature::fixed>(args, generation);
+    Message::extractArg<ArgumentNature::fixed>(args, accepted);
+    return nonce == expectedNonce && generation == projection.committedAuthorityGeneration &&
+        accepted == uint8_t(expectedAcceptance);
+  };
+
+  neuron.receiveTransportCredentialPeerProjection(0x7108, projection);
+  suite.expect(neuron.projectionPersistenceCalls == 1 && neuron.transportPeerProjectionPersistencePending &&
+                   neuron.controlTransportCredentials.committedAuthorityGeneration == original.committedAuthorityGeneration &&
+                   stream.wBuffer.size() == 0,
+               "runtime_persistence_projection_waits_for_durable_receipt_before_install_or_ack");
+
+  // Suppress actual send submission: the assertion is about the receiver's
+  // exact ACK frame, and this fixture has no remote message owner.
+  stream.pendingSend = true;
+  neuron.finishProjectionPersistence(true);
+  suite.expect(!neuron.transportPeerProjectionPersistencePending &&
+                   neuron.controlTransportCredentials.committedAuthorityGeneration == projection.committedAuthorityGeneration &&
+                   neuron.controlTransportCredentials.authorizedPeers.size() == projection.authorizedPeers.size() &&
+                   std::memcmp(neuron.controlTransportCredentials.self.secret, original.self.secret,
+                               sizeof(original.self.secret)) == 0 && hasAck(0x7108, true),
+               "runtime_persistence_projection_installs_durable_public_revision_and_preserves_self_secret");
+
+  stream.wBuffer.clear();
+  stream.pendingSend = false;
+  neuron.controlTransportCredentials = original;
+  neuron.receiveTransportCredentialPeerProjection(0x7109, projection);
+  stream.pendingSend = true;
+  neuron.finishProjectionPersistence(false);
+  suite.expect(neuron.controlTransportCredentials.committedAuthorityGeneration == original.committedAuthorityGeneration &&
+                   std::memcmp(neuron.controlTransportCredentials.self.secret, original.self.secret,
+                               sizeof(original.self.secret)) == 0 && hasAck(0x7109, false),
+               "runtime_persistence_projection_failed_receipt_preserves_existing_credentials");
+
+  stream.wBuffer.clear();
+  stream.pendingSend = false;
+  neuron.controlTransportCredentials = original;
+  neuron.receiveTransportCredentialPeerProjection(0x7110, projection);
+  stream.ioGeneration += 1;
+  stream.pendingSend = true;
+  neuron.finishProjectionPersistence(true);
+  suite.expect(neuron.controlTransportCredentials.committedAuthorityGeneration == original.committedAuthorityGeneration &&
+                   stream.wBuffer.size() == 0,
+               "runtime_persistence_projection_replaced_authenticated_stream_cannot_install_or_ack");
+
+  neuron.receiveTransportCredentialPeerProjection(0x7111, projection);
+  stream.connectionLifetime = std::make_shared<uint8_t>(0);
+  neuron.finishProjectionPersistence(true);
+  suite.expect(neuron.controlTransportCredentials.committedAuthorityGeneration == original.committedAuthorityGeneration &&
+                   stream.wBuffer.size() == 0,
+               "runtime_persistence_projection_retired_stream_token_fences_same_address_and_generation");
+
+  ::close(stream.fd);
+  stream.fd = -1;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -993,5 +1178,6 @@ int main(void)
   testRuntimeAwareNeuronActivatesOnlyTheAsyncPersistenceOwner(suite);
   testBootPersistenceAdmissionRejectionHasNoReceipt(suite);
   testDurableMaterializedRecoveryHistoricalCull(suite);
+  testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(suite);
   return suite.failed == 0 ? 0 : 1;
 }

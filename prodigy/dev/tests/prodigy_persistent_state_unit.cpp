@@ -631,6 +631,69 @@ static bool equalLocalBrainStates(const ProdigyPersistentLocalBrainState& lhs, c
   return lhs.uuid == rhs.uuid && lhs.ownerClusterUUID == rhs.ownerClusterUUID && lhs.transportTLS == rhs.transportTLS;
 }
 
+class LegacyPersistentLocalBrainStateWire {
+public:
+
+  uint128_t uuid = 0;
+  uint128_t ownerClusterUUID = 0;
+  ProdigyTransportTLSMaterial transportTLS;
+};
+
+template <typename S>
+static void serialize(S&& serializer, LegacyPersistentLocalBrainStateWire& state)
+{
+  serializer.value16b(state.uuid);
+  serializer.value16b(state.ownerClusterUUID);
+  serializer.object(state.transportTLS);
+}
+
+static bool makePersistentLocalTransportCredentialState(
+    ProdigyPersistentLocalBrainState& state,
+    ProdigyTransportCredentialNodeRole localRole)
+{
+  state = {};
+  state.uuid = localRole == ProdigyTransportCredentialNodeRole::brain ? uint128_t(0xB100) : uint128_t(0xD100);
+  state.ownerClusterUUID = uint128_t(0xC100);
+
+  ProdigyTransportCredentialAuthorityRoot authority = {};
+  authority.authorityEpoch = 11;
+  authority.keyEpoch = 13;
+  authority.authorityGeneration = 17;
+  for (uint32_t index = 0; index < sizeof(authority.root); ++index)
+  {
+    authority.root[index] = uint8_t(0x80 + index);
+  }
+
+  ProdigyTransportCredentialEnrollment local = {};
+  local.operationUUID = localRole == ProdigyTransportCredentialNodeRole::brain ? uint128_t(0xB101) : uint128_t(0xD101);
+  local.nodeUUID = state.uuid;
+  local.clusterUUID = state.ownerClusterUUID;
+  local.authorityEpoch = authority.authorityEpoch;
+  local.keyEpoch = authority.keyEpoch;
+  local.authorityGeneration = 19;
+  local.role = localRole;
+  local.state = ProdigyTransportCredentialEnrollmentState::active;
+
+  ProdigyTransportCredentialEnrollment peer = local;
+  peer.operationUUID = localRole == ProdigyTransportCredentialNodeRole::brain ? uint128_t(0xD101) : uint128_t(0xB101);
+  peer.nodeUUID = localRole == ProdigyTransportCredentialNodeRole::brain ? uint128_t(0xD100) : uint128_t(0xB100);
+  peer.role = localRole == ProdigyTransportCredentialNodeRole::brain ?
+      ProdigyTransportCredentialNodeRole::neuron : ProdigyTransportCredentialNodeRole::brain;
+
+  state.transportCredentials.enabled = true;
+  if (!prodigyDeriveTransportNodeCredential(authority, local, state.transportCredentials.self))
+  {
+    return false;
+  }
+  state.transportCredentials.authorizedPeers.push_back(peer);
+  state.transportCredentials.committedAuthorityGeneration = 19;
+  if (localRole == ProdigyTransportCredentialNodeRole::brain)
+  {
+    state.transportCredentialAuthorityRoot = authority;
+  }
+  return prodigyLocalTransportCredentialStateValid(state);
+}
+
 static bool generateApplicationTlsFactory(ApplicationTlsVaultFactory& factory, String& failure)
 {
   failure.clear();
@@ -1086,7 +1149,7 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
                "master_authority_runtime_state_rejects_truncated_version_marker");
 
   String unknownVersion = bothBytes;
-  uint64_t unsupportedVersion = 10;
+  uint64_t unsupportedVersion = 11;
   memcpy(unknownVersion.data() + sizeof(uint64_t), &unsupportedVersion, sizeof(unsupportedVersion));
   malformed = {};
   suite.expect(BitseryEngine::deserializeSafe(unknownVersion, malformed) == false,
@@ -2707,6 +2770,293 @@ int main(void)
         extractedSecrets.mothershipTunnelGatewayServerKeyPem.equals(storedTunnelGatewayAuth.serverKeyPem),
         "extract_snapshot_secrets_captures_tunnel_gateway_server_key");
 
+    {
+      // This carries the ordinary snapshot's existing TLS and private state,
+      // adds only a transport authority root, and intentionally leaves the
+      // preceding cluster-pair sidecar tail empty.
+      ProdigyPersistentBrainSnapshot transportRootSnapshot = expectedManagedSnapshot;
+      transportRootSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.clear();
+      auto& runtime = transportRootSnapshot.masterAuthority.runtimeState;
+      ProdigyTransportCredentialAuthorityRoot authority = {};
+      authority.authorityEpoch = 0xA101;
+      authority.keyEpoch = 0xA102;
+      authority.authorityGeneration = runtime.generation;
+      for (uint32_t index = 0; index < sizeof(authority.root); ++index)
+        authority.root[index] = uint8_t(0x40 + index);
+      runtime.transportCredentialAuthorityRoot = authority;
+      ProdigyTransportCredentialEnrollment enrollment = {};
+      enrollment.operationUUID = uint128_t(0xA103);
+      enrollment.nodeUUID = storedLocalBrainState.uuid;
+      enrollment.clusterUUID = transportRootSnapshot.brainConfig.clusterUUID;
+      enrollment.authorityEpoch = authority.authorityEpoch;
+      enrollment.keyEpoch = authority.keyEpoch;
+      enrollment.authorityGeneration = authority.authorityGeneration;
+      enrollment.role = ProdigyTransportCredentialNodeRole::brain;
+      enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+      runtime.transportCredentialEnrollments.clear();
+      runtime.transportCredentialEnrollments.push_back(enrollment);
+
+      ProdigyPersistentBrainSnapshot transportRootPublic = {};
+      ProdigyPersistentBrainSnapshotSecrets transportRootSecrets = {};
+      String transportRootFailure = {};
+      suite.expect(
+          prodigyExtractPersistentBrainSnapshotSecrets(
+              transportRootSnapshot, transportRootPublic, transportRootSecrets, &transportRootFailure) &&
+              transportRootSecrets.clusterPairEnrollmentRootSecrets.empty() &&
+              transportRootSecrets.transportCredentialAuthorityRootSecrets.size() == 1,
+          "transport_root_sidecar_extracts_after_empty_cluster_pair_tail");
+      String transportRootSidecarBytes = {};
+      BitseryEngine::serialize(transportRootSidecarBytes, transportRootSecrets);
+      ProdigyPersistentBrainSnapshotSecrets decodedTransportRootSecrets = {};
+      ProdigyPersistentBrainSnapshot restoredTransportRootSnapshot = transportRootPublic;
+      suite.expect(
+          BitseryEngine::deserializeSafe(transportRootSidecarBytes, decodedTransportRootSecrets) &&
+              decodedTransportRootSecrets.clusterPairEnrollmentRootSecrets.empty() &&
+              decodedTransportRootSecrets.transportCredentialAuthorityRootSecrets.size() == 1 &&
+              prodigyApplyPersistentBrainSnapshotSecrets(
+                  restoredTransportRootSnapshot, decodedTransportRootSecrets, &transportRootFailure) &&
+              restoredTransportRootSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot.valid() &&
+              restoredTransportRootSnapshot.masterAuthority.runtimeState.transportCredentialEnrollments.size() == 1,
+          "transport_root_sidecar_roundtrips_after_empty_cluster_pair_tail");
+      Vault::secureClearString(transportRootSidecarBytes);
+      decodedTransportRootSecrets.clear();
+      transportRootSecrets.clear();
+
+      String transportRootStorePath = dbPath;
+      transportRootStorePath.append(".transport-root-tail"_ctv);
+      suite.expect(cleanupPersistentStateRoots(transportRootStorePath),
+                   "transport_root_sidecar_store_cleanup_before");
+      {
+        ProdigyPersistentStateStore transportRootStore(transportRootStorePath);
+        suite.expect(transportRootStore.saveBrainSnapshot(transportRootSnapshot, &transportRootFailure),
+                     "transport_root_sidecar_store_save_full_snapshot");
+      }
+      ProdigyPersistentBrainSnapshot coldTransportRootSnapshot = {};
+      {
+        ProdigyPersistentStateStore transportRootStore(transportRootStorePath);
+        suite.expect(
+            transportRootStore.loadBrainSnapshot(coldTransportRootSnapshot, &transportRootFailure) &&
+                coldTransportRootSnapshot.masterAuthority.runtimeState.transportCredentialAuthorityRoot.valid() &&
+                coldTransportRootSnapshot.masterAuthority.runtimeState.transportCredentialEnrollments.size() == 1 &&
+                coldTransportRootSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.empty(),
+            "transport_root_sidecar_store_cold_reopen_after_empty_cluster_pair_tail");
+      }
+      suite.expect(cleanupPersistentStateRoots(transportRootStorePath),
+                   "transport_root_sidecar_store_cleanup_after");
+    }
+
+    ProdigyClusterPairEnrollment enrollment = {};
+    enrollment.pairUUID = uint128_t(0xC001);
+    enrollment.localClusterUUID = uint128_t(0x3301);
+    enrollment.peerClusterUUID = uint128_t(0xC003);
+    enrollment.operationUUID = uint128_t(0xC004);
+    enrollment.rootGeneration = 7;
+    enrollment.agreedKeyEpoch = 9;
+    enrollment.localAuthorityGeneration = expectedManagedSnapshot.masterAuthority.runtimeState.generation;
+    enrollment.state = ProdigyClusterPairEnrollmentState::pending;
+    // Distinct binary material: the public fixture also contains printable
+    // artifact hashes, so a repeated hex substring is not a secret marker.
+    for (uint32_t index = 0; index < sizeof(enrollment.root); ++index)
+      enrollment.root[index] = uint8_t(0xa0 + index);
+
+    ProdigyMasterAuthorityRuntimeState preEnrollmentRuntimeState = {};
+    preEnrollmentRuntimeState.generation = 99;
+    LegacyRuntimeStateWire preEnrollmentLegacyWire = {};
+    preEnrollmentLegacyWire.state = preEnrollmentRuntimeState;
+    String preEnrollmentLegacyBytes = {};
+    BitseryEngine::serialize(preEnrollmentLegacyBytes, preEnrollmentLegacyWire);
+    String preEnrollmentRuntimeStateBytes = {};
+    BitseryEngine::serialize(preEnrollmentRuntimeStateBytes, preEnrollmentRuntimeState);
+    ProdigyMasterAuthorityRuntimeState preEnrollmentRuntimeStateRestored = {};
+    suite.expect(
+        BitseryEngine::deserializeSafe(preEnrollmentRuntimeStateBytes, preEnrollmentRuntimeStateRestored) &&
+            preEnrollmentRuntimeStateBytes.equals(preEnrollmentLegacyBytes) &&
+            preEnrollmentRuntimeStateRestored == preEnrollmentRuntimeState &&
+            preEnrollmentRuntimeStateRestored.clusterPairEnrollments.empty(),
+        "cluster_pair_enrollment_runtime_state_preserves_pre_v10_bytes");
+
+    ProdigyPersistentBrainSnapshot pairEnrollmentSnapshot = expectedManagedSnapshot;
+    pairEnrollmentSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.push_back(enrollment);
+    ProdigyPersistentBrainSnapshot pairEnrollmentPublic = {};
+    ProdigyPersistentBrainSnapshotSecrets pairEnrollmentSecrets = {};
+    String pairEnrollmentFailure = {};
+    suite.expect(
+        prodigyExtractPersistentBrainSnapshotSecrets(
+            std::move(pairEnrollmentSnapshot), pairEnrollmentPublic, pairEnrollmentSecrets, &pairEnrollmentFailure),
+        "extract_snapshot_secrets_moves_cluster_pair_root_to_private_sidecar");
+    suite.expect(
+        pairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments.size() == 1 &&
+            prodigyClusterPairEnrollmentRootIsZero(
+                pairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments[0]) &&
+            pairEnrollmentSecrets.clusterPairEnrollmentRootSecrets.size() == 1 &&
+            pairEnrollmentSecrets.clusterPairEnrollmentRootSecrets[0].matches(enrollment),
+        "extract_snapshot_secrets_scrubs_cluster_pair_root_from_public_descriptor");
+    String pairEnrollmentPublicBytes = {};
+    String pairEnrollmentSecretsBytes = {};
+    BitseryEngine::serialize(pairEnrollmentPublicBytes, pairEnrollmentPublic);
+    BitseryEngine::serialize(pairEnrollmentSecretsBytes, pairEnrollmentSecrets);
+    String pairEnrollmentRootNeedle = {};
+    pairEnrollmentRootNeedle.assign(
+        reinterpret_cast<const char *>(enrollment.root), sizeof(enrollment.root));
+    suite.expect(
+        pairEnrollmentRootNeedle.size() == sizeof(enrollment.root) &&
+            stringContains(pairEnrollmentSecretsBytes, pairEnrollmentRootNeedle),
+        "cluster_pair_root_marker_is_present_in_private_sidecar_bytes");
+    suite.expect(
+        stringContains(pairEnrollmentPublicBytes, pairEnrollmentRootNeedle) == false,
+        "cluster_pair_root_never_appears_in_public_snapshot_bytes");
+    ProdigyPersistentBrainSnapshot pairEnrollmentRestored = {};
+    ProdigyPersistentBrainSnapshotSecrets pairEnrollmentRestoredSecrets = {};
+    suite.expect(
+        BitseryEngine::deserializeSafe(pairEnrollmentPublicBytes, pairEnrollmentRestored) &&
+            BitseryEngine::deserializeSafe(pairEnrollmentSecretsBytes, pairEnrollmentRestoredSecrets),
+        "cluster_pair_enrollment_public_and_private_sidecars_roundtrip_bytes");
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            pairEnrollmentRestored, pairEnrollmentRestoredSecrets, &pairEnrollmentFailure) &&
+            pairEnrollmentRestored.masterAuthority.runtimeState.clusterPairEnrollments.size() == 1 &&
+            prodigyClusterPairEnrollmentIdentityEquals(
+                pairEnrollmentRestored.masterAuthority.runtimeState.clusterPairEnrollments[0], enrollment) &&
+            pairEnrollmentRestored.masterAuthority.runtimeState.clusterPairEnrollments[0].state == enrollment.state &&
+            prodigyClusterPairEnrollmentRootEquals(
+                pairEnrollmentRestored.masterAuthority.runtimeState.clusterPairEnrollments[0], enrollment),
+        "apply_snapshot_secrets_restores_hydrated_cluster_pair_enrollment_root");
+    // Exercise the actual store boundary as well as the two codecs: close and
+    // reopen the database, then verify that only the private sidecar restores
+    // the hydrated root and that the public stored record has no root bytes.
+    String pairEnrollmentDbPath = dbPath;
+    pairEnrollmentDbPath.append(".pair-enrollment"_ctv);
+    suite.expect(cleanupPersistentStateRoots(pairEnrollmentDbPath), "cluster_pair_store_cleanup_before");
+    {
+      ProdigyPersistentStateStore pairStore(pairEnrollmentDbPath);
+      suite.expect(pairStore.saveBrainSnapshot(pairEnrollmentRestored, &pairEnrollmentFailure),
+                   "cluster_pair_store_saves_private_enrollment");
+    }
+    {
+      ProdigyPersistentStateStore pairStore(pairEnrollmentDbPath);
+      ProdigyPersistentBrainSnapshot coldPairSnapshot = {};
+      suite.expect(pairStore.loadBrainSnapshot(coldPairSnapshot, &pairEnrollmentFailure) &&
+                       prodigyClusterPairEnrollmentsEqual(
+                           coldPairSnapshot.masterAuthority.runtimeState.clusterPairEnrollments,
+                           pairEnrollmentRestored.masterAuthority.runtimeState.clusterPairEnrollments),
+                   "cluster_pair_store_cold_reopen_restores_exact_private_enrollment");
+    }
+    String rawPairSnapshot = {};
+    suite.expect(readRawTidesDBRecord(pairEnrollmentDbPath, "brain"_ctv, "snapshot"_ctv,
+                                     rawPairSnapshot, &pairEnrollmentFailure) &&
+                     !stringContains(rawPairSnapshot, pairEnrollmentRootNeedle),
+                 "cluster_pair_store_public_record_omits_root_bytes");
+    suite.expect(cleanupPersistentStateRoots(pairEnrollmentDbPath), "cluster_pair_store_cleanup_after");
+
+    ProdigyPersistentBrainSnapshotSecrets missingPairEnrollmentRoot = pairEnrollmentSecrets;
+    missingPairEnrollmentRoot.clusterPairEnrollmentRootSecrets.clear();
+    ProdigyPersistentBrainSnapshot missingPairEnrollmentPublic = pairEnrollmentPublic;
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            missingPairEnrollmentPublic, missingPairEnrollmentRoot, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_missing_cluster_pair_root");
+    ProdigyPersistentBrainSnapshot partialPairEnrollmentPublic = pairEnrollmentPublic;
+    ProdigyClusterPairEnrollment secondPublicEnrollment =
+        partialPairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments[0];
+    ++secondPublicEnrollment.pairUUID;
+    ++secondPublicEnrollment.operationUUID;
+    partialPairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments.push_back(secondPublicEnrollment);
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            partialPairEnrollmentPublic, pairEnrollmentSecrets, &pairEnrollmentFailure) == false &&
+            prodigyClusterPairEnrollmentRootIsZero(
+                partialPairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments[0]),
+        "apply_snapshot_secrets_never_partially_hydrates_cluster_pair_roots");
+    ProdigyPersistentBrainSnapshotSecrets duplicatePairEnrollmentRoot = pairEnrollmentSecrets;
+    duplicatePairEnrollmentRoot.clusterPairEnrollmentRootSecrets.push_back(
+        duplicatePairEnrollmentRoot.clusterPairEnrollmentRootSecrets[0]);
+    ProdigyPersistentBrainSnapshot duplicatePairEnrollmentPublic = pairEnrollmentPublic;
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            duplicatePairEnrollmentPublic, duplicatePairEnrollmentRoot, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_duplicate_cluster_pair_root");
+    ProdigyPersistentBrainSnapshotSecrets stalePairEnrollmentRoot = pairEnrollmentSecrets;
+    ++stalePairEnrollmentRoot.clusterPairEnrollmentRootSecrets[0].rootGeneration;
+    ProdigyPersistentBrainSnapshot stalePairEnrollmentPublic = pairEnrollmentPublic;
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            stalePairEnrollmentPublic, stalePairEnrollmentRoot, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_stale_cluster_pair_root_generation");
+    ProdigyPersistentBrainSnapshotSecrets orphanPairEnrollmentRoot = pairEnrollmentSecrets;
+    ++orphanPairEnrollmentRoot.clusterPairEnrollmentRootSecrets[0].pairUUID;
+    ProdigyPersistentBrainSnapshot orphanPairEnrollmentPublic = pairEnrollmentPublic;
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            orphanPairEnrollmentPublic, orphanPairEnrollmentRoot, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_orphan_cluster_pair_root");
+    ProdigyPersistentBrainSnapshot publicRootPairEnrollment = pairEnrollmentPublic;
+    std::memcpy(
+        publicRootPairEnrollment.masterAuthority.runtimeState.clusterPairEnrollments[0].root,
+        enrollment.root,
+        sizeof(enrollment.root));
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            publicRootPairEnrollment, pairEnrollmentSecrets, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_public_cluster_pair_root");
+    ProdigyPersistentBrainSnapshot revokedPairEnrollmentSnapshot = expectedManagedSnapshot;
+    ProdigyClusterPairEnrollment revokedEnrollment = enrollment;
+    revokedEnrollment.state = ProdigyClusterPairEnrollmentState::revoked;
+    prodigyClearPersistentSecretBytes(revokedEnrollment.root, sizeof(revokedEnrollment.root));
+    revokedPairEnrollmentSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.push_back(revokedEnrollment);
+    ProdigyPersistentBrainSnapshot revokedPairEnrollmentPublic = {};
+    ProdigyPersistentBrainSnapshotSecrets revokedPairEnrollmentSecrets = {};
+    suite.expect(
+        prodigyExtractPersistentBrainSnapshotSecrets(
+            std::move(revokedPairEnrollmentSnapshot), revokedPairEnrollmentPublic,
+            revokedPairEnrollmentSecrets, &pairEnrollmentFailure) &&
+            revokedPairEnrollmentSecrets.clusterPairEnrollmentRootSecrets.empty(),
+        "extract_snapshot_secrets_keeps_revoked_cluster_pair_without_root");
+    revokedPairEnrollmentSecrets.clusterPairEnrollmentRootSecrets.push_back(
+        pairEnrollmentSecrets.clusterPairEnrollmentRootSecrets[0]);
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            revokedPairEnrollmentPublic, revokedPairEnrollmentSecrets, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_revoked_cluster_pair_root");
+    ProdigyPersistentBrainSnapshot duplicateRevokedPairEnrollment = revokedPairEnrollmentPublic;
+    duplicateRevokedPairEnrollment.masterAuthority.runtimeState.clusterPairEnrollments.push_back(
+        duplicateRevokedPairEnrollment.masterAuthority.runtimeState.clusterPairEnrollments[0]);
+    suite.expect(
+        prodigyPersistentSnapshotClusterPairEnrollmentsNeedNoSecrets(
+            duplicateRevokedPairEnrollment, &pairEnrollmentFailure) == false,
+        "no_sidecar_snapshot_rejects_duplicate_revoked_cluster_pair_identity");
+    ProdigyPersistentBrainSnapshot malformedPairEnrollmentSnapshot = expectedManagedSnapshot;
+    ProdigyClusterPairEnrollment malformedEnrollment = enrollment;
+    malformedEnrollment.rootGeneration = 0;
+    malformedPairEnrollmentSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.push_back(malformedEnrollment);
+    ProdigyPersistentBrainSnapshot ignoredPairEnrollmentPublic = {};
+    ProdigyPersistentBrainSnapshotSecrets ignoredPairEnrollmentSecrets = {};
+    suite.expect(
+        prodigyExtractPersistentBrainSnapshotSecrets(
+            std::move(malformedPairEnrollmentSnapshot), ignoredPairEnrollmentPublic,
+            ignoredPairEnrollmentSecrets, &pairEnrollmentFailure) == false,
+        "extract_snapshot_secrets_rejects_malformed_cluster_pair_identity_generation");
+    ProdigyPersistentBrainSnapshot wrongLocalPairEnrollmentSnapshot = expectedManagedSnapshot;
+    ProdigyClusterPairEnrollment wrongLocalEnrollment = enrollment;
+    ++wrongLocalEnrollment.localClusterUUID;
+    wrongLocalPairEnrollmentSnapshot.masterAuthority.runtimeState.clusterPairEnrollments.push_back(wrongLocalEnrollment);
+    ProdigyPersistentBrainSnapshot wrongLocalPairEnrollmentPublic = pairEnrollmentPublic;
+    ProdigyPersistentBrainSnapshotSecrets wrongLocalPairEnrollmentSecrets = pairEnrollmentSecrets;
+    suite.expect(
+        prodigyExtractPersistentBrainSnapshotSecrets(
+            std::move(wrongLocalPairEnrollmentSnapshot), wrongLocalPairEnrollmentPublic,
+            wrongLocalPairEnrollmentSecrets, &pairEnrollmentFailure) == false &&
+            wrongLocalPairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments.empty() &&
+            wrongLocalPairEnrollmentSecrets.clusterPairEnrollmentRootSecrets.empty(),
+        "extract_snapshot_secrets_rejects_wrong_local_cluster_without_public_root_leak");
+    ProdigyPersistentBrainSnapshot futureAuthorityPairEnrollmentPublic = pairEnrollmentPublic;
+    ++futureAuthorityPairEnrollmentPublic.masterAuthority.runtimeState.clusterPairEnrollments[0].localAuthorityGeneration;
+    ProdigyPersistentBrainSnapshotSecrets futureAuthorityPairEnrollmentSecrets = pairEnrollmentSecrets;
+    ++futureAuthorityPairEnrollmentSecrets.clusterPairEnrollmentRootSecrets[0].localAuthorityGeneration;
+    suite.expect(
+        prodigyApplyPersistentBrainSnapshotSecrets(
+            futureAuthorityPairEnrollmentPublic, futureAuthorityPairEnrollmentSecrets, &pairEnrollmentFailure) == false,
+        "apply_snapshot_secrets_rejects_future_local_authority_generation");
+
     // A paired stateless retirement can use the same numeric deployment ID on
     // independent clusters.  Its cluster tuple, not that local ID, separates
     // identities; ensure the v2 public descriptor and private bootstrap stay
@@ -3615,6 +3965,584 @@ int main(void)
       suite.expect(freshLocalState.ownerClusterUUID == 0, "fresh_load_local_brain_state_owner_cluster_uuid_zero");
 
       suite.expect(cleanupPersistentStateRoots(freshPath), "fresh_cleanup_state_directory");
+    }
+  }
+
+  {
+    ProdigyPersistentLocalBrainState seed;
+    const bool haveSeed = makePersistentLocalTransportCredentialState(seed, ProdigyTransportCredentialNodeRole::brain);
+    suite.expect(haveSeed, "transport_electorate_fixture");
+    if (!haveSeed) return 1;
+    Vector<ProdigyTransportCredentialEnrollment> ledger;
+    prodigyTransportCredentialBootstrapLedger(seed.transportCredentials, ledger);
+    auto voter = ledger.back();
+    for (const auto& entry : ledger)
+      if (entry.role == ProdigyTransportCredentialNodeRole::brain) voter = entry;
+    Vector<uint128_t> voters = {voter.nodeUUID};
+    for (unsigned index = 1; index <= 2; ++index)
+    {
+      auto extra = voter;
+      extra.nodeUUID += index * 16;
+      extra.operationUUID += index * 16;
+      ledger.push_back(extra);
+      voters.push_back(extra.nodeUUID);
+    }
+    auto target = voter;
+    target.operationUUID += 128;
+    target.nodeUUID += 128;
+    target.authorityGeneration = 20;
+    target.state = ProdigyTransportCredentialEnrollmentState::pending;
+    ledger.push_back(target);
+    ProdigyTransportCredentialEnrollmentOperation operation;
+    operation.enrollment = target;
+    operation.electorate = voters;
+    operation.pinnedMasterAuthorityEpoch = 3;
+    operation.transitionGeneration = 20;
+    Vector<ProdigyTransportCredentialEnrollmentOperation> operations = {operation};
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 20),
+                 "transport_electorate_restores_full_original_voters");
+    operations[0].electorate.resize(1);
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 20),
+                 "transport_electorate_restore_rejects_shrunken_majority");
+    operations[0] = operation;
+    ledger.back().state = ProdigyTransportCredentialEnrollmentState::active;
+    operations[0].enrollment = ledger.back();
+    operations[0].phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+    operations[0].transitionGeneration = 21;
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 21),
+                 "transport_electorate_activation_excludes_new_brain_from_original_voters");
+    auto concurrent = operation;
+    concurrent.enrollment.operationUUID += 128;
+    concurrent.enrollment.nodeUUID += 128;
+    concurrent.enrollment.authorityGeneration = 22;
+    concurrent.transitionGeneration = 22;
+    concurrent.electorate.push_back(target.nodeUUID);
+    ledger.push_back(concurrent.enrollment);
+    operations.push_back(concurrent);
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 22),
+                 "transport_electorate_restore_rejects_concurrent_unfinished_enrollments");
+    ProdigyTransportCredentialAuthorityRoot malformed;
+    malformed.authorityEpoch = 1;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollments({}, &malformed, 1, 1),
+                 "transport_empty_ledger_rejects_partial_authority_metadata");
+    malformed.authorityEpoch = 0;
+    malformed.root[0] = 1;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollments({}, &malformed, 1, 1),
+                 "transport_empty_ledger_rejects_orphan_secret");
+  }
+
+  {
+    ProdigyPersistentLocalBrainState seed = {};
+    suite.expect(makePersistentLocalTransportCredentialState(seed, ProdigyTransportCredentialNodeRole::brain),
+                 "transport_cohort_persistence_fixture");
+    Vector<ProdigyTransportCredentialEnrollment> ledger;
+    prodigyTransportCredentialBootstrapLedger(seed.transportCredentials, ledger);
+    ProdigyTransportCredentialEnrollment voter = {};
+    for (const auto& entry : ledger)
+      if (entry.role == ProdigyTransportCredentialNodeRole::brain) voter = entry;
+    auto duplicateLedger = ledger;
+    auto duplicateIdentity = voter;
+    duplicateIdentity.operationUUID += 0x10000;
+    duplicateIdentity.state = ProdigyTransportCredentialEnrollmentState::pending;
+    duplicateLedger.push_back(duplicateIdentity);
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollments(
+                     duplicateLedger, &seed.transportCredentialAuthorityRoot, voter.clusterUUID, 20),
+                 "transport_cohort_rejects_active_plus_pending_same_node_role");
+    duplicateLedger.back().state = ProdigyTransportCredentialEnrollmentState::revoked;
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollments(
+                     duplicateLedger, &seed.transportCredentialAuthorityRoot, voter.clusterUUID, 20),
+                 "transport_cohort_preserves_revoked_identity_history");
+    Vector<uint128_t> voters = {voter.nodeUUID};
+    for (uint32_t index = 1; index <= 2; ++index)
+    {
+      auto extra = voter;
+      extra.nodeUUID += index * 16;
+      extra.operationUUID += index * 16;
+      ledger.push_back(extra);
+      voters.push_back(extra.nodeUUID);
+    }
+    Vector<ProdigyTransportCredentialEnrollmentOperation> operations;
+    for (uint32_t machine = 1; machine <= 3; ++machine)
+      for (uint32_t role = 1; role <= (machine == 3 ? 1u : 2u); ++role)
+      {
+        ProdigyTransportCredentialEnrollmentOperation operation = {};
+        operation.enrollment = voter;
+        operation.enrollment.nodeUUID += 1024 + machine;
+        operation.enrollment.operationUUID += 1024 + machine * 2 + role;
+        operation.enrollment.role = role == 1 ? ProdigyTransportCredentialNodeRole::neuron : ProdigyTransportCredentialNodeRole::brain;
+        operation.enrollment.authorityGeneration = 20;
+        operation.enrollment.state = ProdigyTransportCredentialEnrollmentState::pending;
+        operation.electorate = voters;
+        operation.pinnedMasterAuthorityEpoch = 3;
+        operation.transitionGeneration = 20;
+        ledger.push_back(operation.enrollment);
+        operations.push_back(operation);
+      }
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 20),
+                 "transport_cohort_persists_all_five_roles_with_old_electorate");
+    auto partial = operations;
+    partial.resize(partial.size() - 1);
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(partial, ledger, 20),
+                 "transport_cohort_rejects_ledger_member_without_operation");
+    const uint32_t cohortStart = ledger.size() - operations.size();
+    operations[0].phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+    operations[0].enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+    operations[0].transitionGeneration = 21;
+    ledger[cohortStart] = operations[0].enrollment;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 21),
+                 "transport_cohort_rejects_partial_activation");
+    for (uint32_t index = 0; index < operations.size(); ++index)
+    {
+      operations[index].phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+      operations[index].enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+      operations[index].transitionGeneration = 21;
+      ledger[cohortStart + index] = operations[index].enrollment;
+    }
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 21),
+                 "transport_cohort_active_new_brains_do_not_join_sibling_electorate");
+    auto staleLeader = operations;
+    ++staleLeader[1].pinnedMasterAuthorityEpoch;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(staleLeader, ledger, 21),
+                 "transport_cohort_rejects_mixed_local_callback_epochs");
+    auto differentVoters = operations;
+    differentVoters[1].electorate[0] = operations[1].enrollment.nodeUUID;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(differentVoters, ledger, 21),
+                 "transport_cohort_rejects_target_substituted_as_voter");
+    operations[0].phase = ProdigyTransportCredentialEnrollmentOperationPhase::delivered;
+    operations[0].transitionGeneration = 22;
+    operations[1].phase = ProdigyTransportCredentialEnrollmentOperationPhase::delivered;
+    operations[1].transitionGeneration = 22;
+    std::reverse(operations[1].electorate.begin(), operations[1].electorate.end());
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 22),
+                 "transport_cohort_preserves_undelivered_targets_after_one_machine_receipt");
+    ProdigyMasterAuthorityRuntimeState runtime = {};
+    runtime.generation = 22;
+    runtime.transportCredentialEnrollments = ledger;
+    runtime.transportCredentialEnrollmentOperations = operations;
+    String bytes = {};
+    BitseryEngine::serialize(bytes, runtime);
+    ProdigyMasterAuthorityRuntimeState restored = {};
+    suite.expect(BitseryEngine::deserializeSafe(bytes, restored) &&
+                     restored.transportCredentialEnrollmentOperations.size() == operations.size() &&
+                     prodigyValidatePersistentTransportCredentialEnrollmentOperations(
+                         restored.transportCredentialEnrollmentOperations, restored.transportCredentialEnrollments, restored.generation),
+                 "transport_cohort_roundtrips_existing_runtime_codec_during_delivery");
+    for (auto& operation : operations)
+      operation.phase = ProdigyTransportCredentialEnrollmentOperationPhase::delivered;
+    auto inventedVoter = operations;
+    for (auto& operation : inventedVoter)
+      operation.electorate = {uint128_t(0xfefefefe)};
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(inventedVoter, ledger, 22),
+                 "transport_cohort_terminal_history_rejects_consistently_invented_voters");
+    for (auto& enrollment : ledger)
+      if (enrollment.nodeUUID == voter.nodeUUID && enrollment.role == ProdigyTransportCredentialNodeRole::brain)
+        enrollment.state = ProdigyTransportCredentialEnrollmentState::revoked;
+    suite.expect(prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 22),
+                 "transport_cohort_terminal_history_survives_later_old_voter_revocation");
+    operations.back().phase = ProdigyTransportCredentialEnrollmentOperationPhase::active;
+    suite.expect(!prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations, ledger, 22),
+                 "transport_cohort_cannot_resume_delivery_after_old_electorate_changed");
+  }
+
+  {
+    ProdigyPersistentLocalBrainState legacyState = {};
+    legacyState.uuid = uint128_t(0xAA01);
+    legacyState.ownerClusterUUID = uint128_t(0xCC01);
+    LegacyPersistentLocalBrainStateWire legacyWire = {};
+    legacyWire.uuid = legacyState.uuid;
+    legacyWire.ownerClusterUUID = legacyState.ownerClusterUUID;
+    String legacyBytes = {};
+    String currentBytes = {};
+    BitseryEngine::serialize(legacyBytes, legacyWire);
+    BitseryEngine::serialize(currentBytes, legacyState);
+    ProdigyPersistentLocalBrainState decodedLegacyState = {};
+    suite.expect(
+        legacyBytes.equals(currentBytes) && BitseryEngine::deserializeSafe(legacyBytes, decodedLegacyState) &&
+            decodedLegacyState.uuid == legacyState.uuid &&
+            decodedLegacyState.ownerClusterUUID == legacyState.ownerClusterUUID &&
+            !decodedLegacyState.transportCredentials.enabled &&
+            !decodedLegacyState.transportCredentialAuthorityRoot.valid(),
+        "local_transport_credentials_preserve_legacy_disabled_bytes");
+
+    ProdigyPersistentLocalBrainState brainState = {};
+    ProdigyPersistentLocalBrainState neuronState = {};
+    suite.expect(
+        makePersistentLocalTransportCredentialState(brainState, ProdigyTransportCredentialNodeRole::brain) &&
+            makePersistentLocalTransportCredentialState(neuronState, ProdigyTransportCredentialNodeRole::neuron),
+        "local_transport_credentials_build_valid_brain_and_neuron_fixtures");
+
+    auto expectLocalCredentialCodecRoundtrip =
+        [&](const ProdigyPersistentLocalBrainState& expected, const char *name) {
+          String binary = {};
+          BitseryEngine::serialize(binary, expected);
+          ProdigyPersistentLocalBrainState decodedBinary = {};
+          String json = {};
+          renderProdigyPersistentLocalBrainStateJSON(expected, json);
+          ProdigyPersistentLocalBrainState decodedJSON = {};
+          String localFailure = {};
+          const bool ok = BitseryEngine::deserializeSafe(binary, decodedBinary) &&
+              prodigyPersistentSerializedEqual(expected, decodedBinary) &&
+              parseProdigyPersistentLocalBrainStateJSON(json, decodedJSON, &localFailure) &&
+              prodigyPersistentSerializedEqual(expected, decodedJSON);
+          suite.expect(ok, name);
+          Vault::secureClearString(binary);
+          Vault::secureClearString(json);
+        };
+    expectLocalCredentialCodecRoundtrip(
+        brainState, "local_transport_credentials_brain_json_and_binary_roundtrip");
+    expectLocalCredentialCodecRoundtrip(
+        neuronState, "local_transport_credentials_neuron_json_and_binary_roundtrip");
+
+    {
+      auto cleared = neuronState.transportCredentials;
+      cleared.clear();
+      suite.expect(!cleared.enabled && cleared.committedAuthorityGeneration == 0 &&
+                       prodigyTransportCredentialBootstrapValid(cleared),
+                   "transport_credential_bootstrap_clear_resets_committed_generation");
+
+      Vector<ProdigyTransportCredentialEnrollment> ledger = {};
+      prodigyTransportCredentialBootstrapLedger(neuronState.transportCredentials, ledger);
+      const ProdigyTransportCredentialEnrollment *local = nullptr;
+      for (const auto& enrollment : ledger)
+        if (enrollment.nodeUUID == neuronState.uuid && enrollment.role == ProdigyTransportCredentialNodeRole::neuron)
+          local = &enrollment;
+      ProdigyTransportCredentialBootstrap defaultRevision = {};
+      suite.expect(
+          local != nullptr && prodigyBuildTransportCredentialBootstrap(brainState.transportCredentialAuthorityRoot, *local, ledger,
+              true, defaultRevision) && defaultRevision.committedAuthorityGeneration == 19,
+          "transport_credential_bootstrap_default_revision_is_max_active_generation");
+      ProdigyPersistentLocalBrainState rebuiltNeuron = {};
+      suite.expect(
+          local != nullptr && prodigyBuildLocalTransportCredentialState(brainState.transportCredentialAuthorityRoot, ledger,
+              neuronState.uuid, ProdigyTransportCredentialNodeRole::neuron, rebuiltNeuron, 23) &&
+              rebuiltNeuron.transportCredentials.committedAuthorityGeneration == 23,
+          "local_transport_credential_builder_accepts_explicit_committed_revision");
+      defaultRevision.committedAuthorityGeneration = 18;
+      suite.expect(!prodigyTransportCredentialBootstrapValid(defaultRevision),
+                   "transport_credential_bootstrap_rejects_revision_before_creation_generation");
+    }
+
+    {
+      const auto current = neuronState.transportCredentials;
+      auto projection = current;
+      OPENSSL_cleanse(projection.self.secret, sizeof(projection.self.secret));
+      projection.committedAuthorityGeneration = current.committedAuthorityGeneration + 2;
+      auto newPeer = projection.authorizedPeers.front();
+      newPeer.operationUUID += 0x100;
+      newPeer.nodeUUID += 0x100;
+      newPeer.authorityGeneration = projection.committedAuthorityGeneration;
+      projection.authorizedPeers.push_back(newPeer);
+      ProdigyTransportCredentialBootstrap applied = {};
+      const bool appliedNew = prodigyApplyTransportCredentialPeerProjection(current, projection, applied);
+      suite.expect(appliedNew && applied.committedAuthorityGeneration == projection.committedAuthorityGeneration &&
+                       CRYPTO_memcmp(applied.self.secret, current.self.secret, sizeof(applied.self.secret)) == 0 &&
+                       applied.authorizedPeers == projection.authorizedPeers,
+                   "transport_credential_projection_advances_without_replacing_self_secret");
+
+      auto inPlace = current;
+      suite.expect(prodigyApplyTransportCredentialPeerProjection(inPlace, projection, inPlace) &&
+                       prodigyTransportCredentialBootstrapSameProjection(inPlace, applied) &&
+                       CRYPTO_memcmp(inPlace.self.secret, current.self.secret, sizeof(inPlace.self.secret)) == 0,
+                   "transport_credential_projection_in_place_update_preserves_self_secret");
+
+      auto duplicate = projection;
+      ProdigyTransportCredentialBootstrap duplicateResult = {};
+      const bool appliedDuplicate = prodigyApplyTransportCredentialPeerProjection(applied, duplicate, duplicateResult);
+      auto divergent = duplicate;
+      divergent.authorizedPeers.pop_back();
+      ProdigyTransportCredentialBootstrap ignored = {};
+      auto rollback = duplicate;
+      rollback.committedAuthorityGeneration--;
+      suite.expect(appliedDuplicate && duplicateResult.committedAuthorityGeneration == applied.committedAuthorityGeneration &&
+                       !prodigyApplyTransportCredentialPeerProjection(applied, divergent, ignored) &&
+                       !prodigyApplyTransportCredentialPeerProjection(applied, rollback, ignored),
+                   "transport_credential_projection_rejects_same_revision_divergence_and_rollback");
+
+      auto wrongSelf = projection;
+      ++wrongSelf.self.nodeUUID;
+      suite.expect(!prodigyApplyTransportCredentialPeerProjection(applied, wrongSelf, ignored),
+                   "transport_credential_projection_rejects_self_identity_change");
+    }
+
+    {
+      // A worker stores its Neuron credential directly. A colocated Neuron is
+      // rebuilt from the Brain's retained root and Brain-role credential; both
+      // paths accept only a public Neuron projection and preserve local secret
+      // material.
+      ProdigyPersistentLocalBrainState colocated = brainState;
+      // The generic fixture has a separate worker. A Brain host also retains
+      // its own distinct Neuron enrollment, as initial provisioning supplies.
+      auto localNeuronEnrollment = colocated.transportCredentials.authorizedPeers.front();
+      localNeuronEnrollment.nodeUUID = colocated.uuid;
+      localNeuronEnrollment.operationUUID = 0xB102;
+      colocated.transportCredentials.authorizedPeers.push_back(localNeuronEnrollment);
+      Vector<ProdigyTransportCredentialEnrollment> brainLedger = {};
+      prodigyTransportCredentialBootstrapLedger(colocated.transportCredentials, brainLedger);
+      ProdigyPersistentLocalBrainState derivedNeuron = {};
+      const bool derived = prodigyBuildLocalTransportCredentialState(
+          colocated.transportCredentialAuthorityRoot, brainLedger, colocated.uuid,
+          ProdigyTransportCredentialNodeRole::neuron, derivedNeuron,
+          colocated.transportCredentials.committedAuthorityGeneration);
+      suite.expect(derived, "local_transport_peer_projection_derives_colocated_neuron_fixture");
+      auto projection = derivedNeuron.transportCredentials;
+      OPENSSL_cleanse(projection.self.secret, sizeof(projection.self.secret));
+      projection.committedAuthorityGeneration += 2;
+      ProdigyTransportCredentialEnrollment addedBrain = {};
+      if (!projection.authorizedPeers.empty()) addedBrain = projection.authorizedPeers.front();
+      addedBrain.operationUUID += 0x440;
+      addedBrain.nodeUUID += 0x440;
+      addedBrain.authorityGeneration = projection.committedAuthorityGeneration;
+      addedBrain.role = ProdigyTransportCredentialNodeRole::brain;
+      projection.authorizedPeers.push_back(addedBrain);
+
+      const auto originalRoot = colocated.transportCredentialAuthorityRoot;
+      const auto originalBrainSecret = colocated.transportCredentials.self;
+      ProdigyTransportCredentialBootstrap rebuiltNeuron = {};
+      const bool appliedColocated = derived && prodigyApplyLocalTransportCredentialPeerProjection(
+          colocated, projection, rebuiltNeuron);
+      const bool retainedAddedBrain = std::any_of(colocated.transportCredentials.authorizedPeers.begin(),
+          colocated.transportCredentials.authorizedPeers.end(), [&](const auto& peer) { return peer == addedBrain; });
+      suite.expect(appliedColocated && colocated.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain &&
+                       colocated.transportCredentialAuthorityRoot.authorityEpoch == originalRoot.authorityEpoch &&
+                       colocated.transportCredentialAuthorityRoot.keyEpoch == originalRoot.keyEpoch &&
+                       colocated.transportCredentialAuthorityRoot.authorityGeneration == originalRoot.authorityGeneration &&
+                       CRYPTO_memcmp(colocated.transportCredentialAuthorityRoot.root, originalRoot.root,
+                                     sizeof(originalRoot.root)) == 0 &&
+                       CRYPTO_memcmp(colocated.transportCredentials.self.secret, originalBrainSecret.secret,
+                                     sizeof(originalBrainSecret.secret)) == 0 &&
+                       rebuiltNeuron.self.role == ProdigyTransportCredentialNodeRole::neuron &&
+                       CRYPTO_memcmp(rebuiltNeuron.self.secret, derivedNeuron.transportCredentials.self.secret,
+                                     sizeof(rebuiltNeuron.self.secret)) == 0 && retainedAddedBrain,
+                   "local_transport_peer_projection_preserves_colocated_brain_root_and_both_role_secrets");
+
+      ProdigyPersistentLocalBrainState worker = neuronState;
+      const auto workerSecret = worker.transportCredentials.self;
+      ProdigyTransportCredentialBootstrap workerProjection = worker.transportCredentials;
+      OPENSSL_cleanse(workerProjection.self.secret, sizeof(workerProjection.self.secret));
+      workerProjection.committedAuthorityGeneration += 2;
+      auto workerAddedBrain = workerProjection.authorizedPeers.front();
+      workerAddedBrain.operationUUID += 0x550;
+      workerAddedBrain.nodeUUID += 0x550;
+      workerAddedBrain.authorityGeneration = workerProjection.committedAuthorityGeneration;
+      workerAddedBrain.role = ProdigyTransportCredentialNodeRole::brain;
+      workerProjection.authorizedPeers.push_back(workerAddedBrain);
+      ProdigyTransportCredentialBootstrap workerResult = {};
+      suite.expect(prodigyApplyLocalTransportCredentialPeerProjection(worker, workerProjection, workerResult) &&
+                       !worker.transportCredentialAuthorityRoot.valid() &&
+                       worker.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::neuron &&
+                       CRYPTO_memcmp(worker.transportCredentials.self.secret, workerSecret.secret,
+                                     sizeof(workerSecret.secret)) == 0 &&
+                       CRYPTO_memcmp(workerResult.self.secret, workerSecret.secret, sizeof(workerSecret.secret)) == 0,
+                   "local_transport_peer_projection_preserves_worker_neuron_secret_without_root");
+
+      const auto acceptedColocated = colocated;
+      ProdigyTransportCredentialBootstrap ignored = {};
+      auto divergent = projection;
+      divergent.authorizedPeers.pop_back();
+      auto stale = projection;
+      --stale.committedAuthorityGeneration;
+      auto missingOwnBrain = projection;
+      missingOwnBrain.committedAuthorityGeneration += 1;
+      missingOwnBrain.authorizedPeers.erase(std::remove_if(missingOwnBrain.authorizedPeers.begin(),
+          missingOwnBrain.authorizedPeers.end(), [&](const auto& peer) {
+            return peer.nodeUUID == colocated.uuid && peer.role == ProdigyTransportCredentialNodeRole::brain;
+          }), missingOwnBrain.authorizedPeers.end());
+      suite.expect(!prodigyApplyLocalTransportCredentialPeerProjection(colocated, divergent, ignored) &&
+                       prodigyPersistentSerializedEqual(colocated, acceptedColocated) &&
+                       !prodigyApplyLocalTransportCredentialPeerProjection(colocated, stale, ignored) &&
+                       prodigyPersistentSerializedEqual(colocated, acceptedColocated) &&
+                       !prodigyApplyLocalTransportCredentialPeerProjection(colocated, missingOwnBrain, ignored) &&
+                       prodigyPersistentSerializedEqual(colocated, acceptedColocated),
+                   "local_transport_peer_projection_rejects_divergent_stale_or_missing_own_brain_without_mutation");
+    }
+
+    {
+      Vector<ProdigyTransportCredentialEnrollment> cohort = {};
+      prodigyTransportCredentialBootstrapLedger(brainState.transportCredentials, cohort);
+      ProdigyTransportCredentialEnrollment secondBrain = {};
+      for (const auto& enrollment : cohort)
+        if (enrollment.role == ProdigyTransportCredentialNodeRole::brain)
+          secondBrain = enrollment;
+      ++secondBrain.operationUUID;
+      secondBrain.nodeUUID += 0x200;
+      cohort.push_back(secondBrain);
+      const ProdigyTransportCredentialEnrollment *firstBrain = nullptr;
+      for (const auto& enrollment : cohort)
+        if (enrollment.role == ProdigyTransportCredentialNodeRole::brain && enrollment.nodeUUID == brainState.uuid)
+          firstBrain = &enrollment;
+      ProdigyTransportCredentialBootstrap firstProjection = {}, secondProjection = {};
+      const bool built = firstBrain != nullptr && prodigyBuildTransportCredentialBootstrap(brainState.transportCredentialAuthorityRoot,
+          *firstBrain, cohort, true, firstProjection) &&
+          prodigyBuildTransportCredentialBootstrap(brainState.transportCredentialAuthorityRoot,
+              secondBrain, cohort, true, secondProjection);
+      Vector<ProdigyTransportCredentialEnrollment> firstLedger = {}, secondLedger = {};
+      if (built)
+      {
+        prodigyTransportCredentialBootstrapLedger(firstProjection, firstLedger);
+        prodigyTransportCredentialBootstrapLedger(secondProjection, secondLedger);
+      }
+      suite.expect(built && firstLedger == secondLedger,
+                   "transport_credential_bootstrap_ledger_is_canonical_across_brain_projections");
+    }
+
+    ProdigyPersistentLocalBrainState invalidNeuronRoot = neuronState;
+    invalidNeuronRoot.transportCredentialAuthorityRoot = brainState.transportCredentialAuthorityRoot;
+    suite.expect(
+        !prodigyLocalTransportCredentialStateValid(invalidNeuronRoot),
+        "local_transport_credentials_reject_authority_root_on_neuron");
+
+    ProdigyPersistentLocalBrainState publicBrainState = {};
+    ProdigyPersistentLocalBrainStateSecrets brainSecrets = {};
+    prodigyExtractPersistentLocalBrainStateSecrets(brainState, publicBrainState, brainSecrets);
+    String publicBytes = {};
+    String privateBytes = {};
+    BitseryEngine::serialize(publicBytes, publicBrainState);
+    BitseryEngine::serialize(privateBytes, brainSecrets);
+    String rootNeedle = {};
+    rootNeedle.assign(
+        reinterpret_cast<const char *>(brainState.transportCredentialAuthorityRoot.root),
+        sizeof(brainState.transportCredentialAuthorityRoot.root));
+    String credentialNeedle = {};
+    credentialNeedle.assign(
+        reinterpret_cast<const char *>(brainState.transportCredentials.self.secret),
+        sizeof(brainState.transportCredentials.self.secret));
+    suite.expect(
+        prodigyLocalTransportCredentialStateValid(publicBrainState, false) &&
+            stringContains(publicBytes, rootNeedle) == false &&
+            stringContains(publicBytes, credentialNeedle) == false &&
+            stringContains(privateBytes, rootNeedle) && stringContains(privateBytes, credentialNeedle),
+        "local_transport_credentials_public_record_scrubs_private_root_and_credential");
+    ProdigyPersistentLocalBrainState hydratedBrainState = publicBrainState;
+    suite.expect(
+        prodigyApplyPersistentLocalBrainStateSecrets(hydratedBrainState, brainSecrets) &&
+            prodigyPersistentSerializedEqual(brainState, hydratedBrainState),
+        "local_transport_credentials_private_sidecar_hydrates_brain_state");
+
+    ProdigyPersistentLocalBrainState swappedIdentity = publicBrainState;
+    ++swappedIdentity.uuid;
+    ProdigyPersistentLocalBrainState swappedCluster = publicBrainState;
+    ++swappedCluster.ownerClusterUUID;
+    ProdigyPersistentLocalBrainStateSecrets swappedRootSecrets = brainSecrets;
+    ++swappedRootSecrets.transportAuthorityRoot.authorityGeneration;
+    suite.expect(
+        !prodigyApplyPersistentLocalBrainStateSecrets(swappedIdentity, brainSecrets) &&
+            !prodigyApplyPersistentLocalBrainStateSecrets(swappedCluster, brainSecrets) &&
+            !prodigyApplyPersistentLocalBrainStateSecrets(publicBrainState, swappedRootSecrets),
+        "local_transport_credentials_reject_identity_cluster_and_root_sidecar_mismatch");
+
+    char credentialScratch[] = "/tmp/nametag-prodigy-persistent-transport-credentials-XXXXXX";
+    char *credentialCreated = mkdtemp(credentialScratch);
+    suite.expect(credentialCreated != nullptr, "local_transport_credentials_mkdtemp_created");
+    if (credentialCreated != nullptr)
+    {
+      String credentialPath = {};
+      credentialPath.assign(credentialCreated);
+      String localFailure = {};
+      {
+        ProdigyPersistentStateStore credentialStore(credentialPath);
+        suite.expect(
+            credentialStore.saveLocalBrainState(brainState, &localFailure),
+            "local_transport_credentials_store_save_brain_state");
+      }
+      ProdigyPersistentLocalBrainState coldLoadedBrainState = {};
+      {
+        ProdigyPersistentStateStore credentialStore(credentialPath);
+        suite.expect(
+            credentialStore.loadLocalBrainState(coldLoadedBrainState, &localFailure) &&
+                prodigyPersistentSerializedEqual(brainState, coldLoadedBrainState),
+            "local_transport_credentials_store_cold_roundtrip");
+      }
+
+      String rawPublic = {};
+      ProdigyPersistentStoredLocalBrainState storedPublic = {};
+      String secretsPath = {};
+      resolveProdigyPersistentSecretsDBPath(credentialPath, secretsPath);
+      suite.expect(
+          readRawTidesDBRecord(credentialPath, "brain"_ctv, "local_brain_state"_ctv, rawPublic, &localFailure) &&
+              BitseryEngine::deserializeSafe(rawPublic, storedPublic) && storedPublic.secretVersion != 0 &&
+              stringContains(rawPublic, rootNeedle) == false && stringContains(rawPublic, credentialNeedle) == false,
+          "local_transport_credentials_store_public_record_scrubs_private_material");
+      String sidecarKey = {};
+      prodigyBuildPersistentSecretRecordKey("local_brain_state", storedPublic.secretVersion, sidecarKey);
+      String rawSidecar = {};
+      suite.expect(
+          readRawTidesDBRecord(secretsPath, "brain"_ctv, sidecarKey, rawSidecar, &localFailure) &&
+              stringContains(rawSidecar, rootNeedle) && stringContains(rawSidecar, credentialNeedle),
+          "local_transport_credentials_store_private_sidecar_keeps_private_material");
+
+      ProdigyPersistentLocalBrainState otherBrainState = {};
+      ProdigyPersistentLocalBrainState otherPublicState = {};
+      ProdigyPersistentLocalBrainStateSecrets otherSecrets = {};
+      String serializedOtherSecrets = {};
+      const bool builtOtherState = makePersistentLocalTransportCredentialState(
+          otherBrainState, ProdigyTransportCredentialNodeRole::brain);
+      if (builtOtherState)
+      {
+        ++otherBrainState.uuid;
+        ProdigyTransportCredentialEnrollment local = {};
+        local.operationUUID = otherBrainState.transportCredentials.self.operationUUID;
+        local.nodeUUID = otherBrainState.uuid;
+        local.clusterUUID = otherBrainState.ownerClusterUUID;
+        local.authorityEpoch = otherBrainState.transportCredentials.self.authorityEpoch;
+        local.keyEpoch = otherBrainState.transportCredentials.self.keyEpoch;
+        local.authorityGeneration = otherBrainState.transportCredentials.self.authorityGeneration;
+        local.role = otherBrainState.transportCredentials.self.role;
+        local.state = ProdigyTransportCredentialEnrollmentState::active;
+        (void)prodigyDeriveTransportNodeCredential(
+            otherBrainState.transportCredentialAuthorityRoot, local, otherBrainState.transportCredentials.self);
+        prodigyExtractPersistentLocalBrainStateSecrets(otherBrainState, otherPublicState, otherSecrets);
+        BitseryEngine::serialize(serializedOtherSecrets, otherSecrets);
+      }
+      suite.expect(
+          builtOtherState && writeRawTidesDBRecord(
+              secretsPath, "brain"_ctv, sidecarKey, serializedOtherSecrets, &localFailure),
+          "local_transport_credentials_write_swapped_sidecar");
+      ProdigyPersistentLocalBrainState swappedLoaded = {};
+      {
+        ProdigyPersistentStateStore credentialStore(credentialPath);
+        suite.expect(
+            !credentialStore.loadLocalBrainState(swappedLoaded, &localFailure) && swappedLoaded.uuid == 0,
+            "local_transport_credentials_reject_swapped_sidecar");
+      }
+
+      String malformedSidecar = {};
+      malformedSidecar.assign("not-a-local-credential-sidecar"_ctv);
+      suite.expect(
+          writeRawTidesDBRecord(secretsPath, "brain"_ctv, sidecarKey, malformedSidecar, &localFailure),
+          "local_transport_credentials_write_malformed_sidecar");
+      ProdigyPersistentLocalBrainState malformedLoaded = {};
+      {
+        ProdigyPersistentStateStore credentialStore(credentialPath);
+        suite.expect(
+            !credentialStore.loadLocalBrainState(malformedLoaded, &localFailure) &&
+                malformedLoaded.uuid == publicBrainState.uuid,
+            "local_transport_credentials_reject_malformed_sidecar");
+      }
+      suite.expect(cleanupPersistentStateRoots(credentialPath), "local_transport_credentials_cleanup_state_directory");
+    }
+
+    char missingScratch[] = "/tmp/nametag-prodigy-persistent-transport-missing-sidecar-XXXXXX";
+    char *missingCreated = mkdtemp(missingScratch);
+    suite.expect(missingCreated != nullptr, "local_transport_credentials_missing_sidecar_mkdtemp_created");
+    if (missingCreated != nullptr)
+    {
+      String missingPath = {};
+      missingPath.assign(missingCreated);
+      ProdigyPersistentStoredLocalBrainState missingStored = {};
+      missingStored.secretVersion = 1;
+      missingStored.state = publicBrainState;
+      String encodedMissingStored = {};
+      BitseryEngine::serialize(encodedMissingStored, missingStored);
+      String localFailure = {};
+      suite.expect(
+          writeRawTidesDBRecord(missingPath, "brain"_ctv, "local_brain_state"_ctv, encodedMissingStored, &localFailure),
+          "local_transport_credentials_write_missing_sidecar_public_record");
+      ProdigyPersistentLocalBrainState missingLoaded = {};
+      ProdigyPersistentStateStore missingStore(missingPath);
+      suite.expect(
+          !missingStore.loadLocalBrainState(missingLoaded, &localFailure) && missingLoaded.uuid == publicBrainState.uuid,
+          "local_transport_credentials_reject_missing_sidecar");
+      suite.expect(cleanupPersistentStateRoots(missingPath), "local_transport_credentials_missing_sidecar_cleanup");
     }
   }
 

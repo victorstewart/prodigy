@@ -13,6 +13,11 @@ __attribute__((__always_inline__)) static inline bool parse_tcp(void *data, void
   {
     pckt->flags |= F_SYN_SET;
   }
+  if (tcp->ack)
+  {
+    pckt->flags |= F_ACK_SET;
+  }
+  pckt->tcp_sequence = tcp->seq;
 
   pckt->flow.port16[0] = tcp->source;
   pckt->flow.port16[1] = tcp->dest;

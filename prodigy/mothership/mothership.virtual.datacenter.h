@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <openssl/rand.h>
 
 #include <services/time.h>
 
@@ -679,13 +680,73 @@ static inline bool mothershipWriteVirtualDatacenterBootstrapMaterial(
   return mothershipVirtualDatacenterWriteFile(transportTLSPath, transportTLSJSON, 0600, failure);
 }
 
+// Creation owns this one-time cohort. The root stays in the command-scoped
+// provisioning owner; only Brain private boot state receives it.
+static inline bool mothershipBuildInitialTransportCredentialProjection(
+    uint128_t clusterUUID, const ClusterTopology& topology,
+    ProdigyInitialTransportCredentialProjection& output, String *failure = nullptr)
+{
+  output = {};
+  ProdigyInitialTransportCredentialProjection candidate;
+  if (clusterUUID == 0 || topology.machines.empty() || topology.machines.size() > 2048)
+  {
+    if (failure) failure->assign("invalid initial transport cohort"_ctv);
+    return false;
+  }
+  candidate.authority.authorityEpoch = 1;
+  candidate.authority.keyEpoch = 1;
+  candidate.authority.authorityGeneration = 1;
+  candidate.committedAuthorityGeneration = 1;
+  if (RAND_priv_bytes(candidate.authority.root, sizeof(candidate.authority.root)) != 1 ||
+      !candidate.authority.valid())
+  {
+    if (failure) failure->assign("initial transport root randomness unavailable"_ctv);
+    return false;
+  }
+  for (const auto& machine : topology.machines)
+  {
+    if (machine.uuid == 0 || std::any_of(candidate.ledger.begin(), candidate.ledger.end(),
+        [&](const auto& prior) { return prior.nodeUUID == machine.uuid; }))
+    {
+      if (failure) failure->assign("initial transport cohort has ambiguous machine identity"_ctv);
+      return false;
+    }
+    for (auto role : {ProdigyTransportCredentialNodeRole::brain, ProdigyTransportCredentialNodeRole::neuron})
+    {
+      if (role == ProdigyTransportCredentialNodeRole::brain && !machine.isBrain) continue;
+      ProdigyTransportCredentialEnrollment enrollment;
+      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&enrollment.operationUUID), sizeof(enrollment.operationUUID)) != 1 ||
+          enrollment.operationUUID == 0 || std::any_of(candidate.ledger.begin(), candidate.ledger.end(),
+              [&](const auto& prior) { return prior.operationUUID == enrollment.operationUUID; }))
+      {
+        if (failure) failure->assign("initial transport enrollment randomness unavailable"_ctv);
+        return false;
+      }
+      enrollment.nodeUUID = machine.uuid; enrollment.clusterUUID = clusterUUID;
+      enrollment.authorityEpoch = 1; enrollment.keyEpoch = 1; enrollment.authorityGeneration = 1;
+      enrollment.role = role; enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+      candidate.ledger.push_back(enrollment);
+    }
+  }
+  if (std::none_of(candidate.ledger.begin(), candidate.ledger.end(),
+      [](const auto& member) { return member.role == ProdigyTransportCredentialNodeRole::brain; }))
+  {
+    if (failure) failure->assign("initial transport cohort requires a Brain"_ctv);
+    return false;
+  }
+  output = std::move(candidate);
+  if (failure) failure->clear();
+  return true;
+}
+
 static inline bool mothershipProvisionVirtualDatacenterSeed(
     const MothershipProdigyCluster& cluster,
     const ClusterTopology& seedTopology,
     const AddMachines& request,
     const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
     const String& bundlePath,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const ProdigyInitialTransportCredentialProjection *transportProjection = nullptr)
 {
   String approvedDigest = {};
   if (prodigyApproveBundleArtifact(bundlePath, approvedDigest, failure) == false)
@@ -714,7 +775,7 @@ static inline bool mothershipProvisionVirtualDatacenterSeed(
   }
   String bootJSON = {}, transportTLSJSON = {};
   if (prodigyBuildRemoteBootstrapBootMaterial(seedTopology.machines[0], request, seedTopology,
-                                              runtimeEnvironment, bootJSON, transportTLSJSON, failure) == false ||
+                                              runtimeEnvironment, bootJSON, transportTLSJSON, failure, transportProjection) == false ||
       mothershipWriteVirtualDatacenterBootstrapMaterial(cluster, 1, bootJSON, transportTLSJSON, failure) == false)
   {
     return false;
@@ -730,7 +791,8 @@ static inline bool mothershipProvisionVirtualDatacenterMembers(
     const ClusterTopology& topology,
     const AddMachines& request,
     const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment,
-    String *failure = nullptr)
+    String *failure = nullptr,
+    const ProdigyInitialTransportCredentialProjection *transportProjection = nullptr)
 {
   if (topology.machines.size() != cluster.test.machineCount || topology.machines.empty())
   {
@@ -741,7 +803,7 @@ static inline bool mothershipProvisionVirtualDatacenterMembers(
   {
     String bootJSON = {}, transportTLSJSON = {};
     if (prodigyBuildRemoteBootstrapBootMaterial(topology.machines[index], request, topology, runtimeEnvironment,
-                                                bootJSON, transportTLSJSON, failure) == false ||
+                                                bootJSON, transportTLSJSON, failure, transportProjection) == false ||
         mothershipWriteVirtualDatacenterBootstrapMaterial(cluster, index + 1, bootJSON, transportTLSJSON, failure) == false)
     {
       return false;

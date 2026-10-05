@@ -316,6 +316,7 @@ private:
   uint32_t pendingRequests = 0;
   bool accepting = true;
   bool commitFailureLatched = false;
+  bool localBrainMutationPending = false;
   std::atomic<bool> workerFailureLatched = false;
 
   static const char *requestKind(const Request& request)
@@ -481,6 +482,42 @@ public:
     request->writeLocalState = true;
     request->completion = std::move(completion);
     return submit(std::move(request), retainedBytes);
+  }
+
+  // Local state has one process-wide authoritative cache. A caller supplies a
+  // pure Ring-owned transform; this writer admits at most one such mutation so
+  // a later transform always starts from the prior durable receipt, rather
+  // than from a stale whole-record copy. `durableCache` must outlive the
+  // request and its completion.
+  bool submitLocalBrainMutation(
+      ProdigyPersistentLocalBrainState& durableCache,
+      std::function<bool(ProdigyPersistentLocalBrainState&, String&)> transform,
+      Completion completion)
+  {
+    if (!transform || !completion || localBrainMutationPending) return false;
+    ProdigyPersistentLocalBrainState candidate = durableCache;
+    String failure = {};
+    if (!transform(candidate, failure) || !detach(candidate)) return false;
+    const uint64_t retainedBytes = retainedBytesFor(candidate);
+    if (retainedBytes == 0) return false;
+
+    auto request = std::make_shared<Request>();
+    request->result.sequence = nextSequence++;
+    request->localState = std::move(candidate);
+    request->writeLocalState = true;
+    Request *const published = request.get();
+    localBrainMutationPending = true;
+    request->completion = [this, &durableCache, published, completion = std::move(completion)](Result&& result) mutable {
+      // Clear before invoking user code so a receipt can synchronously admit
+      // its dependent mutation. The active request still retains its ArtifactIO
+      // lease until this callback returns.
+      localBrainMutationPending = false;
+      if (result.durable) durableCache = std::move(published->localState);
+      completion(std::move(result));
+    };
+    if (submit(request, retainedBytes)) return true;
+    localBrainMutationPending = false;
+    return false;
   }
 
   bool hasPending(void) const { return pendingRequests != 0; }

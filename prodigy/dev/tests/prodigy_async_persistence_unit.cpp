@@ -410,12 +410,160 @@ static void runUpdateBundleBackpressureMeasurement(TestSuite& suite, const char 
   ring.drainStoppedIO();
 }
 
+static void testLocalBrainMutationWriter(TestSuite& suite)
+{
+  // A second mutation cannot capture a stale whole-record snapshot while the
+  // first write is outstanding. Once the first durable receipt publishes its
+  // candidate, its callback may synchronously submit the dependent mutation.
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    ProdigyPersistentLocalBrainState cache = {};
+    cache.uuid = 0x7101;
+    cache.ownerClusterUUID = 0x7102;
+    bool firstCallback = false;
+    bool nestedAdmitted = false;
+    bool nestedCallback = false;
+    bool rejectedCallback = false;
+    bool secondSawFirstReceipt = false;
+    suite.expect(io != nullptr, "async_persistence_starts_local_mutation_writer");
+    if (io)
+    {
+      ProdigyPersistentStateWriter writer(store, *io, [](auto&, auto& request) {
+        request.result.durable = true;
+      });
+      const bool firstAdmitted = writer.submitLocalBrainMutation(
+          cache,
+          [](ProdigyPersistentLocalBrainState& candidate, String&) {
+            candidate.ownerClusterUUID = 0x7103;
+            return true;
+          },
+          [&](auto&& result) {
+            firstCallback = result.durable && cache.ownerClusterUUID == 0x7103;
+            nestedAdmitted = writer.submitLocalBrainMutation(
+                cache,
+                [&](ProdigyPersistentLocalBrainState& candidate, String&) {
+                  secondSawFirstReceipt = candidate.ownerClusterUUID == 0x7103;
+                  candidate.transportTLS.generation = 17;
+                  return true;
+                },
+                [&](auto&& nestedResult) {
+                  nestedCallback = nestedResult.durable && cache.ownerClusterUUID == 0x7103 &&
+                      cache.transportTLS.generation == 17;
+                  Ring::exit = true;
+                });
+            if (!nestedAdmitted) Ring::exit = true;
+          });
+      const bool concurrentRejected = !writer.submitLocalBrainMutation(
+          cache,
+          [](ProdigyPersistentLocalBrainState& candidate, String&) {
+            candidate.ownerClusterUUID = 0x7104;
+            return true;
+          },
+          [&](auto&&) { rejectedCallback = true; });
+      ring.armDeadline(1000);
+      Ring::start();
+      suite.expect(!ring.timedOut && firstAdmitted && concurrentRejected && !rejectedCallback &&
+                       firstCallback && nestedAdmitted && nestedCallback && secondSawFirstReceipt &&
+                       cache.ownerClusterUUID == 0x7103 && cache.transportTLS.generation == 17 &&
+                       writer.drainForExec(),
+                   "async_persistence_local_mutation_rejects_concurrent_then_publishes_before_nested_retry");
+      io->stop();
+      ring.drainStoppedIO();
+    }
+  }
+
+  // A failed commit never replaces the caller's durable cache, and its
+  // callback clears the mutation guard even though the writer's ordinary
+  // failure latch rejects later admission without invoking that callback.
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    ProdigyPersistentLocalBrainState cache = {};
+    cache.uuid = 0x7201;
+    cache.ownerClusterUUID = 0x7202;
+    bool failedCallback = false;
+    bool rejectedAfterFailureCallback = false;
+    suite.expect(io != nullptr, "async_persistence_starts_local_mutation_failure_writer");
+    if (io)
+    {
+      ProdigyPersistentStateWriter writer(store, *io, [](auto&, auto& request) {
+        request.result.failure.assign("injected local mutation failure"_ctv);
+      });
+      const bool admitted = writer.submitLocalBrainMutation(
+          cache,
+          [](ProdigyPersistentLocalBrainState& candidate, String&) {
+            candidate.ownerClusterUUID = 0x7203;
+            return true;
+          },
+          [&](auto&& result) {
+            failedCallback = !result.durable && cache.ownerClusterUUID == 0x7202;
+            Ring::exit = true;
+          });
+      ring.armDeadline(1000);
+      Ring::start();
+      const bool rejectedAfterFailure = !writer.submitLocalBrainMutation(
+          cache,
+          [](ProdigyPersistentLocalBrainState& candidate, String&) {
+            candidate.ownerClusterUUID = 0x7204;
+            return true;
+          },
+          [&](auto&&) { rejectedAfterFailureCallback = true; });
+      suite.expect(!ring.timedOut && admitted && failedCallback && rejectedAfterFailure &&
+                       !rejectedAfterFailureCallback && cache.ownerClusterUUID == 0x7202 && writer.drainForExec(),
+                   "async_persistence_local_mutation_failed_write_preserves_cache_and_never_callbacks_rejection");
+      io->stop();
+      ring.drainStoppedIO();
+    }
+  }
+
+  // `drainForExec` must continue to report the active mutation as pending.
+  {
+    PersistenceRing ring;
+    ScopedPersistentRoot root;
+    ProdigyPersistentStateStore store(root.path);
+    auto io = ProdigyArtifactIO::startOwned();
+    ProdigyPersistentLocalBrainState cache = {};
+    cache.uuid = 0x7301;
+    bool callback = false;
+    suite.expect(io != nullptr, "async_persistence_starts_local_mutation_drain_writer");
+    if (io)
+    {
+      ProdigyPersistentStateWriter writer(store, *io, [](auto&, auto& request) {
+        request.result.durable = true;
+      });
+      const bool admitted = writer.submitLocalBrainMutation(
+          cache,
+          [](ProdigyPersistentLocalBrainState& candidate, String&) {
+            candidate.ownerClusterUUID = 0x7302;
+            return true;
+          },
+          [&](auto&& result) {
+            callback = result.durable;
+            Ring::exit = true;
+          });
+      const bool drainWhilePending = writer.drainForExec();
+      ring.armDeadline(1000);
+      Ring::start();
+      suite.expect(!ring.timedOut && admitted && !drainWhilePending && callback && writer.drainForExec(),
+                   "async_persistence_local_mutation_drain_observes_in_flight_request");
+      io->stop();
+      ring.drainStoppedIO();
+    }
+  }
+}
+
 int main()
 {
   TestSuite suite;
 
   testPersistentWriterOwnsVersionedAuthorityState(suite);
   testPersistentWriterRetainsOwnedStorage(suite);
+  testLocalBrainMutationWriter(suite);
   runUpdateBundleWriterMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
   runUpdateBundleBackpressureMeasurement(suite, std::getenv("PRODIGY_TEST_PERSISTENCE_BACKPRESSURE_BUNDLE"));
 
