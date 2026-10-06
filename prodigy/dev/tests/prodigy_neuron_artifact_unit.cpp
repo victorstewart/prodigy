@@ -326,6 +326,19 @@ public:
     return wormholeContainerRefresh(container);
   }
 
+  bool buildContainerWormholeDesiredStateForTest(const ContainerPlan& plan,
+                                                 const Vector<Wormhole>& wormholes,
+                                                 SwitchboardWormholeDesiredState& desired)
+  {
+    return buildContainerWormholeDesiredState(plan, wormholes, desired);
+  }
+
+  bool strengthenWormholeDesiredStateForLocalPlanForTest(const ContainerPlan& plan,
+                                                         SwitchboardWormholeDesiredState& desired)
+  {
+    return strengthenWormholeDesiredStateForLocalPlan(plan, desired);
+  }
+
   void trackContainerForReplyTest(Container *container)
   {
     containers.insert_or_assign(container->plan.uuid, container);
@@ -702,6 +715,65 @@ int main()
     localContainer->plan.wormholes.back().name.assign("current-wormhole"_ctv);
     localContainer->plan.wormholes.back().containerPort = 8443;
     localContainer->plan.wormholes.back().externalPort = 443;
+
+    {
+      const uint64_t cousinService = MeshServices::constrainPrefixToGroup(
+          MeshServices::generateStatefulService(17, 3), 0);
+      ContainerPlan protectedPlan = {};
+      protectedPlan.isStateful = true;
+      protectedPlan.statefulMeshRoles.cousin = cousinService;
+      protectedPlan.advertisements.emplace(
+          cousinService,
+          Advertisement(cousinService, ContainerState::healthy, ContainerState::destroying, 8443));
+
+      Wormhole direct = {};
+      direct.name.assign("cousin-public"_ctv);
+      direct.externalAddress = IPAddress("2001:db8::44", true);
+      direct.externalPort = 443;
+      direct.containerPort = 8443;
+      direct.layer4 = IPPROTO_TCP;
+      Vector<Wormhole> directWormholes = {direct};
+
+      SwitchboardWormholeDesiredState localDesired = {};
+      suite.expect(neuron.buildContainerWormholeDesiredStateForTest(protectedPlan, directWormholes, localDesired) &&
+                       prodigyWormholeRequiresPairAdmission(localDesired, 8443, IPPROTO_TCP),
+                   "neuron_wormhole_startup_derives_cousin_protection_from_plan_definition");
+
+      SwitchboardWormholeDesiredState legacyFleet = {};
+      legacyFleet.wormholes = directWormholes;
+      String rawFleetBytes = {};
+      suite.expect(prodigyEncodeWormholeDesiredState(legacyFleet, rawFleetBytes),
+                   "neuron_wormhole_fleet_raw_state_has_canonical_legacy_bytes");
+      suite.expect(neuron.strengthenWormholeDesiredStateForLocalPlanForTest(protectedPlan, legacyFleet) &&
+                       prodigyWormholeRequiresPairAdmission(legacyFleet, 8443, IPPROTO_TCP),
+                   "neuron_wormhole_fleet_legacy_state_is_strengthened_by_tracked_local_plan");
+      String strengthenedFleetBytes = {};
+      suite.expect(prodigyEncodeWormholeDesiredState(legacyFleet, strengthenedFleetBytes) &&
+                       strengthenedFleetBytes.equals(rawFleetBytes) == false,
+                   "neuron_wormhole_fleet_strengthening_requires_retry_with_protected_revision");
+
+      Wormhole separatelyProtected = direct;
+      separatelyProtected.name.assign("already-protected"_ctv);
+      separatelyProtected.externalAddress = IPAddress("2001:db8::45", true);
+      separatelyProtected.externalPort = 444;
+      separatelyProtected.containerPort = 9443;
+      legacyFleet = {};
+      legacyFleet.wormholes = {direct, separatelyProtected};
+      legacyFleet.pairAdmissionTCPPorts = {9443};
+      suite.expect(neuron.strengthenWormholeDesiredStateForLocalPlanForTest(protectedPlan, legacyFleet) &&
+                       legacyFleet.pairAdmissionTCPPorts.size() == 2 &&
+                       legacyFleet.pairAdmissionTCPPorts[0] == 8443 && legacyFleet.pairAdmissionTCPPorts[1] == 9443,
+                   "neuron_wormhole_local_protection_never_downgrades_live_fleet_profile");
+
+      protectedPlan.advertisements.emplace(
+          cousinService + 1,
+          Advertisement(cousinService + 1, ContainerState::healthy, ContainerState::destroying, 8443));
+      legacyFleet = {};
+      legacyFleet.wormholes = directWormholes;
+      suite.expect(!neuron.strengthenWormholeDesiredStateForLocalPlanForTest(protectedPlan, legacyFleet) &&
+                       legacyFleet.pairAdmissionTCPPorts.empty(),
+                   "neuron_wormhole_ambiguous_cousin_definition_rejects_before_switchboard_open");
+    }
     neuron.trackContainerForReplyTest(localContainer.get());
     String expectedWormholes = {};
     BitseryEngine::serialize(expectedWormholes, localContainer->plan.wormholes);

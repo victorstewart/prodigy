@@ -615,13 +615,52 @@ inline void BrainBase::sendNeuronSwitchboardOverlayRoutes(void)
 
 static inline bool prodigyPrepareSwitchboardWormholeOperation(uint32_t containerID,
                                                               const Vector<Wormhole>& wormholes,
+                                                              bool isStateful,
+                                                              uint64_t cousinService,
+                                                              const bytell_hash_map<uint64_t, Advertisement>& advertisements,
                                                               SwitchboardWormholeOperation& operation)
 {
   operation = {};
   operation.containerID = containerID;
-  BitseryEngine::serialize(operation.desired, wormholes);
+  SwitchboardWormholeDesiredState desired = {};
+  if (containerID == 0 || !prodigyBuildCousinWormholeDesiredState(wormholes, isStateful, cousinService,
+                                                                   advertisements, desired) ||
+      !prodigyEncodeWormholeDesiredState(desired, operation.desired)) return false;
   return operation.desired.size() <= SwitchboardWormholeOperation::maximumDesiredBytes &&
          prodigyComputeWormholeDesiredStateRevision(containerID, operation.desired, operation.revision);
+}
+
+// Compatibility helper for ordinary call sites and focused unit fixtures. Production
+// container delivery uses prodigyPrepareContainerWormholeOperation below.
+static inline bool prodigyPrepareSwitchboardWormholeOperation(uint32_t containerID,
+                                                              const Vector<Wormhole>& wormholes,
+                                                              SwitchboardWormholeOperation& operation)
+{
+  const bytell_hash_map<uint64_t, Advertisement> noAdvertisements = {};
+  return prodigyPrepareSwitchboardWormholeOperation(containerID, wormholes, false, 0,
+                                                     noAdvertisements, operation);
+}
+
+static inline const DeploymentPlan *prodigyWormholeDeploymentPlan(const BrainBase& brain, uint64_t deploymentID)
+{
+  if (const auto active = brain.deployments.find(deploymentID); active != brain.deployments.end() && active->second != nullptr)
+    return &active->second->plan;
+  if (const auto retained = brain.deploymentPlans.find(deploymentID); retained != brain.deploymentPlans.end())
+    return &retained->second;
+  return nullptr;
+}
+
+static inline bool prodigyPrepareContainerWormholeOperation(const BrainBase& brain, ContainerView *container,
+                                                            const Vector<Wormhole>& wormholes,
+                                                            SwitchboardWormholeOperation& operation)
+{
+  if (container == nullptr || container->machine == nullptr || container->generateContainerID() == 0) return false;
+  const DeploymentPlan *plan = prodigyWormholeDeploymentPlan(brain, container->deploymentID);
+  if (container->isStateful && plan == nullptr) return false;
+  const uint64_t cousinService = container->isStateful ? container->effectiveStatefulMeshRoles(*plan).cousin : 0;
+  return prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), wormholes,
+                                                     container->isStateful, cousinService,
+                                                     container->advertisements, operation);
 }
 
 static inline bool prodigyWormholeRuntimeTargetMachine(const Machine *machine)
@@ -720,31 +759,20 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
       continue;
     }
 
-    SwitchboardWormholeOperation operation = {};
+    // Preserve the applied endpoint set across replay. A retained legacy raw
+    // COUSIN desired state is upgraded to the protected envelope, but mutable
+    // container definitions cannot replace an applied endpoint by themselves.
+    Vector<Wormhole> appliedWormholes = container->wormholes;
     if (container->wormholeRuntimeRevision.size() == 64)
     {
-      operation.containerID = container->generateContainerID();
-      operation.desired = container->wormholeRuntimeDesired;
-      // Retained state may come from an earlier runtime which cached a
-      // revision before the owner identity was known. Preserve the desired
-      // bytes, but bind their revision to the now-authoritative identity.
-      if (prodigyComputeWormholeDesiredStateRevision(operation.containerID,
-                                                    operation.desired,
-                                                    operation.revision) == false)
-      {
-        continue;
-      }
-      container->wormholeRuntimeRevision = operation.revision;
+      SwitchboardWormholeDesiredState retained = {};
+      if (!prodigyDecodeWormholeDesiredState(container->wormholeRuntimeDesired, retained)) continue;
+      appliedWormholes = std::move(retained.wormholes);
     }
-    else if (prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), container->wormholes, operation) == false)
-    {
-      continue;
-    }
-    else
-    {
-      container->wormholeRuntimeRevision = operation.revision;
-      container->wormholeRuntimeDesired = operation.desired;
-    }
+    SwitchboardWormholeOperation operation = {};
+    if (!prodigyPrepareContainerWormholeOperation(*this, container, appliedWormholes, operation)) continue;
+    container->wormholeRuntimeRevision = operation.revision;
+    container->wormholeRuntimeDesired = operation.desired;
 
     if (prodigyWormholeRuntimeTargetMachine(machine))
     {
@@ -825,7 +853,7 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
   }
 
   SwitchboardWormholeOperation operation = {};
-  if (prodigyPrepareSwitchboardWormholeOperation(container->generateContainerID(), wormholes, operation) == false)
+  if (prodigyPrepareContainerWormholeOperation(*this, container, wormholes, operation) == false)
   {
     basics_log("brain failed to prepare switchboard wormhole operation containerID=%u\n", container->generateContainerID());
     return;
@@ -886,8 +914,14 @@ inline void BrainBase::sendNeuronRefreshContainerWormholes(ContainerView *contai
     return;
   }
 
+  const DeploymentPlan *plan = prodigyWormholeDeploymentPlan(*this, container->deploymentID);
+  if (container->isStateful && plan == nullptr) return;
+  const uint64_t cousinService = container->isStateful ? container->effectiveStatefulMeshRoles(*plan).cousin : 0;
+  SwitchboardWormholeDesiredState desired = {};
   String serializedWormholes = {};
-  BitseryEngine::serialize(serializedWormholes, wormholes);
+  if (!prodigyBuildCousinWormholeDesiredState(wormholes, container->isStateful, cousinService,
+                                               container->advertisements, desired) ||
+      !prodigyEncodeWormholeDesiredState(desired, serializedWormholes)) return;
   container->proxySend(NeuronTopic::refreshContainerWormholes, container->uuid, serializedWormholes);
 }
 
@@ -10325,13 +10359,12 @@ public:
     std::memcpy(containerBytes, &machine->fragment, 3);
     std::memcpy(containerBytes + 3, &state.plan.fragment, 1);
     String expectedRevision = {};
-    Vector<Wormhole> desired = {};
+    SwitchboardWormholeDesiredState desired = {};
     return prodigyComputeWormholeDesiredStateRevision(containerID,
                                                        state.wormholeRuntimeDesired,
                                                        expectedRevision) &&
            expectedRevision.equals(state.wormholeRuntimeRevision) &&
-           BitseryEngine::deserializeSafe(state.wormholeRuntimeDesired, desired) &&
-           wormholeTargetBindingsUnique(desired);
+           prodigyDecodeWormholeDesiredState(state.wormholeRuntimeDesired, desired);
   }
 
   enum class ReplicatedContainerRuntimeStateApplyResult : uint8_t {
@@ -10377,13 +10410,59 @@ public:
       created = true;
     }
 
-    bool uploadedRuntimeReady = state.plan.runtimeReady;
+    // The serving authority owns the role and advertisement definitions used
+    // to derive pair admission. Apply it before inspecting retained endpoints:
+    // a Neuron inventory snapshot may legitimately carry an older plan.
     ContainerPlan plan = state.plan;
     if (!projectStatefulServingPlan(plan, state.machineUUID))
     {
       if (created) delete container;
       return ReplicatedContainerRuntimeStateApplyResult::deferred;
     }
+    // Deployment mode is immutable plan authority; an older inventory plan
+    // must not turn a protected stateful listener back into a stateless view.
+    plan.isStateful = deployment->plan.isStateful;
+
+    // Runtime snapshots may predate the protected desired-state envelope.
+    // Decode their applied endpoints, then rebuild only the derived admission
+    // profile from the replicated plan definition. This preserves an applied
+    // endpoint across failover while preventing a legacy COUSIN listener from
+    // inheriting an old public-ready receipt.
+    SwitchboardWormholeDesiredState replicatedDesired = {};
+    String protectedDesiredBytes = state.wormholeRuntimeDesired;
+    String protectedRevision = state.wormholeRuntimeRevision;
+    bool desiredUpgraded = false;
+    // An empty desired state and revision is the established representation for
+    // ordinary containers with no Wormholes. It carries no endpoint to upgrade.
+    // Preserve that representation rather than attempting to decode an absent
+    // payload as a legacy raw Wormhole vector.
+    if (!state.wormholeRuntimeDesired.empty())
+    {
+      SwitchboardWormholeDesiredState protectedDesired = {};
+      if (!prodigyDecodeWormholeDesiredState(state.wormholeRuntimeDesired, replicatedDesired) ||
+          !prodigyBuildCousinWormholeDesiredState(replicatedDesired.wormholes, deployment->plan.isStateful,
+                                                   plan.statefulMeshRoles.cousin,
+                                                   plan.advertisements, protectedDesired) ||
+          !prodigyEncodeWormholeDesiredState(protectedDesired, protectedDesiredBytes))
+      {
+        if (created) delete container;
+        return ReplicatedContainerRuntimeStateApplyResult::rejected;
+      }
+      desiredUpgraded = !protectedDesiredBytes.equals(state.wormholeRuntimeDesired);
+      if (desiredUpgraded)
+      {
+        uint32_t protectedContainerID = 0;
+        uint8_t *protectedContainerBytes = reinterpret_cast<uint8_t *>(&protectedContainerID);
+        std::memcpy(protectedContainerBytes, &machine->fragment, 3);
+        std::memcpy(protectedContainerBytes + 3, &state.plan.fragment, 1);
+        if (!prodigyComputeWormholeDesiredStateRevision(protectedContainerID, protectedDesiredBytes, protectedRevision))
+        {
+          if (created) delete container;
+          return ReplicatedContainerRuntimeStateApplyResult::rejected;
+        }
+      }
+    }
+    bool uploadedRuntimeReady = state.plan.runtimeReady && !desiredUpgraded;
     prodigyCancelWormholeRuntimeAckDeadline(container);
     detachContainerRuntimeState(container);
     plan.runtimeReady = false;
@@ -10392,20 +10471,28 @@ public:
     container->runtime_nLogicalCores = state.runtimeLogicalCores;
     container->runtime_memoryMB = state.runtimeMemoryMB;
     container->runtime_storageMB = state.runtimeStorageMB;
-    container->wormholeRuntimeRevision = state.wormholeRuntimeRevision;
-    container->wormholeRuntimeDesired = state.wormholeRuntimeDesired;
+    container->wormholeRuntimeRevision = protectedRevision;
+    container->wormholeRuntimeDesired = protectedDesiredBytes;
     container->wormholeRuntimePendingMachines.clear();
     container->wormholeRuntimeFailedMachines.clear();
-    for (uint32_t fragment : state.wormholeRuntimePendingMachines)
+    if (!desiredUpgraded)
     {
-      container->wormholeRuntimePendingMachines.insert(fragment);
+      for (uint32_t fragment : state.wormholeRuntimePendingMachines)
+      {
+        container->wormholeRuntimePendingMachines.insert(fragment);
+      }
+      for (uint32_t fragment : state.wormholeRuntimeFailedMachines)
+      {
+        container->wormholeRuntimeFailedMachines.insert(fragment);
+      }
+      container->wormholeRuntimeFailure = state.wormholeRuntimeFailure;
+      container->wormholeRuntimeFailureSuppressedReady = state.wormholeRuntimeFailureSuppressedReady;
     }
-    for (uint32_t fragment : state.wormholeRuntimeFailedMachines)
+    else
     {
-      container->wormholeRuntimeFailedMachines.insert(fragment);
+      container->wormholeRuntimeFailure.clear();
+      container->wormholeRuntimeFailureSuppressedReady = true;
     }
-    container->wormholeRuntimeFailure = state.wormholeRuntimeFailure;
-    container->wormholeRuntimeFailureSuppressedReady = state.wormholeRuntimeFailureSuppressedReady;
 
     containers.insert_or_assign(container->uuid, container);
     machine->upsertContainerIndexEntry(container->deploymentID, container);
@@ -10419,7 +10506,11 @@ public:
     {
       deployment->containerIsRuntimeReady(container);
     }
-    if (weAreMaster)
+    if (weAreMaster && desiredUpgraded)
+    {
+      sendNeuronOpenSwitchboardWormholes(container, replicatedDesired.wormholes);
+    }
+    else if (weAreMaster)
     {
       armWormholeRuntimeAckDeadline(container);
     }
@@ -26796,13 +26887,16 @@ public:
       return;
     }
 
+    SwitchboardWormholeDesiredState retained = {};
+    if (!prodigyDecodeWormholeDesiredState(container->wormholeRuntimeDesired, retained)) return;
     SwitchboardWormholeOperation operation = {};
-    operation.containerID = container->generateContainerID();
-    operation.desired = container->wormholeRuntimeDesired;
-    if (operation.containerID == 0 || operation.desired.size() > SwitchboardWormholeOperation::maximumDesiredBytes ||
-        prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, operation.revision) == false ||
-        operation.revision.equals(container->wormholeRuntimeRevision) == false)
+    if (!prodigyPrepareContainerWormholeOperation(*this, container, retained.wormholes, operation)) return;
+    if (operation.revision.equals(container->wormholeRuntimeRevision) == false)
     {
+      // A restored legacy desired state lacks its protected COUSIN envelope.
+      // Reissue the same applied endpoints through the ordinary revision/ACK
+      // owner instead of retrying them as an unprotected listener.
+      sendNeuronOpenSwitchboardWormholes(container, retained.wormholes);
       return;
     }
 
@@ -31636,12 +31730,11 @@ public:
             !container->wormholeRuntimeFailure.empty() || !container->wormholeRuntimePendingMachines.empty() ||
             !container->wormholeRuntimeFailedMachines.empty()) continue;
         String revision = {};
-        Vector<Wormhole> applied = {};
+        SwitchboardWormholeDesiredState applied = {};
         if (!prodigyComputeWormholeDesiredStateRevision(container->generateContainerID(),
                                                         container->wormholeRuntimeDesired, revision) ||
             !revision.equals(container->wormholeRuntimeRevision) ||
-            !BitseryEngine::deserializeSafe(container->wormholeRuntimeDesired, applied) ||
-            !wormholeTargetBindingsUnique(applied)) continue;
+            !prodigyDecodeWormholeDesiredState(container->wormholeRuntimeDesired, applied)) continue;
         const StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(deployment->second->plan);
         if (roles.cousin == 0 || !MeshRegistry::prefixContains(permission.localCousinServicePrefix, roles.cousin)) continue;
         const auto advertisement = container->advertisements.find(roles.cousin);
@@ -31652,7 +31745,7 @@ public:
             [&](uint16_t slot) { if (permission.slots.contains(slot)) owned.insert(slot); });
         if (owned.empty()) continue;
         const Wormhole *selected = nullptr;
-        for (const Wormhole& wormhole : applied)
+        for (const Wormhole& wormhole : applied.wormholes)
         {
           if (wormhole.layer4 != IPPROTO_TCP || wormhole.isQuic || !wormhole.externalAddress.is6 ||
               wormhole.externalAddress.isNull() ||
@@ -31661,7 +31754,9 @@ public:
           if (selected != nullptr) { selected = nullptr; break; }
           selected = &wormhole;
         }
-        if (selected == nullptr || snapshot.records.size() >= ProdigyCousinDiscoveryMaximumRecords) {
+        if (selected == nullptr ||
+            !prodigyWormholeRequiresPairAdmission(applied, selected->containerPort, selected->layer4) ||
+            snapshot.records.size() >= ProdigyCousinDiscoveryMaximumRecords) {
           if (snapshot.records.size() >= ProdigyCousinDiscoveryMaximumRecords) { snapshot.records.clear(); return true; }
           continue;
         }

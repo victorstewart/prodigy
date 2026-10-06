@@ -1,5 +1,6 @@
 #include <prodigy/ingress.validation.h>
 #include <prodigy/wire.h>
+#include <prodigy/bundle.artifact.h>
 #include <services/debug.h>
 
 #include <cstdio>
@@ -683,6 +684,83 @@ static void expectWireRoundTrip(TestSuite& suite, const T& expected, const char 
 int main(void)
 {
   TestSuite suite;
+
+  {
+    Wormhole wormhole = {};
+    wormhole.name.assign("cousin"_ctv);
+    wormhole.externalAddress = IPAddress("2001:db8::44", true);
+    wormhole.externalPort = 8443;
+    wormhole.containerPort = 9443;
+    wormhole.layer4 = IPPROTO_TCP;
+    Vector<Wormhole> wormholes = {wormhole};
+    SwitchboardWormholeDesiredState ordinary = {};
+    ordinary.wormholes = wormholes;
+    String legacy = {}, encoded = {};
+    BitseryEngine::serialize(legacy, wormholes);
+    suite.expect(prodigyEncodeWormholeDesiredState(ordinary, encoded) && encoded == legacy,
+                 "wormhole_desired_ordinary_encoding_preserves_legacy_bytes");
+    SwitchboardWormholeDesiredState decoded = {};
+    suite.expect(prodigyDecodeWormholeDesiredState(legacy, decoded) && decoded.pairAdmissionTCPPorts.empty() &&
+                     decoded.wormholes.size() == 1 && equalWormhole(decoded.wormholes.front(), wormhole),
+                 "wormhole_desired_accepts_legacy_ordinary_vector");
+    bytell_hash_map<uint64_t, Advertisement> advertisements = {};
+    const uint64_t cousinService = MeshServices::constrainPrefixToGroup(MeshServices::generateStatefulService(17, 3), 0);
+    advertisements.emplace(cousinService,
+        Advertisement(cousinService, ContainerState::healthy, ContainerState::destroying, 9443));
+    SwitchboardWormholeDesiredState protectedState = {};
+    suite.expect(prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, protectedState) &&
+                     prodigyWormholeRequiresPairAdmission(protectedState, 9443, IPPROTO_TCP),
+                 "wormhole_desired_cousin_definition_protects_before_active_lifecycle_state");
+    suite.expect(prodigyEncodeWormholeDesiredState(protectedState, encoded) && encoded != legacy &&
+                     prodigyDecodeWormholeDesiredState(encoded, decoded) &&
+                     prodigyWormholeRequiresPairAdmission(decoded, 9443, IPPROTO_TCP),
+                 "wormhole_desired_protected_envelope_roundtrip");
+    Vector<Wormhole> legacyDecoded = {};
+    suite.expect(!BitseryEngine::deserializeSafe(encoded, legacyDecoded),
+                 "wormhole_desired_legacy_reader_rejects_protected_envelope");
+    String ordinaryRevision = {}, protectedRevision = {};
+    suite.expect(prodigyComputeWormholeDesiredStateRevision(1, legacy, ordinaryRevision) &&
+                     prodigyComputeWormholeDesiredStateRevision(1, encoded, protectedRevision) &&
+                     ordinaryRevision != protectedRevision,
+                 "wormhole_desired_admission_profile_changes_applied_revision");
+    String corrupted = encoded;
+    corrupted[1] = 'X';
+    suite.expect(!prodigyDecodeWormholeDesiredState(corrupted, decoded),
+                 "wormhole_desired_unknown_envelope_never_falls_back_to_public");
+    corrupted = encoded;
+    corrupted.resize(corrupted.size() - 1);
+    suite.expect(!prodigyDecodeWormholeDesiredState(corrupted, decoded),
+                 "wormhole_desired_truncated_protected_envelope_rejected");
+    auto invalid = protectedState;
+    invalid.protocolVersion = 2;
+    suite.expect(!prodigyEncodeWormholeDesiredState(invalid, corrupted),
+                 "wormhole_desired_unknown_version_rejected");
+    String unsupportedBody = {};
+    BitseryEngine::serialize(unsupportedBody, invalid);
+    const bool unsupportedReserved = corrupted.reserve(sizeof(prodigyWormholeDesiredMagic) + unsupportedBody.size());
+    corrupted.append(prodigyWormholeDesiredMagic, sizeof(prodigyWormholeDesiredMagic));
+    corrupted.append(unsupportedBody);
+    suite.expect(unsupportedReserved && !prodigyDecodeWormholeDesiredState(corrupted, decoded),
+                 "wormhole_desired_unknown_received_version_rejected");
+    invalid = protectedState;
+    invalid.pairAdmissionTCPPorts.push_back(9443);
+    suite.expect(!prodigyWormholeDesiredStateValid(invalid), "wormhole_desired_duplicate_protected_port_rejected");
+    invalid = protectedState;
+    invalid.pairAdmissionTCPPorts.front() = 9444;
+    suite.expect(!prodigyWormholeDesiredStateValid(invalid), "wormhole_desired_missing_protected_target_rejected");
+    advertisements.emplace(cousinService + 1,
+        Advertisement(cousinService + 1, ContainerState::healthy, ContainerState::destroying, 9443));
+    suite.expect(!prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, decoded),
+                 "wormhole_desired_rejects_cousin_port_shared_with_another_service");
+    advertisements.erase(cousinService + 1);
+    wormholes.front().layer4 = IPPROTO_UDP;
+    suite.expect(!prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, decoded),
+                 "wormhole_desired_rejects_unsupported_cousin_udp_without_public_fallback");
+    wormholes.front() = wormhole;
+    wormholes.front().deliveryAddress = IPAddress("2001:db8:1::44", true);
+    suite.expect(!prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, decoded),
+                 "wormhole_desired_rejects_translated_protected_endpoint");
+  }
 
   expectWireRoundTrip(suite, makeTlsResumptionKeyEpoch(9), "tls_resumption_key_epoch_decode_state", "tls_resumption_key_epoch_roundtrip_state", prodigyTlsResumptionKeyEpochsEqual);
   expectWireRoundTrip(suite, makeTlsResumptionSnapshot(), "tls_resumption_snapshot_decode_state", "tls_resumption_snapshot_roundtrip_state", prodigyTlsResumptionSnapshotsEqual);

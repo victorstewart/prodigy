@@ -188,13 +188,23 @@ static inline bool switchboardGenerateWormholeOwnerGeneration(uint64_t& generati
   return true;
 }
 
+static inline bool switchboardWormholeAdmissionProfileValid(uint8_t profile)
+{
+  return profile == SWITCHBOARD_WORMHOLE_ADMISSION_NONE ||
+         profile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+}
+
 static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& externalAddress,
                                                          uint16_t externalPort,
                                                          uint8_t proto,
                                                          uint64_t ownerGeneration,
+                                                         uint8_t admissionProfile,
                                                          switchboard_wormhole_egress_binding& binding)
 {
-  if (externalPort == 0 || proto == 0 || ownerGeneration == 0)
+  if (externalPort == 0 || proto == 0 || ownerGeneration == 0 ||
+      !switchboardWormholeAdmissionProfileValid(admissionProfile) ||
+      (admissionProfile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT &&
+       (proto != IPPROTO_TCP || !externalAddress.is6 || externalAddress.isNull())))
   {
     binding = {};
     return false;
@@ -204,9 +214,20 @@ static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& extern
   binding.port = htons(externalPort);
   binding.proto = proto;
   binding.is_ipv6 = externalAddress.is6 ? 1 : 0;
+  binding.admission_profile = admissionProfile;
   binding.owner_generation = ownerGeneration;
   std::memcpy(binding.addr6, externalAddress.v6, sizeof(binding.addr6));
   return true;
+}
+
+static inline bool switchboardBuildWormholeEgressBinding(const IPAddress& externalAddress,
+                                                         uint16_t externalPort,
+                                                         uint8_t proto,
+                                                         uint64_t ownerGeneration,
+                                                         switchboard_wormhole_egress_binding& binding)
+{
+  return switchboardBuildWormholeEgressBinding(externalAddress, externalPort, proto, ownerGeneration,
+                                                SWITCHBOARD_WORMHOLE_ADMISSION_NONE, binding);
 }
 
 static inline bool switchboardWormholeEgressKeysEqual(const switchboard_wormhole_egress_key& lhs,
@@ -429,6 +450,7 @@ public:
   ServiceUserCapacity userCapacity;
   uint32_t weight = 1;
   uint64_t ownerGeneration = 0;
+  uint8_t admissionProfile = SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
   ::Wormhole definition = {};
   SwitchboardPortal *portal;
 
@@ -1728,6 +1750,7 @@ private:
                                                                                                                                                           wormhole->portal->port,
                                                                                                                                                           wormhole->proto,
                                                                                                                                                           wormhole->ownerGeneration,
+                                                                                                                                                          wormhole->admissionProfile,
                                                                                                                                                           desired.binding) == false)
         {
           continue;
@@ -1744,6 +1767,7 @@ private:
                                                   wormhole->portal->port,
                                                   wormhole->proto,
                                                   wormhole->ownerGeneration,
+                                                  wormhole->admissionProfile,
                                                   desired4.binding))
         {
           desiredBindings4.push_back(desired4);
@@ -1754,7 +1778,8 @@ private:
 
   bool validateWormholeTargetBinding(const SwitchboardPortal *portal,
                                       const switchboard_runtime::Wormhole *wormhole,
-                                      const Wormhole& requestedWormhole) const
+                                      const Wormhole& requestedWormhole,
+                                      uint8_t admissionProfile) const
   {
     if (!bpf_router || !host_egress || !portal || !wormhole) return false;
     switchboard_wormhole_target_key targetKey = {};
@@ -1765,7 +1790,7 @@ private:
            switchboardBuildWormholeEgressBinding(wormholeSwitchboardAddress(requestedWormhole),
                                                 requestedWormhole.externalPort,
                                                 requestedWormhole.layer4,
-                                                wormhole->ownerGeneration, binding);
+                                                wormhole->ownerGeneration, admissionProfile, binding);
   }
 
   void syncBoundaryMaps(void)
@@ -3062,8 +3087,14 @@ public:
     maybeDetachBoundaryRouter();
   }
 
-  bool openWormhole(uint32_t containerID, const Wormhole& requestedWormhole)
+  bool openWormhole(uint32_t containerID, const Wormhole& requestedWormhole, uint8_t admissionProfile)
   {
+    if (!switchboardWormholeAdmissionProfileValid(admissionProfile) ||
+        (admissionProfile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT &&
+         (requestedWormhole.layer4 != IPPROTO_TCP || requestedWormhole.isQuic ||
+          !requestedWormhole.externalAddress.is6 || requestedWormhole.externalAddress.isNull() ||
+          (!requestedWormhole.deliveryAddress.isNull() &&
+           !requestedWormhole.deliveryAddress.equals(requestedWormhole.externalAddress))))) return false;
     if (switchboardPacketBudgetExternalIngressUnderlayMTUValid(eth.mtu) == false)
     {
       basics_log("Switchboard openWormhole underlay mtu too small ifidx=%u mtu=%u required=%u containerID=%u\n",
@@ -3115,6 +3146,8 @@ public:
     if (auto it = portals.find(&query); it != portals.end())
     {
       portal = *it;
+      for (const switchboard_runtime::Wormhole *existing : portal->wormholes)
+        if (existing != nullptr && existing->admissionProfile != admissionProfile) return false;
       applyPortalQuicCidStateFromWormhole(portal, requestedWormhole);
     }
     else
@@ -3173,10 +3206,11 @@ public:
     wormhole->userCapacity = requestedWormhole.userCapacity;
     wormhole->weight = serviceUserCapacityPlanningWeight(requestedWormhole.userCapacity);
     wormhole->ownerGeneration = ownerGeneration;
+    wormhole->admissionProfile = admissionProfile;
     wormhole->definition = requestedWormhole;
     wormhole->portal = portal;
 
-    if (validateWormholeTargetBinding(portal, wormhole, requestedWormhole) == false)
+    if (validateWormholeTargetBinding(portal, wormhole, requestedWormhole, admissionProfile) == false)
     {
       basics_log("Switchboard openWormhole failed target/egress admission validation ifidx=%u containerID=%u slot=%u port=%u proto=%u\n",
                  eth.ifidx,
@@ -3233,84 +3267,151 @@ public:
     return true;
   }
 
-  SwitchboardWormholeOperationStatus openWormholes(uint32_t containerID, const Vector<Wormhole>& wormholes)
+  bool wormholeAdmissionProfilesCompatible(uint32_t containerID,
+                                           const SwitchboardWormholeDesiredState& desired) const
   {
-    appendAttachLogf("Switchboard openWormholes begin ifidx=%u containerID=%u requested=%u announcing=%u dpfx=%u",
-                     eth.ifidx,
-                     containerID,
-                     unsigned(wormholes.size()),
-                     unsigned(announcingPrefixes.size()),
-                     unsigned(subnet.dpfx));
-    if (wormholeTargetBindingsUnique(wormholes) == false)
+    for (uint32_t index = 0; index < desired.wormholes.size(); ++index)
     {
-      basics_log("Switchboard openWormholes rejected duplicate target containerID=%u ifidx=%u\n",
-                 containerID,
-                 eth.ifidx);
-      return SwitchboardWormholeOperationStatus::rejected;
-    }
-    String desiredBytes = switchboardSerializeWormholeFleet(wormholes);
-    String desiredRevision = {};
-    if (prodigyComputeWormholeDesiredStateRevision(containerID, desiredBytes, desiredRevision) == false)
-    {
-      basics_log("Switchboard openWormholes failed desired-state digest containerID=%u ifidx=%u\n", containerID, eth.ifidx);
-      return SwitchboardWormholeOperationStatus::rejected;
-    }
-    if (auto applied = wormholeRevisionByContainer.find(containerID);
-        applied != wormholeRevisionByContainer.end() && applied->second.equals(desiredRevision))
-    {
-      return SwitchboardWormholeOperationStatus::applied;
-    }
-    Vector<Wormhole> previous = {};
-    String previousRevision = {};
-    if (auto applied = wormholeRevisionByContainer.find(containerID); applied != wormholeRevisionByContainer.end())
-    {
-      previousRevision = applied->second;
-    }
-    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
-    {
-      previous.reserve(existing->second.size());
-      for (const switchboard_runtime::Wormhole *wormhole : existing->second)
+      const Wormhole& candidate = desired.wormholes[index];
+      const uint8_t profile = prodigyWormholeRequiresPairAdmission(desired, candidate.containerPort,
+                                                                     candidate.layer4)
+          ? SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT : SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
+
+      SwitchboardPortal query = {};
+      query.address = wormholeSwitchboardAddress(candidate);
+      query.port = candidate.externalPort;
+      query.proto = candidate.layer4;
+      query.isQuic = candidate.isQuic;
+      if (auto existing = portals.find(&query); existing != portals.end())
       {
-        if (wormhole != nullptr)
-        {
-          previous.push_back(wormhole->definition);
-        }
+        for (const switchboard_runtime::Wormhole *wormhole : (*existing)->wormholes)
+          if (wormhole != nullptr && wormhole->containerID != containerID &&
+              wormhole->admissionProfile != profile)
+            return false;
+      }
+
+      for (uint32_t other = 0; other < index; ++other)
+      {
+        const Wormhole& peer = desired.wormholes[other];
+        if (!wormholeSwitchboardAddress(candidate).equals(wormholeSwitchboardAddress(peer)) ||
+            candidate.externalPort != peer.externalPort || candidate.layer4 != peer.layer4 ||
+            candidate.isQuic != peer.isQuic)
+          continue;
+        const uint8_t peerProfile = prodigyWormholeRequiresPairAdmission(desired, peer.containerPort,
+                                                                           peer.layer4)
+            ? SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT : SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
+        if (peerProfile != profile) return false;
       }
     }
-    SwitchboardWormholeOperationStatus status = switchboardReplaceWormholesTransaction(
-        previous,
-        wormholes,
-        [&](const Wormhole& wormhole) -> bool { return openWormhole(containerID, wormhole); },
+    return true;
+  }
+
+  bool retainedProtectedWormholesRemainProtected(uint32_t containerID,
+                                                 const SwitchboardWormholeDesiredState& desired)
+  {
+    auto existing = wormholesByContainer.find(containerID);
+    if (existing == wormholesByContainer.end()) return true;
+    for (const switchboard_runtime::Wormhole *current : existing->second)
+    {
+      if (current == nullptr ||
+          current->admissionProfile != SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT)
+        continue;
+      for (const Wormhole& replacement : desired.wormholes)
+      {
+        if (replacement.containerPort != current->port || replacement.layer4 != current->proto)
+          continue;
+        if (!prodigyWormholeRequiresPairAdmission(desired, replacement.containerPort,
+                                                  replacement.layer4))
+          return false;
+        break;
+      }
+    }
+    return true;
+  }
+
+  SwitchboardWormholeOperationStatus openWormholes(uint32_t containerID,
+                                                   const Vector<Wormhole>& wormholes)
+  {
+    // Legacy callers cannot express PAIR_GRANT.  Refuse an attempted refresh
+    // of any existing protected fleet rather than silently publishing it as
+    // ordinary ingress.
+    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
+      for (const switchboard_runtime::Wormhole *wormhole : existing->second)
+        if (wormhole != nullptr && wormhole->admissionProfile != SWITCHBOARD_WORMHOLE_ADMISSION_NONE)
+          return SwitchboardWormholeOperationStatus::rejected;
+    SwitchboardWormholeDesiredState desired = {};
+    desired.wormholes = wormholes;
+    return openWormholes(containerID, desired);
+  }
+
+  SwitchboardWormholeOperationStatus openWormholes(uint32_t containerID,
+                                                   const SwitchboardWormholeDesiredState& desired)
+  {
+    appendAttachLogf("Switchboard openWormholes begin ifidx=%u containerID=%u requested=%u protected=%u announcing=%u dpfx=%u",
+                     eth.ifidx, containerID, unsigned(desired.wormholes.size()),
+                     unsigned(desired.pairAdmissionTCPPorts.size()), unsigned(announcingPrefixes.size()),
+                     unsigned(subnet.dpfx));
+    if (containerID == 0 || !prodigyWormholeDesiredStateValid(desired) ||
+        !wormholeAdmissionProfilesCompatible(containerID, desired) ||
+        !retainedProtectedWormholesRemainProtected(containerID, desired))
+      return SwitchboardWormholeOperationStatus::rejected;
+    String desiredBytes = {};
+    String desiredRevision = {};
+    if (!prodigyEncodeWormholeDesiredState(desired, desiredBytes) ||
+        !prodigyComputeWormholeDesiredStateRevision(containerID, desiredBytes, desiredRevision))
+      return SwitchboardWormholeOperationStatus::rejected;
+    if (auto applied = wormholeRevisionByContainer.find(containerID);
+        applied != wormholeRevisionByContainer.end() && applied->second.equals(desiredRevision))
+      return SwitchboardWormholeOperationStatus::applied;
+
+    SwitchboardWormholeDesiredState previous = {};
+    if (auto existing = wormholesByContainer.find(containerID); existing != wormholesByContainer.end())
+    {
+      for (const switchboard_runtime::Wormhole *wormhole : existing->second)
+      {
+        if (wormhole == nullptr) continue;
+        previous.wormholes.push_back(wormhole->definition);
+        if (wormhole->admissionProfile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT)
+          previous.pairAdmissionTCPPorts.push_back(wormhole->port);
+      }
+      std::sort(previous.pairAdmissionTCPPorts.begin(), previous.pairAdmissionTCPPorts.end());
+    }
+    if (!prodigyWormholeDesiredStateValid(previous)) return SwitchboardWormholeOperationStatus::rejected;
+    String previousRevision = {};
+    if (auto applied = wormholeRevisionByContainer.find(containerID); applied != wormholeRevisionByContainer.end())
+      previousRevision = applied->second;
+    if (previousRevision.empty())
+    {
+      String previousBytes = {};
+      if (!prodigyEncodeWormholeDesiredState(previous, previousBytes) ||
+          !prodigyComputeWormholeDesiredStateRevision(containerID, previousBytes, previousRevision))
+        return SwitchboardWormholeOperationStatus::rejected;
+    }
+
+    auto openFrom = [&](const SwitchboardWormholeDesiredState& state, const Wormhole& wormhole) -> bool {
+      const uint8_t profile = prodigyWormholeRequiresPairAdmission(state, wormhole.containerPort, wormhole.layer4)
+          ? SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT : SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
+      return openWormhole(containerID, wormhole, profile);
+    };
+
+    const SwitchboardWormholeOperationStatus status = switchboardReplaceWormholesTransaction(
+        previous.wormholes, desired.wormholes,
+        [&](const Wormhole& wormhole) -> bool { return openFrom(desired, wormhole); },
+        [&](const Wormhole& wormhole) -> bool { return openFrom(previous, wormhole); },
         [&]() -> void { closeWormholesToContainer(containerID); });
     if (status != SwitchboardWormholeOperationStatus::applied)
     {
-      if (status == SwitchboardWormholeOperationStatus::rejected)
-      {
-        if (previousRevision.empty())
-        {
-          String previousBytes = switchboardSerializeWormholeFleet(previous);
-          (void)prodigyComputeWormholeDesiredStateRevision(containerID, previousBytes, previousRevision);
-        }
-        if (previousRevision.empty() == false)
-        {
-          wormholeRevisionByContainer.insert_or_assign(containerID, std::move(previousRevision));
-        }
-      }
+      if (status == SwitchboardWormholeOperationStatus::rejected && !previous.wormholes.empty())
+        wormholeRevisionByContainer.insert_or_assign(containerID, std::move(previousRevision));
       if (status == SwitchboardWormholeOperationStatus::rollbackFailed)
-      {
         basics_log("Switchboard openWormholes rollback failed containerID=%u previous=%u ifidx=%u\n",
-                   containerID, unsigned(previous.size()), eth.ifidx);
-      }
-      basics_log("Switchboard openWormholes transaction rolled back containerID=%u requested=%u ifidx=%u\n",
-                 containerID, unsigned(wormholes.size()), eth.ifidx);
+                   containerID, unsigned(previous.wormholes.size()), eth.ifidx);
       return status;
     }
     wormholeRevisionByContainer.insert_or_assign(containerID, std::move(desiredRevision));
-    appendAttachLogf("Switchboard openWormholes done ifidx=%u containerID=%u requested=%u opened=%u",
-                     eth.ifidx,
-                     containerID,
-                     unsigned(wormholes.size()),
-                     unsigned(wormholes.size()));
+    appendAttachLogf("Switchboard openWormholes done ifidx=%u containerID=%u requested=%u protected=%u",
+                     eth.ifidx, containerID, unsigned(desired.wormholes.size()),
+                     unsigned(desired.pairAdmissionTCPPorts.size()));
     return SwitchboardWormholeOperationStatus::applied;
   }
 

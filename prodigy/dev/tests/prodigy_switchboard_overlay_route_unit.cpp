@@ -358,6 +358,36 @@ int main(void)
   suite.expect(rollbackStatus == SwitchboardWormholeOperationStatus::rollbackFailed && activeWormholes.empty(),
                "switchboard_wormhole_transaction_reports_and_clears_failed_rollback");
 
+  activeWormholes = previousWormholes;
+  Vector<uint8_t> activeProfiles = {};
+  activeProfiles.push_back(SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT);
+  auto openDesiredProfile = [&](const Wormhole& wormhole) -> bool {
+    if (wormhole.containerPort == desiredSecond.containerPort) return false;
+    activeWormholes.push_back(wormhole);
+    activeProfiles.push_back(SWITCHBOARD_WORMHOLE_ADMISSION_NONE);
+    return true;
+  };
+  auto restorePreviousProfile = [&](const Wormhole& wormhole) -> bool {
+    activeWormholes.push_back(wormhole);
+    activeProfiles.push_back(SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT);
+    return true;
+  };
+  auto closeProfiledWormholes = [&]() -> void {
+    activeWormholes.clear();
+    activeProfiles.clear();
+  };
+  rollbackStatus = switchboardReplaceWormholesTransaction(previousWormholes,
+                                                           desiredWormholes,
+                                                           openDesiredProfile,
+                                                           restorePreviousProfile,
+                                                           closeProfiledWormholes);
+  suite.expect(rollbackStatus == SwitchboardWormholeOperationStatus::rejected &&
+                   activeWormholes.size() == 1 &&
+                   activeWormholes[0].containerPort == previousWormhole.containerPort &&
+                   activeProfiles.size() == 1 &&
+                   activeProfiles[0] == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT,
+               "switchboard_wormhole_transaction_restores_previous_admission_profile");
+
   suite.expect(switchboardContainerIDTargetsLocalMachine(&localContainerID, &localSubnet), "switchboard_container_id_detects_local_machine_delivery");
   suite.expect(switchboardContainerIDTargetsRemoteMachine(&localContainerID, &localSubnet) == false, "switchboard_container_id_local_delivery_is_not_remote");
   suite.expect(switchboardContainerIDTargetsRemoteMachine(&remoteContainerID, &localSubnet), "switchboard_container_id_detects_cross_machine_delivery");

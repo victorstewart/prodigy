@@ -55,10 +55,11 @@ static String switchboardSerializeWormholeFleet(const Vector<Wormhole>& wormhole
   return serialized;
 }
 
-template <typename Open, typename Close>
+template <typename Open, typename Restore, typename Close>
 static SwitchboardWormholeOperationStatus switchboardReplaceWormholesTransaction(const Vector<Wormhole>& previous,
                                                                                   const Vector<Wormhole>& desired,
                                                                                   Open&& open,
+                                                                                  Restore&& restore,
                                                                                   Close&& close)
 {
   close();
@@ -72,7 +73,7 @@ static SwitchboardWormholeOperationStatus switchboardReplaceWormholesTransaction
     close();
     for (const Wormhole& prior : previous)
     {
-      if (open(prior) == false)
+      if (restore(prior) == false)
       {
         close();
         return SwitchboardWormholeOperationStatus::rollbackFailed;
@@ -81,6 +82,15 @@ static SwitchboardWormholeOperationStatus switchboardReplaceWormholesTransaction
     return SwitchboardWormholeOperationStatus::rejected;
   }
   return SwitchboardWormholeOperationStatus::applied;
+}
+
+template <typename Open, typename Close>
+static SwitchboardWormholeOperationStatus switchboardReplaceWormholesTransaction(const Vector<Wormhole>& previous,
+                                                                                  const Vector<Wormhole>& desired,
+                                                                                  Open&& open,
+                                                                                  Close&& close)
+{
+  return switchboardReplaceWormholesTransaction(previous, desired, open, open, close);
 }
 
 struct SwitchboardWormholeFlowMapGCCursor {

@@ -23164,6 +23164,122 @@ static void testBrainReplicatedContainerRuntimeStateRestoresTakeoverView(TestSui
     delete restored;
   }
 
+  // No-Wormhole containers retain the long-standing empty runtime representation:
+  // neither the desired bytes nor revision is present to decode or upgrade.
+  BrainReplicatedContainerRuntimeState ordinaryRuntimeState = runtimeState;
+  ordinaryRuntimeState.plan.uuid = uint128_t(0x5209);
+  ordinaryRuntimeState.plan.fragment = 10;
+  ordinaryRuntimeState.plan.runtimeReady = true;
+  ordinaryRuntimeState.plan.wormholes.clear();
+  ordinaryRuntimeState.wormholeRuntimeDesired.clear();
+  ordinaryRuntimeState.wormholeRuntimeRevision.clear();
+  ordinaryRuntimeState.wormholeRuntimePendingMachines.clear();
+  ordinaryRuntimeState.wormholeRuntimeFailedMachines.clear();
+  ordinaryRuntimeState.wormholeRuntimeFailure.clear();
+  ordinaryRuntimeState.wormholeRuntimeFailureSuppressedReady = false;
+  brain.weAreMaster = false;
+  suite.require(brain.replicatedWormholeRuntimeStateValid(ordinaryRuntimeState, &machine),
+                "brain_replicated_runtime_state_accepts_empty_ordinary_wormhole_state");
+  brain.applyReplicatedContainerRuntimeState(ordinaryRuntimeState);
+  auto ordinaryIt = brain.containers.find(ordinaryRuntimeState.plan.uuid);
+  ContainerView *ordinary = ordinaryIt == brain.containers.end() ? nullptr : ordinaryIt->second;
+  suite.expect(ordinary != nullptr && ordinary->wormholes.empty() &&
+                   ordinary->wormholeRuntimeDesired.empty() && ordinary->wormholeRuntimeRevision.empty() &&
+                   ordinary->runtimeReady,
+               "brain_replicated_runtime_state_replays_empty_ordinary_wormhole_state");
+  if (ordinary != nullptr)
+  {
+    deployment.containers.erase(ordinary);
+    machine.removeContainerIndexEntry(ordinary->deploymentID, ordinary);
+    brain.containers.erase(ordinary->uuid);
+    delete ordinary;
+  }
+
+  // Legacy raw desired bytes for a stateful COUSIN listener must be upgraded
+  // before its retained ready receipt is trusted.  The applied endpoint remains
+  // intact, but readiness is withheld until the protected desired state is sent.
+  // The local deployment and serving authority now require a COUSIN listener.
+  // Deliberately retain an older incoming plan without that role or advertisement:
+  // restoration must derive protection from the authority projection instead.
+  constexpr uint64_t cousinPrefix = MeshServices::generateStatefulService(62'023, 3);
+  deployment.plan.isStateful = true;
+  deployment.plan.stateful.cousinPrefix = cousinPrefix;
+  BrainReplicatedContainerRuntimeState legacyProtectedRuntimeState = runtimeState;
+  legacyProtectedRuntimeState.plan.uuid = uint128_t(0x520A);
+  legacyProtectedRuntimeState.plan.fragment = 11;
+  legacyProtectedRuntimeState.plan.isStateful = false;
+  legacyProtectedRuntimeState.plan.runtimeReady = true;
+  legacyProtectedRuntimeState.plan.nShardGroups = 1;
+  const uint64_t cousinService = MeshServices::constrainPrefixToGroup(
+      cousinPrefix, legacyProtectedRuntimeState.plan.shardGroup);
+  BrainReplicatedContainerRuntimeState authorityProjectedRuntimeState = legacyProtectedRuntimeState;
+  authorityProjectedRuntimeState.plan.statefulMeshRoles.cousin = cousinService;
+  authorityProjectedRuntimeState.plan.advertisements.insert_or_assign(
+      cousinService, Advertisement(cousinService, ContainerState::healthy, ContainerState::destroying, 9443));
+  legacyProtectedRuntimeState.plan.statefulMeshRoles = {};
+  legacyProtectedRuntimeState.plan.advertisements.clear();
+  ProdigyStatefulServingAuthority servingAuthority = {};
+  servingAuthority.deploymentID = deployment.plan.config.deploymentID();
+  servingAuthority.applicationID = deployment.plan.config.applicationID;
+  servingAuthority.targetConfig = deployment.plan.config;
+  ProdigyStatefulServingAuthorityMember servingMember = {};
+  servingMember.containerUUID = legacyProtectedRuntimeState.plan.uuid;
+  servingMember.machineUUID = machine.uuid;
+  servingMember.shardGroup = legacyProtectedRuntimeState.plan.shardGroup;
+  servingAuthority.members.push_back(servingMember);
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities.push_back(servingAuthority);
+  brain.statefulServingRuntimeStates.push_back(authorityProjectedRuntimeState);
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+  Wormhole legacyCousinWormhole = {};
+  legacyCousinWormhole.externalAddress = IPAddress("fd00:520a::1", true);
+  legacyCousinWormhole.externalPort = 443;
+  legacyCousinWormhole.containerPort = 9443;
+  legacyCousinWormhole.layer4 = IPPROTO_TCP;
+  legacyCousinWormhole.routablePrefixUUID = 0x520A;
+  legacyProtectedRuntimeState.plan.wormholes = {legacyCousinWormhole};
+  Vector<Wormhole> legacyCousinDesired = {legacyCousinWormhole};
+  legacyProtectedRuntimeState.wormholeRuntimeDesired.clear();
+  suite.require(BitseryEngine::serialize(legacyProtectedRuntimeState.wormholeRuntimeDesired,
+                                         legacyCousinDesired) > 0 &&
+                    prodigyComputeWormholeDesiredStateRevision(
+                        (machine.fragment & 0x00ffffffu) | (uint32_t(legacyProtectedRuntimeState.plan.fragment) << 24),
+                        legacyProtectedRuntimeState.wormholeRuntimeDesired,
+                        legacyProtectedRuntimeState.wormholeRuntimeRevision),
+                "brain_replicated_runtime_state_builds_legacy_cousin_desired_fixture");
+  legacyProtectedRuntimeState.wormholeRuntimePendingMachines.clear();
+  legacyProtectedRuntimeState.wormholeRuntimeFailedMachines.clear();
+  legacyProtectedRuntimeState.wormholeRuntimeFailure.clear();
+  legacyProtectedRuntimeState.wormholeRuntimeFailureSuppressedReady = false;
+  suite.require(brain.replicatedWormholeRuntimeStateValid(legacyProtectedRuntimeState, &machine),
+                "brain_replicated_runtime_state_accepts_legacy_cousin_desired_fixture");
+  brain.applyReplicatedContainerRuntimeState(legacyProtectedRuntimeState);
+  auto legacyProtectedIt = brain.containers.find(legacyProtectedRuntimeState.plan.uuid);
+  ContainerView *legacyProtected = legacyProtectedIt == brain.containers.end() ? nullptr : legacyProtectedIt->second;
+  SwitchboardWormholeDesiredState upgradedDesired = {};
+  suite.expect(legacyProtected != nullptr && legacyProtected->isStateful &&
+                   legacyProtected->runtimeReady == false && legacyProtected->wormholeRuntimeFailureSuppressedReady &&
+                   prodigyDecodeWormholeDesiredState(legacyProtected->wormholeRuntimeDesired, upgradedDesired) &&
+                   prodigyWormholeRequiresPairAdmission(upgradedDesired, 9443, IPPROTO_TCP) &&
+                   upgradedDesired.wormholes.size() == 1 &&
+                   upgradedDesired.wormholes.front().externalAddress.equals(legacyCousinWormhole.externalAddress) &&
+                   upgradedDesired.wormholes.front().externalPort == legacyCousinWormhole.externalPort &&
+                   upgradedDesired.wormholes.front().containerPort == legacyCousinWormhole.containerPort,
+               "brain_replicated_runtime_state_upgrades_legacy_cousin_desired_and_withholds_readiness");
+  if (legacyProtected != nullptr)
+  {
+    deployment.containers.erase(legacyProtected);
+    while (deployment.containersByShardGroup.eraseEntry(legacyProtected->shardGroup, legacyProtected)) {}
+    machine.removeContainerIndexEntry(legacyProtected->deploymentID, legacyProtected);
+    brain.containers.erase(legacyProtected->uuid);
+    delete legacyProtected;
+  }
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities.clear();
+  brain.statefulServingRuntimeStates.clear();
+  brain.masterAuthorityRuntimeStateDurable = false;
+  deployment.plan.isStateful = false;
+  deployment.plan.stateful.cousinPrefix = 0;
+
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
@@ -31903,10 +32019,24 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       discoveryWormhole.layer4 = IPPROTO_TCP; discoveryWormhole.isQuic = false;
       discoveryWormhole.routablePrefixUUID = 0x9c22;
       Vector<Wormhole> appliedDiscoveryWormholes = {discoveryWormhole};
-      BitseryEngine::serialize(discoveryContainer.wormholeRuntimeDesired, appliedDiscoveryWormholes);
-      suite.require(prodigyComputeWormholeDesiredStateRevision(discoveryContainer.generateContainerID(),
-          discoveryContainer.wormholeRuntimeDesired, discoveryContainer.wormholeRuntimeRevision),
-          "cousin_discovery_owner_prepares_applied_wormhole_revision");
+      SwitchboardWormholeDesiredState protectedDiscoveryDesired = {};
+      suite.require(prodigyBuildCousinWormholeDesiredState(appliedDiscoveryWormholes, true, discoveryService,
+                                                            discoveryContainer.advertisements, protectedDiscoveryDesired) &&
+                        prodigyWormholeRequiresPairAdmission(protectedDiscoveryDesired, 9443, IPPROTO_TCP) &&
+                        prodigyEncodeWormholeDesiredState(protectedDiscoveryDesired, discoveryContainer.wormholeRuntimeDesired) &&
+                        prodigyComputeWormholeDesiredStateRevision(discoveryContainer.generateContainerID(),
+                            discoveryContainer.wormholeRuntimeDesired, discoveryContainer.wormholeRuntimeRevision),
+                    "cousin_discovery_owner_prepares_protected_applied_wormhole_revision");
+      SwitchboardWormholeDesiredState decodedDiscoveryDesired = {};
+      suite.expect(prodigyDecodeWormholeDesiredState(discoveryContainer.wormholeRuntimeDesired, decodedDiscoveryDesired) &&
+                       decodedDiscoveryDesired.pairAdmissionTCPPorts == protectedDiscoveryDesired.pairAdmissionTCPPorts,
+                   "cousin_discovery_owner_persists_protected_desired_envelope");
+      SwitchboardWormholeOperation protectedFleetOperation = {};
+      suite.expect(prodigyPrepareContainerWormholeOperation(permissionBrain, &discoveryContainer,
+                                                             appliedDiscoveryWormholes, protectedFleetOperation) &&
+                       protectedFleetOperation.desired.equals(discoveryContainer.wormholeRuntimeDesired) &&
+                       protectedFleetOperation.revision.equals(discoveryContainer.wormholeRuntimeRevision),
+                   "cousin_discovery_owner_emits_protected_fleet_desired_revision");
       auto destinationPermission = activePermission.permission;
       destinationPermission.localHalf = CousinRouteHalf::destination;
       destinationPermission.localDeploymentID = live.plan.config.deploymentID();
@@ -31923,6 +32053,24 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                        discoverySnapshot.records.front().servicePort == 9443 &&
                        discoverySnapshot.records.front().ownedSlots.contains(3),
                    "cousin_discovery_owner_binds_asymmetric_slots_to_live_group_listener");
+      // A valid legacy raw vector remains decodable for ordinary listeners,
+      // but it is never eligible for a published COUSIN counterpart.
+      String legacyDiscoveryDesired = {};
+      String legacyDiscoveryRevision = {};
+      suite.require(BitseryEngine::serialize(legacyDiscoveryDesired, appliedDiscoveryWormholes) > 0 &&
+                        prodigyComputeWormholeDesiredStateRevision(discoveryContainer.generateContainerID(),
+                                                                    legacyDiscoveryDesired, legacyDiscoveryRevision),
+                    "cousin_discovery_owner_constructs_legacy_unprotected_desired_fixture");
+      discoveryContainer.wormholeRuntimeDesired = legacyDiscoveryDesired;
+      discoveryContainer.wormholeRuntimeRevision = legacyDiscoveryRevision;
+      suite.require(permissionBrain.buildCousinDiscoverySnapshot(destinationPermission.pairUUID, discoverySnapshot) &&
+                        discoverySnapshot.records.empty(),
+                    "cousin_discovery_owner_rejects_unprotected_applied_cousin_listener");
+      discoveryContainer.wormholeRuntimeDesired = {};
+      suite.require(prodigyEncodeWormholeDesiredState(protectedDiscoveryDesired, discoveryContainer.wormholeRuntimeDesired) &&
+                        prodigyComputeWormholeDesiredStateRevision(discoveryContainer.generateContainerID(),
+                            discoveryContainer.wormholeRuntimeDesired, discoveryContainer.wormholeRuntimeRevision),
+                    "cousin_discovery_owner_restores_protected_applied_desired_state");
       // A permission-only authority revision leaves the credential projection
       // fingerprint unchanged. Discovery must bind its carrier generation to
       // that already ACKed projection while retaining the newer authority

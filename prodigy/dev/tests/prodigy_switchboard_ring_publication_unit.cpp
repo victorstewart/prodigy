@@ -1577,6 +1577,102 @@ static void runNonQuicBalancerOptionalEgressMaps(TestSuite& suite)
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
+static void runPairAdmissionEgressProfilePublication(TestSuite& suite)
+{
+  TestRing ring = {};
+  BPFProgram router = {}, ingress = {};
+  EthDevice eth = {};
+  Switchboard board(eth);
+  SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+  fakeKernel.reset();
+
+  constexpr uint32_t containerID = 0x03000092u;
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, containerID);
+  switchboard_runtime::Wormhole *wormhole = nullptr;
+  if (!portal->wormholes.empty()) wormhole = *portal->wormholes.begin();
+  suite.expect(wormhole != nullptr, "switchboard_pair_admission_profile_fixture_has_runtime_wormhole");
+  if (wormhole == nullptr)
+  {
+    SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+    return;
+  }
+  portal->wormholes.erase(wormhole);
+  wormhole->admissionProfile = SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+  portal->wormholes.insert(wormhole);
+
+  switchboard_wormhole_egress_key key = {};
+  switchboard_wormhole_egress_binding binding = {};
+  const uint16_t containerPort = uint16_t(8000 + (containerID & 0xFF));
+  const bool expectedEgress = SwitchboardRingTestAccess::egressKey(
+      board, containerID, containerPort, IPPROTO_TCP, key) &&
+      switchboardBuildWormholeEgressBinding(portal->address, portal->port,
+                                             IPPROTO_TCP, 1,
+                                             SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT,
+                                             binding);
+  switchboard_wormhole_egress_binding rejectedBinding = {};
+  suite.expect(!switchboardBuildWormholeEgressBinding(IPAddress("198.18.0.92", false), 443,
+                                                       IPPROTO_TCP, 1,
+                                                       SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT,
+                                                       rejectedBinding) &&
+                   !switchboardBuildWormholeEgressBinding(portal->address, portal->port,
+                                                          IPPROTO_UDP, 1,
+                                                          SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT,
+                                                          rejectedBinding),
+               "switchboard_pair_admission_profile_rejects_non_direct_tcp_bindings");
+
+  suite.expect(SwitchboardRingTestAccess::generate(board, portal),
+               "switchboard_pair_admission_profile_admits_portal_ring");
+  bool receipt = false, receiptValue = false;
+  board.whenRingsReady(571, [&](bool ready) { receipt = true; receiptValue = ready; });
+  SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+  SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+  suite.expect(expectedEgress && ring.runUntil([&] { return receipt; }) && receiptValue &&
+                   fakeKernel.routingValueEquals(ingressEgressMapFD, key, binding),
+               "switchboard_pair_admission_profile_reconciles_exact_ipv6_egress_binding_to_active_egress_owner");
+  suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+               "switchboard_pair_admission_profile_drains_before_teardown");
+  SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+}
+
+static void runPairAdmissionProtectedRefreshFence(TestSuite& suite)
+{
+  TestRing ring = {};
+  (void)ring;
+  EthDevice eth = {};
+  Switchboard board(eth);
+  constexpr uint32_t containerID = 0x03000093u;
+  auto *portal = SwitchboardRingTestAccess::addPortal(board, containerID);
+  switchboard_runtime::Wormhole *current = nullptr;
+  if (!portal->wormholes.empty()) current = *portal->wormholes.begin();
+  suite.expect(current != nullptr, "switchboard_pair_admission_refresh_fixture_has_runtime_wormhole");
+  if (current == nullptr) return;
+
+  portal->wormholes.erase(current);
+  current->admissionProfile = SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+  current->definition = {};
+  current->definition.containerPort = current->port;
+  current->definition.layer4 = current->proto;
+  current->definition.externalAddress = portal->address;
+  current->definition.externalPort = portal->port;
+  portal->wormholes.insert(current);
+  SwitchboardWormholeDesiredState publicReplacement = {};
+  publicReplacement.wormholes.push_back(current->definition);
+  suite.expect(board.openWormholes(containerID, publicReplacement) ==
+                   SwitchboardWormholeOperationStatus::rejected,
+               "switchboard_pair_admission_refresh_rejects_protected_target_downgrade");
+  suite.expect(board.openWormholes(containerID + 1, publicReplacement) ==
+                   SwitchboardWormholeOperationStatus::rejected,
+               "switchboard_pair_admission_rejects_public_target_on_existing_protected_portal");
+  auto mixed = publicReplacement;
+  mixed.pairAdmissionTCPPorts.push_back(current->port);
+  Wormhole publicTarget = current->definition;
+  ++publicTarget.containerPort;
+  mixed.wormholes.push_back(publicTarget);
+  suite.expect(prodigyWormholeDesiredStateValid(mixed) &&
+                   board.openWormholes(containerID, mixed) == SwitchboardWormholeOperationStatus::rejected,
+               "switchboard_pair_admission_rejects_mixed_profiles_in_one_desired_portal");
+}
+
 static void runNonQuicRoutingFanoutRequestDeferral(TestSuite& suite)
 {
   TestRing ring = {};
@@ -2007,6 +2103,8 @@ int main()
   runOwnerFailuresRetry(suite, PublicationFailure::Outer);
   runOwnerFailuresRetry(suite, PublicationFailure::Metadata);
   runNonQuicBalancerOptionalEgressMaps(suite);
+  runPairAdmissionEgressProfilePublication(suite);
+  runPairAdmissionProtectedRefreshFence(suite);
   runNonQuicRoutingFanoutRequestDeferral(suite);
   runNonQuicRoutingSlowMapDeadline(suite);
   runNonQuicRoutingAdoptionSupersessionAndReplacement(suite);

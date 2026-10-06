@@ -2546,23 +2546,90 @@ protected:
     };
   }
 
-  void refreshContainerSwitchboardWormholes(Container *container) override
+  static bool buildContainerWormholeDesiredState(const ContainerPlan& plan,
+                                                 const Vector<Wormhole>& wormholes,
+                                                 SwitchboardWormholeDesiredState& desired)
+  {
+    return prodigyBuildCousinWormholeDesiredState(
+        wormholes, plan.isStateful, plan.statefulMeshRoles.cousin, plan.advertisements, desired);
+  }
+
+  // A fleet replay can predate the protected desired-state envelope.  The
+  // locally retained plan is still sufficient to derive its required listener
+  // protection, so preserve every incoming protected port and add the local
+  // requirement before handing state to Switchboard.
+  static bool strengthenWormholeDesiredStateForLocalPlan(const ContainerPlan& plan,
+                                                         SwitchboardWormholeDesiredState& desired)
+  {
+    SwitchboardWormholeDesiredState local = {};
+    if (buildContainerWormholeDesiredState(plan, desired.wormholes, local) == false)
+    {
+      return false;
+    }
+
+    for (uint16_t requiredPort : local.pairAdmissionTCPPorts)
+    {
+      bool present = false;
+      for (uint16_t port : desired.pairAdmissionTCPPorts)
+      {
+        if (port == requiredPort)
+        {
+          present = true;
+          break;
+        }
+      }
+      if (present)
+      {
+        continue;
+      }
+
+      Vector<uint16_t> merged = {};
+      merged.reserve(desired.pairAdmissionTCPPorts.size() + 1);
+      bool inserted = false;
+      for (uint16_t port : desired.pairAdmissionTCPPorts)
+      {
+        if (inserted == false && requiredPort < port)
+        {
+          merged.push_back(requiredPort);
+          inserted = true;
+        }
+        merged.push_back(port);
+      }
+      if (inserted == false)
+      {
+        merged.push_back(requiredPort);
+      }
+      desired.pairAdmissionTCPPorts = std::move(merged);
+    }
+    return prodigyWormholeDesiredStateValid(desired);
+  }
+
+  bool applyContainerSwitchboardWormholes(Container *container, const SwitchboardWormholeDesiredState& desired)
   {
     if (container == nullptr)
     {
-      return;
+      return false;
     }
 
     Switchboard *activeSwitchboard = ensureSwitchboard();
     uint32_t containerID = generateLocalContainerID(container->plan.fragment);
 
+    if (prodigyWormholeDesiredStateValid(desired) == false)
+    {
+      basics_log("neuron wormhole refresh rejected invalid cousin protection containerID=%u count=%u\n",
+                 containerID,
+                 unsigned(container->plan.wormholes.size()));
+      return false;
+    }
+
     activeSwitchboard->setLocalContainerSubnet(lcsubnet6);
-    SwitchboardWormholeOperationStatus status = activeSwitchboard->openWormholes(containerID, container->plan.wormholes);
+    SwitchboardWormholeOperationStatus status = activeSwitchboard->openWormholes(containerID, desired);
     if (status != SwitchboardWormholeOperationStatus::applied)
     {
       basics_log("neuron wormhole refresh failed containerID=%u count=%u\n",
                  containerID,
                  unsigned(container->plan.wormholes.size()));
+      return false;
     }
     syncSwitchboardBalancerOverlayRoutingProgram();
 
@@ -2570,6 +2637,24 @@ protected:
     // barrier as the broader Switchboard state. The refresh receipt is held
     // until their egress bindings and the current routing generation converge.
     syncContainerSwitchboardRuntime(container);
+    return true;
+  }
+
+  void refreshContainerSwitchboardWormholes(Container *container) override
+  {
+    if (container == nullptr)
+    {
+      return;
+    }
+
+    SwitchboardWormholeDesiredState desired = {};
+    if (buildContainerWormholeDesiredState(container->plan, container->plan.wormholes, desired) == false)
+    {
+      basics_log("neuron wormhole refresh rejected invalid local cousin protection count=%u\n",
+                 unsigned(container->plan.wormholes.size()));
+      return;
+    }
+    (void)applyContainerSwitchboardWormholes(container, desired);
   }
 
   void openWhiteholesForLocalContainer(uint8_t fragment, const Vector<Whitehole>& whiteholes) override
@@ -5901,7 +5986,7 @@ public:
           String serialized;
           Message::extractToStringView(args, serialized);
           SwitchboardWormholeOperation operation = {};
-          Vector<Wormhole> wormholes = {};
+          SwitchboardWormholeDesiredState desired = {};
           String expectedRevision = {};
           bool valid = BitseryEngine::deserializeSafe(serialized, operation) &&
                        operation.status == SwitchboardWormholeOperationStatus::request &&
@@ -5909,7 +5994,21 @@ public:
                        operation.desired.size() <= SwitchboardWormholeOperation::maximumDesiredBytes &&
                        prodigyComputeWormholeDesiredStateRevision(operation.containerID, operation.desired, expectedRevision) &&
                        expectedRevision.equals(operation.revision) &&
-                       BitseryEngine::deserializeSafe(operation.desired, wormholes);
+                       prodigyDecodeWormholeDesiredState(operation.desired, desired);
+          if (valid)
+          {
+            if (Container *container = findTrackedContainerByLocalID(operation.containerID); container != nullptr)
+            {
+              valid = strengthenWormholeDesiredStateForLocalPlan(container->plan, desired);
+              // The operation revision covers the sender's exact desired
+              // bytes.  Do not acknowledge an applied local strengthening as
+              // that older/raw revision: Brain must retry with its own
+              // protected-envelope state and matching revision.
+              String strengthenedBytes = {};
+              valid = valid && prodigyEncodeWormholeDesiredState(desired, strengthenedBytes) &&
+                      strengthenedBytes.equals(operation.desired);
+            }
+          }
           if (valid == false)
           {
             basics_log("neuron openSwitchboardWormholes deserialize failed\n");
@@ -5917,7 +6016,7 @@ public:
           else
           {
             ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
-            operation.status = ensureSwitchboard()->openWormholes(operation.containerID, wormholes);
+            operation.status = ensureSwitchboard()->openWormholes(operation.containerID, desired);
             syncSwitchboardBalancerOverlayRoutingProgram();
 
             // The open topic must converge the live local peer runtime immediately
@@ -5949,8 +6048,8 @@ public:
           String serialized;
           Message::extractToStringView(args, serialized);
 
-          Vector<Wormhole> wormholes = {};
-          if (BitseryEngine::deserializeSafe(serialized, wormholes) == false)
+          SwitchboardWormholeDesiredState desired = {};
+          if (prodigyDecodeWormholeDesiredState(serialized, desired) == false)
           {
             basics_log("neuron refreshContainerWormholes deserialize failed\n");
             break;
@@ -5964,8 +6063,18 @@ public:
               break;
             }
 
-            container->plan.wormholes = wormholes;
-            refreshContainerSwitchboardWormholes(container);
+            if (strengthenWormholeDesiredStateForLocalPlan(container->plan, desired) == false)
+            {
+              basics_log("neuron refreshContainerWormholes rejected local cousin protection containerUUID=%llu\n",
+                         (unsigned long long)containerUUID);
+              break;
+            }
+
+            if (applyContainerSwitchboardWormholes(container, desired) == false)
+            {
+              break;
+            }
+            container->plan.wormholes = desired.wormholes;
             ensureSwitchboard()->whenRingsReady(
                 generateLocalContainerID(container->plan.fragment), wormholeContainerRefresh(container),
                 Switchboard::RingConsumer::containerRefresh);

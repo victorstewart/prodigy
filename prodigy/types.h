@@ -5930,6 +5930,111 @@ static inline bool wormholeTargetBindingsUnique(const Vector<Wormhole>& wormhole
   return true;
 }
 
+// Admission belongs to the revisioned runtime desired state, not the embedded,
+// unversioned deployment/application Wormhole wire layout.
+struct SwitchboardWormholeDesiredState {
+  static constexpr uint32_t version = 1;
+  static constexpr uint32_t maximumWormholes = 1024;
+  uint32_t protocolVersion = version;
+  Vector<Wormhole> wormholes = {};
+  Vector<uint16_t> pairAdmissionTCPPorts = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, SwitchboardWormholeDesiredState& state)
+{
+  serializer.value4b(state.protocolVersion);
+  serializer.container(state.wormholes, SwitchboardWormholeDesiredState::maximumWormholes,
+      [](auto& nested, Wormhole& wormhole) { nested.object(wormhole); });
+  serializer.container(state.pairAdmissionTCPPorts, SwitchboardWormholeDesiredState::maximumWormholes,
+      [](auto& nested, uint16_t& port) { nested.value2b(port); });
+}
+
+static inline bool prodigyWormholeRequiresPairAdmission(const SwitchboardWormholeDesiredState& state,
+                                                       uint16_t port, uint8_t protocol)
+{
+  if (protocol != IPPROTO_TCP || port == 0) return false;
+  for (uint16_t protectedPort : state.pairAdmissionTCPPorts)
+    if (protectedPort == port) return true;
+  return false;
+}
+
+static inline bool prodigyWormholeDesiredStateValid(const SwitchboardWormholeDesiredState& state)
+{
+  if (state.protocolVersion != SwitchboardWormholeDesiredState::version ||
+      (!state.pairAdmissionTCPPorts.empty() &&
+       state.wormholes.size() > SwitchboardWormholeDesiredState::maximumWormholes) ||
+      state.pairAdmissionTCPPorts.size() > state.wormholes.size() ||
+      !wormholeTargetBindingsUnique(state.wormholes)) return false;
+  uint16_t previous = 0;
+  for (uint16_t port : state.pairAdmissionTCPPorts)
+  {
+    if (port == 0 || port <= previous) return false;
+    previous = port;
+    uint32_t matches = 0;
+    for (const Wormhole& wormhole : state.wormholes)
+    {
+      if (wormhole.containerPort != port) continue;
+      if (wormhole.layer4 != IPPROTO_TCP || wormhole.isQuic ||
+          !wormhole.externalAddress.is6 || wormhole.externalAddress.isNull() ||
+          wormhole.externalPort == 0 || (!wormhole.deliveryAddress.isNull() &&
+          !wormhole.deliveryAddress.equals(wormhole.externalAddress))) return false;
+      ++matches;
+    }
+    if (matches != 1) return false;
+  }
+  return true;
+}
+
+// A legacy vector begins with its element count. Zero followed by trailing
+// bytes cannot be a valid legacy vector, so old readers reject this envelope
+// without attempting a large allocation. Malformed envelopes never downgrade.
+constexpr inline uint8_t prodigyWormholeDesiredMagic[] = {0, 'P', 'R', 'D', 'W', 'H', 1, 0};
+
+static inline bool prodigyEncodeWormholeDesiredState(const SwitchboardWormholeDesiredState& state, String& encoded)
+{
+  encoded.clear();
+  if (!prodigyWormholeDesiredStateValid(state)) return false;
+  auto copy = state;
+  String body = {};
+  if (state.pairAdmissionTCPPorts.empty())
+  {
+    if (!BitseryEngine::serialize(body, copy.wormholes)) return false;
+  }
+  else
+  {
+    if (!BitseryEngine::serialize(body, copy) ||
+        !encoded.reserve(sizeof(prodigyWormholeDesiredMagic) + body.size())) return false;
+    encoded.append(prodigyWormholeDesiredMagic, sizeof(prodigyWormholeDesiredMagic));
+  }
+  if (state.pairAdmissionTCPPorts.empty()) encoded = std::move(body);
+  else encoded.append(body);
+  if (encoded.empty() || encoded.size() > SwitchboardWormholeOperation::maximumDesiredBytes)
+  { encoded.clear(); return false; }
+  return true;
+}
+
+static inline bool prodigyDecodeWormholeDesiredState(const String& encoded, SwitchboardWormholeDesiredState& state)
+{
+  state = {};
+  if (encoded.empty() || encoded.size() > SwitchboardWormholeOperation::maximumDesiredBytes) return false;
+  SwitchboardWormholeDesiredState decoded = {};
+  if (encoded.size() > 1 && encoded[0] == 0)
+  {
+    if (encoded.size() <= sizeof(prodigyWormholeDesiredMagic) ||
+        std::memcmp(encoded.data(), prodigyWormholeDesiredMagic, sizeof(prodigyWormholeDesiredMagic)) != 0) return false;
+    String body = {};
+    const uint64_t bytes = encoded.size() - sizeof(prodigyWormholeDesiredMagic);
+    if (!body.reserve(bytes)) return false;
+    body.append(encoded.data() + sizeof(prodigyWormholeDesiredMagic), bytes);
+    if (!BitseryEngine::deserializeSafe(body, decoded) || decoded.pairAdmissionTCPPorts.empty()) return false;
+  }
+  else if (!BitseryEngine::deserializeSafe(encoded, decoded.wormholes)) return false;
+  if (!prodigyWormholeDesiredStateValid(decoded)) return false;
+  state = std::move(decoded);
+  return true;
+}
+
 static inline bool wormholeDNSRecordType(const Wormhole& wormhole, String& type, String *failure = nullptr)
 {
   type = wormhole.dns.type;
@@ -8719,6 +8824,39 @@ static void serialize(S&& serializer, Advertisement& advertisement)
   serialize(serializer, static_cast<ServiceBlueprint&>(advertisement));
   serializer.value2b(advertisement.port);
   serializer.object(advertisement.userCapacity);
+}
+
+static inline bool prodigyBuildCousinWormholeDesiredState(
+    const Vector<Wormhole>& wormholes, bool isStateful, uint64_t cousinService,
+    const bytell_hash_map<uint64_t, Advertisement>& advertisements, SwitchboardWormholeDesiredState& state)
+{
+  state = {};
+  SwitchboardWormholeDesiredState desired = {};
+  desired.wormholes = wormholes;
+  if (isStateful && cousinService != 0)
+  {
+    const auto cousin = advertisements.find(cousinService);
+    if (cousin != advertisements.end())
+    {
+      // The definition controls first publication, even before the service's
+      // active lifecycle state. Waiting for healthy would expose an open port.
+      const uint16_t port = cousin->second.port;
+      if (port == 0 && !wormholes.empty()) return false;
+      bool exposed = false;
+      for (const Wormhole& wormhole : wormholes)
+        if (wormhole.containerPort == port) exposed = true;
+      if (exposed)
+      {
+        if (cousin->second.service != cousinService) return false;
+        for (const auto& [service, advertisement] : advertisements)
+          if (service != cousinService && advertisement.port == port) return false;
+        desired.pairAdmissionTCPPorts.push_back(port);
+      }
+    }
+  }
+  if (!prodigyWormholeDesiredStateValid(desired)) return false;
+  state = std::move(desired);
+  return true;
 }
 
 class AssignedGPUDevice {
