@@ -38064,16 +38064,6 @@ public:
             }
 
             auto deployment = deployments.find(stale->deploymentID);
-            if (taskWithoutDurableExecution(stale))
-            {
-              // Task admission first durably writes taskExecutions before it
-              // creates a canonical container. A missing record therefore
-              // cannot authorize an unreported pending task. Use the task
-              // owner so its placement and resource reservations are released.
-              deployment->second->taskAttemptContainerDone(stale);
-              continue;
-            }
-
             neuron->machine->removeContainerIndexEntry(stale->deploymentID, stale);
             if (deployment != deployments.end() && deployment->second)
             {
