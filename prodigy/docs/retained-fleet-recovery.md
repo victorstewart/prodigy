@@ -19,6 +19,12 @@ currently installed v10 runtime. Use a new operation ID and operation root.
 Run on the selected seed with the normal commissioned registry and outer
 Mothership client lock; no other Mothership process may own that registry.
 
+A fresh recovery requires a successor binary with a different digest from every
+installed predecessor. To recover retained state with otherwise unchanged code,
+build and seal a new binary version through Discombobulator. Do not reuse the
+installed bundle or bypass the runtime identity checks: activation and reentry
+use those identities to distinguish the retained and replacement runtimes.
+
 When every host runs the same predecessor binary and bundle but some running
 executables reside outside the registered service root, use schema 3. Each
 machine must name `installedRuntimeRoot`, `installedRuntimeSHA256`, and
