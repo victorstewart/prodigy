@@ -99,6 +99,65 @@ static bool buildComplementaryProjections(PairProjections& output, uint64_t comm
       prodigyLocalClusterPairControlProjectionValid(output.second, true);
 }
 
+static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nodeUUID,
+                                                                  uint128_t sourceClusterUUID,
+                                                                  uint128_t peerClusterUUID,
+                                                                  uint128_t pairUUID,
+                                                                  uint64_t rootGeneration,
+                                                                  uint64_t keyEpoch,
+                                                                  uint64_t projectionGeneration)
+{
+  ProdigyCousinDiscoveryPublication publication = {};
+  publication.nodeUUID = nodeUUID;
+  publication.projectionGeneration = projectionGeneration;
+  auto& snapshot = publication.snapshot;
+  snapshot.pairUUID = pairUUID;
+  snapshot.sourceClusterUUID = sourceClusterUUID;
+  snapshot.peerClusterUUID = peerClusterUUID;
+  snapshot.rootGeneration = rootGeneration;
+  snapshot.keyEpoch = keyEpoch;
+  snapshot.authorityGeneration = projectionGeneration;
+  ProdigyCousinCounterpart counterpart = {};
+  counterpart.permission.permissionUUID = 0x7e01;
+  counterpart.permission.pairUUID = pairUUID;
+  counterpart.permission.logicalWorkloadUUID = 0x7e02;
+  counterpart.permission.logicalServiceUUID = 0x7e03;
+  counterpart.permission.localClusterUUID = sourceClusterUUID;
+  counterpart.permission.peerClusterUUID = peerClusterUUID;
+  counterpart.permission.localHalf = CousinRouteHalf::destination;
+  counterpart.permission.localApplicationID = 7;
+  counterpart.permission.peerApplicationID = 19;
+  counterpart.permission.localCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  counterpart.permission.peerCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  counterpart.permission.slots.insert(3);
+  counterpart.permission.localDeploymentID = 0x7000000000001;
+  for (uint32_t index = 0; index < 64; ++index) {
+    counterpart.permission.canonicalPlanSHA256.append('a'); counterpart.permission.artifactSHA256.append('b');
+  }
+  counterpart.permission.artifactBytes = 1;
+  counterpart.permission.generation = 1;
+  counterpart.permission.acceptedAuthorityGeneration = projectionGeneration;
+  counterpart.permission.state = ProdigyLocalCousinServicePermissionState::active;
+  counterpart.containerUUID = 0x7e04;
+  counterpart.nodeUUID = nodeUUID;
+  counterpart.containerID = 9;
+  counterpart.shardGroups = 2;
+  counterpart.shardGroup = statefulServiceGroupOwnerForSlot(3, counterpart.shardGroups);
+  counterpart.service = MeshServices::constrainPrefixToGroup(counterpart.permission.localCousinServicePrefix,
+                                                               counterpart.shardGroup);
+  counterpart.servicePort = 9443;
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (counterpart.permission.slots.contains(slot) &&
+        statefulServiceGroupOwnerForSlot(slot, counterpart.shardGroups) == counterpart.shardGroup)
+      counterpart.ownedSlots.insert(slot);
+  counterpart.routablePrefixUUID = 0x7e05;
+  counterpart.publicAddress = IPAddress("fd00:ffff:1234::7", true);
+  counterpart.publicTCPPort = 8443;
+  for (uint32_t index = 0; index < 64; ++index) counterpart.wormholeRevision.append('c');
+  snapshot.records.push_back(std::move(counterpart));
+  return publication;
+}
+
 static bool appendComplementaryEpoch(PairProjections& output, uint64_t keyEpoch)
 {
   ClusterPairRoot root = {};
@@ -403,6 +462,73 @@ static void pairControlCarrierReadyStatusUsesBothOverlapEpochs(TestSuite& suite)
   suite.expect(quiescePair(ring, first, second), "pair_control_ring_ready_overlap_quiesces_before_destruction");
 }
 
+static void pairControlCarrierTransfersAndWithdrawsDiscovery(TestSuite& suite)
+{
+  PersistenceRing ring(64, 32);
+  PairProjections projections = {};
+  const bool built = buildComplementaryProjections(projections, 1);
+  SwitchboardPairControlRuntime first = {}, second = {};
+  std::vector<ProdigyCousinDiscoveryReceipt> receipts = {}, reverseReceipts = {};
+  second.onDiscoverySnapshot = [&](const ProdigyCousinDiscoveryReceipt& receipt) { receipts.push_back(receipt); };
+  first.onDiscoverySnapshot = [&](const ProdigyCousinDiscoveryReceipt& receipt) { reverseReceipts.push_back(receipt); };
+  const bool installed = built && first.installProjection(projections.first) && second.installProjection(projections.second);
+  suite.expect(installed && first.start() && second.start(), "pair_control_ring_starts_discovery_carriers");
+  const bool ready = installed && runUntil(ring, [&] { return first.readyCount() == 1 && second.readyCount() == 1; }, 6000);
+  const bool hasCredential = !projections.first.credentials.empty();
+  const ProdigyLocalClusterPairControlCredential credential = hasCredential ?
+      projections.first.credentials[0] : ProdigyLocalClusterPairControlCredential {};
+  auto publication = buildDiscoveryPublication(firstNodeUUID, firstClusterUUID, secondClusterUUID,
+      credential.pairUUID, credential.rootGeneration, credential.keyEpoch, 1);
+  publication.snapshot.authorityGeneration = 2;
+  if (!publication.snapshot.records.empty())
+    publication.snapshot.records.front().permission.acceptedAuthorityGeneration = 2;
+  const bool publicationValid = hasCredential && prodigyCousinDiscoveryPublicationValid(publication);
+  const bool publicationInstalled = ready && publicationValid && first.installDiscoverySnapshot(publication);
+  suite.expect(publicationValid,
+               "pair_control_ring_builds_structurally_valid_local_discovery_publication");
+  suite.expect(publicationInstalled,
+               "pair_control_ring_installs_current_local_discovery_publication");
+  const bool received = publicationInstalled && runUntil(ring, [&] { return receipts.size() == 1 && !receipts[0].withdrawn; }, 6000);
+  suite.expect(received && receipts[0].connectionID != 0 && receipts[0].sequence != 0 &&
+                    receipts[0].projectionGeneration == 1 && receipts[0].snapshot.authorityGeneration == 2 &&
+                    receipts[0].snapshot.records.size() == 1 &&
+                    receipts[0].snapshot.sourceClusterUUID == firstClusterUUID,
+               "pair_control_ring_receives_exact_authenticated_discovery_snapshot");
+  auto withdrawn = publication;
+  withdrawn.snapshot.records.clear();
+  suite.expect(received && first.installDiscoverySnapshot(withdrawn),
+               "pair_control_ring_accepts_full_empty_discovery_replacement");
+  const bool withdrew = received && runUntil(ring, [&] { return receipts.size() >= 2 && receipts.back().withdrawn; }, 6000);
+  suite.expect(withdrew && receipts.back().connectionID == receipts.front().connectionID &&
+                    receipts.back().sequence > receipts.front().sequence,
+               "pair_control_ring_binds_empty_withdrawal_to_same_connection_and_sequence");
+  const auto reversePublication = buildDiscoveryPublication(secondNodeUUID, secondClusterUUID, firstClusterUUID,
+      credential.pairUUID, credential.rootGeneration, credential.keyEpoch, 1);
+  suite.expect(withdrew && second.installDiscoverySnapshot(reversePublication),
+               "pair_control_ring_accepts_responder_owned_discovery_publication");
+  const bool reverseReceived = withdrew && runUntil(ring, [&] {
+    return reverseReceipts.size() == 1 && !reverseReceipts[0].withdrawn;
+  }, 6000);
+  suite.expect(reverseReceived && reverseReceipts[0].snapshot.sourceClusterUUID == secondClusterUUID,
+               "pair_control_ring_transfers_responder_to_initiator_discovery_snapshot");
+  const uint64_t reverseConnectionID = reverseReceipts.empty() ? 0 : reverseReceipts[0].connectionID;
+  const bool expired = reverseReceived && runUntil(ring, [&] {
+    return reverseReceipts.size() >= 2 && reverseReceipts.back().withdrawn;
+  }, ProdigyCousinDiscoveryMaximumAgeMs + 3000);
+  suite.expect(expired && reverseReceipts.back().connectionID == reverseConnectionID,
+               "pair_control_ring_local_publication_expiry_withdraws_remote_snapshot_within_bounded_ttl");
+  suite.expect(expired && second.installDiscoverySnapshot(reversePublication),
+               "pair_control_ring_reinstalls_fresh_publication_after_local_expiry");
+  const bool reinstalled = expired && runUntil(ring, [&] {
+    return reverseReceipts.size() >= 3 && !reverseReceipts.back().withdrawn;
+  }, 6000);
+  const bool disconnected = reinstalled && first.installProjection(revokedProjection(projections.first, 2));
+  suite.expect(disconnected && reverseReceipts.back().withdrawn &&
+                    reverseReceipts.back().connectionID == reverseConnectionID,
+               "pair_control_ring_projection_disconnect_invalidates_remote_discovery_by_exact_connection");
+  suite.expect(quiescePair(ring, first, second), "pair_control_ring_discovery_scenario_quiesces_before_destruction");
+}
+
 static void pairControlCarrierThreeByThreeFanout(TestSuite& suite)
 {
   // Nine initiating sockets plus three listeners, and nine accepted sockets.
@@ -455,6 +581,7 @@ int main()
   pairControlCarrierRejectsWrongPSK(suite);
   pairControlCarrierTransfersExactEpochStatus(suite);
   pairControlCarrierReadyStatusUsesBothOverlapEpochs(suite);
+  pairControlCarrierTransfersAndWithdrawsDiscovery(suite);
   pairControlCarrierThreeByThreeFanout(suite);
   return suite.failed == 0 ? 0 : 1;
 }

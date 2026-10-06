@@ -53,6 +53,7 @@
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.cousin.permission.h>
+#include <prodigy/cousin.discovery.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
@@ -18559,8 +18560,66 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  void runCousinDiscovery(int argc, char *argv[])
+  {
+    String failure;
+    ProdigyCousinDiscoveryQuery query;
+    ProdigyCousinDiscoveryResponse response;
+    ProdigyLocalCousinServicePermissionResponse permission;
+    uint32_t slot = 0;
+    bool valid = argc == 4 && prodigyParseCanonicalHex128(String(argv[2]), query.permissionUUID) &&
+        query.permissionUUID != 0 && parseU32Arg(argv[3], slot) && slot < CousinRouteSlotBitmap::slotCount;
+    query.slot = uint16_t(slot);
+    if (!valid) failure.assign("usage: cousinPermission TARGET discover SOURCE_PERMISSION_UUID SLOT"_ctv);
+    if (valid) {
+      ProdigyLocalCousinServicePermissionQuery policyQuery;
+      policyQuery.permissionUUID = query.permissionUUID;
+      valid = configureControlTarget(argv[0], &failure) &&
+          requestTopicRoundTrip(MothershipTopic::pullLocalCousinServicePermission, policyQuery, permission, failure);
+      if (valid && (permission.protocolVersion != 1 || !permission.success || !permission.found || !permission.qualified ||
+          !prodigyLocalCousinServicePermissionValid(permission.permission) ||
+          permission.permission.permissionUUID != query.permissionUUID ||
+          permission.permission.localClusterUUID != permission.localClusterUUID ||
+          permission.permission.acceptedAuthorityGeneration > permission.currentAuthorityGeneration ||
+          permission.permission.state != ProdigyLocalCousinServicePermissionState::active ||
+          permission.permission.localHalf != CousinRouteHalf::source || !permission.permission.slots.contains(query.slot))) {
+        valid = false;
+        failure.assign("counterpart observation requires a qualified active source permission for this slot"_ctv);
+      }
+    }
+    if (valid) {
+      valid = requestTopicRoundTrip(MothershipTopic::pullCousinCounterparts, query, response, failure);
+      if (valid && (response.protocolVersion != 1 || !response.success ||
+          response.records.size() > ProdigyCousinDiscoveryMaximumRecords)) {
+        valid = false; failure = response.failure;
+        if (failure.empty()) failure.assign("counterpart observation returned an invalid response"_ctv);
+      }
+      if (valid) for (const auto& record : response.records)
+        if (!prodigyCousinCounterpartMatchesPermission(record, permission.permission, query.slot)) {
+          valid = false; failure.assign("counterpart observation conflicts with the source permission"_ctv); break;
+        }
+    }
+    basics_log("cousinPermission success=%u action=discover permissionUUID=%016llx%016llx slot=%u candidates=%zu failure=%s\n",
+        unsigned(valid), (unsigned long long)(query.permissionUUID >> 64), (unsigned long long)query.permissionUUID,
+        unsigned(query.slot), valid ? size_t(response.records.size()) : size_t(0), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+    for (const auto& record : response.records) {
+      char address[INET6_ADDRSTRLEN] = {};
+      if (::inet_ntop(AF_INET6, record.publicAddress.v6, address, sizeof(address)) == nullptr) exit(EXIT_FAILURE);
+      basics_log("cousinCounterpart permissionUUID=%016llx%016llx containerUUID=%016llx%016llx nodeUUID=%016llx%016llx applicationID=%u shardGroup=%u shardGroups=%u service=%llu servicePort=%u publicAddress=%s publicTCPPort=%u\n",
+          (unsigned long long)(record.permission.permissionUUID >> 64), (unsigned long long)record.permission.permissionUUID,
+          (unsigned long long)(record.containerUUID >> 64), (unsigned long long)record.containerUUID,
+          (unsigned long long)(record.nodeUUID >> 64), (unsigned long long)record.nodeUUID,
+          unsigned(record.permission.localApplicationID), unsigned(record.shardGroup), unsigned(record.shardGroups),
+          (unsigned long long)record.service, unsigned(record.servicePort), address, unsigned(record.publicTCPPort));
+    }
+  }
+
   void runCousinPermission(int argc, char *argv[])
   {
+    if (argc >= 2 && std::strcmp(argv[1], "discover") == 0) {
+      runCousinDiscovery(argc, argv); return;
+    }
     String failure, action;
     ProdigyLocalCousinServicePermission permission;
     ProdigyLocalCousinServicePermissionQuery query;
@@ -18579,7 +18638,7 @@ private:
       valid = prodigyParseCanonicalHex128(String(argv[2]), query.permissionUUID) && query.permissionUUID != 0;
     } else valid = false;
     if (!valid && failure.empty())
-      failure.assign("usage: cousinPermission TARGET install JSON | query UUID | revoke UUID"_ctv);
+      failure.assign("usage: cousinPermission TARGET install JSON | query UUID | revoke UUID | discover UUID SLOT"_ctv);
 
     auto bindResponse = [&]() {
       if (response.protocolVersion != 1 || !response.success || response.localClusterUUID == 0 ||
@@ -22377,7 +22436,7 @@ int main(int argc, char *argv[])
     message.append("revokeClusterPair [enrollment operationUUID canonical hex]\n");
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
-    message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID]\n");
+    message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
     message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");

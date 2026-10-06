@@ -1,5 +1,6 @@
 #include <networking/includes.h>
 #include <services/prodigy.h>
+#include <prodigy/cousin.discovery.h>
 #include <prodigy/types.h>
 #include <prodigy/wire.h>
 
@@ -384,6 +385,7 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullClusterPairEpochRotation:
     case MothershipTopic::commitLocalCousinServicePermission:
     case MothershipTopic::pullLocalCousinServicePermission:
+    case MothershipTopic::pullCousinCounterparts:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;
@@ -751,8 +753,11 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         if (!extractFixed(cursor, terminal, projectionVersion) || projectionVersion != 1) return false;
         if (cursor == terminal) return true;
         uint8_t pairProjectionVersion = 0;
-        return extractFixed(cursor, terminal, pairProjectionVersion) &&
-            (pairProjectionVersion == 1 || pairProjectionVersion == 2) && cursor == terminal;
+        if (!extractFixed(cursor, terminal, pairProjectionVersion) ||
+            (pairProjectionVersion != 1 && pairProjectionVersion != 2)) return false;
+        if (cursor == terminal) return true;
+        uint8_t cousinDiscoveryVersion = 0;
+        return extractFixed(cursor, terminal, cousinDiscoveryVersion) && cousinDiscoveryVersion == 1 && cursor == terminal;
       }
     case NeuronTopic::transportCredentialPeersAck:
     case NeuronTopic::clusterPairControlCredentialsAck:
@@ -768,6 +773,12 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 2048 && cursor == terminal;
+      }
+    case NeuronTopic::cousinDiscoveryReceipt:
+      {
+        String encoded;
+        return extractVariableStringView(cursor, terminal, encoded) &&
+            encoded.size() <= ProdigyCousinDiscoveryMaximumBytes && cursor == terminal;
       }
     case NeuronTopic::machineHardwareProfile:
     case NeuronTopic::pullContainerLogs:
@@ -973,6 +984,12 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         String encoded;
         return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
             extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 1048576 && cursor == terminal;
+      }
+    case NeuronTopic::cousinDiscoverySnapshot:
+      {
+        String encoded;
+        return extractVariableStringView(cursor, terminal, encoded) &&
+            encoded.size() <= ProdigyCousinDiscoveryMaximumBytes && cursor == terminal;
       }
     case NeuronTopic::registration:
       {

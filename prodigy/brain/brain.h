@@ -43,6 +43,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/cluster.bootstrap.h>
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/cluster.pair.projection.h>
+#include <prodigy/cousin.discovery.h>
 #include <prodigy/cousin.route.h>
 #include <prodigy/dns.provider.h>
 #include <prodigy/debug.h>
@@ -1163,6 +1164,20 @@ static inline bool prodigyNeuronArtifactCapabilityValidationMatches(
 
 class Brain : public BrainBase, public TimeoutDispatcher {
 public:
+
+  class CousinDiscoveryReceiptCache {
+  public:
+    ProdigyCousinDiscoveryReceipt receipt = {};
+    uint128_t nodeUUID = 0;
+    uint64_t ioGeneration = 0;
+    uint64_t authorityEpoch = 0;
+    uint64_t projectionGeneration = 0;
+    String projectionFingerprint = {};
+    int64_t observedAtMs = 0;
+  };
+
+  Vector<CousinDiscoveryReceiptCache> cousinDiscoveryReceipts = {};
+  int64_t lastCousinDiscoveryDriveMs = 0;
 
   // A provisioned AEGIS node never falls back to TLS or plaintext because its
   // current authority/ledger is unavailable, stale, or has revoked a peer.
@@ -17396,6 +17411,7 @@ public:
     queueMasterAuthorityRuntimeStateReplication(true);
     driveTransportCredentialEnrollmentOperations();
     driveClusterPairEnrollmentOperations();
+    driveCousinDiscoverySnapshots();
     resumeStatefulTopologyRetirements();
     for (BrainView *peer : brains)
     {
@@ -31572,6 +31588,278 @@ public:
     if (accepted) driveClusterPairEnrollmentOperations();
   }
 
+  bool buildCousinDiscoverySnapshot(uint128_t pairUUID, ProdigyCousinDiscoverySnapshot& snapshot) const
+  {
+    snapshot = {};
+    if (pairUUID == 0 || !clusterPairAuthorityQualified() ||
+        !localCousinServicePermissionAuthorityAcknowledged()) return false;
+    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == pairUUID && value.localClusterUUID == brainConfig.clusterUUID &&
+              value.state == ProdigyClusterPairEnrollmentState::active &&
+              !prodigyClusterPairEnrollmentRootIsZero(value);
+        });
+    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+    const auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+          return value.operationUUID == enrollment->operationUUID;
+        });
+    if (operation == masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end() || operation->revocationRequested) return false;
+    snapshot.pairUUID = pairUUID;
+    snapshot.sourceClusterUUID = brainConfig.clusterUUID;
+    snapshot.peerClusterUUID = enrollment->peerClusterUUID;
+    snapshot.rootGeneration = enrollment->rootGeneration;
+    snapshot.keyEpoch = enrollment->agreedKeyEpoch;
+    snapshot.authorityGeneration = masterAuthorityRuntimeState.generation;
+
+    for (const auto& permission : masterAuthorityRuntimeState.localCousinServicePermissions)
+    {
+      if (permission.state != ProdigyLocalCousinServicePermissionState::active ||
+          permission.localHalf != CousinRouteHalf::destination || permission.pairUUID != pairUUID ||
+          permission.localClusterUUID != brainConfig.clusterUUID ||
+          permission.peerClusterUUID != enrollment->peerClusterUUID ||
+          !localCousinServicePermissionMatchesCurrentLivePlan(permission)) continue;
+      auto deployment = deployments.find(permission.localDeploymentID);
+      if (deployment == deployments.end() || deployment->second == nullptr ||
+          deployment->second->plan.isStateful == false || deployment->second->nShardGroups == 0 ||
+          deployment->second->nShardGroups > UINT16_MAX) continue;
+      const uint16_t shardGroups = uint16_t(deployment->second->nShardGroups);
+      for (ContainerView *container : deployment->second->containers)
+      {
+        if (container == nullptr || container->machine == nullptr || container->uuid == 0 ||
+            container->machine->uuid == 0 || container->runtimeReady == false ||
+            !container->readyForPairingNotifications() || !container->machine->runtimeReady ||
+            !neuronControlStreamActive(container->machine) || container->isStateful == false ||
+            container->deploymentID != permission.localDeploymentID || container->fragment == 0 ||
+            container->machine->fragment == 0 || container->shardGroup >= shardGroups ||
+            container->wormholeRuntimeRevision.size() != 64 || container->wormholeRuntimeFailureSuppressedReady ||
+            !container->wormholeRuntimeFailure.empty() || !container->wormholeRuntimePendingMachines.empty() ||
+            !container->wormholeRuntimeFailedMachines.empty()) continue;
+        String revision = {};
+        Vector<Wormhole> applied = {};
+        if (!prodigyComputeWormholeDesiredStateRevision(container->generateContainerID(),
+                                                        container->wormholeRuntimeDesired, revision) ||
+            !revision.equals(container->wormholeRuntimeRevision) ||
+            !BitseryEngine::deserializeSafe(container->wormholeRuntimeDesired, applied) ||
+            !wormholeTargetBindingsUnique(applied)) continue;
+        const StatefulMeshRoles roles = container->effectiveStatefulMeshRoles(deployment->second->plan);
+        if (roles.cousin == 0 || !MeshRegistry::prefixContains(permission.localCousinServicePrefix, roles.cousin)) continue;
+        const auto advertisement = container->advertisements.find(roles.cousin);
+        if (advertisement == container->advertisements.end() ||
+            !serviceBlueprintActiveAtContainerState(advertisement->second, container->state)) continue;
+        CousinRouteSlotBitmap owned = {};
+        forEachStatefulServiceSlotOwnedByGroup(uint16_t(container->shardGroup), shardGroups,
+            [&](uint16_t slot) { if (permission.slots.contains(slot)) owned.insert(slot); });
+        if (owned.empty()) continue;
+        const Wormhole *selected = nullptr;
+        for (const Wormhole& wormhole : applied)
+        {
+          if (wormhole.layer4 != IPPROTO_TCP || wormhole.isQuic || !wormhole.externalAddress.is6 ||
+              wormhole.externalAddress.isNull() ||
+              !wormholeSwitchboardAddress(wormhole).equals(wormhole.externalAddress) || wormhole.externalPort == 0 ||
+              wormhole.containerPort != advertisement->second.port || wormhole.routablePrefixUUID == 0) continue;
+          if (selected != nullptr) { selected = nullptr; break; }
+          selected = &wormhole;
+        }
+        if (selected == nullptr || snapshot.records.size() >= ProdigyCousinDiscoveryMaximumRecords) {
+          if (snapshot.records.size() >= ProdigyCousinDiscoveryMaximumRecords) { snapshot.records.clear(); return true; }
+          continue;
+        }
+        ProdigyCousinCounterpart counterpart = {};
+        counterpart.permission = permission;
+        counterpart.containerUUID = container->uuid;
+        counterpart.nodeUUID = container->machine->uuid;
+        counterpart.containerID = container->generateContainerID();
+        counterpart.shardGroup = uint16_t(container->shardGroup);
+        counterpart.shardGroups = shardGroups;
+        counterpart.service = roles.cousin;
+        counterpart.servicePort = advertisement->second.port;
+        counterpart.ownedSlots = owned;
+        counterpart.routablePrefixUUID = selected->routablePrefixUUID;
+        counterpart.publicAddress = wormholeSwitchboardAddress(*selected);
+        counterpart.publicTCPPort = selected->externalPort;
+        counterpart.wormholeRevision = revision;
+        if (!prodigyCousinCounterpartValid(counterpart)) { snapshot.records.clear(); return false; }
+        snapshot.records.push_back(std::move(counterpart));
+      }
+    }
+    return prodigyCousinDiscoverySnapshotValid(snapshot);
+  }
+
+  bool cousinDiscoveryNeuronAuthorized(const NeuronView *neuron) const
+  {
+    return clusterPairProjectionNeuronAuthorized(neuron) && neuron->cousinDiscoveryCapable &&
+        neuron->cousinDiscoveryVersion == 1 && neuron->clusterPairProjectionAcknowledgedFingerprint.size() != 0;
+  }
+
+  bool buildCousinDiscoveryPublication(const Machine *machine, uint128_t pairUUID,
+                                      ProdigyCousinDiscoveryPublication& publication) const
+  {
+    publication = {};
+    if (machine == nullptr || !cousinDiscoveryNeuronAuthorized(&machine->neuron) ||
+        machine->neuron.clusterPairProjectionGeneration == 0) return false;
+    ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+    if (!buildLocalClusterPairControlProjection(machine->uuid, projection, fingerprint) ||
+        fingerprint != machine->neuron.clusterPairProjectionAcknowledgedFingerprint ||
+        fingerprint != machine->neuron.clusterPairProjectionFingerprint) return false;
+    ProdigyCousinDiscoverySnapshot snapshot = {};
+    if (!buildCousinDiscoverySnapshot(pairUUID, snapshot)) return false;
+    publication.nodeUUID = machine->uuid;
+    // The carrier is keyed by the installed projection. Its acknowledgement
+    // intentionally survives authority-only policy revisions that leave its
+    // credential fingerprint unchanged.
+    publication.projectionGeneration = machine->neuron.clusterPairProjectionGeneration;
+    publication.snapshot = std::move(snapshot);
+    return prodigyCousinDiscoveryPublicationValid(publication);
+  }
+
+  void driveCousinDiscoverySnapshots()
+  {
+    const int64_t now = Time::msSinceBoot();
+    if (lastCousinDiscoveryDriveMs != 0 && now - lastCousinDiscoveryDriveMs < 2000) return;
+    lastCousinDiscoveryDriveMs = now;
+    cousinDiscoveryReceipts.erase(std::remove_if(cousinDiscoveryReceipts.begin(), cousinDiscoveryReceipts.end(),
+        [&](const auto& cache) { return cache.observedAtMs <= 0 || now - cache.observedAtMs > ProdigyCousinDiscoveryMaximumAgeMs ||
+          cache.authorityEpoch != masterAuthorityEpoch; }), cousinDiscoveryReceipts.end());
+    if (!clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged()) return;
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || !cousinDiscoveryNeuronAuthorized(&machine->neuron)) continue;
+      ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+      if (!buildLocalClusterPairControlProjection(machine->uuid, projection, fingerprint) ||
+          fingerprint != machine->neuron.clusterPairProjectionAcknowledgedFingerprint) continue;
+      // Append one full bounded batch before starting I/O. Starting each send
+      // inside the loop would starve every pair after the first one.
+      if (machine->neuron.pendingSend || machine->neuron.wBuffer.outstandingBytes() != 0) continue;
+      Vector<uint128_t> publishedPairs = {};
+      for (const auto& credential : projection.credentials)
+      {
+        if (std::find(publishedPairs.begin(), publishedPairs.end(), credential.pairUUID) != publishedPairs.end()) continue;
+        const bool hasPermission = std::any_of(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+            masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& permission) {
+              return permission.pairUUID == credential.pairUUID;
+            });
+        if (!hasPermission) continue;
+        if (publishedPairs.size() >= ProdigyCousinDiscoveryMaximumPairs) break;
+        publishedPairs.push_back(credential.pairUUID);
+        ProdigyCousinDiscoveryPublication publication = {};
+        if (!buildCousinDiscoveryPublication(machine, credential.pairUUID, publication)) continue;
+        String serialized = {};
+        if (!BitseryEngine::serialize(serialized, publication) || serialized.size() > ProdigyCousinDiscoveryMaximumBytes ||
+            !cousinDiscoveryNeuronAuthorized(&machine->neuron) ||
+            machine->neuron.clusterPairProjectionGeneration != publication.projectionGeneration ||
+            machine->neuron.clusterPairProjectionFingerprint != fingerprint) continue;
+        Message::construct(machine->neuron.wBuffer, NeuronTopic::cousinDiscoverySnapshot, serialized);
+      }
+      if (machine->neuron.wBuffer.outstandingBytes() != 0) Ring::queueSend(&machine->neuron);
+    }
+  }
+
+  void receiveCousinDiscoverySnapshot(NeuronView *neuron, const ProdigyCousinDiscoveryReceipt& receipt)
+  {
+    const int64_t now = Time::msSinceBoot();
+    if (!weAreMaster || !clusterPairAuthorityQualified() || !neuron || !neuron->machine ||
+        !cousinDiscoveryNeuronAuthorized(neuron) || !prodigyCousinDiscoveryReceiptValid(receipt) ||
+        receipt.localEndpoint.clusterUUID != brainConfig.clusterUUID || receipt.localEndpoint.nodeUUID != neuron->machine->uuid ||
+        receipt.projectionGeneration != neuron->clusterPairProjectionGeneration) return;
+    ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+    if (!buildLocalClusterPairControlProjection(neuron->machine->uuid, projection, fingerprint) ||
+        fingerprint != neuron->clusterPairProjectionAcknowledgedFingerprint ||
+        std::none_of(projection.credentials.begin(), projection.credentials.end(), [&](const auto& credential) {
+          return credential.pairUUID == receipt.snapshot.pairUUID && credential.rootGeneration == receipt.snapshot.rootGeneration &&
+              credential.keyEpoch == receipt.wireEpoch &&
+              ((credential.initiator == receipt.localEndpoint && credential.responder == receipt.remoteEndpoint) ||
+               (credential.responder == receipt.localEndpoint && credential.initiator == receipt.remoteEndpoint));
+        })) return;
+    cousinDiscoveryReceipts.erase(std::remove_if(cousinDiscoveryReceipts.begin(), cousinDiscoveryReceipts.end(),
+        [&](const auto& cache) { return cache.observedAtMs <= 0 || now - cache.observedAtMs > ProdigyCousinDiscoveryMaximumAgeMs ||
+          cache.authorityEpoch != masterAuthorityEpoch; }), cousinDiscoveryReceipts.end());
+    auto existing = std::find_if(cousinDiscoveryReceipts.begin(), cousinDiscoveryReceipts.end(), [&](const auto& cache) {
+      return cache.nodeUUID == neuron->machine->uuid && cache.receipt.snapshot.pairUUID == receipt.snapshot.pairUUID &&
+          cache.receipt.remoteEndpoint == receipt.remoteEndpoint;
+    });
+    if (existing != cousinDiscoveryReceipts.end()) {
+      if (existing->ioGeneration != neuron->ioGeneration) {
+        cousinDiscoveryReceipts.erase(existing);
+        existing = cousinDiscoveryReceipts.end();
+      }
+    }
+    if (existing != cousinDiscoveryReceipts.end()) {
+      if (receipt.connectionID < existing->receipt.connectionID) return;
+      if (receipt.connectionID == existing->receipt.connectionID &&
+          (receipt.sequence < existing->receipt.sequence ||
+           (receipt.sequence == existing->receipt.sequence && !(receipt.withdrawn && !existing->receipt.withdrawn)))) return;
+    }
+    if (existing == cousinDiscoveryReceipts.end()) {
+      if (cousinDiscoveryReceipts.size() >= ProdigyCousinDiscoveryMaximumPairs) return;
+      cousinDiscoveryReceipts.emplace_back();
+      existing = std::prev(cousinDiscoveryReceipts.end());
+    }
+    existing->receipt = receipt; existing->nodeUUID = neuron->machine->uuid;
+    existing->ioGeneration = neuron->ioGeneration; existing->authorityEpoch = masterAuthorityEpoch;
+    existing->projectionGeneration = neuron->clusterPairProjectionGeneration;
+    existing->projectionFingerprint = fingerprint; existing->observedAtMs = now;
+  }
+
+  ProdigyCousinDiscoveryResponse queryCousinCounterparts(const ProdigyCousinDiscoveryQuery& query) const
+  {
+    ProdigyCousinDiscoveryResponse response = {};
+    if (!prodigyCousinDiscoveryQueryValid(query)) { response.failure.assign("invalid cousin discovery query"_ctv); return response; }
+    const auto source = std::find_if(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+        masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& permission) {
+          return permission.permissionUUID == query.permissionUUID;
+        });
+    if (source == masterAuthorityRuntimeState.localCousinServicePermissions.end() ||
+        source->state != ProdigyLocalCousinServicePermissionState::active || source->localHalf != CousinRouteHalf::source ||
+        !source->slots.contains(query.slot) || !clusterPairAuthorityQualified() ||
+        !localCousinServicePermissionAuthorityAcknowledged() || !localCousinServicePermissionMatchesCurrentLivePlan(*source))
+    { response.success = true; return response; }
+    const int64_t now = Time::msSinceBoot();
+    Vector<uint128_t> returnedContainers = {};
+    for (const auto& cache : cousinDiscoveryReceipts)
+    {
+      if (cache.observedAtMs <= 0 || now - cache.observedAtMs > ProdigyCousinDiscoveryMaximumAgeMs ||
+          cache.authorityEpoch != masterAuthorityEpoch || cache.nodeUUID == 0) continue;
+      Machine *machine = nullptr;
+      for (Machine *candidate : machines) if (candidate && candidate->uuid == cache.nodeUUID) { machine = candidate; break; }
+      if (!machine || machine->neuron.ioGeneration != cache.ioGeneration ||
+          !cousinDiscoveryNeuronAuthorized(&machine->neuron) ||
+          machine->neuron.clusterPairProjectionGeneration != cache.projectionGeneration ||
+          machine->neuron.clusterPairProjectionAcknowledgedFingerprint != cache.projectionFingerprint) continue;
+      ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+      if (!buildLocalClusterPairControlProjection(machine->uuid, projection, fingerprint) ||
+          fingerprint != cache.projectionFingerprint ||
+          std::none_of(projection.credentials.begin(), projection.credentials.end(), [&](const auto& credential) {
+            return credential.pairUUID == cache.receipt.snapshot.pairUUID &&
+                credential.rootGeneration == cache.receipt.snapshot.rootGeneration && credential.keyEpoch == cache.receipt.wireEpoch;
+          })) continue;
+      const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+          masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+            return value.pairUUID == cache.receipt.snapshot.pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
+                !prodigyClusterPairEnrollmentRootIsZero(value) && value.rootGeneration == cache.receipt.snapshot.rootGeneration &&
+                value.agreedKeyEpoch == cache.receipt.wireEpoch;
+          });
+      if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) continue;
+      const auto operation = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+          masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(), [&](const auto& value) {
+            return value.operationUUID == enrollment->operationUUID;
+          });
+      if (operation == masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end() || operation->revocationRequested) continue;
+      for (const auto& record : cache.receipt.snapshot.records)
+      {
+        if (prodigyCousinCounterpartMatchesPermission(record, *source, query.slot))
+        {
+          if (std::find(returnedContainers.begin(), returnedContainers.end(), record.containerUUID) != returnedContainers.end()) continue;
+          if (response.records.size() >= ProdigyCousinDiscoveryMaximumRecords) { response.records.clear(); return response; }
+          response.records.push_back(record);
+          returnedContainers.push_back(record.containerUUID);
+        }
+      }
+    }
+    response.success = true;
+    return response;
+  }
+
   void receiveClusterPairEpochStatus(NeuronView *neuron, const ProdigyClusterPairEpochReceipt& receipt)
   {
     if (!weAreMaster || masterAuthorityEpoch == 0 || masterAuthorityPersistencePending != 0 ||
@@ -41233,6 +41521,18 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::pullLocalCousinServicePermission, serialized);
           break;
         }
+      case MothershipTopic::pullCousinCounterparts:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCousinDiscoveryQuery query = {};
+          ProdigyCousinDiscoveryResponse response = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
+            response = queryCousinCounterparts(query);
+          else response.failure.assign("invalid cousin counterpart query"_ctv);
+          String serialized = {}; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullCousinCounterparts, serialized);
+          break;
+        }
       case MothershipTopic::pullStatelessDeploymentAdmission:
         {
           uint8_t requestVersion = 0;
@@ -43422,6 +43722,14 @@ public:
             receiveClusterPairEpochStatus(neuron, receipt);
           break;
         }
+      case NeuronTopic::cousinDiscoveryReceipt:
+        {
+          String encoded; Message::extractToStringView(args, encoded);
+          ProdigyCousinDiscoveryReceipt receipt = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, receipt))
+            receiveCousinDiscoverySnapshot(neuron, receipt);
+          break;
+        }
       case NeuronTopic::registration:
         {
           // bootTimeMs(8) kernel{4} osID{4} osVersionID{4} haveData(1)
@@ -43455,6 +43763,10 @@ public:
           if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, pairProjectionVersion);
           neuron->clusterPairProjectionCapable = (pairProjectionVersion == 1 || pairProjectionVersion == 2) && neuron->transportPeerProjectionCapable;
           neuron->clusterPairProjectionVersion = neuron->clusterPairProjectionCapable ? pairProjectionVersion : 0;
+          uint8_t cousinDiscoveryVersion = 0;
+          if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, cousinDiscoveryVersion);
+          neuron->cousinDiscoveryCapable = cousinDiscoveryVersion == 1 && neuron->clusterPairProjectionCapable;
+          neuron->cousinDiscoveryVersion = neuron->cousinDiscoveryCapable ? cousinDiscoveryVersion : 0;
           neuron->clusterPairProjectionNonce = 0;
           neuron->clusterPairProjectionAcknowledgedFingerprint.clear();
           neuron->transportPeerProjectionIOGeneration = neuron->ioGeneration;

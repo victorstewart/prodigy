@@ -10,6 +10,7 @@
 #include <networking/multiplexer.h>
 #include <networking/ring.h>
 #include <prodigy/cluster.pair.projection.h>
+#include <prodigy/cousin.discovery.h>
 
 // Neuron owns this Switchboard control component. Its input is an already
 // durable, node-scoped credential projection; it never possesses a pair root
@@ -17,7 +18,8 @@
 class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
   static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
-  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2;
+  static constexpr uint32_t discoveryRecordHeaderBytes = 4 + 8 + 4;
+  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2, discoveryRecordType = 3;
   static constexpr size_t maximumSockets = ProdigyLocalClusterPairControlProjectionMaximumCredentials + 16;
   static constexpr int64_t handshakeTimeoutMs = 10000, idleTimeoutMs = 15000, helloIntervalMs = 3000;
   struct Listener : TCPSocket {
@@ -30,10 +32,22 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     sockaddr_storage observedPeer = {};
     socklen_t observedPeerLength = 0;
     bool closing = false, connected = false, selected = false, ready = false;
+    uint64_t connectionID = 0;
     uint64_t sentSequence = 0, receivedSequence = 0, sentStatusSequence = 0, receivedStatusSequence = 0;
-    int64_t createdAt = 0, lastReceiveAt = 0, lastHelloAt = 0, lastStatusAt = 0;
+    uint64_t sentDiscoverySequence = 0, receivedDiscoverySequence = 0;
+    bool remoteDiscoveryPresent = false;
+    ProdigyCousinDiscoverySnapshot remoteDiscovery = {};
+    int64_t remoteDiscoveryExpiresAt = 0;
+    int64_t createdAt = 0, lastReceiveAt = 0, lastHelloAt = 0, lastStatusAt = 0, lastDiscoveryAt = 0;
+  };
+  struct LocalDiscoveryPublication {
+    ProdigyCousinDiscoveryPublication publication = {};
+    bool withdrawing = false;
+    int64_t expiresAt = 0;
   };
   ProdigyLocalClusterPairControlProjection projection;
+  std::vector<LocalDiscoveryPublication> discoveryPublications;
+  uint64_t nextConnectionID = 1;
   std::vector<std::unique_ptr<Listener>> listeners;
   std::vector<std::unique_ptr<Connection>> connections;
   TimeoutPacket tick;
@@ -64,6 +78,107 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   { for (auto& listener : listeners) if (listener.get() == socket) return listener.get(); return nullptr; }
   Connection *connectionFor(void *socket)
   { for (auto& connection : connections) if (connection.get() == socket) return connection.get(); return nullptr; }
+  bool discoveryMatchesConnection(const ProdigyCousinDiscoverySnapshot& snapshot,
+                                  const Connection& connection, bool outgoing) const
+  {
+    return snapshot.pairUUID == connection.credential.pairUUID &&
+        snapshot.rootGeneration == connection.credential.rootGeneration &&
+        snapshot.keyEpoch == connection.credential.keyEpoch &&
+        snapshot.sourceClusterUUID == (outgoing ? connection.local.clusterUUID : connection.remote.clusterUUID) &&
+        snapshot.peerClusterUUID == (outgoing ? connection.remote.clusterUUID : connection.local.clusterUUID);
+  }
+  const LocalDiscoveryPublication *localDiscoveryFor(const Connection& connection) const
+  {
+    for (const auto& candidate : discoveryPublications)
+      if (candidate.expiresAt > Time::msSinceBoot() &&
+          candidate.publication.nodeUUID == projection.nodeUUID &&
+          candidate.publication.projectionGeneration == projection.committedAuthorityGeneration &&
+          discoveryMatchesConnection(candidate.publication.snapshot, connection, true)) return &candidate;
+    return nullptr;
+  }
+  void emitDiscoveryWithdrawal(Connection& connection)
+  {
+    if (!connection.remoteDiscoveryPresent) return;
+    connection.remoteDiscoveryPresent = false;
+    connection.remoteDiscoveryExpiresAt = 0;
+    if (!onDiscoverySnapshot) return;
+    ProdigyCousinDiscoveryReceipt receipt = {};
+    receipt.localEndpoint = connection.local;
+    receipt.remoteEndpoint = connection.remote;
+    receipt.wireEpoch = connection.credential.keyEpoch;
+    receipt.projectionGeneration = projection.committedAuthorityGeneration;
+    receipt.connectionID = connection.connectionID;
+    receipt.sequence = connection.receivedDiscoverySequence;
+    receipt.withdrawn = true;
+    receipt.snapshot = connection.remoteDiscovery;
+    receipt.snapshot.records.clear();
+    onDiscoverySnapshot(receipt);
+  }
+  void queueDiscoverySnapshot(Connection& connection, int64_t now)
+  {
+    if (!approved(connection) || connection.closing || !connection.connected || !connection.ready ||
+        !connection.isTransportNegotiated() || !connection.tlsPeerVerified ||
+        connection.tlsPeerUUID != connection.remote.nodeUUID || connection.pendingSend ||
+        connection.wBuffer.outstandingBytes() != 0 ||
+        (connection.lastDiscoveryAt != 0 && now - connection.lastDiscoveryAt < helloIntervalMs)) return;
+    const LocalDiscoveryPublication *publication = localDiscoveryFor(connection);
+    if (!publication) return;
+    String payload = {};
+    auto snapshot = publication->publication.snapshot;
+    BitseryEngine::serialize(payload, snapshot);
+    if (payload.size() == 0 || payload.size() > ProdigyCousinDiscoveryMaximumBytes ||
+        connection.sentDiscoverySequence == UINT64_MAX ||
+        !connection.wBuffer.need(discoveryRecordHeaderBytes + payload.size())) { retire(connection); return; }
+    String record = {};
+    if (!record.reserve(discoveryRecordHeaderBytes + payload.size())) { retire(connection); return; }
+    clusterPairControlAppendU32BE(record, discoveryRecordType);
+    clusterPairKeyAppendU64BE(record, ++connection.sentDiscoverySequence);
+    clusterPairControlAppendU32BE(record, uint32_t(payload.size()));
+    record.append(payload.data(), payload.size());
+    if (record.size() != discoveryRecordHeaderBytes + payload.size()) { retire(connection); return; }
+    connection.wBuffer.append(record);
+    connection.lastDiscoveryAt = now;
+    Ring::queueSend(&connection);
+  }
+  bool receiveDiscoverySnapshot(Connection& connection, const uint8_t *payload, uint32_t payloadBytes)
+  {
+    const uint8_t *cursor = payload;
+    const uint8_t *end = payload + payloadBytes;
+    uint64_t sequence = 0;
+    uint32_t encodedBytes = 0;
+    ProdigyCousinDiscoverySnapshot snapshot = {};
+    if (!approved(connection) || !connection.ready || !connection.isTransportNegotiated() ||
+        !connection.tlsPeerVerified || connection.tlsPeerUUID != connection.remote.nodeUUID ||
+        !clusterPairControlReadU64BE(cursor, end, sequence) || sequence == 0 ||
+        sequence <= connection.receivedDiscoverySequence ||
+        !clusterPairControlReadU32BE(cursor, end, encodedBytes) || encodedBytes > ProdigyCousinDiscoveryMaximumBytes ||
+        encodedBytes != uint32_t(end - cursor)) return false;
+    String encoded = {};
+    if (!encoded.reserve(encodedBytes)) return false;
+    encoded.append(cursor, encodedBytes);
+    if (!BitseryEngine::deserializeSafe(encoded, snapshot) || !prodigyCousinDiscoverySnapshotValid(snapshot) ||
+        !discoveryMatchesConnection(snapshot, connection, false)) return false;
+    connection.receivedDiscoverySequence = sequence;
+    connection.lastReceiveAt = Time::msSinceBoot();
+    connection.remoteDiscovery = snapshot;
+    connection.remoteDiscoveryPresent = !snapshot.records.empty();
+    connection.remoteDiscoveryExpiresAt = connection.remoteDiscoveryPresent ?
+        connection.lastReceiveAt + ProdigyCousinDiscoveryMaximumAgeMs : 0;
+    if (onDiscoverySnapshot)
+    {
+      ProdigyCousinDiscoveryReceipt receipt = {};
+      receipt.localEndpoint = connection.local;
+      receipt.remoteEndpoint = connection.remote;
+      receipt.wireEpoch = connection.credential.keyEpoch;
+      receipt.projectionGeneration = projection.committedAuthorityGeneration;
+      receipt.connectionID = connection.connectionID;
+      receipt.sequence = sequence;
+      receipt.withdrawn = snapshot.records.empty();
+      receipt.snapshot = std::move(snapshot);
+      onDiscoverySnapshot(receipt);
+    }
+    return true;
+  }
   void retire(Connection& connection)
   {
     if (connection.closing) return;
@@ -73,6 +188,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
           (unsigned long long)(connection.remote.nodeUUID >> 64), (unsigned long long)connection.remote.nodeUUID,
           (unsigned long long)(connection.credential.pairUUID >> 64), (unsigned long long)connection.credential.pairUUID,
           (unsigned long long)connection.credential.rootGeneration, (unsigned long long)connection.credential.keyEpoch);
+    emitDiscoveryWithdrawal(connection);
     connection.closing = true; connection.ready = false;
     Ring::queueClose(&connection);
   }
@@ -245,13 +361,14 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (connections.size() + acceptsPending >= maximumSockets) return;
     auto connection = std::make_unique<Connection>();
     connection->credential = credential; connection->local = credential.initiator; connection->remote = credential.responder;
-    connection->selected = true; connection->createdAt = Time::msSinceBoot();
+    if (nextConnectionID == 0 || nextConnectionID == UINT64_MAX) return;
+    connection->selected = true; connection->connectionID = nextConnectionID++; connection->createdAt = Time::msSinceBoot();
     connection->setIPVersion(AF_INET6); connection->setNonBlocking();
     connection->setSaddr(connection->local.address, 0); connection->setDaddr(connection->remote.address, connection->remote.port);
     if (connection->fd < 0 || !Ring::bindSourceAddressBeforeFixedFileInstall(connection.get()))
     { if (connection->fd >= 0) ::close(connection->fd); connection->fd = -1; return; }
     if (!adoptProcessSocket(*connection)) return;
-    connection->rBuffer.reserve(8192); connection->wBuffer.reserve(4096);
+    connection->rBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128); connection->wBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128);
     auto *owned = connection.get(); connections.push_back(std::move(connection));
     RingDispatcher::installMultiplexee(owned, this);
     if (!owned->beginTransportAEGISWithPrelude(false, projection.nodeUUID, credential.localClaim,
@@ -266,6 +383,16 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   {
     if (!started || stopping || projection.protocolVersion == 0) return;
     const int64_t now = Time::msSinceBoot();
+    for (auto& publication : discoveryPublications)
+      if (publication.expiresAt <= now && !publication.withdrawing)
+      {
+        publication.publication.snapshot.records.clear();
+        publication.withdrawing = true;
+        publication.expiresAt = now + helloIntervalMs;
+      }
+    discoveryPublications.erase(std::remove_if(discoveryPublications.begin(), discoveryPublications.end(),
+        [&](const auto& publication) { return publication.expiresAt <= now && publication.withdrawing; }),
+        discoveryPublications.end());
     for (auto& listener : listeners)
       if (!listener->closing && !ownsListenerEndpoint(listener->endpoint)) retire(*listener);
     for (auto& connection : connections)
@@ -274,8 +401,10 @@ class SwitchboardPairControlRuntime final : public RingInterface {
       if ((connection->selected && !approved(*connection)) ||
           (!connection->ready && now - connection->createdAt >= handshakeTimeoutMs) ||
           (connection->ready && now - connection->lastReceiveAt >= idleTimeoutMs)) { retire(*connection); continue; }
+      if (connection->remoteDiscoveryPresent && connection->remoteDiscoveryExpiresAt <= now) emitDiscoveryWithdrawal(*connection);
       queueHello(*connection, now);
       queueEpochStatus(*connection, now);
+      queueDiscoverySnapshot(*connection, now);
     }
     for (const auto& credential : projection.credentials)
     {
@@ -289,6 +418,39 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   }
 public:
   std::function<void(const ProdigyClusterPairEpochReceipt&)> onEpochStatus;
+  std::function<void(const ProdigyCousinDiscoveryReceipt&)> onDiscoverySnapshot;
+
+  bool installDiscoverySnapshot(const ProdigyCousinDiscoveryPublication& publication)
+  {
+    if (stopping || !prodigyCousinDiscoveryPublicationValid(publication) ||
+        publication.nodeUUID != projection.nodeUUID ||
+        publication.projectionGeneration != projection.committedAuthorityGeneration ||
+        publication.snapshot.authorityGeneration < projection.committedAuthorityGeneration) return false;
+    bool authorized = false;
+    for (const auto& credential : projection.credentials)
+      if ((isLocal(credential.initiator) || isLocal(credential.responder)) &&
+          publication.snapshot.pairUUID == credential.pairUUID &&
+          publication.snapshot.rootGeneration == credential.rootGeneration &&
+          publication.snapshot.keyEpoch == credential.keyEpoch &&
+          publication.snapshot.sourceClusterUUID == projection.localClusterUUID &&
+          publication.snapshot.peerClusterUUID != projection.localClusterUUID &&
+          (publication.snapshot.peerClusterUUID == credential.initiator.clusterUUID ||
+           publication.snapshot.peerClusterUUID == credential.responder.clusterUUID)) { authorized = true; break; }
+    if (!authorized) return false;
+    LocalDiscoveryPublication *existing = nullptr;
+    for (auto& candidate : discoveryPublications)
+      if (candidate.publication.snapshot.pairUUID == publication.snapshot.pairUUID &&
+          candidate.publication.snapshot.rootGeneration == publication.snapshot.rootGeneration &&
+          candidate.publication.snapshot.keyEpoch == publication.snapshot.keyEpoch) { existing = &candidate; break; }
+    if (!existing && discoveryPublications.size() >= ProdigyCousinDiscoveryMaximumPairs) return false;
+    const int64_t now = Time::msSinceBoot();
+    if (existing) { existing->publication = publication; existing->withdrawing = false; existing->expiresAt = now + ProdigyCousinDiscoveryMaximumAgeMs; }
+    else discoveryPublications.push_back({publication, false, now + ProdigyCousinDiscoveryMaximumAgeMs});
+    for (auto& connection : connections)
+      if (!connection->closing && discoveryMatchesConnection(publication.snapshot, *connection, true))
+        connection->lastDiscoveryAt = 0;
+    armTick(); return true;
+  }
 
   // The owner calls quiesce until true before destruction or process exec.
   ~SwitchboardPairControlRuntime()
@@ -303,6 +465,8 @@ public:
         next.nodeUUID != projection.nodeUUID || next.committedAuthorityGeneration < projection.committedAuthorityGeneration ||
         (next.committedAuthorityGeneration == projection.committedAuthorityGeneration &&
          !prodigyLocalClusterPairControlProjectionEqual(next, projection)))) return false;
+    for (auto& connection : connections) emitDiscoveryWithdrawal(*connection);
+    discoveryPublications.clear();
     projection = next;
     // Revoke before returning the durable installation receipt. New connection
     // attempts wait for the common tick, which also bounds reconnect frequency.
@@ -336,12 +500,14 @@ public:
     {
       auto connection = std::make_unique<Connection>();
       connection->fslot = slot; connection->isFixedFile = true; connection->isNonBlocking = true;
-      connection->connected = true; connection->local = listener->endpoint; connection->createdAt = Time::msSinceBoot();
+      const bool connectionIDExhausted = nextConnectionID == 0 || nextConnectionID == UINT64_MAX;
+      connection->connected = true; connection->connectionID = connectionIDExhausted ? UINT64_MAX : nextConnectionID++;
+      connection->local = listener->endpoint; connection->createdAt = Time::msSinceBoot();
       const bool captured = Ring::takeAcceptedPeerAddress(slot, connection->observedPeer, connection->observedPeerLength);
-      connection->rBuffer.reserve(8192); connection->wBuffer.reserve(4096);
+      connection->rBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128); connection->wBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128);
       auto *owned = connection.get(); connections.push_back(std::move(connection));
       RingDispatcher::installMultiplexee(owned, this);
-      if (!captured || stopping || listener->closing || !owned->beginTransportAEGISWithDeferredServerPrelude(
+      if (connectionIDExhausted || !captured || stopping || listener->closing || !owned->beginTransportAEGISWithDeferredServerPrelude(
           projection.nodeUUID, [this, owned](const String& remote, String& local, std::array<uint8_t,32>& key, String& context, uint128_t& peer) {
             return selectIncoming(*owned, remote, local, key, context, peer);
           })) retire(*owned);
@@ -370,18 +536,30 @@ public:
       const uint8_t *terminal = frame + connection->rBuffer.outstandingBytes();
       uint32_t type = 0;
       if (!clusterPairControlReadU32BE(frame, terminal, type)) { retire(*connection); return; }
-      const uint32_t bytes = type == helloRecordType ? helloBytes : type == epochRecordType ? epochRecordBytes : 0;
+      uint32_t bytes = type == helloRecordType ? helloBytes : type == epochRecordType ? epochRecordBytes : 0;
+      if (type == discoveryRecordType)
+      {
+        if (connection->rBuffer.outstandingBytes() < discoveryRecordHeaderBytes) break;
+        const uint8_t *cursor = frame + sizeof(uint64_t);
+        uint32_t encodedBytes = 0;
+        if (!clusterPairControlReadU32BE(cursor, terminal, encodedBytes) ||
+            encodedBytes > ProdigyCousinDiscoveryMaximumBytes ||
+            encodedBytes > UINT32_MAX - discoveryRecordHeaderBytes) { retire(*connection); return; }
+        bytes = discoveryRecordHeaderBytes + encodedBytes;
+      }
       if (bytes == 0) { retire(*connection); return; }
       if (connection->rBuffer.outstandingBytes() < bytes) break;
       const uint8_t *record = connection->rBuffer.pHead();
       if ((type == helloRecordType && !receiveHello(*connection, record)) ||
-          (type == epochRecordType && !receiveEpochStatus(*connection, record + sizeof(uint32_t))))
+          (type == epochRecordType && !receiveEpochStatus(*connection, record + sizeof(uint32_t))) ||
+          (type == discoveryRecordType && !receiveDiscoverySnapshot(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))))
       { retire(*connection); return; }
       connection->rBuffer.consume(bytes, true);
     }
     const int64_t now = Time::msSinceBoot();
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
+    queueDiscoverySnapshot(*connection, now);
     if (connection->closing) return;
     if (connection->needsTransportTLSSendKick()) Ring::queueSend(connection);
     Ring::queueRecv(connection);
@@ -397,6 +575,7 @@ public:
     const int64_t now = Time::msSinceBoot();
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
+    queueDiscoverySnapshot(*connection, now);
     if (!connection->closing && (connection->needsTransportTLSSendKick() || connection->wBuffer.outstandingBytes()))
       Ring::queueSend(connection);
   }

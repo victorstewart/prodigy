@@ -4,6 +4,7 @@
 #include <string>
 
 #include <prodigy/cousin.route.h>
+#include <prodigy/cousin.discovery.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
 #include <prodigy/mothership/mothership.cousin.permission.h>
@@ -66,6 +67,50 @@ static bool parseLocalCousinPermissionJSON(const String& json,
   simdjson::dom::element document;
   return parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
          mothershipParseLocalCousinPermissionJSON(document, permission, failure);
+}
+
+static ProdigyCousinCounterpart validCousinCounterpart()
+{
+  ProdigyCousinCounterpart counterpart = {};
+  counterpart.permission = validLocalCousinPermission();
+  counterpart.permission.localHalf = CousinRouteHalf::destination;
+  counterpart.permission.localClusterUUID = 0x402;
+  counterpart.permission.peerClusterUUID = 0x401;
+  counterpart.permission.localApplicationID = 19;
+  counterpart.permission.peerApplicationID = 7;
+  counterpart.permission.localCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  counterpart.permission.peerCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  counterpart.permission.localDeploymentID = 0x13000000000001;
+  counterpart.containerUUID = 0x701;
+  counterpart.nodeUUID = 0x702;
+  counterpart.containerID = 99;
+  counterpart.shardGroups = 3;
+  counterpart.shardGroup = statefulServiceGroupOwnerForSlot(3, counterpart.shardGroups);
+  counterpart.service = MeshServices::constrainPrefixToGroup(
+      counterpart.permission.localCousinServicePrefix, counterpart.shardGroup);
+  counterpart.servicePort = 8443;
+  for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
+    if (counterpart.permission.slots.contains(slot) &&
+        statefulServiceGroupOwnerForSlot(slot, counterpart.shardGroups) == counterpart.shardGroup)
+      counterpart.ownedSlots.insert(slot);
+  counterpart.routablePrefixUUID = 0x703;
+  counterpart.publicAddress = IPAddress("fd42:4242:4242:2::44", true);
+  counterpart.publicTCPPort = 443;
+  counterpart.wormholeRevision = digest('c');
+  return counterpart;
+}
+
+static ProdigyCousinDiscoverySnapshot validCousinDiscoverySnapshot()
+{
+  ProdigyCousinDiscoverySnapshot snapshot = {};
+  snapshot.pairUUID = 0x300;
+  snapshot.sourceClusterUUID = 0x402;
+  snapshot.peerClusterUUID = 0x401;
+  snapshot.rootGeneration = 7;
+  snapshot.keyEpoch = 11;
+  snapshot.authorityGeneration = 12;
+  snapshot.records.push_back(validCousinCounterpart());
+  return snapshot;
 }
 
 static CousinRouteRecord validRoute(uint128_t routeUUID = 0x101, uint128_t operationUUID = 0x201)
@@ -185,6 +230,61 @@ int main(void)
   ProdigyLocalCousinServicePermission permission = validLocalCousinPermission();
   suite.require(prodigyLocalCousinServicePermissionValid(permission),
                 "local_cousin_permission_accepts_asymmetric_application_mapping");
+  ProdigyCousinDiscoverySnapshot discovery = validCousinDiscoverySnapshot();
+  suite.require(prodigyCousinDiscoverySnapshotValid(discovery),
+                "cousin_discovery_accepts_exact_destination_counterpart_slots");
+  suite.require(prodigyCousinCounterpartMatchesPermission(discovery.records[0], permission, 3),
+                "cousin_discovery_matches_asymmetric_source_permission_at_owned_slot");
+  auto malformedCounterpart = discovery.records[0];
+  malformedCounterpart.ownedSlots.insert(4);
+  suite.require(!prodigyCousinCounterpartValid(malformedCounterpart),
+                "cousin_discovery_rejects_sender_chosen_slot_subset_or_extra_slot");
+  malformedCounterpart = discovery.records[0];
+  malformedCounterpart.permission.state = ProdigyLocalCousinServicePermissionState::revoked;
+  malformedCounterpart.permission.generation = 2;
+  suite.require(!prodigyCousinCounterpartValid(malformedCounterpart),
+                "cousin_discovery_rejects_revoked_destination_permission");
+  malformedCounterpart = discovery.records[0];
+  malformedCounterpart.service = MeshServices::constrainPrefixToGroup(
+      malformedCounterpart.permission.localCousinServicePrefix, malformedCounterpart.shardGroup + 1);
+  suite.require(!prodigyCousinCounterpartValid(malformedCounterpart),
+                "cousin_discovery_rejects_wrong_exact_shard_service");
+  discovery.records.push_back(discovery.records[0]);
+  suite.require(!prodigyCousinDiscoverySnapshotValid(discovery),
+                "cousin_discovery_rejects_duplicate_container_permission_descriptor");
+  discovery.records.pop_back();
+  String discoveryBytes = {};
+  BitseryEngine::serialize(discoveryBytes, discovery);
+  ProdigyCousinDiscoverySnapshot decodedDiscovery = {};
+  suite.require(discoveryBytes.size() <= ProdigyCousinDiscoveryMaximumBytes &&
+                    BitseryEngine::deserializeSafe(discoveryBytes, decodedDiscovery) &&
+                    prodigyCousinDiscoverySnapshotValid(decodedDiscovery),
+                "cousin_discovery_roundtrips_bounded_snapshot_codec");
+  ProdigyCousinDiscoveryQuery discoveryQuery = {};
+  discoveryQuery.permissionUUID = permission.permissionUUID;
+  discoveryQuery.slot = 3;
+  suite.require(prodigyCousinDiscoveryQueryValid(discoveryQuery),
+                "cousin_discovery_query_accepts_bounded_permission_slot");
+  ProdigyCousinDiscoveryPublication malformedPublication = {};
+  malformedPublication.nodeUUID = 0x704;
+  malformedPublication.projectionGeneration = 12;
+  malformedPublication.snapshot = decodedDiscovery;
+  malformedPublication.snapshot.records[0].permission.acceptedAuthorityGeneration = 13;
+  suite.require(!prodigyCousinDiscoveryPublicationValid(malformedPublication),
+                "cousin_discovery_rejects_record_authority_after_snapshot_authority");
+  ProdigyCousinDiscoveryReceipt malformedReceipt = {};
+  malformedReceipt.localEndpoint = validPairEndpoint(0x401, 0x705, 7);
+  malformedReceipt.remoteEndpoint = validPairEndpoint(0x402, 0x706, 8);
+  malformedReceipt.wireEpoch = decodedDiscovery.keyEpoch;
+  malformedReceipt.projectionGeneration = 12;
+  malformedReceipt.connectionID = 1;
+  malformedReceipt.sequence = 1;
+  malformedReceipt.snapshot = decodedDiscovery;
+  suite.require(prodigyCousinDiscoveryReceiptValid(malformedReceipt),
+                "cousin_discovery_receipt_accepts_exact_authenticated_snapshot_binding");
+  malformedReceipt.sequence = 0;
+  suite.require(!prodigyCousinDiscoveryReceiptValid(malformedReceipt),
+                "cousin_discovery_receipt_rejects_replayable_zero_sequence");
   suite.require(prodigyLocalCousinServicePermissionsValid(
                     Vector<ProdigyLocalCousinServicePermission> {permission}, 0x401, 7),
                 "local_cousin_permission_vector_is_sorted_and_authority_bounded");

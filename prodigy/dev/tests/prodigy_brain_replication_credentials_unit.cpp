@@ -31881,6 +31881,196 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       suite.expect(activePermission.success && activePermission.found && activePermission.qualified &&
                        activePermission.permission.acceptedAuthorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation,
                    "local_cousin_permission_owner_reports_only_durable_current_policy_as_qualified");
+      // Discovery is derived entirely from the currently qualified local
+      // destination policy plus a live, applied Wormhole listener.  It is not
+      // another authority record and must stop on any live-state fence.
+      Machine discoveryMachine = {};
+      discoveryMachine.uuid = 0x9c20; discoveryMachine.fragment = 1; discoveryMachine.runtimeReady = true;
+      discoveryMachine.neuron.machine = &discoveryMachine;
+      discoveryMachine.neuron.connected = true; discoveryMachine.neuron.isFixedFile = true; discoveryMachine.neuron.fslot = 81;
+      ContainerView discoveryContainer = {};
+      discoveryContainer.uuid = 0x9c21; discoveryContainer.machine = &discoveryMachine;
+      discoveryContainer.deploymentID = live.plan.config.deploymentID(); discoveryContainer.fragment = 1;
+      discoveryContainer.isStateful = true; discoveryContainer.shardGroup = statefulServiceGroupOwnerForSlot(3, 2);
+      discoveryContainer.state = ContainerState::healthy; discoveryContainer.runtimeReady = true;
+      live.nShardGroups = 2; live.containers.insert(&discoveryContainer);
+      const uint64_t discoveryService = discoveryContainer.effectiveStatefulMeshRoles(live.plan).cousin;
+      discoveryContainer.advertisements.emplace(discoveryService,
+          Advertisement(discoveryService, ContainerState::healthy, ContainerState::destroyed, 9443));
+      Wormhole discoveryWormhole = {};
+      discoveryWormhole.externalAddress = IPAddress("fd00:9b::42", true);
+      discoveryWormhole.externalPort = 443; discoveryWormhole.containerPort = 9443;
+      discoveryWormhole.layer4 = IPPROTO_TCP; discoveryWormhole.isQuic = false;
+      discoveryWormhole.routablePrefixUUID = 0x9c22;
+      Vector<Wormhole> appliedDiscoveryWormholes = {discoveryWormhole};
+      BitseryEngine::serialize(discoveryContainer.wormholeRuntimeDesired, appliedDiscoveryWormholes);
+      suite.require(prodigyComputeWormholeDesiredStateRevision(discoveryContainer.generateContainerID(),
+          discoveryContainer.wormholeRuntimeDesired, discoveryContainer.wormholeRuntimeRevision),
+          "cousin_discovery_owner_prepares_applied_wormhole_revision");
+      auto destinationPermission = activePermission.permission;
+      destinationPermission.localHalf = CousinRouteHalf::destination;
+      destinationPermission.localDeploymentID = live.plan.config.deploymentID();
+      destinationPermission.localApplicationID = live.plan.config.applicationID;
+      destinationPermission.localCousinServicePrefix = live.plan.stateful.cousinPrefix;
+      permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front() = destinationPermission;
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "cousin_discovery_owner_acks_destination_policy_snapshot");
+      ProdigyCousinDiscoverySnapshot discoverySnapshot = {};
+      suite.require(permissionBrain.buildCousinDiscoverySnapshot(destinationPermission.pairUUID, discoverySnapshot),
+                    "cousin_discovery_owner_builds_live_destination_snapshot");
+      suite.expect(discoverySnapshot.records.size() == 1 && discoverySnapshot.records.front().containerUUID == discoveryContainer.uuid &&
+                       discoverySnapshot.records.front().service == discoveryService &&
+                       discoverySnapshot.records.front().servicePort == 9443 &&
+                       discoverySnapshot.records.front().ownedSlots.contains(3),
+                   "cousin_discovery_owner_binds_asymmetric_slots_to_live_group_listener");
+      // A permission-only authority revision leaves the credential projection
+      // fingerprint unchanged. Discovery must bind its carrier generation to
+      // that already ACKed projection while retaining the newer authority
+      // generation in the policy snapshot.
+      permissionBrain.machines.insert(&selfMachine);
+      permissionBrain.neurons.insert(&selfMachine.neuron);
+      selfMachine.neuron.clusterPairProjectionCapable = true;
+      selfMachine.neuron.clusterPairProjectionVersion = 2;
+      selfMachine.neuron.cousinDiscoveryCapable = true;
+      selfMachine.neuron.cousinDiscoveryVersion = 1;
+      selfMachine.neuron.transportPeerProjectionAuthorityEpoch = permissionBrain.masterAuthorityEpoch;
+      ProdigyLocalClusterPairControlProjection acknowledgedProjection = {}; String acknowledgedFingerprint = {};
+      if (!suite.require(permissionBrain.buildLocalClusterPairControlProjection(selfMachine.uuid, acknowledgedProjection,
+                                                                                 acknowledgedFingerprint),
+                         "cousin_discovery_owner_builds_acknowledged_projection_before_policy_revision")) return;
+      const uint64_t acknowledgedProjectionGeneration = acknowledgedProjection.committedAuthorityGeneration;
+      selfMachine.neuron.clusterPairProjectionGeneration = acknowledgedProjectionGeneration;
+      selfMachine.neuron.clusterPairProjectionFingerprint = acknowledgedFingerprint;
+      selfMachine.neuron.clusterPairProjectionAcknowledgedFingerprint = acknowledgedFingerprint;
+      ++permissionBrain.masterAuthorityRuntimeState.generation;
+      permissionBrain.durableMasterAuthorityRuntimeStateGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      if (!suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                         "cousin_discovery_owner_qualifies_permission_revision_without_projection_redelivery")) return;
+      ProdigyLocalClusterPairControlProjection currentProjection = {}; String currentFingerprint = {};
+      if (!suite.require(permissionBrain.buildLocalClusterPairControlProjection(selfMachine.uuid, currentProjection,
+                                                                                 currentFingerprint),
+                         "cousin_discovery_owner_rebuilds_projection_after_policy_revision")) return;
+      suite.expect(currentProjection.committedAuthorityGeneration > acknowledgedProjectionGeneration &&
+                       currentFingerprint == acknowledgedFingerprint &&
+                       selfMachine.neuron.clusterPairProjectionGeneration == acknowledgedProjectionGeneration,
+                   "cousin_discovery_owner_keeps_acked_projection_current_across_policy_generation");
+      ProdigyCousinDiscoveryPublication acknowledgedPublication = {};
+      if (!suite.require(permissionBrain.buildCousinDiscoveryPublication(&selfMachine, destinationPermission.pairUUID,
+                                                                          acknowledgedPublication),
+                         "cousin_discovery_owner_builds_publication_for_older_acked_projection")) return;
+      suite.expect(acknowledgedPublication.projectionGeneration == acknowledgedProjectionGeneration &&
+                       acknowledgedPublication.snapshot.authorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation,
+                   "cousin_discovery_owner_separates_carrier_and_policy_generations");
+      discoveryContainer.wormholeRuntimeFailedMachines.insert(1);
+      suite.require(permissionBrain.buildCousinDiscoverySnapshot(destinationPermission.pairUUID, discoverySnapshot) &&
+                        discoverySnapshot.records.empty(),
+                    "cousin_discovery_owner_withdraws_when_applied_wormhole_is_not_ready");
+      discoveryContainer.wormholeRuntimeFailedMachines.clear();
+      discoveryContainer.wormholes = appliedDiscoveryWormholes;
+      discoveryContainer.wormholes.front().containerPort = 9444;
+      suite.require(permissionBrain.buildCousinDiscoverySnapshot(destinationPermission.pairUUID, discoverySnapshot) &&
+                        discoverySnapshot.records.size() == 1,
+                    "cousin_discovery_owner_uses_applied_wormhole_not_mutable_plan");
+      discoveryContainer.wormholeRuntimeDesired.assign("invalid"_ctv);
+      suite.require(permissionBrain.buildCousinDiscoverySnapshot(destinationPermission.pairUUID, discoverySnapshot) &&
+                        discoverySnapshot.records.empty(),
+                    "cousin_discovery_owner_rejects_unparseable_applied_wormhole_state");
+      // Restore the source permission used by the route eligibility and
+      // revoke checks below.
+      permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front() = activePermission.permission;
+      live.containers.erase(&discoveryContainer);
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "cousin_discovery_owner_restores_source_policy_snapshot");
+      // Exercise the Brain-owned receipt cache through its authenticated
+      // projection fence.  The remote descriptor is independently scoped as
+      // a destination permission; its UUID and plan are not assumed equal to
+      // the local source permission.
+      permissionBrain.machines.insert(&selfMachine);
+      permissionBrain.neurons.insert(&selfMachine.neuron);
+      selfMachine.neuron.clusterPairProjectionCapable = true;
+      selfMachine.neuron.clusterPairProjectionVersion = 2;
+      selfMachine.neuron.cousinDiscoveryCapable = true;
+      selfMachine.neuron.cousinDiscoveryVersion = 1;
+      selfMachine.neuron.transportPeerProjectionAuthorityEpoch = permissionBrain.masterAuthorityEpoch;
+      ProdigyLocalClusterPairControlProjection cacheProjection = {}; String cacheFingerprint = {};
+      suite.require(permissionBrain.buildLocalClusterPairControlProjection(selfMachine.uuid, cacheProjection, cacheFingerprint) &&
+                        !cacheProjection.credentials.empty(),
+                    "cousin_discovery_owner_builds_current_projection_for_receipt_fence");
+      selfMachine.neuron.clusterPairProjectionGeneration = cacheProjection.committedAuthorityGeneration;
+      selfMachine.neuron.clusterPairProjectionFingerprint = cacheFingerprint;
+      selfMachine.neuron.clusterPairProjectionAcknowledgedFingerprint = cacheFingerprint;
+      const auto& cacheCredential = cacheProjection.credentials.front();
+      const ClusterPairControlEndpoint cacheLocal = cacheCredential.initiator.clusterUUID == clusterUUID ?
+          cacheCredential.initiator : cacheCredential.responder;
+      const ClusterPairControlEndpoint cacheRemote = cacheCredential.initiator.clusterUUID == clusterUUID ?
+          cacheCredential.responder : cacheCredential.initiator;
+      auto remotePermission = activePermission.permission;
+      remotePermission.permissionUUID = 0x9c31; remotePermission.localHalf = CousinRouteHalf::destination;
+      std::swap(remotePermission.localClusterUUID, remotePermission.peerClusterUUID);
+      std::swap(remotePermission.localApplicationID, remotePermission.peerApplicationID);
+      std::swap(remotePermission.localCousinServicePrefix, remotePermission.peerCousinServicePrefix);
+      remotePermission.localDeploymentID = (uint64_t(remotePermission.localApplicationID) << 48) | 1;
+      ProdigyCousinCounterpart remoteCounterpart = {};
+      remoteCounterpart.permission = remotePermission; remoteCounterpart.containerUUID = 0x9c32;
+      remoteCounterpart.nodeUUID = cacheRemote.nodeUUID; remoteCounterpart.containerID = 0x01020304;
+      remoteCounterpart.shardGroup = statefulServiceGroupOwnerForSlot(3, 1); remoteCounterpart.shardGroups = 1;
+      remoteCounterpart.service = MeshServices::constrainPrefixToGroup(remotePermission.localCousinServicePrefix, remoteCounterpart.shardGroup);
+      remoteCounterpart.servicePort = 9443; remoteCounterpart.ownedSlots.insert(3);
+      remoteCounterpart.routablePrefixUUID = 0x9c33; remoteCounterpart.publicAddress = IPAddress("fd00:9c::33", true);
+      remoteCounterpart.publicTCPPort = 443; remoteCounterpart.wormholeRevision.assign("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv);
+      ProdigyCousinDiscoveryReceipt cacheReceipt = {};
+      cacheReceipt.localEndpoint = cacheLocal; cacheReceipt.remoteEndpoint = cacheRemote;
+      cacheReceipt.wireEpoch = cacheCredential.keyEpoch; cacheReceipt.projectionGeneration = cacheProjection.committedAuthorityGeneration;
+      cacheReceipt.connectionID = 2; cacheReceipt.sequence = 1;
+      cacheReceipt.snapshot.pairUUID = cacheCredential.pairUUID; cacheReceipt.snapshot.sourceClusterUUID = cacheRemote.clusterUUID;
+      cacheReceipt.snapshot.peerClusterUUID = cacheLocal.clusterUUID; cacheReceipt.snapshot.rootGeneration = cacheCredential.rootGeneration;
+      cacheReceipt.snapshot.keyEpoch = cacheCredential.keyEpoch;
+      cacheReceipt.snapshot.authorityGeneration = remotePermission.acceptedAuthorityGeneration;
+      cacheReceipt.snapshot.records.push_back(remoteCounterpart);
+      suite.require(prodigyCousinDiscoveryReceiptValid(cacheReceipt), "cousin_discovery_owner_constructs_authenticated_remote_receipt");
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, cacheReceipt);
+      auto cacheQuery = permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3});
+      suite.expect(cacheQuery.success && cacheQuery.records.size() == 1 &&
+                       cacheQuery.records.front().containerUUID == remoteCounterpart.containerUUID,
+                   "cousin_discovery_owner_returns_current_matching_remote_candidate");
+      auto wrongIdentityReceipt = cacheReceipt;
+      wrongIdentityReceipt.sequence = 2;
+      wrongIdentityReceipt.snapshot.records.front().permission.logicalServiceUUID++;
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, wrongIdentityReceipt);
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.empty(),
+                   "cousin_discovery_owner_rejects_wrong_remote_logical_identity_at_lookup");
+      auto newerReceipt = cacheReceipt; newerReceipt.connectionID = 3; newerReceipt.sequence = 1;
+      newerReceipt.sequence = 2;
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, newerReceipt);
+      suite.require(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.size() == 1,
+                    "cousin_discovery_owner_rehydrates_current_connection_before_expiry");
+      auto staleClose = cacheReceipt; staleClose.withdrawn = true; staleClose.snapshot.records.clear();
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, staleClose);
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.size() == 1,
+                   "cousin_discovery_owner_ignores_stale_connection_withdrawal");
+      auto currentClose = newerReceipt; currentClose.withdrawn = true; currentClose.snapshot.records.clear();
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, currentClose);
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.empty(),
+                   "cousin_discovery_owner_accepts_same_sequence_current_connection_withdrawal");
+      ++newerReceipt.sequence;
+      permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, newerReceipt);
+      suite.require(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.size() == 1,
+                    "cousin_discovery_owner_rehydrates_current_connection_before_expiry");
+      selfMachine.neuron.clusterPairProjectionAcknowledgedFingerprint.clear();
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.empty(),
+                   "cousin_discovery_owner_fences_lookup_on_lost_projection_ack");
+      selfMachine.neuron.clusterPairProjectionAcknowledgedFingerprint = cacheFingerprint;
+      auto& cacheOperation = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+      cacheOperation.revocationRequested = true;
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.empty(),
+                   "cousin_discovery_owner_fences_lookup_on_pair_revocation");
+      cacheOperation.revocationRequested = false;
+      if (!permissionBrain.cousinDiscoveryReceipts.empty())
+        permissionBrain.cousinDiscoveryReceipts.front().observedAtMs = Time::msSinceBoot() - ProdigyCousinDiscoveryMaximumAgeMs - 1;
+      suite.expect(permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3}).records.empty(),
+                   "cousin_discovery_owner_expires_remote_receipts");
+      permissionBrain.machines.erase(&selfMachine);
+      permissionBrain.neurons.erase(&selfMachine.neuron);
       CousinRouteRecord route = {};
       route.routeUUID = 0x9c11; route.operationUUID = 0x9c12;
       route.pairUUID = permission.pairUUID; route.logicalWorkloadUUID = permission.logicalWorkloadUUID;

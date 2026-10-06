@@ -78,7 +78,9 @@ enum class MothershipTopic : uint16_t {
   // Deployment permissions are installed once; ordinary route eligibility is
   // evaluated locally without a Mothership request.
   commitLocalCousinServicePermission,
-  pullLocalCousinServicePermission
+  pullLocalCousinServicePermission,
+  // Observation of ephemeral, locally filtered counterpart candidates only.
+  pullCousinCounterparts
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -183,6 +185,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "commitLocalCousinServicePermission";
     case MothershipTopic::pullLocalCousinServicePermission:
       return "pullLocalCousinServicePermission";
+    case MothershipTopic::pullCousinCounterparts:
+      return "pullCousinCounterparts";
   }
 
   return "unknown";
@@ -272,7 +276,9 @@ enum class NeuronTopic : uint16_t {
   transportCredentialPeersAck,
   clusterPairControlCredentials,
   clusterPairControlCredentialsAck,
-  clusterPairEpochStatus
+  clusterPairEpochStatus,
+  cousinDiscoverySnapshot,
+  cousinDiscoveryReceipt
 };
 
 enum class ContainerTopic : uint16_t {

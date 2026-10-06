@@ -77,6 +77,12 @@ public:
   String clusterPairProjectionFingerprint;
   String clusterPairProjectionAcknowledgedFingerprint;
 
+  // Advertised during registration. Discovery records are accepted only from
+  // a current control-stream incarnation that explicitly supports their
+  // bounded, root-free carrier format.
+  bool cousinDiscoveryCapable = false;
+  uint8_t cousinDiscoveryVersion = 0;
+
   void reset(void) override
   {
     ProdigyArtifactStream::reset();
@@ -99,6 +105,8 @@ public:
     clusterPairProjectionSentAtMs = 0;
     clusterPairProjectionFingerprint.clear();
     clusterPairProjectionAcknowledgedFingerprint.clear();
+    cousinDiscoveryCapable = false;
+    cousinDiscoveryVersion = 0;
     verifiedInstalledBundleSHA256.clear();
     verifiedInstalledBundleIOGeneration = 0;
     verifiedInstalledBundleAuthorityEpoch = 0;

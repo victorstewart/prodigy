@@ -1156,6 +1156,42 @@ int main(void)
         ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
         "neuron_registration_with_installed_bundle_digest_valid_for_brain");
     frame.clear();
+    Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+                       true, "0123456789abcdef"_ctv, uint8_t(1), uint8_t(2), uint8_t(1));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "neuron_registration_accepts_cousin_discovery_capability_tail");
+    frame.clear();
+    Message::construct(frame, NeuronTopic::registration, int64_t(101), "kernel"_ctv, "os"_ctv, "version"_ctv,
+                       true, "0123456789abcdef"_ctv, uint8_t(1), uint8_t(2), uint8_t(2));
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        !ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()),
+        "neuron_registration_rejects_unknown_cousin_discovery_capability_tail");
+
+    ProdigyCousinDiscoveryQuery cousinQuery = {};
+    cousinQuery.permissionUUID = 0x5c11;
+    cousinQuery.slot = 7;
+    String serializedCousinQuery = {};
+    BitseryEngine::serialize(serializedCousinQuery, cousinQuery);
+    frame.clear();
+    Message::construct(frame, MothershipTopic::pullCousinCounterparts, serializedCousinQuery);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+        "pull_cousin_counterparts_accepts_bounded_query_envelope");
+    String oversizedDiscovery = {};
+    const bool oversizedDiscoveryReserved = oversizedDiscovery.reserve(ProdigyCousinDiscoveryMaximumBytes + 1);
+    suite.expect(oversizedDiscoveryReserved, "cousin_discovery_oversized_fixture_reserves_payload");
+    oversizedDiscovery.resize(ProdigyCousinDiscoveryMaximumBytes + 1);
+    frame.clear();
+    Message::construct(frame, NeuronTopic::cousinDiscoverySnapshot, oversizedDiscovery);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(
+        !ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "cousin_discovery_snapshot_rejects_oversized_envelope");
+    frame.clear();
     Message::construct(frame, NeuronTopic::updateBundle, true, "0123456789abcdef"_ctv, ""_ctv);
     message = reinterpret_cast<Message *>(frame.data());
     suite.expect(

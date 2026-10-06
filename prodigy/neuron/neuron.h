@@ -48,6 +48,7 @@
 #include <prodigy/netdev.detect.h>
 #include <prodigy/transport.artifact.h>
 #include <prodigy/cluster.pair.projection.h>
+#include <prodigy/cousin.discovery.h>
 #include <switchboard/overlay.route.h>
 #include <switchboard/pair.control.h>
 #include <switchboard/switchboard.h>
@@ -1338,7 +1339,7 @@ protected:
     // before it advances the next worker.
     if (controlTransportCredentials.enabled)
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
-                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2));
+                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2), uint8_t(1));
     else
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
                          haveFragments(), installedBundleDigest);
@@ -3082,6 +3083,9 @@ public:
     pairControlRuntime->onEpochStatus = [this](const ProdigyClusterPairEpochReceipt& receipt) {
       forwardClusterPairEpochStatus(receipt);
     };
+    pairControlRuntime->onDiscoverySnapshot = [this](const ProdigyCousinDiscoveryReceipt& receipt) {
+      forwardCousinDiscoveryReceipt(receipt);
+    };
     // The saved projection fences rollback, but may have been revoked while
     // this node was offline. Only a fresh durable current-master projection
     // may activate its credentials on this process incarnation.
@@ -3127,9 +3131,76 @@ public:
     Ring::queueSend(stream);
   }
 
+  bool discoverySnapshotMatchesCurrentProjection(const ProdigyCousinDiscoverySnapshot& snapshot) const
+  {
+    if (snapshot.sourceClusterUUID != clusterPairControlProjection.localClusterUUID) return false;
+    return std::any_of(clusterPairControlProjection.credentials.begin(), clusterPairControlProjection.credentials.end(),
+        [&](const auto& credential) {
+          const bool endpointClustersMatch =
+              (credential.initiator.clusterUUID == snapshot.sourceClusterUUID &&
+               credential.responder.clusterUUID == snapshot.peerClusterUUID) ||
+              (credential.responder.clusterUUID == snapshot.sourceClusterUUID &&
+               credential.initiator.clusterUUID == snapshot.peerClusterUUID);
+          return credential.pairUUID == snapshot.pairUUID && credential.rootGeneration == snapshot.rootGeneration &&
+              credential.keyEpoch == snapshot.keyEpoch && endpointClustersMatch;
+        });
+  }
+
+  void forwardCousinDiscoveryReceipt(const ProdigyCousinDiscoveryReceipt& receipt)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    const bool credentialMatches = std::any_of(clusterPairControlProjection.credentials.begin(),
+        clusterPairControlProjection.credentials.end(), [&](const auto& credential) {
+          return credential.pairUUID == receipt.snapshot.pairUUID &&
+              credential.rootGeneration == receipt.snapshot.rootGeneration && credential.keyEpoch == receipt.wireEpoch &&
+              ((clusterPairControlEndpointEquals(credential.initiator, receipt.localEndpoint) &&
+                clusterPairControlEndpointEquals(credential.responder, receipt.remoteEndpoint)) ||
+               (clusterPairControlEndpointEquals(credential.responder, receipt.localEndpoint) &&
+                clusterPairControlEndpointEquals(credential.initiator, receipt.remoteEndpoint)));
+        });
+    if (!pairControlRuntime || !prodigyLocalClusterPairControlProjectionValid(clusterPairControlProjection, true) ||
+        !prodigyCousinDiscoveryReceiptValid(receipt) ||
+        receipt.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+        receipt.localEndpoint.clusterUUID != clusterPairControlProjection.localClusterUUID ||
+        receipt.localEndpoint.nodeUUID != clusterPairControlProjection.nodeUUID ||
+        receipt.snapshot.sourceClusterUUID != receipt.remoteEndpoint.clusterUUID ||
+        receipt.snapshot.peerClusterUUID != receipt.localEndpoint.clusterUUID || !credentialMatches ||
+        !controlPeerCurrentlyAuthorized(peerUUID) ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+    // Bound queued observations. Live snapshots repeat; if a one-shot close
+    // is dropped, Brain's independent receipt expiry still removes the view.
+    if (stream->pendingSend || stream->wBuffer.outstandingBytes() != 0) return;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, receipt);
+    if (serialized.size() > ProdigyCousinDiscoveryMaximumBytes) return;
+    Message::construct(stream->wBuffer, NeuronTopic::cousinDiscoveryReceipt, serialized);
+    Ring::queueSend(stream);
+  }
+
   bool controlPeerCurrentlyAuthorized(uint128_t peerUUID) const
   {
     return controlTransportCredentials.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain);
+  }
+
+  void receiveCousinDiscoverySnapshot(const ProdigyCousinDiscoveryPublication& publication)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (!controlTransportCredentials.enabled || !pairControlRuntime ||
+        !prodigyLocalClusterPairControlProjectionValid(clusterPairControlProjection, true) ||
+        !prodigyCousinDiscoveryPublicationValid(publication) ||
+        publication.nodeUUID != controlTransportCredentials.self.nodeUUID ||
+        publication.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+        publication.snapshot.sourceClusterUUID != clusterPairControlProjection.localClusterUUID ||
+        !discoverySnapshotMatchesCurrentProjection(publication.snapshot) ||
+        !controlPeerCurrentlyAuthorized(peerUUID) ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+    // The carrier owns the bounded replacement cache and its six-second
+    // expiry.  This path adds no persistence or independent lifecycle.
+    (void)pairControlRuntime->installDiscoverySnapshot(publication);
   }
 
   virtual bool persistTransportCredentialPeerProjection(
@@ -5060,6 +5131,17 @@ public:
               !prodigyLocalClusterPairControlProjectionValid(projection, true))
           { if (brain) queueCloseIfActive(brain); break; }
           receiveClusterPairControlProjection(nonce, projection);
+          break;
+        }
+      case NeuronTopic::cousinDiscoverySnapshot:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ProdigyCousinDiscoveryPublication publication = {};
+          if (!BitseryEngine::deserializeSafe(serialized, publication) ||
+              !prodigyCousinDiscoveryPublicationValid(publication))
+          { if (brain) queueCloseIfActive(brain); break; }
+          receiveCousinDiscoverySnapshot(publication);
           break;
         }
       case NeuronTopic::registration:
