@@ -11227,6 +11227,70 @@ static void testRetainedStatelessHealthRestoresRunning(TestSuite& suite)
   brain.containers.erase(taskContainer.uuid);
   task.containers.erase(&taskContainer);
 
+  // A fully restored non-all-master stateful cohort reaches its final health
+  // callback after the ordinary inventory pass. Its NONE state must converge
+  // through the existing recovery owner without reviving partial cohorts or
+  // active materialized handoffs.
+  ApplicationDeployment stateful = {};
+  stateful.plan = makeDeploymentPlan(62'573, 265'325'899'677'729ULL);
+  stateful.plan.isStateful = true;
+  stateful.plan.config.type = ApplicationType::stateful;
+  stateful.plan.stateful.allMasters = false;
+  stateful.plan.stateful.clientPrefix = (uint64_t(62'573) << 48) | (uint64_t(1) << 40);
+  stateful.plan.stateful.siblingPrefix = (uint64_t(62'573) << 48) | (uint64_t(2) << 40);
+  stateful.plan.stateful.seedingPrefix = (uint64_t(62'573) << 48) | (uint64_t(3) << 40);
+  stateful.plan.stateful.allowUpdateInPlace = true;
+  stateful.state = DeploymentState::none;
+  stateful.nTargetBase = 3;
+  stateful.nDeployedBase = 3;
+  stateful.nHealthyBase = 1;
+  const StatefulMeshRoles statefulRoles = StatefulMeshRoles::forShardGroup(
+      stateful.plan.stateful, stateful.plan.config.applicationID, 0);
+  ContainerView statefulContainers[3] = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    ContainerView& current = statefulContainers[index];
+    current.uuid = uint128_t(0xA574 + index);
+    current.deploymentID = stateful.plan.config.deploymentID();
+    current.applicationID = stateful.plan.config.applicationID;
+    current.machine = &machine;
+    current.fragment = 8 + index;
+    current.lifetime = ApplicationLifetime::base;
+    current.isStateful = true;
+    current.shardGroup = 0;
+    current.state = index == 0 ? ContainerState::healthy : ContainerState::crashedRestarting;
+    current.runtimeReady = true;
+    current.explicitStatefulMeshRoles = statefulRoles;
+    if (index > 0)
+    {
+      current.explicitStatefulMeshRoles.client = 0;
+    }
+    stateful.containers.insert(&current);
+    stateful.containersByShardGroup.insert(0, &current);
+    brain.containers.insert_or_assign(current.uuid, &current);
+  }
+  brain.deployments.insert_or_assign(stateful.plan.config.deploymentID(), &stateful);
+  brain.deploymentsByApp.insert_or_assign(stateful.plan.config.applicationID, &stateful);
+
+  brain.noteLocalContainerHealthy(statefulContainers[1].uuid);
+  suite.expect(stateful.state == DeploymentState::none && stateful.nHealthy() == 2,
+               "retained_health_partial_stateful_target_does_not_reenter_recovery");
+  brain.noteLocalContainerHealthy(statefulContainers[2].uuid);
+  suite.expect(stateful.state == DeploymentState::running && stateful.nHealthy() == 3,
+               "retained_health_complete_stateful_target_reenters_recovery_and_runs");
+  brain.noteLocalContainerHealthy(statefulContainers[2].uuid);
+  suite.expect(stateful.state == DeploymentState::running && stateful.nHealthy() == 3,
+               "retained_health_duplicate_stateful_receipt_does_not_replay_recovery");
+
+  brain.deploymentsByApp.erase(stateful.plan.config.applicationID);
+  brain.deployments.erase(stateful.plan.config.deploymentID());
+  for (ContainerView& current : statefulContainers)
+  {
+    brain.containers.erase(current.uuid);
+    stateful.containersByShardGroup.eraseEntry(current.shardGroup, &current);
+    stateful.containers.erase(&current);
+  }
+
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.containers.erase(container.uuid);

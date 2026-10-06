@@ -19741,6 +19741,15 @@ public:
         const bool recoveringStatelessDeployment = deployment->plan.isStateful == false &&
                                                    deployment->plan.config.type != ApplicationType::task &&
                                                    deployment->state == DeploymentState::none;
+        // The retained-stateful recovery owner intentionally begins a rebuilt
+        // base cohort in NONE. Unlike an active materialized handoff, it has
+        // no transition flag to re-enter recovery when the final process later
+        // reports healthy. Re-enter only after its complete target is healthy;
+        // NONE excludes deploying, canary, and decommissioning transitions.
+        const bool recoveredStatefulDeployment = deployment->plan.isStateful &&
+                                                  deployment->materializedStatefulRecoveryOwnsTransition == false &&
+                                                  deployment->plan.config.type != ApplicationType::task &&
+                                                  deployment->state == DeploymentState::none;
         deployment->containerIsHealthy(container);
         (void)advanceTlsResumptionLifecycleForDeployment(deployment->plan, Time::now<TimeResolution::ms>(), false);
         replicateContainerRuntimeStateToFollowers(container);
@@ -19758,7 +19767,7 @@ public:
         // Wait for the complete target. Once running, repeated health receipts
         // must not trigger another recovery/routing replay.
         if (recoveringStatefulDeployment ||
-            (recoveringStatelessDeployment && deployment->nTarget() > 0 &&
+            ((recoveringStatelessDeployment || recoveredStatefulDeployment) && deployment->nTarget() > 0 &&
              deployment->nHealthy() >= deployment->nTarget()))
         {
           recoverDeploymentsAfterNeuronState();
