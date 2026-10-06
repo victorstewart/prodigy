@@ -1337,6 +1337,161 @@ static void testNeuronClusterPairControlProjectionDurabilityAndStreamFence(TestS
   ::close(stream.fd); stream.fd = -1;
 }
 
+static void testLocalPairProjectionMarkerBindsProjectionVersion(TestSuite& suite)
+{
+  constexpr uint64_t pairMarkerV1 = 0x5041495250524a31ULL;
+  constexpr uint64_t pairMarkerV2 = 0x5041495250524a32ULL;
+  auto replaceMarker = [](String& encoded, uint64_t from, uint64_t to) {
+    std::array<uint8_t, sizeof(from)> needle = {}, replacement = {};
+    std::memcpy(needle.data(), &from, sizeof(from));
+    std::memcpy(replacement.data(), &to, sizeof(to));
+    for (uint32_t offset = 0; offset + needle.size() <= encoded.size(); ++offset)
+      if (std::memcmp(encoded.data() + offset, needle.data(), needle.size()) == 0)
+      {
+        std::memcpy(encoded.data() + offset, replacement.data(), replacement.size());
+        return true;
+      }
+    return false;
+  };
+  auto encode = [](uint32_t version) {
+    ProdigyPersistentLocalBrainState state = {};
+    state.uuid = 0x72f1; state.ownerClusterUUID = 0x72f2;
+    state.clusterPairControlProjection.protocolVersion = version;
+    state.clusterPairControlProjection.localClusterUUID = state.ownerClusterUUID;
+    state.clusterPairControlProjection.nodeUUID = state.uuid;
+    state.clusterPairControlProjection.committedAuthorityGeneration = 11;
+    if (version == ProdigyLocalClusterPairControlProjection::version)
+    {
+      ProdigyClusterPairEpochStatus status = {};
+      status.protocolVersion = ProdigyClusterPairEpochProtocolVersion;
+      status.pairUUID = 0x72f3; status.rootGeneration = 1;
+      status.sourceClusterUUID = state.ownerClusterUUID; status.peerClusterUUID = 0x72f4;
+      status.agreedKeyEpoch = status.oldEpoch = 1; status.nextEpoch = 2;
+      status.agreementUUID = 0x72f5; status.phase = ProdigyClusterPairEpochPhase::prepared;
+      status.authorityGeneration = 11;
+      (void)prodigyClusterPairEpochAgreementDigest(status.pairUUID, status.rootGeneration,
+          status.sourceClusterUUID, status.peerClusterUUID, status.agreementUUID, status.oldEpoch,
+          status.nextEpoch, status.agreementDigest);
+      state.clusterPairControlProjection.epochStatuses.push_back(std::move(status));
+    }
+    String encoded = {}; BitseryEngine::serialize(encoded, state);
+    return encoded;
+  };
+
+  String v2 = encode(2);
+  ProdigyPersistentLocalBrainState restored = {};
+  const bool v2RoundTrip = BitseryEngine::deserializeSafe(v2, restored) &&
+      restored.clusterPairControlProjection.protocolVersion == 2 &&
+      restored.clusterPairControlProjection.committedAuthorityGeneration == 11;
+  const bool v2RelabeledV1Rejected = replaceMarker(v2, pairMarkerV2, pairMarkerV1) &&
+      !BitseryEngine::deserializeSafe(v2, restored);
+
+  String v1 = encode(1);
+  const bool v1RelabeledV2Rejected = replaceMarker(v1, pairMarkerV1, pairMarkerV2) &&
+      !BitseryEngine::deserializeSafe(v1, restored);
+  ProdigyPersistentLocalBrainState emptyV2 = {};
+  emptyV2.uuid = 0x72f6; emptyV2.ownerClusterUUID = 0x72f7;
+  emptyV2.clusterPairControlProjection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  emptyV2.clusterPairControlProjection.localClusterUUID = emptyV2.ownerClusterUUID;
+  emptyV2.clusterPairControlProjection.nodeUUID = emptyV2.uuid;
+  emptyV2.clusterPairControlProjection.committedAuthorityGeneration = 11;
+  String legacyShape = {}; BitseryEngine::serialize(legacyShape, emptyV2);
+  const bool emptyV2UsesV1Layout = BitseryEngine::deserializeSafe(legacyShape, restored) &&
+      restored.clusterPairControlProjection.protocolVersion == ProdigyLocalClusterPairControlProjection::legacyVersion1 &&
+      restored.clusterPairControlProjection.epochStatuses.empty();
+  suite.expect(v2RoundTrip && v2RelabeledV1Rejected && v1RelabeledV2Rejected && emptyV2UsesV1Layout,
+      "runtime_pair_projection_marker_binds_v1_v2_public_layout");
+}
+
+static void testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(TestSuite& suite)
+{
+  constexpr uint128_t neuronUUID = uint128_t(0x72e1), brainUUID = uint128_t(0x72e2), remoteNodeUUID = uint128_t(0x72e3);
+  ProjectionReceiptTestNeuron neuron = {};
+  NeuronBrainControlStream stream = {}; ProdigyTransportTLSStream remote = {};
+  reserveProjectionTransport(stream); reserveProjectionTransport(remote);
+  std::array<uint8_t, 32> psk = {}; psk.fill(0x6b);
+  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "pair-epoch-forward"_ctv, neuronUUID, brainUUID) &&
+      remote.beginTransportAEGIS(false, psk.data(), "pair-epoch-forward"_ctv, brainUUID, neuronUUID) &&
+      completeProjectionTransportHandshake(remote, stream);
+  suite.expect(authenticated, "runtime_pair_epoch_status_uses_authenticated_control_stream");
+  if (!authenticated) return;
+  stream.connected = true; stream.tlsPeerVerified = true; stream.tlsPeerUUID = brainUUID;
+  stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); neuron.brain = &stream;
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  ProdigyLocalClusterPairControlProjection remoteProjection = {};
+  const bool projectionBuilt = buildRuntimePairControlProjections(neuronUUID, remoteNodeUUID,
+      neuron.clusterPairControlProjection, remoteProjection);
+  // A newly proposed epoch must cross the existing v1 carrier before either
+  // side can persist a v2 staged projection.
+  neuron.clusterPairControlProjection.protocolVersion = ProdigyLocalClusterPairControlProjection::legacyVersion1;
+  neuron.pairControlRuntime = std::make_unique<SwitchboardPairControlRuntime>();
+  neuron.pairControlRuntime->onEpochStatus = [&neuron](const ProdigyClusterPairEpochReceipt& receipt) {
+    neuron.forwardClusterPairEpochStatus(receipt);
+  };
+
+  ProdigyClusterPairEpochReceipt receipt = {};
+  receipt.localEndpoint = runtimePairControlEndpoint(uint128_t(0x7101), neuronUUID, "fd00:ffff:1234::1");
+  receipt.remoteEndpoint = runtimePairControlEndpoint(uint128_t(0x7201), remoteNodeUUID, "fd00:ffff:1234::2");
+  receipt.wireEpoch = 1; receipt.projectionGeneration = 12;
+  auto& status = receipt.status;
+  status.protocolVersion = ProdigyClusterPairEpochProtocolVersion;
+  status.pairUUID = uint128_t(0x72a1); status.rootGeneration = 1;
+  status.sourceClusterUUID = receipt.remoteEndpoint.clusterUUID;
+  status.peerClusterUUID = receipt.localEndpoint.clusterUUID;
+  status.agreedKeyEpoch = 1; status.agreementUUID = uint128_t(0x72e5);
+  status.oldEpoch = 1; status.nextEpoch = 2; status.phase = ProdigyClusterPairEpochPhase::prepared;
+  status.authorityGeneration = 12;
+  const bool digest = prodigyClusterPairEpochAgreementDigest(status.pairUUID, status.rootGeneration,
+      status.sourceClusterUUID, status.peerClusterUUID, status.agreementUUID, status.oldEpoch,
+      status.nextEpoch, status.agreementDigest);
+  // This fixture observes the constructed frame only; a live Ring send is
+  // neither needed nor valid without the production dispatcher.
+  stream.pendingSend = true;
+  if (digest) neuron.pairControlRuntime->onEpochStatus(receipt);
+  bool forwarded = false;
+  if (!stream.wBuffer.empty())
+  {
+    auto *message = reinterpret_cast<Message *>(stream.wBuffer.data());
+    String serialized = {};
+    if (message->topic == uint16_t(NeuronTopic::clusterPairEpochStatus) &&
+        ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()))
+    {
+      uint8_t *args = message->args; Message::extractToStringView(args, serialized);
+      ProdigyClusterPairEpochReceipt decoded = {};
+      forwarded = args == message->terminal() && BitseryEngine::deserializeSafe(serialized, decoded) &&
+          decoded.projectionGeneration == receipt.projectionGeneration && decoded.wireEpoch == receipt.wireEpoch &&
+          decoded.status.agreementUUID == receipt.status.agreementUUID;
+    }
+  }
+  stream.wBuffer.clear();
+  // A peer can finish its local staging before this side sees the prepared
+  // status. Its ready status must still cross the old carrier to let the local
+  // authority stage; only that authority may count next-epoch readiness.
+  status.phase = ProdigyClusterPairEpochPhase::ready;
+  neuron.pairControlRuntime->onEpochStatus(receipt);
+  const bool readyOnOldForwarded = !stream.wBuffer.empty();
+  stream.wBuffer.clear();
+  receipt.wireEpoch = 2;
+  neuron.pairControlRuntime->onEpochStatus(receipt);
+  const bool unapprovedNextDropped = stream.wBuffer.empty();
+  receipt.wireEpoch = 1;
+  ++receipt.projectionGeneration;
+  neuron.pairControlRuntime->onEpochStatus(receipt);
+  const bool staleProjectionDropped = stream.wBuffer.empty();
+  --receipt.projectionGeneration;
+  neuron.controlTransportCredentials.authorizedPeers.clear();
+  neuron.pairControlRuntime->onEpochStatus(receipt);
+  const bool removedAuthorityDropped = stream.wBuffer.empty();
+  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  neuron.brain = nullptr;
+  neuron.pairControlRuntime->onEpochStatus(receipt);
+  suite.expect(projectionBuilt && digest && forwarded && readyOnOldForwarded && unapprovedNextDropped &&
+      staleProjectionDropped && removedAuthorityDropped && stream.wBuffer.empty(),
+      "runtime_pair_epoch_status_forwards_first_proposal_on_v1_only_to_current_authorized_brain_channel");
+  neuron.pairControlRuntime.reset();
+  ::close(stream.fd); stream.fd = -1;
+}
+
 static void testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(TestSuite& suite)
 {
   if (const char *enabled = std::getenv("PRODIGY_TEST_PAIR_CONTROL_RING");
@@ -1528,5 +1683,7 @@ int main(void)
   testBootPersistenceAdmissionRejectionHasNoReceipt(suite);
   testDurableMaterializedRecoveryHistoricalCull(suite);
   testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(suite);
+  testLocalPairProjectionMarkerBindsProjectionVersion(suite);
+  testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(suite);
   return suite.failed == 0 ? 0 : 1;
 }

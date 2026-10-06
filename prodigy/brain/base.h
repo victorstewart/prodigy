@@ -78,6 +78,7 @@ public:
   bool clusterPairEnrollmentCapabilityAcknowledged = false;
   bool clusterPairOperationsCapabilityAcknowledged = false;
   bool clusterPairRevocationCapabilityAcknowledged = false;
+  bool clusterPairEpochRotationCapabilityAcknowledged = false;
   uint128_t containerRetirementCapabilityUUID = 0;
   int64_t containerRetirementCapabilityBootNs = 0;
   uint64_t containerRetirementCapabilityIOGeneration = 0;
@@ -150,6 +151,7 @@ public:
     clusterPairEnrollmentCapabilityAcknowledged = false;
     clusterPairOperationsCapabilityAcknowledged = false;
     clusterPairRevocationCapabilityAcknowledged = false;
+    clusterPairEpochRotationCapabilityAcknowledged = false;
     containerRetirementCapabilityUUID = 0;
     containerRetirementCapabilityBootNs = 0;
     containerRetirementCapabilityIOGeneration = 0;

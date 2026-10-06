@@ -58,6 +58,7 @@ FIRST_REMOVED=0
 SECOND_REMOVED=0
 PAIR_CONTROL_ATTEMPTED=0
 PAIR_CONTROL_REMOVED=0
+PAIR_PARTITION_PID=0
 
 new_operation() {
   python3 - <<'PY'
@@ -100,7 +101,7 @@ copy_cluster_logs() {
   mkdir -p "$output"
   local workspace provider_evidence
   workspace=$(dirname "$manifest")
-  for provider_evidence in virtual-datacenter.log virtual-datacenter.failure machine-exits.log; do
+  for provider_evidence in virtual-datacenter.log virtual-datacenter.failure machine-exits.log fault-events.log; do
     [[ ! -r "$workspace/$provider_evidence" ]] || cp -p "$workspace/$provider_evidence" "$output/$provider_evidence"
   done
   cp -p "$manifest" "$output/test-cluster-manifest.json" 2>/dev/null || true
@@ -143,6 +144,10 @@ cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
   set +e
+  if (( PAIR_PARTITION_PID )); then
+    wait "$PAIR_PARTITION_PID" || status=1
+    PAIR_PARTITION_PID=0
+  fi
   copy_cluster_logs first "$FIRST_MANIFEST" || status=1
   copy_cluster_logs second "$SECOND_MANIFEST" || status=1
   local boundary_file
@@ -286,7 +291,7 @@ PY_CONTROL
 }
 
 master_identity() {
-  python3 - "$1" "$FIRST_MANIFEST" <<'PY2'
+  python3 - "$1" "${2:-$FIRST_MANIFEST}" <<'PY2'
 import json,pathlib,re,sys
 nodes={node['ipv4']:node['index'] for node in json.loads(pathlib.Path(sys.argv[2]).read_text())['nodes']}
 for block in re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)', pathlib.Path(sys.argv[1]).read_text()):
@@ -353,6 +358,106 @@ printf 'oldMasterUUID=%s newMasterUUID=%s oldMasterIndex=%s newMasterIndex=%s\n'
 wait_pair_control recovered
 m enroll-after-master-fault 45 "$ROOT/enroll-after-master-fault.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION"
 enrollment_complete "$ROOT/enroll-after-master-fault.log"
+
+# Partition through the existing provider. Its completed link mutations are
+# observed read-only before the originating authority receives one request.
+LOWER_LABEL=$(python3 - "$ROOT/create-first.log" "$ROOT/create-second.log" <<'PY_LOWER'
+import pathlib,re,sys
+ids=[int(re.search(r'clusterUUID=(0x[0-9a-f]+) deploymentMode=test',pathlib.Path(p).read_text())[1],16) for p in sys.argv[1:]]
+assert ids[0]!=ids[1]
+print('first' if ids[0]<ids[1] else 'second')
+PY_LOWER
+)
+if [[ "$LOWER_LABEL" == first ]]; then
+  ROTATION_CLUSTER=$FIRST ROTATION_MANIFEST=$FIRST_MANIFEST
+  PARTITION_CLUSTER=$SECOND PARTITION_WORKSPACE=$SECOND_WORKSPACE
+else
+  ROTATION_CLUSTER=$SECOND ROTATION_MANIFEST=$SECOND_MANIFEST
+  PARTITION_CLUSTER=$FIRST PARTITION_WORKSPACE=$FIRST_WORKSPACE
+fi
+m epoch-peer-partition 45 "$ROOT/epoch-peer-partition.log" faultTestCluster "$PARTITION_CLUSTER" link 1,2,3 20000 0 0 0 &
+PAIR_PARTITION_PID=$!
+python3 - "$PARTITION_WORKSPACE/fault-events.log" <<'PY_PARTITION'
+import pathlib,re,sys,time
+path=pathlib.Path(sys.argv[1]);deadline=time.monotonic()+10
+while True:
+    down=set(re.findall(r'fault-link runtime=\d+ link=(vp[123]) state=down',path.read_text() if path.exists() else ''))
+    if down=={'vp1','vp2','vp3'}:break
+    if time.monotonic()>=deadline:raise SystemExit('provider did not witness all peer links down')
+    time.sleep(.1)
+PY_PARTITION
+[[ -r "/proc/$PAIR_PARTITION_PID/stat" ]]
+m epoch-request 15 "$ROOT/epoch-request.log" rotateClusterPairEpoch "$OPERATION" request
+ok "$ROOT/epoch-request.log" rotateClusterPairEpoch
+rg -q 'firstEpoch=1 firstComplete=0' "$ROOT/epoch-request.log"
+EPOCH_AGREEMENT=$(python3 - "$ROOT/epoch-request.log" <<'PY_AGREEMENT'
+import pathlib,re,sys
+value=re.search(r'firstAgreement=([0-9a-f]{32})',pathlib.Path(sys.argv[1]).read_text())[1]
+assert int(value,16)!=0
+print(value)
+PY_AGREEMENT
+)
+[[ -r "/proc/$PAIR_PARTITION_PID/stat" ]]
+m epoch-origin-report 8 "$ROOT/epoch-origin-report.log" clusterReport "$ROTATION_CLUSTER"
+ready "$ROOT/epoch-origin-report.log"
+IFS=$'\t' read -r EPOCH_MASTER_INDEX EPOCH_MASTER_UUID EPOCH_MASTER_BOOT < <(master_identity "$ROOT/epoch-origin-report.log" "$ROTATION_MANIFEST")
+m epoch-master-fault 45 "$ROOT/epoch-master-fault.log" faultTestCluster "$ROTATION_CLUSTER" crash "$EPOCH_MASTER_INDEX" 12000 0 0 0
+ok "$ROOT/epoch-master-fault.log" faultTestCluster
+wait "$PAIR_PARTITION_PID"
+PAIR_PARTITION_PID=0
+ok "$ROOT/epoch-peer-partition.log" faultTestCluster
+python3 - "$ROOT" "$PARTITION_WORKSPACE/fault-events.log" "$(dirname "$ROTATION_MANIFEST")/fault-events.log" "$EPOCH_MASTER_INDEX" <<'PY_FAULT_INTERVAL'
+import json,pathlib,re,sys
+root=pathlib.Path(sys.argv[1]); groups={}
+for runtime,link,state,at in re.findall(r'fault-link runtime=(\d+) link=(vp[123]) state=(down|up) atMs=(\d+)',pathlib.Path(sys.argv[2]).read_text()):
+    groups.setdefault(runtime,{}).setdefault(state,{})[link]=int(at)
+assert len(groups)==1, 'partition receipt runtime identity changed'
+runtime,events=next(iter(groups.items()))
+assert set(events.get('down',{}))==set(events.get('up',{}))=={'vp1','vp2','vp3'}, 'partition restoration receipt missing'
+fully_down=max(events['down'].values()); restore_started=min(events['up'].values())
+requests=[json.loads(p.read_text()) for p in (root/'receipts').glob('epoch-request-*.json')]
+assert len(requests)==1 and fully_down<=requests[0]['startedMs']<=requests[0]['endedMs']<restore_started, 'rotation request escaped partition'
+crashes=[int(at) for machine,at in re.findall(r'fault-crash runtime=\d+ machine=(\d+) atMs=(\d+)',pathlib.Path(sys.argv[3]).read_text()) if machine==sys.argv[4]]
+assert any(requests[0]['endedMs']<=at<restore_started for at in crashes), 'master crash escaped partition'
+(root/'epoch-fault-interval.json').write_text(json.dumps({'runtime':runtime,'links':events,'request':requests[0],'masterCrashMs':[at for at in crashes if requests[0]['endedMs']<=at<restore_started]},indent=2)+'\n')
+PY_FAULT_INTERVAL
+# No epoch control commands occur while the clusters resume and agree.
+python3 - "$ROOT" "$FIRST_MANIFEST" "$SECOND_MANIFEST" <<'PY_EPOCH'
+import json,pathlib,re,sys,time
+root=pathlib.Path(sys.argv[1]);initial=json.loads((root/'pair-control-initial.json').read_text())
+expected={tuple(x) for x in initial['expected']};pairs=set(initial['pairUUIDs'])
+logs=[pathlib.Path(node['stdoutLog']) for p in sys.argv[2:] for node in json.loads(pathlib.Path(p).read_text())['nodes']]
+deadline=time.monotonic()+60
+while True:
+    observed=set()
+    for path in logs:
+        for own,peer,pair,epoch in re.findall(r'switchboard pair-control ready local=([0-9a-f]{32}) peer=([0-9a-f]{32}) pair=([0-9a-f]{32}) rootGeneration=1 keyEpoch=(\d+)',path.read_text(errors='replace')):
+            assert pair in pairs and epoch in ('1','2')
+            if epoch=='2':observed.add((own,peer))
+    if expected<=observed:break
+    if time.monotonic()>=deadline:raise SystemExit(f'epoch2 missing authenticated directions: {sorted(expected-observed)}')
+    time.sleep(.2)
+(root/'pair-control-epoch2.json').write_text(json.dumps({'expected':sorted(expected),'observed':sorted(observed),'pairUUIDs':sorted(pairs),'keyEpoch':2},indent=2)+'\n')
+PY_EPOCH
+wait_ready "$FIRST" first-after-epoch
+wait_ready "$SECOND" second-after-epoch
+python3 - "$ROOT/$LOWER_LABEL-after-epoch-cluster-report.log" "$EPOCH_MASTER_UUID" "$EPOCH_MASTER_BOOT" <<'PY_EPOCH_RESTART'
+import pathlib,re,sys
+for block in re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)',pathlib.Path(sys.argv[1]).read_text()):
+    identity=re.search(r'(?m)^[ \t]*identity uuid=(\S+)',block);boot=re.search(r'\bbootTimeMs=([0-9]+)',block)
+    if identity and identity[1]==sys.argv[2] and boot:
+        assert boot[1]!=sys.argv[3], 'rotation master did not change incarnation'
+        break
+else: raise SystemExit('rotation master missing after recovery')
+PY_EPOCH_RESTART
+for attempt in {1..30}; do
+  m epoch-query 15 "$ROOT/epoch-query.log" rotateClusterPairEpoch "$OPERATION" query
+  ok "$ROOT/epoch-query.log" rotateClusterPairEpoch
+  rg -q 'firstEpoch=2 firstComplete=1 secondEpoch=2 secondComplete=1 complete=1' "$ROOT/epoch-query.log" && break
+  sleep .25
+done
+rg -q 'firstEpoch=2 firstComplete=1 secondEpoch=2 secondComplete=1 complete=1' "$ROOT/epoch-query.log"
+rg -q "firstAgreement=$EPOCH_AGREEMENT secondAgreement=$EPOCH_AGREEMENT" "$ROOT/epoch-query.log"
 
 m report-first-final 8 "$ROOT/first-final-cluster-report.log" clusterReport "$FIRST"
 ready "$ROOT/first-final-cluster-report.log"

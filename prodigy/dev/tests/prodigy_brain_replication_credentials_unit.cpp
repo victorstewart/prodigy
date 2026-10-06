@@ -31000,6 +31000,42 @@ static void testMachineInventoryCopyDoesNotCopyTransport(TestSuite& suite)
                "machine_inventory_copy_destruction_preserves_source_session");
 }
 
+static void testClusterPairEpochOperationCodec(TestSuite& suite)
+{
+  ProdigyClusterPairEnrollment enrollment = {};
+  enrollment.pairUUID = 0xe101; enrollment.localClusterUUID = 0xe102; enrollment.peerClusterUUID = 0xe103;
+  enrollment.operationUUID = 0xe104; enrollment.rootGeneration = 1; enrollment.agreedKeyEpoch = 1;
+  enrollment.localAuthorityGeneration = 10; enrollment.state = ProdigyClusterPairEnrollmentState::active;
+  ClusterPairControlEndpoint local = {}, remote = {};
+  local.clusterUUID = enrollment.localClusterUUID; local.nodeUUID = 1; local.port = uint16_t(ReservedPorts::clusterPairControl);
+  remote.clusterUUID = enrollment.peerClusterUUID; remote.nodeUUID = 2; remote.port = uint16_t(ReservedPorts::clusterPairControl);
+  suite.require(ClusterMachine::parseIPAddressLiteral("fd00:e1::1", local.address) &&
+                    ClusterMachine::parseIPAddressLiteral("fd00:e1::2", remote.address),
+                "cluster_pair_epoch_codec_endpoint_fixture");
+  ProdigyClusterPairEnrollmentOperation operation = {};
+  operation.protocolVersion = ProdigyClusterPairEnrollmentOperation::version; operation.pairUUID = enrollment.pairUUID;
+  operation.operationUUID = enrollment.operationUUID; operation.localAuthorityGeneration = enrollment.localAuthorityGeneration;
+  operation.transitionGeneration = 11; operation.pinnedMasterAuthorityEpoch = 9; operation.initialProjectionDelivered = true;
+  operation.frozenElectorate = {1, 2, 3}; operation.localEndpoints = {local}; operation.peerEndpoints = {remote};
+  operation.rotationPhase = ProdigyClusterPairEpochPhase::prepared; operation.agreementUUID = 0xe105;
+  operation.oldEpoch = 1; operation.nextEpoch = 2; operation.rotationTransitionGeneration = 11;
+  operation.rotationPinnedMasterAuthorityEpoch = 9; operation.rotationFrozenElectorate = {1, 2, 3};
+  suite.require(prodigyClusterPairEpochAgreementDigest(enrollment.pairUUID, enrollment.rootGeneration,
+                    enrollment.localClusterUUID, enrollment.peerClusterUUID, operation.agreementUUID,
+                    operation.oldEpoch, operation.nextEpoch, operation.agreementDigest),
+                "cluster_pair_epoch_codec_canonical_digest");
+  String encoded = {}; ProdigyClusterPairEnrollmentOperation decoded = {};
+  suite.expect(prodigyClusterPairEnrollmentOperationValid(operation, enrollment, 11) &&
+                   BitseryEngine::serialize(encoded, operation) > 0 && BitseryEngine::deserializeSafe(encoded, decoded) &&
+                   decoded.protocolVersion == ProdigyClusterPairEnrollmentOperation::version &&
+                   decoded.rotationPhase == ProdigyClusterPairEpochPhase::prepared &&
+                   decoded.rotationFrozenElectorate == operation.rotationFrozenElectorate,
+               "cluster_pair_epoch_codec_v3_round_trip_preserves_pending_agreement");
+  decoded.nextEpoch = 3;
+  suite.expect(!prodigyClusterPairEnrollmentOperationValid(decoded, enrollment, 11),
+               "cluster_pair_epoch_codec_rejects_nonmonotonic_or_noncanonical_epoch");
+}
+
 static void testTransportCredentialDerivationSymmetry(TestSuite& suite)
 {
   ProdigyTransportCredentialAuthorityRoot root = {};
@@ -31525,6 +31561,255 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     suite.expect(!pairBrain.prepareReplicatedMasterAuthorityTransition(mutatedOperation, prepared),
                  "cluster_pair_owner_replication_cannot_mutate_frozen_operation_electorate");
 
+    // Exercise normal v3 epoch rotation on an independent durable copy so
+    // the v2 revocation fixture below continues to prove its legacy path.
+    {
+      TransportCredentialCohortTestBrain epochBrain = {};
+      configureAuthority(epochBrain, pairBrain.masterAuthorityRuntimeState.generation, pairBrain.masterAuthorityEpoch);
+      epochBrain.nBrains = 3;
+      epochBrain.authoritativeTopology = pairBrain.authoritativeTopology;
+      epochBrain.masterAuthorityRuntimeState = pairBrain.masterAuthorityRuntimeState;
+      epochBrain.masterAuthorityRuntimeStateDurable = true;
+      epochBrain.durableMasterAuthorityRuntimeStateGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      BrainView epochPeerA = {}, epochPeerB = {};
+      suite.require(authenticatePeer(epochBrain, epochPeerA, peerAUUID) &&
+                        authenticatePeer(epochBrain, epochPeerB, peerBUUID),
+                    "cluster_pair_epoch_owner_authenticates_frozen_electorate");
+      auto acknowledgeEpochCapabilities = [&](BrainView& peer) {
+        peer.version = ProdigyBinaryVersion;
+        String frame = {};
+        epochBrain.brainHandler(&peer, buildBrainMessage(frame,
+            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 256)));
+      };
+      acknowledgeEpochCapabilities(epochPeerA);
+      acknowledgeEpochCapabilities(epochPeerB);
+      struct SavedProjectionState {
+        uint128_t nonce = 0;
+        uint64_t generation = 0;
+        uint64_t authorityEpoch = 0;
+        uint32_t version = 0;
+        String fingerprint = {};
+        String acknowledgedFingerprint = {};
+      };
+      std::array<SavedProjectionState, 3> savedProjectionStates = {};
+      const std::array<Machine *, 3> epochMachines = {&selfMachine, &peerAMachine, &peerBMachine};
+      for (uint32_t index = 0; index < epochMachines.size(); ++index) {
+        auto& neuron = epochMachines[index]->neuron;
+        savedProjectionStates[index] = {neuron.clusterPairProjectionNonce, neuron.clusterPairProjectionGeneration,
+            neuron.transportPeerProjectionAuthorityEpoch, neuron.clusterPairProjectionVersion,
+            neuron.clusterPairProjectionFingerprint, neuron.clusterPairProjectionAcknowledgedFingerprint};
+      }
+      // Rotation admission requires every local endpoint to have advertised
+      // projection v2 on its current authenticated Brain stream.
+      for (Machine *machine : epochMachines) {
+        machine->neuron.clusterPairProjectionVersion = 2;
+        machine->neuron.transportPeerProjectionAuthorityEpoch = epochBrain.masterAuthorityEpoch;
+        epochBrain.machines.insert(machine);
+        epochBrain.neurons.insert(&machine->neuron);
+      }
+      suite.require(acknowledgeCurrent(epochBrain, epochPeerA),
+                    "cluster_pair_epoch_owner_records_current_prepared_quorum");
+
+      auto& epochOperation = epochBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+      const auto epochBeforeRequest = epochOperation;
+      ProdigyClusterPairEpochRotateRequest epochRequest = {};
+      epochRequest.expectedAuthorityGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      epochRequest.pairUUID = epochOperation.pairUUID;
+      epochRequest.operationUUID = epochOperation.operationUUID;
+      ProdigyClusterPairEpochRotateResponse epochResponse = {};
+      auto staleEpochRequest = epochRequest;
+      --staleEpochRequest.expectedAuthorityGeneration;
+      suite.expect(!epochBrain.requestClusterPairEpochRotation(staleEpochRequest, epochResponse) &&
+                       epochOperation.protocolVersion == epochBeforeRequest.protocolVersion &&
+                       epochOperation.rotationPhase == ProdigyClusterPairEpochPhase::none,
+                   "cluster_pair_epoch_owner_rejects_stale_request_without_mutating_operation");
+      epochBrain.weAreMaster = false;
+      suite.expect(!epochBrain.requestClusterPairEpochRotation(epochRequest, epochResponse) &&
+                       epochOperation.protocolVersion == epochBeforeRequest.protocolVersion &&
+                       epochOperation.rotationPhase == ProdigyClusterPairEpochPhase::none,
+                   "cluster_pair_epoch_owner_rejects_nonmaster_request_without_mutating_operation");
+      epochBrain.weAreMaster = true;
+      epochBrain.holdRuntimePersistence = true;
+      suite.require(epochBrain.requestClusterPairEpochRotation(epochRequest, epochResponse) && epochResponse.found &&
+                        epochOperation.protocolVersion == ProdigyClusterPairEnrollmentOperation::version &&
+                        epochOperation.rotationPhase == ProdigyClusterPairEpochPhase::prepared &&
+                        epochOperation.oldEpoch == 1 && epochOperation.nextEpoch == 2 &&
+                        !epochOperation.peerPrepared && !epochOperation.peerReady,
+                    "cluster_pair_epoch_owner_admits_qualified_prepared_proposal_only_after_capability_quorum");
+      epochBrain.finishRuntimePersistence(true);
+
+      // A ready remote status on the old overlap key is preparation evidence,
+      // but cannot be treated as new-key cutover evidence.
+      suite.require(acknowledgeCurrent(epochBrain, epochPeerA),
+                    "cluster_pair_epoch_owner_reacknowledges_prepared_transition");
+      ProdigyLocalClusterPairControlProjection preparedProjection = {};
+      String preparedFingerprint = {};
+      if (!suite.require(epochBrain.buildLocalClusterPairControlProjection(selfUUID, preparedProjection, preparedFingerprint),
+                         "cluster_pair_epoch_owner_builds_local_prepared_projection")) return;
+      selfMachine.neuron.clusterPairProjectionGeneration = preparedProjection.committedAuthorityGeneration;
+      selfMachine.neuron.clusterPairProjectionFingerprint = preparedFingerprint;
+      ProdigyClusterPairEpochStatus peerReadyOnOld = {};
+      const auto& epochEnrollment = epochBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front();
+      suite.require(epochBrain.buildClusterPairEpochStatus(epochEnrollment, epochOperation, peerReadyOnOld),
+                    "cluster_pair_epoch_owner_builds_prepared_status_for_overlap_receipt");
+      peerReadyOnOld.sourceClusterUUID = epochEnrollment.peerClusterUUID;
+      peerReadyOnOld.peerClusterUUID = epochEnrollment.localClusterUUID;
+      peerReadyOnOld.phase = ProdigyClusterPairEpochPhase::ready;
+      peerReadyOnOld.agreedKeyEpoch = epochOperation.oldEpoch;
+      peerReadyOnOld.committedAgreementUUID = epochOperation.lastCommittedAgreementUUID;
+      ProdigyClusterPairEpochReceipt oldReadyReceipt = {};
+      oldReadyReceipt.localEndpoint = epochOperation.localEndpoints.front();
+      oldReadyReceipt.remoteEndpoint = epochOperation.peerEndpoints.front();
+      oldReadyReceipt.wireEpoch = epochOperation.oldEpoch;
+      oldReadyReceipt.projectionGeneration = selfMachine.neuron.clusterPairProjectionGeneration;
+      oldReadyReceipt.status = peerReadyOnOld;
+      epochBrain.receiveClusterPairEpochStatus(&selfMachine.neuron, oldReadyReceipt);
+      suite.expect(epochOperation.peerPrepared && !epochOperation.peerReady,
+                   "cluster_pair_epoch_owner_accepts_ready_over_old_only_as_peer_preparation");
+      epochBrain.finishRuntimePersistence(true);
+
+      // Persisted v3 operations require the v14 runtime envelope.  Relabeling
+      // its bytes as v13 must be rejected by the normal runtime decoder.
+      String v3RuntimeBytes = {};
+      ProdigyMasterAuthorityRuntimeState v3RuntimeRoundTrip = {};
+      uint64_t v3Marker = 0, v3Version = 0;
+      if (!suite.require(BitseryEngine::serialize(v3RuntimeBytes, epochBrain.masterAuthorityRuntimeState) > 0 &&
+                         BitseryEngine::deserializeSafe(v3RuntimeBytes, v3RuntimeRoundTrip) &&
+                         v3RuntimeBytes.size() >= sizeof(v3Marker) + sizeof(v3Version),
+                         "cluster_pair_epoch_owner_serializes_v3_runtime")) return;
+      std::memcpy(&v3Marker, v3RuntimeBytes.data(), sizeof(v3Marker));
+      std::memcpy(&v3Version, v3RuntimeBytes.data() + sizeof(v3Marker), sizeof(v3Version));
+      suite.expect(v3Marker == UINT64_MAX && v3Version == 14 &&
+                       v3RuntimeRoundTrip.clusterPairEnrollmentOperations.front().protocolVersion ==
+                           ProdigyClusterPairEnrollmentOperation::version,
+                   "cluster_pair_epoch_owner_runtime_v14_round_trips_v3_rotation");
+      String relabeledV13 = v3RuntimeBytes;
+      const uint64_t forgedV13 = 13;
+      std::memcpy(relabeledV13.data() + sizeof(uint64_t), &forgedV13, sizeof(forgedV13));
+      ProdigyMasterAuthorityRuntimeState rejectedV13 = {};
+      suite.expect(!BitseryEngine::deserializeSafe(relabeledV13, rejectedV13),
+                   "cluster_pair_epoch_owner_rejects_v3_rotation_in_v13_runtime_envelope");
+
+      // A committed transition changes the enrolled epoch only with the
+      // matching agreement receipt.  A silent epoch bump is rejected during
+      // replicated-transition preparation.
+      String epochBeforeBytes = {}, epochBeforeDigest = {};
+      ProdigyMasterAuthorityStateTransition epochBefore = {};
+      if (!suite.require(epochBrain.serializeCurrentMasterAuthorityTransition(epochBeforeBytes, epochBeforeDigest) &&
+                         BitseryEngine::deserializeSafe(epochBeforeBytes, epochBefore),
+                         "cluster_pair_epoch_owner_serializes_prepared_replica_baseline")) return;
+      auto committedEpoch = epochBefore;
+      ++committedEpoch.runtimeState.generation;
+      auto& committedOperation = committedEpoch.runtimeState.clusterPairEnrollmentOperations.front();
+      auto& committedEnrollment = committedEpoch.runtimeState.clusterPairEnrollments.front();
+      committedOperation.rotationPhase = ProdigyClusterPairEpochPhase::committed;
+      committedOperation.peerPrepared = true;
+      committedOperation.peerReady = true;
+      committedOperation.lastCommittedAgreementUUID = committedOperation.agreementUUID;
+      committedOperation.rotationTransitionGeneration = committedEpoch.runtimeState.generation;
+      committedEnrollment.agreedKeyEpoch = committedOperation.nextEpoch;
+      TransportCredentialCohortTestBrain epochReplica = {};
+      configureAuthority(epochReplica, epochBefore.runtimeState.generation, epochBrain.masterAuthorityEpoch);
+      epochReplica.masterAuthorityRuntimeState = epochBefore.runtimeState;
+      epochReplica.weAreMaster = false;
+      Brain::PreparedMasterAuthorityTransition epochPrepared = {};
+      suite.expect(epochReplica.prepareReplicatedMasterAuthorityTransition(committedEpoch, epochPrepared),
+                   "cluster_pair_epoch_owner_replica_accepts_committed_matching_epoch_receipt");
+      TransportCredentialCohortTestBrain legacyEpochReplica = {};
+      configureAuthority(legacyEpochReplica, replicated.runtimeState.generation, epochBrain.masterAuthorityEpoch);
+      legacyEpochReplica.masterAuthorityRuntimeState = replicated.runtimeState;
+      legacyEpochReplica.weAreMaster = false;
+      suite.expect(legacyEpochReplica.prepareReplicatedMasterAuthorityTransition(committedEpoch, epochPrepared),
+                   "cluster_pair_epoch_owner_replica_catches_up_legacy_active_pair_to_committed_receipt");
+      auto silentEpoch = committedEpoch;
+      ++silentEpoch.runtimeState.generation;
+      ++silentEpoch.runtimeState.clusterPairEnrollments.front().agreedKeyEpoch;
+      silentEpoch.runtimeState.clusterPairEnrollmentOperations.front().rotationTransitionGeneration =
+          silentEpoch.runtimeState.generation;
+      suite.expect(!epochReplica.prepareReplicatedMasterAuthorityTransition(silentEpoch, epochPrepared),
+                   "cluster_pair_epoch_owner_replica_rejects_silent_committed_epoch_change");
+
+      // Completion makes the next explicit lower-cluster request a fresh
+      // agreement while preserving the retained receipt for lagging peers.
+      epochOperation.rotationPhase = ProdigyClusterPairEpochPhase::complete;
+      epochOperation.peerPrepared = true;
+      epochOperation.peerReady = true;
+      epochOperation.lastCommittedAgreementUUID = epochOperation.agreementUUID;
+      epochBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().agreedKeyEpoch = epochOperation.nextEpoch;
+      epochBrain.masterAuthorityRuntimeState.generation = committedEpoch.runtimeState.generation;
+      epochBrain.durableMasterAuthorityRuntimeStateGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      epochOperation.rotationTransitionGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      suite.require(acknowledgeCurrent(epochBrain, epochPeerA),
+                    "cluster_pair_epoch_owner_qualifies_completed_query_with_current_transition");
+      const auto completedQuery = epochBrain.queryClusterPairEpochRotation({1, epochRequest.operationUUID});
+      suite.expect(completedQuery.success && completedQuery.found && completedQuery.complete,
+                   "cluster_pair_epoch_owner_reports_complete_only_while_current_authority_qualified");
+      const uint128_t retainedAgreement = epochOperation.lastCommittedAgreementUUID;
+      epochBrain.masterAuthorityReplicationByPeer.clear();
+      const auto unqualifiedCompletedQuery = epochBrain.queryClusterPairEpochRotation({1, epochRequest.operationUUID});
+      suite.expect(!unqualifiedCompletedQuery.complete,
+                   "cluster_pair_epoch_owner_completed_query_requires_current_qualified_authority");
+      suite.require(acknowledgeCurrent(epochBrain, epochPeerA),
+                    "cluster_pair_epoch_owner_requalifies_complete_before_next_request");
+      epochRequest.expectedAuthorityGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      suite.require(epochBrain.requestClusterPairEpochRotation(epochRequest, epochResponse) &&
+                        epochOperation.rotationPhase == ProdigyClusterPairEpochPhase::prepared &&
+                        epochOperation.agreementUUID != retainedAgreement &&
+                        epochOperation.lastCommittedAgreementUUID == retainedAgreement &&
+                        !epochOperation.peerPrepared && !epochOperation.peerReady,
+                    "cluster_pair_epoch_owner_starts_second_proposal_after_complete_and_retains_prior_receipt");
+      String secondProposalBytes = {}, secondProposalDigest = {};
+      ProdigyMasterAuthorityStateTransition secondProposal = {};
+      if (!suite.require(epochBrain.serializeCurrentMasterAuthorityTransition(secondProposalBytes, secondProposalDigest) &&
+                         BitseryEngine::deserializeSafe(secondProposalBytes, secondProposal),
+                         "cluster_pair_epoch_owner_serializes_second_prepared_proposal")) return;
+      TransportCredentialCohortTestBrain completeEpochReplica = {};
+      configureAuthority(completeEpochReplica, committedEpoch.runtimeState.generation, epochBrain.masterAuthorityEpoch);
+      completeEpochReplica.masterAuthorityRuntimeState = committedEpoch.runtimeState;
+      completeEpochReplica.weAreMaster = false;
+      suite.expect(completeEpochReplica.prepareReplicatedMasterAuthorityTransition(secondProposal, epochPrepared),
+                   "cluster_pair_epoch_owner_replica_accepts_complete_to_second_prepared_proposal");
+      // The peer may have started another proposal before this side receives
+      // its final commit. Its retained receipt must finish the older agreement.
+      ProdigyClusterPairEpochStatus retainedStatus = {};
+      if (!suite.require(epochBrain.buildClusterPairEpochStatus(
+              epochBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front(), epochOperation, retainedStatus),
+              "cluster_pair_epoch_owner_builds_new_proposal_with_retained_commit")) return;
+      epochBrain.finishRuntimePersistence(true);
+      epochOperation = epochBefore.runtimeState.clusterPairEnrollmentOperations.front();
+      epochOperation.rotationPhase = ProdigyClusterPairEpochPhase::ready;
+      epochOperation.peerPrepared = true; epochOperation.peerReady = false;
+      ++epochBrain.masterAuthorityRuntimeState.generation;
+      epochOperation.rotationTransitionGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      epochBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().agreedKeyEpoch = epochOperation.oldEpoch;
+      epochBrain.masterAuthorityRuntimeStateDurable = true;
+      epochBrain.durableMasterAuthorityRuntimeStateGeneration = epochBrain.masterAuthorityRuntimeState.generation;
+      ProdigyLocalClusterPairControlProjection laggingProjection = {}; String laggingFingerprint = {};
+      if (!suite.require(acknowledgeCurrent(epochBrain, epochPeerA) &&
+              epochBrain.buildLocalClusterPairControlProjection(selfUUID, laggingProjection, laggingFingerprint),
+              "cluster_pair_epoch_owner_qualifies_lagging_ready_overlap")) return;
+      selfMachine.neuron.clusterPairProjectionGeneration = laggingProjection.committedAuthorityGeneration;
+      selfMachine.neuron.clusterPairProjectionFingerprint = laggingFingerprint;
+      std::swap(retainedStatus.sourceClusterUUID, retainedStatus.peerClusterUUID);
+      auto retainedReceipt = oldReadyReceipt;
+      retainedReceipt.status = retainedStatus; retainedReceipt.wireEpoch = epochOperation.nextEpoch;
+      retainedReceipt.projectionGeneration = laggingProjection.committedAuthorityGeneration;
+      epochBrain.receiveClusterPairEpochStatus(&selfMachine.neuron, retainedReceipt);
+      suite.expect(epochOperation.peerReady && epochOperation.agreementUUID == retainedAgreement &&
+                       retainedStatus.agreementUUID != epochOperation.agreementUUID,
+                   "cluster_pair_epoch_owner_retained_receipt_finishes_prior_agreement_on_next_key");
+      for (uint32_t index = 0; index < epochMachines.size(); ++index) {
+        auto& neuron = epochMachines[index]->neuron;
+        const auto& saved = savedProjectionStates[index];
+        neuron.clusterPairProjectionNonce = saved.nonce;
+        neuron.clusterPairProjectionGeneration = saved.generation;
+        neuron.transportPeerProjectionAuthorityEpoch = saved.authorityEpoch;
+        neuron.clusterPairProjectionVersion = saved.version;
+        neuron.clusterPairProjectionFingerprint = saved.fingerprint;
+        neuron.clusterPairProjectionAcknowledgedFingerprint = saved.acknowledgedFingerprint;
+      }
+    }
+
     // Revocation is an independent v2 operation phase. It captures the
     // current electorate, never the enrollment electorate, and only releases
     // empty projections after a new exact-transition majority.
@@ -31552,7 +31837,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     suite.require(pairBrain.revokeClusterPairAuthority(revoke, revokeResponse) && revokeResponse.found,
                   "cluster_pair_revoke_owner_admits_two_of_three_authenticated_capabilities");
     auto& revocationOperation = pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
-    suite.expect(revocationOperation.protocolVersion == ProdigyClusterPairEnrollmentOperation::version &&
+    suite.expect(revocationOperation.protocolVersion == ProdigyClusterPairEnrollmentOperation::revocationVersion &&
                      revocationOperation.revocationRequested && !revocationOperation.projectionsWithdrawn &&
                      revocationOperation.revocationFrozenElectorate == pairBrain.clusterPairCurrentElectorate() &&
                      !prodigyClusterPairEnrollmentRootIsZero(pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front()),
@@ -32198,12 +32483,14 @@ int main(void)
   {
     TestSuite suite;
     testMachineInventoryCopyDoesNotCopyTransport(suite);
+    testClusterPairEpochOperationCodec(suite);
     testTransportCredentialDerivationSymmetry(suite);
     testTransportCredentialEnrollmentOwner(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   TestSuite suite;
   testMachineInventoryCopyDoesNotCopyTransport(suite);
+  testClusterPairEpochOperationCodec(suite);
   testTransportCredentialDerivationSymmetry(suite);
   testTransportCredentialEnrollmentOwner(suite);
 

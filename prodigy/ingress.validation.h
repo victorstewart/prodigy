@@ -380,6 +380,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullClusterPairEnrollment:
     case MothershipTopic::revokeClusterPair:
     case MothershipTopic::pullClusterPairRevocation:
+    case MothershipTopic::rotateClusterPairEpoch:
+    case MothershipTopic::pullClusterPairEpochRotation:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;
@@ -747,7 +749,8 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         if (!extractFixed(cursor, terminal, projectionVersion) || projectionVersion != 1) return false;
         if (cursor == terminal) return true;
         uint8_t pairProjectionVersion = 0;
-        return extractFixed(cursor, terminal, pairProjectionVersion) && pairProjectionVersion == 1 && cursor == terminal;
+        return extractFixed(cursor, terminal, pairProjectionVersion) &&
+            (pairProjectionVersion == 1 || pairProjectionVersion == 2) && cursor == terminal;
       }
     case NeuronTopic::transportCredentialPeersAck:
     case NeuronTopic::clusterPairControlCredentialsAck:
@@ -758,6 +761,11 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
         return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
             extractFixed(cursor, terminal, generation) && generation != 0 &&
             extractFixed(cursor, terminal, accepted) && accepted <= 1 && cursor == terminal;
+      }
+    case NeuronTopic::clusterPairEpochStatus:
+      {
+        String encoded;
+        return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 2048 && cursor == terminal;
       }
     case NeuronTopic::machineHardwareProfile:
     case NeuronTopic::pullContainerLogs:
@@ -962,7 +970,7 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
         uint128_t nonce = 0;
         String encoded;
         return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
-            extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 524288 && cursor == terminal;
+            extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 1048576 && cursor == terminal;
       }
     case NeuronTopic::registration:
       {

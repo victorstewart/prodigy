@@ -18490,6 +18490,74 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  void runRotateClusterPairEpoch(int argc, char *argv[])
+  {
+    String failure, action;
+    uint128_t operationUUID = 0;
+    MothershipClusterPairEnrollmentIntent intent;
+    MothershipProdigyCluster first, second;
+    bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    if (valid) action.assign(argv[1]);
+    valid = valid && (action == "request"_ctv || action == "query"_ctv);
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadClusterPairEnrollmentIntent(operationUUID, intent, &failure);
+      String firstID, secondID;
+      firstID.assignItoh(intent.firstClusterUUID); secondID.assignItoh(intent.secondClusterUUID);
+      if (valid) valid = registry.getClusterByIdentity(firstID, first, &failure) &&
+                         registry.getClusterByIdentity(secondID, second, &failure);
+    }
+    auto bindResponse = [&](bool firstSide, const ProdigyClusterPairEpochRotateResponse& response) {
+      const uint128_t local = firstSide ? intent.firstClusterUUID : intent.secondClusterUUID;
+      const uint128_t peer = firstSide ? intent.secondClusterUUID : intent.firstClusterUUID;
+      const auto& enrollment = response.enrollment;
+      const uint64_t admitted = firstSide ? intent.firstEnrolledAuthorityGeneration : intent.secondEnrolledAuthorityGeneration;
+      if (response.protocolVersion != ProdigyClusterPairEpochRotateResponse::version || !response.success || !response.found ||
+          response.localClusterUUID != local || response.currentAuthorityGeneration == 0 ||
+          !prodigyClusterPairEnrollmentDescriptorValid(enrollment) || !prodigyClusterPairEnrollmentRootIsZero(enrollment) ||
+          enrollment.pairUUID != intent.pairUUID || enrollment.operationUUID != operationUUID ||
+          enrollment.localClusterUUID != local || enrollment.peerClusterUUID != peer ||
+          enrollment.rootGeneration != intent.rootGeneration || enrollment.agreedKeyEpoch < intent.keyEpoch ||
+          (admitted != 0 && enrollment.localAuthorityGeneration != admitted) ||
+          enrollment.state != ProdigyClusterPairEnrollmentState::active ||
+          (response.complete && (enrollment.agreedKeyEpoch <= intent.keyEpoch || response.agreementUUID == 0)) ||
+          response.localEndpoints != (firstSide ? intent.firstEndpoints : intent.secondEndpoints) ||
+          response.peerEndpoints != (firstSide ? intent.secondEndpoints : intent.firstEndpoints))
+      { failure.assign("pair epoch response conflicts with the active enrollment identity"_ctv); return false; }
+      return true;
+    };
+    auto querySide = [&](bool firstSide, ProdigyClusterPairEpochRotateResponse& response) {
+      String name = firstSide ? first.name : second.name;
+      ProdigyClusterPairEpochRotateQuery query; query.operationUUID = operationUUID;
+      return configureControlTarget(name.c_str(), &failure) &&
+          requestTopicRoundTrip(MothershipTopic::pullClusterPairEpochRotation, query, response, failure) && bindResponse(firstSide, response);
+    };
+    ProdigyClusterPairEpochRotateResponse firstResponse, secondResponse;
+    if (valid) valid = querySide(true, firstResponse);
+    if (valid && action == "request"_ctv)
+    {
+      // The stored intent is canonical: the lower cluster originates the
+      // proposal. Its peer prepares and activates through pair control only.
+      ProdigyClusterPairEpochRotateRequest request;
+      request.pairUUID = intent.pairUUID; request.operationUUID = operationUUID;
+      request.expectedAuthorityGeneration = firstResponse.currentAuthorityGeneration;
+      valid = requestTopicRoundTrip(MothershipTopic::rotateClusterPairEpoch, request, firstResponse, failure) &&
+          bindResponse(true, firstResponse) && firstResponse.agreementUUID != 0;
+    }
+    if (valid && action == "query"_ctv) valid = querySide(false, secondResponse);
+    const bool complete = firstResponse.complete && secondResponse.complete &&
+        firstResponse.enrollment.agreedKeyEpoch == secondResponse.enrollment.agreedKeyEpoch &&
+        firstResponse.agreementUUID == secondResponse.agreementUUID;
+    basics_log("rotateClusterPairEpoch success=%u action=%s operationUUID=%016llx%016llx firstEpoch=%llu firstComplete=%u secondEpoch=%llu secondComplete=%u complete=%u firstAgreement=%016llx%016llx secondAgreement=%016llx%016llx failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        (unsigned long long)firstResponse.enrollment.agreedKeyEpoch, unsigned(firstResponse.complete),
+        (unsigned long long)secondResponse.enrollment.agreedKeyEpoch, unsigned(secondResponse.complete), unsigned(complete),
+        (unsigned long long)(firstResponse.agreementUUID >> 64), (unsigned long long)firstResponse.agreementUUID,
+        (unsigned long long)(secondResponse.agreementUUID >> 64), (unsigned long long)secondResponse.agreementUUID, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   bool bindPairControlBoundary(const MothershipClusterPairEnrollmentIntent& intent,
                                MothershipPairControlBoundaryDescriptor& boundary, String& failure)
   {
@@ -22088,6 +22156,7 @@ public:
         {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
         {"revokeClusterPair",               &Mothership::runRevokeClusterPair              },
+        {"rotateClusterPairEpoch",          &Mothership::runRotateClusterPairEpoch         },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
@@ -22224,6 +22293,8 @@ int main(int argc, char *argv[])
     message.append("\tcreates or resumes one durable private pair enrollment intent after both clusters return qualified endpoint rosters; it waits up to 30 seconds for both active projections\n");
     message.append("revokeClusterPair [enrollment operationUUID canonical hex]\n");
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
+    message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
+    message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
     message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");

@@ -72,7 +72,9 @@ enum class MothershipTopic : uint16_t {
   enrollClusterPair,
   pullClusterPairEnrollment,
   revokeClusterPair,
-  pullClusterPairRevocation
+  pullClusterPairRevocation,
+  rotateClusterPairEpoch,
+  pullClusterPairEpochRotation
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -169,6 +171,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "revokeClusterPair";
     case MothershipTopic::pullClusterPairRevocation:
       return "pullClusterPairRevocation";
+    case MothershipTopic::rotateClusterPairEpoch:
+      return "rotateClusterPairEpoch";
+    case MothershipTopic::pullClusterPairEpochRotation:
+      return "pullClusterPairEpochRotation";
   }
 
   return "unknown";
@@ -257,7 +263,8 @@ enum class NeuronTopic : uint16_t {
   transportCredentialPeers,
   transportCredentialPeersAck,
   clusterPairControlCredentials,
-  clusterPairControlCredentialsAck
+  clusterPairControlCredentialsAck,
+  clusterPairEpochStatus
 };
 
 enum class ContainerTopic : uint16_t {

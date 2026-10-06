@@ -18,6 +18,7 @@
 #include <openssl/rand.h>
 
 #include <prodigy/cousin.route.h>
+#include <prodigy/cluster.pair.codec.h>
 
 enum class ClusterPairKeyPurpose : uint8_t {
   servicePairingBase = 1,
@@ -147,15 +148,7 @@ static inline bool clusterPairKeyContextValid(const ClusterPairKeyContext& conte
   return false;
 }
 
-static inline void clusterPairKeyAppendU64BE(String& bytes, uint64_t value)
-{
-  for (int shift = 56; shift >= 0; shift -= 8) bytes.append(uint8_t(value >> shift));
-}
 
-static inline void clusterPairKeyAppendU128BE(String& bytes, uint128_t value)
-{
-  for (int shift = 120; shift >= 0; shift -= 8) bytes.append(uint8_t(value >> shift));
-}
 
 static inline bool clusterPairCanonicalKeyContext(const ClusterPairRoot& root,
                                                      const ClusterPairKeyContext& context,

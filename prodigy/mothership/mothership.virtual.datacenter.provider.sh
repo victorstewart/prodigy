@@ -396,7 +396,8 @@ fault_link_set()
    local current_runtime_identity=""
    current_runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${current_provider_pid}")" || return 1
    [[ "${current_runtime_identity}" == "${expected_runtime_identity}" ]] || return 1
-   nsenter -t "${current_provider_pid}" -m -- ip netns exec "pvd-p-${expected_runtime_identity}" ip link set "${link_name}" "${link_state}"
+   nsenter -t "${current_provider_pid}" -m -- ip netns exec "pvd-p-${expected_runtime_identity}" ip link set "${link_name}" "${link_state}" || return 1
+   printf 'fault-link runtime=%s link=%s state=%s atMs=%s\n' "${expected_runtime_identity}" "${link_name}" "${link_state}" "$(date +%s%3N)" >> "${workspace}/fault-events.log"
 }
 
 fault_datacenter()
@@ -478,6 +479,7 @@ fault_datacenter()
       mv -f "${marker}.$$.tmp" "${marker}"
       kill -KILL -- "-${fault_pid}" >/dev/null 2>&1 || true
       kill -KILL "${fault_pid}" >/dev/null 2>&1 || true
+      printf 'fault-crash runtime=%s machine=%s atMs=%s\n' "${runtime_identity}" "${index}" "$(date +%s%3N)" >> "${workspace}/fault-events.log"
    done
    [[ "${duration_ms}" -ne 0 ]] || return 0
    sleep_milliseconds "${duration_ms}"

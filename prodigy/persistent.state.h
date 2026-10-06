@@ -538,11 +538,20 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
     serializer.object(state.transportCredentialAuthorityRoot);
   }
   constexpr uint64_t pairMarker = 0x5041495250524a31ULL;
+  constexpr uint64_t pairEpochMarker = 0x5041495250524a32ULL;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
     if (state.clusterPairControlProjection.protocolVersion != 0)
     {
-      uint64_t marker = pairMarker; serializer.value8b(marker);
+      // Projection v2 deliberately retains the v1 payload when no epoch
+      // status is present.  Bind the outer marker to that emitted layout,
+      // rather than the in-memory capability version, so the reader never
+      // sees a PRJ2 envelope carrying a v1 body.
+      const bool emitsPairEpochLayout =
+          state.clusterPairControlProjection.protocolVersion >= ProdigyLocalClusterPairControlProjection::version &&
+          !state.clusterPairControlProjection.epochStatuses.empty();
+      uint64_t marker = emitsPairEpochLayout ? pairEpochMarker : pairMarker;
+      serializer.value8b(marker);
       ProdigyLocalClusterPairControlProjection publicProjection = state.clusterPairControlProjection;
       for (auto& credential : publicProjection.credentials) OPENSSL_cleanse(credential.psk, sizeof(credential.psk));
       serializer.object(publicProjection);
@@ -551,9 +560,11 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
   else if (!serializer.adapter().isCompletedSuccessfully())
   {
     uint64_t marker = 0; serializer.value8b(marker);
-    if (marker != pairMarker) { serializer.adapter().error(bitsery::ReaderError::InvalidData); return; }
+    if (marker != pairMarker && marker != pairEpochMarker) { serializer.adapter().error(bitsery::ReaderError::InvalidData); return; }
     serializer.object(state.clusterPairControlProjection);
-    if (!prodigyLocalClusterPairControlProjectionValid(state.clusterPairControlProjection, false))
+    if ((marker == pairMarker && state.clusterPairControlProjection.protocolVersion != 1) ||
+        (marker == pairEpochMarker && state.clusterPairControlProjection.protocolVersion != 2) ||
+        !prodigyLocalClusterPairControlProjectionValid(state.clusterPairControlProjection, false))
       serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
 }

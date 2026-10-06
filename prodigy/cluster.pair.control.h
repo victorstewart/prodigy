@@ -37,16 +37,7 @@ static inline bool clusterPairControlEndpointClaimValid(const ClusterPairControl
          clusterPairControlEndpointEquals(claim.presenter, claim.responder);
 }
 
-static inline void clusterPairControlAppendU16BE(String& output, uint16_t value)
-{
-  output.append(uint8_t(value >> 8));
-  output.append(uint8_t(value));
-}
 
-static inline void clusterPairControlAppendU32BE(String& output, uint32_t value)
-{
-  for (int shift = 24; shift >= 0; shift -= 8) output.append(uint8_t(value >> shift));
-}
 
 static inline void clusterPairControlAppendEndpoint(String& output, const ClusterPairControlEndpoint& endpoint)
 {
@@ -75,29 +66,9 @@ static inline bool clusterPairRenderControlEndpointClaim(const ClusterPairContro
   return true;
 }
 
-static inline bool clusterPairControlReadU16BE(const uint8_t *&cursor, const uint8_t *terminal, uint16_t& value)
-{
-  if (cursor == nullptr || terminal - cursor < 2) return false;
-  value = uint16_t(uint16_t(cursor[0]) << 8 | cursor[1]); cursor += 2; return true;
-}
 
-static inline bool clusterPairControlReadU32BE(const uint8_t *&cursor, const uint8_t *terminal, uint32_t& value)
-{
-  if (cursor == nullptr || terminal - cursor < 4) return false;
-  value = 0; for (uint32_t index = 0; index < 4; ++index) value = (value << 8) | cursor[index]; cursor += 4; return true;
-}
 
-static inline bool clusterPairControlReadU64BE(const uint8_t *&cursor, const uint8_t *terminal, uint64_t& value)
-{
-  if (cursor == nullptr || terminal - cursor < 8) return false;
-  value = 0; for (uint32_t index = 0; index < 8; ++index) value = (value << 8) | cursor[index]; cursor += 8; return true;
-}
 
-static inline bool clusterPairControlReadU128BE(const uint8_t *&cursor, const uint8_t *terminal, uint128_t& value)
-{
-  if (cursor == nullptr || terminal - cursor < 16) return false;
-  value = 0; for (uint32_t index = 0; index < 16; ++index) value = (value << 8) | cursor[index]; cursor += 16; return true;
-}
 
 static inline bool clusterPairControlReadEndpoint(const uint8_t *&cursor, const uint8_t *terminal,
                                                   ClusterPairControlEndpoint& endpoint)

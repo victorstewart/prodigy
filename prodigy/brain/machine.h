@@ -70,6 +70,7 @@ public:
   String transportPeerProjectionAcknowledgedFingerprint;
 
   bool clusterPairProjectionCapable = false;
+  uint8_t clusterPairProjectionVersion = 0;
   uint128_t clusterPairProjectionNonce = 0;
   uint64_t clusterPairProjectionGeneration = 0;
   int64_t clusterPairProjectionSentAtMs = 0;
@@ -92,6 +93,7 @@ public:
     transportPeerProjectionFingerprint.clear();
     transportPeerProjectionAcknowledgedFingerprint.clear();
     clusterPairProjectionCapable = false;
+    clusterPairProjectionVersion = 0;
     clusterPairProjectionNonce = 0;
     clusterPairProjectionGeneration = 0;
     clusterPairProjectionSentAtMs = 0;

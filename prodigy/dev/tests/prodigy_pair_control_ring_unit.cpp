@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -42,7 +43,7 @@ static bool populateCredential(ProdigyLocalClusterPairControlCredential& credent
                                const ClusterPairControlEndpoint& initiator,
                                const ClusterPairControlEndpoint& responder,
                                ClusterPairControlResolver& local,
-                               const ClusterPairControlResolver& remote)
+                               const ClusterPairControlResolver& remote, uint64_t keyEpoch = 11)
 {
   std::array<uint8_t, 32> psk = {};
   String context = {};
@@ -50,7 +51,7 @@ static bool populateCredential(ProdigyLocalClusterPairControlCredential& credent
   if (!local.resolve(remote.localPublicClaim(), psk, context, peerUUID)) return false;
   credential.pairUUID = root.pairUUID;
   credential.rootGeneration = root.rootGeneration;
-  credential.keyEpoch = 11;
+  credential.keyEpoch = keyEpoch;
   credential.initiator = initiator;
   credential.responder = responder;
   credential.localClaim = local.localPublicClaim();
@@ -96,6 +97,29 @@ static bool buildComplementaryProjections(PairProjections& output, uint64_t comm
   output.second.credentials.push_back(std::move(secondCredential));
   return prodigyLocalClusterPairControlProjectionValid(output.first, true) &&
       prodigyLocalClusterPairControlProjectionValid(output.second, true);
+}
+
+static bool appendComplementaryEpoch(PairProjections& output, uint64_t keyEpoch)
+{
+  ClusterPairRoot root = {};
+  root.pairUUID = 0x7c01;
+  root.firstClusterUUID = firstClusterUUID;
+  root.secondClusterUUID = secondClusterUUID;
+  root.rootGeneration = 5;
+  for (uint32_t index = 0; index < root.root.size(); ++index) root.root[index] = uint8_t(index + 1);
+  const auto initiator = endpoint(firstClusterUUID, firstNodeUUID, "fd00:ffff:1234::1");
+  const auto responder = endpoint(secondClusterUUID, secondNodeUUID, "fd00:ffff:1234::2");
+  ClusterPairControlResolver firstResolver = {}, secondResolver = {};
+  if (!clusterPairPrepareControlResolver(root, initiator, responder, initiator, responder, keyEpoch,
+                                         "pair-control-ring-unit"_ctv, firstResolver) ||
+      !clusterPairPrepareControlResolver(root, initiator, responder, responder, initiator, keyEpoch,
+                                         "pair-control-ring-unit"_ctv, secondResolver)) return false;
+  ProdigyLocalClusterPairControlCredential firstCredential = {}, secondCredential = {};
+  if (!populateCredential(firstCredential, root, initiator, responder, firstResolver, secondResolver, keyEpoch) ||
+      !populateCredential(secondCredential, root, initiator, responder, secondResolver, firstResolver, keyEpoch)) return false;
+  output.first.credentials.push_back(std::move(firstCredential));
+  output.second.credentials.push_back(std::move(secondCredential));
+  return true;
 }
 
 static bool buildThreeByThreeFanout(PairFanoutProjections& output, uint64_t committedGeneration)
@@ -162,6 +186,33 @@ static bool buildThreeByThreeFanout(PairFanoutProjections& output, uint64_t comm
 
   for (const auto& projection : output.nodes)
     if (!prodigyLocalClusterPairControlProjectionValid(projection, true)) return false;
+  return true;
+}
+
+static bool addEpochStatus(ProdigyLocalClusterPairControlProjection& projection,
+                           uint128_t peerClusterUUID, uint64_t authorityGeneration,
+                           ProdigyClusterPairEpochPhase phase = ProdigyClusterPairEpochPhase::prepared)
+{
+  ProdigyClusterPairEpochStatus status = {};
+  status.protocolVersion = ProdigyClusterPairEpochProtocolVersion;
+  status.pairUUID = projection.credentials[0].pairUUID;
+  status.rootGeneration = projection.credentials[0].rootGeneration;
+  status.sourceClusterUUID = projection.localClusterUUID;
+  status.peerClusterUUID = peerClusterUUID;
+  status.agreedKeyEpoch = projection.credentials[0].keyEpoch;
+  status.agreementUUID = 0x7d01;
+  status.oldEpoch = projection.credentials[0].keyEpoch;
+  status.nextEpoch = status.oldEpoch + 1;
+  status.phase = phase;
+  status.authorityGeneration = authorityGeneration;
+  if (phase == ProdigyClusterPairEpochPhase::committed || phase == ProdigyClusterPairEpochPhase::complete)
+  {
+    status.agreedKeyEpoch = status.nextEpoch;
+    status.committedAgreementUUID = status.agreementUUID;
+  }
+  if (!prodigyClusterPairEpochAgreementDigest(status.pairUUID, status.rootGeneration, status.sourceClusterUUID,
+      status.peerClusterUUID, status.agreementUUID, status.oldEpoch, status.nextEpoch, status.agreementDigest)) return false;
+  projection.epochStatuses.push_back(std::move(status));
   return true;
 }
 
@@ -277,6 +328,81 @@ static void pairControlCarrierRejectsWrongPSK(TestSuite& suite)
   suite.expect(quiescePair(ring, first, second), "pair_control_ring_wrong_psk_drains_before_destruction");
 }
 
+static void pairControlCarrierTransfersExactEpochStatus(TestSuite& suite)
+{
+  PersistenceRing ring;
+  PairProjections projections = {};
+  const bool built = buildComplementaryProjections(projections, 7) &&
+      addEpochStatus(projections.first, secondClusterUUID, 7) &&
+      addEpochStatus(projections.second, firstClusterUUID, 7);
+  suite.expect(built && prodigyLocalClusterPairControlProjectionValid(projections.first, true) &&
+      prodigyLocalClusterPairControlProjectionValid(projections.second, true),
+      "pair_control_ring_builds_valid_prepared_epoch_status_projections");
+
+  SwitchboardPairControlRuntime first = {}, second = {};
+  std::vector<ProdigyClusterPairEpochReceipt> firstReceipts = {}, secondReceipts = {};
+  first.onEpochStatus = [&](const ProdigyClusterPairEpochReceipt& receipt) { firstReceipts.push_back(receipt); };
+  second.onEpochStatus = [&](const ProdigyClusterPairEpochReceipt& receipt) { secondReceipts.push_back(receipt); };
+  const bool installed = built && first.installProjection(projections.first) && second.installProjection(projections.second);
+  suite.expect(installed && first.start() && second.start(), "pair_control_ring_starts_epoch_status_carriers");
+  const bool transferred = installed && runUntil(ring, [&] {
+    return first.readyCount() == 1 && second.readyCount() == 1 && !firstReceipts.empty() && !secondReceipts.empty();
+  }, 6000);
+  const auto exactReceipt = [&](const std::vector<ProdigyClusterPairEpochReceipt>& receipts,
+                                uint128_t localClusterUUID, uint128_t remoteClusterUUID) {
+    return !receipts.empty() && receipts[0].localEndpoint.clusterUUID == localClusterUUID &&
+        receipts[0].remoteEndpoint.clusterUUID == remoteClusterUUID && receipts[0].wireEpoch == 11 &&
+        receipts[0].projectionGeneration == 7 && receipts[0].status.phase == ProdigyClusterPairEpochPhase::prepared &&
+        receipts[0].status.sourceClusterUUID == remoteClusterUUID && receipts[0].status.peerClusterUUID == localClusterUUID;
+  };
+  suite.expect(transferred && exactReceipt(firstReceipts, firstClusterUUID, secondClusterUUID) &&
+      exactReceipt(secondReceipts, secondClusterUUID, firstClusterUUID),
+      "pair_control_ring_forwards_only_exact_authenticated_epoch_receipts");
+
+  PairProjections malformed = {};
+  const bool malformedBuilt = buildComplementaryProjections(malformed, 7) &&
+      addEpochStatus(malformed.first, secondClusterUUID, 7);
+  if (malformedBuilt) malformed.first.epochStatuses[0].peerClusterUUID = 0xdead;
+  suite.expect(malformedBuilt && !prodigyLocalClusterPairControlProjectionValid(malformed.first, true),
+      "pair_control_ring_rejects_epoch_status_with_unapproved_peer_binding");
+  suite.expect(quiescePair(ring, first, second), "pair_control_ring_epoch_status_scenario_quiesces_before_destruction");
+}
+
+static void pairControlCarrierReadyStatusUsesBothOverlapEpochs(TestSuite& suite)
+{
+  // Dual epochs need one listener and both outbound/inbound socket pairs;
+  // use the existing spacious Ring fixture rather than the default unit slot
+  // budget, which is deliberately sized for one credential pair.
+  PersistenceRing ring(64, 32);
+  PairProjections projections = {};
+  const bool built = buildComplementaryProjections(projections, 8) && appendComplementaryEpoch(projections, 12) &&
+      addEpochStatus(projections.first, secondClusterUUID, 8, ProdigyClusterPairEpochPhase::ready) &&
+      addEpochStatus(projections.second, firstClusterUUID, 8, ProdigyClusterPairEpochPhase::ready);
+  suite.expect(built && prodigyLocalClusterPairControlProjectionValid(projections.first, true) &&
+      prodigyLocalClusterPairControlProjectionValid(projections.second, true),
+      "pair_control_ring_builds_exact_ready_dual_epoch_overlap");
+  SwitchboardPairControlRuntime first = {}, second = {};
+  std::vector<ProdigyClusterPairEpochReceipt> firstReceipts = {}, secondReceipts = {};
+  first.onEpochStatus = [&](const ProdigyClusterPairEpochReceipt& receipt) { firstReceipts.push_back(receipt); };
+  second.onEpochStatus = [&](const ProdigyClusterPairEpochReceipt& receipt) { secondReceipts.push_back(receipt); };
+  const bool installed = built && first.installProjection(projections.first) && second.installProjection(projections.second);
+  suite.expect(installed && first.start() && second.start(), "pair_control_ring_starts_ready_dual_epoch_overlap");
+  const auto sawBothEpochs = [](const std::vector<ProdigyClusterPairEpochReceipt>& receipts) {
+    bool oldEpoch = false, nextEpoch = false;
+    for (const auto& receipt : receipts)
+    {
+      oldEpoch = oldEpoch || receipt.wireEpoch == 11;
+      nextEpoch = nextEpoch || receipt.wireEpoch == 12;
+    }
+    return oldEpoch && nextEpoch;
+  };
+  const bool transferred = installed && runUntil(ring, [&] {
+    return first.readyCount() == 2 && second.readyCount() == 2 && sawBothEpochs(firstReceipts) && sawBothEpochs(secondReceipts);
+  }, 6000);
+  suite.expect(transferred, "pair_control_ring_ready_status_is_accepted_on_old_and_next_overlap_epochs");
+  suite.expect(quiescePair(ring, first, second), "pair_control_ring_ready_overlap_quiesces_before_destruction");
+}
+
 static void pairControlCarrierThreeByThreeFanout(TestSuite& suite)
 {
   // Nine initiating sockets plus three listeners, and nine accepted sockets.
@@ -327,6 +453,8 @@ int main()
   pairControlCarrierReadyAndGenerationAdvance(suite);
   pairControlCarrierRevocationDropsReadinessAndDrains(suite);
   pairControlCarrierRejectsWrongPSK(suite);
+  pairControlCarrierTransfersExactEpochStatus(suite);
+  pairControlCarrierReadyStatusUsesBothOverlapEpochs(suite);
   pairControlCarrierThreeByThreeFanout(suite);
   return suite.failed == 0 ? 0 : 1;
 }

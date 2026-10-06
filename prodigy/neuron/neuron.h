@@ -1338,7 +1338,7 @@ protected:
     // before it advances the next worker.
     if (controlTransportCredentials.enabled)
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
-                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(1));
+                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2));
     else
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
                          haveFragments(), installedBundleDigest);
@@ -3079,6 +3079,9 @@ public:
   {
     if (pairControlRuntime) return false;
     pairControlRuntime = std::make_unique<SwitchboardPairControlRuntime>();
+    pairControlRuntime->onEpochStatus = [this](const ProdigyClusterPairEpochReceipt& receipt) {
+      forwardClusterPairEpochStatus(receipt);
+    };
     // The saved projection fences rollback, but may have been revoked while
     // this node was offline. Only a fresh durable current-master projection
     // may activate its credentials on this process incarnation.
@@ -3088,6 +3091,41 @@ public:
   virtual bool persistClusterPairControlProjection(
       const ProdigyLocalClusterPairControlProjection&, uint128_t peerUUID, std::function<void(bool)> completion)
   { (void)peerUUID; (void)completion; return false; }
+
+  void forwardClusterPairEpochStatus(const ProdigyClusterPairEpochReceipt& receipt)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    const bool credentialMatches = std::any_of(clusterPairControlProjection.credentials.begin(),
+        clusterPairControlProjection.credentials.end(), [&](const auto& credential) {
+          return credential.pairUUID == receipt.status.pairUUID &&
+              credential.rootGeneration == receipt.status.rootGeneration && credential.keyEpoch == receipt.wireEpoch &&
+              ((clusterPairControlEndpointEquals(credential.initiator, receipt.localEndpoint) &&
+                clusterPairControlEndpointEquals(credential.responder, receipt.remoteEndpoint)) ||
+               (clusterPairControlEndpointEquals(credential.responder, receipt.localEndpoint) &&
+                clusterPairControlEndpointEquals(credential.initiator, receipt.remoteEndpoint)));
+        });
+    if (!pairControlRuntime || !prodigyLocalClusterPairControlProjectionValid(clusterPairControlProjection, true) ||
+        receipt.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+        receipt.localEndpoint.clusterUUID != clusterPairControlProjection.localClusterUUID ||
+        receipt.localEndpoint.nodeUUID != clusterPairControlProjection.nodeUUID ||
+        receipt.status.sourceClusterUUID != receipt.remoteEndpoint.clusterUUID ||
+        receipt.status.peerClusterUUID != receipt.localEndpoint.clusterUUID ||
+        !prodigyClusterPairEpochStatusAllowsWireEpoch(receipt.status, receipt.wireEpoch) ||
+        !prodigyClusterPairEpochStatusValid(receipt.status) || !credentialMatches ||
+        !controlPeerCurrentlyAuthorized(peerUUID) ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+    // Epoch status is periodic carrier evidence.  Do not let a delayed Brain
+    // control stream retain an unbounded duplicate queue; the carrier emits it
+    // again after the existing bounded interval.
+    if (stream->wBuffer.outstandingBytes() > 8192) return;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, receipt);
+    if (serialized.size() > 2048) return;
+    Message::construct(stream->wBuffer, NeuronTopic::clusterPairEpochStatus, serialized);
+    Ring::queueSend(stream);
+  }
 
   bool controlPeerCurrentlyAuthorized(uint128_t peerUUID) const
   {

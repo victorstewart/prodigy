@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <memory>
 #include <vector>
@@ -15,6 +16,8 @@
 // or carries application traffic. The first control record is a fixed hello.
 class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
+  static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
+  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2;
   static constexpr size_t maximumSockets = ProdigyLocalClusterPairControlProjectionMaximumCredentials + 16;
   static constexpr int64_t handshakeTimeoutMs = 10000, idleTimeoutMs = 15000, helloIntervalMs = 3000;
   struct Listener : TCPSocket {
@@ -27,8 +30,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     sockaddr_storage observedPeer = {};
     socklen_t observedPeerLength = 0;
     bool closing = false, connected = false, selected = false, ready = false;
-    uint64_t sentSequence = 0, receivedSequence = 0;
-    int64_t createdAt = 0, lastReceiveAt = 0, lastHelloAt = 0;
+    uint64_t sentSequence = 0, receivedSequence = 0, sentStatusSequence = 0, receivedStatusSequence = 0;
+    int64_t createdAt = 0, lastReceiveAt = 0, lastHelloAt = 0, lastStatusAt = 0;
   };
   ProdigyLocalClusterPairControlProjection projection;
   std::vector<std::unique_ptr<Listener>> listeners;
@@ -65,10 +68,11 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   {
     if (connection.closing) return;
     if (connection.ready)
-      std::fprintf(stderr, "switchboard pair-control closed local=%016llx%016llx peer=%016llx%016llx pair=%016llx%016llx\n",
+      std::fprintf(stderr, "switchboard pair-control closed local=%016llx%016llx peer=%016llx%016llx pair=%016llx%016llx rootGeneration=%llu keyEpoch=%llu\n",
           (unsigned long long)(projection.nodeUUID >> 64), (unsigned long long)projection.nodeUUID,
           (unsigned long long)(connection.remote.nodeUUID >> 64), (unsigned long long)connection.remote.nodeUUID,
-          (unsigned long long)(connection.credential.pairUUID >> 64), (unsigned long long)connection.credential.pairUUID);
+          (unsigned long long)(connection.credential.pairUUID >> 64), (unsigned long long)connection.credential.pairUUID,
+          (unsigned long long)connection.credential.rootGeneration, (unsigned long long)connection.credential.keyEpoch);
     connection.closing = true; connection.ready = false;
     Ring::queueClose(&connection);
   }
@@ -123,6 +127,59 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     std::memcpy(key.data(), selected->psk, key.size()); peerUUID = selected->initiator.nodeUUID;
     return true;
   }
+  bool statusMatchesConnection(const ProdigyClusterPairEpochStatus& status, const Connection& connection) const
+  {
+    return prodigyClusterPairEpochStatusValid(status) && status.pairUUID == connection.credential.pairUUID &&
+        status.rootGeneration == connection.credential.rootGeneration && status.sourceClusterUUID == connection.local.clusterUUID &&
+        status.peerClusterUUID == connection.remote.clusterUUID && prodigyClusterPairEpochStatusAllowsWireEpoch(status, connection.credential.keyEpoch);
+  }
+  void queueEpochStatus(Connection& connection, int64_t now)
+  {
+    if (!approved(connection) || connection.closing || !connection.connected || !connection.ready ||
+        !connection.isTransportNegotiated() || !connection.tlsPeerVerified ||
+        connection.tlsPeerUUID != connection.remote.nodeUUID ||
+        (connection.lastStatusAt != 0 && now - connection.lastStatusAt < helloIntervalMs) ||
+        connection.pendingSend || connection.wBuffer.outstandingBytes() != 0) return;
+    const ProdigyClusterPairEpochStatus *status = nullptr;
+    for (const auto& candidate : projection.epochStatuses)
+      if (statusMatchesConnection(candidate, connection)) { if (status) { retire(connection); return; } status = &candidate; }
+    if (!status) return;
+    String record = {};
+    if (connection.sentStatusSequence == UINT64_MAX || !record.reserve(epochRecordBytes)) { retire(connection); return; }
+    clusterPairControlAppendU32BE(record, epochRecordType);
+    clusterPairKeyAppendU64BE(record, ++connection.sentStatusSequence);
+    if (!prodigyClusterPairEpochStatusAppend(record, *status) || record.size() != epochRecordBytes ||
+        !connection.wBuffer.need(epochRecordBytes)) { retire(connection); return; }
+    connection.wBuffer.append(record); connection.lastStatusAt = now;
+    Ring::queueSend(&connection);
+  }
+  bool receiveEpochStatus(Connection& connection, const uint8_t *payload)
+  {
+    const uint8_t *cursor = payload;
+    const uint8_t *end = payload + 8 + ProdigyClusterPairEpochStatusBytes;
+    uint64_t sequence = 0;
+    ProdigyClusterPairEpochStatus status = {};
+    if (!approved(connection) || !connection.ready || !connection.isTransportNegotiated() || !connection.tlsPeerVerified ||
+        connection.tlsPeerUUID != connection.remote.nodeUUID ||
+        !clusterPairControlReadU64BE(cursor, end, sequence) || sequence == 0 || sequence <= connection.receivedStatusSequence ||
+        !prodigyClusterPairEpochStatusParse(cursor, end - cursor, status) ||
+        status.pairUUID != connection.credential.pairUUID || status.rootGeneration != connection.credential.rootGeneration ||
+        status.sourceClusterUUID != connection.remote.clusterUUID || status.peerClusterUUID != connection.local.clusterUUID ||
+        !prodigyClusterPairEpochStatusAllowsWireEpoch(status, connection.credential.keyEpoch)) return false;
+    connection.receivedStatusSequence = sequence;
+    connection.lastReceiveAt = Time::msSinceBoot();
+    if (onEpochStatus)
+    {
+      ProdigyClusterPairEpochReceipt receipt = {};
+      receipt.localEndpoint = connection.local;
+      receipt.remoteEndpoint = connection.remote;
+      receipt.wireEpoch = connection.credential.keyEpoch;
+      receipt.projectionGeneration = projection.committedAuthorityGeneration;
+      receipt.status = std::move(status);
+      onEpochStatus(receipt);
+    }
+    return true;
+  }
   void queueHello(Connection& connection, int64_t now)
   {
     if (!approved(connection) || connection.closing || !connection.connected || !connection.isTransportNegotiated() ||
@@ -134,7 +191,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (connection.sentSequence == UINT64_MAX) { retire(connection); return; }
     String hello;
     if (!hello.reserve(helloBytes)) { retire(connection); return; }
-    clusterPairControlAppendU32BE(hello, 1);
+    clusterPairControlAppendU32BE(hello, helloRecordType);
     clusterPairKeyAppendU128BE(hello, connection.credential.pairUUID);
     clusterPairKeyAppendU64BE(hello, connection.credential.rootGeneration);
     clusterPairKeyAppendU64BE(hello, connection.credential.keyEpoch);
@@ -218,6 +275,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
           (!connection->ready && now - connection->createdAt >= handshakeTimeoutMs) ||
           (connection->ready && now - connection->lastReceiveAt >= idleTimeoutMs)) { retire(*connection); continue; }
       queueHello(*connection, now);
+      queueEpochStatus(*connection, now);
     }
     for (const auto& credential : projection.credentials)
     {
@@ -230,6 +288,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     for (auto& listener : listeners) armAccept(*listener);
   }
 public:
+  std::function<void(const ProdigyClusterPairEpochReceipt&)> onEpochStatus;
+
   // The owner calls quiesce until true before destruction or process exec.
   ~SwitchboardPairControlRuntime()
   {
@@ -304,12 +364,24 @@ public:
     connection->pendingRecv = false;
     if (result <= 0 || uint64_t(result) > connection->rBuffer.remainingCapacity() ||
         !connection->decryptTransportTLS(uint32_t(result))) { retire(*connection); return; }
-    while (connection->rBuffer.outstandingBytes() >= helloBytes)
+    while (connection->rBuffer.outstandingBytes() >= sizeof(uint32_t))
     {
-      if (!receiveHello(*connection, connection->rBuffer.pHead())) { retire(*connection); return; }
-      connection->rBuffer.consume(helloBytes, true);
+      const uint8_t *frame = connection->rBuffer.pHead();
+      const uint8_t *terminal = frame + connection->rBuffer.outstandingBytes();
+      uint32_t type = 0;
+      if (!clusterPairControlReadU32BE(frame, terminal, type)) { retire(*connection); return; }
+      const uint32_t bytes = type == helloRecordType ? helloBytes : type == epochRecordType ? epochRecordBytes : 0;
+      if (bytes == 0) { retire(*connection); return; }
+      if (connection->rBuffer.outstandingBytes() < bytes) break;
+      const uint8_t *record = connection->rBuffer.pHead();
+      if ((type == helloRecordType && !receiveHello(*connection, record)) ||
+          (type == epochRecordType && !receiveEpochStatus(*connection, record + sizeof(uint32_t))))
+      { retire(*connection); return; }
+      connection->rBuffer.consume(bytes, true);
     }
-    queueHello(*connection, Time::msSinceBoot());
+    const int64_t now = Time::msSinceBoot();
+    queueHello(*connection, now);
+    queueEpochStatus(*connection, now);
     if (connection->closing) return;
     if (connection->needsTransportTLSSendKick()) Ring::queueSend(connection);
     Ring::queueRecv(connection);
@@ -322,7 +394,9 @@ public:
     const uint32_t submitted = connection->pendingSendBytes; connection->pendingSendBytes = 0;
     if (result <= 0 || uint32_t(result) > submitted) { connection->noteSendCompleted(); retire(*connection); return; }
     connection->consumeSentBytes(uint32_t(result), false); connection->noteSendCompleted();
-    queueHello(*connection, Time::msSinceBoot());
+    const int64_t now = Time::msSinceBoot();
+    queueHello(*connection, now);
+    queueEpochStatus(*connection, now);
     if (!connection->closing && (connection->needsTransportTLSSendKick() || connection->wBuffer.outstandingBytes()))
       Ring::queueSend(connection);
   }
