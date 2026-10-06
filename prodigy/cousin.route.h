@@ -8,51 +8,14 @@
 #include <networking/ip.h>
 #include <services/prodigy.h>
 
+#include <prodigy/cousin.service.permission.h>
 #include <prodigy/bundle.artifact.h>
-
-// This is routing authorization only. logicalWorkloadUUID identifies the
-// operator-approved routing domain; it is deliberately not application data
-// lineage, a durability assertion, or a writer-fencing token.
-class CousinRouteSlotBitmap {
-public:
-  static constexpr uint32_t slotCount = nStatefulServiceGroupSlots;
-  static constexpr uint32_t wordCount = slotCount / 64;
-  static_assert(slotCount % 64 == 0);
-
-  std::array<uint64_t, wordCount> words = {};
-
-  bool empty(void) const
-  {
-    for (uint64_t word : words)
-      if (word != 0) return false;
-    return true;
-  }
-
-  bool contains(uint16_t slot) const
-  {
-    return slot < slotCount && (words[slot / 64] & (uint64_t(1) << (slot % 64))) != 0;
-  }
-
-  void insert(uint16_t slot)
-  {
-    if (slot < slotCount) words[slot / 64] |= uint64_t(1) << (slot % 64);
-  }
-
-  bool operator==(const CousinRouteSlotBitmap& other) const { return words == other.words; }
-  bool operator!=(const CousinRouteSlotBitmap& other) const { return !(*this == other); }
-};
 
 constexpr static int64_t cousinRouteMaximumLifetimeMs = 24LL * 60 * 60 * 1000;
 // A route UUID admits at most this many distinct operation identities over its
 // lifetime. After the cap, an operator must allocate a new route UUID.
 constexpr static uint32_t cousinRouteMaximumOperationGenerations = 64;
 constexpr static uint32_t cousinRouteMaximumPriorOperationUUIDs = cousinRouteMaximumOperationGenerations - 1;
-
-template <typename S>
-static void serialize(S&& serializer, CousinRouteSlotBitmap& bitmap)
-{
-  for (uint64_t& word : bitmap.words) serializer.value8b(word);
-}
 
 enum class CousinRouteState : uint8_t {
   active = 1,
@@ -61,11 +24,9 @@ enum class CousinRouteState : uint8_t {
   revoked = 4
 };
 
-enum class CousinRouteHalf : uint8_t {
-  source = 1,
-  destination = 2
-};
-
+// This is routing authorization only. logicalWorkloadUUID identifies the
+// operator-approved routing domain; it is deliberately not application data
+// lineage, a durability assertion, or a writer-fencing token.
 class CousinRouteRecord {
 public:
   uint32_t version = 1;
@@ -169,19 +130,9 @@ static inline bool cousinRouteStateValid(CousinRouteState state)
          state == CousinRouteState::withdrawn || state == CousinRouteState::revoked;
 }
 
-static inline bool cousinRouteHalfValid(CousinRouteHalf half)
-{
-  return half == CousinRouteHalf::source || half == CousinRouteHalf::destination;
-}
-
 static inline bool cousinRouteTerminal(const CousinRouteRecord& route)
 {
   return route.state == CousinRouteState::withdrawn || route.state == CousinRouteState::revoked;
-}
-
-static inline uint16_t cousinRouteServiceApplicationID(uint64_t service)
-{
-  return uint16_t(service >> 48);
 }
 
 static inline bool cousinRouteStructurallyValid(const CousinRouteRecord& route)

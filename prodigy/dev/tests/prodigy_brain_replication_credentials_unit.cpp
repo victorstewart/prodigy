@@ -31810,6 +31810,176 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       }
     }
 
+    {
+      // Permissions are durable local policy, not pair secrets or route
+      // admissions. Use a separate authority copy so the pair lifecycle below
+      // remains a v1/v2 compatibility fixture.
+      TransportCredentialCohortTestBrain permissionBrain = {};
+      configureAuthority(permissionBrain, pairBrain.masterAuthorityRuntimeState.generation, pairBrain.masterAuthorityEpoch);
+      permissionBrain.nBrains = 3;
+      permissionBrain.boottimens = 0x9c10;
+      permissionBrain.authoritativeTopology = pairBrain.authoritativeTopology;
+      permissionBrain.masterAuthorityRuntimeState = pairBrain.masterAuthorityRuntimeState;
+      permissionBrain.masterAuthorityRuntimeStateDurable = true;
+      permissionBrain.durableMasterAuthorityRuntimeStateGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      BrainView permissionPeerA = {}, permissionPeerB = {};
+      suite.require(authenticatePeer(permissionBrain, permissionPeerA, peerAUUID) &&
+                        authenticatePeer(permissionBrain, permissionPeerB, peerBUUID),
+                    "local_cousin_permission_owner_authenticates_credential_electorate");
+      auto acknowledgePermissionCapabilities = [&](BrainView& peer) {
+        peer.version = ProdigyBinaryVersion;
+        String frame = {};
+        permissionBrain.brainHandler(&peer, buildBrainMessage(frame,
+            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 512)));
+      };
+      acknowledgePermissionCapabilities(permissionPeerA);
+      acknowledgePermissionCapabilities(permissionPeerB);
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "local_cousin_permission_owner_records_capable_current_quorum");
+      ApplicationDeployment live = {};
+      live.plan.isStateful = true;
+      live.plan.config.applicationID = 0x9a41;
+      live.plan.config.versionID = 1;
+      live.plan.config.containerBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+      live.plan.config.containerBlobBytes = 1;
+      live.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(0x9a41, 3);
+      permissionBrain.deployments.insert_or_assign(live.plan.config.deploymentID(), &live);
+      String serializedLivePlan = {}, livePlanDigest = {}, digestFailure = {};
+      suite.require(BitseryEngine::serialize(serializedLivePlan, live.plan) > 0 &&
+                        prodigyComputeSHA256Hex(serializedLivePlan, livePlanDigest, &digestFailure),
+                    "local_cousin_permission_owner_hashes_current_live_plan");
+      ProdigyLocalCousinServicePermissionRequest permissionRequest = {};
+      permissionRequest.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      permissionRequest.expectedMasterUUID = selfUUID;
+      permissionRequest.expectedMasterBootNs = permissionBrain.boottimens;
+      auto& permission = permissionRequest.permission;
+      permission.permissionUUID = 0x9c01;
+      permission.pairUUID = pairBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().pairUUID;
+      permission.logicalWorkloadUUID = 0x9c02; permission.logicalServiceUUID = 0x9c03;
+      permission.localClusterUUID = clusterUUID; permission.peerClusterUUID = 0x9b99;
+      permission.localHalf = CousinRouteHalf::source;
+      permission.localApplicationID = live.plan.config.applicationID; permission.peerApplicationID = 0x9c42;
+      permission.localCousinServicePrefix = live.plan.stateful.cousinPrefix;
+      permission.peerCousinServicePrefix = MeshServices::generateStatefulService(0x9c42, 3);
+      permission.slots.insert(3); permission.localDeploymentID = live.plan.config.deploymentID();
+      permission.canonicalPlanSHA256 = livePlanDigest; permission.artifactSHA256 = live.plan.config.containerBlobSHA256;
+      permission.artifactBytes = live.plan.config.containerBlobBytes; permission.generation = 1;
+      ProdigyLocalCousinServicePermissionResponse permissionResponse = {};
+      auto stalePermission = permissionRequest;
+      --stalePermission.expectedAuthorityGeneration;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(stalePermission, permissionResponse) &&
+                       permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.empty(),
+                   "local_cousin_permission_owner_rejects_stale_install_without_mutation");
+      permissionBrain.holdRuntimePersistence = true;
+      suite.require(permissionBrain.commitLocalCousinServicePermission(permissionRequest, permissionResponse) &&
+                        permissionResponse.found && !permissionResponse.qualified,
+                    "local_cousin_permission_owner_commits_active_policy_before_quorum");
+      permissionBrain.finishRuntimePersistence(true);
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "local_cousin_permission_owner_records_durable_permission_quorum");
+      const auto activePermission = permissionBrain.queryLocalCousinServicePermission({1, permission.permissionUUID});
+      suite.expect(activePermission.success && activePermission.found && activePermission.qualified &&
+                       activePermission.permission.acceptedAuthorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation,
+                   "local_cousin_permission_owner_reports_only_durable_current_policy_as_qualified");
+      CousinRouteRecord route = {};
+      route.routeUUID = 0x9c11; route.operationUUID = 0x9c12;
+      route.pairUUID = permission.pairUUID; route.logicalWorkloadUUID = permission.logicalWorkloadUUID;
+      route.logicalServiceUUID = permission.logicalServiceUUID;
+      route.sourceClusterUUID = permission.localClusterUUID; route.destinationClusterUUID = permission.peerClusterUUID;
+      route.sourceApplicationID = permission.localApplicationID; route.destinationApplicationID = permission.peerApplicationID;
+      route.sourceCousinServicePrefix = permission.localCousinServicePrefix;
+      route.destinationCousinServicePrefix = permission.peerCousinServicePrefix;
+      route.slots.insert(3); route.destinationRoutablePrefixUUID = 0x9c13;
+      route.destinationTCPPort = uint16_t(ReservedPorts::clusterPairControl);
+      suite.require(ClusterMachine::parseIPAddressLiteral("fd00:9b::1", route.destinationPublicAddress),
+                    "local_cousin_permission_owner_route_fixture_address");
+      route.generation = 1; route.issuedAtMs = 100; route.expiresAtMs = 200;
+      route.keyEpoch = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().agreedKeyEpoch;
+      route.rootGeneration = permissionBrain.masterAuthorityRuntimeState.clusterPairEnrollments.front().rootGeneration;
+      route.state = CousinRouteState::active;
+      suite.expect(permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, 3, 150),
+                   "local_cousin_permission_owner_allows_exact_live_current_route_scope");
+      auto wrongClusterRoute = route; wrongClusterRoute.sourceClusterUUID = 0x9c14;
+      auto wrongApplicationRoute = route; wrongApplicationRoute.sourceApplicationID = 0x9c43;
+      wrongApplicationRoute.sourceCousinServicePrefix = MeshServices::generateStatefulService(0x9c43, 3);
+      auto wrongServiceRoute = route; wrongServiceRoute.logicalServiceUUID = 0x9c15;
+      auto wrongSlotRoute = route; wrongSlotRoute.slots.insert(4);
+      auto wrongRootRoute = route; ++wrongRootRoute.rootGeneration;
+      auto wrongEpochRoute = route; ++wrongEpochRoute.keyEpoch;
+      auto wrongRoleRoute = route; wrongRoleRoute.sourceCousinServicePrefix = MeshServices::generateStatefulService(0x9a41, 4);
+      suite.expect(cousinRouteStructurallyValid(wrongApplicationRoute) && cousinRouteStructurallyValid(wrongRoleRoute) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongClusterRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongApplicationRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongServiceRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongSlotRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongRootRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongEpochRoute, 3, 150) &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongRoleRoute, 3, 150),
+                   "local_cousin_permission_owner_rejects_foreign_role_identity_slot_bitmap_root_and_epoch");
+      const uint32_t savedLiveMemoryMB = live.plan.config.memoryMB;
+      ++live.plan.config.memoryMB;
+      suite.expect(permissionBrain.localCousinServicePermissionAuthorityAcknowledged() &&
+                       !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, 3, 150),
+                   "local_cousin_permission_owner_rejects_live_plan_hash_mismatch_without_losing_authority_quorum");
+      live.plan.config.memoryMB = savedLiveMemoryMB;
+      permissionBrain.masterAuthorityReplicationByPeer.clear();
+      suite.expect(!permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, 3, 150),
+                   "local_cousin_permission_owner_requires_current_exact_majority_for_eligibility");
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "local_cousin_permission_owner_restores_exact_majority_after_predicate_fence");
+      String permissionTransitionBytes = {}, permissionTransitionDigest = {};
+      ProdigyMasterAuthorityStateTransition permissionTransition = {};
+      suite.require(permissionBrain.serializeCurrentMasterAuthorityTransition(permissionTransitionBytes, permissionTransitionDigest) &&
+                        BitseryEngine::deserializeSafe(permissionTransitionBytes, permissionTransition),
+                    "local_cousin_permission_owner_serializes_runtime_v15_transition7");
+      suite.expect(permissionTransition.version == 7 &&
+                       permissionTransition.runtimeState.localCousinServicePermissions.size() == 1,
+                   "local_cousin_permission_owner_transition7_carries_permission_tail");
+      auto relabeledTransition = permissionTransition;
+      relabeledTransition.version = 6;
+      String relabeledTransitionBytes = {};
+      suite.expect(BitseryEngine::serialize(relabeledTransitionBytes, relabeledTransition) == 0 && relabeledTransitionBytes.empty(),
+                   "local_cousin_permission_owner_rejects_permission_tail_in_transition6_envelope");
+      TransportCredentialCohortTestBrain permissionReplica = {};
+      configureAuthority(permissionReplica, pairBrain.masterAuthorityRuntimeState.generation, permissionBrain.masterAuthorityEpoch);
+      permissionReplica.masterAuthorityRuntimeState = pairBrain.masterAuthorityRuntimeState;
+      permissionReplica.weAreMaster = false;
+      Brain::PreparedMasterAuthorityTransition permissionPrepared = {};
+      suite.expect(permissionReplica.prepareReplicatedMasterAuthorityTransition(permissionTransition, permissionPrepared),
+                   "local_cousin_permission_owner_replica_catches_up_active_permission_transition");
+      auto droppedPermission = permissionTransition;
+      ++droppedPermission.runtimeState.generation;
+      droppedPermission.runtimeState.localCousinServicePermissions.clear();
+      permissionReplica.masterAuthorityRuntimeState = permissionTransition.runtimeState;
+      suite.expect(!permissionReplica.prepareReplicatedMasterAuthorityTransition(droppedPermission, permissionPrepared),
+                   "local_cousin_permission_owner_replica_rejects_permission_drop_or_rollback");
+      permissionBrain.weAreMaster = false;
+      auto nonmasterPermission = permissionRequest;
+      nonmasterPermission.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(nonmasterPermission, permissionResponse) &&
+                       permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.size() == 1,
+                   "local_cousin_permission_owner_rejects_nonmaster_mutation_without_rewrite");
+      permissionBrain.weAreMaster = true;
+      permissionBrain.deployments.erase(live.plan.config.deploymentID());
+      auto revokePermission = permissionRequest;
+      revokePermission.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      revokePermission.permission.state = ProdigyLocalCousinServicePermissionState::revoked;
+      revokePermission.permission.generation = 2;
+      suite.require(permissionBrain.commitLocalCousinServicePermission(revokePermission, permissionResponse),
+                    "local_cousin_permission_owner_allows_narrowing_revoke_after_live_plan_disappears");
+      permissionBrain.finishRuntimePersistence(true);
+      suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                    "local_cousin_permission_owner_records_revoked_tombstone_quorum");
+      const auto revokedPermission = permissionBrain.queryLocalCousinServicePermission({1, permission.permissionUUID});
+      suite.expect(revokedPermission.success && revokedPermission.found && revokedPermission.qualified &&
+                       revokedPermission.permission.state == ProdigyLocalCousinServicePermissionState::revoked,
+                   "local_cousin_permission_owner_keeps_durable_revoked_tombstone_qualified");
+      auto resurrection = permissionRequest;
+      resurrection.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(resurrection, permissionResponse),
+                   "local_cousin_permission_owner_rejects_terminal_policy_resurrection");
+    }
+
     // Revocation is an independent v2 operation phase. It captures the
     // current electorate, never the enrollment electorate, and only releases
     // empty projections after a new exact-transition majority.

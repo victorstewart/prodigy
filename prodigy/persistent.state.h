@@ -3374,6 +3374,18 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
   publicSnapshot = {};
   secrets.clear();
   if (failure) failure->clear();
+  // Deployment permissions are public runtime policy, but they still bind to
+  // this snapshot's local authority generation and cluster identity.  Check
+  // them before accepting a snapshot for either public or private storage.
+  if (!snapshot.masterAuthority.runtimeState.localCousinServicePermissions.empty() &&
+      !prodigyLocalCousinServicePermissionsValid(
+          snapshot.masterAuthority.runtimeState.localCousinServicePermissions,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation))
+  {
+    if (failure) failure->assign("persistent brain snapshot local cousin service permission is malformed"_ctv);
+    return false;
+  }
   if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
           snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
           snapshot.brainConfig.clusterUUID,
@@ -3660,6 +3672,15 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   const ProdigyTransportCredentialAuthorityRoot *transportAuthorityRoot =
       secrets.transportCredentialAuthorityRootSecrets.empty() ? nullptr :
       &secrets.transportCredentialAuthorityRootSecrets[0].root;
+  if (!snapshot.masterAuthority.runtimeState.localCousinServicePermissions.empty() &&
+      !prodigyLocalCousinServicePermissionsValid(
+          snapshot.masterAuthority.runtimeState.localCousinServicePermissions,
+          snapshot.brainConfig.clusterUUID,
+          snapshot.masterAuthority.runtimeState.generation))
+  {
+    if (failure) failure->assign("persistent brain snapshot local cousin service permission is malformed"_ctv);
+    return false;
+  }
   if (!prodigyValidateClusterPairEnrollmentOperations(
           snapshot.masterAuthority.runtimeState.clusterPairEnrollments,
           snapshot.masterAuthority.runtimeState.clusterPairEnrollmentOperations,
@@ -4850,8 +4871,15 @@ public:
     else if (prodigyPersistentSnapshotRetirementDescriptorsNeedNoSecrets(snapshot, failure) == false ||
              prodigyPersistentSnapshotServingRuntimeDescriptorsNeedNoSecrets(snapshot, failure) == false ||
              prodigyPersistentSnapshotClusterPairEnrollmentsNeedNoSecrets(snapshot, failure) == false ||
-             prodigyPersistentSnapshotTransportCredentialEnrollmentsNeedNoSecrets(snapshot, failure) == false)
+             prodigyPersistentSnapshotTransportCredentialEnrollmentsNeedNoSecrets(snapshot, failure) == false ||
+             (!snapshot.masterAuthority.runtimeState.localCousinServicePermissions.empty() &&
+              !prodigyLocalCousinServicePermissionsValid(
+                  snapshot.masterAuthority.runtimeState.localCousinServicePermissions,
+                  snapshot.brainConfig.clusterUUID,
+                  snapshot.masterAuthority.runtimeState.generation)))
     {
+      if (failure && failure->empty())
+        failure->assign("persistent brain snapshot local cousin service permission is malformed"_ctv);
       return false;
     }
 

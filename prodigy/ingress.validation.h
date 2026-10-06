@@ -382,6 +382,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullClusterPairRevocation:
     case MothershipTopic::rotateClusterPairEpoch:
     case MothershipTopic::pullClusterPairEpochRotation:
+    case MothershipTopic::commitLocalCousinServicePermission:
+    case MothershipTopic::pullLocalCousinServicePermission:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;

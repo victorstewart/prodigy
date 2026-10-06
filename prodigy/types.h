@@ -14,6 +14,7 @@
 #include <prodigy/container.contract.h>
 #include <prodigy/cluster.pair.enrollment.h>
 #include <prodigy/cluster.pair.authority.h>
+#include <prodigy/cousin.service.permission.h>
 #include <prodigy/transport.credentials.h>
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
@@ -8056,6 +8057,9 @@ public:
   // Durable enrollment metadata only; its root is private snapshot material.
   Vector<ProdigyClusterPairEnrollment> clusterPairEnrollments;
   Vector<ProdigyClusterPairEnrollmentOperation> clusterPairEnrollmentOperations;
+  // Version-fifteen local deployment policy records.  They carry no pair
+  // root, epoch, endpoint, or traffic key material.
+  Vector<ProdigyLocalCousinServicePermission> localCousinServicePermissions;
   // Public enrollment ledger; its one authority root is in the snapshot sidecar.
   Vector<ProdigyTransportCredentialEnrollment> transportCredentialEnrollments;
   Vector<ProdigyTransportCredentialEnrollmentOperation> transportCredentialEnrollmentOperations;
@@ -8070,6 +8074,7 @@ public:
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
         prodigyClusterPairEnrollmentsEqual(clusterPairEnrollments, other.clusterPairEnrollments) == false ||
         clusterPairEnrollmentOperations.size() != other.clusterPairEnrollmentOperations.size() ||
+        prodigyLocalCousinServicePermissionsEqual(localCousinServicePermissions, other.localCousinServicePermissions) == false ||
         transportCredentialEnrollments != other.transportCredentialEnrollments ||
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
@@ -9135,9 +9140,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // Version 10 appends cluster-pair enrollment descriptors; version 11
   // appends internal transport credential enrollment descriptors; version 12
   // appends durable pair-enrollment operations; version 13 permits their
-  // revocation tail; version 14 adds explicitly agreed epoch rotation.
+  // revocation tail; version 14 adds explicitly agreed epoch rotation;
+  // version 15 adds root-free, epoch-neutral local COUSIN deployment policy.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 14;
+  constexpr uint64_t explicitVersion = 15;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9155,6 +9161,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasClusterPairEnrollmentOperations = false;
   bool permitsClusterPairRevocationOperations = false;
   bool permitsClusterPairEpochOperations = false;
+  bool hasLocalCousinServicePermissions = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9185,9 +9192,13 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     // (empty when unused) so a version-three reader has an unambiguous tail.
     hasClusterPairEnrollments = state.clusterPairEnrollments.empty() == false;
     hasClusterPairEnrollmentOperations = state.clusterPairEnrollmentOperations.empty() == false;
-    hasTransportCredentialEnrollments = state.transportCredentialEnrollments.empty() == false || state.transportCredentialEnrollmentOperations.empty() == false || hasClusterPairEnrollmentOperations;
+    hasLocalCousinServicePermissions = state.localCousinServicePermissions.empty() == false;
+    // Version fifteen is cumulative through the v12 operation container.
+    // Emit that bounded empty container when the new policy tail is present.
+    if (hasLocalCousinServicePermissions) hasClusterPairEnrollmentOperations = true;
+    hasTransportCredentialEnrollments = state.transportCredentialEnrollments.empty() == false || state.transportCredentialEnrollmentOperations.empty() == false || hasClusterPairEnrollmentOperations || hasLocalCousinServicePermissions;
     // Version 11 retains the version-10 container even when there are no pairs.
-    if (hasTransportCredentialEnrollments || hasClusterPairEnrollmentOperations) hasClusterPairEnrollments = true;
+    if (hasTransportCredentialEnrollments || hasClusterPairEnrollmentOperations || hasLocalCousinServicePermissions) hasClusterPairEnrollments = true;
     // Version 10 is cumulative and may use a zero concurrency placeholder
     // while retaining the pre-v21 unlimited behavior.
     hasExplicitUpdateSelfFollowerConcurrency = state.updateSelfFollowerConcurrency != 0 || hasClusterPairEnrollments || hasTransportCredentialEnrollments || hasClusterPairEnrollmentOperations;
@@ -9217,10 +9228,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9263,6 +9274,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasClusterPairEnrollmentOperations = version >= 12;
       permitsClusterPairRevocationOperations = version >= 13;
       permitsClusterPairEpochOperations = version >= 14;
+      hasLocalCousinServicePermissions = version >= 15;
     }
   }
 
@@ -9437,6 +9449,16 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.clusterPairEnrollmentOperations.clear();
+  }
+  if (hasLocalCousinServicePermissions)
+  {
+    serializer.container(state.localCousinServicePermissions,
+        ProdigyLocalCousinServicePermissionMaximumRecords,
+        [](auto& nested, ProdigyLocalCousinServicePermission& permission) { nested.object(permission); });
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.localCousinServicePermissions.clear();
   }
 }
 

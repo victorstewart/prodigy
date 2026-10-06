@@ -74,7 +74,11 @@ enum class MothershipTopic : uint16_t {
   revokeClusterPair,
   pullClusterPairRevocation,
   rotateClusterPairEpoch,
-  pullClusterPairEpochRotation
+  pullClusterPairEpochRotation,
+  // Deployment permissions are installed once; ordinary route eligibility is
+  // evaluated locally without a Mothership request.
+  commitLocalCousinServicePermission,
+  pullLocalCousinServicePermission
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -175,6 +179,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "rotateClusterPairEpoch";
     case MothershipTopic::pullClusterPairEpochRotation:
       return "pullClusterPairEpochRotation";
+    case MothershipTopic::commitLocalCousinServicePermission:
+      return "commitLocalCousinServicePermission";
+    case MothershipTopic::pullLocalCousinServicePermission:
+      return "pullLocalCousinServicePermission";
   }
 
   return "unknown";

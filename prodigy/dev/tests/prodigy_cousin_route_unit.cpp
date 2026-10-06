@@ -1,10 +1,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
 
 #include <prodigy/cousin.route.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
+#include <prodigy/mothership/mothership.cousin.permission.h>
 
 class TestSuite {
 public:
@@ -28,6 +30,42 @@ static String digest(char value)
   String result = {};
   for (uint32_t index = 0; index < 64; ++index) result.append(value);
   return result;
+}
+
+static ProdigyLocalCousinServicePermission validLocalCousinPermission(bool accepted = true)
+{
+  ProdigyLocalCousinServicePermission permission = {};
+  permission.permissionUUID = 0x601;
+  permission.pairUUID = 0x300;
+  permission.logicalWorkloadUUID = 0x301;
+  permission.logicalServiceUUID = 0x302;
+  permission.localClusterUUID = 0x401;
+  permission.peerClusterUUID = 0x402;
+  permission.localHalf = CousinRouteHalf::source;
+  permission.localApplicationID = 7;
+  permission.peerApplicationID = 19;
+  permission.localCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  permission.peerCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  permission.slots.insert(3);
+  permission.slots.insert(1001);
+  permission.localDeploymentID = 0x7000000000001;
+  permission.canonicalPlanSHA256 = digest('a');
+  permission.artifactSHA256 = digest('b');
+  permission.artifactBytes = 8192;
+  permission.generation = 1;
+  permission.acceptedAuthorityGeneration = accepted ? 7 : 0;
+  permission.state = ProdigyLocalCousinServicePermissionState::active;
+  return permission;
+}
+
+static bool parseLocalCousinPermissionJSON(const String& json,
+                                           ProdigyLocalCousinServicePermission& permission,
+                                           String& failure)
+{
+  simdjson::dom::parser parser;
+  simdjson::dom::element document;
+  return parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
+         mothershipParseLocalCousinPermissionJSON(document, permission, failure);
 }
 
 static CousinRouteRecord validRoute(uint128_t routeUUID = 0x101, uint128_t operationUUID = 0x201)
@@ -144,6 +182,98 @@ static MothershipPairControlBoundaryDescriptor validPairControlBoundary(
 int main(void)
 {
   TestSuite suite;
+  ProdigyLocalCousinServicePermission permission = validLocalCousinPermission();
+  suite.require(prodigyLocalCousinServicePermissionValid(permission),
+                "local_cousin_permission_accepts_asymmetric_application_mapping");
+  suite.require(prodigyLocalCousinServicePermissionsValid(
+                    Vector<ProdigyLocalCousinServicePermission> {permission}, 0x401, 7),
+                "local_cousin_permission_vector_is_sorted_and_authority_bounded");
+  Vector<ProdigyLocalCousinServicePermission> unsortedPermissions = {permission, permission};
+  unsortedPermissions[1].permissionUUID = permission.permissionUUID - 1;
+  suite.require(!prodigyLocalCousinServicePermissionsValid(unsortedPermissions, 0x401, 7),
+                "local_cousin_permission_vector_rejects_unsorted_identifiers");
+  Vector<ProdigyLocalCousinServicePermission> overBoundPermissions = {};
+  for (uint32_t index = 0; index <= ProdigyLocalCousinServicePermissionMaximumRecords; ++index)
+  {
+    ProdigyLocalCousinServicePermission candidate = permission;
+    candidate.permissionUUID = uint128_t(index) + 1;
+    overBoundPermissions.push_back(std::move(candidate));
+  }
+  suite.require(!prodigyLocalCousinServicePermissionsValid(overBoundPermissions, 0x401, 7),
+                "local_cousin_permission_vector_rejects_more_than_256_records");
+  ProdigyLocalCousinServicePermission revokedPermission = permission;
+  revokedPermission.generation = 2;
+  revokedPermission.state = ProdigyLocalCousinServicePermissionState::revoked;
+  suite.require(prodigyLocalCousinServicePermissionValid(revokedPermission) &&
+                    prodigyLocalCousinServicePermissionScopeMatches(permission, revokedPermission) &&
+                    !prodigyLocalCousinServicePermissionEqual(permission, revokedPermission),
+                "local_cousin_permission_retains_immutable_scope_for_tombstone");
+  ProdigyLocalCousinServicePermission invalidPermission = permission;
+  invalidPermission.peerApplicationID = 20;
+  suite.require(!prodigyLocalCousinServicePermissionValid(invalidPermission),
+                "local_cousin_permission_rejects_prefix_application_mismatch");
+  invalidPermission = permission;
+  invalidPermission.generation = 2;
+  suite.require(!prodigyLocalCousinServicePermissionValid(invalidPermission),
+                "local_cousin_permission_rejects_active_generation_two");
+  invalidPermission = permission;
+  invalidPermission.acceptedAuthorityGeneration = 0;
+  suite.require(!prodigyLocalCousinServicePermissionValid(invalidPermission) &&
+                    prodigyLocalCousinServicePermissionValid(invalidPermission, false),
+                "local_cousin_permission_distinguishes_ingress_from_owner_record");
+
+  // UUID text uses the existing assignItoh whole-byte canonical encoding.
+  const String validPermissionJSON = R"json({"permissionUUID":"0x0601","pairUUID":"0x0300","logicalWorkloadUUID":"0x0301","logicalServiceUUID":"0x0302","localClusterUUID":"0x0401","peerClusterUUID":"0x0402","localHalf":"source","localApplicationID":7,"peerApplicationID":19,"localCousinServicePrefix":1973623371858943,"peerCousinServicePrefix":5351323092386815,"slots":[3,1001],"localDeploymentID":1970324836974593,"canonicalPlanSHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifactSHA256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","artifactBytes":8192})json";
+  ProdigyLocalCousinServicePermission parsedPermission = {};
+  String parseFailure = {};
+  suite.require(parseLocalCousinPermissionJSON(validPermissionJSON, parsedPermission, parseFailure) &&
+                    prodigyLocalCousinServicePermissionValid(parsedPermission, false) &&
+                    parsedPermission.localApplicationID != parsedPermission.peerApplicationID &&
+                    parsedPermission.slots.contains(3) && parsedPermission.slots.contains(1001),
+                "mothership_local_cousin_permission_parser_accepts_asymmetric_policy");
+  auto parserRejects = [&](const std::string& malformed, const char *name) {
+    suite.require(!parseLocalCousinPermissionJSON(String(malformed.c_str()), parsedPermission, parseFailure), name);
+  };
+  const std::string validPermissionText(reinterpret_cast<const char *>(validPermissionJSON.data()), validPermissionJSON.size());
+  std::string malformed = validPermissionText;
+  malformed.replace(malformed.size() - 1, 1, ",\"unexpected\":1}");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_unknown_field");
+  malformed = validPermissionText;
+  malformed.replace(malformed.size() - 1, 1, ",\"permissionUUID\":\"0x0601\"}");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_duplicate_field");
+  malformed = validPermissionText;
+  malformed.replace(malformed.size() - 1, 1, ",\"acceptedAuthorityGeneration\":1}");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_owner_field_injection");
+  malformed = validPermissionText;
+  malformed.replace(malformed.find("[3,1001]"), 8, "[3,3]");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_duplicate_slot");
+  malformed = validPermissionText;
+  malformed.replace(malformed.find("\"localApplicationID\":7"), 22, "\"localApplicationID\":-7");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_negative_numeric");
+  malformed = validPermissionText;
+  malformed.replace(malformed.find("0x0601"), 6, "0x601");
+  parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_noncanonical_uuid");
+
+  String encodedPermission = {};
+  ProdigyLocalCousinServicePermission permissionToEncode = permission;
+  BitseryEngine::serialize(encodedPermission, permissionToEncode);
+  ProdigyLocalCousinServicePermission decodedPermission = {};
+  suite.require(BitseryEngine::deserializeSafe(encodedPermission, decodedPermission) &&
+                    prodigyLocalCousinServicePermissionEqual(permission, decodedPermission),
+                "local_cousin_permission_binary_round_trip_preserves_owner_record");
+  ProdigyMasterAuthorityRuntimeState permissionRuntime = {};
+  permissionRuntime.generation = 7;
+  permissionRuntime.localCousinServicePermissions.push_back(permission);
+  String encodedRuntime = {};
+  BitseryEngine::serialize(encodedRuntime, permissionRuntime);
+  ProdigyMasterAuthorityRuntimeState decodedRuntime = {};
+  suite.require(BitseryEngine::deserializeSafe(encodedRuntime, decodedRuntime) &&
+                    prodigyLocalCousinServicePermissionsEqual(permissionRuntime.localCousinServicePermissions,
+                                                              decodedRuntime.localCousinServicePermissions),
+                "local_cousin_permission_runtime_v15_round_trip");
+  suite.require(prodigyLocalCousinServicePermissionsValid({}, 0, 0),
+                "local_cousin_permission_empty_legacy_vector_remains_valid");
+
   CousinRouteRecord route = validRoute();
   suite.require(cousinRouteStructurallyValid(route), "route_structural_validation_accepts_unequal_application_mapping");
   String routeDigest = {};

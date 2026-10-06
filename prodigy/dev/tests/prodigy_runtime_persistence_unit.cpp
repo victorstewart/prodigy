@@ -1403,6 +1403,107 @@ static void testLocalPairProjectionMarkerBindsProjectionVersion(TestSuite& suite
       "runtime_pair_projection_marker_binds_v1_v2_public_layout");
 }
 
+static ProdigyLocalCousinServicePermission runtimePersistenceCousinPermission(
+    uint128_t permissionUUID, uint128_t localClusterUUID, uint64_t acceptedAuthorityGeneration)
+{
+  ProdigyLocalCousinServicePermission permission = {};
+  permission.permissionUUID = permissionUUID;
+  permission.pairUUID = 0x73a1;
+  permission.logicalWorkloadUUID = 0x73a2;
+  permission.logicalServiceUUID = 0x73a3;
+  permission.localClusterUUID = localClusterUUID;
+  permission.peerClusterUUID = 0x73a4;
+  permission.localHalf = CousinRouteHalf::source;
+  permission.localApplicationID = 73;
+  permission.peerApplicationID = 74;
+  permission.localCousinServicePrefix = MeshServices::generateStatefulService(73, 3);
+  permission.peerCousinServicePrefix = MeshServices::generateStatefulService(74, 3);
+  permission.slots.insert(7);
+  permission.localDeploymentID = (uint64_t(permission.localApplicationID) << 48) | 0x73a5;
+  for (uint32_t index = 0; index < 64; ++index)
+  {
+    permission.canonicalPlanSHA256.append('a');
+    permission.artifactSHA256.append('b');
+  }
+  permission.artifactBytes = 4096;
+  permission.generation = 1;
+  permission.acceptedAuthorityGeneration = acceptedAuthorityGeneration;
+  permission.state = ProdigyLocalCousinServicePermissionState::active;
+  return permission;
+}
+
+static void testPersistentLocalCousinServicePermissions(TestSuite& suite)
+{
+  constexpr uint128_t localClusterUUID = uint128_t(0x73b1);
+  constexpr uint64_t authorityGeneration = 12;
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  snapshot.brainConfig.clusterUUID = localClusterUUID;
+  snapshot.masterAuthority.runtimeState.generation = authorityGeneration;
+  snapshot.masterAuthority.runtimeState.localCousinServicePermissions.push_back(
+      runtimePersistenceCousinPermission(0x73b2, localClusterUUID, authorityGeneration));
+
+  String runtimeWire = {};
+  ProdigyMasterAuthorityRuntimeState runtimeCopy = snapshot.masterAuthority.runtimeState;
+  BitseryEngine::serialize(runtimeWire, runtimeCopy);
+  ProdigyMasterAuthorityRuntimeState runtimeRestored = {};
+  const bool runtimeRoundTrip = BitseryEngine::deserializeSafe(runtimeWire, runtimeRestored) &&
+      prodigyLocalCousinServicePermissionsEqual(
+          runtimeRestored.localCousinServicePermissions,
+          snapshot.masterAuthority.runtimeState.localCousinServicePermissions);
+
+  // Version fifteen's bounded policy tail must not be interpreted as a v14
+  // epoch-operation tail.  The version marker immediately precedes v15.
+  String relabeled = runtimeWire;
+  uint64_t legacyVersion = 14;
+  if (relabeled.size() >= 2 * sizeof(uint64_t))
+    std::memcpy(relabeled.data() + sizeof(uint64_t), &legacyVersion, sizeof(legacyVersion));
+  ProdigyMasterAuthorityRuntimeState relabeledState = {};
+  const bool legacyRelabelRejected = relabeled.size() >= 2 * sizeof(uint64_t) &&
+      !BitseryEngine::deserializeSafe(relabeled, relabeledState);
+
+  // A legacy runtime record has no policy tail.  Decoding it into a reused
+  // state must remove stale policy that was learned from a newer authority.
+  ProdigyMasterAuthorityRuntimeState legacyRuntime = {};
+  legacyRuntime.generation = authorityGeneration;
+  String legacyWire = {};
+  BitseryEngine::serialize(legacyWire, legacyRuntime);
+  ProdigyMasterAuthorityRuntimeState reused = snapshot.masterAuthority.runtimeState;
+  const bool legacyCatchupClearsPermissions = BitseryEngine::deserializeSafe(legacyWire, reused) &&
+      reused.localCousinServicePermissions.empty();
+
+  ScopedPersistentRoot root = {};
+  ProdigyPersistentStateStore store(root.path);
+  String failure = {};
+  const bool saved = store.saveBrainSnapshot(snapshot, &failure);
+  store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentBrainSnapshot restored = {};
+  const bool restartRoundTrip = saved && reopened.loadBrainSnapshot(restored, &failure) &&
+      prodigyLocalCousinServicePermissionsEqual(
+          restored.masterAuthority.runtimeState.localCousinServicePermissions,
+          snapshot.masterAuthority.runtimeState.localCousinServicePermissions);
+  reopened.close();
+
+  ProdigyPersistentBrainSnapshot malformed = snapshot;
+  malformed.masterAuthority.runtimeState.localCousinServicePermissions[0].acceptedAuthorityGeneration =
+      authorityGeneration + 1;
+  ProdigyPersistentBrainSnapshot publicSnapshot = {};
+  ProdigyPersistentBrainSnapshotSecrets secrets = {};
+  String malformedFailure = {};
+  const bool malformedWriteRejected =
+      !prodigyExtractPersistentBrainSnapshotSecrets(malformed, publicSnapshot, secrets, &malformedFailure) &&
+      malformedFailure.equals("persistent brain snapshot local cousin service permission is malformed"_ctv);
+  malformedFailure.clear();
+  const bool malformedReadRejected =
+      !prodigyApplyPersistentBrainSnapshotSecrets(malformed, secrets, &malformedFailure) &&
+      malformedFailure.equals("persistent brain snapshot local cousin service permission is malformed"_ctv);
+  secrets.clear();
+
+  suite.expect(runtimeRoundTrip && legacyRelabelRejected && legacyCatchupClearsPermissions &&
+                   restartRoundTrip && malformedWriteRejected && malformedReadRejected,
+               "runtime_persistence_local_cousin_service_permissions_roundtrip_relabel_catchup_and_validation");
+}
+
 static void testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(TestSuite& suite)
 {
   constexpr uint128_t neuronUUID = uint128_t(0x72e1), brainUUID = uint128_t(0x72e2), remoteNodeUUID = uint128_t(0x72e3);
@@ -1684,6 +1785,7 @@ int main(void)
   testDurableMaterializedRecoveryHistoricalCull(suite);
   testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(suite);
   testLocalPairProjectionMarkerBindsProjectionVersion(suite);
+  testPersistentLocalCousinServicePermissions(suite);
   testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(suite);
   return suite.failed == 0 ? 0 : 1;
 }

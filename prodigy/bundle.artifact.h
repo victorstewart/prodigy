@@ -5,6 +5,7 @@
 #include <services/filesystem.h>
 
 #include <prodigy/build.identity.h>
+#include <prodigy/sha256.digest.h>
 
 #include <openssl/evp.h>
 
@@ -217,27 +218,6 @@ static inline void prodigyAppendHexByte(String& digest, uint8_t value)
   constexpr static char hex[] = "0123456789abcdef";
   digest.append(hex[value >> 4]);
   digest.append(hex[value & 0x0F]);
-}
-
-static inline bool prodigyIsSHA256HexDigest(const String& digest)
-{
-  if (digest.size() != 64)
-  {
-    return false;
-  }
-
-  for (uint64_t index = 0; index < digest.size(); ++index)
-  {
-    unsigned char ch = static_cast<unsigned char>(digest[index]);
-    bool isDigit = (ch >= '0' && ch <= '9');
-    bool isLowerHex = (ch >= 'a' && ch <= 'f');
-    if (isDigit == false && isLowerHex == false)
-    {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 static inline bool prodigyComputeSHA256Hex(const uint8_t *data, uint64_t size, String& digest, String *failure = nullptr)

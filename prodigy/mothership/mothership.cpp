@@ -52,6 +52,7 @@
 #include <prodigy/mothership/mothership.neuron.checkpoint.h>
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
+#include <prodigy/mothership/mothership.cousin.permission.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
@@ -18558,6 +18559,87 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  void runCousinPermission(int argc, char *argv[])
+  {
+    String failure, action;
+    ProdigyLocalCousinServicePermission permission;
+    ProdigyLocalCousinServicePermissionQuery query;
+    ProdigyLocalCousinServicePermissionResponse response;
+    bool valid = argc == 3;
+    if (valid) action.assign(argv[1]);
+    if (valid && action == "install"_ctv) {
+      String json; json.assign(argv[2]);
+      simdjson::dom::parser parser;
+      simdjson::dom::element document;
+      valid = json.size() <= 65536 &&
+          parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
+          mothershipParseLocalCousinPermissionJSON(document, permission, failure);
+      query.permissionUUID = permission.permissionUUID;
+    } else if (valid && (action == "query"_ctv || action == "revoke"_ctv)) {
+      valid = prodigyParseCanonicalHex128(String(argv[2]), query.permissionUUID) && query.permissionUUID != 0;
+    } else valid = false;
+    if (!valid && failure.empty())
+      failure.assign("usage: cousinPermission TARGET install JSON | query UUID | revoke UUID"_ctv);
+
+    auto bindResponse = [&]() {
+      if (response.protocolVersion != 1 || !response.success || response.localClusterUUID == 0 ||
+          response.currentAuthorityGeneration == 0 || response.currentMasterUUID == 0 ||
+          response.currentMasterBootNs <= 0 ||
+          (response.found && (!prodigyLocalCousinServicePermissionValid(response.permission) ||
+            response.permission.permissionUUID != query.permissionUUID ||
+            response.permission.localClusterUUID != response.localClusterUUID ||
+            response.permission.acceptedAuthorityGeneration > response.currentAuthorityGeneration)) ||
+          (action == "install"_ctv && response.localClusterUUID != permission.localClusterUUID)) {
+        failure = response.failure;
+        if (failure.empty()) failure.assign("cousin permission response conflicts with the requested identity"_ctv);
+        return false;
+      }
+      return true;
+    };
+    auto observe = [&]() {
+      return requestTopicRoundTrip(MothershipTopic::pullLocalCousinServicePermission, query, response, failure) && bindResponse();
+    };
+    if (valid) valid = configureControlTarget(argv[0], &failure) && observe();
+    if (valid && action == "revoke"_ctv) {
+      valid = response.found;
+      if (valid) {
+        permission = response.permission;
+        permission.state = ProdigyLocalCousinServicePermissionState::revoked;
+        permission.generation = 2;
+        permission.acceptedAuthorityGeneration = 0;
+      } else failure.assign("cousin permission not found"_ctv);
+    }
+    if (valid && action != "query"_ctv) {
+      ProdigyLocalCousinServicePermissionRequest request;
+      request.expectedAuthorityGeneration = response.currentAuthorityGeneration;
+      request.expectedMasterUUID = response.currentMasterUUID;
+      request.expectedMasterBootNs = response.currentMasterBootNs;
+      request.permission = permission;
+      valid = requestTopicRoundTrip(MothershipTopic::commitLocalCousinServicePermission, request, response, failure) && bindResponse();
+      for (uint32_t attempt = 0; valid && !response.qualified && attempt < 60; ++attempt) {
+        ::usleep(500'000);
+        valid = observe();
+      }
+      if (valid) {
+        auto actual = response.permission;
+        actual.acceptedAuthorityGeneration = 0;
+        String requestedBytes, actualBytes;
+        BitseryEngine::serialize(requestedBytes, permission);
+        BitseryEngine::serialize(actualBytes, actual);
+        valid = response.found && response.qualified && requestedBytes == actualBytes;
+        if (!valid) failure.assign("cousin permission awaits a qualified exact policy; retry the same request"_ctv);
+      }
+    }
+    auto& observed = response.permission;
+    basics_log("cousinPermission success=%u action=%s permissionUUID=%016llx%016llx found=%u qualified=%u generation=%llu state=%u authorityGeneration=%llu localApplicationID=%u peerApplicationID=%u deploymentID=%llu planSHA256=%s failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(query.permissionUUID >> 64), (unsigned long long)query.permissionUUID,
+        unsigned(response.found), unsigned(response.qualified), (unsigned long long)observed.generation,
+        unsigned(observed.state), (unsigned long long)response.currentAuthorityGeneration,
+        unsigned(observed.localApplicationID), unsigned(observed.peerApplicationID),
+        (unsigned long long)observed.localDeploymentID, observed.canonicalPlanSHA256.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   bool bindPairControlBoundary(const MothershipClusterPairEnrollmentIntent& intent,
                                MothershipPairControlBoundaryDescriptor& boundary, String& failure)
   {
@@ -22111,6 +22193,7 @@ public:
         {"cancelDeployment",                &Mothership::runCancelDeployment               },
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
+        {"cousinPermission",                &Mothership::runCousinPermission               },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
         {"credentialExpiryNotifications",   &Mothership::runCredentialExpiryNotifications },
@@ -22294,6 +22377,7 @@ int main(int argc, char *argv[])
     message.append("revokeClusterPair [enrollment operationUUID canonical hex]\n");
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
+    message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
     message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");
