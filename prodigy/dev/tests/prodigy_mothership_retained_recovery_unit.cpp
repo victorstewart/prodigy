@@ -1484,6 +1484,41 @@ int main()
     try { validateRecoveryArtifacts(artifactManifest,artifactRequest); }
     catch(const std::exception&) { rejectedArtifact=true; }
     assert(rejectedArtifact);
+
+    // A missing artifact root is accepted only when the selected cold runtime
+    // has its exact original, plan-bound image sealed for restoration.
+    Manifest missingRootfs = artifactManifest;
+    missingRootfs.artifacts[0].bytes--;
+    missingRootfs.coldCanonicalSource.requestedContainerUUIDs.push_back(42);
+    Manifest::ColdCanonicalSourceInput::StorageMetadata missingStorage = {};
+    missingStorage.containerUUID=42; missingStorage.rootfsMetadata="missing"_ctv;
+    missingStorage.storageMetadata="1:2:3"_ctv;
+    missingRootfs.coldCanonicalSource.storage.push_back(missingStorage);
+    ColdCanonicalSource missingSource = {};
+    missingSource.requestedContainerUUIDs.push_back(42);
+    BrainReplicatedContainerRuntimeState missingState = {};
+    missingState.plan.uuid=42; missingState.plan.config=artifactPlan.config;
+    missingSource.states.push_back(missingState);
+    validateColdCanonicalMissingRootfsArtifacts(missingRootfs,artifactRequest,missingSource);
+    auto coldOnlyRequest=artifactRequest; coldOnlyRequest.machines.clear();
+    validateRecoveryArtifacts(missingRootfs,coldOnlyRequest,&missingSource);
+    bool rejectedUnboundColdArtifact=false;
+    try { validateRecoveryArtifacts(missingRootfs,coldOnlyRequest); }
+    catch(const std::exception&) { rejectedUnboundColdArtifact=true; }
+    assert(rejectedUnboundColdArtifact);
+    auto noArtifact=missingRootfs; noArtifact.artifacts.clear();
+    bool rejectedMissingArtifact=false;
+    try { validateColdCanonicalMissingRootfsArtifacts(noArtifact,artifactRequest,missingSource); }
+    catch(const std::exception&) { rejectedMissingArtifact=true; }
+    assert(rejectedMissingArtifact);
+    auto wrongConfig=missingSource; wrongConfig.states[0].plan.config.memoryMB++;
+    bool rejectedConfig=false;
+    try { validateColdCanonicalMissingRootfsArtifacts(missingRootfs,artifactRequest,wrongConfig); }
+    catch(const std::exception&) { rejectedConfig=true; }
+    assert(rejectedConfig);
+    const auto coldStorage=coldCanonicalStorageProgram(missingRootfs.coldCanonicalSource);
+    assert(coldStorage.find("os.lstat(artifact)")!=std::string::npos &&
+        coldStorage.find("FileNotFoundError")!=std::string::npos);
     fs::remove_all(directory);
   }
 

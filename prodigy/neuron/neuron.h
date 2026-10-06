@@ -5027,6 +5027,15 @@ public:
                 uint128_t restoredUUID = container->plan.uuid;
                 if (container->plan.restartOnFailure)
                 {
+                  // This wrapper was reconstructed from state upload, but its
+                  // cgroup had no process to re-adopt.  It is not a warm
+                  // restart owner: discard the observed descriptor so the
+                  // cold restart owner rebuilds the cgroup and hydrates storage.
+                  if (container->cgroup >= 0)
+                  {
+                    close(container->cgroup);
+                    container->cgroup = -1;
+                  }
                   restarted = true;
                   ContainerManager::restartContainer(container);
                 }

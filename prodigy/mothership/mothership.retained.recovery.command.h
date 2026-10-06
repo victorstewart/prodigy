@@ -352,6 +352,9 @@ struct Manifest {
     Vector<uint128_t> requestedContainerUUIDs;
     struct StorageMetadata {
       uint128_t containerUUID = 0;
+      // Literal "missing" is a sealed recovery instruction: the complete
+      // immutable /containers/<uuid> artifact root is absent, while the
+      // separate storage directory remains required and identity-bound.
       String rootfsMetadata;
       String storageMetadata;
     };
@@ -563,7 +566,8 @@ inline Manifest parseManifest(const std::string& path,const Plan& p) {
       Manifest::ColdCanonicalSourceInput::StorageMetadata entry = {};
       entry.containerUUID=uuid(field(item,"containerUUID"));
       entry.rootfsMetadata=text(field(item,"rootfsMetadata")); entry.storageMetadata=text(field(item,"storageMetadata"));
-      require(coldCanonicalMetadata(entry.rootfsMetadata) && coldCanonicalMetadata(entry.storageMetadata),
+      require((entry.rootfsMetadata=="missing"_ctv || coldCanonicalMetadata(entry.rootfsMetadata)) &&
+                  entry.storageMetadata!="missing"_ctv && coldCanonicalMetadata(entry.storageMetadata),
               "cold canonical source storage metadata is invalid");
       m.coldCanonicalSource.storage.push_back(std::move(entry));
     }
@@ -680,7 +684,8 @@ inline const DeploymentPlan& bindCanonicalRecoveryPlan(Manifest& manifest,const 
 inline void loadSnapshot(const std::string& path,ProdigyPersistentBrainSnapshot& snapshot);
 inline bool prepareLocal(const char *requestPath,const char *statePath,bool verifyOnly,String *failure,
                          const String& previousBundleSHA256);
-inline const DeploymentPlan& bindRecoveryArtifact(const Request& request,uint64_t deploymentID) {
+inline const DeploymentPlan& bindRecoveryArtifact(const Request& request,uint64_t deploymentID,
+                                                 const ColdCanonicalSource *coldCanonicalSource=nullptr) {
   const auto plan=request.plans.find(deploymentID);
   require(plan!=request.plans.end() && plan->second.config.containerBlobBytes!=0 &&
               prodigyIsSHA256HexDigest(plan->second.config.containerBlobSHA256),
@@ -688,14 +693,60 @@ inline const DeploymentPlan& bindRecoveryArtifact(const Request& request,uint64_
   bool canonical=false;
   for(const auto& machine:request.machines) for(const auto& parameters:machine.parameters)
     canonical |= parameters.deploymentID==deploymentID;
+  if (!canonical && coldCanonicalSource) for (const auto& state:coldCanonicalSource->states) {
+    if (state.plan.config.deploymentID()!=deploymentID) continue;
+    String selected={}, approved={}; ApplicationConfig selectedConfig=state.plan.config, approvedConfig=plan->second.config;
+    BitseryEngine::serialize(selected,selectedConfig); BitseryEngine::serialize(approved,approvedConfig);
+    require(selected==approved,"cold canonical recovery artifact deployment config differs");
+    canonical=true;
+  }
   require(canonical,"recovery artifact deployment is not canonical");
   return plan->second;
 }
-inline void validateRecoveryArtifacts(const Manifest& manifest,const Request& request) {
+inline void validateRecoveryArtifacts(const Manifest& manifest,const Request& request,
+                                      const ColdCanonicalSource *coldCanonicalSource=nullptr) {
   for(const auto& artifact:manifest.artifacts) {
-    const DeploymentPlan& plan=bindRecoveryArtifact(request,artifact.deploymentID);
+    const DeploymentPlan& plan=bindRecoveryArtifact(request,artifact.deploymentID,coldCanonicalSource);
     require(plan.config.containerBlobSHA256==artifact.sha256 && plan.config.containerBlobBytes==artifact.bytes,
             "recovery artifact differs from sealed deployment plan");
+  }
+}
+// A missing artifact root is an explicit cold-recovery exception.  It is
+// never inferred from a failed stat: the sealed source must name it, retain
+// the stateful storage identity, and bind the exact original image to the
+// selected runtime record before the activation boundary.
+inline void validateColdCanonicalMissingRootfsArtifacts(
+    const Manifest& manifest,const Request& request,const ColdCanonicalSource& source) {
+  require(source.states.size()==manifest.coldCanonicalSource.storage.size() &&
+              source.states.size()==source.requestedContainerUUIDs.size(),
+          "cold canonical missing-rootfs source is incomplete");
+  for (uint32_t index=0;index<source.states.size();++index) {
+    const auto& sealed=manifest.coldCanonicalSource.storage[index];
+    const auto& state=source.states[index];
+    require(sealed.containerUUID==source.requestedContainerUUIDs[index] &&
+                state.plan.uuid==sealed.containerUUID,
+            "cold canonical missing-rootfs identity differs");
+    if (sealed.rootfsMetadata!="missing"_ctv) continue;
+    const uint64_t deploymentID=state.plan.config.deploymentID();
+    const auto plan=request.plans.find(deploymentID);
+    require(deploymentID!=0 && plan!=request.plans.end(),
+            "cold canonical missing-rootfs deployment plan is unavailable");
+    String selectedConfig={}, approvedConfig={};
+    ApplicationConfig selected=state.plan.config, approved=plan->second.config;
+    BitseryEngine::serialize(selectedConfig,selected);
+    BitseryEngine::serialize(approvedConfig,approved);
+    require(selectedConfig==approvedConfig,
+            "cold canonical missing-rootfs deployment config differs");
+    const Manifest::ArtifactInput *artifact=nullptr;
+    for (const auto& candidate:manifest.artifacts) if (candidate.deploymentID==deploymentID) {
+      require(artifact==nullptr,"cold canonical missing-rootfs artifact is duplicated");
+      artifact=&candidate;
+    }
+    require(artifact!=nullptr,"cold canonical missing-rootfs artifact is absent");
+    const DeploymentPlan& bound=bindRecoveryArtifact(request,deploymentID,&source);
+    require(bound.config.containerBlobSHA256==artifact->sha256 &&
+                bound.config.containerBlobBytes==artifact->bytes,
+            "cold canonical missing-rootfs artifact differs from sealed deployment plan");
   }
 }
 // Local, fenced artifact preparation.  It works only after the same sealed
@@ -715,7 +766,7 @@ inline bool prepareArtifactLocal(const char *requestPath,const char *statePath,u
     MothershipRetainedRecoveryOrphanedStatefulPredecessor orphan={};
     require(decodeRequest(read(requestPath),request,&proof,&retired,&empty,&cold,&handoff,&orphan),
             "recovery artifact request decode failed");
-    const DeploymentPlan& plan=bindRecoveryArtifact(request,deploymentID);
+    const DeploymentPlan& plan=bindRecoveryArtifact(request,deploymentID,&cold);
     ProdigyPersistentBrainSnapshot prepared={}; loadSnapshot(state,prepared);
     const auto preparedPlan=prepared.masterAuthority.deploymentPlans.find(deploymentID);
     require(preparedPlan!=prepared.masterAuthority.deploymentPlans.end() &&
@@ -814,10 +865,15 @@ inline std::string coldCanonicalStorageProgram(const Manifest::ColdCanonicalSour
   return "python3 -c "+quote(
       "import os,stat,sys\nentries="+entries+"\n"
       "for value,expected_root,expected_storage in entries:\n"
-      "  name=str(int(value,16)); root='/containers/'+name+'/rootfs'; storage='/containers/storage/'+name\n"
+      "  name=str(int(value,16)); artifact='/containers/'+name; root=artifact+'/rootfs'; storage='/containers/storage/'+name\n"
       "  def metadata(path):\n"
       "    item=os.lstat(path); assert stat.S_ISDIR(item.st_mode) and not stat.S_ISLNK(item.st_mode); return f'{os.major(item.st_dev)}:{os.minor(item.st_dev)}:{item.st_ino}'\n"
-      "  assert metadata(root)==expected_root and metadata(storage)==expected_storage\n"
+      "  if expected_root == 'missing':\n"
+      "    try: os.lstat(artifact)\n"
+      "    except FileNotFoundError: pass\n"
+      "    else: raise AssertionError('cold artifact root is present')\n"
+      "  else: assert metadata(root)==expected_root\n"
+      "  assert metadata(storage)==expected_storage\n"
       "print('cold-canonical-storage=verified')\n");
 }
 inline std::string coldCanonicalExtractionProgram(const std::string& sourcePath,const std::string& extractionPath) {
@@ -1864,7 +1920,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(!retiringOrphanedStatefulPredecessor ||
                     mothershipRetainedRecoveryOrphanedStatefulPredecessorValid(manifest.orphanedStatefulPredecessor),
                 "orphaned stateful predecessor was not sealed from live parameters");
-        validateRecoveryArtifacts(manifest,manifest.request);
+        validateRecoveryArtifacts(manifest,manifest.request,&coldCanonicalSource);
+        validateColdCanonicalMissingRootfsArtifacts(manifest,manifest.request,coldCanonicalSource);
         String bytes=retiringOrphanedStatefulPredecessor ?
             encodeOrphanedStatefulPredecessorRequest(manifest.request,e.plan,manifest.orphanedStatefulPredecessor) :
             !manifest.partialHandoff.operationID.empty() ?
@@ -1900,6 +1957,8 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
                       sealedColdSource.serializedStates==coldCanonicalSource.serializedStates &&
                       coldCanonicalPayloadDigest(sealedColdSource.serializedStates)==coldCanonicalSource.selectedStatesSHA256,
                   "sealed cold canonical source differs from preflight authority");
+        if (!manifest.coldCanonicalSource.requestedContainerUUIDs.empty())
+          validateColdCanonicalMissingRootfsArtifacts(manifest,sealedRequest,sealedColdSource);
         const auto requestDigest=digest(requestPath);
         String recoveryAuthority=text(e.plan.planSHA+"\n"+manifestSHA+"\n"+requestDigest+"\n");
         if (retiringOrphanedStatefulPredecessor) {
@@ -1995,6 +2054,12 @@ inline bool runFile(const char *file,const char *action,String *failure=nullptr,
         require(read("/etc/machine-id")==e.plan.machines[0].linuxID+"\n",
                 "cold canonical source revalidation requires the selected seed");
         validateColdCanonicalSource();
+        Request sealedRequest = {}; MothershipRetainedRecoveryMixedProof sealedProof = {};
+        uint128_t sealedRetired=0, sealedEmpty=0; ColdCanonicalSource sealedCold = {};
+        require(decodeRequest(read(requestPath),sealedRequest,&sealedProof,&sealedRetired,&sealedEmpty,&sealedCold) &&
+                    sealedRetired==0 && sealedEmpty==manifest.emptyRetainedInventoryMachineUUID,
+                "cold canonical sealed request is unreadable");
+        validateColdCanonicalMissingRootfsArtifacts(manifest,sealedRequest,sealedCold);
         const auto requestAuthority=e.plan.operationRoot+"/cold-canonical-request-authority";
         privateFile(requestAuthority,4096);
         require(read(requestAuthority)==str(coldCanonicalBinding)+digest(requestPath)+"\n",

@@ -2151,6 +2151,35 @@ int main(void)
                      std::filesystem::exists(sentinel),
                  "cold_restart_missing_cgroup_failure_retains_existing_rootfs_and_storage");
 
+    Container waitidInitialized = {};
+    suite.expect(waitidInitialized.infop.si_pid == 0 &&
+                     waitidInitialized.infop.si_code == 0 &&
+                     waitidInitialized.infop.si_status == 0,
+                 "container_waitid_info_is_zero_before_waitid");
+
+    TemporaryDirectory publicationFixture;
+    suite.expect(publicationFixture.create(".run"), "recovered_artifact_publication_fixture_created");
+    if (publicationFixture.path.size() > 0)
+    {
+      const auto publicationRoot = filesystemPathFromString(publicationFixture.path);
+      const auto publicationSource = publicationRoot / "received";
+      const auto publicationTarget = publicationRoot / "existing-empty-target";
+      std::filesystem::create_directory(publicationSource);
+      std::filesystem::create_directory(publicationTarget);
+      String publicationFailure = {};
+      bool usedSnapshotFallback = false;
+      suite.expect(
+          ContainerManager::debugMoveContainerArtifactSubvolumeIntoPlace(
+              stringFromFilesystemPath(publicationSource),
+              stringFromFilesystemPath(publicationTarget),
+              usedSnapshotFallback,
+              &publicationFailure,
+              true) == false &&
+              std::filesystem::is_directory(publicationSource) &&
+              std::filesystem::is_directory(publicationTarget),
+          "recovered_artifact_publication_never_replaces_existing_target");
+    }
+
     // Allocation can reject an isolated cold restart before it fills the new
     // container's lcores array.  Its zero-initialized entries must not release
     // CPU zero from an already running owner during the shared cleanup path.
