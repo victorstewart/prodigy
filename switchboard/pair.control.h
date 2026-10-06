@@ -11,6 +11,7 @@
 #include <networking/ring.h>
 #include <prodigy/cluster.pair.projection.h>
 #include <prodigy/cousin.discovery.h>
+#include <prodigy/cousin.session.h>
 
 // Neuron owns this Switchboard control component. Its input is an already
 // durable, node-scoped credential projection; it never possesses a pair root
@@ -19,7 +20,9 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
   static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
   static constexpr uint32_t discoveryRecordHeaderBytes = 4 + 8 + 4;
-  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2, discoveryRecordType = 3;
+  static constexpr uint32_t helloRecordType = 1, epochRecordType = 2, discoveryRecordType = 3, sessionRecordType = 4;
+  static constexpr uint32_t sessionRecordHeaderBytes = 4 + 8 + 4;
+  static constexpr size_t maximumPendingSessionRecords = ProdigyCousinSessionMaximumRecords;
   static constexpr size_t maximumSockets = ProdigyLocalClusterPairControlProjectionMaximumCredentials + 16;
   static constexpr int64_t handshakeTimeoutMs = 10000, idleTimeoutMs = 15000, helloIntervalMs = 3000;
   struct Listener : TCPSocket {
@@ -35,6 +38,9 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     uint64_t connectionID = 0;
     uint64_t sentSequence = 0, receivedSequence = 0, sentStatusSequence = 0, receivedStatusSequence = 0;
     uint64_t sentDiscoverySequence = 0, receivedDiscoverySequence = 0;
+    uint64_t sentSessionSequence = 0, receivedSessionSequence = 0;
+    std::vector<String> pendingSessionRecords = {};
+    uint32_t pendingSessionBytes = 0;
     bool remoteDiscoveryPresent = false;
     ProdigyCousinDiscoverySnapshot remoteDiscovery = {};
     int64_t remoteDiscoveryExpiresAt = 0;
@@ -114,6 +120,52 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     receipt.snapshot.records.clear();
     onDiscoverySnapshot(receipt);
   }
+  void emitSessionDisconnect(Connection& connection)
+  {
+    if (!onSessionControl) return;
+    ProdigyCousinSessionReceipt receipt = {};
+    receipt.localEndpoint = connection.local; receipt.remoteEndpoint = connection.remote;
+    receipt.projectionGeneration = projection.committedAuthorityGeneration;
+    receipt.connectionID = connection.connectionID; receipt.disconnected = true;
+    onSessionControl(receipt);
+  }
+  void flushSessionControl(Connection& connection)
+  {
+    if (!approved(connection) || connection.closing || !connection.ready || connection.pendingSend ||
+        connection.wBuffer.outstandingBytes() != 0 || connection.pendingSessionRecords.empty()) return;
+    String record = std::move(connection.pendingSessionRecords.front());
+    connection.pendingSessionRecords.erase(connection.pendingSessionRecords.begin());
+    connection.pendingSessionBytes -= uint32_t(record.size());
+    if (!connection.wBuffer.need(record.size())) { retire(connection); return; }
+    connection.wBuffer.append(record); Ring::queueSend(&connection);
+  }
+  bool receiveSessionControl(Connection& connection, const uint8_t *payload, uint32_t payloadBytes)
+  {
+    const uint8_t *cursor = payload, *end = payload + payloadBytes;
+    uint64_t sequence = 0; uint32_t encodedBytes = 0;
+    if (!approved(connection) || !connection.ready || !connection.isTransportNegotiated() ||
+        !connection.tlsPeerVerified || connection.tlsPeerUUID != connection.remote.nodeUUID ||
+        !clusterPairControlReadU64BE(cursor, end, sequence) || sequence == 0 || sequence <= connection.receivedSessionSequence ||
+        !clusterPairControlReadU32BE(cursor, end, encodedBytes) || encodedBytes == 0 ||
+        encodedBytes > ProdigyCousinSessionMaximumBytes || encodedBytes != uint32_t(end - cursor)) return false;
+    String encoded = {}; ProdigyCousinSessionControl control = {};
+    if (!encoded.reserve(encodedBytes)) return false;
+    encoded.append(cursor, encodedBytes);
+    if (!BitseryEngine::deserializeSafe(encoded, control) || !prodigyCousinSessionControlValid(control) ||
+        !prodigyCousinSessionControlFromCluster(control, connection.remote.clusterUUID) ||
+        control.session.sourcePermission.pairUUID != connection.credential.pairUUID ||
+        control.session.rootGeneration != connection.credential.rootGeneration ||
+        control.session.keyEpoch != connection.credential.keyEpoch) return false;
+    connection.receivedSessionSequence = sequence; connection.lastReceiveAt = Time::msSinceBoot();
+    if (onSessionControl) {
+      ProdigyCousinSessionReceipt receipt = {};
+      receipt.localEndpoint = connection.local; receipt.remoteEndpoint = connection.remote;
+      receipt.projectionGeneration = projection.committedAuthorityGeneration;
+      receipt.connectionID = connection.connectionID; receipt.sequence = sequence; receipt.control = std::move(control);
+      onSessionControl(receipt);
+    }
+    return true;
+  }
   void queueDiscoverySnapshot(Connection& connection, int64_t now)
   {
     if (!approved(connection) || connection.closing || !connection.connected || !connection.ready ||
@@ -189,6 +241,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
           (unsigned long long)(connection.credential.pairUUID >> 64), (unsigned long long)connection.credential.pairUUID,
           (unsigned long long)connection.credential.rootGeneration, (unsigned long long)connection.credential.keyEpoch);
     emitDiscoveryWithdrawal(connection);
+    emitSessionDisconnect(connection);
+    connection.pendingSessionRecords.clear(); connection.pendingSessionBytes = 0;
     connection.closing = true; connection.ready = false;
     Ring::queueClose(&connection);
   }
@@ -405,6 +459,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
       queueHello(*connection, now);
       queueEpochStatus(*connection, now);
       queueDiscoverySnapshot(*connection, now);
+      flushSessionControl(*connection);
     }
     for (const auto& credential : projection.credentials)
     {
@@ -419,6 +474,34 @@ class SwitchboardPairControlRuntime final : public RingInterface {
 public:
   std::function<void(const ProdigyClusterPairEpochReceipt&)> onEpochStatus;
   std::function<void(const ProdigyCousinDiscoveryReceipt&)> onDiscoverySnapshot;
+  std::function<void(const ProdigyCousinSessionReceipt&)> onSessionControl;
+
+  bool sendSessionControl(const ProdigyCousinSessionPublication& publication)
+  {
+    if (stopping || !prodigyCousinSessionPublicationValid(publication) ||
+        publication.projectionGeneration != projection.committedAuthorityGeneration ||
+        publication.nodeUUID != projection.nodeUUID) return false;
+    Connection *selected = nullptr;
+    for (auto& candidate : connections) {
+      if (candidate->closing || !candidate->ready || candidate->connectionID != publication.connectionID ||
+          candidate->local != publication.localEndpoint || candidate->remote != publication.remoteEndpoint) continue;
+      if (selected) return false; selected = candidate.get();
+    }
+    if (!selected || !approved(*selected) || publication.control.session.sourcePermission.pairUUID != selected->credential.pairUUID ||
+        publication.control.session.rootGeneration != selected->credential.rootGeneration ||
+        publication.control.session.keyEpoch != selected->credential.keyEpoch) return false;
+    String encoded = {}; auto control = publication.control;
+    if (!BitseryEngine::serialize(encoded, control) || encoded.empty() || encoded.size() > ProdigyCousinSessionMaximumBytes ||
+        selected->sentSessionSequence == UINT64_MAX || selected->pendingSessionRecords.size() >= maximumPendingSessionRecords ||
+        encoded.size() > UINT32_MAX - sessionRecordHeaderBytes ||
+        selected->pendingSessionBytes > maximumPendingSessionRecords * ProdigyCousinSessionMaximumBytes - encoded.size() - sessionRecordHeaderBytes) return false;
+    String record = {}; if (!record.reserve(sessionRecordHeaderBytes + encoded.size())) return false;
+    clusterPairControlAppendU32BE(record, sessionRecordType); clusterPairKeyAppendU64BE(record, ++selected->sentSessionSequence);
+    clusterPairControlAppendU32BE(record, uint32_t(encoded.size())); record.append(encoded.data(), encoded.size());
+    if (record.size() != sessionRecordHeaderBytes + encoded.size()) return false;
+    selected->pendingSessionBytes += uint32_t(record.size()); selected->pendingSessionRecords.push_back(std::move(record));
+    flushSessionControl(*selected); return true;
+  }
 
   bool installDiscoverySnapshot(const ProdigyCousinDiscoveryPublication& publication)
   {
@@ -547,12 +630,23 @@ public:
             encodedBytes > UINT32_MAX - discoveryRecordHeaderBytes) { retire(*connection); return; }
         bytes = discoveryRecordHeaderBytes + encodedBytes;
       }
+      else if (type == sessionRecordType)
+      {
+        if (connection->rBuffer.outstandingBytes() < sessionRecordHeaderBytes) break;
+        // `clusterPairControlReadU32BE` advanced frame past the type above.
+        // The length follows the eight-byte sequence, not another type field.
+        const uint8_t *cursor = frame + sizeof(uint64_t); uint32_t encodedBytes = 0;
+        if (!clusterPairControlReadU32BE(cursor, terminal, encodedBytes) || encodedBytes == 0 ||
+            encodedBytes > ProdigyCousinSessionMaximumBytes || encodedBytes > UINT32_MAX - sessionRecordHeaderBytes) { retire(*connection); return; }
+        bytes = sessionRecordHeaderBytes + encodedBytes;
+      }
       if (bytes == 0) { retire(*connection); return; }
       if (connection->rBuffer.outstandingBytes() < bytes) break;
       const uint8_t *record = connection->rBuffer.pHead();
       if ((type == helloRecordType && !receiveHello(*connection, record)) ||
           (type == epochRecordType && !receiveEpochStatus(*connection, record + sizeof(uint32_t))) ||
-          (type == discoveryRecordType && !receiveDiscoverySnapshot(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))))
+          (type == discoveryRecordType && !receiveDiscoverySnapshot(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))) ||
+          (type == sessionRecordType && !receiveSessionControl(*connection, record + sizeof(uint32_t), bytes - sizeof(uint32_t))))
       { retire(*connection); return; }
       connection->rBuffer.consume(bytes, true);
     }
@@ -560,6 +654,7 @@ public:
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
     queueDiscoverySnapshot(*connection, now);
+    flushSessionControl(*connection);
     if (connection->closing) return;
     if (connection->needsTransportTLSSendKick()) Ring::queueSend(connection);
     Ring::queueRecv(connection);
@@ -576,6 +671,7 @@ public:
     queueHello(*connection, now);
     queueEpochStatus(*connection, now);
     queueDiscoverySnapshot(*connection, now);
+    flushSessionControl(*connection);
     if (!connection->closing && (connection->needsTransportTLSSendKick() || connection->wBuffer.outstandingBytes()))
       Ring::queueSend(connection);
   }

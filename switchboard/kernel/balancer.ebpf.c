@@ -295,6 +295,14 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
     return XDP_PASS;
   }
 
+  // Pair-grant portals need the host TC path, which owns exact admission
+  // target selection and one-shot grant consumption. Do not hash-select here:
+  // the selected endpoint can live on another machine.
+  if (portal_meta != NULL && (portal_meta->flags & F_PAIR_GRANT_PORTAL))
+  {
+    return pckt.flow.proto == IPPROTO_TCP ? XDP_PASS : XDP_DROP;
+  }
+
   struct quic_route_result quic_route = {};
 
 #if NAMETAG_SWITCHBOARD_DEV_FAKE_IPV4_ROUTE

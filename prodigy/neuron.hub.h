@@ -6,6 +6,7 @@
 #include <services/prodigy.h>
 #include <macros/bytes.h>
 #include <prodigy/types.h>
+#include <prodigy/cousin.session.h>
 #include <prodigy/wire.h>
 #include <prodigy/ingress.validation.h>
 #include <prodigy/statistics.h>
@@ -23,6 +24,9 @@ public:
   virtual void resourceDelta(uint16_t nLogicalCores, uint32_t memoryMB, uint32_t storageMB, bool isDownscale, uint32_t graceSeconds) {}
   virtual void credentialsRefresh(const CredentialDelta& delta) {}
   virtual void wormholesRefresh(const Vector<Wormhole>& wormholes) {}
+  // Return true only after the native workload installed, activated, renewed, or
+  // revoked the exact private session command.
+  virtual bool cousinSessionCommand(const ProdigyCousinSessionLocalCommand&) { return false; }
   virtual void messageFromProdigy(Message *message) {}
 };
 
@@ -124,6 +128,29 @@ private:
       return false;
     }
 
+    queueSendToNeuron();
+    return true;
+  }
+
+  // Cousin session payloads are variable Message arguments.  They cannot use
+  // the packed-frame convention because Neuron ingress consumes a bounded
+  // length-prefixed String before decoding the typed payload.
+  bool queueCousinSessionFrame(ContainerTopic topic, const String& payload)
+  {
+    if (payload.size() > ProdigyCousinSessionMaximumBytes)
+    {
+      return false;
+    }
+
+    uint32_t frameOffset = neuron.wBuffer.size();
+    Message::construct(neuron.wBuffer, topic, payload);
+    Message *frame = reinterpret_cast<Message *>(neuron.wBuffer.data() + frameOffset);
+    if (frame->padding != 0)
+    {
+      // Message::finish aligns the tail but does not initialize it.  Keep the
+      // packed-frame wire invariant that queued padding contains no stale data.
+      std::memset(frame->terminal(), 0, frame->padding);
+    }
     queueSendToNeuron();
     return true;
   }
@@ -549,6 +576,30 @@ public:
     signalRuntimeReady();
   }
 
+  bool closeCousinSession(uint128_t sessionUUID, uint64_t leaseGeneration)
+  {
+    if (sessionUUID == 0 || leaseGeneration == 0) return false;
+    ProdigyCousinSessionLocalAck acknowledgement = {};
+    acknowledgement.sessionUUID = sessionUUID;
+    acknowledgement.leaseGeneration = leaseGeneration;
+    acknowledgement.kind = ProdigyCousinSessionLocalKind::revoke;
+    acknowledgement.success = true;
+    String serialized = {};
+    return BitseryEngine::serialize(serialized, acknowledgement) &&
+        serialized.size() <= ProdigyCousinSessionMaximumBytes &&
+        queueCousinSessionFrame(ContainerTopic::cousinSessionAck, serialized);
+  }
+
+  bool requestCousinSession(const ProdigyCousinSessionRequest& request)
+  {
+    if (!prodigyCousinSessionRequestValid(request)) return false;
+    String serialized = {};
+    auto copy = request;
+    return BitseryEngine::serialize(serialized, copy) &&
+        serialized.size() <= ProdigyCousinSessionMaximumBytes &&
+        queueCousinSessionFrame(ContainerTopic::cousinSessionRequest, serialized);
+  }
+
   bool publishTaskResult(const String& result)
   {
     if (result.size() > prodigyTaskResultMaxBytes)
@@ -853,6 +904,27 @@ public:
             target->credentialsRefresh(delta);
           }
 
+          break;
+        }
+      case ContainerTopic::cousinSessionCommand:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ProdigyCousinSessionLocalCommand command = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, command) ||
+              !prodigyCousinSessionLocalCommandValid(command)) break;
+          const bool applied = target->cousinSessionCommand(command);
+          // A reject is informational; it has no installed session to acknowledge.
+          if (command.kind == ProdigyCousinSessionLocalKind::reject) break;
+          ProdigyCousinSessionLocalAck ack = {};
+          ack.sessionUUID = command.session.sessionUUID;
+          ack.leaseGeneration = command.leaseGeneration;
+          ack.kind = command.kind;
+          ack.success = applied;
+          if (!applied) ack.failure.assign("native cousin session command rejected"_ctv);
+          String encoded = {};
+          if (BitseryEngine::serialize(encoded, ack) && encoded.size() <= ProdigyCousinSessionMaximumBytes)
+            (void)queueCousinSessionFrame(ContainerTopic::cousinSessionAck, encoded);
           break;
         }
       case ContainerTopic::wormholesRefresh:

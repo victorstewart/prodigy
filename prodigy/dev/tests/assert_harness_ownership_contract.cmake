@@ -256,6 +256,16 @@ foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "
    endif()
 endforeach()
 
+foreach(_cousin_client IN ITEMS prodigy_dev_cousin_session_qualification.sh prodigy_dev_cousin_session_observe.py)
+   file(READ "${PRODIGY_ROOT}/prodigy/dev/tests/${_cousin_client}" _cousin_source)
+   foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "bpftool" "mount --" "kill -" "--pair-control-launch" "--pair-control-action" "container exec" "os.kill" "subprocess.")
+      string(FIND "${_cousin_source}" "${_forbidden}" _position)
+      if(NOT _position EQUAL -1)
+         message(FATAL_ERROR "${_cousin_client} assumes provider ownership: ${_forbidden}")
+      endif()
+   endforeach()
+endforeach()
+
 file(GLOB _scenario_scripts "${PRODIGY_ROOT}/prodigy/dev/tests/*.sh")
 foreach(_scenario IN LISTS _scenario_scripts)
    file(READ "${_scenario}" _scenario_source)

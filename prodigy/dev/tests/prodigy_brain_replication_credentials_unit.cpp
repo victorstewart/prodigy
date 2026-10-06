@@ -11220,6 +11220,44 @@ static void testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(TestSui
   suite.expect(container.wormholeRuntimePendingMachines.empty() && container.runtimeReady,
                "recovered_stateless_wormholes_restore_readiness_only_after_ack");
 
+  // The same recovery owner must replay protected stateful COUSIN portals.
+  deployment.plan.isStateful = true;
+  deployment.plan.config.type = ApplicationType::stateful;
+  deployment.plan.stateful.allMasters = true;
+  deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(62'551, 3);
+  container.isStateful = true; container.shardGroup = 0;
+  deployment.nShardGroups = 1;
+  const uint64_t cousin = container.effectiveStatefulMeshRoles(deployment.plan).cousin;
+  container.advertisements.emplace(cousin,
+      Advertisement(cousin, ContainerState::scheduled, ContainerState::destroying, 8443));
+  auto& protectedWormhole = deployment.plan.wormholes.front();
+  protectedWormhole.externalAddress = IPAddress("fdc5:551::1", true);
+  protectedWormhole.deliveryAddress = protectedWormhole.externalAddress;
+  protectedWormhole.externalPort = protectedWormhole.containerPort;
+  brain.brainConfig.distributableExternalSubnets.front().subnet = IPPrefix("fdc5:551::1", true, 128);
+  brain.brainConfig.distributableExternalSubnets.front().deliverySubnet =
+      brain.brainConfig.distributableExternalSubnets.front().subnet;
+  machine.neuron.wBuffer.clear();
+  deployment.recoverAfterReboot();
+  bool protectedReplay = false;
+  forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+    if (NeuronTopic(queued->topic) != NeuronTopic::openSwitchboardWormholes) return;
+    SwitchboardWormholeOperation operation = {}; String serialized = {};
+    uint8_t *args = queued->args; Message::extractToStringView(args, serialized);
+    SwitchboardWormholeDesiredState desired = {};
+    if (BitseryEngine::deserializeSafe(serialized, operation) &&
+        prodigyDecodeWormholeDesiredState(operation.desired, desired) &&
+        prodigyWormholeRequiresPairAdmission(desired, 8443, IPPROTO_TCP)) protectedReplay = true;
+  });
+  suite.expect(protectedReplay && container.wormholeRuntimePendingMachines.contains(machine.fragment) && !container.runtimeReady,
+               "recovered_stateful_cousin_replays_protection_and_waits_for_actual_ack");
+  brain.neuronHandler(&machine.neuron,
+                      buildNeuronSwitchboardWormholeAcknowledgement(acknowledgement,
+                          container.generateContainerID(), container.wormholeRuntimeRevision,
+                          SwitchboardWormholeOperationStatus::applied));
+  suite.expect(container.wormholeRuntimePendingMachines.empty() && container.runtimeReady,
+               "recovered_stateful_cousin_restores_readiness_after_protected_revision_ack");
+
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   machine.removeContainerIndexEntry(container.deploymentID, &container);
@@ -32181,6 +32219,123 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       suite.expect(cacheQuery.success && cacheQuery.records.size() == 1 &&
                        cacheQuery.records.front().containerUUID == remoteCounterpart.containerUUID,
                    "cousin_discovery_owner_returns_current_matching_remote_candidate");
+      {
+        const uint32_t savedFragment = selfMachine.fragment;
+        const bool savedReady = selfMachine.runtimeReady;
+        selfMachine.fragment = 1; selfMachine.runtimeReady = true;
+        permissionBrain.machinesByUUID.insert_or_assign(selfMachine.uuid, &selfMachine);
+        ContainerView sourceApp = {};
+        sourceApp.uuid = 0x9c44; sourceApp.machine = &selfMachine; sourceApp.fragment = 2;
+        sourceApp.deploymentID = live.plan.config.deploymentID(); sourceApp.isStateful = true;
+        sourceApp.state = ContainerState::healthy; sourceApp.runtimeReady = true;
+        sourceApp.shardGroup = statefulServiceGroupOwnerForSlot(3, live.nShardGroups);
+        Whitehole binding = {}; binding.hasAddress = true; binding.address = IPAddress("fd00:9c::44", true);
+        binding.sourcePort = 40044; binding.bindingNonce = 0x9c44; sourceApp.whiteholes.push_back(binding);
+        permissionBrain.containers.insert_or_assign(sourceApp.uuid, &sourceApp);
+        ProdigyCousinSessionRequest request = {}; request.requestUUID = 0x9c45;
+        request.permissionUUID = permission.permissionUUID; request.slot = 3; request.bindingNonce = binding.bindingNonce;
+        auto invalid = request; ++invalid.bindingNonce;
+        suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, invalid),
+                     "cousin_session_source_rejects_unallocated_whitehole");
+        bool created = permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, request);
+        suite.expect(created && permissionBrain.cousinSessions.size() == 1,
+                     "cousin_session_source_authorizes_current_permission_without_mothership");
+        if (created && permissionBrain.cousinSessions.size() == 1) {
+          suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, request),
+                       "cousin_session_source_rejects_second_session_on_same_binding");
+          auto initial = permissionBrain.cousinSessions.front();
+          ProdigyCousinSessionReceipt readyReceipt = {};
+          readyReceipt.localEndpoint = initial.localEndpoint; readyReceipt.remoteEndpoint = initial.remoteEndpoint;
+          readyReceipt.projectionGeneration = initial.projectionGeneration; readyReceipt.connectionID = initial.connectionID;
+          readyReceipt.sequence = 2; readyReceipt.control.kind = ProdigyCousinSessionControlKind::ready;
+          readyReceipt.control.session = initial.record;
+          auto staleReceipt = readyReceipt; ++staleReceipt.connectionID;
+          permissionBrain.receiveCousinSessionControlReceipt(&selfMachine.neuron, staleReceipt);
+          suite.expect(permissionBrain.cousinSessions.front().awaitingPeerReady &&
+                           !permissionBrain.cousinSessions.front().awaitingLocalAck,
+                       "cousin_session_source_rejects_ready_on_replaced_carrier");
+          permissionBrain.receiveCousinSessionControlReceipt(&selfMachine.neuron, readyReceipt);
+          suite.expect(!permissionBrain.cousinSessions.front().awaitingPeerReady &&
+                           permissionBrain.cousinSessions.front().awaitingLocalAck &&
+                           !permissionBrain.cousinSessions.front().sourceActivated,
+                       "cousin_session_source_waits_for_application_activation_ack");
+          ProdigyCousinSessionLocalAck ack = {}; ack.sessionUUID = initial.record.sessionUUID;
+          ack.kind = ProdigyCousinSessionLocalKind::activate; ack.success = true;
+          ++selfMachine.neuron.ioGeneration;
+          permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, ack);
+          --selfMachine.neuron.ioGeneration;
+          suite.expect(!permissionBrain.cousinSessions.front().sourceActivated,
+                       "cousin_session_source_rejects_replaced_neuron_ack");
+          permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, ack);
+          suite.expect(permissionBrain.cousinSessions.front().sourceActivated,
+                       "cousin_session_source_becomes_active_after_exact_ack");
+          permissionBrain.cousinSessions.front().nextRenewalMs = Time::msSinceBoot() - 1;
+          permissionBrain.driveCousinSessions();
+          suite.expect(permissionBrain.cousinSessions.size() == 1 &&
+                           permissionBrain.cousinSessions.front().leaseGeneration == 2 &&
+                           permissionBrain.cousinSessions.front().awaitingPeerReady,
+                       "cousin_session_source_renews_through_carrier_with_new_generation");
+          if (!permissionBrain.cousinSessions.empty()) {
+            readyReceipt.sequence = 3; readyReceipt.control.leaseGeneration = 2;
+            permissionBrain.receiveCousinSessionControlReceipt(&selfMachine.neuron, readyReceipt);
+            ack.kind = ProdigyCousinSessionLocalKind::renew;
+            permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, ack);
+            suite.expect(permissionBrain.cousinSessions.front().awaitingLocalAck,
+                         "cousin_session_source_rejects_prior_generation_renewal_ack");
+            ack.leaseGeneration = 2;
+            permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, ack);
+            suite.expect(!permissionBrain.cousinSessions.front().awaitingLocalAck,
+                         "cousin_session_source_accepts_current_generation_renewal_ack");
+            const auto oldPermission = permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front();
+            auto revokeRequest = permissionRequest;
+            revokeRequest.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+            revokeRequest.permission = oldPermission;
+            revokeRequest.permission.state = ProdigyLocalCousinServicePermissionState::revoked;
+            revokeRequest.permission.generation = 2;
+            // Requests are unassigned; only the committing owner assigns this
+            // field to the resulting durable permission record.
+            revokeRequest.permission.acceptedAuthorityGeneration = 0;
+            suite.require(permissionBrain.commitLocalCousinServicePermission(revokeRequest, permissionResponse),
+                          "cousin_session_revoked_permission_commits_terminal_policy");
+            permissionBrain.finishRuntimePersistence(true);
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                          "cousin_session_revoked_permission_qualifies_terminal_policy");
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(), "cousin_session_permission_loss_revokes_ephemeral_owner");
+            selfMachine.neuron.wBuffer.clear();
+            auto denied = request; ++denied.requestUUID;
+            suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, denied) &&
+                           permissionBrain.cousinSessions.empty(),
+                         "cousin_session_revoked_permission_creates_no_session");
+            uint32_t exactRejects = 0;
+            forEachMessageInBuffer(selfMachine.neuron.wBuffer, [&](Message *queued) {
+              if (NeuronTopic(queued->topic) != NeuronTopic::cousinSessionCommand) return;
+              uint8_t *args = queued->args; uint128_t target = 0; String serialized = {};
+              ProdigyCousinSessionLocalCommand command = {};
+              if (Message::extractArg<ArgumentNature::fixed>(args, target) && args < queued->terminal())
+                Message::extractToStringView(args, serialized);
+              if (args == queued->terminal() && BitseryEngine::deserializeSafe(serialized, command) &&
+                  command.kind == ProdigyCousinSessionLocalKind::reject && target == sourceApp.uuid &&
+                  command.requestUUID == denied.requestUUID && command.session.sessionUUID == 0) ++exactRejects;
+            });
+            suite.expect(exactRejects == 1, "cousin_session_revoked_permission_rejects_exact_request");
+            selfMachine.neuron.wBuffer.clear();
+            suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid + 1, denied) &&
+                           selfMachine.neuron.wBuffer.empty(),
+                         "cousin_session_reject_does_not_cross_container_binding");
+            NeuronView staleNeuron = {}; staleNeuron.machine = &selfMachine;
+            suite.expect(!permissionBrain.cousinSessionSourceRequest(&staleNeuron, sourceApp.uuid, denied) &&
+                           selfMachine.neuron.wBuffer.empty(),
+                         "cousin_session_reject_does_not_target_stale_neuron");
+            permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front() = oldPermission;
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                          "cousin_session_fixture_restores_source_permission_authority");
+          }
+        }
+        permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
+        permissionBrain.machinesByUUID.erase(selfMachine.uuid);
+        selfMachine.fragment = savedFragment; selfMachine.runtimeReady = savedReady;
+      }
       auto wrongIdentityReceipt = cacheReceipt;
       wrongIdentityReceipt.sequence = 2;
       wrongIdentityReceipt.snapshot.records.front().permission.logicalServiceUUID++;

@@ -14,6 +14,97 @@
 constexpr static uint16_t mothershipPairControlBoundaryPort = 315;
 constexpr static uint32_t mothershipPairControlBoundaryMaximumEndpoints = 16;
 
+// One operation-scoped, direct TCP flow is optional after the pair-control
+// carrier is prepared.  It deliberately names both deployed workloads and the
+// two already-leased public tuples; it is not a general inter-VDC route.
+class MothershipPairControlServiceTransit {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t sourceClusterUUID = 0;
+  uint128_t destinationClusterUUID = 0;
+  uint64_t sourceDeploymentID = 0;
+  uint64_t destinationDeploymentID = 0;
+  uint128_t sourcePermissionUUID = 0;
+  uint128_t destinationPermissionUUID = 0;
+  uint16_t sourceSlot = 0;
+  IPAddress sourceWhiteholeAddress = {};
+  uint16_t sourceTCPPort = 0;
+  IPAddress destinationWormholeAddress = {};
+  uint16_t destinationTCPPort = 0;
+  IPAddress sourceIngressPrivate6 = {};
+  IPAddress destinationIngressPrivate6 = {};
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipPairControlServiceTransit& transit)
+{
+  serializer.value4b(transit.protocolVersion);
+  serializer.value16b(transit.sourceClusterUUID);
+  serializer.value16b(transit.destinationClusterUUID);
+  serializer.value8b(transit.sourceDeploymentID);
+  serializer.value8b(transit.destinationDeploymentID);
+  serializer.value16b(transit.sourcePermissionUUID);
+  serializer.value16b(transit.destinationPermissionUUID);
+  serializer.value2b(transit.sourceSlot);
+  serializer.object(transit.sourceWhiteholeAddress);
+  serializer.value2b(transit.sourceTCPPort);
+  serializer.object(transit.destinationWormholeAddress);
+  serializer.value2b(transit.destinationTCPPort);
+  serializer.object(transit.sourceIngressPrivate6);
+  serializer.object(transit.destinationIngressPrivate6);
+}
+
+static inline bool mothershipPairControlServiceTransitAddressValid(const IPAddress& address)
+{
+  if (!address.is6 || address.isNull()) return false;
+  if (IN6_IS_ADDR_UNSPECIFIED(reinterpret_cast<const in6_addr*>(address.v6)) ||
+      IN6_IS_ADDR_MULTICAST(reinterpret_cast<const in6_addr*>(address.v6)) ||
+      IN6_IS_ADDR_LOOPBACK(reinterpret_cast<const in6_addr*>(address.v6)) ||
+      (address.v6[0] == 0xfeu && (address.v6[1] & 0xc0u) == 0x80u)) return false;
+  return true;
+}
+
+static inline bool mothershipPairControlServiceTransitValid(
+    const MothershipPairControlServiceTransit& transit, uint128_t firstClusterUUID,
+    uint128_t secondClusterUUID, String *failure = nullptr, bool requireIngress = true)
+{
+  if (failure) failure->clear();
+  auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (transit.protocolVersion != MothershipPairControlServiceTransit::version ||
+      transit.sourceClusterUUID == 0 || transit.destinationClusterUUID == 0 ||
+      transit.sourceClusterUUID == transit.destinationClusterUUID ||
+      !((transit.sourceClusterUUID == firstClusterUUID && transit.destinationClusterUUID == secondClusterUUID) ||
+        (transit.sourceClusterUUID == secondClusterUUID && transit.destinationClusterUUID == firstClusterUUID)) ||
+      transit.sourceDeploymentID == 0 || transit.destinationDeploymentID == 0 ||
+      transit.sourcePermissionUUID == 0 || transit.destinationPermissionUUID == 0 ||
+      transit.sourceSlot >= CousinRouteSlotBitmap::slotCount ||
+      !mothershipPairControlServiceTransitAddressValid(transit.sourceWhiteholeAddress) ||
+      !mothershipPairControlServiceTransitAddressValid(transit.destinationWormholeAddress) ||
+      transit.sourceTCPPort == 0 || transit.destinationTCPPort == 0 ||
+      (requireIngress && (!mothershipPairControlServiceTransitAddressValid(transit.sourceIngressPrivate6) ||
+                          !mothershipPairControlServiceTransitAddressValid(transit.destinationIngressPrivate6) ||
+                          transit.sourceIngressPrivate6.equals(transit.destinationIngressPrivate6))))
+  {
+    return reject("pair-control service transit requires exact distinct deployments, permissions, and routable IPv6 TCP tuples");
+  }
+  return true;
+}
+
+static inline bool mothershipPairControlServiceTransitEqual(
+    const MothershipPairControlServiceTransit& left, const MothershipPairControlServiceTransit& right)
+{
+  return left.protocolVersion == right.protocolVersion &&
+      left.sourceClusterUUID == right.sourceClusterUUID && left.destinationClusterUUID == right.destinationClusterUUID &&
+      left.sourceDeploymentID == right.sourceDeploymentID && left.destinationDeploymentID == right.destinationDeploymentID &&
+      left.sourcePermissionUUID == right.sourcePermissionUUID && left.destinationPermissionUUID == right.destinationPermissionUUID &&
+      left.sourceSlot == right.sourceSlot && left.sourceWhiteholeAddress.equals(right.sourceWhiteholeAddress) && left.sourceTCPPort == right.sourceTCPPort &&
+      left.destinationWormholeAddress.equals(right.destinationWormholeAddress) &&
+      left.destinationTCPPort == right.destinationTCPPort &&
+      left.sourceIngressPrivate6.equals(right.sourceIngressPrivate6) &&
+      left.destinationIngressPrivate6.equals(right.destinationIngressPrivate6);
+}
+
 class MothershipPairControlBoundaryDescriptor {
 public:
   static constexpr uint32_t version = 1;
@@ -245,17 +336,90 @@ static inline bool mothershipPairControlBoundaryArguments(
   return true;
 }
 
-static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
-    const MothershipPairControlBoundaryDescriptor& descriptor, const String& receipt)
+static inline bool mothershipPairControlServiceTransitArguments(
+    const MothershipPairControlBoundaryDescriptor& descriptor,
+    const MothershipPairControlServiceTransit& transit, Vector<String>& arguments,
+    String *failure = nullptr)
 {
-  if (!mothershipPairControlBoundaryValid(descriptor)) return false;
+  arguments.clear();
+  if (!mothershipPairControlBoundaryValid(descriptor, failure) ||
+      !mothershipPairControlServiceTransitValid(transit, descriptor.firstClusterUUID, descriptor.secondClusterUUID, failure)) return false;
+  if (!mothershipPairControlBoundaryArguments(descriptor, "query"_ctv, arguments, failure)) return false;
+  // query's provider argv is `--pair-control-action query`; retain its exact
+  // canonical boundary arguments and replace only the authorized action.
+  arguments[1] = "service"_ctv;
+  String sourceCluster = {}, destinationCluster = {}, sourceDeployment = {}, destinationDeployment = {};
+  String sourcePermission = {}, destinationPermission = {}, sourceAddress = {}, destinationAddress = {};
+  String sourceSlot = {}, sourcePort = {}, destinationPort = {};
+  sourceCluster.assignItoh(transit.sourceClusterUUID);
+  destinationCluster.assignItoh(transit.destinationClusterUUID);
+  sourceDeployment.assignItoa(transit.sourceDeploymentID);
+  destinationDeployment.assignItoa(transit.destinationDeploymentID);
+  sourcePermission.assignItoh(transit.sourcePermissionUUID);
+  destinationPermission.assignItoh(transit.destinationPermissionUUID);
+  sourceSlot.assignItoa(transit.sourceSlot);
+  sourcePort.assignItoa(transit.sourceTCPPort);
+  destinationPort.assignItoa(transit.destinationTCPPort);
+  char sourceBuffer[INET6_ADDRSTRLEN] = {}, destinationBuffer[INET6_ADDRSTRLEN] = {};
+  if (::inet_ntop(AF_INET6, transit.sourceWhiteholeAddress.v6, sourceBuffer, sizeof(sourceBuffer)) == nullptr ||
+      ::inet_ntop(AF_INET6, transit.destinationWormholeAddress.v6, destinationBuffer, sizeof(destinationBuffer)) == nullptr)
+  {
+    if (failure) failure->assign("pair-control service transit IPv6 address cannot be rendered"_ctv);
+    arguments.clear();
+    return false;
+  }
+  sourceAddress.assign(sourceBuffer);
+  destinationAddress.assign(destinationBuffer);
+  arguments.push_back(sourceCluster);
+  arguments.push_back(destinationCluster);
+  arguments.push_back(sourceDeployment);
+  arguments.push_back(destinationDeployment);
+  arguments.push_back(sourcePermission);
+  arguments.push_back(destinationPermission);
+  arguments.push_back(sourceSlot);
+  arguments.push_back(sourceAddress);
+  arguments.push_back(sourcePort);
+  arguments.push_back(destinationAddress);
+  arguments.push_back(destinationPort);
+  for (const auto& address : {transit.sourceIngressPrivate6, transit.destinationIngressPrivate6}) {
+    char buffer[INET6_ADDRSTRLEN] = {}; String text = {};
+    if (::inet_ntop(AF_INET6, address.v6, buffer, sizeof(buffer)) == nullptr) return false;
+    text.assign(buffer); arguments.push_back(std::move(text));
+  }
+  return true;
+}
+
+static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const String& receipt,
+    const MothershipPairControlServiceTransit *transit = nullptr)
+{
+  if (!mothershipPairControlBoundaryValid(descriptor) ||
+      (transit != nullptr && !mothershipPairControlServiceTransitValid(*transit,
+          descriptor.firstClusterUUID, descriptor.secondClusterUUID))) return false;
   String operation = {}, firstCluster = {}, secondCluster = {}, expected = {};
   operation.assignItoh(descriptor.operationUUID);
   firstCluster.assignItoh(descriptor.firstClusterUUID);
   secondCluster.assignItoh(descriptor.secondClusterUUID);
+  if (transit == nullptr)
+  {
+    expected.snprintf<
+        "PAIR_CONTROL operationID={} firstClusterUUID={} secondClusterUUID={} firstRuntimeIdentity={} secondRuntimeIdentity={} firstPrivate6Subnet={} secondPrivate6Subnet={} port=315 phase=prepared\n"_ctv>(
+        operation, firstCluster, secondCluster, descriptor.firstRuntimeIdentity, descriptor.secondRuntimeIdentity,
+        descriptor.firstPrivateIPv6Subnet, descriptor.secondPrivateIPv6Subnet);
+    return receipt == expected;
+  }
+  String source = {}, destination = {}, sourceIngress = {}, destinationIngress = {};
+  char sourceBuffer[INET6_ADDRSTRLEN] = {}, destinationBuffer[INET6_ADDRSTRLEN] = {};
+  if (::inet_ntop(AF_INET6, transit->sourceWhiteholeAddress.v6, sourceBuffer, sizeof(sourceBuffer)) == nullptr ||
+      ::inet_ntop(AF_INET6, transit->destinationWormholeAddress.v6, destinationBuffer, sizeof(destinationBuffer)) == nullptr) return false;
+  source.assign(sourceBuffer); destination.assign(destinationBuffer);
+  if (::inet_ntop(AF_INET6, transit->sourceIngressPrivate6.v6, sourceBuffer, sizeof(sourceBuffer)) == nullptr ||
+      ::inet_ntop(AF_INET6, transit->destinationIngressPrivate6.v6, destinationBuffer, sizeof(destinationBuffer)) == nullptr) return false;
+  sourceIngress.assign(sourceBuffer); destinationIngress.assign(destinationBuffer);
   expected.snprintf<
-      "PAIR_CONTROL operationID={} firstClusterUUID={} secondClusterUUID={} firstRuntimeIdentity={} secondRuntimeIdentity={} firstPrivate6Subnet={} secondPrivate6Subnet={} port=315 phase=prepared\n"_ctv>(
+      "PAIR_CONTROL operationID={} firstClusterUUID={} secondClusterUUID={} firstRuntimeIdentity={} secondRuntimeIdentity={} firstPrivate6Subnet={} secondPrivate6Subnet={} port=315 phase=prepared service=1 source={}:{itoa} destination={}:{itoa} sourceIngress={} destinationIngress={}\n"_ctv>(
       operation, firstCluster, secondCluster, descriptor.firstRuntimeIdentity, descriptor.secondRuntimeIdentity,
-      descriptor.firstPrivateIPv6Subnet, descriptor.secondPrivateIPv6Subnet);
+      descriptor.firstPrivateIPv6Subnet, descriptor.secondPrivateIPv6Subnet,
+      source, uint64_t(transit->sourceTCPPort), destination, uint64_t(transit->destinationTCPPort), sourceIngress, destinationIngress);
   return receipt == expected;
 }

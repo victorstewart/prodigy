@@ -158,6 +158,30 @@ static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nod
   return publication;
 }
 
+static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounterpart& destination,
+                                                       uint64_t rootGeneration, uint64_t keyEpoch)
+{
+  ProdigyCousinSessionControl control = {};
+  control.kind = ProdigyCousinSessionControlKind::propose;
+  auto& session = control.session;
+  session.sessionUUID = 0x7f01; session.requestUUID = 0x7f02;
+  session.rootGeneration = rootGeneration; session.keyEpoch = keyEpoch; session.slot = 3;
+  session.destination = destination;
+  session.sourcePermission = destination.permission;
+  session.sourcePermission.permissionUUID = 0x7f03;
+  session.sourcePermission.localHalf = CousinRouteHalf::source;
+  std::swap(session.sourcePermission.localClusterUUID, session.sourcePermission.peerClusterUUID);
+  std::swap(session.sourcePermission.localApplicationID, session.sourcePermission.peerApplicationID);
+  std::swap(session.sourcePermission.localCousinServicePrefix, session.sourcePermission.peerCousinServicePrefix);
+  session.sourcePermission.localDeploymentID = uint64_t(session.sourcePermission.localApplicationID) << 48 | 1;
+  session.sourceContainerUUID = 0x7f04; session.sourceNodeUUID = firstNodeUUID; session.sourceContainerID = 0x01020304;
+  session.sourceShardGroups = 2; session.sourceShardGroup = statefulServiceGroupOwnerForSlot(3, 2);
+  session.sourceService = MeshServices::constrainPrefixToGroup(session.sourcePermission.localCousinServicePrefix,
+                                                                 session.sourceShardGroup);
+  session.sourceBindingNonce = 1; session.sourceAddress = IPAddress("fd00:ffff:1234::1", true); session.sourceTCPPort = 40001;
+  return control;
+}
+
 static bool appendComplementaryEpoch(PairProjections& output, uint64_t keyEpoch)
 {
   ClusterPairRoot root = {};
@@ -529,6 +553,46 @@ static void pairControlCarrierTransfersAndWithdrawsDiscovery(TestSuite& suite)
   suite.expect(quiescePair(ring, first, second), "pair_control_ring_discovery_scenario_quiesces_before_destruction");
 }
 
+static void pairControlCarrierTransfersSessionControl(TestSuite& suite)
+{
+  PersistenceRing ring(64, 32); PairProjections projections = {};
+  SwitchboardPairControlRuntime first = {}, second = {};
+  std::vector<ProdigyCousinSessionReceipt> receipts = {};
+  std::vector<ProdigyCousinDiscoveryReceipt> discoveryReceipts = {};
+  first.onDiscoverySnapshot = [&](const ProdigyCousinDiscoveryReceipt& receipt) { discoveryReceipts.push_back(receipt); };
+  second.onSessionControl = [&](const ProdigyCousinSessionReceipt& receipt) { receipts.push_back(receipt); };
+  const bool installed = buildComplementaryProjections(projections, 1) &&
+      first.installProjection(projections.first) && second.installProjection(projections.second);
+  suite.expect(installed && first.start() && second.start(), "pair_control_ring_starts_session_control_carriers");
+  const bool ready = installed && runUntil(ring, [&] { return first.readyCount() == 1 && second.readyCount() == 1; }, 6000);
+  const auto publication = buildDiscoveryPublication(secondNodeUUID, secondClusterUUID, firstClusterUUID,
+      projections.first.credentials[0].pairUUID, projections.first.credentials[0].rootGeneration,
+      projections.first.credentials[0].keyEpoch, 1);
+  const bool discovered = ready && second.installDiscoverySnapshot(publication) && runUntil(ring, [&] {
+    return !discoveryReceipts.empty() && !discoveryReceipts.back().withdrawn;
+  }, 6000);
+  suite.expect(discovered, "pair_control_ring_observes_actual_session_carrier_connection");
+  ProdigyCousinSessionPublication outbound = {};
+  outbound.nodeUUID = firstNodeUUID; outbound.projectionGeneration = 1;
+  outbound.connectionID = discovered ? discoveryReceipts.back().connectionID : 0;
+  outbound.localEndpoint = projections.first.credentials[0].initiator;
+  outbound.remoteEndpoint = projections.first.credentials[0].responder;
+  outbound.control = buildSessionControl(publication.snapshot.records[0],
+                                         projections.first.credentials[0].rootGeneration,
+                                         projections.first.credentials[0].keyEpoch);
+  const bool queued = discovered && prodigyCousinSessionPublicationValid(outbound) && first.sendSessionControl(outbound);
+  const bool received = queued && runUntil(ring, [&] { return receipts.size() == 1; }, 6000);
+  suite.expect(received && !receipts[0].disconnected && receipts[0].sequence == 1 &&
+                   receipts[0].control.kind == ProdigyCousinSessionControlKind::propose,
+               "pair_control_ring_transfers_exact_authenticated_session_control");
+  auto staleConnection = outbound; staleConnection.connectionID = outbound.connectionID + 1;
+  suite.expect(!first.sendSessionControl(staleConnection), "pair_control_ring_rejects_stale_session_publication_connection_fence");
+  const bool disconnected = received && first.installProjection(revokedProjection(projections.first, 2));
+  suite.expect(disconnected && runUntil(ring, [&] { return !receipts.empty() && receipts.back().disconnected; }, 6000),
+               "pair_control_ring_emits_session_disconnect_receipt");
+  suite.expect(quiescePair(ring, first, second), "pair_control_ring_session_control_quiesces_before_destruction");
+}
+
 static void pairControlCarrierThreeByThreeFanout(TestSuite& suite)
 {
   // Nine initiating sockets plus three listeners, and nine accepted sockets.
@@ -576,6 +640,11 @@ int main()
   if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return 77;
 
   TestSuite suite = {};
+  const char *selection = std::getenv("PRODIGY_TEST_ONLY");
+  if (selection != nullptr && std::strcmp(selection, "cousin-session") == 0) {
+    pairControlCarrierTransfersSessionControl(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   pairControlCarrierReadyAndGenerationAdvance(suite);
   pairControlCarrierRevocationDropsReadinessAndDrains(suite);
   pairControlCarrierRejectsWrongPSK(suite);

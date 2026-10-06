@@ -1,6 +1,6 @@
 #include <networking/includes.h>
 #include <services/prodigy.h>
-#include <prodigy/cousin.discovery.h>
+#include <prodigy/cousin.session.h>
 #include <prodigy/types.h>
 #include <prodigy/wire.h>
 
@@ -718,6 +718,16 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::cousinSessionRequest:
+    case NeuronTopic::cousinSessionAck:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
+      }
+    case NeuronTopic::cousinSessionControlReceipt:
+    case NeuronTopic::cousinAdmissionAck:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case NeuronTopic::registration:
       {
         int64_t bootTimeMs = 0;
@@ -973,6 +983,15 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::cousinSessionCommand:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
+      }
+    case NeuronTopic::cousinSessionControlSend:
+    case NeuronTopic::cousinAdmissionCommand:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case NeuronTopic::transportCredentialPeers:
       {
         uint128_t nonce = 0;
@@ -1296,6 +1315,9 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::cousinSessionRequest:
+    case ContainerTopic::cousinSessionAck:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case ContainerTopic::ping:
     case ContainerTopic::pong:
     case ContainerTopic::healthy:
@@ -1350,6 +1372,8 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::cousinSessionCommand:
+      return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case ContainerTopic::none:
     case ContainerTopic::ping:
     case ContainerTopic::pong:

@@ -2160,10 +2160,77 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                                                differentSyn, sizeof(*differentSyn));
   std::vector<uint8_t> differentSynOverlay = makeWormholeIPv6OverlayFrame(differentSynInner, selected);
   expectNamed(runHost(differentSynOverlay, hostOutput) == TC_ACT_SHOT, "protected_ipv6_different_syn_sequence_drops");
+  std::vector<uint8_t> protectedTCPAckInner = publicTCPInner;
+  struct ipv6hdr *protectedTCPAckIPv6 =
+      reinterpret_cast<struct ipv6hdr *>(protectedTCPAckInner.data() + sizeof(struct ethhdr));
+  struct tcphdr *protectedTCPAckHeader = reinterpret_cast<struct tcphdr *>(protectedTCPAckIPv6 + 1);
+  protectedTCPAckHeader->syn = 0;
+  protectedTCPAckHeader->ack = 1;
+  protectedTCPAckHeader->ack_seq = htonl(1);
+  protectedTCPAckHeader->check = 0;
+  protectedTCPAckHeader->check = checksumIPv6Transport(protectedTCPAckIPv6->saddr.s6_addr,
+                                                        protectedTCPAckIPv6->daddr.s6_addr,
+                                                        IPPROTO_TCP,
+                                                        protectedTCPAckHeader,
+                                                        sizeof(*protectedTCPAckHeader));
+  std::vector<uint8_t> protectedTCPAckOverlay = makeWormholeIPv6OverlayFrame(protectedTCPAckInner, selected);
+  expectNamed(runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "protected_ipv6_ack_before_syn_ack_cannot_promote_pending_owner");
+  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS &&
+                  runNetkit(egress, tcpReply, 0, packetOutput) == NETKIT_PASS,
+              "protected_ipv6_syn_ack_advances_exact_pending_owner");
+  std::vector<uint8_t> protectedWrongTCPInner = protectedTCPAckInner;
+  struct tcphdr *protectedWrongTCPHeader =
+      reinterpret_cast<struct tcphdr *>(protectedWrongTCPInner.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  protectedWrongTCPHeader->ack_seq = htonl(2);
+  protectedWrongTCPHeader->check = 0;
+  protectedWrongTCPHeader->check = checksumIPv6Transport(protectedTCPAckIPv6->saddr.s6_addr,
+                                                          protectedTCPAckIPv6->daddr.s6_addr,
+                                                          IPPROTO_TCP,
+                                                          protectedWrongTCPHeader,
+                                                          sizeof(*protectedWrongTCPHeader));
+  std::vector<uint8_t> protectedWrongTCPOverlay = makeWormholeIPv6OverlayFrame(protectedWrongTCPInner, selected);
+  expectNamed(runHost(protectedWrongTCPOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_DROP,
+              "protected_ipv6_wrong_ack_cannot_promote_pending_owner");
+  std::vector<uint8_t> protectedWrongTupleInner = protectedTCPAckInner;
+  struct tcphdr *protectedWrongTupleHeader =
+      reinterpret_cast<struct tcphdr *>(protectedWrongTupleInner.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
+  protectedWrongTupleHeader->source = htons(49'156);
+  protectedWrongTupleHeader->check = 0;
+  protectedWrongTupleHeader->check = checksumIPv6Transport(protectedTCPAckIPv6->saddr.s6_addr,
+                                                            protectedTCPAckIPv6->daddr.s6_addr,
+                                                            IPPROTO_TCP,
+                                                            protectedWrongTupleHeader,
+                                                            sizeof(*protectedWrongTupleHeader));
+  std::vector<uint8_t> protectedWrongTupleOverlay = makeWormholeIPv6OverlayFrame(protectedWrongTupleInner, selected);
+  expectNamed(runHost(protectedWrongTupleOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_wrong_tuple_cannot_use_pending_owner");
+  protectedRoute.expires_at_ns = 0;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_expired_route_drops_pending_ack");
+  protectedRoute.expires_at_ns = UINT64_MAX;
+  protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_revoked_route_drops_pending_ack");
+  protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "protected_ipv6_matching_ack_promotes_pending_owner");
+  switchboard_wormhole_flow protectedEstablishedTCP = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, protectedEstablishedTCP) &&
+                  protectedEstablishedTCP.phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+                  lookupProgramMapElement(host, "wh_pending"_ctv, tcpOwnerKey, protectedEstablishedTCP) == false,
+              "protected_ipv6_ack_moves_owner_to_established_map");
   protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
                   runHost(publicTCPOverlay, hostOutput) == TC_ACT_SHOT,
-              "protected_ipv6_revoked_route_drops_cached_pending_flow");
+              "protected_ipv6_revoked_route_drops_cached_owner");
   tcpBinding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
   expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
                   updateProgramMapElement(ingress, "wh_egress"_ctv, protectedExposure, tcpBinding) &&

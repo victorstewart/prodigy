@@ -43,8 +43,19 @@ public:
 class TestNeuronHubDispatch final : public NeuronHubDispatch {
 public:
 
+  uint32_t cousinSessionCommandCount = 0;
+  bool cousinSessionCommandResult = false;
+  ProdigyCousinSessionLocalCommand lastCousinSessionCommand = {};
+
   void beginShutdown(void) override
   {}
+
+  bool cousinSessionCommand(const ProdigyCousinSessionLocalCommand& command) override
+  {
+    ++cousinSessionCommandCount;
+    lastCousinSessionCommand = command;
+    return cousinSessionCommandResult;
+  }
 };
 
 class NeuronHubReconnectTimeout final : public TimeoutDispatcher {
@@ -194,6 +205,216 @@ static void testNeuronHubCanQueueToNeuron(TestSuite& suite)
   suite.expect(prodigyNeuronHubCanQueueToNeuron(false, true, -1) == false, "neuron_hub_rejects_missing_fixed_slot");
 }
 
+static void testNeuronHubCousinSessionAckGeneration(TestSuite& suite)
+{
+  ProdigyCousinSessionLocalAck acknowledgement = {};
+  acknowledgement.sessionUUID = 0x71;
+  acknowledgement.leaseGeneration = 4;
+  acknowledgement.kind = ProdigyCousinSessionLocalKind::renew;
+  acknowledgement.success = true;
+  String encoded = {};
+  ProdigyCousinSessionLocalAck decoded = {};
+  suite.expect(BitseryEngine::serialize(encoded, acknowledgement) &&
+                   BitseryEngine::deserializeSafe(encoded, decoded) &&
+                   prodigyCousinSessionLocalAckValid(decoded) && decoded.leaseGeneration == 4,
+               "neuron_hub_cousin_session_ack_preserves_lease_generation");
+  decoded.leaseGeneration = 0;
+  suite.expect(!prodigyCousinSessionLocalAckValid(decoded),
+               "neuron_hub_cousin_session_ack_rejects_missing_lease_generation");
+}
+
+static ProdigyCousinSessionLocalCommand validNeuronHubCousinSessionCommand()
+{
+  ProdigyCousinCounterpart destination = {};
+  auto& permission = destination.permission;
+  permission.permissionUUID = 0x7e01;
+  permission.pairUUID = 0x100;
+  permission.logicalWorkloadUUID = 0x7e02;
+  permission.logicalServiceUUID = 0x7e03;
+  permission.localClusterUUID = 0x300;
+  permission.peerClusterUUID = 0x200;
+  permission.localHalf = CousinRouteHalf::destination;
+  permission.localApplicationID = 7;
+  permission.peerApplicationID = 19;
+  permission.localCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  permission.peerCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  permission.slots.insert(3);
+  permission.localDeploymentID = uint64_t(permission.localApplicationID) << 48 | 1;
+  for (uint32_t index = 0; index < 64; ++index)
+  {
+    permission.canonicalPlanSHA256.append('a');
+    permission.artifactSHA256.append('b');
+  }
+  permission.artifactBytes = 1;
+  permission.generation = 1;
+  permission.acceptedAuthorityGeneration = 11;
+  permission.state = ProdigyLocalCousinServicePermissionState::active;
+
+  destination.containerUUID = 0x7e04;
+  destination.nodeUUID = 0x222;
+  destination.containerID = 9;
+  destination.shardGroups = 2;
+  destination.shardGroup = statefulServiceGroupOwnerForSlot(3, destination.shardGroups);
+  destination.service = MeshServices::constrainPrefixToGroup(permission.localCousinServicePrefix,
+                                                              destination.shardGroup);
+  destination.servicePort = 9443;
+  destination.ownedSlots.insert(3);
+  destination.routablePrefixUUID = 0x7e05;
+  destination.publicAddress = IPAddress("fd00:ffff:1234::7", true);
+  destination.publicTCPPort = 8443;
+  for (uint32_t index = 0; index < 64; ++index) destination.wormholeRevision.append('c');
+
+  ProdigyCousinSessionLocalCommand command = {};
+  auto& session = command.session;
+  session.sessionUUID = 0x7f01;
+  session.requestUUID = 0x7f02;
+  session.rootGeneration = 7;
+  session.keyEpoch = 9;
+  session.slot = 3;
+  session.destination = destination;
+  session.sourcePermission = destination.permission;
+  session.sourcePermission.permissionUUID = 0x7f03;
+  session.sourcePermission.localHalf = CousinRouteHalf::source;
+  std::swap(session.sourcePermission.localClusterUUID, session.sourcePermission.peerClusterUUID);
+  std::swap(session.sourcePermission.localApplicationID, session.sourcePermission.peerApplicationID);
+  std::swap(session.sourcePermission.localCousinServicePrefix, session.sourcePermission.peerCousinServicePrefix);
+  session.sourcePermission.localDeploymentID = uint64_t(session.sourcePermission.localApplicationID) << 48 | 1;
+  session.sourceContainerUUID = 0x7f04;
+  session.sourceNodeUUID = 0x111;
+  session.sourceContainerID = 0x01020304;
+  session.sourceShardGroups = 2;
+  session.sourceShardGroup = statefulServiceGroupOwnerForSlot(session.slot, session.sourceShardGroups);
+  session.sourceService = MeshServices::constrainPrefixToGroup(session.sourcePermission.localCousinServicePrefix,
+                                                                 session.sourceShardGroup);
+  session.sourceBindingNonce = 1;
+  session.sourceAddress = IPAddress("fd00:ffff:1234::1", true);
+  session.sourceTCPPort = 40001;
+
+  command.requestUUID = session.requestUUID;
+  command.localHalf = CousinRouteHalf::destination;
+  command.kind = ProdigyCousinSessionLocalKind::install;
+  command.validForMs = ProdigyCousinSessionLeaseMs;
+  command.psk[0] = 1;
+  (void)prodigyCousinSessionDigest(session, command.canonicalContext);
+  return command;
+}
+
+static bool decodeNeuronHubCousinSessionFrame(const String& bytes, ContainerTopic expectedTopic, String& payload)
+{
+  if (bytes.size() < Message::headerBytes) return false;
+  Message *frame = reinterpret_cast<Message *>(const_cast<uint8_t *>(bytes.data()));
+  if (frame->size != bytes.size() || ContainerTopic(frame->topic) != expectedTopic ||
+      !ProdigyIngressValidation::validateContainerPayloadForNeuron(frame->topic, frame->args, frame->terminal())) return false;
+  uint8_t *args = frame->args;
+  Message::extractToStringView(args, payload);
+  return args == frame->terminal();
+}
+
+static bool neuronHubFramePaddingIsZero(const String& bytes)
+{
+  if (bytes.size() < Message::headerBytes) return false;
+  Message *frame = reinterpret_cast<Message *>(const_cast<uint8_t *>(bytes.data()));
+  for (const uint8_t *cursor = frame->terminal(); cursor != reinterpret_cast<const uint8_t *>(frame) + frame->size; ++cursor)
+    if (*cursor != 0) return false;
+  return true;
+}
+
+static void testNeuronHubCousinSessionMessageFrames(TestSuite& suite)
+{
+  int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  suite.expect(listener >= 0, "neuron_hub_cousin_session_frame_creates_listener");
+  if (listener < 0) return;
+
+  sockaddr_un address = {};
+  address.sun_family = AF_UNIX;
+  char name[96] = {};
+  const int nameLength = snprintf(name, sizeof(name), "prodigy-neuron-hub-frame-%d", int(getpid()));
+  const bool nameFits = nameLength > 0 && size_t(nameLength) + 1 < sizeof(address.sun_path);
+  suite.expect(nameFits, "neuron_hub_cousin_session_frame_listener_name_fits");
+  if (!nameFits)
+  {
+    ::close(listener);
+    return;
+  }
+  address.sun_path[0] = '\0';
+  std::memcpy(address.sun_path + 1, name, size_t(nameLength));
+  const socklen_t addressLength = socklen_t(offsetof(sockaddr_un, sun_path) + 1 + nameLength);
+  const bool listening = ::bind(listener, reinterpret_cast<sockaddr *>(&address), addressLength) == 0 &&
+      ::listen(listener, 1) == 0;
+  suite.expect(listening, "neuron_hub_cousin_session_frame_binds_listener");
+  if (!listening)
+  {
+    ::close(listener);
+    return;
+  }
+
+  char listenerText[32] = {};
+  snprintf(listenerText, sizeof(listenerText), "%d", listener);
+  const char *existingListenerText = getenv("PRODIGY_NEURON_LISTENER_FD");
+  const bool hadListenerText = existingListenerText != nullptr;
+  const std::string savedListenerText = existingListenerText ? existingListenerText : "";
+  setenv("PRODIGY_NEURON_LISTENER_FD", listenerText, 1);
+  {
+    TestNeuronHubDispatch dispatch = {};
+    NeuronHub hub(&dispatch);
+
+    ProdigyCousinSessionRequest request = {};
+    request.requestUUID = 0x501;
+    request.permissionUUID = 0x502;
+    request.bindingNonce = 0x503;
+    request.slot = 3;
+    ProdigyCousinSessionRequest decodedRequest = {};
+    String payload = {};
+    const bool queuedRequest = hub.requestCousinSession(request);
+    const bool decodedRequestFrame = decodeNeuronHubCousinSessionFrame(
+        hub.neuron.wBuffer, ContainerTopic::cousinSessionRequest, payload) &&
+        BitseryEngine::deserializeSafe(payload, decodedRequest);
+    suite.expect(queuedRequest && decodedRequestFrame && prodigyCousinSessionRequestValid(decodedRequest) &&
+                     decodedRequest.requestUUID == request.requestUUID && decodedRequest.permissionUUID == request.permissionUUID &&
+                     decodedRequest.bindingNonce == request.bindingNonce && decodedRequest.slot == request.slot &&
+                     neuronHubFramePaddingIsZero(hub.neuron.wBuffer),
+                 "neuron_hub_cousin_session_request_uses_bounded_message_payload");
+
+    hub.neuron.wBuffer.clear();
+    ProdigyCousinSessionLocalAck decodedClose = {};
+    payload.clear();
+    const bool queuedClose = hub.closeCousinSession(0x504, 4);
+    const bool decodedCloseFrame = decodeNeuronHubCousinSessionFrame(
+        hub.neuron.wBuffer, ContainerTopic::cousinSessionAck, payload) &&
+        BitseryEngine::deserializeSafe(payload, decodedClose);
+    suite.expect(queuedClose && decodedCloseFrame && prodigyCousinSessionLocalAckValid(decodedClose) &&
+                     decodedClose.sessionUUID == 0x504 && decodedClose.leaseGeneration == 4 &&
+                     decodedClose.kind == ProdigyCousinSessionLocalKind::revoke && decodedClose.success &&
+                     neuronHubFramePaddingIsZero(hub.neuron.wBuffer),
+                 "neuron_hub_cousin_session_close_uses_bounded_message_payload");
+
+    hub.neuron.wBuffer.clear();
+    auto command = validNeuronHubCousinSessionCommand();
+    String commandPayload = {};
+    String commandFrame = {};
+    dispatch.cousinSessionCommandResult = true;
+    const bool encodedCommand = BitseryEngine::serialize(commandPayload, command);
+    if (encodedCommand) {
+      Message::construct(commandFrame, ContainerTopic::cousinSessionCommand, commandPayload);
+      hub.neuronHandler(reinterpret_cast<Message *>(commandFrame.data()));
+    }
+    ProdigyCousinSessionLocalAck decodedApplied = {};
+    payload.clear();
+    const bool decodedAppliedFrame = decodeNeuronHubCousinSessionFrame(
+        hub.neuron.wBuffer, ContainerTopic::cousinSessionAck, payload) &&
+        BitseryEngine::deserializeSafe(payload, decodedApplied);
+    suite.expect(encodedCommand && prodigyCousinSessionLocalCommandValid(command) &&
+                     dispatch.cousinSessionCommandCount == 1 && decodedAppliedFrame &&
+                     prodigyCousinSessionLocalAckValid(decodedApplied) && decodedApplied.sessionUUID == command.session.sessionUUID &&
+                     decodedApplied.leaseGeneration == command.leaseGeneration && decodedApplied.kind == command.kind &&
+                     decodedApplied.success && neuronHubFramePaddingIsZero(hub.neuron.wBuffer),
+                 "neuron_hub_applied_cousin_command_ack_uses_bounded_message_payload");
+  }
+  if (hadListenerText) setenv("PRODIGY_NEURON_LISTENER_FD", savedListenerText.c_str(), 1);
+  else unsetenv("PRODIGY_NEURON_LISTENER_FD");
+  ::close(listener);
+}
+
 static void testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(TestSuite& suite)
 {
   suite.expect(
@@ -270,6 +491,36 @@ static void testNeuronHubAcceptedReconnectReplaysLatchedReadiness(TestSuite& sui
     hub.signalReady();
     hub.signalRuntimeReady();
     hub.neuron.wBuffer.clear();
+
+    // Reject is a native callback only: it has no installed session, so it
+    // must never manufacture the normal application-to-Brain acknowledgement.
+    ProdigyCousinSessionLocalCommand reject = {};
+    reject.kind = ProdigyCousinSessionLocalKind::reject;
+    reject.requestUUID = 0x77;
+    reject.failure.assign("destination unavailable"_ctv);
+    String rejectPayload = {};
+    String rejectFrame = {};
+    const bool rejectEncoded = BitseryEngine::serialize(rejectPayload, reject);
+    if (rejectEncoded) {
+      Message::construct(rejectFrame, ContainerTopic::cousinSessionCommand, rejectPayload);
+      hub.neuronHandler(reinterpret_cast<Message *>(rejectFrame.data()));
+    }
+    suite.expect(rejectEncoded && dispatch.cousinSessionCommandCount == 1 &&
+                     dispatch.lastCousinSessionCommand.kind == ProdigyCousinSessionLocalKind::reject,
+                 "neuron_hub_delivers_native_cousin_session_reject");
+    suite.expect(hub.neuron.wBuffer.empty(), "neuron_hub_reject_has_no_cousin_session_ack");
+
+    ProdigyCousinSessionLocalCommand malformedReject = reject;
+    malformedReject.failure.clear();
+    String malformedPayload = {};
+    String malformedFrame = {};
+    const bool malformedEncoded = BitseryEngine::serialize(malformedPayload, malformedReject);
+    if (malformedEncoded) {
+      Message::construct(malformedFrame, ContainerTopic::cousinSessionCommand, malformedPayload);
+      hub.neuronHandler(reinterpret_cast<Message *>(malformedFrame.data()));
+    }
+    suite.expect(malformedEncoded && dispatch.cousinSessionCommandCount == 1,
+                 "neuron_hub_reject_requires_valid_command_before_callback");
 
     int client = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     const bool connected = client >= 0 &&
@@ -887,6 +1138,8 @@ int main(void)
     testContainerControlExecQuiesce(suite);
     testRetainedNonChildPidfdExecQuiesce(suite);
     testNeuronHubCanQueueToNeuron(suite);
+    testNeuronHubCousinSessionAckGeneration(suite);
+    testNeuronHubCousinSessionMessageFrames(suite);
     testNeuronHubFlushesBufferedFramesWhenNeuronBecomesSendable(suite);
     testNeuronHubRetainsBuffersUntilCloseRetirement(suite);
     testNeuronResourceObservationReply(suite);

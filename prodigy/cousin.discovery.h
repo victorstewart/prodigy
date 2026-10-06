@@ -157,6 +157,21 @@ static void serialize(S&& serializer, ProdigyCousinDiscoveryResponse& value)
   serializer.text1b(value.failure, 1024);
 }
 
+static inline bool prodigyCousinDirectIPv6AddressValid(const IPAddress& value)
+{
+  if (!value.is6 || value.isNull()) return false;
+  const uint8_t *address = value.v6;
+  const bool loopback = address[15] == 1 && [] (const uint8_t *bytes) {
+    for (uint32_t index = 0; index < 15; ++index) if (bytes[index] != 0) return false;
+    return true;
+  }(address);
+  const bool mappedV4 = address[0] == 0 && address[1] == 0 && address[2] == 0 && address[3] == 0 &&
+      address[4] == 0 && address[5] == 0 && address[6] == 0 && address[7] == 0 && address[8] == 0 &&
+      address[9] == 0 && address[10] == 0xff && address[11] == 0xff;
+  const bool linkLocal = address[0] == 0xfe && (address[1] & 0xc0u) == 0x80u;
+  return !loopback && !mappedV4 && !linkLocal && address[0] != 0xff;
+}
+
 static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart& value)
 {
   if (!prodigyLocalCousinServicePermissionValid(value.permission) ||
@@ -167,18 +182,8 @@ static inline bool prodigyCousinCounterpartValid(const ProdigyCousinCounterpart&
       !MeshServices::isShard(value.service) ||
       value.service != MeshServices::constrainPrefixToGroup(value.permission.localCousinServicePrefix, value.shardGroup) ||
       value.servicePort == 0 || value.ownedSlots.empty() || value.routablePrefixUUID == 0 ||
-      !value.publicAddress.is6 || value.publicAddress.isNull() || value.publicTCPPort == 0 ||
+      !prodigyCousinDirectIPv6AddressValid(value.publicAddress) || value.publicTCPPort == 0 ||
       !prodigyIsSHA256HexDigest(value.wormholeRevision)) return false;
-  const uint8_t *address = value.publicAddress.v6;
-  const bool loopback = address[15] == 1 && [] (const uint8_t *bytes) {
-    for (uint32_t index = 0; index < 15; ++index) if (bytes[index] != 0) return false;
-    return true;
-  }(address);
-  const bool mappedV4 = address[0] == 0 && address[1] == 0 && address[2] == 0 && address[3] == 0 &&
-      address[4] == 0 && address[5] == 0 && address[6] == 0 && address[7] == 0 && address[8] == 0 &&
-      address[9] == 0 && address[10] == 0xff && address[11] == 0xff;
-  const bool linkLocal = address[0] == 0xfe && (address[1] & 0xc0u) == 0x80u;
-  if (loopback || mappedV4 || linkLocal || address[0] == 0xff) return false;
   for (uint16_t slot = 0; slot < nStatefulServiceGroupSlots; ++slot)
   {
     const bool expected = value.permission.slots.contains(slot) &&

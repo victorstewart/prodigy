@@ -7004,7 +7004,7 @@ public:
         // A restored inventory may retain its healthy container report without
         // retaining the per-Neuron switchboard map. Requeue the existing
         // revisioned operation so routing readiness remains ACK-gated.
-        if (plan.isStateful == false)
+        if (plan.isStateful == false || !plan.wormholes.empty())
         {
           thisBrain->sendNeuronOpenSwitchboardWormholes(container, plan.wormholes);
         }
@@ -8779,13 +8779,11 @@ public:
                  unsigned(nHealthySurge));
     PRODIGY_DEBUG_FLUSH();
 
-    if (plan.isStateful == false)
+    if (plan.isStateful == false || !plan.wormholes.empty())
     {
-      // only non stateful allowed to have wormholes right now
-
       thisBrain->sendNeuronOpenSwitchboardWormholes(container, plan.wormholes);
     }
-    else
+    if (plan.isStateful)
     {
       if (deployingNewShardGroup) // aka stateful
       {

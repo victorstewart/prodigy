@@ -11431,6 +11431,65 @@ private:
     return valid;
   }
 
+  bool readRoutableResourceLeases(const MothershipProdigyCluster& cluster,
+                                  RoutableResourceLeaseReport& report, String& failure)
+  {
+    report = {};
+    socket.close();
+    String targetName = cluster.name;
+    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullRoutableResourceLeases);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullRoutableResourceLeases);
+    if (!response) { failure.assign("routable resource lease observation unavailable"_ctv); socket.close(); return false; }
+    uint8_t *args = response->args;
+    String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) && report.success;
+    socket.close();
+    if (!valid) failure.assign("routable resource lease observation is invalid"_ctv);
+    return valid;
+  }
+
+  bool readRoutableSubnets(const MothershipProdigyCluster& cluster,
+                           RoutableSubnetRegistryReport& report, String& failure)
+  {
+    report = {}; socket.close(); String targetName = cluster.name;
+    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    Message::construct(socket.wBuffer, MothershipTopic::pullRoutableSubnets);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullRoutableSubnets);
+    if (!response) { failure.assign("routable prefix observation unavailable"_ctv); socket.close(); return false; }
+    uint8_t *args = response->args; String encoded = {};
+    Message::extractToStringView(args, encoded);
+    const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) && report.success;
+    socket.close();
+    if (!valid) failure.assign("routable prefix observation is invalid"_ctv);
+    return valid;
+  }
+
+  bool readLocalCousinServicePermission(const MothershipProdigyCluster& cluster, uint128_t permissionUUID,
+                                        ProdigyLocalCousinServicePermissionResponse& response, String& failure)
+  {
+    response = {};
+    String targetName = cluster.name;
+    if (permissionUUID == 0 || !configureControlTarget(targetName.c_str(), &failure)) return false;
+    ProdigyLocalCousinServicePermissionQuery query = {};
+    query.permissionUUID = permissionUUID;
+    if (!requestTopicRoundTrip(MothershipTopic::pullLocalCousinServicePermission, query, response, failure) ||
+        response.protocolVersion != 1 || !response.success || !response.found || !response.qualified ||
+        !prodigyLocalCousinServicePermissionValid(response.permission) ||
+        response.permission.permissionUUID != permissionUUID ||
+        response.permission.localClusterUUID != cluster.clusterUUID ||
+        response.permission.state != ProdigyLocalCousinServicePermissionState::active ||
+        response.permission.acceptedAuthorityGeneration > response.currentAuthorityGeneration)
+    {
+      if (failure.empty()) failure.assign("active qualified cousin permission observation is unavailable"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool testPairDeploymentReady(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
                                uint32_t machineIndex, const String& vip, uint16_t port,
                                DeploymentIdentityReport& report, String& failure)
@@ -15468,9 +15527,21 @@ private:
     {
       if (plan.isStateful)
       {
-        basics_log("wormholes require stateless applications\n");
-        deploymentFailure.assign("deployment request rejected"_ctv);
-      return false;
+        bytell_hash_map<uint64_t, Advertisement> advertisements = {};
+        for (const auto& advertisement : plan.advertisements)
+          advertisements.emplace(advertisement.service, advertisement);
+        SwitchboardWormholeDesiredState desired = {};
+        const uint64_t cousin = StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0).cousin;
+        bool protectedCousin = !plan.useHostNetworkNamespace &&
+            prodigyBuildCousinWormholeDesiredState(plan.wormholes, true, cousin, advertisements, desired, false);
+        for (const auto& wormhole : plan.wormholes)
+          protectedCousin = protectedCousin && wormhole.externalPort == wormhole.containerPort &&
+              prodigyWormholeRequiresPairAdmission(desired, wormhole.containerPort, wormhole.layer4);
+        if (!protectedCousin) {
+          basics_log("stateful wormholes require an explicit protected COUSIN TCP advertisement without port translation\n");
+          deploymentFailure.assign("deployment request rejected"_ctv);
+          return false;
+        }
       }
 
       if (wormholeTargetBindingsUnique(plan.wormholes) == false)
@@ -18560,6 +18631,33 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  // Observe the canonical live plan through the existing Brain report owner.
+  // Operators use this identity when installing exact deployment permissions.
+  void runDeploymentIdentity(int argc, char *argv[])
+  {
+    String failure = {};
+    uint64_t deploymentID = 0;
+    MothershipProdigyCluster cluster = {};
+    DeploymentIdentityReport report = {};
+    bool valid = argc == 2 && argv[1][0] >= '0' && argv[1][0] <= '9' &&
+        mothershipParseUnsignedArgument(argv[1], UINT64_MAX, deploymentID) && deploymentID != 0;
+    if (valid) {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure);
+    }
+    if (valid) {
+      valid = readDeploymentIdentity(cluster, deploymentID, report, failure) &&
+          prodigyIsSHA256HexDigest(report.canonicalPlanSHA256) &&
+          prodigyIsSHA256HexDigest(report.containerBlobSHA256) && report.containerBlobBytes != 0;
+    }
+    if (!valid && failure.empty()) failure.assign("usage: deploymentIdentity CLUSTER DEPLOYMENT_ID; requires a live deployment"_ctv);
+    basics_log("deploymentIdentity success=%u clusterUUID=%016llx%016llx deploymentID=%llu applicationID=%u planSHA256=%s artifactSHA256=%s artifactBytes=%llu failure=%s\n",
+        unsigned(valid), (unsigned long long)(report.clusterUUID >> 64), (unsigned long long)report.clusterUUID,
+        (unsigned long long)report.deploymentID, unsigned(report.applicationID), report.canonicalPlanSHA256.c_str(),
+        report.containerBlobSHA256.c_str(), (unsigned long long)report.containerBlobBytes, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runCousinDiscovery(int argc, char *argv[])
   {
     String failure;
@@ -18699,6 +18797,186 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  static bool parsePairControlServiceTransitJSON(const String& json,
+                                                  MothershipPairControlServiceTransit& transit,
+                                                  String& failure)
+  {
+    transit = {}; failure.clear();
+    simdjson::dom::parser parser;
+    simdjson::dom::element document;
+    auto reject = [&]() { transit = {}; failure.assign("invalid pair-control service transit: require exact canonical fields"_ctv); return false; };
+    if (json.empty() || json.size() > 16384 || parser.parse(json.data(), json.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT) return reject();
+    constexpr std::string_view names[] = {
+      "sourceClusterUUID", "destinationClusterUUID", "sourceDeploymentID", "destinationDeploymentID",
+      "sourcePermissionUUID", "destinationPermissionUUID", "sourceSlot", "sourceWhiteholeIPv6",
+      "sourceTCPPort", "destinationWormholeIPv6", "destinationTCPPort"
+    };
+    uint16_t seen = 0;
+    for (auto field : document.get_object())
+    {
+      uint32_t index = 0;
+      while (index < 11 && names[index] != field.key) ++index;
+      if (index == 11 || (seen & (uint16_t(1) << index))) return reject();
+      seen |= uint16_t(1) << index;
+      if (index == 0 || index == 1 || index == 4 || index == 5)
+      {
+        std::string_view value;
+        if (field.value.get(value) != simdjson::SUCCESS) return reject();
+        String text = {}; text.setInvariant(value.data(), value.size());
+        uint128_t parsed = 0;
+        if (!prodigyParseCanonicalHex128(text, parsed) || parsed == 0) return reject();
+        uint128_t *target[] = {&transit.sourceClusterUUID, &transit.destinationClusterUUID,
+          &transit.sourcePermissionUUID, &transit.destinationPermissionUUID};
+        *target[index == 0 ? 0 : index == 1 ? 1 : index == 4 ? 2 : 3] = parsed;
+      }
+      else if (index == 7 || index == 9)
+      {
+        std::string_view value;
+        if (field.value.get(value) != simdjson::SUCCESS) return reject();
+        // inet_pton needs a terminated string; a length-only JSON view has no
+        // spare byte and String::c_str() deliberately returns empty for it.
+        String text = {}; text.assign(value);
+        IPAddress& target = index == 7 ? transit.sourceWhiteholeAddress : transit.destinationWormholeAddress;
+        target = {};
+        if (::inet_pton(AF_INET6, text.c_str(), target.v6) != 1) return reject();
+        target.is6 = true;
+        char canonical[INET6_ADDRSTRLEN] = {};
+        String canonicalText = {};
+        if (::inet_ntop(AF_INET6, target.v6, canonical, sizeof(canonical)) == nullptr) return reject();
+        canonicalText.assign(canonical);
+        if (text != canonicalText) return reject();
+      }
+      else
+      {
+        uint64_t value = 0;
+        if (field.value.get(value) != simdjson::SUCCESS || (index != 6 && value == 0)) return reject();
+        if (index == 2) transit.sourceDeploymentID = value;
+        else if (index == 3) transit.destinationDeploymentID = value;
+        else if (index == 6) { if (value >= CousinRouteSlotBitmap::slotCount) return reject(); transit.sourceSlot = uint16_t(value); }
+        else if (index == 8) { if (value > UINT16_MAX) return reject(); transit.sourceTCPPort = uint16_t(value); }
+        else if (index == 10) { if (value > UINT16_MAX) return reject(); transit.destinationTCPPort = uint16_t(value); }
+        else return reject();
+      }
+    }
+    return seen == ((uint16_t(1) << 11) - 1) &&
+        mothershipPairControlServiceTransitAddressValid(transit.sourceWhiteholeAddress) &&
+        mothershipPairControlServiceTransitAddressValid(transit.destinationWormholeAddress) &&
+        transit.sourceTCPPort != 0 && transit.destinationTCPPort != 0 ? true : reject();
+  }
+
+  bool validatePairControlServiceTransit(const MothershipClusterPairEnrollmentIntent& intent,
+                                         MothershipPairControlServiceTransit& transit,
+                                         String& failure)
+  {
+    if (!mothershipPairControlServiceTransitValid(transit, intent.firstClusterUUID, intent.secondClusterUUID, &failure, false)) return false;
+    String sourceIdentity = {}, destinationIdentity = {};
+    sourceIdentity.assignItoh(transit.sourceClusterUUID);
+    destinationIdentity.assignItoh(transit.destinationClusterUUID);
+    MothershipProdigyCluster source = {}, destination = {};
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.getClusterByIdentity(sourceIdentity, source, &failure) ||
+          !registry.getClusterByIdentity(destinationIdentity, destination, &failure)) return false;
+    }
+    if (!mothershipClusterUsesVirtualDatacenter(source) || !mothershipClusterUsesVirtualDatacenter(destination) ||
+        source.test.enableFakeIpv4Boundary || destination.test.enableFakeIpv4Boundary ||
+        source.nBrains != 3 || destination.nBrains != 3 || source.test.machineCount != 3 || destination.test.machineCount != 3)
+    { failure.assign("pair-control service transit requires independent three-Brain IPv6 test clusters"_ctv); return false; }
+
+    DeploymentIdentityReport sourceDeployment = {}, destinationDeployment = {};
+    ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, destinationPermission = {};
+    if (!readDeploymentIdentity(source, transit.sourceDeploymentID, sourceDeployment, failure) ||
+        !readDeploymentIdentity(destination, transit.destinationDeploymentID, destinationDeployment, failure) ||
+        !readLocalCousinServicePermission(source, transit.sourcePermissionUUID, sourcePermission, failure) ||
+        !readLocalCousinServicePermission(destination, transit.destinationPermissionUUID, destinationPermission, failure)) return false;
+    if (!sourceDeployment.isStateful || !destinationDeployment.isStateful || sourceDeployment.nTarget == 0 ||
+        sourceDeployment.nTarget != sourceDeployment.nDeployed || sourceDeployment.nTarget != sourceDeployment.nHealthy ||
+        destinationDeployment.nTarget == 0 || destinationDeployment.nTarget != destinationDeployment.nDeployed ||
+        destinationDeployment.nTarget != destinationDeployment.nHealthy ||
+        sourcePermission.permission.pairUUID != intent.pairUUID || destinationPermission.permission.pairUUID != intent.pairUUID ||
+        sourcePermission.permission.peerClusterUUID != destination.clusterUUID ||
+        destinationPermission.permission.peerClusterUUID != source.clusterUUID ||
+        sourcePermission.permission.localHalf != CousinRouteHalf::source ||
+        destinationPermission.permission.localHalf != CousinRouteHalf::destination ||
+        sourcePermission.permission.localApplicationID != sourceDeployment.applicationID ||
+        sourcePermission.permission.peerApplicationID != destinationDeployment.applicationID ||
+        destinationPermission.permission.localApplicationID != destinationDeployment.applicationID ||
+        destinationPermission.permission.peerApplicationID != sourceDeployment.applicationID ||
+        sourcePermission.permission.localDeploymentID != transit.sourceDeploymentID ||
+        destinationPermission.permission.localDeploymentID != transit.destinationDeploymentID ||
+        sourcePermission.permission.canonicalPlanSHA256 != sourceDeployment.canonicalPlanSHA256 ||
+        sourcePermission.permission.artifactSHA256 != sourceDeployment.containerBlobSHA256 ||
+        sourcePermission.permission.artifactBytes != sourceDeployment.containerBlobBytes ||
+        destinationPermission.permission.canonicalPlanSHA256 != destinationDeployment.canonicalPlanSHA256 ||
+        destinationPermission.permission.artifactSHA256 != destinationDeployment.containerBlobSHA256 ||
+        destinationPermission.permission.artifactBytes != destinationDeployment.containerBlobBytes ||
+        !sourcePermission.permission.slots.contains(transit.sourceSlot) ||
+        sourcePermission.permission.logicalWorkloadUUID != destinationPermission.permission.logicalWorkloadUUID ||
+        sourcePermission.permission.logicalServiceUUID != destinationPermission.permission.logicalServiceUUID ||
+        sourcePermission.permission.localCousinServicePrefix != destinationPermission.permission.peerCousinServicePrefix ||
+        sourcePermission.permission.peerCousinServicePrefix != destinationPermission.permission.localCousinServicePrefix)
+    { failure.assign("pair-control service transit conflicts with current exact deployment permission identities"_ctv); return false; }
+
+    RoutableResourceLeaseReport sourceLeases = {}, destinationLeases = {};
+    if (!readRoutableResourceLeases(source, sourceLeases, failure) ||
+        !readRoutableResourceLeases(destination, destinationLeases, failure)) return false;
+    uint32_t sourceLeaseMatches = 0, destinationLeaseMatches = 0;
+    uint128_t sourcePrefixUUID = 0, destinationPrefixUUID = 0;
+    for (const auto& lease : sourceLeases.leases)
+      if (lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort &&
+          lease.owner.deploymentID == transit.sourceDeploymentID && lease.address.equals(transit.sourceWhiteholeAddress) &&
+          lease.sourcePort == transit.sourceTCPPort) { ++sourceLeaseMatches; sourcePrefixUUID = lease.registeredPrefixUUID; }
+    for (const auto& lease : destinationLeases.leases)
+      if (lease.kind == RoutableResourceLeaseKind::wormholeAddress &&
+          lease.owner.deploymentID == transit.destinationDeploymentID && lease.address.equals(transit.destinationWormholeAddress)) { ++destinationLeaseMatches; destinationPrefixUUID = lease.registeredPrefixUUID; }
+    if (sourceLeaseMatches != 1 || destinationLeaseMatches != 1)
+    { failure.assign("pair-control service transit requires one exact live source Whitehole and destination Wormhole lease"_ctv); return false; }
+
+    RoutableSubnetRegistryReport sourceSubnets = {}, destinationSubnets = {};
+    if (!readRoutableSubnets(source, sourceSubnets, failure) || !readRoutableSubnets(destination, destinationSubnets, failure)) return false;
+    uint128_t sourceOwnerUUID = 0;
+    for (const auto& subnet : sourceSubnets.subnets)
+      if (subnet.uuid == sourcePrefixUUID && subnet.ingressScope == RoutableIngressScope::singleMachine &&
+          distributableExternalSubnetAllowsWhiteholes(subnet) &&
+          distributableExternalSubnetContainsAddress(subnet, transit.sourceWhiteholeAddress)) sourceOwnerUUID = subnet.machineUUID;
+    const bool destinationFleet = std::any_of(destinationSubnets.subnets.begin(), destinationSubnets.subnets.end(), [&](const auto& subnet) {
+      return subnet.uuid == destinationPrefixUUID && subnet.ingressScope == RoutableIngressScope::switchboardFleet &&
+          distributableExternalSubnetAllowsWormholes(subnet) &&
+          distributableExternalSubnetContainsAddress(subnet, transit.destinationWormholeAddress);
+    });
+    const auto& sourceEndpoints = source.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    const auto& destinationEndpoints = destination.clusterUUID == intent.firstClusterUUID ? intent.firstEndpoints : intent.secondEndpoints;
+    transit.sourceIngressPrivate6 = {}; transit.destinationIngressPrivate6 = {};
+    for (const auto& endpoint : sourceEndpoints)
+      if (endpoint.nodeUUID == sourceOwnerUUID) transit.sourceIngressPrivate6 = endpoint.address;
+    if (destinationFleet && !destinationEndpoints.empty()) transit.destinationIngressPrivate6 = destinationEndpoints.front().address;
+    if (sourceOwnerUUID == 0 || !mothershipPairControlServiceTransitValid(transit, intent.firstClusterUUID, intent.secondClusterUUID, &failure)) {
+      failure.assign("service transit requires a machine-owned source prefix and an enrolled destination ingress fleet"_ctv); return false;
+    }
+
+    ProdigyCousinDiscoveryQuery query = {};
+    query.permissionUUID = transit.sourcePermissionUUID;
+    query.slot = transit.sourceSlot;
+    ProdigyCousinDiscoveryResponse discovery = {};
+    if (!configureControlTarget(source.name.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::pullCousinCounterparts, query, discovery, failure) ||
+        discovery.protocolVersion != 1 || !discovery.success || discovery.records.size() > ProdigyCousinDiscoveryMaximumRecords)
+    { if (failure.empty()) failure.assign("pair-control service transit counterpart observation is unavailable"_ctv); return false; }
+    uint32_t matchingCounterparts = 0;
+    for (const auto& counterpart : discovery.records)
+      if (prodigyCousinCounterpartMatchesPermission(counterpart, sourcePermission.permission, transit.sourceSlot) &&
+          prodigyLocalCousinServicePermissionEqual(counterpart.permission, destinationPermission.permission) &&
+          counterpart.permission.permissionUUID == transit.destinationPermissionUUID &&
+          counterpart.permission.localDeploymentID == transit.destinationDeploymentID &&
+          counterpart.publicAddress.equals(transit.destinationWormholeAddress) &&
+          counterpart.publicTCPPort == transit.destinationTCPPort) ++matchingCounterparts;
+    if (matchingCounterparts == 0)
+    { failure.assign("pair-control service transit destination is not a current authenticated counterpart"_ctv); return false; }
+    failure.clear();
+    return true;
+  }
+
   bool bindPairControlBoundary(const MothershipClusterPairEnrollmentIntent& intent,
                                MothershipPairControlBoundaryDescriptor& boundary, String& failure)
   {
@@ -18758,16 +19036,21 @@ private:
 
   void runTestClusterPairControl(int argc, char *argv[])
   {
-    String failure, action;
+    String failure = {}, action = {};
     uint128_t operationUUID = 0;
-    TestPairLifecycleLock lock;
-    bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    MothershipPairControlServiceTransit service = {};
+    TestPairLifecycleLock lock = {};
+    bool valid = argc >= 2 && argc <= 3 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
-    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv) &&
-        lockTestPairLifecycle(lock, failure);
-    MothershipClusterPairEnrollmentIntent intent;
+    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv);
+    if (valid && action == "service"_ctv)
+      valid = argc == 3 && parsePairControlServiceTransitJSON(String(argv[2]), service, failure);
+    else valid = valid && argc == 2;
+    valid = valid && lockTestPairLifecycle(lock, failure);
+
+    MothershipClusterPairEnrollmentIntent intent = {};
     if (valid) { auto registry = openClusterRegistry(); valid = registry.loadClusterPairEnrollmentIntent(operationUUID, intent, &failure); }
-    MothershipPairControlBoundaryDescriptor boundary;
+    MothershipPairControlBoundaryDescriptor boundary = {};
     if (valid && action == "prepare"_ctv)
     {
       valid = bindPairControlBoundary(intent, boundary, failure);
@@ -18785,19 +19068,42 @@ private:
       if (valid && action == "query"_ctv && intent.testControlBoundaryClosed)
       { failure.assign("pair-control boundary is closed"_ctv); valid = false; }
     }
+    if (valid && action == "service"_ctv)
+    {
+      valid = !intent.testControlBoundaryClosed && validatePairControlServiceTransit(intent, service, failure);
+      if (valid)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.recordClusterPairTestControlServiceTransit(operationUUID, service, intent, &failure);
+      }
+    }
+
     if (valid && !(action == "remove"_ctv && intent.testControlBoundaryClosed))
     {
-      Vector<String> arguments;
-      String providerAction = action == "prepare"_ctv ? String("launch"_ctv) : action;
-      if (action != "query"_ctv)
-        valid = mothershipPairControlBoundaryArguments(boundary, providerAction, arguments, &failure) &&
+      Vector<String> arguments = {};
+      if (action == "prepare"_ctv)
+      {
+        valid = mothershipPairControlBoundaryArguments(boundary, "launch"_ctv, arguments, &failure) &&
             mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+      }
+      else if (action == "remove"_ctv)
+      {
+        valid = mothershipPairControlBoundaryArguments(boundary, "remove"_ctv, arguments, &failure) &&
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+      }
+      else if (action == "service"_ctv)
+      {
+        valid = mothershipPairControlServiceTransitArguments(boundary, service, arguments, &failure) &&
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+      }
       if (valid && action != "remove"_ctv)
       {
-        String output;
+        String output = {};
+        const MothershipPairControlServiceTransit *expectedService =
+            intent.testControlServiceTransitAdmitted ? &intent.testControlServiceTransit : nullptr;
         valid = mothershipPairControlBoundaryArguments(boundary, "query"_ctv, arguments, &failure) &&
             mothershipRunVirtualDatacenterProvider(std::move(arguments), &output, &failure) &&
-            mothershipPairControlBoundaryPreparedReceiptValid(boundary, output);
+            mothershipPairControlBoundaryPreparedReceiptValid(boundary, output, expectedService);
         if (!valid && failure.empty()) failure.assign("pair-control provider did not prove the exact prepared boundary"_ctv);
       }
       if (valid && action == "remove"_ctv)
@@ -18806,9 +19112,18 @@ private:
         valid = registry.recordClusterPairTestControlBoundary(boundary, true, intent, &failure);
       }
     }
-    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx failure=%s\n",
+    String sourceAddress = {}, destinationAddress = {};
+    if (action == "service"_ctv)
+    {
+      char source[INET6_ADDRSTRLEN] = {}, destination[INET6_ADDRSTRLEN] = {};
+      if (::inet_ntop(AF_INET6, service.sourceWhiteholeAddress.v6, source, sizeof(source))) sourceAddress.assign(source);
+      if (::inet_ntop(AF_INET6, service.destinationWormholeAddress.v6, destination, sizeof(destination))) destinationAddress.assign(destination);
+    }
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u source=%s:%u destination=%s:%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
-        (unsigned long long)operationUUID, failure.c_str());
+        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), sourceAddress.c_str(),
+        unsigned(action == "service"_ctv ? service.sourceTCPPort : 0), destinationAddress.c_str(),
+        unsigned(action == "service"_ctv ? service.destinationTCPPort : 0), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -22260,6 +22575,7 @@ public:
         {"deleteMachineSchema",             &Mothership::runDeleteMachineSchema            },
         {"deltaMachineBudget",              &Mothership::runDeltaMachineBudget             },
         {"deploy",                          &Mothership::runDeploy                         },
+        {"deploymentIdentity",              &Mothership::runDeploymentIdentity             },
         {"destroyProviderClusterMachines",  &Mothership::runDestroyProviderClusterMachines },
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
@@ -22438,8 +22754,8 @@ int main(int argc, char *argv[])
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
-    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove]\n");
-    message.append("\tmanages the enrolled endpoint roster’s TCP control transit between two test clusters\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON]\n");
+    message.append("\tmanages enrolled TCP control transit and one exact permission-verified Whitehole-to-protected-Wormhole test flow\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
@@ -22449,6 +22765,7 @@ int main(int argc, char *argv[])
     message.append("\tlists retained API credential expiry metadata and acknowledges unacknowledged notices\n");
     message.append("deploy [target: local|clusterName|clusterUUID] [json|-|@path] [path to container blob]\n");
     message.append("\tdeploys an application on the cluster\n");
+    message.append("deploymentIdentity [clusterName|clusterUUID] [deploymentID]\n");
     message.append("applicationReport [target: local|clusterName|clusterUUID] [application name]\n");
     message.append("\tfetches the state of each deployment of the application\n");
     message.append("\tex: applicationReport local Radar\n");

@@ -278,7 +278,14 @@ enum class NeuronTopic : uint16_t {
   clusterPairControlCredentialsAck,
   clusterPairEpochStatus,
   cousinDiscoverySnapshot,
-  cousinDiscoveryReceipt
+  cousinDiscoveryReceipt,
+  cousinSessionRequest,
+  cousinSessionCommand,
+  cousinSessionAck,
+  cousinSessionControlSend,
+  cousinSessionControlReceipt,
+  cousinAdmissionCommand,
+  cousinAdmissionAck
 };
 
 enum class ContainerTopic : uint16_t {
@@ -298,6 +305,9 @@ enum class ContainerTopic : uint16_t {
   wormholesRefresh,
   runtimeReady,
   taskResult,
+  cousinSessionRequest,
+  cousinSessionCommand,
+  cousinSessionAck,
 };
 
 enum class PulseTopic : uint16_t {

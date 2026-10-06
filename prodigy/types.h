@@ -5959,7 +5959,8 @@ static inline bool prodigyWormholeRequiresPairAdmission(const SwitchboardWormhol
   return false;
 }
 
-static inline bool prodigyWormholeDesiredStateValid(const SwitchboardWormholeDesiredState& state)
+static inline bool prodigyWormholeDesiredStateValid(const SwitchboardWormholeDesiredState& state,
+                                                   bool requireResolvedAddresses = true)
 {
   if (state.protocolVersion != SwitchboardWormholeDesiredState::version ||
       (!state.pairAdmissionTCPPorts.empty() &&
@@ -5976,7 +5977,7 @@ static inline bool prodigyWormholeDesiredStateValid(const SwitchboardWormholeDes
     {
       if (wormhole.containerPort != port) continue;
       if (wormhole.layer4 != IPPROTO_TCP || wormhole.isQuic ||
-          !wormhole.externalAddress.is6 || wormhole.externalAddress.isNull() ||
+          (wormhole.externalAddress.isNull() ? requireResolvedAddresses : !wormhole.externalAddress.is6) ||
           wormhole.externalPort == 0 || (!wormhole.deliveryAddress.isNull() &&
           !wormhole.deliveryAddress.equals(wormhole.externalAddress))) return false;
       ++matches;
@@ -8828,7 +8829,8 @@ static void serialize(S&& serializer, Advertisement& advertisement)
 
 static inline bool prodigyBuildCousinWormholeDesiredState(
     const Vector<Wormhole>& wormholes, bool isStateful, uint64_t cousinService,
-    const bytell_hash_map<uint64_t, Advertisement>& advertisements, SwitchboardWormholeDesiredState& state)
+    const bytell_hash_map<uint64_t, Advertisement>& advertisements, SwitchboardWormholeDesiredState& state,
+    bool requireResolvedAddresses = true)
 {
   state = {};
   SwitchboardWormholeDesiredState desired = {};
@@ -8854,7 +8856,7 @@ static inline bool prodigyBuildCousinWormholeDesiredState(
       }
     }
   }
-  if (!prodigyWormholeDesiredStateValid(desired)) return false;
+  if (!prodigyWormholeDesiredStateValid(desired, requireResolvedAddresses)) return false;
   state = std::move(desired);
   return true;
 }

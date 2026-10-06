@@ -540,6 +540,7 @@ add_executable(prodigy_pingpong_container_alt ${CMAKE_CURRENT_SOURCE_DIR}/tests/
 add_executable(prodigy_pingpong_container_noport ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_crash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
 add_executable(prodigy_pingpong_container_google_egress ${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong_container.cpp)
+add_executable(prodigy_cousin_session_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/cousin_session_probe_container.cpp)
 add_executable(prodigy_whitehole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/whitehole_probe_container.cpp)
 add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/quic_wormhole_probe_container.cpp)
 add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/wormhole_matrix_probe_container.cpp)
@@ -555,6 +556,7 @@ set(
    prodigy_pingpong_container_noport
    prodigy_pingpong_container_crash
    prodigy_pingpong_container_google_egress
+   prodigy_cousin_session_probe_container
    prodigy_whitehole_probe_container
    prodigy_quic_wormhole_probe_container
    prodigy_wormhole_matrix_probe_container
@@ -653,6 +655,7 @@ add_executable(prodigy_mothership_upgrade_admission_registry_unit ${CMAKE_CURREN
 target_compile_options(prodigy_mothership_upgrade_admission_registry_unit PRIVATE -UNDEBUG)
 add_executable(prodigy_cousin_route_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_route_unit.cpp)
 add_executable(prodigy_cluster_pair_keys_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cluster_pair_keys_unit.cpp)
+add_executable(prodigy_cousin_session_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_session_unit.cpp)
 add_executable(prodigy_transport_aegis_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_aegis_unit.cpp)
 add_executable(prodigy_pair_control_ring_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_pair_control_ring_unit.cpp)
 add_executable(prodigy_transport_crypto_benchmark ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_transport_crypto_benchmark.cpp)
@@ -769,6 +772,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_upgrade_admission_registry_unit
    prodigy_cousin_route_unit
    prodigy_cluster_pair_keys_unit
+   prodigy_cousin_session_unit
    prodigy_transport_aegis_unit
    prodigy_pair_control_ring_unit
    prodigy_transport_crypto_benchmark
@@ -989,6 +993,7 @@ target_compile_options(prodigy_pingpong_container_alt PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_noport PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_crash PUBLIC -O2)
 target_compile_options(prodigy_pingpong_container_google_egress PUBLIC -O2)
+target_compile_options(prodigy_cousin_session_probe_container PUBLIC -O2)
 target_compile_options(prodigy_whitehole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_quic_wormhole_probe_container PUBLIC -O2)
 target_compile_options(prodigy_wormhole_matrix_probe_container PUBLIC -O2)
@@ -2469,10 +2474,14 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_TRANSPORT_CREDENTIALS_ONLY=1
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>)
    set_tests_properties(prodigy_transport_credential_authority_unit PROPERTIES TIMEOUT 30)
+   add_test(NAME prodigy_cousin_session_unit COMMAND $<TARGET_FILE:prodigy_cousin_session_unit>)
+   set_tests_properties(prodigy_cousin_session_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_transport_aegis_unit COMMAND $<TARGET_FILE:prodigy_transport_aegis_unit>)
    set_tests_properties(prodigy_transport_aegis_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_pair_control_ring_unit COMMAND $<TARGET_FILE:prodigy_pair_control_ring_unit>)
    set_tests_properties(prodigy_pair_control_ring_unit PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+   add_test(NAME prodigy_pair_control_session_unit COMMAND $<TARGET_FILE:prodigy_pair_control_ring_unit>)
+   set_tests_properties(prodigy_pair_control_session_unit PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77 ENVIRONMENT "PRODIGY_TEST_ONLY=cousin-session")
    add_test(NAME prodigy_noise_backend_unit
       COMMAND ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${PRODIGY_NOISE_TARGET_DIR}"
               "${PRODIGY_NOISE_CARGO_EXECUTABLE}" test --locked --offline --release --manifest-path "${PRODIGY_NOISE_MANIFEST}")

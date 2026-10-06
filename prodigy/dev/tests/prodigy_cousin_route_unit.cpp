@@ -224,6 +224,26 @@ static MothershipPairControlBoundaryDescriptor validPairControlBoundary(
   return boundary;
 }
 
+static MothershipPairControlServiceTransit validPairControlServiceTransit(
+    const MothershipClusterPairEnrollmentIntent& intent)
+{
+  MothershipPairControlServiceTransit transit = {};
+  transit.sourceClusterUUID = intent.firstClusterUUID;
+  transit.destinationClusterUUID = intent.secondClusterUUID;
+  transit.sourceDeploymentID = (uint64_t(7) << 48) | 1;
+  transit.destinationDeploymentID = (uint64_t(19) << 48) | 1;
+  transit.sourcePermissionUUID = 0x906;
+  transit.destinationPermissionUUID = 0x907;
+  transit.sourceSlot = 0;
+  transit.sourceWhiteholeAddress = IPAddress("2001:db8:100:1::2", true);
+  transit.sourceTCPPort = 42001;
+  transit.destinationWormholeAddress = IPAddress("2001:db8:100:2::3", true);
+  transit.destinationTCPPort = 9443;
+  transit.sourceIngressPrivate6 = intent.firstEndpoints.front().address;
+  transit.destinationIngressPrivate6 = intent.secondEndpoints.front().address;
+  return transit;
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -681,6 +701,7 @@ int main(void)
   }
 
   MothershipPairControlBoundaryDescriptor controlBoundary = validPairControlBoundary(pairIntent);
+  MothershipPairControlServiceTransit serviceTransit = validPairControlServiceTransit(pairIntent);
   Vector<ClusterPairControlEndpoint> numericOrder = controlBoundary.firstEndpoints;
   numericOrder.push_back(validPairEndpoint(pairIntent.firstClusterUUID, 0x906, 16));
   String endpointCSV = {};
@@ -695,6 +716,45 @@ int main(void)
                 "pair_control_boundary_endpoint_csv_rejects_duplicate_address");
   suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, "mismatched receipt"_ctv),
                 "pair_control_boundary_rejects_mismatched_prepared_receipt");
+  auto unresolvedTransit = serviceTransit; unresolvedTransit.sourceIngressPrivate6 = {};
+  suite.require(!mothershipPairControlServiceTransitValid(unresolvedTransit, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_service_transit_rejects_unresolved_ingress_owner");
+  Vector<String> serviceArguments = {};
+  suite.require(mothershipPairControlServiceTransitValid(serviceTransit, pairIntent.firstClusterUUID,
+                                                          pairIntent.secondClusterUUID) &&
+                mothershipPairControlServiceTransitArguments(controlBoundary, serviceTransit, serviceArguments, &failure) &&
+                serviceArguments.size() == 27 && serviceArguments[0] == "--pair-control-action"_ctv &&
+                serviceArguments[1] == "service"_ctv && serviceArguments[14] == "0x0902"_ctv &&
+                serviceArguments[24] == "9443"_ctv &&
+                serviceArguments[25] == "fd42:4242:4242:1::4"_ctv &&
+                serviceArguments[26] == "fd42:4242:4242:2::5"_ctv,
+                "pair_control_service_transit_encodes_one_exact_provider_tuple");
+  String serviceReceipt = {};
+  String serviceReceiptUUID = {};
+  serviceReceipt.append("PAIR_CONTROL operationID=");
+  serviceReceiptUUID.assignItoh(controlBoundary.operationUUID);
+  serviceReceipt.append(serviceReceiptUUID);
+  serviceReceipt.append(" firstClusterUUID=");
+  serviceReceiptUUID.assignItoh(controlBoundary.firstClusterUUID);
+  serviceReceipt.append(serviceReceiptUUID);
+  serviceReceipt.append(" secondClusterUUID=");
+  serviceReceiptUUID.assignItoh(controlBoundary.secondClusterUUID);
+  serviceReceipt.append(serviceReceiptUUID);
+  serviceReceipt.append(" firstRuntimeIdentity=");
+  serviceReceipt.append(controlBoundary.firstRuntimeIdentity);
+  serviceReceipt.append(" secondRuntimeIdentity=");
+  serviceReceipt.append(controlBoundary.secondRuntimeIdentity);
+  serviceReceipt.append(" firstPrivate6Subnet=");
+  serviceReceipt.append(controlBoundary.firstPrivateIPv6Subnet);
+  serviceReceipt.append(" secondPrivate6Subnet=");
+  serviceReceipt.append(controlBoundary.secondPrivateIPv6Subnet);
+  serviceReceipt.append(" port=315 phase=prepared service=1 source=2001:db8:100:1::2:42001 destination=2001:db8:100:2::3:9443 sourceIngress=fd42:4242:4242:1::4 destinationIngress=fd42:4242:4242:2::5\n"_ctv);
+  suite.require(mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, &serviceTransit),
+                "pair_control_service_transit_receipt_binds_exact_source_and_destination_tuples");
+  MothershipPairControlServiceTransit receiptChangedTransit = serviceTransit;
+  receiptChangedTransit.sourceTCPPort++;
+  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, &receiptChangedTransit),
+                "pair_control_service_transit_receipt_rejects_changed_source_tuple");
 
   {
     MothershipClusterRegistry pairRegistry {String(pairDirectory)};
@@ -715,18 +775,33 @@ int main(void)
     changedRoster.firstEndpoints[0].nodeUUID++;
     suite.require(!pairRegistry.recordClusterPairTestControlBoundary(changedRoster, false, pairRecorded, &failure),
                   "pair_control_boundary_rejects_changed_delivered_roster");
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, serviceTransit,
+                                                                            pairRecorded, &failure) &&
+                  pairRecorded.testControlServiceTransitAdmitted &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransit, serviceTransit),
+                  "pair_control_service_transit_records_open_exact_qualified_boundary");
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, serviceTransit,
+                                                                            pairRecorded, &failure),
+                  "pair_control_service_transit_exact_retry_is_idempotent");
+    MothershipPairControlServiceTransit changedServiceTransit = serviceTransit;
+    changedServiceTransit.destinationTCPPort++;
+    suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, changedServiceTransit,
+                                                                             pairRecorded, &failure),
+                  "pair_control_service_transit_rejects_changed_immutable_tuple");
   }
   {
     MothershipClusterRegistry pairRegistry {String(pairDirectory)};
     suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure) &&
-                  pairRecorded.testControlBoundaryAdmitted && !pairRecorded.testControlBoundaryClosed,
+                  pairRecorded.testControlBoundaryAdmitted && !pairRecorded.testControlBoundaryClosed &&
+                  pairRecorded.testControlServiceTransitAdmitted &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransit, serviceTransit),
                   "pair_control_boundary_cold_reopen_preserves_exact_open_descriptor");
     bool guardOpen = false;
     suite.require(pairRegistry.clusterHasOpenTestPairControlBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && guardOpen &&
                   pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.secondClusterUUID, guardOpen, &failure) && guardOpen,
                   "pair_control_boundary_open_guard_blocks_cluster_removal");
     suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, true, pairRecorded, &failure) &&
-                  pairRecorded.testControlBoundaryClosed,
+                  pairRecorded.testControlBoundaryClosed && pairRecorded.testControlServiceTransitAdmitted,
                   "pair_control_boundary_closes_durable_guard");
     suite.require(pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && !guardOpen,
                   "pair_control_boundary_closed_guard_no_longer_blocks_removal");

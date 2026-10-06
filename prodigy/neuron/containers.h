@@ -1659,6 +1659,33 @@ public:
     return grantInstalled;
   }
 
+  // Remove only the exact grant recorded by the authenticated Neuron owner.
+  // A reused tuple belonging to another session/root/epoch is never deleted.
+  static bool removeVerifiedPairAdmissionGrant(BPFProgram *program,
+                                                const switchboard_pair_admission_grant_key& key,
+                                                const switchboard_pair_admission_route_key& routeKey,
+                                                uint64_t rootGeneration, uint64_t keyEpoch)
+  {
+    if (program == nullptr) return false;
+    bool removed = false;
+    program->openMap("wh_pair_grants"_ctv, [&](int mapFD) -> void {
+      if (mapFD < 0) return;
+      switchboard_pair_admission_grant current = {};
+      if (bpf_map_lookup_elem(mapFD, &key, &current) != 0) {
+        removed = errno == ENOENT;
+        return;
+      }
+      const bool exact = current.pair_uuid_hi == routeKey.pair_uuid_hi &&
+          current.pair_uuid_lo == routeKey.pair_uuid_lo &&
+          current.route_uuid_hi == routeKey.route_uuid_hi &&
+          current.route_uuid_lo == routeKey.route_uuid_lo &&
+          current.route_generation == 1 && current.root_generation == rootGeneration &&
+          current.key_epoch == keyEpoch;
+      removed = exact && bpf_map_delete_elem(mapFD, &key) == 0;
+    });
+    return removed;
+  }
+
   static bool revokeVerifiedPairAdmissionRoute(BPFProgram *program,
                                                const switchboard_pair_admission_route_key& key,
                                                const switchboard_pair_admission_route_policy& revoked)

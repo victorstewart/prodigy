@@ -711,6 +711,17 @@ int main(void)
     suite.expect(prodigyBuildCousinWormholeDesiredState(wormholes, true, cousinService, advertisements, protectedState) &&
                      prodigyWormholeRequiresPairAdmission(protectedState, 9443, IPPROTO_TCP),
                  "wormhole_desired_cousin_definition_protects_before_active_lifecycle_state");
+    auto declarations = wormholes;
+    declarations.front().externalAddress = {};
+    SwitchboardWormholeDesiredState declaredState = {};
+    suite.expect(prodigyBuildCousinWormholeDesiredState(declarations, true, cousinService, advertisements, declaredState, false) &&
+                     prodigyWormholeRequiresPairAdmission(declaredState, 9443, IPPROTO_TCP) &&
+                     !prodigyWormholeDesiredStateValid(declaredState) &&
+                     !prodigyEncodeWormholeDesiredState(declaredState, encoded),
+                 "wormhole_cousin_declaration_accepts_unallocated_address_but_cannot_publish_it");
+    declarations.front().externalAddress = IPAddress("192.0.2.44", false);
+    suite.expect(!prodigyBuildCousinWormholeDesiredState(declarations, true, cousinService, advertisements, declaredState, false),
+                 "wormhole_cousin_declaration_rejects_explicit_ipv4");
     suite.expect(prodigyEncodeWormholeDesiredState(protectedState, encoded) && encoded != legacy &&
                      prodigyDecodeWormholeDesiredState(encoded, decoded) &&
                      prodigyWormholeRequiresPairAdmission(decoded, 9443, IPPROTO_TCP),

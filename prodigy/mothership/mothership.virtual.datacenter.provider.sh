@@ -1599,8 +1599,10 @@ PAIR_PROBE
 # two currently-live VDC parent namespaces.
 pair_control_parse()
 {
-   [[ "$#" -eq 12 && "${EUID}" -eq 0 ]] || return 2
-   pair_control_args=("$@")
+   [[ ( "$#" -eq 12 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
+   pair_control_args=("${@:1:12}")
+   pair_control_service_args=()
+   if [[ "$#" -eq 25 ]]; then pair_control_service_args=("${@:13:13}"); fi
    pair_control_id="$1"; pair_control_first_uuid="$2"; pair_control_second_uuid="$3"
    pair_control_first_workspace="$4"; pair_control_second_workspace="$5"
    pair_control_first_runtime="$6"; pair_control_second_runtime="$7"
@@ -1639,6 +1641,48 @@ PAIR_CONTROL_PARSE
    fi
    pair_control_dir="/mnt/prodigy-vdc-pair-control/$pair_control_id"
    [[ ! -L "$pair_control_dir" ]] || return 2
+   if [[ ${#pair_control_service_args[@]} -ne 0 ]]; then
+      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 2
+      pair_control_service_side || return 2
+   fi
+}
+
+# Service tuple arguments are supplied only by the typed Mothership owner.
+# They are still parsed independently here because the provider must never
+# route an arbitrary address merely because it appears after a valid boundary.
+pair_control_parse_service_args()
+{
+   [[ "$#" -eq 13 ]] || return 2
+   pair_control_service_source_uuid="$1"; pair_control_service_destination_uuid="$2"
+   pair_control_service_source_deployment="$3"; pair_control_service_destination_deployment="$4"
+   pair_control_service_source_permission="$5"; pair_control_service_destination_permission="$6"
+   pair_control_service_slot="$7"; pair_control_service_source_address="$8"; pair_control_service_source_port="$9"
+   pair_control_service_destination_address="${10}"; pair_control_service_destination_port="${11}"
+   pair_control_service_source_ingress_private6="${12}"; pair_control_service_destination_ingress_private6="${13}"
+   python3 - "$pair_control_first_uuid" "$pair_control_second_uuid" \
+      "$pair_control_service_source_uuid" "$pair_control_service_destination_uuid" \
+      "$pair_control_service_source_deployment" "$pair_control_service_destination_deployment" \
+      "$pair_control_service_source_permission" "$pair_control_service_destination_permission" \
+      "$pair_control_service_slot" "$pair_control_service_source_address" "$pair_control_service_source_port" \
+      "$pair_control_service_destination_address" "$pair_control_service_destination_port" \
+      "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6" <<'PAIR_CONTROL_SERVICE_PARSE'
+import ipaddress,re,sys
+first,second,source,destination,source_deployment,destination_deployment,source_permission,destination_permission,slot,source_address,source_port,destination_address,destination_port,source_ingress,destination_ingress=sys.argv[1:]
+ident=re.compile(r'^0x[0-9a-f]{2,32}$')
+assert all(ident.fullmatch(v) and len(v[2:])%2==0 and int(v,16)!=0 for v in (first,second,source,destination,source_permission,destination_permission))
+assert {source,destination}=={first,second} and source!=destination
+assert all(str(int(v))==v and int(v)>0 for v in (source_deployment,destination_deployment,source_port,destination_port))
+assert str(int(slot))==slot and 0<=int(slot)<1024
+for text in (source_address,destination_address,source_ingress,destination_ingress):
+    value=ipaddress.IPv6Address(text)
+    assert value.compressed==text and not (value.is_unspecified or value.is_multicast or value.is_loopback or value.is_link_local)
+assert source_ingress != destination_ingress
+PAIR_CONTROL_SERVICE_PARSE
+}
+
+pair_control_service_descriptor()
+{
+   printf '%s\n' "${pair_control_service_args[@]}"
 }
 
 pair_control_descriptor() { printf '%s\n' "${pair_control_args[@]}"; }
@@ -1815,6 +1859,27 @@ pair_control_cleanup_inside()
          fi
       fi
    done
+   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
+      pair_control_load_service_descriptor || status=1
+      if [[ "$status" == 0 ]]; then
+         pair_control_service_side || status=1
+         pair_control_remove_service_route "pc-$pair_control_service_source_side" service-source-route \
+            "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || status=1
+         pair_control_remove_service_route "pc-$pair_control_service_destination_side" service-destination-route \
+            "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || status=1
+         pair_control_remove_service_route "pc-$pair_control_service_source_side" service-source-local-route \
+            "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || status=1
+         pair_control_remove_service_route "pc-$pair_control_service_destination_side" service-destination-local-route \
+            "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || status=1
+         # The namespace removal below disposes of these router routes too, but
+         # validating and removing them here proves cleanup owns no foreign
+         # route after a partial service install.
+         pair_control_remove_service_route "$pair_control_router_ns" service-router-source-route \
+            "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || status=1
+         pair_control_remove_service_route "$pair_control_router_ns" service-router-destination-route \
+            "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || status=1
+      fi
+   fi
    # The router is owned only by this supervisor's private mount namespace.
    if [[ -n "${pair_control_router_ns:-}" && -e "/run/netns/$pair_control_router_ns" ]]; then
       [[ -f "$pair_control_dir/router-namespace" && "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] || status=1
@@ -1879,6 +1944,192 @@ print(mac)
 '
 }
 
+pair_control_link_mtu()
+{
+   ip -n "$1" -j link show "$2" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+assert len(rows)==1 and isinstance(rows[0]["mtu"],int) and 1280<=rows[0]["mtu"]<=65535
+print(rows[0]["mtu"])
+'
+}
+
+pair_control_load_service_descriptor()
+{
+   pair_control_service_args=()
+   [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]] || return 1
+   [[ -f "$pair_control_dir/service-descriptor" && ! -L "$pair_control_dir/service-descriptor" ]] || return 2
+   mapfile -t pair_control_service_args < "$pair_control_dir/service-descriptor"
+   [[ ${#pair_control_service_args[@]} -eq 13 ]] || return 2
+   pair_control_parse_service_args "${pair_control_service_args[@]}"
+}
+
+pair_control_service_side()
+{
+   # Parsing also calls this before entering the provider mount namespace.
+   # Derive the same descriptor-owned router addresses without ambient state.
+   local addresses first_router second_router
+   addresses="$(pair_control_addresses)" || return 1
+   read -r _ first_router _ second_router <<< "$addresses" || return 1
+   if [[ "$pair_control_service_source_uuid" == "$pair_control_first_uuid" ]]; then
+      pair_control_service_source_side=first; pair_control_service_destination_side=second
+      pair_control_service_source_router="$first_router"; pair_control_service_destination_router="$second_router"
+      pair_control_service_source_workspace="$pair_control_first_workspace"; pair_control_service_destination_workspace="$pair_control_second_workspace"
+   else
+      pair_control_service_source_side=second; pair_control_service_destination_side=first
+      pair_control_service_source_router="$second_router"; pair_control_service_destination_router="$first_router"
+      pair_control_service_source_workspace="$pair_control_second_workspace"; pair_control_service_destination_workspace="$pair_control_first_workspace"
+   fi
+   python3 - "$pair_control_service_source_workspace/test-cluster-manifest.json" \
+      "$pair_control_service_destination_workspace/test-cluster-manifest.json" \
+      "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6" <<'PAIR_CONTROL_SERVICE_INGRESSES'
+import ipaddress,json,sys
+source_manifest,destination_manifest,source,destination=sys.argv[1:]
+source=ipaddress.IPv6Address(source)
+destination=ipaddress.IPv6Address(destination)
+assert source != destination
+for path,address in ((source_manifest,source),(destination_manifest,destination)):
+    values={ipaddress.IPv6Address(node['private6']) for node in json.load(open(path,encoding='utf-8'))['nodes']}
+    assert address in values
+PAIR_CONTROL_SERVICE_INGRESSES
+}
+
+pair_control_service_route_exact()
+{
+   [[ "$#" -eq 4 ]] || return 2
+   local namespace="$1" prefix="$2" gateway="$3" device="$4" rows
+   rows="$(ip -n "$namespace" -j -6 route show exact "$prefix")" || return 2
+   python3 - "$prefix" "$gateway" "$device" "$rows" <<'PAIR_CONTROL_ROUTE_EXACT'
+import ipaddress,json,sys
+prefix,gateway,device,encoded=sys.argv[1:]
+try:
+    rows=json.loads(encoded)
+    if not isinstance(rows,list): raise ValueError('route list')
+    if not rows: raise SystemExit(1)
+    network=ipaddress.IPv6Network(prefix,strict=True)
+    if len(rows)!=1: raise ValueError('route count')
+    route=rows[0]
+    destination=route.get('dst')
+    if destination is None: raise ValueError('missing destination')
+    if '/' not in destination: destination += '/128'
+    if ipaddress.IPv6Network(destination,strict=True)!=network: raise ValueError('destination')
+    if route.get('gateway')!=gateway or route.get('dev')!=device: raise ValueError('next hop')
+except (KeyError,ValueError):
+    raise SystemExit(2)
+PAIR_CONTROL_ROUTE_EXACT
+}
+
+pair_control_service_route_expected()
+{
+   [[ "$#" -eq 3 ]] || return 2
+   printf '%s via %s dev %s\n' "$1" "$2" "$3"
+}
+
+pair_control_service_route_journal_valid()
+{
+   local name="$1" prefix="$2" gateway="$3" device="$4" expected
+   expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" &&
+      -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" &&
+      "$(<"$pair_control_dir/$name-intent")" == "$expected" &&
+      "$(<"$pair_control_dir/$name")" == "$expected" ]]
+}
+
+pair_control_install_service_route()
+{
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state owned=0
+   expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   if [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ]]; then
+      [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+      owned=1
+   elif [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      return 1
+   fi
+   if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+      # An identical pre-existing route is not ours unless intent preceded it.
+      [[ "$owned" == 1 ]] || return 1
+   else
+      state=$?
+      [[ "$state" == 1 ]] || return 1
+      [[ "$owned" == 1 ]] || pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+      ip -n "$namespace" -6 route add "$prefix" via "$gateway" dev "$device" || return 1
+      pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device" || return 1
+   fi
+   pair_write "$pair_control_dir/$name" "$expected"
+}
+
+pair_control_install_service_inside()
+{
+   [[ ${#pair_control_service_args[@]} -eq 13 ]] || return 1
+   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
+      local existing=()
+      [[ -f "$pair_control_dir/service-descriptor" && ! -L "$pair_control_dir/service-descriptor" ]] || return 1
+      mapfile -t existing < "$pair_control_dir/service-descriptor"
+      [[ "$(printf '%s\n' "${existing[@]}")" == "$(pair_control_service_descriptor)" ]] || return 1
+   else
+      pair_write "$pair_control_dir/service-descriptor" "$(pair_control_service_descriptor)"
+   fi
+   pair_control_service_side || return 1
+   # Rebuild the restrictive firewall with the tuple before either external
+   # /128 route becomes live.
+   pair_control_firewall || return 1
+   # The two parent cross-routes select the pair router.  Router-local routes
+   # then select the exact current ingress node, and the parent-local routes
+   # return traffic from that ingress node to the selected endpoint.
+   pair_control_install_service_route "pc-$pair_control_service_source_side" service-source-route \
+      "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+   pair_control_install_service_route "pc-$pair_control_service_destination_side" service-destination-route \
+      "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+   pair_control_install_service_route "$pair_control_router_ns" service-router-source-route \
+      "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+   pair_control_install_service_route "$pair_control_router_ns" service-router-destination-route \
+      "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
+   pair_control_install_service_route "pc-$pair_control_service_source_side" service-source-local-route \
+      "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+   pair_control_install_service_route "pc-$pair_control_service_destination_side" service-destination-local-route \
+      "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   pair_write "$pair_control_dir/service-phase" prepared
+}
+
+pair_control_validate_service_inside()
+{
+   pair_control_load_service_descriptor
+   local loaded=$?
+   [[ "$loaded" == 0 ]] || { [[ "$loaded" == 1 ]] && return 0; return 1; }
+   pair_control_service_side || return 1
+   [[ -f "$pair_control_dir/service-phase" && ! -L "$pair_control_dir/service-phase" && "$(<"$pair_control_dir/service-phase")" == prepared ]] || return 1
+   pair_control_service_route_journal_valid service-source-route "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+   pair_control_service_route_journal_valid service-destination-route "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+   pair_control_service_route_journal_valid service-router-source-route "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+   pair_control_service_route_journal_valid service-router-destination-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
+   pair_control_service_route_journal_valid service-source-local-route "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+   pair_control_service_route_journal_valid service-destination-local-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0
+}
+
+pair_control_remove_service_route()
+{
+   local namespace="$1" name="$2" prefix="$3" gateway="$4" device="$5" expected state
+   [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ||
+      -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]] || return 0
+   expected="$(pair_control_service_route_expected "$prefix" "$gateway" "$device")" || return 1
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   if pair_control_service_route_exact "$namespace" "$prefix" "$gateway" "$device"; then
+      ip -n "$namespace" -6 route del "$prefix" via "$gateway" dev "$device" || return 1
+   else
+      state=$?
+      [[ "$state" == 1 ]] || return 1
+   fi
+}
+
 pair_control_firewall_digest()
 {
    # Counter changes are expected once the carrier is live; hash only the
@@ -1902,6 +2153,16 @@ pair_control_firewall()
    done; done
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+   if pair_control_load_service_descriptor; then
+      pair_control_service_side || return 1
+      ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
+         -i "${pair_control_service_source_side}0" -o "${pair_control_service_destination_side}0" \
+         -s "$pair_control_service_source_address" -d "$pair_control_service_destination_address" \
+         -p tcp --sport "$pair_control_service_source_port" --dport "$pair_control_service_destination_port" -j ACCEPT
+   else
+      local service_load=$?
+      [[ "$service_load" == 1 ]] || return 1
+   fi
    # NDP is link-local to each VDC bridge and router interface. It never
    # traverses this router's FORWARD hook, so there is no broad ICMPv6 rule.
    digest="$(pair_control_firewall_digest)" || return 1
@@ -1921,11 +2182,13 @@ pair_control_serve()
    trap 'pair_control_cleanup_inside || true' EXIT
    trap 'exit 0' TERM INT HUP
    pair_control_bind_parents || return 1
-   local first_bridge_mac second_bridge_mac
+   local first_bridge_mac second_bridge_mac first_mtu second_mtu
    first_bridge_mac="$(pair_control_bridge_mac first)" || return 1
    second_bridge_mac="$(pair_control_bridge_mac second)" || return 1
    pair_write "$pair_control_dir/first-bridge-mac" "$first_bridge_mac"
    pair_write "$pair_control_dir/second-bridge-mac" "$second_bridge_mac"
+   first_mtu="$(pair_control_link_mtu pc-first vdcbr0)" || return 1
+   second_mtu="$(pair_control_link_mtu pc-second vdcbr0)" || return 1
    local tag addresses first_mac second_mac first_link_identity second_link_identity router_namespace_inode first_route_intent second_route_intent
    tag="$(pair_control_tag)" || return 1
    pair_control_router_ns="pc-r-$tag"
@@ -1955,6 +2218,13 @@ PAIR_CONTROL_ROUTER_UNIQUE
    ip -n "$pair_control_router_ns" link set "$pair_control_first_link" netns pc-first
    ip -n "$pair_control_router_ns" link add second0 type veth peer name "$pair_control_second_link" address "$second_mac"
    ip -n "$pair_control_router_ns" link set "$pair_control_second_link" netns pc-second
+   # Bridge forwarding cannot send IPv6 Packet Too Big when a smaller
+   # bridge port drops a jumbo frame. Match each VDC's underlay before joining
+   # its bridge so ordinary TCP records can reach the routed boundary.
+   ip -n "$pair_control_router_ns" link set first0 mtu "$first_mtu"
+   ip -n pc-first link set "$pair_control_first_link" mtu "$first_mtu"
+   ip -n "$pair_control_router_ns" link set second0 mtu "$second_mtu"
+   ip -n pc-second link set "$pair_control_second_link" mtu "$second_mtu"
    ip -n pc-first link set "$pair_control_first_link" master vdcbr0
    ip -n pc-second link set "$pair_control_second_link" master vdcbr0
    first_link_identity="$(pair_link_identity pc-first "$pair_control_first_link")" || return 1
@@ -2022,6 +2292,14 @@ pair_control_query_inside()
    done
    pair_control_link_owned first "$pair_control_first_link" || { echo "pair-control query rejected: first-link" >&2; return 1; }
    pair_control_link_owned second "$pair_control_second_link" || { echo "pair-control query rejected: second-link" >&2; return 1; }
+   local first_mtu second_mtu
+   first_mtu="$(pair_control_link_mtu pc-first vdcbr0)" || return 1
+   second_mtu="$(pair_control_link_mtu pc-second vdcbr0)" || return 1
+   [[ "$(pair_control_link_mtu pc-first "$pair_control_first_link")" == "$first_mtu" &&
+      "$(pair_control_link_mtu "$pair_control_router_ns" first0)" == "$first_mtu" &&
+      "$(pair_control_link_mtu pc-second "$pair_control_second_link")" == "$second_mtu" &&
+      "$(pair_control_link_mtu "$pair_control_router_ns" second0)" == "$second_mtu" ]] || {
+      echo "pair-control query rejected: link-mtu" >&2; return 1; }
    [[ -f "$pair_control_dir/first-route-intent" && ! -L "$pair_control_dir/first-route-intent" &&
       -f "$pair_control_dir/first-route" && ! -L "$pair_control_dir/first-route" &&
       "$(<"$pair_control_dir/first-route-intent")" == "$pair_control_second_subnet via $pair_control_first_router dev vdcbr0" &&
@@ -2032,17 +2310,25 @@ pair_control_query_inside()
       "$(<"$pair_control_dir/second-route")" == "$(<"$pair_control_dir/second-route-intent")" ]] || { echo "pair-control query rejected: second-route-journal" >&2; return 1; }
    [[ "$(ip -n pc-first -o -6 route show exact "$pair_control_second_subnet")" == "$(<"$pair_control_dir/first-route-intent")"* ]] || { echo "pair-control query rejected: first-route" >&2; return 1; }
    [[ "$(ip -n pc-second -o -6 route show exact "$pair_control_first_subnet")" == "$(<"$pair_control_dir/second-route-intent")"* ]] || { echo "pair-control query rejected: second-route" >&2; return 1; }
+   pair_control_validate_service_inside || { echo "pair-control query rejected: service" >&2; return 1; }
    [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
       "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
       "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || { echo "pair-control query rejected: firewall" >&2; return 1; }
-   printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
-      "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
+   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
+      printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared service=1 source=%s:%s destination=%s:%s sourceIngress=%s destinationIngress=%s\n' \
+         "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port" \
+         "$pair_control_service_source_address" "$pair_control_service_source_port" "$pair_control_service_destination_address" "$pair_control_service_destination_port" \
+         "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6"
+   else
+      printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
+         "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
+   fi
 }
 
 pair_control_action()
 {
    local action="$1"; shift
-   [[ "$action" == query || "$action" == remove ]] || return 2
+   [[ "$action" == query || "$action" == remove || "$action" == service ]] || return 2
    pair_control_parse "$@" || return
    if [[ "$action" == remove && ! -e "$pair_control_dir" ]]; then return 0; fi
    [[ -r "$pair_control_dir/descriptor" && ! -L "$pair_control_dir/descriptor" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" &&
@@ -2061,11 +2347,16 @@ pair_control_action()
       return 1
    fi
    pair_control_unlock_both
+   if [[ "$action" == service ]]; then
+      exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside service "$@"
+   fi
    exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside "$@"
 }
 
 pair_control_inside()
 {
+   local action=query
+   if [[ "${1:-}" == service ]]; then action=service; shift; fi
    pair_control_parse "$@" || return
    pair_control_owner_live || { echo "pair-control query rejected: live-owner" >&2; return 1; }
    [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$pair_control_mount" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || { echo "pair-control query rejected: owner-mount-or-descriptor" >&2; return 1; }
@@ -2075,6 +2366,9 @@ pair_control_inside()
    local addresses
    addresses="$(pair_control_addresses)" || return 1
    read -r _ pair_control_first_router _ pair_control_second_router <<< "$addresses" || return 1
+   if [[ "$action" == service ]]; then
+      pair_control_install_service_inside || return 1
+   fi
    pair_control_query_inside
 }
 

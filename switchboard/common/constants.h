@@ -15,6 +15,8 @@
 // portal_meta flags
 // use quic's connection id for the hash calculation
 #define F_QUIC_PORTAL (1 << 0)
+// Route pair-grant TCP through host TC, which owns exact grant selection and consumption.
+#define F_PAIR_GRANT_PORTAL (1 << 1)
 
 #define MAX_OWNED_ROUTABLE_PREFIXES 256
 #define MAX_WHITEHOLE_BINDINGS 8192

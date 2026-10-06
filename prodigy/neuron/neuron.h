@@ -49,6 +49,7 @@
 #include <prodigy/transport.artifact.h>
 #include <prodigy/cluster.pair.projection.h>
 #include <prodigy/cousin.discovery.h>
+#include <prodigy/cousin.session.h>
 #include <switchboard/overlay.route.h>
 #include <switchboard/pair.control.h>
 #include <switchboard/switchboard.h>
@@ -3155,6 +3156,39 @@ public:
   bool clusterPairControlProjectionPersistencePending = false;
   std::unique_ptr<SwitchboardPairControlRuntime> pairControlRuntime;
 
+  struct CousinSessionLocalPending {
+    uint128_t sessionUUID = 0;
+    uint64_t leaseGeneration = 0;
+    uint128_t containerUUID = 0;
+    uint64_t controlGeneration = 0;
+    uint128_t controlPeerUUID = 0;
+    ProdigyCousinSessionLocalKind kind = ProdigyCousinSessionLocalKind::install;
+    bool acknowledged = false;
+    int64_t expiresAtMs = 0;
+  };
+  Vector<CousinSessionLocalPending> cousinSessionLocalPendings = {};
+
+  struct CousinAdmissionInstalled {
+    uint128_t sessionUUID = 0;
+    uint64_t leaseGeneration = 0;
+    switchboard_pair_admission_route_key routeKey = {};
+    switchboard_pair_admission_grant_key grantKey = {};
+    uint64_t rootGeneration = 0;
+    uint64_t keyEpoch = 0;
+    String digest = {};
+    int64_t expiresAtMs = 0;
+  };
+  Vector<CousinAdmissionInstalled> cousinAdmissionInstalled = {};
+
+  struct CousinSessionReceiptPending {
+    String serialized = {};
+    uint64_t controlGeneration = 0;
+    uint128_t controlPeerUUID = 0;
+    uint64_t projectionGeneration = 0;
+    int64_t expiresAtMs = 0;
+  };
+  Vector<CousinSessionReceiptPending> cousinSessionReceiptPendings = {};
+
   virtual bool installClusterPairControlProjection(const ProdigyLocalClusterPairControlProjection& projection)
   {
     return prodigyLocalClusterPairControlProjectionValid(projection, true) &&
@@ -3171,10 +3205,317 @@ public:
     pairControlRuntime->onDiscoverySnapshot = [this](const ProdigyCousinDiscoveryReceipt& receipt) {
       forwardCousinDiscoveryReceipt(receipt);
     };
+    pairControlRuntime->onSessionControl = [this](const ProdigyCousinSessionReceipt& receipt) {
+      forwardCousinSessionControlReceipt(receipt);
+    };
     // The saved projection fences rollback, but may have been revoked while
     // this node was offline. Only a fresh durable current-master projection
     // may activate its credentials on this process incarnation.
     return pairControlRuntime->start();
+  }
+
+  bool cousinSessionCarrierCurrent(NeuronBrainControlStream *stream, uint64_t generation,
+                                   uint128_t peerUUID) const
+  {
+    return pairControlRuntime && controlTransportCredentials.enabled &&
+        prodigyLocalClusterPairControlProjectionValid(clusterPairControlProjection, true) &&
+        controlPeerCurrentlyAuthorized(peerUUID) &&
+        transportPeerProjectionControlCurrent(stream, generation, peerUUID);
+  }
+
+  void flushCousinSessionControlReceipts()
+  {
+    const int64_t now = Time::msSinceBoot();
+    while (!cousinSessionReceiptPendings.empty()) {
+      const auto& pending = cousinSessionReceiptPendings.front();
+      NeuronBrainControlStream *stream = brain;
+      if (now >= pending.expiresAtMs ||
+          pending.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+          !cousinSessionCarrierCurrent(stream, pending.controlGeneration, pending.controlPeerUUID)) {
+        cousinSessionReceiptPendings.erase(cousinSessionReceiptPendings.begin());
+        continue;
+      }
+      if (stream->pendingSend || stream->wBuffer.outstandingBytes() != 0 ||
+          !streamIsActive(stream) || Ring::socketIsClosing(stream)) return;
+      Message::construct(stream->wBuffer, NeuronTopic::cousinSessionControlReceipt, pending.serialized);
+      cousinSessionReceiptPendings.erase(cousinSessionReceiptPendings.begin());
+      Ring::queueSend(stream);
+      return;
+    }
+  }
+
+  void forwardCousinSessionControlReceipt(const ProdigyCousinSessionReceipt& receipt)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (!prodigyCousinSessionReceiptValid(receipt) ||
+        receipt.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+        receipt.localEndpoint.clusterUUID != clusterPairControlProjection.localClusterUUID ||
+        receipt.localEndpoint.nodeUUID != clusterPairControlProjection.nodeUUID ||
+        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+    flushCousinSessionControlReceipts();
+    if (cousinSessionReceiptPendings.size() >= ProdigyCousinSessionMaximumRecords) return;
+    CousinSessionReceiptPending pending;
+    if (!BitseryEngine::serialize(pending.serialized, receipt) ||
+        pending.serialized.size() > ProdigyCousinSessionMaximumBytes) return;
+    pending.controlGeneration = generation;
+    pending.controlPeerUUID = peerUUID;
+    pending.projectionGeneration = receipt.projectionGeneration;
+    pending.expiresAtMs = Time::msSinceBoot() + ProdigyCousinSessionPendingMs;
+    cousinSessionReceiptPendings.push_back(std::move(pending));
+    flushCousinSessionControlReceipts();
+  }
+
+  void receiveCousinSessionControl(const ProdigyCousinSessionPublication& publication)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (!prodigyCousinSessionPublicationValid(publication) ||
+        publication.nodeUUID != controlTransportCredentials.self.nodeUUID ||
+        publication.projectionGeneration != clusterPairControlProjection.committedAuthorityGeneration ||
+        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+    (void)pairControlRuntime->sendSessionControl(publication);
+  }
+
+  void receiveCousinSessionLocalCommand(uint128_t containerUUID,
+                                        const ProdigyCousinSessionLocalCommand& command)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (containerUUID == 0 || !prodigyCousinSessionLocalCommandValid(command) ||
+        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+    auto containerIt = containers.find(containerUUID);
+    if (containerIt == containers.end() || containerIt->second == nullptr || !streamIsActive(containerIt->second)) return;
+    Container *container = containerIt->second;
+    if (command.kind != ProdigyCousinSessionLocalKind::reject &&
+        !cousinSessionCommandMatchesContainer(command, *container)) return;
+    pruneCousinSessionEphemeralState(Time::msSinceBoot());
+    auto existing = std::find_if(cousinSessionLocalPendings.begin(), cousinSessionLocalPendings.end(),
+        [&](const auto& value) { return value.sessionUUID == command.session.sessionUUID; });
+    if (command.kind != ProdigyCousinSessionLocalKind::reject) {
+      // A renewal deliberately reuses the session identity.  It may replace only
+      // its own still-live owner record; installs and activations are one-shot.
+      if (existing != cousinSessionLocalPendings.end()) {
+        const bool exactRenewal = command.kind == ProdigyCousinSessionLocalKind::renew &&
+            command.leaseGeneration == existing->leaseGeneration + 1;
+        // Cleanup may race a partially delivered renewal: a newer generation
+        // only removes this exact retained session and cannot grant authority.
+        const bool exactRevocation = command.kind == ProdigyCousinSessionLocalKind::revoke &&
+            command.leaseGeneration >= existing->leaseGeneration;
+        if ((!exactRenewal && !exactRevocation) || existing->containerUUID != containerUUID) return;
+      } else if ((command.kind == ProdigyCousinSessionLocalKind::install ||
+                  command.kind == ProdigyCousinSessionLocalKind::activate) && command.leaseGeneration != 1) return;
+      else if (cousinSessionLocalPendings.size() >= ProdigyCousinSessionMaximumRecords &&
+               command.kind != ProdigyCousinSessionLocalKind::revoke) return;
+    }
+    String serialized = {}; auto copy = command;
+    if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
+    Message::construct(container->wBuffer, ContainerTopic::cousinSessionCommand, serialized);
+    Ring::queueSend(container);
+    if (command.kind != ProdigyCousinSessionLocalKind::reject) {
+      // Revocation has no lease by design, but its local acknowledgement must
+      // remain admissible long enough to reach the same authenticated Brain.
+      const uint32_t acknowledgementWindow = command.validForMs ? command.validForMs : ProdigyCousinSessionPendingMs;
+      CousinSessionLocalPending pending = {command.session.sessionUUID, command.leaseGeneration, containerUUID, generation,
+          peerUUID, command.kind, false, Time::msSinceBoot() + int64_t(acknowledgementWindow)};
+      if (existing != cousinSessionLocalPendings.end()) *existing = pending;
+      else cousinSessionLocalPendings.push_back(std::move(pending));
+    }
+  }
+
+  const Whitehole *cousinSessionSourceWhitehole(const Container& container, uint64_t nonce) const
+  {
+    const Whitehole *matched = nullptr;
+    for (const Whitehole& whitehole : container.plan.whiteholes) {
+      if (whitehole.bindingNonce != nonce) continue;
+      if (!whiteholeDeclarationValid(whitehole) || !whitehole.hasAddress || !whitehole.address.is6 ||
+          whitehole.transport != ExternalAddressTransport::tcp || whitehole.address.isNull() ||
+          whitehole.sourcePort == 0) return nullptr;
+      if (matched != nullptr) return nullptr;
+      matched = &whitehole;
+    }
+    return matched;
+  }
+
+  bool cousinSessionCommandMatchesContainer(const ProdigyCousinSessionLocalCommand& command,
+                                             const Container& container) const
+  {
+    if (!prodigyCousinSessionLocalCommandValid(command) || !controlTransportCredentials.enabled) return false;
+    const uint32_t containerID = generateLocalContainerID(container.plan.fragment);
+    if (command.localHalf == CousinRouteHalf::source) {
+      const Whitehole *whitehole = cousinSessionSourceWhitehole(container, command.session.sourceBindingNonce);
+      return command.session.sourceContainerUUID == container.plan.uuid &&
+          command.session.sourceContainerID == containerID &&
+          command.session.sourceNodeUUID == controlTransportCredentials.self.nodeUUID &&
+          command.session.sourcePermission.localClusterUUID == controlTransportCredentials.self.clusterUUID &&
+          whitehole != nullptr && whitehole->address.equals(command.session.sourceAddress) &&
+          whitehole->sourcePort == command.session.sourceTCPPort;
+    }
+    if (command.localHalf != CousinRouteHalf::destination ||
+        command.session.destination.containerUUID != container.plan.uuid ||
+        command.session.destination.containerID != containerID ||
+        command.session.destination.nodeUUID != controlTransportCredentials.self.nodeUUID ||
+        command.session.destination.permission.localClusterUUID != controlTransportCredentials.self.clusterUUID) return false;
+    uint32_t matches = 0;
+    for (const Wormhole& wormhole : container.plan.wormholes) {
+      if (wormhole.externalAddress.is6 && wormhole.externalAddress.equals(command.session.destination.publicAddress) &&
+          wormhole.externalPort == command.session.destination.publicTCPPort &&
+          wormhole.containerPort == command.session.destination.servicePort &&
+          wormhole.layer4 == IPPROTO_TCP && !wormhole.isQuic) ++matches;
+    }
+    return matches == 1;
+  }
+
+  bool clearCousinAdmissionGrant(const CousinAdmissionInstalled& installed)
+  {
+    if (!tcx_egress_program) return false;
+    switchboard_pair_admission_route_policy revoked = {};
+    revoked.route_generation = 1; revoked.root_generation = installed.rootGeneration;
+    revoked.key_epoch = installed.keyEpoch; revoked.expires_at_ns = monotonicNowNs();
+    revoked.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+    if (revoked.expires_at_ns == 0 ||
+        !Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, installed.routeKey, revoked)) return false;
+    return Container::removeVerifiedPairAdmissionGrant(tcx_egress_program, installed.grantKey,
+        installed.routeKey, installed.rootGeneration, installed.keyEpoch);
+  }
+
+  void pruneCousinSessionEphemeralState(int64_t now)
+  {
+    for (auto it = cousinSessionLocalPendings.begin(); it != cousinSessionLocalPendings.end();) {
+      if (it->expiresAtMs <= now) it = cousinSessionLocalPendings.erase(it); else ++it;
+    }
+    for (auto it = cousinAdmissionInstalled.begin(); it != cousinAdmissionInstalled.end();) {
+      if (it->expiresAtMs > now) { ++it; continue; }
+      if (clearCousinAdmissionGrant(*it)) it = cousinAdmissionInstalled.erase(it); else ++it;
+    }
+  }
+
+  void forwardCousinSessionLocalAck(Container *container, const ProdigyCousinSessionLocalAck& ack)
+  {
+    if (!container || !prodigyCousinSessionLocalAckValid(ack)) return;
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    pruneCousinSessionEphemeralState(Time::msSinceBoot());
+    auto pending = std::find_if(cousinSessionLocalPendings.begin(), cousinSessionLocalPendings.end(),
+        [&](const auto& value) { return value.sessionUUID == ack.sessionUUID && value.leaseGeneration == ack.leaseGeneration &&
+            value.containerUUID == container->plan.uuid && value.kind == ack.kind &&
+            value.controlGeneration == generation && value.controlPeerUUID == peerUUID; });
+    // Native stream failure is a narrowing operation. It may revoke an
+    // installed/renewed lease without waiting for a separately issued revoke.
+    if (pending == cousinSessionLocalPendings.end() && ack.kind == ProdigyCousinSessionLocalKind::revoke && ack.success) {
+      pending = std::find_if(cousinSessionLocalPendings.begin(), cousinSessionLocalPendings.end(),
+          [&](const auto& value) { return value.sessionUUID == ack.sessionUUID &&
+              ack.leaseGeneration <= value.leaseGeneration && value.containerUUID == container->plan.uuid &&
+              value.controlGeneration == generation && value.controlPeerUUID == peerUUID; });
+    }
+    if (pending == cousinSessionLocalPendings.end() ||
+        (pending->acknowledged && ack.kind != ProdigyCousinSessionLocalKind::revoke) ||
+        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+    String serialized = {}; auto copy = ack;
+    if (!BitseryEngine::serialize(serialized, copy) || serialized.size() > ProdigyCousinSessionMaximumBytes) return;
+    Message::construct(stream->wBuffer, NeuronTopic::cousinSessionAck, container->plan.uuid, serialized);
+    Ring::queueSend(stream);
+    if (ack.kind == ProdigyCousinSessionLocalKind::revoke || !ack.success)
+      cousinSessionLocalPendings.erase(pending);
+    else pending->acknowledged = true;
+  }
+
+  bool installCousinAdmissionCommand(const ProdigyCousinAdmissionCommand& command,
+                                     ProdigyCousinAdmissionAck& acknowledgement)
+  {
+    acknowledgement = {};
+    // Every command already carries the immutable destination identity, so
+    // even a local resolver/map rejection has a typed, fenceable receipt.
+    acknowledgement.sessionUUID = command.session.sessionUUID;
+    acknowledgement.leaseGeneration = command.leaseGeneration;
+    acknowledgement.containerID = command.session.destination.containerID;
+    acknowledgement.wormholeRevision = command.session.destination.wormholeRevision;
+    if (!prodigyCousinAdmissionCommandValid(command) || !switchboard || !tcx_egress_program) return false;
+    const uint64_t nowNs = monotonicNowNs();
+    // Revocations intentionally carry no lease; their tombstone is immediately
+    // authoritative. Active/renewed routes remain capped by the session lease.
+    if (nowNs == 0 || (!command.revoke && command.validForMs > ProdigyCousinSessionLeaseMs)) return false;
+    const uint64_t lifetimeNs = uint64_t(command.validForMs) * 1000000ULL;
+    if (!command.revoke && (lifetimeNs == 0 || UINT64_MAX - nowNs < lifetimeNs)) return false;
+    const uint64_t expiresAtNs = command.revoke ? nowNs : nowNs + lifetimeNs;
+    const uint64_t pairHi = uint64_t(command.session.sourcePermission.pairUUID >> 64);
+    const uint64_t pairLo = uint64_t(command.session.sourcePermission.pairUUID);
+    const uint64_t sessionHi = uint64_t(command.session.sessionUUID >> 64);
+    const uint64_t sessionLo = uint64_t(command.session.sessionUUID);
+    switchboard_pair_admission_route_key routeKey = {pairHi, pairLo, sessionHi, sessionLo};
+    switchboard_pair_admission_route_policy route = {};
+    route.route_generation = 1; route.root_generation = command.session.rootGeneration;
+    route.key_epoch = command.session.keyEpoch; route.expires_at_ns = expiresAtNs;
+    route.state = command.revoke ? SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED : SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+    auto existing = std::find_if(cousinAdmissionInstalled.begin(), cousinAdmissionInstalled.end(),
+        [&](const auto& value) { return value.sessionUUID == command.session.sessionUUID; });
+    if (command.revoke) {
+      // A missing local entry is already-expired best-effort revocation. A
+      // retained entry accepts its current or a newer cleanup generation.
+      if (existing != cousinAdmissionInstalled.end() &&
+          (command.leaseGeneration < existing->leaseGeneration ||
+           existing->routeKey.pair_uuid_hi != routeKey.pair_uuid_hi || existing->routeKey.pair_uuid_lo != routeKey.pair_uuid_lo ||
+           existing->routeKey.route_uuid_hi != routeKey.route_uuid_hi || existing->routeKey.route_uuid_lo != routeKey.route_uuid_lo ||
+           existing->rootGeneration != command.session.rootGeneration || existing->keyEpoch != command.session.keyEpoch)) return false;
+      if (existing != cousinAdmissionInstalled.end()) {
+        if (!clearCousinAdmissionGrant(*existing)) return false;
+        cousinAdmissionInstalled.erase(existing);
+      } else if (!Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, routeKey, route)) return false;
+      acknowledgement.containerID = command.session.destination.containerID;
+      acknowledgement.wormholeRevision = command.session.destination.wormholeRevision;
+      acknowledgement.revoked = true; acknowledgement.success = true;
+      return true;
+    }
+    String digest = {};
+    if (!prodigyCousinSessionDigest(command.session, digest)) return false;
+    pruneCousinSessionEphemeralState(Time::msSinceBoot());
+    existing = std::find_if(cousinAdmissionInstalled.begin(), cousinAdmissionInstalled.end(),
+        [&](const auto& value) { return value.sessionUUID == command.session.sessionUUID; });
+    if (existing != cousinAdmissionInstalled.end() &&
+        (existing->digest != digest || command.leaseGeneration != existing->leaseGeneration + 1)) return false;
+    if (existing == cousinAdmissionInstalled.end() && command.leaseGeneration != 1) return false;
+    // Never install a kernel route that cannot be represented by the bounded
+    // renewal ledger used to preserve BPF_NOEXIST grant semantics.
+    if (existing == cousinAdmissionInstalled.end() &&
+        cousinAdmissionInstalled.size() >= ProdigyCousinSessionMaximumRecords) return false;
+    if (!Container::installVerifiedPairAdmissionRoute(tcx_egress_program, routeKey, route)) return false;
+    if (existing == cousinAdmissionInstalled.end()) {
+      uint32_t portalSlot = 0, machineFragment = 0; uint8_t target[5] = {};
+      if (!switchboard->resolveCousinAdmissionTarget(command.session.destination, portalSlot, target, machineFragment)) {
+        switchboard_pair_admission_route_policy revoked = route; revoked.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+        (void)Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, routeKey, revoked);
+        return false;
+      }
+      switchboard_pair_admission_grant_key key = {}; key.portal_slot = portalSlot;
+      std::memcpy(key.flow.srcv6, command.session.sourceAddress.v6, sizeof(key.flow.srcv6));
+      std::memcpy(key.flow.dstv6, command.session.destination.publicAddress.v6, sizeof(key.flow.dstv6));
+      key.flow.port16[0] = htons(command.session.sourceTCPPort);
+      key.flow.port16[1] = htons(command.session.destination.publicTCPPort); key.flow.proto = IPPROTO_TCP;
+      switchboard_pair_admission_grant grant = {};
+      grant.pair_uuid_hi = pairHi; grant.pair_uuid_lo = pairLo; grant.route_uuid_hi = sessionHi; grant.route_uuid_lo = sessionLo;
+      grant.route_generation = 1; grant.root_generation = command.session.rootGeneration; grant.key_epoch = command.session.keyEpoch;
+      grant.expires_at_ns = expiresAtNs; std::memcpy(grant.target_container, target, sizeof(target));
+      grant.target_machine_fragment = machineFragment; grant.state = SWITCHBOARD_PAIR_ADMISSION_PENDING;
+      if (!Container::installVerifiedPairAdmissionGrant(tcx_egress_program, key, grant)) {
+        // The route is otherwise an untracked partial application.  Fail closed
+        // immediately; the revoked policy leaves no usable admission route.
+        switchboard_pair_admission_route_policy revoked = route;
+        revoked.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+        (void)Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, routeKey, revoked);
+        return false;
+      }
+      cousinAdmissionInstalled.push_back({command.session.sessionUUID, command.leaseGeneration, routeKey, key,
+          command.session.rootGeneration, command.session.keyEpoch, std::move(digest),
+          Time::msSinceBoot() + command.validForMs});
+    } else { existing->leaseGeneration = command.leaseGeneration; existing->expiresAtMs = Time::msSinceBoot() + command.validForMs; }
+    acknowledgement.containerID = command.session.destination.containerID;
+    acknowledgement.wormholeRevision = command.session.destination.wormholeRevision;
+    acknowledgement.success = true;
+    return true;
   }
 
   virtual bool persistClusterPairControlProjection(
@@ -4407,6 +4748,32 @@ public:
 
       // 	break;
       // }
+      case ContainerTopic::cousinSessionRequest:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ProdigyCousinSessionRequest request = {};
+          NeuronBrainControlStream *stream = brain;
+          const uint64_t generation = stream ? stream->ioGeneration : 0;
+          const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, request) ||
+              !prodigyCousinSessionRequestValid(request) ||
+              cousinSessionSourceWhitehole(*container, request.bindingNonce) == nullptr ||
+              !cousinSessionCarrierCurrent(stream, generation, peerUUID) ||
+              stream->wBuffer.outstandingBytes() > ProdigyCousinSessionMaximumBytes) break;
+          Message::construct(stream->wBuffer, NeuronTopic::cousinSessionRequest, container->plan.uuid, serialized);
+          Ring::queueSend(stream);
+          break;
+        }
+      case ContainerTopic::cousinSessionAck:
+        {
+          String serialized = {};
+          Message::extractToStringView(args, serialized);
+          ProdigyCousinSessionLocalAck acknowledgement = {};
+          if (args == terminal && BitseryEngine::deserializeSafe(serialized, acknowledgement))
+            forwardCousinSessionLocalAck(container, acknowledgement);
+          break;
+        }
       default:
         break;
     }
@@ -5227,6 +5594,49 @@ public:
               !prodigyCousinDiscoveryPublicationValid(publication))
           { if (brain) queueCloseIfActive(brain); break; }
           receiveCousinDiscoverySnapshot(publication);
+          break;
+        }
+      case NeuronTopic::cousinSessionCommand:
+        {
+          uint128_t containerUUID = 0; String serialized = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+          Message::extractToStringView(args, serialized);
+          ProdigyCousinSessionLocalCommand command = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, command) ||
+              !prodigyCousinSessionLocalCommandValid(command)) { if (brain) queueCloseIfActive(brain); break; }
+          receiveCousinSessionLocalCommand(containerUUID, command);
+          break;
+        }
+      case NeuronTopic::cousinSessionControlSend:
+        {
+          String serialized = {}; Message::extractToStringView(args, serialized);
+          ProdigyCousinSessionPublication publication = {};
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, publication) ||
+              !prodigyCousinSessionPublicationValid(publication)) { if (brain) queueCloseIfActive(brain); break; }
+          receiveCousinSessionControl(publication);
+          break;
+        }
+      case NeuronTopic::cousinAdmissionCommand:
+        {
+          String serialized = {}; Message::extractToStringView(args, serialized);
+          ProdigyCousinAdmissionCommand command = {};
+          NeuronBrainControlStream *stream = brain;
+          const uint64_t generation = stream ? stream->ioGeneration : 0;
+          const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+          if (args != terminal || !BitseryEngine::deserializeSafe(serialized, command) ||
+              !prodigyCousinAdmissionCommandValid(command) ||
+              command.session.destination.permission.localClusterUUID != controlTransportCredentials.self.clusterUUID ||
+              !cousinSessionCarrierCurrent(stream, generation, peerUUID)) { if (brain) queueCloseIfActive(brain); break; }
+          ProdigyCousinAdmissionAck acknowledgement = {};
+          const bool applied = installCousinAdmissionCommand(command, acknowledgement);
+          acknowledgement.success = applied;
+          if (!applied && acknowledgement.failure.empty()) acknowledgement.failure.assign("cousin admission rejected"_ctv);
+          String encoded = {};
+          if (BitseryEngine::serialize(encoded, acknowledgement) && encoded.size() <= ProdigyCousinSessionMaximumBytes &&
+              cousinSessionCarrierCurrent(stream, generation, peerUUID)) {
+            Message::construct(stream->wBuffer, NeuronTopic::cousinAdmissionAck, encoded);
+            Ring::queueSend(stream);
+          }
           break;
         }
       case NeuronTopic::registration:
@@ -6769,6 +7179,7 @@ public:
     if (socket == (void *)brain)
     {
       sendHandler(brain, result);
+      flushCousinSessionControlReceipts();
     }
     else if (closingBrainControls.contains(static_cast<NeuronBrainControlStream *>(socket)))
     {
@@ -7166,6 +7577,8 @@ public:
       delete packet;
       return;
     }
+
+    flushCousinSessionControlReceipts();
 
     switch (NeuronTimeoutFlags(packet->flags))
     {

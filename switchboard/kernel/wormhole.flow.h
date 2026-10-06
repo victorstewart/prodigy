@@ -606,6 +606,21 @@ __attribute__((noinline)) static bool switchboardLearnPublicWormholeFlowIPv6(con
     return established == SWITCHBOARD_WORMHOLE_OWNER_MATCH;
   }
 
+  // Pair admission consumes a grant only for the opening bare SYN.  Once that
+  // SYN has claimed this exact owner, an ACK-only continuation must reach
+  // container ingress so its existing expected-ACK check can promote the
+  // pending owner.  Do not route any other packet shape around first-SYN
+  // admission.
+  if (binding->admission_profile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT &&
+      packet->flow.proto == IPPROTO_TCP &&
+      (packet->flags & (F_SYN_SET | F_ACK_SET)) == F_ACK_SET)
+  {
+    return switchboardAuthorizePendingWormholeFlow(&reply,
+                                                   binding,
+                                                   containerID->value,
+                                                   SWITCHBOARD_WORMHOLE_FLOW_PUBLIC);
+  }
+
   __u32 admissionScratchKey = 0;
   struct switchboard_pair_admission_identity *admission = bpf_map_lookup_elem(&wh_adm_scratch, &admissionScratchKey);
   if (admission == NULL)

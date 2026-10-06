@@ -44,6 +44,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 #include <prodigy/cluster.machine.helpers.h>
 #include <prodigy/cluster.pair.projection.h>
 #include <prodigy/cousin.discovery.h>
+#include <prodigy/cousin.session.h>
 #include <prodigy/cousin.route.h>
 #include <prodigy/dns.provider.h>
 #include <prodigy/debug.h>
@@ -1212,6 +1213,34 @@ public:
 
   Vector<CousinDiscoveryReceiptCache> cousinDiscoveryReceipts = {};
   int64_t lastCousinDiscoveryDriveMs = 0;
+
+  class CousinSessionState {
+  public:
+    ProdigyCousinSessionRecord record = {};
+    uint128_t sourceMachineUUID = 0;
+    uint128_t destinationMachineUUID = 0;
+    uint64_t carrierIOGeneration = 0;
+    uint64_t applicationIOGeneration = 0;
+    uint64_t leaseGeneration = 1;
+    uint64_t lastReceiptSequence = 0;
+    bool awaitingPeerReady = false;
+    bool awaitingLocalAck = false;
+    bool awaitingDestinationAcks = false;
+    ProdigyCousinSessionLocalKind expectedLocalKind = ProdigyCousinSessionLocalKind::install;
+    uint64_t authorityEpoch = 0;
+    uint64_t projectionGeneration = 0;
+    uint64_t connectionID = 0;
+    ClusterPairControlEndpoint localEndpoint = {}, remoteEndpoint = {};
+    String projectionFingerprint = {};
+    int64_t createdAtMs = 0;
+    int64_t expiresAtMs = 0;
+    int64_t nextRenewalMs = 0;
+    bool destinationInstalled = false;
+    bool sourceActivated = false;
+    Vector<uint128_t> pendingAdmissionMachines = {};
+    Vector<std::pair<uint128_t, uint64_t>> admissionFleet = {};
+  };
+  Vector<CousinSessionState> cousinSessions = {};
 
   // A provisioned AEGIS node never falls back to TLS or plaintext because its
   // current authority/ledger is unavailable, stale, or has revoked a peer.
@@ -17503,6 +17532,7 @@ public:
     driveTransportCredentialEnrollmentOperations();
     driveClusterPairEnrollmentOperations();
     driveCousinDiscoverySnapshots();
+    driveCousinSessions();
     resumeStatefulTopologyRetirements();
     for (BrainView *peer : brains)
     {
@@ -31955,6 +31985,414 @@ public:
     return response;
   }
 
+  bool rejectCousinSessionSourceRequest(NeuronView *neuron, uint128_t containerUUID,
+                                        const ProdigyCousinSessionRequest& request)
+  {
+    ProdigyCousinSessionLocalCommand command = {};
+    command.kind = ProdigyCousinSessionLocalKind::reject;
+    command.localHalf = CousinRouteHalf::source;
+    command.requestUUID = request.requestUUID;
+    command.failure.assign("cousin session request denied"_ctv);
+    String encoded = {};
+    if (!neuron || !prodigyCousinSessionLocalCommandValid(command) ||
+        !BitseryEngine::serialize(encoded, command) || encoded.size() > ProdigyCousinSessionMaximumBytes ||
+        neuron->wBuffer.outstandingBytes() > ProdigyCousinSessionMaximumBytes * 64) return false;
+    Message::construct(neuron->wBuffer, NeuronTopic::cousinSessionCommand, containerUUID, encoded);
+    Ring::queueSend(neuron);
+    return true;
+  }
+
+  bool cousinSessionSourceRequest(NeuronView *neuron, uint128_t containerUUID,
+                                 const ProdigyCousinSessionRequest& request)
+  {
+    if (!weAreMaster || !neuron || !neuron->machine || neuron != &neuron->machine->neuron ||
+        !prodigyCousinSessionRequestValid(request) ||
+        !cousinDiscoveryNeuronAuthorized(neuron) || cousinSessions.size() >= ProdigyCousinSessionMaximumRecords ||
+        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged()) return false;
+    Machine *machine = neuron->machine;
+    ContainerView *container = nullptr;
+    auto live = containers.find(containerUUID);
+    if (live != containers.end()) container = live->second;
+    if (!container || container->machine != machine || !container->isStateful ||
+        container->state != ContainerState::healthy || !container->runtimeReady) return false;
+    const Whitehole *whitehole = nullptr;
+    for (const Whitehole& candidate : container->whiteholes)
+      if (candidate.bindingNonce == request.bindingNonce && candidate.hasAddress && candidate.address.is6 &&
+          candidate.transport == ExternalAddressTransport::tcp && candidate.sourcePort != 0) { whitehole = &candidate; break; }
+    if (!whitehole) return false;
+    auto reject = [&]() { (void)rejectCousinSessionSourceRequest(neuron, containerUUID, request); return false; };
+    auto deploymentIt = deployments.find(container->deploymentID);
+    if (deploymentIt == deployments.end() || !deploymentIt->second) return reject();
+    ApplicationDeployment *deployment = deploymentIt->second;
+    const auto permission = std::find_if(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+        masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& value) {
+          return value.permissionUUID == request.permissionUUID;
+        });
+    if (permission == masterAuthorityRuntimeState.localCousinServicePermissions.end() ||
+        permission->state != ProdigyLocalCousinServicePermissionState::active ||
+        permission->localHalf != CousinRouteHalf::source || !permission->slots.contains(request.slot) ||
+        permission->localDeploymentID != container->deploymentID ||
+        !localCousinServicePermissionMatchesCurrentLivePlan(*permission)) return reject();
+    if (std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& session) {
+          return session.record.sourceContainerUUID == containerUUID && session.record.sourceBindingNonce == request.bindingNonce && session.expiresAtMs > Time::msSinceBoot(); })) return false;
+    ProdigyCousinDiscoveryResponse counterparts = queryCousinCounterparts({1, request.permissionUUID, request.slot});
+    if (!counterparts.success || counterparts.records.empty()) return false;
+    const ProdigyCousinCounterpart& destination = counterparts.records.front();
+    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == permission->pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
+              !prodigyClusterPairEnrollmentRootIsZero(value);
+        });
+    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+    ProdigyCousinSessionRecord record = {};
+    if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&record.sessionUUID), sizeof(record.sessionUUID)) != 1 ||
+        record.sessionUUID == 0) return false;
+    record.requestUUID = request.requestUUID; record.rootGeneration = enrollment->rootGeneration;
+    record.keyEpoch = enrollment->agreedKeyEpoch; record.slot = request.slot; record.sourcePermission = *permission;
+    record.sourceContainerUUID = container->uuid; record.sourceNodeUUID = machine->uuid;
+    record.sourceContainerID = container->generateContainerID(); record.sourceShardGroup = container->shardGroup;
+    record.sourceShardGroups = deployment->nShardGroups; record.sourceService = container->effectiveStatefulMeshRoles(deployment->plan).cousin;
+    record.sourceBindingNonce = whitehole->bindingNonce; record.sourceAddress = whitehole->address;
+    record.sourceTCPPort = whitehole->sourcePort; record.destination = destination;
+    if (!prodigyCousinSessionRecordValid(record)) return false;
+    CousinSessionState state = {}; state.record = record; state.sourceMachineUUID = machine->uuid;
+    state.authorityEpoch = masterAuthorityEpoch; state.carrierIOGeneration = neuron->ioGeneration;
+    state.applicationIOGeneration = neuron->ioGeneration; state.awaitingPeerReady = true;
+    state.createdAtMs = Time::msSinceBoot(); state.expiresAtMs = state.createdAtMs + ProdigyCousinSessionPendingMs;
+    ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+    if (!buildLocalClusterPairControlProjection(machine->uuid, projection, fingerprint) ||
+        fingerprint != neuron->clusterPairProjectionAcknowledgedFingerprint) return false;
+    const auto credential = std::find_if(projection.credentials.begin(), projection.credentials.end(), [&](const auto& value) {
+      return value.pairUUID == record.sourcePermission.pairUUID && value.rootGeneration == record.rootGeneration &&
+          value.keyEpoch == record.keyEpoch;
+    });
+    const auto cache = std::find_if(cousinDiscoveryReceipts.begin(), cousinDiscoveryReceipts.end(), [&](const auto& value) {
+      return value.nodeUUID == machine->uuid && value.ioGeneration == neuron->ioGeneration &&
+          value.projectionFingerprint == fingerprint && std::any_of(value.receipt.snapshot.records.begin(),
+          value.receipt.snapshot.records.end(), [&](const auto& candidate) { return candidate.containerUUID == destination.containerUUID; });
+    });
+    if (credential == projection.credentials.end() || cache == cousinDiscoveryReceipts.end()) return false;
+    ProdigyCousinSessionPublication publication = {};
+    publication.nodeUUID = machine->uuid; publication.projectionGeneration = neuron->clusterPairProjectionGeneration;
+    publication.localEndpoint = cache->receipt.localEndpoint; publication.remoteEndpoint = cache->receipt.remoteEndpoint;
+    publication.connectionID = cache->receipt.connectionID; publication.control.kind = ProdigyCousinSessionControlKind::propose;
+    publication.control.session = record;
+    if (!prodigyCousinSessionPublicationValid(publication)) return false;
+    String encoded = {};
+    if (!BitseryEngine::serialize(encoded, publication) || encoded.size() > ProdigyCousinSessionMaximumBytes) return false;
+    state.projectionGeneration = publication.projectionGeneration; state.projectionFingerprint = fingerprint;
+    state.localEndpoint = publication.localEndpoint; state.remoteEndpoint = publication.remoteEndpoint;
+    state.connectionID = publication.connectionID;
+    if (!cousinSessionLocalCurrent(state)) return false;
+    cousinSessions.push_back(std::move(state));
+    Message::construct(neuron->wBuffer, NeuronTopic::cousinSessionControlSend, encoded);
+    Ring::queueSend(neuron);
+    return true;
+  }
+
+  bool cousinSessionDeriveKey(const ProdigyCousinSessionRecord& record, std::array<uint8_t, 32>& key,
+                              String& context) const
+  {
+    OPENSSL_cleanse(key.data(), key.size()); context.clear();
+    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == record.sourcePermission.pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
+              !prodigyClusterPairEnrollmentRootIsZero(value) && value.rootGeneration == record.rootGeneration &&
+              value.agreedKeyEpoch == record.keyEpoch;
+        });
+    if (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
+    ClusterPairRoot root = {}; root.pairUUID = enrollment->pairUUID; root.rootGeneration = enrollment->rootGeneration;
+    root.firstClusterUUID = std::min(enrollment->localClusterUUID, enrollment->peerClusterUUID);
+    root.secondClusterUUID = std::max(enrollment->localClusterUUID, enrollment->peerClusterUUID);
+    std::memcpy(root.root.data(), enrollment->root, root.root.size());
+    ClusterPairKeyContext keyContext = {}; ClusterPairDerivedKey derived = {};
+    const bool ok = prodigyCousinSessionKeyContext(record, keyContext) && clusterPairDeriveKey(root, keyContext, derived) &&
+        derived.size == key.size() && prodigyCousinSessionDigest(record, context);
+    if (ok) std::memcpy(key.data(), derived.bytes.data(), key.size());
+    OPENSSL_cleanse(derived.bytes.data(), derived.bytes.size()); OPENSSL_cleanse(root.root.data(), root.root.size());
+    return ok;
+  }
+
+  bool cousinSessionLocalCurrent(const CousinSessionState& state)
+  {
+    if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
+        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged()) return false;
+    Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
+    if (!carrier || !cousinDiscoveryNeuronAuthorized(&carrier->neuron) ||
+        carrier->neuron.ioGeneration != state.carrierIOGeneration ||
+        carrier->neuron.clusterPairProjectionGeneration != state.projectionGeneration ||
+        carrier->neuron.clusterPairProjectionAcknowledgedFingerprint != state.projectionFingerprint) return false;
+    ProdigyLocalClusterPairControlProjection projection = {}; String fingerprint = {};
+    if (!buildLocalClusterPairControlProjection(carrier->uuid, projection, fingerprint) ||
+        fingerprint != state.projectionFingerprint || std::none_of(projection.credentials.begin(), projection.credentials.end(), [&](const auto& key) {
+          return key.pairUUID == state.record.sourcePermission.pairUUID && key.rootGeneration == state.record.rootGeneration &&
+              key.keyEpoch == state.record.keyEpoch;
+        })) return false;
+    const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+    const auto& expected = source ? state.record.sourcePermission : state.record.destination.permission;
+    const auto permission = std::find_if(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+        masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& value) {
+          return prodigyLocalCousinServicePermissionEqual(value, expected);
+        });
+    if (permission == masterAuthorityRuntimeState.localCousinServicePermissions.end() ||
+        !localCousinServicePermissionMatchesCurrentLivePlan(*permission)) return false;
+    const auto localUUID = source ? state.record.sourceContainerUUID : state.record.destination.containerUUID;
+    auto found = containers.find(localUUID);
+    if (found == containers.end() || !found->second || !found->second->machine) return false;
+    ContainerView *app = found->second; Machine *machine = app->machine;
+    if (!app->isStateful || !app->runtimeReady || app->state != ContainerState::healthy ||
+        !machine->runtimeReady || !containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid) ||
+        machine->neuron.ioGeneration != state.applicationIOGeneration) return false;
+    if (source) {
+      auto deployment = deployments.find(app->deploymentID);
+      if (machine->uuid != state.record.sourceNodeUUID || app->generateContainerID() != state.record.sourceContainerID ||
+          deployment == deployments.end() || !deployment->second ||
+          app->effectiveStatefulMeshRoles(deployment->second->plan).cousin != state.record.sourceService ||
+          deployment->second->nShardGroups != state.record.sourceShardGroups || app->shardGroup != state.record.sourceShardGroup) return false;
+      uint32_t bindings = 0;
+      for (const auto& whitehole : app->whiteholes)
+        if (whitehole.bindingNonce == state.record.sourceBindingNonce && whitehole.hasAddress &&
+            whitehole.transport == ExternalAddressTransport::tcp && whitehole.address.equals(state.record.sourceAddress) &&
+            whitehole.sourcePort == state.record.sourceTCPPort) ++bindings;
+      if (bindings != 1) return false;
+      const auto response = queryCousinCounterparts({1, permission->permissionUUID, state.record.slot});
+      return response.success && std::any_of(response.records.begin(), response.records.end(), [&](const auto& counterpart) {
+        auto candidate = state.record; candidate.destination = counterpart;
+        return prodigyCousinSessionExact(candidate, state.record);
+      });
+    }
+    ProdigyCousinDiscoverySnapshot snapshot = {};
+    return buildCousinDiscoverySnapshot(permission->pairUUID, snapshot) &&
+        snapshot.rootGeneration == state.record.rootGeneration && snapshot.keyEpoch == state.record.keyEpoch &&
+        std::any_of(snapshot.records.begin(), snapshot.records.end(), [&](const auto& counterpart) {
+          auto candidate = state.record; candidate.destination = counterpart;
+          return prodigyCousinSessionExact(candidate, state.record);
+        });
+  }
+
+  bool sendCousinSessionControl(NeuronView *neuron, const CousinSessionState& state,
+                                ProdigyCousinSessionControlKind kind)
+  {
+    if (!neuron || !neuron->machine || neuron->machine->uuid != state.localEndpoint.nodeUUID ||
+        !cousinDiscoveryNeuronAuthorized(neuron) || neuron->ioGeneration != state.carrierIOGeneration ||
+        neuron->clusterPairProjectionGeneration != state.projectionGeneration ||
+        neuron->clusterPairProjectionAcknowledgedFingerprint != state.projectionFingerprint) return false;
+    ProdigyCousinSessionPublication publication = {};
+    publication.nodeUUID = neuron->machine->uuid; publication.projectionGeneration = state.projectionGeneration;
+    publication.localEndpoint = state.localEndpoint; publication.remoteEndpoint = state.remoteEndpoint;
+    publication.connectionID = state.connectionID; publication.control.kind = kind; publication.control.session = state.record;
+    publication.control.leaseGeneration = state.leaseGeneration;
+    String encoded = {};
+    if (!prodigyCousinSessionPublicationValid(publication) || !BitseryEngine::serialize(encoded, publication) ||
+        encoded.size() > ProdigyCousinSessionMaximumBytes || neuron->wBuffer.outstandingBytes() > ProdigyCousinSessionMaximumBytes * 64) return false;
+    Message::construct(neuron->wBuffer, NeuronTopic::cousinSessionControlSend, encoded); Ring::queueSend(neuron); return true;
+  }
+
+  bool sendCousinSessionLocalCommand(CousinSessionState& state, ProdigyCousinSessionLocalKind kind)
+  {
+    const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+    const uint128_t localUUID = source ? state.record.sourceContainerUUID : state.record.destination.containerUUID;
+    Machine *machine = findMachineByUUID(source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID);
+    if (!machine || !containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid) ||
+        machine->neuron.ioGeneration != state.applicationIOGeneration) return false;
+    ProdigyCousinSessionLocalCommand command = {};
+    command.kind = kind; command.localHalf = source ? CousinRouteHalf::source : CousinRouteHalf::destination;
+    command.requestUUID = state.record.requestUUID; command.session = state.record; command.leaseGeneration = state.leaseGeneration;
+    if (kind != ProdigyCousinSessionLocalKind::revoke) {
+      command.validForMs = ProdigyCousinSessionLeaseMs;
+      if (!cousinSessionDeriveKey(state.record, command.psk, command.canonicalContext)) return false;
+    }
+    String encoded = {};
+    if (!prodigyCousinSessionLocalCommandValid(command) || !BitseryEngine::serialize(encoded, command) ||
+        encoded.size() > ProdigyCousinSessionMaximumBytes || machine->neuron.wBuffer.outstandingBytes() > ProdigyCousinSessionMaximumBytes * 64) return false;
+    state.expectedLocalKind = kind; state.awaitingLocalAck = true;
+    Message::construct(machine->neuron.wBuffer, NeuronTopic::cousinSessionCommand, localUUID, encoded);
+    Ring::queueSend(&machine->neuron); return true;
+  }
+
+  void revokeCousinSession(CousinSessionState& state, bool notifyPeer = true)
+  {
+    // A deposed leader cannot keep issuing commands. Independent kernel/app
+    // deadlines close anything whose current owner can no longer be reached.
+    if (weAreMaster && state.authorityEpoch == masterAuthorityEpoch) {
+      (void)sendCousinSessionLocalCommand(state, ProdigyCousinSessionLocalKind::revoke);
+      ProdigyCousinAdmissionCommand command = {}; command.session = state.record;
+      command.revoke = true; command.leaseGeneration = state.leaseGeneration;
+      String encoded = {};
+      if (BitseryEngine::serialize(encoded, command)) for (const auto& owner : state.admissionFleet) {
+        Machine *machine = findMachineByUUID(owner.first);
+        if (machine && machine->neuron.ioGeneration == owner.second && containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid)) {
+          Message::construct(machine->neuron.wBuffer, NeuronTopic::cousinAdmissionCommand, encoded); Ring::queueSend(&machine->neuron);
+        }
+      }
+      if (notifyPeer) if (Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID))
+        (void)sendCousinSessionControl(&carrier->neuron, state, ProdigyCousinSessionControlKind::revoke);
+    }
+    state.expiresAtMs = 0;
+  }
+
+  bool installCousinSessionDestination(CousinSessionState& state, bool renewal)
+  {
+    if (!cousinSessionLocalCurrent(state)) return false;
+    Vector<std::pair<uint128_t, uint64_t>> fleet = {};
+    for (Machine *machine : machines) {
+      if (!prodigyWormholeRuntimeTargetMachine(machine)) continue;
+      if (!machine->runtimeReady || !containerRetirementNeuronAuthorized(&machine->neuron, machine->uuid)) return false;
+      fleet.emplace_back(machine->uuid, machine->neuron.ioGeneration);
+    }
+    if (fleet.empty() || fleet.size() > ProdigyCousinSessionMaximumRecords) return false;
+    if (renewal && (fleet.size() != state.admissionFleet.size() || std::any_of(fleet.begin(), fleet.end(), [&](const auto& owner) {
+          return std::find(state.admissionFleet.begin(), state.admissionFleet.end(), owner) == state.admissionFleet.end();
+        }))) return false;
+    state.admissionFleet = std::move(fleet); state.pendingAdmissionMachines.clear(); state.destinationInstalled = false;
+    state.awaitingDestinationAcks = true;
+    state.expiresAtMs = Time::msSinceBoot() + ProdigyCousinSessionPendingMs;
+    if (!sendCousinSessionLocalCommand(state, renewal ? ProdigyCousinSessionLocalKind::renew : ProdigyCousinSessionLocalKind::install)) return false;
+    ProdigyCousinAdmissionCommand command = {}; command.session = state.record;
+    command.validForMs = ProdigyCousinSessionLeaseMs; command.leaseGeneration = state.leaseGeneration;
+    String encoded = {}; if (!BitseryEngine::serialize(encoded, command)) return false;
+    for (const auto& owner : state.admissionFleet) {
+      Machine *machine = findMachineByUUID(owner.first);
+      if (!machine || machine->neuron.wBuffer.outstandingBytes() > ProdigyCousinSessionMaximumBytes * 64) return false;
+      state.pendingAdmissionMachines.push_back(owner.first);
+      Message::construct(machine->neuron.wBuffer, NeuronTopic::cousinAdmissionCommand, encoded); Ring::queueSend(&machine->neuron);
+    }
+    return true;
+  }
+
+  void finishCousinSessionDestination(CousinSessionState& state)
+  {
+    if (!state.awaitingDestinationAcks || !state.destinationInstalled || !state.pendingAdmissionMachines.empty()) return;
+    if (!cousinSessionLocalCurrent(state)) { revokeCousinSession(state); return; }
+    Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
+    if (!carrier || !sendCousinSessionControl(&carrier->neuron, state, ProdigyCousinSessionControlKind::ready)) {
+      revokeCousinSession(state); return;
+    }
+    state.awaitingDestinationAcks = false;
+    state.expiresAtMs = Time::msSinceBoot() + ProdigyCousinSessionLeaseMs;
+  }
+
+  void receiveCousinSessionControlReceipt(NeuronView *neuron, const ProdigyCousinSessionReceipt& receipt)
+  {
+    if (!weAreMaster || !neuron || !neuron->machine || !cousinDiscoveryNeuronAuthorized(neuron) ||
+        !prodigyCousinSessionReceiptValid(receipt) || receipt.localEndpoint.clusterUUID != brainConfig.clusterUUID ||
+        receipt.localEndpoint.nodeUUID != neuron->machine->uuid || receipt.projectionGeneration != neuron->clusterPairProjectionGeneration) return;
+    auto sameCarrier = [&](const auto& state) {
+      return state.localEndpoint == receipt.localEndpoint && state.remoteEndpoint == receipt.remoteEndpoint &&
+          state.connectionID == receipt.connectionID && state.carrierIOGeneration == neuron->ioGeneration &&
+          state.projectionGeneration == receipt.projectionGeneration && state.authorityEpoch == masterAuthorityEpoch;
+    };
+    if (receipt.disconnected) {
+      for (auto& state : cousinSessions) if (sameCarrier(state)) revokeCousinSession(state, false);
+      return;
+    }
+    const auto& control = receipt.control;
+    auto existing = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) {
+      return state.record.sessionUUID == control.session.sessionUUID;
+    });
+    if (existing != cousinSessions.end()) {
+      auto& state = *existing;
+      if (!sameCarrier(state) || !prodigyCousinSessionExact(state.record, control.session) ||
+          receipt.sequence <= state.lastReceiptSequence) return;
+      state.lastReceiptSequence = receipt.sequence;
+      if (control.kind == ProdigyCousinSessionControlKind::revoke || control.kind == ProdigyCousinSessionControlKind::reject) {
+        revokeCousinSession(state, false); return;
+      }
+      if (!cousinSessionLocalCurrent(state)) { revokeCousinSession(state); return; }
+      const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+      if (source && control.kind == ProdigyCousinSessionControlKind::ready && state.awaitingPeerReady &&
+          control.leaseGeneration == state.leaseGeneration) {
+        state.awaitingPeerReady = false;
+        if (!sendCousinSessionLocalCommand(state, state.sourceActivated ? ProdigyCousinSessionLocalKind::renew : ProdigyCousinSessionLocalKind::activate))
+          revokeCousinSession(state);
+      } else if (!source && control.kind == ProdigyCousinSessionControlKind::renew && !state.awaitingDestinationAcks &&
+          state.leaseGeneration != UINT64_MAX && control.leaseGeneration == state.leaseGeneration + 1) {
+        state.leaseGeneration = control.leaseGeneration;
+        if (!installCousinSessionDestination(state, true)) revokeCousinSession(state);
+      }
+      return;
+    }
+    if (control.kind != ProdigyCousinSessionControlKind::propose || control.leaseGeneration != 1 ||
+        control.session.destination.permission.localClusterUUID != brainConfig.clusterUUID ||
+        cousinSessions.size() >= ProdigyCousinSessionMaximumRecords) return;
+    if (std::any_of(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) {
+          return state.record.sourceContainerUUID == control.session.sourceContainerUUID &&
+              state.record.sourceBindingNonce == control.session.sourceBindingNonce && state.expiresAtMs > Time::msSinceBoot();
+        })) return;
+    Machine *app = findMachineByUUID(control.session.destination.nodeUUID);
+    if (!app) return;
+    CousinSessionState state = {}; state.record = control.session; state.destinationMachineUUID = app->uuid;
+    state.applicationIOGeneration = app->neuron.ioGeneration; state.carrierIOGeneration = neuron->ioGeneration;
+    state.authorityEpoch = masterAuthorityEpoch; state.createdAtMs = Time::msSinceBoot();
+    state.expiresAtMs = state.createdAtMs + ProdigyCousinSessionPendingMs;
+    state.localEndpoint = receipt.localEndpoint; state.remoteEndpoint = receipt.remoteEndpoint;
+    state.connectionID = receipt.connectionID; state.projectionGeneration = receipt.projectionGeneration;
+    state.projectionFingerprint = neuron->clusterPairProjectionAcknowledgedFingerprint; state.lastReceiptSequence = receipt.sequence;
+    if (!cousinSessionLocalCurrent(state)) return;
+    cousinSessions.push_back(std::move(state));
+    if (!installCousinSessionDestination(cousinSessions.back(), false)) revokeCousinSession(cousinSessions.back());
+  }
+
+  void receiveCousinSessionLocalAck(NeuronView *neuron, uint128_t containerUUID,
+                                    const ProdigyCousinSessionLocalAck& ack)
+  {
+    if (!weAreMaster || !neuron || !neuron->machine || !prodigyCousinSessionLocalAckValid(ack) ||
+        !containerRetirementNeuronAuthorized(neuron, neuron->machine->uuid)) return;
+    auto found = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) { return state.record.sessionUUID == ack.sessionUUID; });
+    if (found == cousinSessions.end()) return;
+    auto& state = *found;
+    const bool source = state.record.sourcePermission.localClusterUUID == brainConfig.clusterUUID;
+    if (state.authorityEpoch != masterAuthorityEpoch || state.applicationIOGeneration != neuron->ioGeneration ||
+        (source ? state.record.sourceNodeUUID : state.record.destination.nodeUUID) != neuron->machine->uuid ||
+        (source ? state.record.sourceContainerUUID : state.record.destination.containerUUID) != containerUUID) return;
+    if (ack.kind == ProdigyCousinSessionLocalKind::revoke && ack.leaseGeneration <= state.leaseGeneration) {
+      revokeCousinSession(state); return;
+    }
+    if (ack.leaseGeneration != state.leaseGeneration || !state.awaitingLocalAck || ack.kind != state.expectedLocalKind) return;
+    state.awaitingLocalAck = false;
+    if (!ack.success || !cousinSessionLocalCurrent(state)) { revokeCousinSession(state); return; }
+    if (source) {
+      state.sourceActivated = true; state.expiresAtMs = Time::msSinceBoot() + ProdigyCousinSessionLeaseMs;
+      state.nextRenewalMs = Time::msSinceBoot() + ProdigyCousinSessionRenewMs;
+    } else { state.destinationInstalled = true; finishCousinSessionDestination(state); }
+  }
+
+  void receiveCousinAdmissionAck(NeuronView *neuron, const ProdigyCousinAdmissionAck& ack)
+  {
+    if (!weAreMaster || !neuron || !neuron->machine || !prodigyCousinAdmissionAckValid(ack) ||
+        !containerRetirementNeuronAuthorized(neuron, neuron->machine->uuid)) return;
+    auto found = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) { return state.record.sessionUUID == ack.sessionUUID; });
+    if (found == cousinSessions.end()) return;
+    auto& state = *found;
+    if (state.authorityEpoch != masterAuthorityEpoch || !state.awaitingDestinationAcks || ack.leaseGeneration != state.leaseGeneration ||
+        std::find(state.admissionFleet.begin(), state.admissionFleet.end(), std::make_pair(neuron->machine->uuid, neuron->ioGeneration)) == state.admissionFleet.end()) return;
+    auto pending = std::find(state.pendingAdmissionMachines.begin(), state.pendingAdmissionMachines.end(), neuron->machine->uuid);
+    if (pending == state.pendingAdmissionMachines.end()) return;
+    if (!ack.success || ack.revoked || ack.containerID != state.record.destination.containerID ||
+        ack.wormholeRevision != state.record.destination.wormholeRevision || !cousinSessionLocalCurrent(state)) {
+      revokeCousinSession(state); return;
+    }
+    state.pendingAdmissionMachines.erase(pending); finishCousinSessionDestination(state);
+  }
+
+  void driveCousinSessions()
+  {
+    const int64_t now = Time::msSinceBoot();
+    for (auto it = cousinSessions.begin(); it != cousinSessions.end();) {
+      auto& state = *it;
+      if (!cousinSessionLocalCurrent(state)) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
+      if (state.sourceActivated && !state.awaitingPeerReady && !state.awaitingLocalAck && now >= state.nextRenewalMs) {
+        Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
+        if (state.leaseGeneration == UINT64_MAX) { revokeCousinSession(state); it = cousinSessions.erase(it); continue; }
+        ++state.leaseGeneration; state.awaitingPeerReady = true; state.expiresAtMs = now + ProdigyCousinSessionPendingMs;
+        if (!carrier || !sendCousinSessionControl(&carrier->neuron, state, ProdigyCousinSessionControlKind::renew)) {
+          revokeCousinSession(state); it = cousinSessions.erase(it); continue;
+        }
+      }
+      ++it;
+    }
+  }
+
   void receiveClusterPairEpochStatus(NeuronView *neuron, const ProdigyClusterPairEpochReceipt& receipt)
   {
     if (!weAreMaster || masterAuthorityEpoch == 0 || masterAuthorityPersistencePending != 0 ||
@@ -43823,6 +44261,41 @@ public:
           ProdigyCousinDiscoveryReceipt receipt = {};
           if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, receipt))
             receiveCousinDiscoverySnapshot(neuron, receipt);
+          break;
+        }
+      case NeuronTopic::cousinSessionControlReceipt:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCousinSessionReceipt receipt = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, receipt))
+            receiveCousinSessionControlReceipt(neuron, receipt);
+          break;
+        }
+      case NeuronTopic::cousinSessionAck:
+        {
+          uint128_t containerUUID = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID); Message::extractToStringView(args, encoded);
+          ProdigyCousinSessionLocalAck acknowledgement = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, acknowledgement))
+            receiveCousinSessionLocalAck(neuron, containerUUID, acknowledgement);
+          break;
+        }
+      case NeuronTopic::cousinAdmissionAck:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCousinAdmissionAck acknowledgement = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, acknowledgement))
+            receiveCousinAdmissionAck(neuron, acknowledgement);
+          break;
+        }
+      case NeuronTopic::cousinSessionRequest:
+        {
+          uint128_t containerUUID = 0; String encoded = {};
+          Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
+          Message::extractToStringView(args, encoded);
+          ProdigyCousinSessionRequest request = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, request))
+            (void)cousinSessionSourceRequest(neuron, containerUUID, request);
           break;
         }
       case NeuronTopic::registration:

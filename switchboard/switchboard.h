@@ -41,6 +41,7 @@
 #include <prodigy/neuron/containers.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/types.h>
+#include <prodigy/cousin.discovery.h>
 #include <switchboard/common/constants.h>
 #include <switchboard/common/quic.cid.h>
 #include <switchboard/common/structs.h>
@@ -77,14 +78,21 @@ public:
 
   uint64_t hash(void) const
   {
-    const uint8_t *start = reinterpret_cast<const uint8_t *>(&address);
-    const uint8_t *end = reinterpret_cast<const uint8_t *>(&wormholes);
-    return Hasher::hash<Hasher::SeedPolicy::thread_shared>(start, static_cast<uint64_t>(end - start));
+    // Portal identity is its public tuple and QUIC mode. Do not include object
+    // padding or mutable routing state: stack lookup keys may carry arbitrary
+    // padding and must find the existing portal.
+    uint8_t identity[21] = {};
+    memcpy(identity, address.v6, sizeof(address.v6));
+    identity[16] = address.is6 ? 1 : 0;
+    memcpy(identity + 17, &port, sizeof(port));
+    identity[19] = proto;
+    identity[20] = isQuic ? 1 : 0;
+    return Hasher::hash<Hasher::SeedPolicy::thread_shared>(identity, sizeof(identity));
   }
 
   bool equals(const SwitchboardPortal& lhs) const
   {
-    return memcmp(&address, &lhs.address, reinterpret_cast<const uint8_t *>(&wormholes) - reinterpret_cast<const uint8_t *>(&address)) == 0;
+    return address.equals(lhs.address) && port == lhs.port && proto == lhs.proto && isQuic == lhs.isQuic;
   }
 
   portal_definition generatePortalDefinition(void) const
@@ -101,6 +109,38 @@ public:
 };
 
 using Portal = SwitchboardPortal;
+
+// Portal lookup uses transient tuple queries. The generic pointer container
+// compares addresses, so keep semantic ownership in this local dereferencing
+// key policy rather than relying on object allocation identity.
+struct SwitchboardPortalPointerHasher {
+  using hash_policy = ska::power_of_two_hash_policy;
+
+  size_t operator()(const SwitchboardPortal *portal) const
+  {
+    return portal == nullptr ? 0 : size_t(portal->hash());
+  }
+};
+
+struct SwitchboardPortalPointerEquals {
+  bool operator()(const SwitchboardPortal *lhs, const SwitchboardPortal *rhs) const
+  {
+    return lhs == rhs || (lhs != nullptr && rhs != nullptr && lhs->equals(*rhs));
+  }
+};
+
+#if USE_MIMALLOC == 2
+using SwitchboardPortalSet = ska::bytell_hash_set<
+  SwitchboardPortal *,
+  SwitchboardPortalPointerHasher,
+  SwitchboardPortalPointerEquals,
+  mi_stl_allocator<SwitchboardPortal *>>;
+#else
+using SwitchboardPortalSet = ska::bytell_hash_set<
+  SwitchboardPortal *,
+  SwitchboardPortalPointerHasher,
+  SwitchboardPortalPointerEquals>;
+#endif
 
 static inline bool switchboardAssignDeterministicPortalSlots(
     Vector<SwitchboardPortal *>& ordered,
@@ -532,7 +572,7 @@ private:
   Vector<switchboard_owned_routable_prefix6_key> installedOwnedRoutablePrefixes6;
   Vector<portal_definition> installedWhiteholeBindingKeys;
 
-  bytell_hash_set<SwitchboardPortal *> portals;
+  SwitchboardPortalSet portals;
   bytell_hash_subset<uint32_t, switchboard_runtime::Wormhole *> wormholesByContainer;
   bytell_hash_map<uint32_t, String> wormholeRevisionByContainer;
   bytell_hash_subset<uint32_t, switchboard_runtime::Whitehole *> whiteholesByContainer;
@@ -1392,6 +1432,18 @@ private:
       desired[size_t(RuntimeMap::rings)].emplace(routingBytes(portal->slot), std::move(ringValue));
       portal_meta meta = {};
       meta.flags = portal->isQuic ? F_QUIC_PORTAL : 0;
+      // openWormhole keeps every endpoint of one portal on the same admission
+      // profile. Publish the protected profile with the portal so XDP can pass
+      // pair-grant TCP to host TC, the existing exact-grant owner.
+      for (const auto *wormhole : portal->wormholes)
+      {
+        if (wormhole != nullptr &&
+            wormhole->admissionProfile == SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT)
+        {
+          meta.flags |= F_PAIR_GRANT_PORTAL;
+          break;
+        }
+      }
       meta.slot = portal->slot;
       desired[size_t(RuntimeMap::portals)].emplace(routingBytes(portal->generatePortalDefinition()), routingBytes(meta));
     }
@@ -3413,6 +3465,42 @@ public:
                      eth.ifidx, containerID, unsigned(desired.wormholes.size()),
                      unsigned(desired.pairAdmissionTCPPorts.size()));
     return SwitchboardWormholeOperationStatus::applied;
+  }
+
+  bool resolveCousinAdmissionTarget(const ProdigyCousinCounterpart& counterpart,
+                                    uint32_t& portalSlot, uint8_t targetContainer[5],
+                                    uint32_t& targetMachineFragment)
+  {
+    portalSlot = 0; targetMachineFragment = 0;
+    std::memset(targetContainer, 0, 5);
+    if (!prodigyCousinCounterpartValid(counterpart) || counterpart.publicTCPPort == 0 ||
+        counterpart.servicePort == 0 || !counterpart.publicAddress.is6) return false;
+    auto revision = wormholeRevisionByContainer.find(counterpart.containerID);
+    auto current = wormholesByContainer.find(counterpart.containerID);
+    if (revision == wormholeRevisionByContainer.end() || current == wormholesByContainer.end() ||
+        !revision->second.equals(counterpart.wormholeRevision)) return false;
+    const switchboard_runtime::Wormhole *selected = nullptr;
+    for (const switchboard_runtime::Wormhole *wormhole : current->second)
+    {
+      if (!wormhole || !wormhole->portal || wormhole->admissionProfile != SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT ||
+          wormhole->port != counterpart.servicePort || wormhole->proto != IPPROTO_TCP ||
+          wormhole->definition.isQuic || wormhole->definition.routablePrefixUUID != counterpart.routablePrefixUUID ||
+          !wormhole->portal->address.equals(counterpart.publicAddress) ||
+          wormhole->portal->port != counterpart.publicTCPPort) continue;
+      if (selected) return false;
+      selected = wormhole;
+    }
+    if (!selected || selected->portal->slot >= MAX_PORTALS) return false;
+    targetContainer[0] = subnet.dpfx;
+    targetContainer[1] = uint8_t((counterpart.containerID >> 16) & 0xff);
+    targetContainer[2] = uint8_t((counterpart.containerID >> 8) & 0xff);
+    targetContainer[3] = uint8_t(counterpart.containerID & 0xff);
+    targetContainer[4] = uint8_t((counterpart.containerID >> 24) & 0xff);
+    if (targetContainer[0] == 0 || targetContainer[4] == 0) { std::memset(targetContainer, 0, 5); return false; }
+    targetMachineFragment = (uint32_t(targetContainer[1]) << 16) | (uint32_t(targetContainer[2]) << 8) | targetContainer[3];
+    if (targetMachineFragment == 0) { std::memset(targetContainer, 0, 5); return false; }
+    portalSlot = selected->portal->slot;
+    return true;
   }
 
   bool openWhitehole(uint32_t containerID, const Whitehole& whitehole)

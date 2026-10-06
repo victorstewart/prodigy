@@ -267,7 +267,7 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
 // retry-safe while each Brain remains the sole runtime authority owner.
 class MothershipClusterPairEnrollmentIntent {
 public:
-  static constexpr uint32_t version = 2;
+  static constexpr uint32_t version = 3;
   uint32_t protocolVersion = version;
   uint128_t pairUUID = 0;
   uint128_t operationUUID = 0;
@@ -295,6 +295,10 @@ public:
   bool testControlBoundaryAdmitted = false;
   bool testControlBoundaryClosed = false;
   MothershipPairControlBoundaryDescriptor testControlBoundary;
+  // Added after the carrier boundary is prepared. This is one exact,
+  // operation-bound application tuple, never an ambient VDC route.
+  bool testControlServiceTransitAdmitted = false;
+  MothershipPairControlServiceTransit testControlServiceTransit;
 
   ~MothershipClusterPairEnrollmentIntent()
   {
@@ -318,8 +322,14 @@ static inline bool mothershipClusterPairEnrollmentIntentValid(const MothershipCl
       mothershipPairControlBoundaryValid(boundary) && boundary.operationUUID == intent.operationUUID &&
       boundary.firstClusterUUID == intent.firstClusterUUID && boundary.secondClusterUUID == intent.secondClusterUUID &&
       boundary.firstEndpoints == intent.firstEndpoints && boundary.secondEndpoints == intent.secondEndpoints;
-  return (intent.protocolVersion == 1 || intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version) &&
-      validBoundary && intent.pairUUID != 0 &&
+  const bool validServiceTransit = intent.protocolVersion < 3 ? !intent.testControlServiceTransitAdmitted :
+      (!intent.testControlServiceTransitAdmitted ||
+       (validBoundary &&
+        mothershipPairControlServiceTransitValid(intent.testControlServiceTransit,
+                                                  intent.firstClusterUUID, intent.secondClusterUUID)));
+  return (intent.protocolVersion == 1 || intent.protocolVersion == 2 ||
+          intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version) &&
+      validBoundary && validServiceTransit && intent.pairUUID != 0 &&
       intent.operationUUID != 0 && intent.firstClusterUUID != 0 && intent.secondClusterUUID != 0 &&
       intent.firstClusterUUID < intent.secondClusterUUID && intent.rootGeneration != 0 && intent.keyEpoch != 0 &&
       intent.firstObservedAuthorityGeneration != 0 && intent.secondObservedAuthorityGeneration != 0 &&
@@ -365,6 +375,11 @@ static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& int
     serializer.value1b(intent.testControlBoundaryAdmitted);
     serializer.value1b(intent.testControlBoundaryClosed);
     serializer.object(intent.testControlBoundary);
+  }
+  if (intent.protocolVersion >= 3)
+  {
+    serializer.value1b(intent.testControlServiceTransitAdmitted);
+    serializer.object(intent.testControlServiceTransit);
   }
 }
 
@@ -3216,6 +3231,51 @@ public:
     }
     String key, encoded;
     key.assignItoh(current.operationUUID);
+    BitseryEngine::serialize(encoded, current);
+    const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
+    Vault::secureClearString(encoded);
+    if (!written) return false;
+    recorded = std::move(current);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool recordClusterPairTestControlServiceTransit(uint128_t operationUUID,
+                                                  const MothershipPairControlServiceTransit& transit,
+                                                  MothershipClusterPairEnrollmentIntent& recorded,
+                                                  String *failure = nullptr)
+  {
+    if (operationUUID == 0)
+    {
+      if (failure) failure->assign("cluster pair enrollment operation UUID is required"_ctv);
+      return false;
+    }
+    ClusterPairEnrollmentLock lock;
+    if (!lockClusterPairEnrollment(lock, failure)) return false;
+    MothershipClusterPairEnrollmentIntent current = {};
+    if (!loadClusterPairEnrollmentIntent(operationUUID, current, failure)) return false;
+    if (!current.testControlBoundaryAdmitted || current.testControlBoundaryClosed ||
+        !mothershipPairControlServiceTransitValid(transit, current.firstClusterUUID, current.secondClusterUUID))
+    {
+      if (failure) failure->assign("pair-control service transit requires an open exact enrolled boundary"_ctv);
+      return false;
+    }
+    if (current.testControlServiceTransitAdmitted &&
+        !mothershipPairControlServiceTransitEqual(current.testControlServiceTransit, transit))
+    {
+      if (failure) failure->assign("pair-control service transit conflicts with its immutable operation tuple"_ctv);
+      return false;
+    }
+    current.protocolVersion = MothershipClusterPairEnrollmentIntent::version;
+    current.testControlServiceTransit = transit;
+    current.testControlServiceTransitAdmitted = true;
+    if (!mothershipClusterPairEnrollmentIntentValid(current))
+    {
+      if (failure) failure->assign("pair-control service transit conflicts with durable enrollment state"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {};
+    key.assignItoh(operationUUID);
     BitseryEngine::serialize(encoded, current);
     const bool written = db.write(clusterPairEnrollmentsColumnFamily, key, encoded, failure);
     Vault::secureClearString(encoded);

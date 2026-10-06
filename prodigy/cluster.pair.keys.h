@@ -24,6 +24,7 @@ enum class ClusterPairKeyPurpose : uint8_t {
   servicePairingBase = 1,
   switchboardAdmissionControl = 2,
   pairControl = 3,
+  serviceSessionAuthentication = 4,
 };
 
 enum class ClusterPairKeyScope : uint8_t { serviceRoute = 1, pairControl = 2, nodeRoleCredential = 3, pairControlEndpoint = 4 };
@@ -109,7 +110,8 @@ static inline bool clusterPairKeyPurposeValid(ClusterPairKeyPurpose purpose)
 {
   return purpose == ClusterPairKeyPurpose::servicePairingBase ||
          purpose == ClusterPairKeyPurpose::switchboardAdmissionControl ||
-         purpose == ClusterPairKeyPurpose::pairControl;
+         purpose == ClusterPairKeyPurpose::pairControl ||
+         purpose == ClusterPairKeyPurpose::serviceSessionAuthentication;
 }
 
 static inline uint32_t clusterPairKeySize(ClusterPairKeyPurpose purpose)

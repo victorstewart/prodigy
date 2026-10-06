@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <mutex>
 #include <map>
+#include <new>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -842,13 +843,14 @@ public:
     board.host_ingress = &ingress;
   }
 
-  static SwitchboardPortal *addPortal(Switchboard& board, uint32_t containerID)
+  static SwitchboardPortal *addPortal(Switchboard& board, uint32_t containerID,
+                                       uint16_t externalPort = 443, bool isQuic = false)
   {
     auto *portal = new SwitchboardPortal();
     portal->address = IPAddress("2001:db8::44", true);
-    portal->port = 443;
+    portal->port = externalPort;
     portal->proto = IPPROTO_TCP;
-    portal->isQuic = false;
+    portal->isQuic = isQuic;
     portal->slot = 9;
     auto *wormhole = new switchboard_runtime::Wormhole();
     wormhole->containerID = containerID;
@@ -899,9 +901,14 @@ public:
     board.host_ingress = nullptr;
   }
 
-  static void configureQuicPortal(SwitchboardPortal *portal, uint128_t first, uint128_t second)
+  static void configureQuicPortal(Switchboard& board, SwitchboardPortal *portal, uint128_t first, uint128_t second)
   {
-    portal->isQuic = true;
+    if (!portal->isQuic)
+    {
+      board.portals.erase(portal);
+      portal->isQuic = true;
+      board.portals.insert(portal);
+    }
     portal->hasQuicCidKeyState = true;
     (void)wormholeQuicCidForceKeyMaterialPhase(first, 0);
     (void)wormholeQuicCidForceKeyMaterialPhase(second, 1);
@@ -915,6 +922,22 @@ public:
     Switchboard::buildQuicCidDecryptState(key, state);
     return state;
   }
+
+  static void setPortalAddress(Switchboard& board, SwitchboardPortal *portal, const IPAddress& address)
+  {
+    board.portals.erase(portal);
+    portal->address = address;
+    board.portals.insert(portal);
+  }
+
+  static void setPortalPort(Switchboard& board, SwitchboardPortal *portal, uint16_t port)
+  {
+    board.portals.erase(portal);
+    portal->port = port;
+    board.portals.insert(portal);
+  }
+
+  static size_t portalCount(const Switchboard& board) { return board.portals.size(); }
 
   static uint32_t quicIndex(const SwitchboardPortal *portal, uint128_t key)
   {
@@ -988,7 +1011,7 @@ static void runQuicCidResetCancelsPending(TestSuite& suite)
   SwitchboardRingTestAccess::installRouterOnly(board, router);
   fakeKernel.reset();
   auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x01020304u);
-  SwitchboardRingTestAccess::configureQuicPortal(portal, uint128_t(0x6101), uint128_t(0x6202));
+  SwitchboardRingTestAccess::configureQuicPortal(board, portal, uint128_t(0x6101), uint128_t(0x6202));
   bool receipt = false;
   bool receiptValue = true;
   board.whenRingsReady(319, [&](bool ready) { receipt = true; receiptValue = ready; });
@@ -1047,7 +1070,7 @@ static void runQuicCidTwoProgramCoalescing(TestSuite& suite)
   auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x11121314u);
   constexpr uint128_t firstKey = uint128_t(0x7101);
   constexpr uint128_t secondKey = uint128_t(0x7202);
-  SwitchboardRingTestAccess::configureQuicPortal(portal, firstKey, secondKey);
+  SwitchboardRingTestAccess::configureQuicPortal(board, portal, firstKey, secondKey);
   const uint32_t firstIndex = SwitchboardRingTestAccess::quicIndex(portal, portal->quicCidKeyMaterialByIndex[0]);
   const uint32_t secondIndex = SwitchboardRingTestAccess::quicIndex(portal, portal->quicCidKeyMaterialByIndex[1]);
   const uint32_t staleIndex = quicCidPortalDecryptMapIndex(portal->slot + 5, 0);
@@ -1139,7 +1162,7 @@ static void runQuicCidSparseReconciliation(TestSuite& suite)
   auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x01020304u);
   constexpr uint128_t firstKey = uint128_t(0x1001);
   constexpr uint128_t secondKey = uint128_t(0x2002);
-  SwitchboardRingTestAccess::configureQuicPortal(portal, firstKey, secondKey);
+  SwitchboardRingTestAccess::configureQuicPortal(board, portal, firstKey, secondKey);
   const uint32_t firstIndex = SwitchboardRingTestAccess::quicIndex(portal, portal->quicCidKeyMaterialByIndex[0]);
   const uint32_t secondIndex = SwitchboardRingTestAccess::quicIndex(portal, portal->quicCidKeyMaterialByIndex[1]);
   const uint32_t staleIndex = quicCidPortalDecryptMapIndex(portal->slot + 3, 0);
@@ -1342,9 +1365,9 @@ static void runQuicCidCpuWorkload(TestSuite& suite)
     fakeKernel.quicDelayUs = 0;
     for (uint32_t i = 0; i < portalCount; ++i)
     {
-      auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000000u + i);
+      auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000000u + i, uint16_t(42000 + i), true);
       portal->slot = i;
-      SwitchboardRingTestAccess::configureQuicPortal(portal, uint128_t(i + 1), uint128_t(i + 129));
+      SwitchboardRingTestAccess::configureQuicPortal(board, portal, uint128_t(i + 1), uint128_t(i + 129));
     }
     for (bool cold : {true, false})
     {
@@ -1549,7 +1572,7 @@ static void runNonQuicBalancerOptionalEgressMaps(TestSuite& suite)
   fakeKernel.routerOmitsEgressMaps = true;
   constexpr uint32_t containerID = 0x03000091u;
   auto *portal = SwitchboardRingTestAccess::addPortal(board, containerID);
-  portal->address = IPAddress("198.18.0.91", false);
+  SwitchboardRingTestAccess::setPortalAddress(board, portal, IPAddress("198.18.0.91", false));
   suite.expect(SwitchboardRingTestAccess::generate(board, portal),
                "switchboard_nonquic_balancer_missing_egress_admits_portal_ring");
   switchboard_wormhole_egress_key key = {};
@@ -1634,6 +1657,93 @@ static void runPairAdmissionEgressProfilePublication(TestSuite& suite)
   SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
 }
 
+static void runPortalIdentityIgnoresPadding(TestSuite& suite)
+{
+  alignas(SwitchboardPortal) std::array<uint8_t, sizeof(SwitchboardPortal)> firstStorage = {};
+  alignas(SwitchboardPortal) std::array<uint8_t, sizeof(SwitchboardPortal)> secondStorage = {};
+  std::memset(firstStorage.data(), 0x5a, firstStorage.size());
+  std::memset(secondStorage.data(), 0xa5, secondStorage.size());
+  auto *first = new(firstStorage.data()) SwitchboardPortal();
+  auto *second = new(secondStorage.data()) SwitchboardPortal();
+  for (SwitchboardPortal *portal : {first, second})
+  {
+    portal->address = IPAddress("2001:db8::94", true);
+    portal->port = 9443;
+    portal->proto = IPPROTO_TCP;
+    portal->isQuic = false;
+  }
+  const auto poisonIdentityPadding = [](SwitchboardPortal *portal, uint8_t value) {
+    uint8_t *addressPadding = reinterpret_cast<uint8_t *>(&portal->address.is6) + sizeof(portal->address.is6);
+    uint8_t *addressEnd = reinterpret_cast<uint8_t *>(&portal->address) + sizeof(portal->address);
+    if (addressPadding < addressEnd) std::memset(addressPadding, value, size_t(addressEnd - addressPadding));
+    uint8_t *portalPadding = reinterpret_cast<uint8_t *>(&portal->isQuic) + sizeof(portal->isQuic);
+    uint8_t *wormholes = reinterpret_cast<uint8_t *>(&portal->wormholes);
+    if (portalPadding < wormholes) std::memset(portalPadding, value, size_t(wormholes - portalPadding));
+  };
+  poisonIdentityPadding(first, 0x11);
+  poisonIdentityPadding(second, 0xee);
+
+  suite.expect(first->equals(*second),
+               "switchboard_portal_identity_ignores_distinct_object_padding_for_equality");
+  suite.expect(first->hash() == second->hash(),
+               "switchboard_portal_identity_ignores_distinct_object_padding_for_hash");
+  SwitchboardPortalSet portals = {};
+  portals.insert(first);
+  portals.insert(second);
+  suite.expect(portals.size() == 1 && portals.find(second) != portals.end(),
+               "switchboard_portal_identity_uses_semantic_pointer_set_lookup");
+  portals.clear();
+  first->~SwitchboardPortal();
+  second->~SwitchboardPortal();
+}
+
+static void runPairGrantPortalMetadataPublication(TestSuite& suite)
+{
+  const auto publish = [&](uint32_t containerID, bool pairGrant, bool quic, uint64_t receiptID,
+                           const char *name) {
+    TestRing ring = {};
+    BPFProgram router = {}, ingress = {};
+    EthDevice eth = {};
+    Switchboard board(eth);
+    SwitchboardRingTestAccess::installPrograms(board, router, ingress);
+    fakeKernel.reset();
+
+    auto *portal = SwitchboardRingTestAccess::addPortal(board, containerID);
+    switchboard_runtime::Wormhole *wormhole = portal->wormholes.empty() ? nullptr : *portal->wormholes.begin();
+    if (pairGrant && wormhole != nullptr)
+    {
+      portal->wormholes.erase(wormhole);
+      wormhole->admissionProfile = SWITCHBOARD_WORMHOLE_ADMISSION_PAIR_GRANT;
+      portal->wormholes.insert(wormhole);
+    }
+    if (quic) SwitchboardRingTestAccess::configureQuicPortal(board, portal, uint128_t(0x8711), uint128_t(0x8722));
+    const portal_meta expected = {
+        .flags = uint32_t((quic ? F_QUIC_PORTAL : 0) | (pairGrant ? F_PAIR_GRANT_PORTAL : 0)),
+        .slot = portal->slot};
+    const portal_definition definition = portal->generatePortalDefinition();
+    bool receipt = false, receiptValue = false;
+    suite.expect(wormhole != nullptr && SwitchboardRingTestAccess::generate(board, portal),
+                 "switchboard_pair_grant_portal_metadata_admits_ring");
+    board.whenRingsReady(receiptID, [&](bool ready) { receipt = true; receiptValue = ready; });
+    SwitchboardRingTestAccess::syncPeerRuntime(board, router);
+    SwitchboardRingTestAccess::syncPeerRuntime(board, ingress);
+    suite.expect(ring.runUntil([&] { return receipt; }) && receiptValue &&
+                     fakeKernel.routingValueEquals(routerPortalMapFD, definition, expected) &&
+                     fakeKernel.routingValueEquals(ingressPortalMapFD, definition, expected),
+                 name);
+    suite.expect(ring.runUntil([&] { return board.quiesceRingPreparationForExec(); }),
+                 "switchboard_pair_grant_portal_metadata_drains_before_teardown");
+    SwitchboardRingTestAccess::detachFakePrograms(board, router, ingress);
+  };
+
+  publish(0x03000094u, false, false, 572,
+          "switchboard_pair_grant_portal_metadata_keeps_ordinary_tcp_unprotected");
+  publish(0x03000095u, true, false, 573,
+          "switchboard_pair_grant_portal_metadata_marks_only_protected_tcp");
+  publish(0x03000096u, false, true, 574,
+          "switchboard_pair_grant_portal_metadata_preserves_quic_without_pair_flag");
+}
+
 static void runPairAdmissionProtectedRefreshFence(TestSuite& suite)
 {
   TestRing ring = {};
@@ -1684,12 +1794,13 @@ static void runNonQuicRoutingFanoutRequestDeferral(TestSuite& suite)
   fakeKernel.routingDelayUs = 150;
   for (uint32_t index = 0; index < 13; ++index)
   {
-    auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000000u + index);
+    auto *portal = SwitchboardRingTestAccess::addPortal(board, 0x03000000u + index, uint16_t(40000 + index));
     portal->slot = index;
-    portal->port = uint16_t(40000 + index);
     suite.expect(SwitchboardRingTestAccess::generate(board, portal),
                  "switchboard_nonquic_fanout_admits_portal_ring");
   }
+  suite.expect(SwitchboardRingTestAccess::portalCount(board) == 13,
+               "switchboard_nonquic_fanout_preserves_distinct_portal_tuples");
   bool receipt = false, receiptValue = false;
   std::vector<uint64_t> submissionIntervals = {};
   board.whenRingsReady(401, [&](bool ready) { receipt = true; receiptValue = ready; });
@@ -1774,9 +1885,8 @@ static void runNonQuicRoutingSlowMapDeadline(TestSuite& suite)
     for (uint32_t index = 0; index < portalCount; ++index)
     {
       auto *portal = SwitchboardRingTestAccess::addPortal(board,
-          0x03010000u + workload * portalCount + index);
+          0x03010000u + workload * portalCount + index, uint16_t(41000 + index));
       portal->slot = index;
-      portal->port = uint16_t(41000 + index);
       suite.expect(SwitchboardRingTestAccess::generate(board, portal),
                    "switchboard_nonquic_slow_map_admits_portal_ring");
       expectedPortals.emplace_back(portal->generatePortalDefinition(),
@@ -1955,7 +2065,7 @@ static void runNonQuicRoutingAdoptionSupersessionAndReplacement(TestSuite& suite
   bool latestReceipt = false, latestValue = false;
   board.whenRingsReady(511, [&](bool) { obsoleteReceipt = true; });
   SwitchboardRingTestAccess::syncPeerRuntime(board, router);
-  portal->port = 8443;
+  SwitchboardRingTestAccess::setPortalPort(board, portal, 8443);
   const portal_definition replacement = portal->generatePortalDefinition();
   board.whenRingsReady(511, [&](bool ready) { latestReceipt = true; latestValue = ready; });
   SwitchboardRingTestAccess::syncPeerRuntime(board, router);
@@ -2045,10 +2155,10 @@ static void runNonQuicPortalRetirementBeforeRingReassignment(TestSuite& suite)
   Switchboard board(eth);
   SwitchboardRingTestAccess::installPrograms(board, router, ingress);
   fakeKernel.reset();
-  auto *first = SwitchboardRingTestAccess::addPortal(board, 0x03000401u);
-  auto *second = SwitchboardRingTestAccess::addPortal(board, 0x03000402u);
-  first->slot = 9; first->port = 4401;
-  second->slot = 10; second->port = 4402;
+  auto *first = SwitchboardRingTestAccess::addPortal(board, 0x03000401u, 4401);
+  auto *second = SwitchboardRingTestAccess::addPortal(board, 0x03000402u, 4402);
+  first->slot = 9;
+  second->slot = 10;
   suite.expect(SwitchboardRingTestAccess::generate(board, first) &&
                    SwitchboardRingTestAccess::generate(board, second),
                "switchboard_nonquic_retirement_admits_two_initial_portal_rings");
@@ -2104,6 +2214,8 @@ int main()
   runOwnerFailuresRetry(suite, PublicationFailure::Metadata);
   runNonQuicBalancerOptionalEgressMaps(suite);
   runPairAdmissionEgressProfilePublication(suite);
+  runPortalIdentityIgnoresPadding(suite);
+  runPairGrantPortalMetadataPublication(suite);
   runPairAdmissionProtectedRefreshFence(suite);
   runNonQuicRoutingFanoutRequestDeferral(suite);
   runNonQuicRoutingSlowMapDeadline(suite);

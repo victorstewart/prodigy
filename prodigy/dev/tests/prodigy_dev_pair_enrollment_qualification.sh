@@ -76,6 +76,7 @@ PY
 )
 
 m() {
+  [[ ${COUSIN_OFFLINE:-0} != 1 ]] || { echo "FAIL: Mothership command attempted during sealed offline phase" >&2; return 125; }
   local label=$1 seconds=$2 log=$3
   shift 3
   local started ended status
@@ -125,7 +126,20 @@ assert_pair_control_removed() {
 import pathlib,sys,time
 root=pathlib.Path(sys.argv[1])
 if not root.exists(): raise SystemExit(0)
+assert root.is_dir() and not root.is_symlink()
 assert (root/'phase').read_text().strip()=='removed'
+# The provider retains the optional service descriptor/journal as its removal
+# receipt. Its cleanup owner writes phase=removed only after it has removed the
+# service routes, router namespace, and both owned veths. Do not require these
+# files after an ordinary or partially prepared pair-control scenario.
+if (root/'service-phase').exists():
+    for name in ('service-descriptor','service-phase','service-source-route',
+                 'service-destination-route','service-source-local-route',
+                 'service-destination-local-route','service-router-source-route',
+                 'service-router-destination-route','router-namespace','first-link','second-link'):
+        receipt=root/name
+        assert receipt.is_file() and not receipt.is_symlink(), f'missing provider cleanup receipt: {name}'
+    assert (root/'service-phase').read_text().strip()=='prepared'
 if not (root/'owner').exists(): raise SystemExit(0)
 pid,start,mount=(root/'owner').read_text().split()
 deadline=time.monotonic()+5
@@ -142,6 +156,7 @@ PY_REMOVED
 
 cleanup() {
   local status=$?
+  COUSIN_OFFLINE=0
   trap - EXIT HUP INT TERM
   set +e
   if (( PAIR_PARTITION_PID )); then
@@ -152,7 +167,7 @@ cleanup() {
   copy_cluster_logs second "$SECOND_MANIFEST" || status=1
   local boundary_file
   mkdir -p "$ROOT/pair-control-provider"
-  for boundary_file in provider.log descriptor phase firewall-digest first-route second-route first-bridge-mac second-bridge-mac; do
+  for boundary_file in provider.log descriptor phase firewall-digest first-route second-route first-bridge-mac second-bridge-mac service-descriptor service-phase service-source-route service-destination-route service-source-local-route service-destination-local-route service-router-source-route service-router-destination-route; do
     [[ ! -r "/mnt/prodigy-vdc-pair-control/$OPERATION/$boundary_file" ]] ||
       cp -p "/mnt/prodigy-vdc-pair-control/$OPERATION/$boundary_file" "$ROOT/pair-control-provider/$boundary_file"
   done
@@ -182,8 +197,12 @@ trap 'exit 143' TERM
 
 request() {
   local name=$1 workspace=$2
-  jq -nc --arg name "$name" --arg workspace "$workspace" \
-    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:180,machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}}'
+  # Fleet prefixes require the ordinary BGP-enabled environment. The inactive
+  # peer is confined to each fake machine's loopback; this scenario qualifies
+  # the provider's explicit service transit, not upstream BGP convergence.
+  jq -nc --arg name "$name" --arg workspace "$workspace" --arg probe "${PRODIGY_DEV_COUSIN_PROBE_BIN:-}" \
+    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:180,machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
+     (if $probe != "" then {bgp:{enabled:true,nextHop6:"::1",peers:[{peerASN:64512,peerAddress:"127.0.0.2",sourceAddress:"127.0.0.1"}]}} else {} end)'
 }
 
 create_cluster() {
@@ -330,6 +349,14 @@ PAIR_CONTROL_ATTEMPTED=1
 m pair-control-prepare 45 "$ROOT/pair-control-prepare.log" testClusterPairControl "$OPERATION" prepare
 ok "$ROOT/pair-control-prepare.log" testClusterPairControl
 wait_pair_control initial
+if [[ -n ${PRODIGY_DEV_COUSIN_PROBE_BIN:-} ]]; then
+  source "$TEST_DIR/prodigy_dev_cousin_session_qualification.sh"
+  prodigy_dev_qualify_cousin_session
+  if [[ ${PRODIGY_DEV_COUSIN_SESSION_ONLY:-0} == 1 ]]; then
+    echo "PASS: native offline COUSIN session qualification"
+    exit 0
+  fi
+fi
 
 # A provider-owned whole-machine crash must restore the committed operation
 # under a different master without another enrollment root or endpoint roster.
