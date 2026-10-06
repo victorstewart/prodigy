@@ -38008,6 +38008,17 @@ public:
 
           Vector<ContainerView *> staleMachineContainerPointers;
           bytell_hash_set<uint128_t> staleMachineContainerUUIDs = {};
+          const auto taskWithoutDurableExecution = [this](const ContainerView *container) {
+            if (container == nullptr ||
+                (container->state != ContainerState::planned && container->state != ContainerState::scheduled))
+            {
+              return false;
+            }
+            const auto deployment = deployments.find(container->deploymentID);
+            return deployment != deployments.end() && deployment->second != nullptr &&
+                   deployment->second->plan.config.type == ApplicationType::task &&
+                   masterAuthorityRuntimeState.taskExecutions.contains(container->deploymentID) == false;
+          };
           for (const auto& [deploymentID, machineContainers] : neuron->machine->containersByDeploymentID)
           {
             (void)deploymentID;
@@ -38027,7 +38038,8 @@ public:
               // An in-flight state upload is authoritative only for observed
               // processes, so it must not erase that pending owner or free its
               // reserved fragment before the normal failure/kill owner responds.
-              if (container->state == ContainerState::planned || container->state == ContainerState::scheduled)
+              if ((container->state == ContainerState::planned || container->state == ContainerState::scheduled) &&
+                  taskWithoutDurableExecution(container) == false)
               {
                 if (container->fragment != 0)
                 {
@@ -38051,8 +38063,19 @@ public:
               continue;
             }
 
+            auto deployment = deployments.find(stale->deploymentID);
+            if (taskWithoutDurableExecution(stale))
+            {
+              // Task admission first durably writes taskExecutions before it
+              // creates a canonical container. A missing record therefore
+              // cannot authorize an unreported pending task. Use the task
+              // owner so its placement and resource reservations are released.
+              deployment->second->taskAttemptContainerDone(stale);
+              continue;
+            }
+
             neuron->machine->removeContainerIndexEntry(stale->deploymentID, stale);
-            if (auto deployment = deployments.find(stale->deploymentID); deployment != deployments.end() && deployment->second)
+            if (deployment != deployments.end() && deployment->second)
             {
               deployment->second->containers.erase(stale);
               if (deployment->second->plan.isStateful)
