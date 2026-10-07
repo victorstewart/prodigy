@@ -496,12 +496,66 @@ static inline void mothershipVirtualDatacenterMachineAddresses(
   }
 }
 
+static inline void mothershipAppendVirtualDatacenterPeerAddresses(
+    const MothershipProdigyCluster& cluster, ClusterMachine& machine,
+    const String& private4, const String& private6, const String& public6)
+{
+  switch (cluster.test.brainBootstrapFamily)
+  {
+    case MothershipClusterTestBootstrapFamily::ipv4: prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, {private4, 24}); break;
+    case MothershipClusterTestBootstrapFamily::private6: prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, {private6, 64}); break;
+    case MothershipClusterTestBootstrapFamily::public6: prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, {public6, 64}); break;
+    case MothershipClusterTestBootstrapFamily::multihome6:
+      prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, {private6, 64});
+      prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, {public6, 64});
+      break;
+  }
+}
+
+static inline bool mothershipBuildVirtualDatacenterSpareMachine(
+    const MothershipProdigyCluster& cluster, ClusterMachine& machine, String *failure = nullptr)
+{
+  machine = {};
+  const uint32_t initialMachineCount = cluster.test.initialMachineCount();
+  if ((cluster.deploymentMode != MothershipClusterDeploymentMode::test || initialMachineCount == 0) ||
+      cluster.datacenterFragment == 0 || cluster.test.spareMachineCount != 1 || cluster.nBrains == 0 || cluster.nBrains > initialMachineCount ||
+      cluster.bootstrapSshUser.equals(defaultMothershipClusterSSHUser()) == false ||
+      cluster.bootstrapSshPrivateKeyPath.size() == 0 ||
+      cluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH.size() == 0)
+  {
+    if (failure && failure->empty()) failure->assign("invalid test cluster spare bootstrap descriptor"_ctv);
+    return false;
+  }
+  String private4 = {}, private6 = {}, public6 = {};
+  mothershipVirtualDatacenterMachineAddresses(cluster.test.machineCount, cluster.datacenterFragment,
+                                              cluster.test.enableFakeIpv4Boundary, private4, private6, public6);
+  machine.source = ClusterMachineSource::adopted;
+  machine.backing = ClusterMachineBacking::owned;
+  machine.kind = MachineConfig::MachineKind::vm;
+  machine.lifetime = MachineLifetime::reserved;
+  machine.rackUUID = cluster.test.machineCount;
+  machine.creationTimeMs = Time::now<TimeResolution::ms>();
+  machine.ssh.address = private4;
+  machine.ssh.port = 22;
+  machine.ssh.user = cluster.bootstrapSshUser;
+  machine.ssh.privateKeyPath = cluster.bootstrapSshPrivateKeyPath;
+  machine.ssh.hostPublicKeyOpenSSH = cluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH;
+  prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, private4, 24);
+  prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, private6, 64);
+  prodigyAppendUniqueClusterMachineAddress(machine.addresses.publicAddresses, public6, 64);
+  mothershipAppendVirtualDatacenterPeerAddresses(cluster, machine, private4, private6, public6);
+  if (failure) failure->clear();
+  return true;
+}
+
 static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProdigyCluster& cluster, ClusterTopology& topology, String *failure = nullptr)
 {
   topology = {};
   topology.version = 1;
-  if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.datacenterFragment == 0 ||
-      cluster.test.machineCount == 0 || cluster.nBrains == 0 || cluster.nBrains > cluster.test.machineCount)
+  const uint32_t initialMachineCount = cluster.test.initialMachineCount();
+  if (cluster.datacenterFragment == 0 ||
+      (cluster.deploymentMode != MothershipClusterDeploymentMode::test || initialMachineCount == 0) ||
+      cluster.nBrains == 0 || cluster.nBrains > initialMachineCount)
   {
     if (failure)
     {
@@ -516,7 +570,7 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
     schema = cluster.machineSchemas[0].schema;
   }
 
-  for (uint32_t index = 1; index <= cluster.test.machineCount; ++index)
+  for (uint32_t index = 1; index <= initialMachineCount; ++index)
   {
     String private4 = {};
     String private6 = {};
@@ -537,22 +591,7 @@ static inline bool mothershipBuildVirtualDatacenterTopology(const MothershipProd
     prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses, private6, 64);
     prodigyAppendUniqueClusterMachineAddress(machine.addresses.publicAddresses, public6, 64);
 
-    switch (cluster.test.brainBootstrapFamily)
-    {
-      case MothershipClusterTestBootstrapFamily::ipv4:
-        prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {private4, 24});
-        break;
-      case MothershipClusterTestBootstrapFamily::private6:
-        prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {private6, 64});
-        break;
-      case MothershipClusterTestBootstrapFamily::public6:
-        prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {public6, 64});
-        break;
-      case MothershipClusterTestBootstrapFamily::multihome6:
-        prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {private6, 64});
-        prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {public6, 64});
-        break;
-    }
+    mothershipAppendVirtualDatacenterPeerAddresses(cluster, machine, private4, private6, public6);
     topology.machines.push_back(std::move(machine));
   }
 
@@ -754,10 +793,16 @@ static inline bool mothershipProvisionVirtualDatacenterSeed(
     return false;
   }
 
+  const uint32_t initialMachineCount = cluster.test.initialMachineCount();
+  if ((cluster.deploymentMode != MothershipClusterDeploymentMode::test || initialMachineCount == 0))
+  {
+    return false;
+  }
+
   // The provider has already created every disposable root, but only this
-  // phase authorizes the seed executable. Followers cannot start before their
-  // configured, cluster-owned transport state exists.
-  for (uint32_t index = 0; index < cluster.test.machineCount; ++index)
+  // phase authorizes the initial topology. The spare remains SSH-only until
+  // ordinary Brain adoption.
+  for (uint32_t index = 0; index < initialMachineCount; ++index)
   {
     String installRoot = {};
     installRoot.snprintf<"{}/machines/{itoa}/root/prodigy"_ctv>(cluster.test.workspaceRoot, uint64_t(index + 1));
@@ -794,7 +839,9 @@ static inline bool mothershipProvisionVirtualDatacenterMembers(
     String *failure = nullptr,
     const ProdigyInitialTransportCredentialProjection *transportProjection = nullptr)
 {
-  if (topology.machines.size() != cluster.test.machineCount || topology.machines.empty())
+  const uint32_t initialMachineCount = cluster.test.initialMachineCount();
+  if ((cluster.deploymentMode != MothershipClusterDeploymentMode::test || initialMachineCount == 0) ||
+      topology.machines.size() != initialMachineCount || topology.machines.empty())
   {
     if (failure) failure->assign("virtual datacenter member bootstrap topology is invalid"_ctv);
     return false;

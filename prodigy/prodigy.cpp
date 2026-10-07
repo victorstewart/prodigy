@@ -609,6 +609,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
       }
       incoming.transportCredentials = current;
       incoming.transportCredentialAuthorityRoot = state.transportCredentialAuthorityRoot;
+      incoming.transportCredentialLifecycleProjection = state.transportCredentialLifecycleProjection;
     }
 
     if (incoming.transportTLS.configured() == false && state.transportTLS.configured())
@@ -644,8 +645,7 @@ static bool loadOrUpdateLocalBrainState(const String& transportTLSJSONPath, Stri
   {
     const auto role = persistentBootState.bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain ?
         ProdigyTransportCredentialNodeRole::brain : ProdigyTransportCredentialNodeRole::neuron;
-    if (!prodigyBuildLocalTransportCredentialState(persistedInternalAuthority.transportCredentialAuthorityRoot,
-          persistedInternalAuthority.transportCredentialEnrollments, state.uuid, role, state, persistedInternalAuthority.generation))
+    if (!prodigyRestoreLocalTransportCredentialsFromAuthority(persistedInternalAuthority, role, state))
     {
       failure.assign("current replicated authority does not authorize local transport identity"_ctv);
       return false;
@@ -879,6 +879,16 @@ class ProdigyBrain : public Brain {
   bool runtimePersistenceStarted = false;
   struct ExecPersistenceState { bool prepared = false, durable = false, closed = false; String failure; };
   std::shared_ptr<ExecPersistenceState> execPersistence = std::make_shared<ExecPersistenceState>();
+
+  const ProdigyTransportCredentialEnrollmentOperation *localTerminalBrainCredentialRevocation() const override
+  {
+    const auto& operation = persistentLocalBrainState.transportCredentialLifecycleProjection.operation;
+    if (operation.lifecycleKind != ProdigyTransportCredentialLifecycleKind::revoke ||
+        operation.predecessor.role != ProdigyTransportCredentialNodeRole::brain ||
+        operation.predecessor.nodeUUID != persistentLocalBrainState.uuid ||
+        !prodigyLocalBrainTransportCredentialRevoked(persistentLocalBrainState)) return nullptr;
+    return &operation;
+  }
 
   static uint64_t retainedBytesForSnapshot(ProdigyPersistentBrainSnapshot& snapshot,
                                            ProdigyPersistentBootState& bootState)
@@ -1949,14 +1959,10 @@ public:
       }
       clusterPairControlProjection = persistentLocalBrainState.clusterPairControlProjection;
     }
-    if (persistentLocalBrainState.transportCredentials.enabled)
+    if (!refreshDurableControlTransportCredentials())
     {
-      if (!prodigyBuildLocalNeuronTransportCredentialBootstrap(
-              persistentLocalBrainState, controlTransportCredentials))
-      {
-        std::fprintf(stderr, "prodigy startup rejected local Neuron transport enrollment\n");
-        _exit(EXIT_FAILURE);
-      }
+      std::fprintf(stderr, "prodigy startup rejected local Neuron transport enrollment\n");
+      _exit(EXIT_FAILURE);
     }
     runtimeAwareIaaS = new RuntimeAwareNeuronIaaS(&persistentStateStore,
                                       effectiveBootstrapConfig,
@@ -1968,6 +1974,54 @@ public:
         [this](ProdigyPersistentBootState state, uint64_t retainedBytes, std::function<void(bool)> completion) {
           if (!ensurePersistentWriter()) return false;
           return prodigySubmitLiveBootState(std::move(state), retainedBytes, std::move(completion));
+        });
+  }
+
+  bool refreshDurableControlTransportCredentials()
+  {
+    const auto& local = persistentLocalBrainState;
+    if (!prodigyLocalTransportCredentialStateValid(local)) return false;
+    controlTransportCredentialLifecycleProjection = local.transportCredentialLifecycleProjection;
+    if (!local.transportCredentials.enabled)
+    { controlTransportCredentials = {}; return true; }
+    if (prodigyLocalNeuronTransportCredentialRevoked(local))
+    {
+      // Retain an explicit provisioned fence. No secret and no TLS fallback;
+      // the colocated Brain may still have its separate valid enrollment.
+      controlTransportCredentials = {};
+      controlTransportCredentials.enabled = true;
+      const auto& retired = local.transportCredentialLifecycleProjection.operation.predecessor;
+      auto& self = controlTransportCredentials.self;
+      self.operationUUID = retired.operationUUID; self.nodeUUID = retired.nodeUUID;
+      self.clusterUUID = retired.clusterUUID; self.authorityEpoch = retired.authorityEpoch;
+      self.keyEpoch = retired.keyEpoch; self.authorityGeneration = retired.authorityGeneration;
+      self.rootAuthorityGeneration = local.transportCredentials.self.rootAuthorityGeneration;
+      self.role = retired.role;
+      controlTransportCredentials.committedAuthorityGeneration = local.transportCredentials.committedAuthorityGeneration;
+      return true;
+    }
+    return prodigyBuildLocalNeuronTransportCredentialBootstrap(local, controlTransportCredentials);
+  }
+
+  bool beginAcceptedBrainTransportTLS(NeuronBrainControlStream *stream) override
+  {
+    // A durable receipt may outlive the connection that requested it. A new
+    // accept reloads the existing local owner before choosing its credential.
+    return refreshDurableControlTransportCredentials() && Neuron::beginAcceptedBrainTransportTLS(stream);
+  }
+
+  bool persistTransportCredentialLifecycleProjection(
+      const ProdigyTransportCredentialLifecycleProjection& projection, std::function<void(bool)> completion) override
+  {
+    if (!ensurePersistentWriter()) return false;
+    return persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+        [projection](auto& latest, String&) {
+          ProdigyTransportCredentialBootstrap resultingNeuron;
+          bool revoked = false;
+          return prodigyApplyLocalTransportCredentialLifecycleProjection(latest, projection, resultingNeuron, revoked);
+        },
+        [completion = std::move(completion)](auto&& result) mutable {
+          if (completion) completion(result.durable);
         });
   }
 

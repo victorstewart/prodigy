@@ -8202,7 +8202,7 @@ public:
     for (uint32_t index = 0; index < transportCredentialEnrollmentOperations.size(); ++index)
     {
       const auto& left = transportCredentialEnrollmentOperations[index]; const auto& right = other.transportCredentialEnrollmentOperations[index];
-      if (left.enrollment != right.enrollment || left.electorate != right.electorate || left.pinnedMasterAuthorityEpoch != right.pinnedMasterAuthorityEpoch || left.transitionGeneration != right.transitionGeneration || left.phase != right.phase) return false;
+      if (!(left == right)) return false;
     }
 
     for (const auto& [key, snapshot] : tlsResumptionSnapshotsByWormhole)
@@ -9281,9 +9281,11 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // appends internal transport credential enrollment descriptors; version 12
   // appends durable pair-enrollment operations; version 13 permits their
   // revocation tail; version 14 adds explicitly agreed epoch rotation;
-  // version 15 adds root-free, epoch-neutral local COUSIN deployment policy.
+  // version 15 adds root-free, epoch-neutral local COUSIN deployment policy;
+  // version 16 tags each transport operation row so lifecycle receipts cannot
+  // be misread as the legacy enrollment layout.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 15;
+  constexpr uint64_t explicitVersion = 16;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9302,6 +9304,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool permitsClusterPairRevocationOperations = false;
   bool permitsClusterPairEpochOperations = false;
   bool hasLocalCousinServicePermissions = false;
+  bool permitsTransportCredentialLifecycleOperations = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9332,7 +9335,12 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     // (empty when unused) so a version-three reader has an unambiguous tail.
     hasClusterPairEnrollments = state.clusterPairEnrollments.empty() == false;
     hasClusterPairEnrollmentOperations = state.clusterPairEnrollmentOperations.empty() == false;
-    hasLocalCousinServicePermissions = state.localCousinServicePermissions.empty() == false;
+    const bool hasTransportCredentialLifecycleOperations = std::any_of(
+        state.transportCredentialEnrollmentOperations.begin(), state.transportCredentialEnrollmentOperations.end(),
+        [](const auto& operation) { return operation.protocolVersion >= 2; });
+    permitsTransportCredentialLifecycleOperations = hasTransportCredentialLifecycleOperations;
+    // Version sixteen includes every earlier tail, even when empty.
+    hasLocalCousinServicePermissions = !state.localCousinServicePermissions.empty() || hasTransportCredentialLifecycleOperations;
     // Version fifteen is cumulative through the v12 operation container.
     // Emit that bounded empty container when the new policy tail is present.
     if (hasLocalCousinServicePermissions) hasClusterPairEnrollmentOperations = true;
@@ -9368,10 +9376,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9415,6 +9423,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       permitsClusterPairRevocationOperations = version >= 13;
       permitsClusterPairEpochOperations = version >= 14;
       hasLocalCousinServicePermissions = version >= 15;
+      permitsTransportCredentialLifecycleOperations = version >= 16;
     }
   }
 
@@ -9566,7 +9575,17 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     serializer.container(state.transportCredentialEnrollments, ProdigyTransportCredentialEnrollmentMaximumRecords,
         [](auto& nested, ProdigyTransportCredentialEnrollment& enrollment) { nested.object(enrollment); });
     serializer.container(state.transportCredentialEnrollmentOperations, ProdigyTransportCredentialEnrollmentMaximumRecords,
-        [](auto& nested, ProdigyTransportCredentialEnrollmentOperation& operation) { nested.object(operation); });
+        [permitsTransportCredentialLifecycleOperations](auto& nested, ProdigyTransportCredentialEnrollmentOperation& operation) {
+          prodigySerializeTransportCredentialEnrollmentOperation(nested, operation, permitsTransportCredentialLifecycleOperations);
+        });
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if ((!permitsTransportCredentialLifecycleOperations && std::any_of(
+              state.transportCredentialEnrollmentOperations.begin(), state.transportCredentialEnrollmentOperations.end(),
+              [](const auto& operation) { return operation.protocolVersion != 1; })) ||
+          (permitsTransportCredentialLifecycleOperations && std::any_of(
+              state.transportCredentialEnrollmentOperations.begin(), state.transportCredentialEnrollmentOperations.end(),
+              [](const auto& operation) { return operation.protocolVersion != 1 && operation.protocolVersion != 2; })))
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
   }
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {

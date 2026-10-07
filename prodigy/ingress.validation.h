@@ -3,6 +3,7 @@
 #include <prodigy/cousin.session.h>
 #include <prodigy/types.h>
 #include <prodigy/wire.h>
+#include <prodigy/sha256.digest.h>
 
 #pragma once
 
@@ -386,6 +387,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::commitLocalCousinServicePermission:
     case MothershipTopic::pullLocalCousinServicePermission:
     case MothershipTopic::pullCousinCounterparts:
+    case MothershipTopic::requestTransportCredentialLifecycle:
+    case MothershipTopic::pullTransportCredentialLifecycle:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;
@@ -585,6 +588,18 @@ static bool validateBrainPayload(uint16_t rawTopic, uint8_t *args, uint8_t *term
         }
         return (cursor == terminal);
       }
+    case BrainTopic::observeAuthorityElection:
+      {
+        uint8_t response = 0;
+        uint64_t nonce = 0, generation = 0;
+        String digest;
+        if (!extractFixed(cursor, terminal, response) || response > 1 ||
+            !extractFixed(cursor, terminal, nonce) || nonce == 0 ||
+            !extractFixed(cursor, terminal, generation) ||
+            !extractVariableStringView(cursor, terminal, digest) || cursor != terminal) return false;
+        return response ? generation != 0 && prodigyIsSHA256HexDigest(digest) :
+                          generation == 0 && digest.empty();
+      }
     case BrainTopic::peerHeartbeat:
       {
         bool isResponse = false;
@@ -767,9 +782,13 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
             (pairProjectionVersion != 1 && pairProjectionVersion != 2)) return false;
         if (cursor == terminal) return true;
         uint8_t cousinDiscoveryVersion = 0;
-        return extractFixed(cursor, terminal, cousinDiscoveryVersion) && cousinDiscoveryVersion == 1 && cursor == terminal;
+        if (!extractFixed(cursor, terminal, cousinDiscoveryVersion) || cousinDiscoveryVersion != 1) return false;
+        if (cursor == terminal) return true;
+        uint8_t lifecycleVersion = 0;
+        return extractFixed(cursor, terminal, lifecycleVersion) && lifecycleVersion == 1 && cursor == terminal;
       }
     case NeuronTopic::transportCredentialPeersAck:
+    case NeuronTopic::transportCredentialLifecycleAck:
     case NeuronTopic::clusterPairControlCredentialsAck:
       {
         uint128_t nonce = 0;
@@ -993,9 +1012,11 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
     case NeuronTopic::cousinAdmissionCommand:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case NeuronTopic::transportCredentialPeers:
+    case NeuronTopic::transportCredentialLifecycle:
       {
         uint128_t nonce = 0;
-        return extractFixed(cursor, terminal, nonce) && nonce != 0 && consumeVariable(cursor, terminal) && cursor == terminal;
+        return extractFixed(cursor, terminal, nonce) && nonce != 0 &&
+            consumeVariableBounded(cursor, terminal, 1048576) && cursor == terminal;
       }
     case NeuronTopic::clusterPairControlCredentials:
       {

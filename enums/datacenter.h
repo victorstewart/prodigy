@@ -80,7 +80,11 @@ enum class MothershipTopic : uint16_t {
   commitLocalCousinServicePermission,
   pullLocalCousinServicePermission,
   // Observation of ephemeral, locally filtered counterpart candidates only.
-  pullCousinCounterparts
+  pullCousinCounterparts,
+  // Durable internal transport credential lifecycle control is independently
+  // framed so legacy controllers reject it rather than decoding shifted data.
+  requestTransportCredentialLifecycle,
+  pullTransportCredentialLifecycle
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -187,6 +191,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "pullLocalCousinServicePermission";
     case MothershipTopic::pullCousinCounterparts:
       return "pullCousinCounterparts";
+    case MothershipTopic::requestTransportCredentialLifecycle:
+      return "requestTransportCredentialLifecycle";
+    case MothershipTopic::pullTransportCredentialLifecycle:
+      return "pullTransportCredentialLifecycle";
   }
 
   return "unknown";
@@ -228,7 +236,9 @@ enum class BrainTopic : uint16_t {
   acknowledgeCapabilities,
   // Read-only, generation-fenced release-admission observation exchange.
   observeUpgradeAdmission,
-  observeUpgradeAdmissionResponse
+  observeUpgradeAdmissionResponse,
+  // Authenticated, nonce-bound durable frontier read for master election.
+  observeAuthorityElection
 };
 
 enum class NeuronTopic : uint16_t {
@@ -285,7 +295,9 @@ enum class NeuronTopic : uint16_t {
   cousinSessionControlSend,
   cousinSessionControlReceipt,
   cousinAdmissionCommand,
-  cousinAdmissionAck
+  cousinAdmissionAck,
+  transportCredentialLifecycle,
+  transportCredentialLifecycleAck
 };
 
 enum class ContainerTopic : uint16_t {

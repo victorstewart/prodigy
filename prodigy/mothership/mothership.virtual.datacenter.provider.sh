@@ -41,6 +41,9 @@ run_machine()
    mount --bind "${workspace}" /mnt/prodigy-vdc-workspace
    mount --bind "${machine_root}/var/log/prodigy" /var/log/prodigy
    mount --bind "${machine_root}/root" /root
+   if [[ -d "${machine_root}/var/lib/prodigy/ssh" ]]; then
+      mount --bind "${machine_root}/var/lib" /var/lib
+   fi
    mount --bind "${containers_root}" /containers
    mkdir -p "${workspace}" /containers/store
    mount --bind /mnt/prodigy-vdc-workspace "${workspace}"
@@ -94,6 +97,157 @@ run_machine()
       mount --bind "${PRODIGY_VDC_MACHINE_BPFFS}" /sys/fs/bpf
       exec "$@"
    ' _ /root/prodigy/prodigy --isolated --netdev=bond0 "--boot-json=${boot_json}" "--transport-tls-json-path=${transport_tls_path}"
+}
+
+prepare_spare_root()
+{
+   local index="$1" containers_root="${filesystem_root}/machines/$1"
+   local root="${containers_root}/.machine-os" material="${workspace}/spare-bootstrap"
+   [[ -x /usr/lib/systemd/systemd && -x /usr/bin/sshd && -r "${material}/sshd_config" ]]
+   # This is disposable machine OS userspace, never an app deployment artifact.
+   # A complete private copy keeps ordinary SSH installer writes off the guest
+   # root. Charge it to the same bounded Btrfs machine quota as its containers.
+   local bytes
+   bytes=$(du -sx -B1 /usr | awk '{print $1}')
+   [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -lt "$((machine_storage_mb * 1048576 * 3 / 4))" ]]
+   mkdir -p "$root" "$containers_root/runtime-containers"
+   cp -a --reflink=auto /usr "$root/usr"
+   mkdir -p "$root"/{etc/ssh,etc/systemd/system/prodigy.service.d,etc/systemd/system.conf.d,root/.ssh,var/empty,var/lib/sshd,var/log/prodigy,run,tmp,proc,sys,dev,containers}
+   ln -s usr/bin "$root/bin"
+   ln -s usr/bin "$root/sbin"
+   ln -s usr/lib "$root/lib"
+   [[ ! -e /lib64 ]] || cp -a /lib64 "$root/lib64"
+   for name in os-release ld.so.cache ld.so.conf; do
+      [[ ! -f "/etc/$name" ]] || cp -L "/etc/$name" "$root/etc/$name"
+   done
+   for name in passwd group nsswitch.conf; do install -m 0644 "$material/$name" "$root/etc/$name"; done
+   install -m 0600 "$material/shadow" "$root/etc/shadow"
+   install -m 0600 "$material/client-public" "$root/root/.ssh/authorized_keys"
+   chmod 0700 "$root/root/.ssh"
+   install -m 0600 "$material/host-private" "$root/etc/ssh/ssh_host_ed25519_key"
+   install -m 0644 "$material/host-public" "$root/etc/ssh/ssh_host_ed25519_key.pub"
+   install -m 0600 "$material/sshd_config" "$root/etc/ssh/sshd_config"
+   install -m 0644 "$material/sshd.service" "$root/etc/systemd/system/sshd.service"
+   install -m 0644 "$material/machine.target" "$root/etc/systemd/system/prodigy-test-machine.target"
+   for name in basic sysinit network-online multi-user sockets; do
+      install -m 0644 "$material/empty.target" "$root/etc/systemd/system/$name.target"
+      # Suppress the image's host boot dependencies inside this private OS.
+      mkdir -p "$root/etc/systemd/system/$name.target.wants"
+      for unit in "$root/usr/lib/systemd/system/$name.target.wants/"*; do
+         [[ -e "$unit" || -L "$unit" ]] || continue
+         ln -s /dev/null "$root/etc/systemd/system/$name.target.wants/${unit##*/}"
+      done
+   done
+   install -m 0644 "$material/manager.conf" "$root/etc/systemd/system.conf.d/10-mothership.conf"
+   install -m 0644 "$material/prodigy.conf" "$root/etc/systemd/system/prodigy.service.d/10-mothership.conf"
+   chmod 1777 "$root/tmp"
+   : > "$root/etc/machine-id"
+   printf 'MOTHERSHIP_SPARE_OS_PREPARED machine=%s userspaceBytes=%s\n' "$index" "$bytes"
+}
+
+enter_spare_machine()
+{
+   trap 'printf "MOTHERSHIP_SPARE_SETUP_FAILED status=%s line=%s\n" "$?" "$LINENO" >&2' ERR
+   [[ "$#" -eq 7 ]]
+   local machine_cgroup="$1" child_ns="$4"
+   mkdir -p "$machine_cgroup/console" "$machine_cgroup/os"
+   printf '%s\n' "$$" > "$machine_cgroup/console/cgroup.procs"
+   local controller
+   for controller in cpuset cpu memory pids; do
+      printf '+%s\n' "$controller" > "$machine_cgroup/cgroup.subtree_control"
+   done
+   local os_cgroup_fd
+   exec {os_cgroup_fd}>"$machine_cgroup/os/cgroup.procs"
+   shift
+   # PID 1 reopens /dev/console and requires a real terminal. Allocate an owned
+   # PTY before the private PID namespace and forward its output to the existing
+   # bounded machine log. The same machine cgroup owns init and this relay.
+   exec ip netns exec "$child_ns" python3 - "$0" "$os_cgroup_fd" "$@" <<'PY'
+import errno,os,pty,re,subprocess,sys,tty
+script,os_cgroup_fd,*args=sys.argv[1:]
+match=re.fullmatch(r'/proc/self/fd/([0-9]+)',script)
+if not match: raise SystemExit('spare bootstrap requires the sealed provider descriptor')
+script_fd=int(match[1])
+if os.readlink(script) != '/memfd:mothership-vdc-provider (deleted)':
+    raise SystemExit('spare bootstrap provider descriptor identity mismatch')
+master,slave=pty.openpty()
+tty.setraw(slave)
+console=os.ttyname(slave)
+# Only PID 1 enters the OS subtree before creating its cgroup namespace. The
+# relay/unshare supervisors remain bounded siblings outside systemd's root.
+enter_os='set -euo pipefail; os_fd=$1; printf "%s\\n" "$$" >&"$os_fd"; exec {os_fd}>&-; shift; exec unshare --cgroup -- bash "$@"'
+child=subprocess.Popen(['unshare','--pid','--fork','--kill-child=KILL',
+    '--mount','--propagation','private','--uts','--ipc','--','bash','-c',enter_os,'_',os_cgroup_fd,script,'--run-spare',*args,console],
+    stdin=slave,stdout=slave,stderr=slave,close_fds=True,pass_fds=(script_fd,int(os_cgroup_fd)))
+os.close(int(os_cgroup_fd))
+os.close(slave)
+while True:
+    try: data=os.read(master,65536)
+    except OSError as error:
+        if error.errno==errno.EIO: break
+        raise
+    if not data: break
+    view=memoryview(data)
+    while view:
+        view=view[os.write(1,view):]
+os.close(master)
+result=child.wait()
+sys.exit(result if result>=0 else 128-result)
+PY
+}
+
+run_spare_machine()
+{
+   trap 'printf "MOTHERSHIP_SPARE_SETUP_FAILED status=%s line=%s\n" "$?" "$LINENO" >&2' ERR
+   [[ "$#" -eq 7 ]]
+   local root="$1" containers_root="$2" child_ns="$3" machine_bpffs="$4" log_root="$5" host_netns="$6" console="$7"
+   [[ "$console" == /dev/pts/[0-9]* && -c "$console" ]]
+   [[ "$root" == /mnt/prodigy-vdc-*/machines/*/.machine-os && -x "$root/usr/lib/systemd/systemd" ]]
+   [[ "$(stat -Lc %i /proc/self/ns/net)" != "$host_netns" ]]
+   mount --bind "$root" "$root"
+   mount --bind "$containers_root" "$root/containers"
+   mount --bind "$log_root" "$root/var/log/prodigy"
+   # Prodigy's ordinary user/PID-namespace containers mount their own procfs.
+   # A covered parent procfs is rejected by Linux's mount_too_revealing check;
+   # expose this private PID namespace's complete procfs as on initial machines.
+   mount -t proc -o nosuid,nodev,noexec proc "$root/proc"
+   mount -t sysfs -o ro,nosuid,nodev,noexec sysfs "$root/sys"
+   mount -t cgroup2 -o nsdelegate cgroup2 "$root/sys/fs/cgroup"
+   [[ "$(findmnt -n -o FSTYPE -T "$machine_bpffs")" == bpf ]]
+   mount --bind "$machine_bpffs" "$root/sys/fs/bpf"
+   mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$root/run"
+   mount -t tmpfs -o mode=0755,nosuid tmpfs "$root/dev"
+   local name major minor
+   while read -r name major minor; do mknod -m 0666 "$root/dev/$name" c "$major" "$minor"; done <<'DEVICES'
+null 1 3
+zero 1 5
+full 1 7
+random 1 8
+urandom 1 9
+tty 5 0
+DEVICES
+   touch "$root/dev/console"
+   mount --bind "$console" "$root/dev/console"
+   ln -s /proc/self/fd "$root/dev/fd"
+   mkdir "$root/dev/pts" "$root/dev/shm"
+   mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$root/dev/pts"
+   ln -s pts/ptmx "$root/dev/ptmx"
+   chmod 1777 "$root/dev/shm"
+   # Give the OS an actual root mount. Its ordinary service/generator
+   # sandboxing remounts / and cannot operate on a mere chroot directory.
+   mkdir -p "$root/.old-root"
+   cd "$root"
+   pivot_root . .old-root
+   cd /
+   umount -l /.old-root
+   rmdir /.old-root
+   # Bash has already parsed this function. Do not lend the provider image or
+   # any provider lock/control handle to the private operating system.
+   local script_fd=${0##*/}
+   [[ "$0" == /proc/self/fd/[0-9]* && "$script_fd" =~ ^[0-9]+$ ]]
+   exec {script_fd}<&-
+   printf 'MOTHERSHIP_SPARE_INIT_EXEC pid=%s netns=%s\n' "$$" "$child_ns"
+   exec /usr/bin/env -i PATH=/usr/bin:/usr/sbin container=prodigy-vdc /usr/lib/systemd/systemd --system --unit=prodigy-test-machine.target --log-target=console --log-level=debug --show-status=no
 }
 
 bounded_machine_log()
@@ -335,7 +489,7 @@ provider_process()
    [[ "${arguments[0]:-}" == bash || "${arguments[0]:-}" == /bin/bash ]] || return 1
    [[ "${arguments[1]:-}" =~ ^/proc/self/fd/[0-9]+$ ]] || return 1
    case "${arguments[2]:-}" in
-      --serve) [[ "${#arguments[@]}" -eq 15 && "${arguments[3]}" == "${workspace}" ]] ;;
+      --serve) [[ ( "${#arguments[@]}" -eq 15 || "${#arguments[@]}" -eq 16 ) && "${arguments[3]}" == "${workspace}" ]] ;;
       --serve-adopt) [[ "${#arguments[@]}" -eq 17 && "${arguments[3]}" =~ ^[0-9]+$ && "${arguments[5]}" == "${workspace}" && "${arguments[4]}" == "${workspace}/virtual-datacenter.recovery/"* ]] ;;
       *) return 1 ;;
    esac
@@ -2682,7 +2836,7 @@ stop_datacenter()
 
 launch_datacenter()
 {
-   [[ "$#" -eq 12 && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 13 ) && "${EUID}" -eq 0 ]] || return 2
    local workspace="$1"
    local control_socket_path="${12}"
    valid_workspace "${workspace}" && valid_control_socket_path "${control_socket_path}" || return 2
@@ -2709,6 +2863,8 @@ adopted_mode=0
 adopted_runtime_identity=""
 adopted_operation_dir=""
 case "${1:-}" in
+   --enter-spare) shift; enter_spare_machine "$@"; exit ;;
+   --run-spare) shift; run_spare_machine "$@"; exit ;;
    --pair-launch) shift; pair_launch "$@"; exit ;;
    --pair-serve) shift; pair_serve "$@"; exit ;;
    --pair-recover-remove) shift; pair_recover_remove "$@"; exit ;;
@@ -2778,7 +2934,7 @@ then
    exec unshare --mount --propagation private -- bash "$0" --serve "$@"
 fi
 
-if [[ "$#" -ne 12 || "${EUID}" -ne 0 ]]
+if [[ ( "$#" -ne 12 && "$#" -ne 13 ) || "${EUID}" -ne 0 ]]
 then
    echo "virtual datacenter provider requires workspace, machine count, brain count, MTU, fake-boundary flag, host netns inode, machine resources, storage devices, and control socket as root" >&2
    exit 2
@@ -2796,6 +2952,8 @@ machine_storage_mb="$9"
 storage_device_count="${10}"
 storage_device_mb="${11}"
 control_socket_path="${12}"
+spare_machine_count="${13:-0}"
+[[ "$spare_machine_count" == 0 || "$spare_machine_count" == 1 ]]
 datacenter_fragment="$(network_fragment_from_control_socket_path "${control_socket_path}")"
 private_network_domain="$((datacenter_fragment - 1))"
 private4_prefix="10.0.${private_network_domain}"
@@ -2824,7 +2982,11 @@ then
    exit 2
 fi
 
+initial_machine_count=$((machine_count - spare_machine_count))
+[[ "$initial_machine_count" -ge "$brain_count" ]]
+[[ "$spare_machine_count" == 0 || ( "$storage_device_count" == 0 && "$fake_boundary" == 0 ) ]]
 required=(btrfs find findmnt flock install ip mkfs.btrfs mount mountpoint mv python3 realpath rm rmdir seq setsid stat tr truncate umount unshare xargs)
+[[ "$spare_machine_count" == 0 ]] || required+=(awk cp du mknod pivot_root ss touch)
 [[ "${storage_device_count}" -eq 0 ]] || required+=(mkfs.ext4)
 if [[ "${fake_boundary}" == "1" ]]
 then
@@ -3025,6 +3187,13 @@ then
 mkdir -p "${workspace}/boot" "${workspace}/transport-tls" "${filesystem_root}"
 install -d -m 0700 "${control_socket_path%/*}"
 rm -f "${provisioned_path}" "${members_provisioned_path}" "${seed_runtime_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
+if [[ "$spare_machine_count" == 1 ]]; then
+   for _ in $(seq 1 100); do
+      [[ ! -r "$workspace/spare-bootstrap/ready" ]] || break
+      sleep .1
+   done
+   [[ -r "$workspace/spare-bootstrap/ready" ]]
+fi
 filesystem_size_bytes=$(( (machine_storage_mb * machine_count + 4096) * 1048576 ))
 machine_memory_bytes=$(( machine_memory_mb * 1048576 ))
 machine_storage_bytes=$(( machine_storage_mb * 1048576 ))
@@ -3065,6 +3234,16 @@ do
    printf '%s %s\n' "$((machine_logical_cores * 100000))" 100000 > "${cgroup_root}/machine${index}/cpu.max"
    printf '%s\n' "${machine_memory_bytes}" > "${cgroup_root}/machine${index}/memory.max"
    printf '%s\n' 32768 > "${cgroup_root}/machine${index}/pids.max"
+   if [[ "$spare_machine_count" == 1 ]]; then
+      mkdir -p "${workspace}/machines/${index}/var/log/prodigy"
+      if [[ "$index" -le "$brain_count" ]]; then
+         install -d -m 0700 "${workspace}/machines/${index}/var/lib/prodigy/ssh"
+         install -m 0600 "${workspace}/spare-bootstrap/client-private" "${workspace}/machines/${index}/var/lib/prodigy/ssh/bootstrap_ed25519"
+         install -m 0644 "${workspace}/spare-bootstrap/client-public" "${workspace}/machines/${index}/var/lib/prodigy/ssh/bootstrap_ed25519.pub"
+      elif [[ "$index" -gt "$initial_machine_count" ]]; then
+         prepare_spare_root "$index"
+      fi
+   fi
 done
 printf '%s\n' "${pid}" > "${cgroup_root}/provider/cgroup.procs"
 
@@ -3214,6 +3393,23 @@ start_machine()
    local log_path="${workspace}/machine${index}.log"
    local fake_ingress=""
    local machine_bpffs="$(machine_bpffs_path "${index}")"
+   if [[ "$index" -gt "$initial_machine_count" ]]; then
+      valid_machine_bpffs "$index"
+      setsid bash "$0" --enter-spare "$machine_cgroup" "$containers_root/.machine-os" "$containers_root/runtime-containers" "$child_ns" "$machine_bpffs" "$machine_root/var/log/prodigy" "$host_netns_inode" \
+         > >(bash "$0" --bounded-log "$log_path" 2 67108864 4194304) 2>&1 &
+      machine_pids[$((index - 1))]="$!"
+      for _ in $(seq 1 300); do
+         if [[ -n "$(ip netns exec "$child_ns" ss -H -lnt '( sport = :22 )')" ]]; then return 0; fi
+         if ! kill -0 "${machine_pids[$((index - 1))]}" 2>/dev/null; then
+            local status=0
+            wait "${machine_pids[$((index - 1))]}" || status=$?
+            printf 'MOTHERSHIP_SPARE_OS_EXIT machine=%s status=%s\n' "$index" "$status" >&2
+            return 1
+         fi
+         sleep .1
+      done
+      return 1
+   fi
    [[ "${fake_boundary}" != "1" ]] || fake_ingress="/root/prodigy/host.ingress.router.dev.ebpf.o"
    [[ -x "${machine_root}/root/prodigy/prodigy" && -r "${boot_path}" && -r "${transport_tls_path}" ]]
    valid_machine_bpffs "${index}"

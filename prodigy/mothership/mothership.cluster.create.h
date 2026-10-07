@@ -1123,7 +1123,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   }
 
   ClusterTopology currentTopology = cluster.topology;
-  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.machineCount > 1)
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.initialMachineCount() > 1)
   {
     ClusterTopology expandedTopology = {};
     String localFailure = {};
@@ -1173,7 +1173,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
         return failWithCleanup(localFailure);
       }
       if (cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
-          mothershipTestClusterTopologyReady(currentTopology, cluster.test.machineCount, cluster.nBrains))
+          mothershipTestClusterTopologyReady(currentTopology, cluster.test.initialMachineCount(), cluster.nBrains))
       {
         fetched = true;
         break;
@@ -1183,7 +1183,7 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     if (fetched == false)
     {
       localFailure.snprintf<"test cluster topology did not become ready expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa} readyMachines={itoa}"_ctv>(
-          uint64_t(cluster.test.machineCount),
+          uint64_t(cluster.test.initialMachineCount()),
           uint64_t(currentTopology.machines.size()),
           uint64_t(cluster.nBrains),
           uint64_t(clusterTopologyBrainCount(currentTopology)),
@@ -1225,11 +1225,11 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   }
 
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::test &&
-      mothershipTestClusterTopologyReady(cluster.topology, cluster.test.machineCount, cluster.nBrains) == false)
+      mothershipTestClusterTopologyReady(cluster.topology, cluster.test.initialMachineCount(), cluster.nBrains) == false)
   {
     String localFailure = {};
     localFailure.snprintf<"test cluster topology mismatch expectedMachines={itoa} gotMachines={itoa} expectedBrains={itoa} gotBrains={itoa} readyMachines={itoa}"_ctv>(
-        uint64_t(cluster.test.machineCount),
+        uint64_t(cluster.test.initialMachineCount()),
         uint64_t(cluster.topology.machines.size()),
         uint64_t(cluster.nBrains),
         uint64_t(clusterTopologyBrainCount(cluster.topology)),
@@ -1305,7 +1305,7 @@ static inline bool mothershipRestartTestClusterToDesiredShape(
   }
 
   uint32_t runtimeBrains = clusterTopologyBrainCount(currentTopology);
-  if (currentTopology.machines.size() == desiredCluster.test.machineCount && runtimeBrains == desiredCluster.nBrains)
+  if (currentTopology.machines.size() == desiredCluster.test.initialMachineCount() && runtimeBrains == desiredCluster.nBrains)
   {
     desiredCluster.topology = currentTopology;
     return true;

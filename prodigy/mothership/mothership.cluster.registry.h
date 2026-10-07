@@ -162,6 +162,25 @@ public:
   MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
 };
 
+class MothershipProdigyClusterRecordV6 {
+public:
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
+  uint32_t spareMachineCount = 0;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV6& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+  serializer.value1b(record.internalTransportProfile);
+  serializer.value4b(record.spareMachineCount);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV5& record)
 {
@@ -399,6 +418,7 @@ private:
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
   constexpr static auto clusterRecordV5Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv;
+  constexpr static auto clusterRecordV6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -565,6 +585,34 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV6Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV6Header.size(), serialized.size() - clusterRecordV6Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV6 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+          record.cluster.test.specified == false ||
+          record.spareMachineCount != 1 ||
+          record.cluster.test.storageDeviceCount != 0 || record.cluster.test.enableFakeIpv4Boundary ||
+          record.cluster.test.machineCount <= record.spareMachineCount ||
+          record.cluster.nBrains == 0 ||
+          record.cluster.nBrains > record.cluster.test.machineCount - record.spareMachineCount ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
+          record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
+          (record.internalTransportProfile != MothershipInternalTransportProfile::tls &&
+           record.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)) return false;
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      record.cluster.internalTransportProfile = record.internalTransportProfile;
+      record.cluster.test.spareMachineCount = record.spareMachineCount;
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
     if (recordHasHeader(serialized, clusterRecordV5Header))
     {
       String payload = {};
@@ -652,7 +700,18 @@ private:
     }
 
     String payload = {};
-    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::tls)
+    if (cluster.test.spareMachineCount > 0)
+    {
+      MothershipProdigyClusterRecordV6 spareRecord = {};
+      spareRecord.cluster = std::move(record.cluster);
+      spareRecord.adoptedMachineRackUUIDs = std::move(record.adoptedMachineRackUUIDs);
+      spareRecord.adoptedMachineUUIDs = std::move(record.adoptedMachineUUIDs);
+      spareRecord.internalTransportProfile = record.internalTransportProfile;
+      spareRecord.spareMachineCount = cluster.test.spareMachineCount;
+      BitseryEngine::serialize(payload, spareRecord);
+      serialized.assign(clusterRecordV6Header);
+    }
+    else if (cluster.internalTransportProfile == MothershipInternalTransportProfile::tls)
     {
       // Ordinary TLS clusters retain the record understood by older binaries.
       MothershipProdigyClusterRecordV4 legacy;
@@ -769,7 +828,7 @@ private:
 
     if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
     {
-      return cluster.test.machineCount;
+      return cluster.test.initialMachineCount();
     }
 
     return 0;
@@ -1950,16 +2009,53 @@ private:
         return false;
       }
 
-      if (cluster.nBrains > cluster.test.machineCount)
+      if (cluster.test.spareMachineCount > 1)
       {
         if (failure)
         {
-          failure->assign("test.machineCount is below nBrains");
+          failure->assign("test.spareMachineCount must be 0 or 1");
         }
         return false;
       }
 
-      cluster.remoteProdigyPath.clear();
+      if (cluster.test.spareMachineCount != 0 &&
+          (cluster.test.storageDeviceCount != 0 || cluster.test.enableFakeIpv4Boundary))
+      {
+        if (failure) failure->assign("test SSH spare requires no additional storage devices and no fake IPv4 boundary"_ctv);
+        return false;
+      }
+
+      const uint32_t initialMachineCount = cluster.test.initialMachineCount();
+      if (initialMachineCount == 0 || cluster.nBrains > initialMachineCount)
+      {
+        if (failure)
+        {
+          failure->assign("test.machineCount minus spareMachineCount is below nBrains");
+        }
+        return false;
+      }
+
+      if (cluster.test.spareMachineCount == 0)
+      {
+        cluster.remoteProdigyPath.clear();
+      }
+      else
+      {
+        if (cluster.bootstrapSshUser.size() == 0)
+        {
+          cluster.bootstrapSshUser.assign(defaultMothershipClusterSSHUser());
+        }
+        if (requireRootBootstrapSSHUser(cluster, failure) == false ||
+            resolveBootstrapSSHKeyPackage(cluster, true, failure) == false ||
+            resolveBootstrapSSHHostKeyPackage(cluster, true, failure) == false)
+        {
+          return false;
+        }
+        if (cluster.remoteProdigyPath.size() == 0)
+        {
+          cluster.remoteProdigyPath.assign(defaultMothershipRemoteProdigyPath());
+        }
+      }
 
       if (cluster.controls.empty() == false)
       {
@@ -1979,10 +2075,13 @@ private:
         return false;
       }
 
-      cluster.bootstrapSshUser.clear();
-      cluster.bootstrapSshKeyPackage.clear();
-      cluster.bootstrapSshHostKeyPackage.clear();
-      cluster.bootstrapSshPrivateKeyPath.clear();
+      if (cluster.test.spareMachineCount == 0)
+      {
+        cluster.bootstrapSshUser.clear();
+        cluster.bootstrapSshKeyPackage.clear();
+        cluster.bootstrapSshHostKeyPackage.clear();
+        cluster.bootstrapSshPrivateKeyPath.clear();
+      }
       mothershipResolveTestClusterControlRecord(cluster.controls, cluster);
     }
     else if (cluster.test.specified)

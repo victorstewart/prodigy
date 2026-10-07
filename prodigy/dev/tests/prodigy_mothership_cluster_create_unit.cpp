@@ -1199,6 +1199,38 @@ int main(void)
 
   {
     MothershipProdigyCluster cluster = {};
+    cluster.name = "test-spare-initial-readiness"_ctv;
+    cluster.clusterUUID = 0x5558;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    cluster.nBrains = 1;
+    cluster.test.specified = true;
+    cluster.test.workspaceRoot = "/tmp/test-spare-initial-readiness"_ctv;
+    cluster.test.machineCount = 3;
+    cluster.test.spareMachineCount = 1;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/test-spare-initial-readiness.sock"_ctv));
+
+    FakeClusterCreateHooks hooks = {};
+    ClusterTopology seedTopology = {};
+    seedTopology.version = 1;
+    seedTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:20:1::a"_ctv, true, ClusterMachineSource::adopted));
+    seedTopology.machines[0].uuid = 0x581;
+    ClusterTopology initialTopology = seedTopology;
+    initialTopology.version = 2;
+    initialTopology.machines.push_back(makeTopologyMachine("bootstrap"_ctv, "fd00:20:1::b"_ctv, false, ClusterMachineSource::adopted));
+    initialTopology.machines[1].uuid = 0x582;
+    hooks.fetchedTopologySequence.push_back(seedTopology);
+    hooks.fetchedTopologySequence.push_back(initialTopology);
+    hooks.fetchedTopologySequence.push_back(initialTopology);
+
+    String failure = {};
+    const bool ok = mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure);
+    suite.expect(ok && failure.empty(), "create_test_spare_uses_initial_member_count");
+    suite.expect(cluster.topology.machines.size() == 2 && clusterTopologyBrainCount(cluster.topology) == 1,
+                 "create_test_spare_readiness_excludes_unjoined_spare");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
     cluster.name = "test-resource-readiness-retry"_ctv;
     cluster.clusterUUID = 0x5557;
     cluster.deploymentMode = MothershipClusterDeploymentMode::test;

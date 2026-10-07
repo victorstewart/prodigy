@@ -1054,7 +1054,7 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 8;
+  constexpr static uint8_t currentVersion = 9;
 
   uint8_t version = 1;
   bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
@@ -1074,6 +1074,9 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> roots;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
+    if (std::any_of(transition.runtimeState.transportCredentialEnrollmentOperations.begin(),
+          transition.runtimeState.transportCredentialEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; }) && transition.version < 9) return;
     if (!transition.runtimeState.localCousinServicePermissions.empty() &&
         (transition.version < 7 || !prodigyLocalCousinServicePermissionsValid(
             transition.runtimeState.localCousinServicePermissions, transition.brainConfig.clusterUUID,
@@ -1092,6 +1095,11 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   serializer.value1b(transition.version);
   serializer.object(transition.runtimeState);
   serializer.object(transition.brainConfig);
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    if (std::any_of(transition.runtimeState.transportCredentialEnrollmentOperations.begin(),
+          transition.runtimeState.transportCredentialEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; }) && transition.version < 9)
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     if (!transition.runtimeState.localCousinServicePermissions.empty() &&
         (transition.version < 7 || !prodigyLocalCousinServicePermissionsValid(
@@ -1251,6 +1259,15 @@ public:
   // A provisioned AEGIS node never falls back to TLS or plaintext because its
   // current authority/ledger is unavailable, stale, or has revoked a peer.
   bool transportCredentialBootstrapRequired = false;
+  bool tryStagedBrainCredentialOnNextConnection = false;
+
+  // The local persistence owner can hold a terminal revocation newer than
+  // this Brain's last replicated snapshot. Never derive authority from that
+  // older ledger across the durable local fence.
+  virtual const ProdigyTransportCredentialEnrollmentOperation *localTerminalBrainCredentialRevocation() const
+  {
+    return nullptr;
+  }
 
   bool internalTransportAEGISRequired() const
   {
@@ -1259,10 +1276,114 @@ public:
         !masterAuthorityRuntimeState.transportCredentialEnrollments.empty();
   }
 
+  bool localInternalTransportCredentialCurrent() const
+  {
+    if (localTerminalBrainCredentialRevocation()) return false;
+    if (!internalTransportAEGISRequired()) return true;
+    const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    return root.valid() && std::count_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(),
+        masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& entry) {
+          return entry.nodeUUID == selfBrainUUID() && entry.clusterUUID == brainConfig.clusterUUID &&
+              entry.role == ProdigyTransportCredentialNodeRole::brain &&
+              entry.state == ProdigyTransportCredentialEnrollmentState::active &&
+              entry.authorityEpoch == root.authorityEpoch && entry.keyEpoch == root.keyEpoch;
+        }) == 1;
+  }
+
+  bool internalControlStreamCredentialCurrent(const ProdigyTransportTLSStream *stream,
+      ProdigyTransportCredentialNodeRole peerRole) const
+  {
+    if (localTerminalBrainCredentialRevocation()) return false;
+    if (!internalTransportAEGISRequired()) return true;
+    if (!stream || !stream->transportAEGISEnabled()) return false;
+    const String *localBytes = nullptr, *peerBytes = nullptr;
+    ProdigyTransportCredentialPrelude local, peer;
+    if (!stream->authenticatedTransportAEGISPreludes(localBytes, peerBytes) ||
+        !prodigyParseTransportCredentialPrelude(*localBytes, local) ||
+        !prodigyParseTransportCredentialPrelude(*peerBytes, peer) ||
+        local.nodeUUID != selfBrainUUID() || local.role != ProdigyTransportCredentialNodeRole::brain ||
+        peer.nodeUUID != stream->tlsPeerUUID || peer.role != peerRole) return false;
+    const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    if (!root.valid() || local.authorityEpoch != root.authorityEpoch || local.keyEpoch != root.keyEpoch ||
+        peer.authorityEpoch != root.authorityEpoch || peer.keyEpoch != root.keyEpoch) return false;
+    uint32_t localMatches = 0, peerMatches = 0;
+    for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+    {
+      if (entry.clusterUUID != brainConfig.clusterUUID) continue;
+      localMatches += prodigyTransportCredentialPreludeMatches(local, entry);
+      peerMatches += prodigyTransportCredentialPreludeMatches(peer, entry);
+    }
+    return localMatches == 1 && peerMatches == 1;
+  }
+
+  bool brainLifecyclePreludeRecognized(const ProdigyTransportCredentialPrelude& prelude, bool local) const
+  {
+    if (prelude.role != ProdigyTransportCredentialNodeRole::brain) return false;
+    const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+    if (!root.valid() || prelude.authorityEpoch != root.authorityEpoch || prelude.keyEpoch != root.keyEpoch) return false;
+    for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+      if (entry.clusterUUID == brainConfig.clusterUUID && prodigyTransportCredentialPreludeMatches(prelude, entry)) return true;
+    if (!masterAuthorityRuntimeStateDurable || durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation) return false;
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+    {
+      if (!operation.lifecycle() || !operation.valid() || operation.predecessor.role != ProdigyTransportCredentialNodeRole::brain ||
+          operation.predecessor.clusterUUID != brainConfig.clusterUUID) continue;
+      if (uint8_t(operation.lifecyclePhase) < uint8_t(ProdigyTransportCredentialLifecyclePhase::active) &&
+          operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate)
+      {
+        auto staged = operation.successor;
+        staged.state = ProdigyTransportCredentialEnrollmentState::active;
+        if (prodigyTransportCredentialPreludeMatches(prelude, staged)) return true;
+      }
+      if (operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active &&
+          (!local || operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate))
+      {
+        auto predecessor = operation.predecessor;
+        predecessor.state = ProdigyTransportCredentialEnrollmentState::active;
+        if (prodigyTransportCredentialPreludeMatches(prelude, predecessor)) return true;
+      }
+    }
+    return false;
+  }
+
+  // Only registration, capability/frontier reads and existing authority replication
+  // may cross a staged/retiring Brain session. It cannot contribute a vote or
+  // authorize ordinary commands until both exact credentials are current.
+  bool internalBrainLifecycleStreamAuthorized(const ProdigyTransportTLSStream *stream) const
+  {
+    if (localTerminalBrainCredentialRevocation()) return false;
+    if (internalControlStreamCredentialCurrent(stream, ProdigyTransportCredentialNodeRole::brain)) return true;
+    const String *localBytes = nullptr, *peerBytes = nullptr;
+    ProdigyTransportCredentialPrelude local, peer;
+    return stream && stream->authenticatedTransportAEGISPreludes(localBytes, peerBytes) &&
+        prodigyParseTransportCredentialPrelude(*localBytes, local) && prodigyParseTransportCredentialPrelude(*peerBytes, peer) &&
+        local.nodeUUID == selfBrainUUID() && peer.nodeUUID == stream->tlsPeerUUID &&
+        brainLifecyclePreludeRecognized(local, true) && brainLifecyclePreludeRecognized(peer, false);
+  }
+
+  bool brainTransportLifecycleUnfinished() const
+  {
+    return std::any_of(masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.begin(),
+        masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.end(), [](const auto& operation) {
+          return operation.lifecycle() && operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain &&
+              operation.lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::complete;
+        });
+  }
+
   bool beginInternalControlTransport(ProdigyTransportTLSStream *stream, bool server,
       ProdigyTransportCredentialNodeRole peerRole, uint128_t expectedPeerUUID)
   {
     if (stream == nullptr) return false;
+    const auto refuseRevokedCredential = [](const ProdigyTransportCredentialEnrollmentOperation& operation) {
+      const uint128_t nodeUUID = operation.predecessor.nodeUUID;
+      std::fprintf(stderr, "transport lifecycle credential-refused role=brain node=%016llx%016llx operation=%016llx%016llx generation=%llu reason=revoked\n",
+          (unsigned long long)(nodeUUID >> 64), (unsigned long long)nodeUUID,
+          (unsigned long long)(operation.lifecycleOperationUUID >> 64), (unsigned long long)operation.lifecycleOperationUUID,
+          (unsigned long long)operation.transitionGeneration);
+      return false;
+    };
+    if (const auto *revocation = localTerminalBrainCredentialRevocation())
+      return refuseRevokedCredential(*revocation);
     if (!internalTransportAEGISRequired())
       return !ProdigyTransportTLSRuntime::configured() || stream->beginTransportTLS(server);
     const uint128_t localUUID = selfBrainUUID();
@@ -1278,7 +1399,37 @@ public:
         local = &candidate;
       }
     }
-    if (local == nullptr) return false;
+    if (local == nullptr)
+    {
+      for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+        if (operation.lifecycle() && operation.predecessor.nodeUUID == localUUID &&
+            operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain &&
+            operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke &&
+            uint8_t(operation.lifecyclePhase) >= uint8_t(ProdigyTransportCredentialLifecyclePhase::active))
+          return refuseRevokedCredential(operation);
+      return false;
+    }
+    auto handshakeLedger = masterAuthorityRuntimeState.transportCredentialEnrollments;
+    auto localEnrollment = *local;
+    if (peerRole == ProdigyTransportCredentialNodeRole::brain && !weAreMaster && masterAuthorityRuntimeStateDurable &&
+        durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
+      for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+        if (operation.lifecycle() && operation.valid() && operation.predecessor == localEnrollment &&
+            operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate &&
+            operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::staged)
+        {
+          const bool useStaged = tryStagedBrainCredentialOnNextConnection;
+          tryStagedBrainCredentialOnNextConnection = !useStaged;
+          if (useStaged)
+          {
+            localEnrollment = operation.successor;
+            localEnrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+            for (auto& entry : handshakeLedger)
+              if (entry == operation.predecessor) entry = localEnrollment;
+          }
+          break;
+        }
+    local = &localEnrollment;
     ProdigyTransportCredentialPrelude localPrelude = {};
     localPrelude.operationUUID = local->operationUUID; localPrelude.nodeUUID = localUUID;
     localPrelude.authorityEpoch = local->authorityEpoch; localPrelude.keyEpoch = local->keyEpoch;
@@ -1286,7 +1437,7 @@ public:
     String encoded = {};
     if (!prodigyRenderTransportCredentialPrelude(localPrelude, encoded)) return false;
     return stream->beginTransportAEGISWithPrelude(server, localUUID, encoded,
-        [this, localUUID, peerRole, expectedPeerUUID](const String& claimed, std::array<uint8_t, 32>& psk,
+        [this, localUUID, peerRole, expectedPeerUUID, handshakeLedger = std::move(handshakeLedger)](const String& claimed, std::array<uint8_t, 32>& psk,
                                                     String& context, uint128_t& peerUUID) {
           ProdigyTransportCredentialPrelude peer = {};
           if (!prodigyParseTransportCredentialPrelude(claimed, peer) || peer.role != peerRole ||
@@ -1294,9 +1445,23 @@ public:
           String purpose = {};
           if (peerRole == ProdigyTransportCredentialNodeRole::brain) purpose.assign("brain-brain"_ctv);
           else purpose.assign("brain-neuron"_ctv);
+          auto resolvedLedger = handshakeLedger;
+          if (peerRole == ProdigyTransportCredentialNodeRole::brain && masterAuthorityRuntimeStateDurable &&
+              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
+            for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+              if (operation.lifecycle() && operation.valid() && operation.predecessor.role == peerRole &&
+                  operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate &&
+                  uint8_t(operation.lifecyclePhase) < uint8_t(ProdigyTransportCredentialLifecyclePhase::active))
+              {
+                auto staged = operation.successor;
+                staged.state = ProdigyTransportCredentialEnrollmentState::active;
+                if (!prodigyTransportCredentialPreludeMatches(peer, staged)) continue;
+                for (auto& entry : resolvedLedger)
+                  if (entry == operation.predecessor) entry = staged;
+              }
           return prodigyResolveBrainTransportCredentialPeer(
               masterAuthorityRuntimeState.transportCredentialAuthorityRoot,
-              masterAuthorityRuntimeState.transportCredentialEnrollments, localUUID,
+              resolvedLedger, localUUID,
               ProdigyTransportCredentialNodeRole::brain, claimed, purpose, psk.data(), context, peerUUID);
         });
   }
@@ -5993,12 +6158,28 @@ public:
   // owner; nothing here is replayed or treated as authority state.
   std::unordered_map<uint64_t, Vector<std::function<void(bool)>>> addMachinesCohortReadinessWaiters;
 
+  void logQualifiedAddMachinesTransportCohort(uint64_t operationID)
+  {
+    if (!addMachinesTransportCohortQualified(operationID) ||
+        !existingNeuronsHaveAddMachinesTransportProjection(operationID)) return;
+    const auto *operation = findPendingAddMachinesOperation(operationID);
+    if (!operation) return;
+    const uint128_t owner = selfBrainUUID();
+    for (const auto& machine : operation->machinesToBootstrap)
+      std::fprintf(stderr, "transport enrollment cohort-qualified node=%016llx%016llx addOperation=%llu generation=%llu master=%016llx%016llx masterEpoch=%llu atMs=%llu\n",
+          (unsigned long long)(machine.uuid >> 64), (unsigned long long)machine.uuid,
+          (unsigned long long)operationID, (unsigned long long)masterAuthorityRuntimeState.generation,
+          (unsigned long long)(owner >> 64), (unsigned long long)owner,
+          (unsigned long long)masterAuthorityEpoch, (unsigned long long)Time::now<TimeResolution::ms>());
+  }
+
   void completeAddMachinesCohortReadiness(uint64_t operationID, bool ready)
   {
     auto found = addMachinesCohortReadinessWaiters.find(operationID);
     if (found == addMachinesCohortReadinessWaiters.end()) return;
     auto continuations = std::move(found->second);
     addMachinesCohortReadinessWaiters.erase(found);
+    if (ready) logQualifiedAddMachinesTransportCohort(operationID);
     for (auto& continuation : continuations)
       if (continuation) continuation(ready);
   }
@@ -6602,6 +6783,8 @@ public:
     auto persistFailure = [this, lifetime, epoch, operationID](const String& failure) -> ProdigyHostTask<bool> {
       if (lifetime.expired() || masterAuthorityEpoch != epoch ||
           findPendingAddMachinesOperation(operationID) == nullptr) co_return false;
+      std::fprintf(stderr, "prodigy addMachines resume failed operation=%llu epoch=%llu reason=%.*s\n",
+          (unsigned long long)operationID, (unsigned long long)epoch, int(failure.size()), failure.data());
       updatePendingAddMachinesOperationFailure(operationID, failure, false, false);
       const bool durable = co_await ProdigyHostCompletion<bool>([this](auto receipt) {
         commitMasterAuthorityStateChangeAsync(std::move(receipt));
@@ -6669,23 +6852,39 @@ public:
     if (operation.machinesToBootstrap.empty() == false)
     {
       ProdigyRemoteBootstrapBundleApprovalCache bootstrapBundleApprovalCache = {};
-      if (prodigyBootstrapItemsConcurrently<ClusterMachine>(
-              operation.machinesToBootstrap,
-              [this, &operation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine,
-                                                                 String& bootstrapFailure) -> bool {
-                return bootstrapClusterMachineBlocking(clusterMachine, operation.request,
-                    operation.plannedTopology, bootstrapFailure, &bootstrapBundleApprovalCache);
-              },
-              [this](const ClusterMachine& clusterMachine) -> void {
-                stopClusterMachineBootstrap(clusterMachine);
-              },
-              &startedMachines,
-              failure) == false)
+      bool bootstrapped = false;
+      // Projection/quorum reads belong to this Brain's Ring thread. Its live
+      // acknowledgement maps use thread-local hashing, and a blocking worker
+      // cannot observe them. Reuse ordinary AddMachines' suspendable owner.
+      auto collectOnly = [](const ClusterMachine&) {};
+      if (canSuspendRemoteBootstrap())
       {
-        for (const ClusterMachine& clusterMachine : startedMachines)
-        {
-          stopClusterMachineBootstrap(clusterMachine);
-        }
+        ProdigyRemoteBootstrapCoordinator coordinator = {};
+        for (const ClusterMachine& machine : operation.machinesToBootstrap)
+          if (!queueClusterMachineBootstrapAsync(coordinator, bootstrapBundleApprovalCache,
+                machine, operation.request, operation.plannedTopology, failure)) break;
+        while (coordinator.pendingTasks > 0 || coordinator.openSockets > 0)
+          co_await coordinator.suspend();
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        String bootstrapFailure;
+        bootstrapped = coordinator.finalize(&startedMachines, collectOnly, bootstrapFailure);
+        if (failure.empty()) failure = std::move(bootstrapFailure);
+        bootstrapped = bootstrapped && failure.empty();
+      }
+      else
+      {
+        bootstrapped = prodigyBootstrapItemsConcurrently<ClusterMachine>(
+            operation.machinesToBootstrap,
+            [this, &operation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine,
+                                                               String& bootstrapFailure) -> bool {
+              return bootstrapClusterMachineBlocking(clusterMachine, operation.request,
+                  operation.plannedTopology, bootstrapFailure, &bootstrapBundleApprovalCache);
+            }, collectOnly, &startedMachines, failure);
+      }
+      if (!bootstrapped)
+      {
+        for (const ClusterMachine& machine : startedMachines)
+          stopClusterMachineBootstrap(machine);
         (void)co_await persistFailure(failure);
         if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
         finish(false);
@@ -6849,6 +7048,7 @@ public:
     if (!transition.runtimeState.localCousinServicePermissions.empty()) transition.version =
         std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
+    if (transportCredentialLifecycleOperationsPresent()) transition.version = 9;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     transition.runtimeState.updateSelfFollowerConcurrency = 0;
     transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
@@ -9123,6 +9323,62 @@ public:
 
   // Validation and witness preparation have no provider or live-state effects.
   // Both synchronous restoration and asynchronous replication use this owner.
+  bool transportCredentialLifecycleHistoryMatches(const ProdigyMasterAuthorityRuntimeState& incoming) const
+  {
+    const auto& previous = masterAuthorityRuntimeState;
+    for (const auto& old : previous.transportCredentialEnrollmentOperations)
+    {
+      if (!old.lifecycle()) continue;
+      auto next = std::find_if(incoming.transportCredentialEnrollmentOperations.begin(),
+          incoming.transportCredentialEnrollmentOperations.end(), [&](const auto& candidate) {
+            return candidate.lifecycle() && candidate.lifecycleOperationUUID == old.lifecycleOperationUUID;
+          });
+      if (next == incoming.transportCredentialEnrollmentOperations.end()) return false;
+      auto normalized = *next;
+      normalized.predecessor.state = old.predecessor.state;
+      normalized.successor.state = old.successor.state;
+      normalized.lifecyclePhase = old.lifecyclePhase;
+      normalized.activationGeneration = old.activationGeneration;
+      normalized.transitionGeneration = old.transitionGeneration;
+      normalized.pinnedMasterAuthorityEpoch = old.pinnedMasterAuthorityEpoch;
+      if (!(normalized == old) || uint8_t(next->lifecyclePhase) < uint8_t(old.lifecyclePhase) ||
+          next->transitionGeneration < old.transitionGeneration ||
+          (old.activationGeneration != 0 && next->activationGeneration != old.activationGeneration) ||
+          (next->pinnedMasterAuthorityEpoch != old.pinnedMasterAuthorityEpoch &&
+           next->transitionGeneration <= old.transitionGeneration)) return false;
+    }
+    const bool lifecyclePresent = std::any_of(incoming.transportCredentialEnrollmentOperations.begin(),
+        incoming.transportCredentialEnrollmentOperations.end(), [](const auto& operation) { return operation.lifecycle(); });
+    if (!lifecyclePresent) return true;
+    // Ordinary scoped lifecycle never changes the root domain. Root recovery
+    // needs separate authority and cannot be smuggled into a newer snapshot.
+    if (previous.transportCredentialAuthorityRoot.valid())
+    {
+      const auto& old = previous.transportCredentialAuthorityRoot;
+      const auto& next = incoming.transportCredentialAuthorityRoot;
+      if (old.authorityEpoch != next.authorityEpoch || old.keyEpoch != next.keyEpoch ||
+          old.authorityGeneration != next.authorityGeneration ||
+          CRYPTO_memcmp(old.root, next.root, sizeof(old.root)) != 0) return false;
+    }
+    for (const auto& old : previous.transportCredentialEnrollments)
+    {
+      auto next = std::find_if(incoming.transportCredentialEnrollments.begin(), incoming.transportCredentialEnrollments.end(),
+          [&](const auto& member) { return member.operationUUID == old.operationUUID; });
+      if (next == incoming.transportCredentialEnrollments.end()) return false;
+      auto normalized = *next;
+      normalized.state = old.state;
+      if (normalized != old || uint8_t(next->state) < uint8_t(old.state)) return false;
+      if (old.state == ProdigyTransportCredentialEnrollmentState::active &&
+          next->state == ProdigyTransportCredentialEnrollmentState::revoked &&
+          std::none_of(incoming.transportCredentialEnrollmentOperations.begin(), incoming.transportCredentialEnrollmentOperations.end(),
+            [&](const auto& operation) {
+              return operation.lifecycle() && operation.predecessor == *next &&
+                  uint8_t(operation.lifecyclePhase) >= uint8_t(ProdigyTransportCredentialLifecyclePhase::active);
+            })) return false;
+    }
+    return true;
+  }
+
   bool prepareReplicatedMasterAuthorityRuntimeState(
       const ProdigyMasterAuthorityRuntimeState& incoming,
       PreparedMasterAuthorityRuntimeState& prepared,
@@ -9141,6 +9397,7 @@ public:
             incoming.transportCredentialEnrollmentOperations,
             incoming.transportCredentialEnrollments,
             incoming.generation) ||
+        !transportCredentialLifecycleHistoryMatches(incoming) ||
         !prodigyValidateClusterPairEnrollmentOperations(incoming.clusterPairEnrollments,
             incoming.clusterPairEnrollmentOperations, incoming.generation, &incoming.transportCredentialEnrollments))
     {
@@ -9669,6 +9926,9 @@ public:
         (!incoming.runtimeState.localCousinServicePermissions.empty() && incoming.version < 7) ||
         (std::any_of(incoming.runtimeState.localCousinServicePermissions.begin(), incoming.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && incoming.version < 8) ||
+        (std::any_of(incoming.runtimeState.transportCredentialEnrollmentOperations.begin(),
+          incoming.runtimeState.transportCredentialEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; }) && incoming.version < 9) ||
         (incoming.version == 1 && (!incoming.runtimeState.statefulServingAuthorities.empty() ||
                                   !incoming.runtimeState.statelessDeploymentAdmissions.empty() ||
                                   !incoming.servingRuntimeStates.empty())) ||
@@ -9867,6 +10127,10 @@ public:
            currentPeer->boottimens == pending->peerBootTime &&
            currentPeer->ioGeneration == pending->peerGeneration &&
            currentPeer->fslot == pending->peerFileSlot &&
+           (!std::any_of(pending->prepared.runtime.runtimeState.transportCredentialEnrollmentOperations.begin(),
+               pending->prepared.runtime.runtimeState.transportCredentialEnrollmentOperations.end(),
+               [](const auto& operation) { return operation.lifecycle(); }) ||
+            transportCredentialLifecyclePeerCapabilityCurrent(currentPeer, true)) &&
            (pending->prepared.runtime.runtimeState.localCousinServicePermissions.empty() ||
             localCousinServicePermissionPeerCapabilityCurrent(currentPeer,
               std::any_of(pending->prepared.runtime.runtimeState.localCousinServicePermissions.begin(), pending->prepared.runtime.runtimeState.localCousinServicePermissions.end(),
@@ -9944,6 +10208,10 @@ public:
   bool beginReplicatedMasterAuthorityTransition(
       BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
   {
+    if (std::any_of(incoming.runtimeState.transportCredentialEnrollmentOperations.begin(),
+          incoming.runtimeState.transportCredentialEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; }) &&
+        !transportCredentialLifecyclePeerCapabilityCurrent(peer, true)) return true;
     if (!incoming.runtimeState.localCousinServicePermissions.empty() &&
         !localCousinServicePermissionPeerCapabilityCurrent(peer,
             std::any_of(incoming.runtimeState.localCousinServicePermissions.begin(), incoming.runtimeState.localCousinServicePermissions.end(),
@@ -10002,6 +10270,9 @@ public:
     if (!candidate.runtimeState.localCousinServicePermissions.empty()) candidate.version =
         std::any_of(candidate.runtimeState.localCousinServicePermissions.begin(), candidate.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
+    if (std::any_of(candidate.runtimeState.transportCredentialEnrollmentOperations.begin(),
+          candidate.runtimeState.transportCredentialEnrollmentOperations.end(),
+          [](const auto& operation) { return operation.protocolVersion >= 2; })) candidate.version = 9;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
@@ -10078,6 +10349,7 @@ public:
   bool peerCanReceiveMasterAuthorityState(BrainView *peer) const
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
+           (!transportCredentialLifecycleOperationsPresent() || transportCredentialLifecyclePeerCapabilityCurrent(peer, true)) &&
            (masterAuthorityRuntimeState.localCousinServicePermissions.empty() ||
             (masterAuthorityRuntimeStateDurable && localCousinServicePermissionPeerCapabilityCurrent(peer,
                 localCousinServicePermissionsRequireBaseline()))) &&
@@ -14992,12 +15264,142 @@ public:
     return true;
   }
 
+  uint64_t nextAuthorityElectionNonce = 1;
+
+  bool authorityElectionRequired() const
+  {
+    return internalTransportAEGISRequired() && hasCompletedInitialMasterElection && nBrains > 1;
+  }
+
+  bool authorityElectionPeerCapable(BrainView *peer) const
+  {
+    return peer && peer->authorityElectionCapabilityAcknowledged &&
+        containerRetirementPeerCapabilityCurrent(peer) && peer->transportAEGISEnabled() &&
+        internalBrainLifecycleStreamAuthorized(peer);
+  }
+
+  bool authorityElectionRequestCurrent(BrainView *peer) const
+  {
+    return authorityElectionPeerCapable(peer) && peer->authorityElectionRequestNonce != 0 &&
+        peer->authorityElectionRequestEpoch == masterAuthorityEpoch &&
+        peer->authorityElectionLocalGeneration == masterAuthorityRuntimeState.generation &&
+        peer->authorityElectionPeerUUID == peer->uuid &&
+        peer->authorityElectionPeerBootNs == peer->boottimens &&
+        peer->authorityElectionPeerIOGeneration == peer->ioGeneration &&
+        peer->authorityElectionPeerTransportEpoch == peer->transportEpoch;
+  }
+
+  bool localAuthorityElectionFrontier(uint64_t& generation, String& digest) const
+  {
+    if (!masterAuthorityRuntimeStateDurable || pendingReplicatedMasterAuthorityTransition ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+      return false;
+    String serialized;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
+    generation = durableMasterAuthorityRuntimeStateGeneration;
+    return generation != 0 && prodigyIsSHA256HexDigest(digest);
+  }
+
+  void requestAuthorityElectionFrontier(BrainView *peer)
+  {
+    if (!authorityElectionPeerCapable(peer)) return;
+    const int64_t nowMs = Time::msSinceBoot();
+    if (authorityElectionRequestCurrent(peer) &&
+        (peer->authorityElectionDigest.size() == 64 ||
+         nowMs - peer->authorityElectionRequestMs < int64_t(brainPeerHeartbeatIntervalMs))) return;
+    if (nextAuthorityElectionNonce == 0) return;
+    peer->clearAuthorityElectionObservation();
+    peer->authorityElectionRequestNonce = nextAuthorityElectionNonce++;
+    peer->authorityElectionRequestEpoch = masterAuthorityEpoch;
+    peer->authorityElectionLocalGeneration = masterAuthorityRuntimeState.generation;
+    peer->authorityElectionPeerUUID = peer->uuid;
+    peer->authorityElectionPeerBootNs = peer->boottimens;
+    peer->authorityElectionPeerIOGeneration = peer->ioGeneration;
+    peer->authorityElectionPeerTransportEpoch = peer->transportEpoch;
+    peer->authorityElectionRequestMs = nowMs;
+    Message::construct(peer->wBuffer, BrainTopic::observeAuthorityElection,
+        false, peer->authorityElectionRequestNonce, uint64_t(0), String{});
+    Ring::queueSend(peer);
+  }
+
+  bool acceptAuthorityElectionFrontier(BrainView *peer, uint64_t nonce,
+                                      uint64_t generation, const String& digest)
+  {
+    if (!authorityElectionRequestCurrent(peer) || nonce != peer->authorityElectionRequestNonce ||
+        generation == 0 || !prodigyIsSHA256HexDigest(digest)) return false;
+    // A request has one immutable response. Duplicate or delayed frames cannot
+    // rewrite the frontier used by this election round.
+    if (!peer->authorityElectionDigest.empty())
+      return generation == peer->authorityElectionGeneration && peer->authorityElectionDigest.equals(digest);
+    peer->authorityElectionGeneration = generation;
+    peer->authorityElectionDigest.assign(digest);
+    std::fprintf(stderr, "brain authority frontier node=%016llx%016llx peer=%016llx%016llx generation=%llu localGeneration=%llu digest=%s\n",
+        (unsigned long long)(selfBrainUUID() >> 64), (unsigned long long)selfBrainUUID(),
+        (unsigned long long)(peer->uuid >> 64), (unsigned long long)peer->uuid,
+        (unsigned long long)generation, (unsigned long long)masterAuthorityRuntimeState.generation, peer->authorityElectionDigest.c_str());
+    return true;
+  }
+
+  // This is the existing election's read barrier, not another authority store.
+  // A normal majority intersects the prior qualified majority. Obtain a fresh
+  // durable frontier on each live stream before ranking that set; UUID breaks
+  // ties only between identical revisions. A catchup stream may expose a newer
+  // frontier, but cannot supply an election vote or become the selected master.
+  bool resolveAuthorityElectionFrontier(bool& preferred, bool breakUUIDTies,
+                                       BrainView *candidate = nullptr)
+  {
+    preferred = false;
+    uint64_t localGeneration = 0;
+    String localDigest;
+    if (!localAuthorityElectionFrontier(localGeneration, localDigest) ||
+        !localInternalTransportCredentialCurrent()) return false;
+    uint32_t voters = 1;
+    bool ready = true;
+    for (BrainView *peer : brains)
+    {
+      if (!peerEligibleForClusterQuorum(peer) || !peerSocketActive(peer)) continue;
+      if (!internalBrainLifecycleStreamAuthorized(peer)) continue;
+      requestAuthorityElectionFrontier(peer);
+      if (!authorityElectionRequestCurrent(peer) || peer->authorityElectionDigest.size() != 64)
+      { ready = false; continue; }
+      if (internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain)) ++voters;
+    }
+    if (!ready || voters <= nBrains / 2) return false;
+    if (candidate && (!brains.contains(candidate) || !authorityElectionRequestCurrent(candidate) ||
+        candidate->authorityElectionDigest.size() != 64 ||
+        !internalControlStreamCredentialCurrent(candidate, ProdigyTransportCredentialNodeRole::brain))) return false;
+    const uint64_t generation = candidate ? candidate->authorityElectionGeneration : localGeneration;
+    const String& digest = candidate ? candidate->authorityElectionDigest : localDigest;
+    const uint128_t uuid = candidate ? candidate->uuid : selfBrainUUID();
+    preferred = true;
+    auto compare = [&](uint64_t otherGeneration, const String& otherDigest, uint128_t otherUUID) {
+      if (otherGeneration == generation && !otherDigest.equals(digest)) return false;
+      if (otherGeneration > generation ||
+          (breakUUIDTies && otherGeneration == generation && otherUUID < uuid)) preferred = false;
+      return true;
+    };
+    if (!compare(localGeneration, localDigest, selfBrainUUID())) return false;
+    for (BrainView *peer : brains)
+    {
+      if (!peerEligibleForClusterQuorum(peer) || !peerSocketActive(peer) ||
+          !internalBrainLifecycleStreamAuthorized(peer)) continue;
+      if (!compare(peer->authorityElectionGeneration, peer->authorityElectionDigest, peer->uuid)) return false;
+    }
+    return true;
+  }
+
   bool resolveFailoverMasterByActivePeerAddressOrder(bool& preferSelf, bool *sawActivePeer = nullptr)
   {
     preferSelf = false;
     if (sawActivePeer != nullptr)
     {
       *sawActivePeer = false;
+    }
+
+    if (authorityElectionRequired())
+    {
+      if (sawActivePeer) *sawActivePeer = true; // Never fall back around this barrier.
+      return resolveAuthorityElectionFrontier(preferSelf, true);
     }
 
     if (thisNeuron == nullptr)
@@ -16140,10 +16542,13 @@ public:
     }
 
     brain->sendRegistration(boottimens, version, getExistingMasterUUID());
-    queueLocalPeerAddressCandidates(brain);
-    queueUpdateSelfBundleToPeer(brain);
-    queueUpdateSelfTransitionToPeer(brain);
-    queueUpdateSelfRelinquishToPeer(brain);
+    if (!brainTransportLifecycleUnfinished())
+    {
+      queueLocalPeerAddressCandidates(brain);
+      queueUpdateSelfBundleToPeer(brain);
+      queueUpdateSelfTransitionToPeer(brain);
+      queueUpdateSelfRelinquishToPeer(brain);
+    }
 
     // they will send us a registration too
     Ring::queueRecv(brain);
@@ -16427,10 +16832,13 @@ public:
 
         // it might have already registered with us... but that data could be old... it could've rebooted
         brain->sendRegistration(boottimens, version, getExistingMasterUUID());
-        queueLocalPeerAddressCandidates(brain);
-        queueUpdateSelfBundleToPeer(brain);
-        queueUpdateSelfTransitionToPeer(brain);
-        queueUpdateSelfRelinquishToPeer(brain);
+        if (!brainTransportLifecycleUnfinished())
+        {
+          queueLocalPeerAddressCandidates(brain);
+          queueUpdateSelfBundleToPeer(brain);
+          queueUpdateSelfTransitionToPeer(brain);
+          queueUpdateSelfRelinquishToPeer(brain);
+        }
 
         // We always need to receive the peer's registration/replication stream after connect.
         Ring::queueRecv(brain);
@@ -17744,6 +18152,12 @@ public:
         continue;
       }
 
+      if (!internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain))
+      {
+        if (!internalBrainLifecycleStreamAuthorized(peer))
+          queueBrainCloseIfActive(peer, "retired-transport-credential", -EACCES);
+        continue;
+      }
       driveMasterPeerIdentityConvergence(peer, nowMs);
 
       const bool heartbeatDue = (peer->lastHeartbeatSendMs == 0 || nowMs - peer->lastHeartbeatSendMs >= int64_t(brainPeerHeartbeatIntervalMs) || (lastPeerLivenessMs > 0 && nowMs - lastPeerLivenessMs >= int64_t(brainPeerHeartbeatIntervalMs)));
@@ -17775,6 +18189,8 @@ public:
       driveUpdateSelfFollowerTransitions();
       maybeRelinquishMasterForUpdateSelf();
     }
+    if (authorityElectionRequired() && noMasterYet && !weAreMaster &&
+        pendingDesignatedMasterPeerKey == 0) deriveMasterBrain();
     retryDeferredPeerArtifactReconciliations();
     // A bounded store-read admission can leave the reconciliation suffix
     // pending.  Reuse the existing heartbeat turn after ArtifactIO has
@@ -17791,8 +18207,11 @@ public:
     const bool peerWasPendingDesignatedMaster = (noMasterYet &&
                                                  pendingDesignatedMasterPeerKey > 0 &&
                                                  updateSelfPeerKeyMatchesBrain(pendingDesignatedMasterPeerKey, brain));
+    const bool firstMissingTransition = (brain->quarantined == false);
     brain->connected = false;
-    cancelBrainReconnectWaiter(brain, "brain-missing");
+    // Repeated missing reports must retain the close path's sole retry owner.
+    // First quarantine replaces that timer when it extends reconnect policy.
+    if (firstMissingTransition) cancelBrainReconnectWaiter(brain, "brain-missing");
     cancelBrainLivenessWaiter(brain, "brain-missing");
     const bool reconnectAlreadyInFlight = (Ring::socketIsClosing(brain) || brain->connectAttemptPending());
     bool expectedUpdateFollowerReboot = (updateSelfState == UpdateSelfState::waitingForFollowerReboots &&
@@ -17805,7 +18224,6 @@ public:
     // we either got here because we failed 3 times in a row trying to connect (or reconnect) to a brain, OR we were never connected to / the connection broke and they never
     // reconnected to us
 
-    bool firstMissingTransition = (brain->quarantined == false);
     brain->weConnectToIt = shouldWeConnectToBrain(brain);
     // On first missing transition, extend outbound reconnect attempts so transient
     // outages can heal without dropping reconnect permanently after the default budget.
@@ -17871,6 +18289,14 @@ public:
         {
           brain->forceConnectorOwnershipUntilMasterAck = true;
         }
+      }
+
+      else if (brain->weConnectToIt && reconnectAlreadyInFlight == false)
+      {
+        // The missing transition canceled the close path's retry timer.
+        // A follower still owns its canonical connector and must resume it
+        // while the existing majority gate keeps master promotion fenced.
+        armOutboundPeerReconnect(brain);
       }
 
       if (weAreMaster)
@@ -22270,6 +22696,11 @@ public:
 
   bool localBrainEligibleForMasterElection(void) const
   {
+    if (!localInternalTransportCredentialCurrent()) return false;
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (operation.lifecycle() && operation.valid() && operation.predecessor.nodeUUID == selfBrainUUID() &&
+          operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain &&
+          operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke) return false;
     ClusterTopology topology = {};
     const ClusterMachine *localMembership = nullptr;
     bool definesBrainMembership = false;
@@ -23149,6 +23580,7 @@ public:
 
     for (BrainView *bv : brains)
     {
+      bv->clearAuthorityElectionObservation();
       bv->isMasterBrain = false;
       bv->isMasterMissing = false;
       bv->forceConnectorOwnershipUntilMasterAck = false;
@@ -24046,6 +24478,12 @@ public:
       return true;
     }
 
+    if (authorityElectionRequired())
+    {
+      bool eligible = false;
+      if (!resolveAuthorityElectionFrontier(eligible, false) || !eligible) return false;
+    }
+
     advanceMasterAuthorityEpoch();
 
     // Promotion must flip master ownership before listener arm so any immediate
@@ -24318,6 +24756,11 @@ public:
       }
     }
 
+    // Inherited sockets did not re-register on this master. Their old digest
+    // evidence is deliberately epoch-scoped, so revalidate it before reports
+    // or artifact work may use it under this authority.
+    (void)revalidateNeuronArtifactCapabilitiesForCurrentAuthorityEpoch();
+
     // Replicated container state can also be waiting on machine inventory.
     // Retry it after both durable deployments and their machines exist.
     for (const auto& [deploymentID, deployment] : deployments)
@@ -24375,6 +24818,12 @@ public:
 
   void electBrainToMaster(BrainView *brain)
   {
+    if (authorityElectionRequired())
+    {
+      bool eligible = false;
+      if (!resolveAuthorityElectionFrontier(eligible, false, brain) || !eligible) return;
+    }
+
     if (peerEligibleForClusterQuorum(brain) == false)
     {
       return;
@@ -24520,9 +24969,11 @@ public:
 
       const bool existingPeerOwnsMaster = peerHasFreshMasterOwnershipClaim(
           findBrainViewByUUID(existingMasterUUID));
-      for (BrainView *brain : brains)
+      // A frontier request completes asynchronously. Keep the current-stream
+      // claim until that read can qualify adoption of the already-live master.
+      if (!authorityElectionRequired())
       {
-        brain->existingMasterUUID = 0; // clear all of these
+        for (BrainView *brain : brains) brain->existingMasterUUID = 0;
       }
 
       bool adoptedExistingMaster = false;
@@ -26608,7 +27059,7 @@ public:
 
   bool isActiveMaster(void) const
   {
-    return weAreMaster;
+    return weAreMaster && localInternalTransportCredentialCurrent();
   }
 
   bool shouldReconnectNeuronControl(NeuronView *neuron) const
@@ -26618,7 +27069,7 @@ public:
 
   bool canControlNeurons(void) const override
   {
-    return weAreMaster;
+    return isActiveMaster();
   }
 
   uint64_t containerLaunchAuthorityEpoch(void) const override
@@ -31051,10 +31502,33 @@ public:
   // newly authenticated AEGIS capability, so it is deliberately excluded.
   // Callers retain `electorate` with their immutable pending operation and
   // re-check this predicate immediately before activation or delivery.
-  bool transportCredentialElectorateHasQualifiedQuorum(const Vector<uint128_t>& electorate,
-                                                        const String& transitionDigest) const
+  bool transportCredentialLifecycleOperationsPresent() const
   {
-    if (!weAreMaster || !masterAuthorityRuntimeStateDurable ||
+    return std::any_of(masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.begin(),
+        masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.end(),
+        [](const auto& operation) { return operation.protocolVersion >= 2; });
+  }
+
+  static bool transportCredentialOperationUnfinished(const ProdigyTransportCredentialEnrollmentOperation& operation)
+  {
+    return operation.lifecycle() ? operation.lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::complete :
+        operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
+        operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active;
+  }
+
+  bool transportCredentialLifecyclePeerCapabilityCurrent(BrainView *peer, bool allowCatchup = false) const
+  {
+    return peer && peer->transportCredentialLifecycleCapabilityAcknowledged &&
+        peer->authorityElectionCapabilityAcknowledged && containerRetirementPeerCapabilityCurrent(peer) &&
+        (allowCatchup ? internalBrainLifecycleStreamAuthorized(peer) :
+         internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain));
+  }
+
+  bool transportCredentialElectorateHasQualifiedQuorum(const Vector<uint128_t>& electorate,
+                                                        const String& transitionDigest,
+                                                        bool requireLifecycleCapability = false) const
+  {
+    if (!weAreMaster || !localInternalTransportCredentialCurrent() || !masterAuthorityRuntimeStateDurable ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
         electorate.empty() || transitionDigest.size() != 64) return false;
     const uint128_t localUUID = selfBrainUUID();
@@ -31077,6 +31551,8 @@ public:
         if (candidate != nullptr && candidate->uuid == voter) { peer = candidate; break; }
       if (peer == nullptr || peer->quarantined || !peer->registrationFresh || !peer->transportAEGISEnabled() ||
           !peer->isTransportNegotiated() || !peer->tlsPeerVerified || peer->tlsPeerUUID != voter ||
+          !internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain) ||
+          (requireLifecycleCapability && !transportCredentialLifecyclePeerCapabilityCurrent(peer)) ||
           !peerHasAcknowledgedCurrentMasterAuthority(peer, transitionDigest)) continue;
       ++acknowledgements;
     }
@@ -31133,11 +31609,15 @@ public:
     // Until bootstrap completes, retain the cohort's old electorate. New
     // Brains must not become prerequisites for distributing their own identity.
     for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
-      if (operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
-          operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active)
+    {
+      if (operation.lifecycle() && transportCredentialOperationUnfinished(operation))
+        return operation.pinnedMasterAuthorityEpoch == masterAuthorityEpoch &&
+            transportCredentialElectorateHasQualifiedQuorum(operation.electorate, digest, true);
+      if (!operation.lifecycle() && transportCredentialOperationUnfinished(operation))
         return operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active &&
             operation.pinnedMasterAuthorityEpoch == masterAuthorityEpoch &&
             transportCredentialEnrollmentHasQualifiedQuorum(operation.enrollment, operation.electorate, digest);
+    }
     Vector<uint128_t> voters;
     const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
     for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
@@ -31300,8 +31780,7 @@ public:
         !buildApprovedClusterPairEndpoints(endpoints) || clusterPairInitialEnrollmentPending() ||
         transportCredentialNewCohortIsFenced()) return false;
     for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
-      if (operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
-          operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active) return false;
+      if (transportCredentialOperationUnfinished(operation)) return false;
     for (const auto& endpoint : endpoints)
       if (endpoint.nodeUUID != selfBrainUUID() &&
           !clusterPairEnrollmentPeerCapabilityCurrent(findBrainViewByUUID(endpoint.nodeUUID), true)) return false;
@@ -32586,6 +33065,380 @@ public:
     return true;
   }
 
+  const ProdigyTransportCredentialEnrollmentOperation *unfinishedTransportCredentialLifecycle(uint128_t nodeUUID) const
+  {
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (operation.lifecycle() && operation.lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::complete &&
+          (operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain ||
+           operation.predecessor.nodeUUID == nodeUUID)) return &operation;
+    return nullptr;
+  }
+
+  bool transportLifecycleNeuronAuthorized(const NeuronView *neuron,
+      const ProdigyTransportCredentialEnrollmentOperation& operation) const
+  {
+    if (!neuron || !neuron->machine || !containerRetirementNeuronAuthorized(neuron, neuron->machine->uuid) ||
+        (operation.predecessor.role == ProdigyTransportCredentialNodeRole::neuron && operation.predecessor.nodeUUID != neuron->machine->uuid) ||
+        !neuron->transportCredentialLifecycleCapable || !neuron->transportPeerProjectionCapable ||
+        neuron->transportPeerProjectionIOGeneration != neuron->ioGeneration ||
+        neuron->transportPeerProjectionAuthorityEpoch != masterAuthorityEpoch ||
+        operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch) return false;
+    if (internalControlStreamCredentialCurrent(neuron, ProdigyTransportCredentialNodeRole::neuron)) return true;
+    if (operation.lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::active) return false;
+    // Only the lifecycle receipt may arrive on the predecessor session after
+    // cutover. Its exact credential proof never authorizes ordinary messages.
+    const String *localBytes = nullptr, *peerBytes = nullptr;
+    ProdigyTransportCredentialPrelude local, peer;
+    if (!neuron->authenticatedTransportAEGISPreludes(localBytes, peerBytes) ||
+        !prodigyParseTransportCredentialPrelude(*localBytes, local) ||
+        !prodigyParseTransportCredentialPrelude(*peerBytes, peer) ||
+        local.nodeUUID != selfBrainUUID() || local.role != ProdigyTransportCredentialNodeRole::brain ||
+        peer.nodeUUID != neuron->tlsPeerUUID) return false;
+    auto predecessor = operation.predecessor;
+    predecessor.state = ProdigyTransportCredentialEnrollmentState::active;
+    if (operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain)
+      return brainLifecyclePreludeRecognized(local, true) &&
+          std::count_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(),
+            masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& entry) {
+              return entry.clusterUUID == brainConfig.clusterUUID && prodigyTransportCredentialPreludeMatches(peer, entry);
+            }) == 1;
+    return prodigyTransportCredentialPreludeMatches(peer, predecessor) &&
+        std::count_if(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(),
+          masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& entry) {
+            return entry.clusterUUID == brainConfig.clusterUUID && prodigyTransportCredentialPreludeMatches(local, entry);
+          }) == 1;
+  }
+
+  bool buildTransportCredentialLifecycleProjection(const ProdigyTransportCredentialEnrollmentOperation& operation,
+      ProdigyTransportCredentialLifecycleProjection& projection, String& fingerprint, uint128_t recipient = 0) const
+  {
+    projection = {};
+    projection.protocolVersion = 1;
+    projection.operation = operation;
+    projection.committedAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    if (operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain)
+    {
+      auto ledger = masterAuthorityRuntimeState.transportCredentialEnrollments;
+      ledger.erase(std::remove_if(ledger.begin(), ledger.end(), [&](const auto& entry) {
+        return entry.nodeUUID == operation.predecessor.nodeUUID && entry.role == ProdigyTransportCredentialNodeRole::brain;
+      }), ledger.end());
+      if (operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate)
+      {
+        auto successor = operation.successor;
+        successor.state = ProdigyTransportCredentialEnrollmentState::active;
+        ledger.push_back(successor);
+      }
+      auto local = std::find_if(ledger.begin(), ledger.end(), [&](const auto& entry) {
+        return entry.nodeUUID == recipient && entry.role == ProdigyTransportCredentialNodeRole::neuron &&
+            entry.state == ProdigyTransportCredentialEnrollmentState::active;
+      });
+      if (local == ledger.end() || !prodigyBuildTransportCredentialBootstrap(masterAuthorityRuntimeState.transportCredentialAuthorityRoot,
+          *local, ledger, true, projection.target, projection.committedAuthorityGeneration)) return false;
+    }
+    else if (operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate)
+    {
+      auto successor = operation.successor;
+      successor.state = ProdigyTransportCredentialEnrollmentState::active;
+      if (!prodigyBuildTransportCredentialBootstrap(masterAuthorityRuntimeState.transportCredentialAuthorityRoot,
+          successor, masterAuthorityRuntimeState.transportCredentialEnrollments, true, projection.target,
+          projection.committedAuthorityGeneration)) return false;
+    }
+    if (!prodigyTransportCredentialLifecycleProjectionValid(projection)) return false;
+    String serialized;
+    BitseryEngine::serialize(serialized, projection);
+    const bool ok = prodigyComputeSHA256Hex(serialized, fingerprint);
+    Vault::secureClearString(serialized);
+    return ok;
+  }
+
+  ProdigyTransportCredentialLifecycleResponse queryTransportCredentialLifecycle(
+      const ProdigyTransportCredentialLifecycleQuery& query) const
+  {
+    ProdigyTransportCredentialLifecycleResponse response;
+    response.localClusterUUID = brainConfig.clusterUUID;
+    response.currentMasterUUID = getExistingMasterUUID();
+    response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    if (!query.valid() || query.clusterUUID != brainConfig.clusterUUID || !isActiveMaster() ||
+        !internalTransportAEGISRequired())
+    {
+      response.failure.assign("lifecycle query requires the current master and exact cluster identity"_ctv);
+      return response;
+    }
+    response.success = true;
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (operation.lifecycle() && operation.lifecycleOperationUUID == query.operationUUID)
+      {
+        response.found = true;
+        response.operation = operation;
+        response.durable = masterAuthorityRuntimeStateDurable &&
+            durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation;
+        String serialized, digest;
+        response.qualified = response.durable && operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::complete &&
+            serializeCurrentMasterAuthorityTransition(serialized, digest) &&
+            transportCredentialElectorateHasQualifiedQuorum(operation.electorate, digest, true);
+        break;
+      }
+    return response;
+  }
+
+  bool requestTransportCredentialLifecycle(const ProdigyTransportCredentialLifecycleRequest& request,
+      ProdigyTransportCredentialLifecycleResponse& response)
+  {
+    auto reject = [&](const char *failure) {
+      response = {};
+      response.localClusterUUID = brainConfig.clusterUUID;
+      response.currentMasterUUID = getExistingMasterUUID();
+      response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+      response.failure.assign(failure);
+      return false;
+    };
+    if (!request.valid() || request.clusterUUID != brainConfig.clusterUUID || !isActiveMaster() ||
+        !internalTransportAEGISRequired()) return reject("invalid lifecycle request or inactive authority");
+    for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (operation.lifecycle() && operation.lifecycleOperationUUID == request.operationUUID)
+      {
+        if (operation.predecessor.clusterUUID != request.clusterUUID || operation.predecessor.nodeUUID != request.nodeUUID ||
+            operation.predecessor.role != request.role || operation.lifecycleKind != request.kind ||
+            operation.frozenAuthorityGeneration != request.expectedAuthorityGeneration)
+          return reject("lifecycle operation identity conflicts with the admitted request");
+        driveTransportCredentialEnrollmentOperations();
+        response = queryTransportCredentialLifecycle({1, request.clusterUUID, request.operationUUID});
+        return response.success;
+      }
+    if (!masterAuthorityRuntimeStateDurable || masterAuthorityEpoch == 0 ||
+        request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1)
+      return reject("lifecycle request requires exact durable authority generation");
+    ProdigyTransportCredentialEnrollmentOperation operation;
+    operation.protocolVersion = 2;
+    operation.lifecycleOperationUUID = request.operationUUID;
+    operation.lifecycleKind = request.kind;
+    operation.electorate = clusterPairCurrentElectorate();
+    operation.pinnedMasterAuthorityEpoch = masterAuthorityEpoch;
+    operation.frozenAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    operation.transitionGeneration = masterAuthorityRuntimeState.generation + 1;
+    uint32_t matches = 0;
+    for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+      if (entry.nodeUUID == request.nodeUUID && entry.role == request.role && entry.clusterUUID == request.clusterUUID &&
+          entry.state == ProdigyTransportCredentialEnrollmentState::active)
+      { operation.predecessor = entry; ++matches; }
+    if (matches != 1) return reject("lifecycle target has no unique active credential");
+    if (request.kind == ProdigyTransportCredentialLifecycleKind::rotate)
+    {
+      operation.successor = operation.predecessor;
+      auto& uuid = operation.successor.operationUUID;
+      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&uuid), sizeof(uuid)) != 1 || uuid == 0 ||
+          uuid == request.operationUUID || std::any_of(masterAuthorityRuntimeState.transportCredentialEnrollments.begin(),
+              masterAuthorityRuntimeState.transportCredentialEnrollments.end(), [&](const auto& entry) { return entry.operationUUID == uuid; }))
+        return reject("lifecycle successor identity unavailable");
+      operation.successor.authorityGeneration = operation.transitionGeneration;
+      operation.successor.state = ProdigyTransportCredentialEnrollmentState::pending;
+    }
+    String admissionFailure;
+    if (!beginTransportCredentialLifecycleAsync(std::move(operation), {}, &admissionFailure))
+      return reject(admissionFailure.c_str());
+    response = queryTransportCredentialLifecycle({1, request.clusterUUID, request.operationUUID});
+    return response.success;
+  }
+
+  bool beginTransportCredentialLifecycleAsync(ProdigyTransportCredentialEnrollmentOperation operation,
+      PersistenceCompletion completion = {}, String *failure = nullptr)
+  {
+    const uint64_t epoch = masterAuthorityEpoch;
+    auto finish = [this, epoch, completion = std::move(completion)](bool durable) mutable {
+      if (completion) completion(durable && weAreMaster && masterAuthorityEpoch == epoch);
+    };
+    auto reject = [&](const char *reason) {
+      if (failure) failure->assign(reason);
+      finish(false); return false;
+    };
+    if (!isActiveMaster() || !masterAuthorityRuntimeStateDurable || masterAuthorityEpoch == 0 ||
+        !internalTransportAEGISRequired() || !operation.valid() || !operation.lifecycle() ||
+        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return reject("lifecycle admission requires current durable authority and a valid operation");
+    // Transfer ordinary leadership before revoking its credential. A revoked
+    // leader must never count itself toward the transition's final quorum.
+    if (operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain &&
+        operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke &&
+        (operation.predecessor.nodeUUID == selfBrainUUID() ||
+         operation.electorate.size() - 1 < operation.electorate.size() / 2 + 1)) return reject("lifecycle revocation must retain a majority and cannot revoke the current leader");
+    for (const auto& existing : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (existing.lifecycle() && existing.lifecycleOperationUUID == operation.lifecycleOperationUUID)
+      {
+        if (!prodigyTransportCredentialLifecycleSameOperation(operation, existing)) return reject("lifecycle operation identity conflicts with existing history");
+        finish(durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation);
+        driveTransportCredentialEnrollmentOperations();
+        return true;
+      }
+    if (operation.lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::prepared ||
+        operation.frozenAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        operation.transitionGeneration != masterAuthorityRuntimeState.generation + 1 ||
+        operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
+        clusterPairInitialEnrollmentPending() || transportCredentialNewCohortIsFenced()) return reject("lifecycle admission generation or epoch changed, or another cohort is fenced");
+    for (const auto& existing : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+      if (transportCredentialOperationUnfinished(existing)) return reject("lifecycle admission waits for the preceding operation to complete");
+    if (operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate)
+    {
+      if (operation.predecessor.role == ProdigyTransportCredentialNodeRole::neuron)
+      {
+        const Machine *target = nullptr;
+        for (const auto *machine : machines)
+          if (machine && machine->uuid == operation.predecessor.nodeUUID) target = machine;
+        if (!target || !transportLifecycleNeuronAuthorized(&target->neuron, operation) ||
+            !internalControlStreamCredentialCurrent(&target->neuron, ProdigyTransportCredentialNodeRole::neuron)) return reject("lifecycle target Neuron has no current authorized control stream");
+      }
+      else if (operation.predecessor.nodeUUID != selfBrainUUID())
+      {
+        auto *peer = findBrainViewByUUID(operation.predecessor.nodeUUID);
+        if (!transportCredentialLifecyclePeerCapabilityCurrent(peer))
+        {
+          std::fprintf(stderr, "transport lifecycle target unavailable node=%016llx%016llx connected=%u registered=%u capability=%u electionCapability=%u credentialCurrent=%u\n",
+              (unsigned long long)(operation.predecessor.nodeUUID >> 64), (unsigned long long)operation.predecessor.nodeUUID,
+              unsigned(peer && peerSocketActive(peer)), unsigned(peer && peer->registrationFresh),
+              unsigned(peer && peer->transportCredentialLifecycleCapabilityAcknowledged),
+              unsigned(peer && peer->authorityElectionCapabilityAcknowledged),
+              unsigned(peer && internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain)));
+          return reject("lifecycle target Brain has no current lifecycle and election capable control stream");
+        }
+      }
+    }
+    auto operations = masterAuthorityRuntimeState.transportCredentialEnrollmentOperations;
+    operations.push_back(operation);
+    if (!prodigyValidatePersistentTransportCredentialEnrollmentOperations(operations,
+          masterAuthorityRuntimeState.transportCredentialEnrollments, operation.transitionGeneration)) return reject("lifecycle operation history validation failed");
+    String serialized, digest;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest) ||
+        !transportCredentialElectorateHasQualifiedQuorum(operation.electorate, digest, true)) return reject("lifecycle admission lacks an exact capable majority receipt");
+    masterAuthorityRuntimeState.transportCredentialEnrollmentOperations = std::move(operations);
+    commitMasterAuthorityStateChangeAsync([this, epoch, finish = std::move(finish)](bool durable) mutable {
+      finish(durable);
+      if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveTransportCredentialEnrollmentOperations();
+    });
+    return true;
+  }
+
+  // True means an unfinished lifecycle owns credential release this turn.
+  bool driveTransportCredentialLifecycleOperations()
+  {
+    for (auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
+    {
+      if (!operation.lifecycle() || operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::complete) continue;
+      if (!operation.valid() || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1 ||
+          operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
+          !transportCredentialProjectionAuthorityQualified()) return true;
+      const bool rotating = operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate;
+      const bool brainCredential = operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain;
+      if (brainCredential && !rotating && operation.predecessor.nodeUUID == selfBrainUUID()) return true;
+      if (brainCredential && rotating && operation.predecessor.nodeUUID != selfBrainUUID())
+      {
+        auto *targetBrain = findBrainViewByUUID(operation.predecessor.nodeUUID);
+        String serialized, digest;
+        if (!transportCredentialLifecyclePeerCapabilityCurrent(targetBrain) ||
+            !serializeCurrentMasterAuthorityTransition(serialized, digest) ||
+            !peerHasAcknowledgedCurrentMasterAuthority(targetBrain, digest)) return true;
+      }
+      auto persistProgress = [&]() {
+        const uint64_t epoch = masterAuthorityEpoch;
+        operation.transitionGeneration = masterAuthorityRuntimeState.generation + 1;
+        commitMasterAuthorityStateChangeAsync([this, epoch](bool durable) {
+          if (durable && weAreMaster && masterAuthorityEpoch == epoch) driveTransportCredentialEnrollmentOperations();
+        });
+      };
+      if (operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::staged ||
+          (!rotating && !brainCredential && operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::prepared))
+      {
+        for (auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+          if (entry.operationUUID == operation.predecessor.operationUUID) entry.state = ProdigyTransportCredentialEnrollmentState::revoked;
+        operation.predecessor.state = ProdigyTransportCredentialEnrollmentState::revoked;
+        if (rotating)
+        {
+          operation.successor.state = ProdigyTransportCredentialEnrollmentState::active;
+          masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(operation.successor);
+        }
+        operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::active;
+        operation.activationGeneration = masterAuthorityRuntimeState.generation + 1;
+        persistProgress();
+        return true;
+      }
+      Vector<uint128_t> recipients;
+      if (brainCredential)
+      {
+        // Enrollment is fenced for this whole operation. The active Neuron
+        // ledger is the immutable recipient set; a missing machine cannot be
+        // silently dropped to complete a partial public-roster cutover.
+        for (const auto& entry : masterAuthorityRuntimeState.transportCredentialEnrollments)
+          if (entry.role == ProdigyTransportCredentialNodeRole::neuron &&
+              entry.state == ProdigyTransportCredentialEnrollmentState::active)
+            recipients.push_back(entry.nodeUUID);
+      }
+      else recipients.push_back(operation.predecessor.nodeUUID);
+      bool allAcknowledged = !recipients.empty();
+      for (uint128_t recipient : recipients)
+      {
+        Machine *target = nullptr;
+        for (auto *machine : machines)
+          if (machine && machine->uuid == recipient) target = machine;
+        if (!target || !transportLifecycleNeuronAuthorized(&target->neuron, operation))
+        {
+          // A revoked Neuron's own offline process cannot veto its authority
+          // fence. Brain roster changes instead require every recipient.
+          if (!brainCredential && !rotating && operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active)
+          {
+            if (target) queueCloseIfActive(&target->neuron);
+            continue;
+          }
+          allAcknowledged = false;
+          continue;
+        }
+        auto& neuron = target->neuron;
+        ProdigyTransportCredentialLifecycleProjection projection;
+        String fingerprint;
+        if (!buildTransportCredentialLifecycleProjection(operation, projection, fingerprint, recipient)) return true;
+        if (neuron.transportPeerProjectionAcknowledgedFingerprint.equals(fingerprint)) continue;
+        allAcknowledged = false;
+        const int64_t now = Time::msSinceBoot();
+        if (neuron.transportPeerProjectionNonce != 0 && neuron.transportPeerProjectionFingerprint.equals(fingerprint) &&
+            now - neuron.transportPeerProjectionSentAtMs < 1000) continue;
+        uint128_t nonce = 0;
+        if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&nonce), sizeof(nonce)) != 1 || nonce == 0) continue;
+        String serialized;
+        BitseryEngine::serialize(serialized, projection);
+        if (!transportCredentialProjectionAuthorityQualified() || !transportLifecycleNeuronAuthorized(&neuron, operation))
+        { Vault::secureClearString(serialized); return true; }
+        neuron.transportPeerProjectionNonce = nonce;
+        neuron.transportPeerProjectionGeneration = projection.committedAuthorityGeneration;
+        neuron.transportPeerProjectionFingerprint = std::move(fingerprint);
+        neuron.transportPeerProjectionSentAtMs = now;
+        Message::construct(neuron.wBuffer, NeuronTopic::transportCredentialLifecycle, nonce, serialized);
+        Vault::secureClearString(serialized);
+        Ring::queueSend(&neuron);
+      }
+      if (allAcknowledged)
+      {
+        operation.lifecyclePhase = operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::prepared ?
+            ProdigyTransportCredentialLifecyclePhase::staged : ProdigyTransportCredentialLifecyclePhase::complete;
+        persistProgress();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void acknowledgeTransportCredentialLifecycleProjection(NeuronView *neuron, uint128_t nonce,
+      uint64_t generation, bool accepted)
+  {
+    const auto *operation = neuron && neuron->machine ? unfinishedTransportCredentialLifecycle(neuron->machine->uuid) : nullptr;
+    if (!operation || !transportLifecycleNeuronAuthorized(neuron, *operation) ||
+        !transportCredentialProjectionAuthorityQualified() || nonce == 0 ||
+        nonce != neuron->transportPeerProjectionNonce || generation != neuron->transportPeerProjectionGeneration) return;
+    ProdigyTransportCredentialLifecycleProjection projection;
+    String fingerprint;
+    if (!buildTransportCredentialLifecycleProjection(*operation, projection, fingerprint, neuron->machine->uuid) ||
+        !neuron->transportPeerProjectionFingerprint.equals(fingerprint)) return;
+    if (accepted) neuron->transportPeerProjectionAcknowledgedFingerprint = fingerprint;
+    neuron->transportPeerProjectionNonce = 0;
+    driveTransportCredentialEnrollmentOperations();
+  }
+
   bool transportPeerProjectionNeuronAuthorized(const NeuronView *neuron) const
   {
     return neuron && neuron->machine && containerRetirementNeuronAuthorized(neuron, neuron->machine->uuid) &&
@@ -32622,7 +33475,9 @@ public:
     const int64_t now = Time::msSinceBoot();
     for (Machine *machine : machines)
     {
-      if (!machine || !transportPeerProjectionNeuronAuthorized(&machine->neuron)) continue;
+      if (!machine || unfinishedTransportCredentialLifecycle(machine->uuid) ||
+          !transportPeerProjectionNeuronAuthorized(&machine->neuron) ||
+          !internalControlStreamCredentialCurrent(&machine->neuron, ProdigyTransportCredentialNodeRole::neuron)) continue;
       auto& neuron = machine->neuron;
       ProdigyTransportCredentialBootstrap projection;
       String fingerprint;
@@ -32942,8 +33797,7 @@ public:
     std::sort(voters.begin(), voters.end());
     if (voters != frozenElectorate || !std::binary_search(voters.begin(), voters.end(), selfBrainUUID())) return failAdmission();
     for (const auto& existing : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
-      if (existing.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
-          existing.phase == ProdigyTransportCredentialEnrollmentOperationPhase::active) return failAdmission();
+      if (transportCredentialOperationUnfinished(existing)) return failAdmission();
     auto ledger = masterAuthorityRuntimeState.transportCredentialEnrollments;
     auto operations = masterAuthorityRuntimeState.transportCredentialEnrollmentOperations;
     for (const auto& enrollment : enrollments)
@@ -32980,7 +33834,11 @@ public:
     { if (completion) completion(false); return false; }
     if (targets.empty() || (addMachinesTransportCohortQualified(operationID) &&
                             existingNeuronsHaveAddMachinesTransportProjection(operationID)))
-    { if (completion) completion(true); return true; }
+    {
+      if (!targets.empty()) logQualifiedAddMachinesTransportCohort(operationID);
+      if (completion) completion(true);
+      return true;
+    }
     if (!members.empty())
     {
       if (completion) addMachinesCohortReadinessWaiters[operationID].push_back(std::move(completion));
@@ -33107,6 +33965,7 @@ public:
   {
     if (!weAreMaster || !masterAuthorityRuntimeStateDurable ||
         masterAuthorityRuntimeState.generation == UINT64_MAX) return;
+    if (driveTransportCredentialLifecycleOperations()) return;
     driveTransportCredentialPeerProjections();
     // A continuation can change authority state when it resumes. Complete one
     // outside any ledger iteration, then let the next receipt/ACK re-drive.
@@ -33129,7 +33988,7 @@ public:
     if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return;
     for (auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
     {
-      if (!operation.valid() || operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
+      if (operation.lifecycle() || !operation.valid() || operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch ||
           operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::delivered ||
           !transportCredentialEnrollmentHasQualifiedQuorum(operation.enrollment, operation.electorate, digest)) continue;
       if (operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending)
@@ -33192,12 +34051,12 @@ public:
   {
     if (!weAreMaster || masterAuthorityEpoch == 0 ||
         masterAuthorityRuntimeState.generation == UINT64_MAX ||
+        (transportCredentialLifecycleOperationsPresent() && masterAuthorityRuntimeState.generation == UINT64_MAX - 1) ||
         !masterAuthorityRuntimeState.transportCredentialAuthorityRoot.valid()) return false;
     bool changed = false;
     for (auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
     {
-      if (!operation.valid() || operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::delivered ||
-          operation.phase == ProdigyTransportCredentialEnrollmentOperationPhase::revoked) continue;
+      if (!operation.valid() || !transportCredentialOperationUnfinished(operation)) continue;
       if (operation.pinnedMasterAuthorityEpoch != masterAuthorityEpoch)
       {
         operation.pinnedMasterAuthorityEpoch = masterAuthorityEpoch;
@@ -34261,8 +35120,28 @@ public:
 
   void brainHandler(BrainView *bv, Message *message)
   {
-    uint8_t *args = message->args;
     const BrainTopic incomingTopic = BrainTopic(message->topic);
+    const bool lifecycleCatchup = !internalControlStreamCredentialCurrent(bv, ProdigyTransportCredentialNodeRole::brain);
+    if (lifecycleCatchup)
+    {
+      if (!internalBrainLifecycleStreamAuthorized(bv))
+      {
+        if (bv) bv->rBuffer.clear();
+        queueBrainCloseIfActive(bv, "retired-transport-credential", -EACCES);
+        return;
+      }
+      if (incomingTopic != BrainTopic::registration && incomingTopic != BrainTopic::advertiseCapabilities &&
+          incomingTopic != BrainTopic::acknowledgeCapabilities && incomingTopic != BrainTopic::replicateMasterAuthorityState &&
+          incomingTopic != BrainTopic::observeAuthorityElection)
+      {
+        // The peer may already have completed the rotation and queued ordinary
+        // startup frames before learning that this replica still needs catchup.
+        // Ignore those frames without authority or side effects; keep the
+        // authenticated snapshot path open so the two ledgers can converge.
+        return;
+      }
+    }
+    uint8_t *args = message->args;
     if ((incomingTopic == BrainTopic::replicateDeployment ||
          incomingTopic == BrainTopic::replicateSystemContainerArtifact ||
          incomingTopic == BrainTopic::updateBundle) &&
@@ -34817,6 +35696,8 @@ public:
           uint8_t *args = message->args;
           const uint128_t previousMasterUUID = getExistingMasterUUID();
           const bool peerRegistrationWasFresh = bv->registrationFresh;
+          const uint128_t previousPeerUUID = bv->uuid;
+          const int64_t previousPeerBootNs = bv->boottimens;
           const bool peerPreviouslyClaimedMaster =
               bv->uuid != 0 && bv->existingMasterUUID == bv->uuid;
           const bool peerWasSelectedMaster =
@@ -34832,7 +35713,11 @@ public:
           Message::extractToString(args, bv->kernel);
           Message::extractToString(args, bv->osID);
           Message::extractToString(args, bv->osVersionID);
+          if (internalTransportAEGISRequired() && bv->uuid != bv->tlsPeerUUID)
+          { queueBrainCloseIfActive(bv, "registration-credential-identity", -EACCES); break; }
           bv->registrationFresh = true;
+          if (!peerRegistrationWasFresh || bv->uuid != previousPeerUUID || bv->boottimens != previousPeerBootNs)
+            bv->clearAuthorityElectionObservation();
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
@@ -34843,6 +35728,8 @@ public:
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
           bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+          bv->transportCredentialLifecycleCapabilityAcknowledged = false;
+          bv->authorityElectionCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
@@ -34850,10 +35737,11 @@ public:
           {
             const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024) : 0);
+                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
+          if (lifecycleCatchup) break;
           if (bv->machine != nullptr)
           {
             bv->machine->kernel = bv->kernel;
@@ -35148,6 +36036,36 @@ public:
             maybeDeriveOnMasterMissingAgreement("response");
           }
 
+          break;
+        }
+      case BrainTopic::observeAuthorityElection:
+        {
+          if (!ProdigyIngressValidation::validateBrainPayload(message->topic, args, message->terminal()) ||
+              !authorityElectionPeerCapable(bv)) break;
+          uint8_t response = 0;
+          uint64_t nonce = 0, generation = 0;
+          String digest;
+          Message::extractArg<ArgumentNature::fixed>(args, response);
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractArg<ArgumentNature::fixed>(args, generation);
+          Message::extractToStringView(args, digest);
+          if (!response)
+          {
+            // The parsed digest is an immutable view of the inbound frame.
+            // Hash the local state into a separately owned response buffer.
+            String responseDigest;
+            if (localAuthorityElectionFrontier(generation, responseDigest))
+            {
+              Message::construct(bv->wBuffer, BrainTopic::observeAuthorityElection,
+                  uint8_t(1), nonce, generation, responseDigest);
+              Ring::queueSend(bv);
+            }
+          }
+          else if (acceptAuthorityElectionFrontier(bv, nonce, generation, digest) &&
+                   noMasterYet && !weAreMaster)
+          {
+            deriveMasterBrain();
+          }
           break;
         }
       case BrainTopic::peerHeartbeat:
@@ -35477,7 +36395,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024) : 0);
+                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -35494,6 +36412,8 @@ public:
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
           bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+          bv->transportCredentialLifecycleCapabilityAcknowledged = false;
+          bv->authorityElectionCapabilityAcknowledged = false;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(1)) != 0)
             bv->placementPolicyCapabilityAcknowledged = true;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(2)) != 0 &&
@@ -35518,6 +36438,10 @@ public:
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(512)) != 0;
             bv->localCousinServicePermissionBaselineCapabilityAcknowledged =
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(1024)) != 0;
+            bv->transportCredentialLifecycleCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(2048)) != 0;
+            bv->authorityElectionCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(4096)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -35531,6 +36455,21 @@ public:
 
           if (weAreMaster)
           {
+            if (lifecycleCatchup)
+            {
+              // This receipt only proves the peer has obtained the current
+              // durable snapshot. Retire the old session so reconnect can use
+              // its staged/current successor; never record this as a vote.
+              ProdigyMasterAuthorityStateTransitionAck acknowledgement;
+              String current, digest;
+              if (BitseryEngine::deserializeSafe(serialized, acknowledgement) &&
+                  acknowledgement.peerUUID == bv->uuid && acknowledgement.peerBootNs == bv->boottimens &&
+                  acknowledgement.generation == masterAuthorityRuntimeState.generation &&
+                  serializeCurrentMasterAuthorityTransition(current, digest) &&
+                  acknowledgement.transitionDigest.equals(digest))
+                queueBrainCloseIfActive(bv, "lifecycle-credential-reconnect");
+              break;
+            }
             ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
             if (BitseryEngine::deserializeSafe(serialized, acknowledgement))
             {
@@ -42056,6 +42995,29 @@ public:
           Message::construct(mothership->wBuffer, MothershipTopic::preparePairedSourceRetirement, serialized);
           break;
         }
+      case MothershipTopic::requestTransportCredentialLifecycle:
+      case MothershipTopic::pullTransportCredentialLifecycle:
+        {
+          String encoded; Message::extractToStringView(args, encoded);
+          ProdigyTransportCredentialLifecycleResponse response;
+          if (MothershipTopic(message->topic) == MothershipTopic::requestTransportCredentialLifecycle)
+          {
+            ProdigyTransportCredentialLifecycleRequest request;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, request))
+              (void)requestTransportCredentialLifecycle(request, response);
+            else response.failure.assign("invalid transport credential lifecycle request"_ctv);
+          }
+          else
+          {
+            ProdigyTransportCredentialLifecycleQuery query;
+            if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
+              response = queryTransportCredentialLifecycle(query);
+            else response.failure.assign("invalid transport credential lifecycle query"_ctv);
+          }
+          String serialized; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic(message->topic), serialized);
+          break;
+        }
       case MothershipTopic::enrollClusterPair:
       case MothershipTopic::pullClusterPairEnrollment:
         {
@@ -44139,19 +45101,31 @@ public:
     const uint64_t authorityEpoch = masterAuthorityEpoch;
     const uint64_t validationGeneration = neuron->artifactCapabilityValidationGeneration;
     neuron->artifactCapabilityPending = true;
+    auto finishCurrentValidation = [this, neuron, generation, authorityEpoch, validationGeneration, peerDigest] {
+      if (!neurons.contains(neuron) || neuron->ioGeneration != generation ||
+          !prodigyNeuronArtifactCapabilityValidationMatches(neuron, generation, validationGeneration)) return false;
+      neuron->artifactCapabilityPending = false;
+      if (masterAuthorityEpoch != authorityEpoch)
+      {
+        // Promotion can retain this socket while its old-epoch measurement is
+        // still in flight. Discard that result and let the same owner measure
+        // again; otherwise the promotion pass leaves it permanently pending.
+        if (isActiveMaster() && streamIsActive(neuron) &&
+            internalControlStreamCredentialCurrent(neuron, ProdigyTransportCredentialNodeRole::neuron))
+          establishNeuronArtifactCapability(neuron, peerDigest);
+        return false;
+      }
+      return streamIsActive(neuron);
+    };
     if (!artifactIO->submit(0,
         [localDigest] {
           String executable;
           if (prodigyResolveCurrentExecutablePath(executable))
             (void)prodigyResolveInstalledBundleDigestForExecutable(executable, *localDigest);
         },
-        [this, neuron, generation, authorityEpoch, validationGeneration, localDigest, peerDigest] {
-          if (neurons.contains(neuron) && neuron->ioGeneration == generation &&
-              masterAuthorityEpoch == authorityEpoch &&
-              prodigyNeuronArtifactCapabilityValidationMatches(neuron, generation, validationGeneration) &&
-              streamIsActive(neuron))
+        [this, neuron, generation, authorityEpoch, localDigest, peerDigest, finishCurrentValidation] {
+          if (finishCurrentValidation())
           {
-            neuron->artifactCapabilityPending = false;
             neuron->artifactChunksEnabled = !localDigest->empty() && localDigest->equals(peerDigest);
             if (neuron->artifactChunksEnabled)
             {
@@ -44163,9 +45137,8 @@ public:
                 !updateSelfWorkerStagedMachineUUIDs.contains(neuron->machine->uuid))
               noteWorkerRegistration(neuron, peerDigest);
           }
-        }, [this, neuron, generation, authorityEpoch, validationGeneration](std::exception_ptr) {
-          if (neurons.contains(neuron) && masterAuthorityEpoch == authorityEpoch &&
-              prodigyNeuronArtifactCapabilityValidationMatches(neuron, generation, validationGeneration))
+        }, [this, neuron, finishCurrentValidation](std::exception_ptr) {
+          if (finishCurrentValidation())
           {
             std::fprintf(stderr, "neuron artifact capability digest worker failed\n");
             queueCloseIfActive(neuron);
@@ -44175,6 +45148,32 @@ public:
       neuron->artifactCapabilityPending = false;
       queueCloseIfActive(neuron);
     }
+  }
+
+  // A promoted Brain inherits live Neuron sockets, but artifact attestations
+  // are scoped to the measuring master's epoch. Re-measure only an already
+  // verified digest on an active stream; no stale stream gains authority.
+  uint32_t revalidateNeuronArtifactCapabilitiesForCurrentAuthorityEpoch(void)
+  {
+    uint32_t revalidated = 0;
+    for (NeuronView *neuron : neurons)
+    {
+      if (neuron == nullptr || neuron->machine == nullptr ||
+          streamIsActive(neuron) == false || neuron->artifactCapabilityPending ||
+          neuron->artifactChunksEnabled == false ||
+          neuron->verifiedInstalledBundleIOGeneration != neuron->ioGeneration ||
+          neuron->verifiedInstalledBundleAuthorityEpoch == masterAuthorityEpoch ||
+          prodigyIsSHA256HexDigest(neuron->verifiedInstalledBundleSHA256) == false ||
+          internalControlStreamCredentialCurrent(neuron, ProdigyTransportCredentialNodeRole::neuron) == false)
+      {
+        continue;
+      }
+      String digest = neuron->verifiedInstalledBundleSHA256.substr(
+          0, neuron->verifiedInstalledBundleSHA256.size(), Copy::yes);
+      establishNeuronArtifactCapability(neuron, digest);
+      ++revalidated;
+    }
+    return revalidated;
   }
 
   bool queueNeuronStoredArtifact(NeuronView *neuron, uint64_t deploymentID)
@@ -44296,6 +45295,15 @@ public:
 
   void neuronHandler(NeuronView *neuron, Message *message)
   {
+    const auto *lifecycle = neuron && neuron->machine ? unfinishedTransportCredentialLifecycle(neuron->machine->uuid) : nullptr;
+    if (!internalControlStreamCredentialCurrent(neuron, ProdigyTransportCredentialNodeRole::neuron) &&
+        !(NeuronTopic(message->topic) == NeuronTopic::transportCredentialLifecycleAck && lifecycle &&
+          transportLifecycleNeuronAuthorized(neuron, *lifecycle)))
+    {
+      if (neuron) neuron->rBuffer.clear();
+      queueCloseIfActive(neuron);
+      return;
+    }
     uint8_t *args = message->args;
     uint8_t *terminal = message->terminal();
 
@@ -44319,6 +45327,17 @@ public:
       // NeuronTopic::stateUpload containers{4} fragment(4)
 
       // maybe we should send it our registration... saying that we just became master and don't have data?
+      case NeuronTopic::transportCredentialLifecycleAck:
+        {
+          uint128_t nonce = 0;
+          uint64_t generation = 0;
+          uint8_t accepted = 0;
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractArg<ArgumentNature::fixed>(args, generation);
+          Message::extractArg<ArgumentNature::fixed>(args, accepted);
+          acknowledgeTransportCredentialLifecycleProjection(neuron, nonce, generation, accepted == 1);
+          break;
+        }
       case NeuronTopic::transportCredentialPeersAck:
         {
           uint128_t nonce = 0;
@@ -44427,10 +45446,28 @@ public:
           if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, cousinDiscoveryVersion);
           neuron->cousinDiscoveryCapable = cousinDiscoveryVersion == 1 && neuron->clusterPairProjectionCapable;
           neuron->cousinDiscoveryVersion = neuron->cousinDiscoveryCapable ? cousinDiscoveryVersion : 0;
+          uint8_t lifecycleVersion = 0;
+          if (args < message->terminal()) Message::extractArg<ArgumentNature::fixed>(args, lifecycleVersion);
+          neuron->transportCredentialLifecycleCapable = lifecycleVersion == 1 && neuron->transportPeerProjectionCapable;
           neuron->clusterPairProjectionNonce = 0;
           neuron->clusterPairProjectionAcknowledgedFingerprint.clear();
           neuron->transportPeerProjectionIOGeneration = neuron->ioGeneration;
           neuron->transportPeerProjectionAuthorityEpoch = masterAuthorityEpoch;
+          const auto *lifecycle = unfinishedTransportCredentialLifecycle(machine->uuid);
+          if (lifecycle && lifecycle->lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active)
+          {
+            refreshNeuronControlHandshakeWatchdog(neuron, "transport-lifecycle-registration");
+            driveTransportCredentialEnrollmentOperations();
+            // A successor registration remains administrative until the
+            // exact active credential is current. Once it is current, retain
+            // its artifact attestation through the existing verifier without
+            // admitting state replay on this lifecycle-only frame.
+            if (internalControlStreamCredentialCurrent(neuron, ProdigyTransportCredentialNodeRole::neuron))
+            {
+              establishNeuronArtifactCapability(neuron, installedBundleDigest);
+            }
+            break;
+          }
           establishNeuronArtifactCapability(neuron, installedBundleDigest);
           noteWorkerRegistration(neuron, installedBundleDigest);
           // A digest-matching post-exec registration proves the intended

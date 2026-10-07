@@ -48,11 +48,15 @@ public:
 
 class ProjectionReceiptTestNeuron final : public Neuron {
 public:
+  using Neuron::beginAcceptedBrainTransportTLS;
   uint32_t projectionPersistenceCalls = 0;
   bool admitProjectionPersistence = true;
   std::deque<std::function<void(bool)>> projectionReceipts;
   uint32_t pairProjectionPersistenceCalls = 0;
   std::deque<std::function<void(bool)>> pairProjectionReceipts;
+  uint32_t lifecycleProjectionPersistenceCalls = 0;
+  bool admitLifecycleProjectionPersistence = true;
+  std::deque<std::function<void(bool)>> lifecycleProjectionReceipts;
 
   bool persistTransportCredentialPeerProjection(
       const ProdigyTransportCredentialBootstrap&, std::function<void(bool)> completion) override
@@ -82,6 +86,23 @@ public:
   {
     if (pairProjectionReceipts.empty()) return;
     auto completion = std::move(pairProjectionReceipts.front()); pairProjectionReceipts.pop_front(); completion(durable);
+  }
+
+  bool persistTransportCredentialLifecycleProjection(
+      const ProdigyTransportCredentialLifecycleProjection&, std::function<void(bool)> completion) override
+  {
+    ++lifecycleProjectionPersistenceCalls;
+    if (!admitLifecycleProjectionPersistence) return false;
+    lifecycleProjectionReceipts.push_back(std::move(completion));
+    return true;
+  }
+
+  void finishLifecycleProjectionPersistence(bool durable)
+  {
+    if (lifecycleProjectionReceipts.empty()) return;
+    auto completion = std::move(lifecycleProjectionReceipts.front());
+    lifecycleProjectionReceipts.pop_front();
+    completion(durable);
   }
 };
 
@@ -130,23 +151,140 @@ static ProdigyTransportCredentialEnrollment projectionEnrollment(uint128_t opera
   return enrollment;
 }
 
+static ProdigyTransportCredentialEnrollment projectionNeuronEnrollment(uint128_t operationUUID, uint128_t nodeUUID,
+                                                                        uint64_t generation)
+{
+  auto enrollment = projectionEnrollment(operationUUID, nodeUUID, generation);
+  enrollment.role = ProdigyTransportCredentialNodeRole::neuron;
+  return enrollment;
+}
+
+static ProdigyTransportCredentialAuthorityRoot projectionCredentialAuthorityRoot()
+{
+  ProdigyTransportCredentialAuthorityRoot authority = {};
+  authority.authorityEpoch = 7;
+  authority.keyEpoch = 9;
+  authority.authorityGeneration = 10;
+  std::memset(authority.root, 0x5a, sizeof(authority.root));
+  return authority;
+}
+
 static ProdigyTransportCredentialBootstrap projectionCredentialBootstrap(uint128_t neuronUUID, uint128_t brainUUID,
                                                                           uint64_t revision)
 {
+  const auto authority = projectionCredentialAuthorityRoot();
+  const auto neuron = projectionNeuronEnrollment(0x7102, neuronUUID, 10);
+  const auto brain = projectionEnrollment(0x7103, brainUUID, 10);
+  const Vector<ProdigyTransportCredentialEnrollment> ledger = {brain, neuron};
   ProdigyTransportCredentialBootstrap bootstrap = {};
-  bootstrap.enabled = true;
-  bootstrap.self.operationUUID = uint128_t(0x7102);
-  bootstrap.self.nodeUUID = neuronUUID;
-  bootstrap.self.clusterUUID = uint128_t(0x7101);
-  bootstrap.self.authorityEpoch = 7;
-  bootstrap.self.keyEpoch = 9;
-  bootstrap.self.authorityGeneration = 10;
-  bootstrap.self.rootAuthorityGeneration = 10;
-  bootstrap.self.role = ProdigyTransportCredentialNodeRole::neuron;
-  std::memset(bootstrap.self.secret, 0x5a, sizeof(bootstrap.self.secret));
-  bootstrap.authorizedPeers.push_back(projectionEnrollment(0x7103, brainUUID, 10));
-  bootstrap.committedAuthorityGeneration = revision;
+  (void)prodigyBuildTransportCredentialBootstrap(authority, neuron, ledger, true, bootstrap, revision);
   return bootstrap;
+}
+
+static bool beginProjectionBrainControlTransport(ProjectionReceiptTestNeuron& neuron, NeuronBrainControlStream& stream,
+                                                 ProdigyTransportTLSStream& remote,
+                                                 const ProdigyTransportCredentialBootstrap& bootstrap,
+                                                 bool installCredentials = true)
+{
+  if (!prodigyTransportCredentialBootstrapValid(bootstrap) ||
+      bootstrap.self.role != ProdigyTransportCredentialNodeRole::neuron ||
+      bootstrap.authorizedPeers.size() != 1) return false;
+  const auto authority = projectionCredentialAuthorityRoot();
+  const auto brain = bootstrap.authorizedPeers.front();
+  ProdigyTransportCredentialEnrollment local = {};
+  local.operationUUID = bootstrap.self.operationUUID;
+  local.nodeUUID = bootstrap.self.nodeUUID;
+  local.clusterUUID = bootstrap.self.clusterUUID;
+  local.authorityEpoch = bootstrap.self.authorityEpoch;
+  local.keyEpoch = bootstrap.self.keyEpoch;
+  local.authorityGeneration = bootstrap.self.authorityGeneration;
+  local.role = bootstrap.self.role;
+  local.state = ProdigyTransportCredentialEnrollmentState::active;
+  if (brain.role != ProdigyTransportCredentialNodeRole::brain ||
+      bootstrap.self.rootAuthorityGeneration != authority.authorityGeneration) return false;
+  const Vector<ProdigyTransportCredentialEnrollment> ledger = {brain, local};
+  ProdigyTransportCredentialPrelude brainPrelude = {};
+  brainPrelude.operationUUID = brain.operationUUID;
+  brainPrelude.nodeUUID = brain.nodeUUID;
+  brainPrelude.authorityEpoch = brain.authorityEpoch;
+  brainPrelude.keyEpoch = brain.keyEpoch;
+  brainPrelude.authorityGeneration = brain.authorityGeneration;
+  brainPrelude.role = brain.role;
+  String encodedBrainPrelude = {};
+  if (installCredentials) neuron.controlTransportCredentials = bootstrap;
+  return prodigyRenderTransportCredentialPrelude(brainPrelude, encodedBrainPrelude) &&
+      neuron.beginAcceptedBrainTransportTLS(&stream) &&
+      remote.beginTransportAEGISWithPrelude(false, brain.nodeUUID, encodedBrainPrelude,
+          [authority, ledger, brain](const String& claimed, std::array<uint8_t, 32>& psk,
+                                     String& context, uint128_t& peerUUID) {
+            return prodigyResolveBrainTransportCredentialPeer(authority, ledger, brain.nodeUUID, brain.role,
+                claimed, "brain-neuron"_ctv, psk.data(), context, peerUUID);
+          }) &&
+      completeProjectionTransportHandshake(remote, stream);
+}
+
+static ProdigyTransportCredentialLifecycleProjection projectionCredentialRotation(
+    const ProdigyTransportCredentialBootstrap& source, uint128_t operationUUID)
+{
+  ProdigyTransportCredentialLifecycleProjection projection = {};
+  projection.protocolVersion = 1;
+  auto& operation = projection.operation;
+  operation.protocolVersion = 2;
+  operation.lifecycleOperationUUID = operationUUID;
+  operation.predecessor.operationUUID = source.self.operationUUID;
+  operation.predecessor.nodeUUID = source.self.nodeUUID;
+  operation.predecessor.clusterUUID = source.self.clusterUUID;
+  operation.predecessor.authorityEpoch = source.self.authorityEpoch;
+  operation.predecessor.keyEpoch = source.self.keyEpoch;
+  operation.predecessor.authorityGeneration = source.self.authorityGeneration;
+  operation.predecessor.role = source.self.role;
+  operation.predecessor.state = ProdigyTransportCredentialEnrollmentState::active;
+  operation.successor = operation.predecessor;
+  operation.successor.operationUUID = operationUUID + 1;
+  operation.successor.authorityGeneration = source.committedAuthorityGeneration + 1;
+  operation.successor.state = ProdigyTransportCredentialEnrollmentState::pending;
+  for (const auto& peer : source.authorizedPeers) operation.electorate.push_back(peer.nodeUUID);
+  operation.frozenAuthorityGeneration = source.committedAuthorityGeneration;
+  operation.transitionGeneration = source.committedAuthorityGeneration + 1;
+  operation.pinnedMasterAuthorityEpoch = source.self.authorityEpoch;
+  projection.committedAuthorityGeneration = operation.transitionGeneration;
+  projection.target = source;
+  projection.target.committedAuthorityGeneration = projection.committedAuthorityGeneration;
+  const auto authority = projectionCredentialAuthorityRoot();
+  auto successor = operation.successor;
+  successor.state = ProdigyTransportCredentialEnrollmentState::active;
+  (void)prodigyDeriveTransportNodeCredential(authority, successor, projection.target.self);
+  return projection;
+}
+
+static ProdigyTransportCredentialLifecycleProjection projectionCredentialRevocation(
+    const ProdigyTransportCredentialBootstrap& source, uint128_t operationUUID)
+{
+  auto projection = projectionCredentialRotation(source, operationUUID);
+  projection.operation.lifecycleKind = ProdigyTransportCredentialLifecycleKind::revoke;
+  projection.operation.successor = {};
+  projection.operation.predecessor.state = ProdigyTransportCredentialEnrollmentState::revoked;
+  projection.operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::active;
+  projection.operation.activationGeneration = projection.operation.transitionGeneration;
+  projection.target = {};
+  return projection;
+}
+
+static bool projectionLifecycleAck(NeuronBrainControlStream& stream, uint128_t nonce,
+                                   uint64_t revision, bool accepted)
+{
+  if (stream.wBuffer.empty()) return false;
+  auto *message = reinterpret_cast<Message *>(stream.wBuffer.data());
+  if (message->topic != uint16_t(NeuronTopic::transportCredentialLifecycleAck) ||
+      !ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal())) return false;
+  uint8_t *args = message->args;
+  uint128_t actualNonce = 0;
+  uint64_t actualRevision = 0;
+  uint8_t actualAccepted = 0;
+  Message::extractArg<ArgumentNature::fixed>(args, actualNonce);
+  Message::extractArg<ArgumentNature::fixed>(args, actualRevision);
+  Message::extractArg<ArgumentNature::fixed>(args, actualAccepted);
+  return actualNonce == nonce && actualRevision == revision && actualAccepted == uint8_t(accepted);
 }
 
 static ClusterPairControlEndpoint runtimePairControlEndpoint(
@@ -320,6 +458,164 @@ static void testPersistentWriterDetachesViewBackedSchemaFields(TestSuite& suite)
   suite.expect(detachedMap && nested != snapshot.brainConfig.dnsCredential.metadata.end() &&
                    nested->second.equals("nested-secret"_ctv),
                "runtime_persistence_writer_detaches_nested_map_views");
+}
+
+static void testPersistentWriterPreservesTransportLifecycleSchema(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto original = projectionCredentialBootstrap(0x7171, 0x7172, 11);
+  // The delivered cohort was admitted by an already enrolled Brain voter.
+  const auto enrolledNeuron = projectionNeuronEnrollment(original.self.operationUUID, original.self.nodeUUID, 11);
+  suite.expect(prodigyDeriveTransportNodeCredential(projectionCredentialAuthorityRoot(), enrolledNeuron, original.self),
+      "runtime_lifecycle_writer_builds_delivered_cohort_after_its_voter");
+  const auto projection = projectionCredentialRotation(original, 0x7173);
+  ProdigyPersistentBrainSnapshot snapshot;
+  snapshot.brainConfig.clusterUUID = original.self.clusterUUID;
+  auto& authority = snapshot.masterAuthority.runtimeState;
+  authority.generation = projection.committedAuthorityGeneration;
+  authority.transportCredentialAuthorityRoot = projectionCredentialAuthorityRoot();
+  authority.transportCredentialEnrollments = {original.authorizedPeers.front(), projection.operation.predecessor};
+  ProdigyTransportCredentialEnrollmentOperation legacy;
+  legacy.enrollment = projection.operation.predecessor;
+  legacy.electorate = projection.operation.electorate;
+  legacy.pinnedMasterAuthorityEpoch = projection.operation.pinnedMasterAuthorityEpoch;
+  legacy.transitionGeneration = original.committedAuthorityGeneration;
+  legacy.phase = ProdigyTransportCredentialEnrollmentOperationPhase::delivered;
+  authority.transportCredentialEnrollmentOperations = {legacy, projection.operation};
+  ProdigyPersistentLocalBrainState local;
+  local.uuid = original.self.nodeUUID;
+  local.ownerClusterUUID = original.self.clusterUUID;
+  local.transportCredentials = original;
+  ProdigyTransportCredentialBootstrap staged;
+  bool revoked = false;
+  suite.expect(prodigyApplyLocalTransportCredentialLifecycleProjection(local, projection, staged, revoked) && !revoked,
+      "runtime_lifecycle_writer_builds_valid_staged_local_record");
+  const auto expectedSnapshot = snapshot;
+  const auto expectedLocal = local;
+  suite.expect(ProdigyPersistentStateWriter::detach(snapshot) && ProdigyPersistentStateWriter::detach(local) &&
+      prodigyPersistentSerializedEqual(snapshot, expectedSnapshot) && prodigyPersistentSerializedEqual(local, expectedLocal) &&
+      authority.transportCredentialEnrollmentOperations == expectedSnapshot.masterAuthority.runtimeState.transportCredentialEnrollmentOperations,
+      "runtime_lifecycle_owning_visitor_preserves_legacy_receipt_lifecycle_operation_and_local_projection");
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_lifecycle_writer_starts");
+  if (!io) return;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io);
+  uint32_t receipts = 0;
+  bool allDurable = true;
+  auto completed = [&](auto&& result) {
+    ++receipts; allDurable &= result.durable;
+    if (receipts == 2) Ring::exit = true;
+  };
+  const bool snapshotQueued = writer->submitSnapshot(snapshot, runtimePersistenceBootState(),
+      ProdigyPersistentStateWriter::retainedBytesFor(snapshot) + 1048576, completed);
+  const bool localQueued = writer->submitLocalBrainState(local, ProdigyPersistentStateWriter::retainedBytesFor(local) + 65536, completed);
+  suite.expect(snapshotQueued && localQueued, "runtime_lifecycle_writer_admits_snapshot_and_local_projection");
+  ring.armDeadline(5000); Ring::start();
+  suite.expect(!ring.timedOut && receipts == 2 && allDurable && writer->drainForExec(),
+      "runtime_lifecycle_writer_commits_both_exact_durable_records");
+  writer.reset(); io->stop(); ring.drainStoppedIO(); io.reset(); store.close();
+  ProdigyPersistentStateStore reopened(root.path);
+  ProdigyPersistentBrainSnapshot loadedSnapshot;
+  ProdigyPersistentLocalBrainState loadedLocal;
+  String failure;
+  suite.expect(reopened.loadBrainSnapshot(loadedSnapshot, &failure) && reopened.loadLocalBrainState(loadedLocal, &failure) &&
+      loadedSnapshot.masterAuthority.runtimeState.transportCredentialEnrollmentOperations ==
+          expectedSnapshot.masterAuthority.runtimeState.transportCredentialEnrollmentOperations &&
+      prodigyPersistentSerializedEqual(loadedLocal, expectedLocal),
+      "runtime_lifecycle_writer_reopens_exact_operations_and_staged_secret");
+  reopened.close();
+}
+
+static void testTerminalLocalBrainFenceOverridesOlderSnapshot(TestSuite& suite)
+{
+  PersistenceRing ring;
+  const auto root = projectionCredentialAuthorityRoot();
+  const auto ownBrain = projectionEnrollment(0x7181, 0x7180, 10);
+  const auto peerBrain = projectionEnrollment(0x7183, 0x7182, 10);
+  const auto ownNeuron = projectionNeuronEnrollment(0x7184, 0x7180, 10);
+  const Vector<ProdigyTransportCredentialEnrollment> ledger = {ownBrain, peerBrain, ownNeuron};
+  ProdigyPersistentLocalBrainState local;
+  const bool built = prodigyBuildLocalTransportCredentialState(root, ledger, ownBrain.nodeUUID,
+      ProdigyTransportCredentialNodeRole::brain, local, 10);
+  suite.expect(built, "runtime_terminal_brain_fixture_has_separate_brain_and_neuron_credentials");
+  if (!built) return;
+  const auto original = local;
+  ProdigyTransportCredentialLifecycleProjection prepared;
+  prepared.protocolVersion = 1;
+  auto& operation = prepared.operation;
+  operation.protocolVersion = 2;
+  operation.lifecycleOperationUUID = 0x7185;
+  operation.lifecycleKind = ProdigyTransportCredentialLifecycleKind::revoke;
+  operation.predecessor = ownBrain;
+  operation.electorate = {ownBrain.nodeUUID, peerBrain.nodeUUID};
+  operation.frozenAuthorityGeneration = 10;
+  operation.transitionGeneration = prepared.committedAuthorityGeneration = 11;
+  operation.pinnedMasterAuthorityEpoch = 7;
+  (void)prodigyBuildLocalNeuronTransportCredentialBootstrap(local, prepared.target);
+  prepared.target.authorizedPeers = {peerBrain};
+  prepared.target.committedAuthorityGeneration = 11;
+  auto active = prepared;
+  active.operation.predecessor.state = ProdigyTransportCredentialEnrollmentState::revoked;
+  active.operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::active;
+  active.operation.activationGeneration = active.operation.transitionGeneration = 12;
+  active.committedAuthorityGeneration = active.target.committedAuthorityGeneration = 12;
+  ProdigyTransportCredentialBootstrap neuronCredential;
+  bool revoked = false;
+  const bool applied = prodigyApplyLocalTransportCredentialLifecycleProjection(local, prepared, neuronCredential, revoked) &&
+      prodigyApplyLocalTransportCredentialLifecycleProjection(local, active, neuronCredential, revoked);
+  suite.expect(applied && !revoked && prodigyLocalBrainTransportCredentialRevoked(local),
+      "runtime_terminal_brain_fixture_durably_fences_only_the_brain_role");
+  if (!applied) return;
+  ProdigyMasterAuthorityRuntimeState older;
+  older.generation = 11;
+  older.transportCredentialAuthorityRoot = root;
+  older.transportCredentialEnrollments = ledger;
+  older.transportCredentialEnrollmentOperations = {prepared.operation};
+  const auto terminal = local;
+  suite.expect(prodigyRestoreLocalTransportCredentialsFromAuthority(older, ProdigyTransportCredentialNodeRole::brain, local) &&
+      prodigyPersistentSerializedEqual(local, terminal) && local.transportCredentials.self.secretIsZero() &&
+      prodigyBuildLocalNeuronTransportCredentialBootstrap(local, neuronCredential) &&
+      neuronCredential.self.nodeUUID == ownNeuron.nodeUUID && !neuronCredential.self.secretIsZero() &&
+      neuronCredential.authorizedPeers == Vector<ProdigyTransportCredentialEnrollment>{peerBrain},
+      "runtime_terminal_brain_restore_preserves_local_fence_and_healthy_neuron");
+
+  const auto savedLocal = persistentLocalBrainState;
+  auto *savedNeuron = thisNeuron;
+  ProjectionReceiptTestNeuron neuron;
+  neuron.uuid = ownNeuron.nodeUUID;
+  thisNeuron = &neuron;
+  ProdigyHostControlNetwork network;
+  persistentLocalBrainState = original;
+  {
+    ProdigyBrain brain(network, {});
+    brain.brainConfig.clusterUUID = ownBrain.clusterUUID;
+    brain.masterAuthorityRuntimeState = older;
+    brain.weAreMaster = true;
+    suite.expect(brain.localInternalTransportCredentialCurrent() && brain.isActiveMaster(),
+        "runtime_terminal_brain_old_snapshot_would_authorize_predecessor_without_local_fence");
+    persistentLocalBrainState = local;
+    ProdigyTransportTLSStream incoming, outgoing;
+    suite.expect(!brain.localInternalTransportCredentialCurrent() && !brain.localBrainEligibleForMasterElection() &&
+        !brain.isActiveMaster() &&
+        !brain.beginInternalControlTransport(&incoming, true, ProdigyTransportCredentialNodeRole::brain, peerBrain.nodeUUID) &&
+        !brain.beginInternalControlTransport(&outgoing, false, ProdigyTransportCredentialNodeRole::brain, peerBrain.nodeUUID) &&
+        !incoming.transportEncryptionEnabled() && !outgoing.transportEncryptionEnabled() &&
+        brain.masterAuthorityRuntimeState == older,
+        "runtime_terminal_brain_persisted_fence_denies_election_and_both_handshake_directions_without_rewriting_authority");
+    brain.masterAuthorityRuntimeState = {};
+    brain.transportCredentialBootstrapRequired = false;
+    suite.expect(!brain.internalTransportAEGISRequired() &&
+        !brain.localInternalTransportCredentialCurrent() && !brain.localBrainEligibleForMasterElection() &&
+        !brain.isActiveMaster() &&
+        !brain.beginInternalControlTransport(&incoming, true, ProdigyTransportCredentialNodeRole::brain, peerBrain.nodeUUID) &&
+        !brain.beginInternalControlTransport(&outgoing, false, ProdigyTransportCredentialNodeRole::brain, peerBrain.nodeUUID) &&
+        !incoming.transportEncryptionEnabled() && !outgoing.transportEncryptionEnabled(),
+        "runtime_terminal_brain_persisted_fence_precedes_legacy_transport_fallback_without_loaded_authority");
+  }
+  thisNeuron = savedNeuron;
+  persistentLocalBrainState = savedLocal;
 }
 
 static void testPersistentWriterRetainedAccountingChargesManyShortStrings(TestSuite& suite)
@@ -1182,13 +1478,10 @@ static void testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(
   ProjectionReceiptTestNeuron neuron = {};
   NeuronBrainControlStream stream = {};
   ProdigyTransportTLSStream remote = {};
+  const ProdigyTransportCredentialBootstrap original = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   reserveProjectionTransport(stream);
   reserveProjectionTransport(remote);
-  std::array<uint8_t, ProdigyTransportCredentialAuthorityRootBytes> psk = {};
-  psk.fill(0x31);
-  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "runtime-projection"_ctv, neuronUUID, brainUUID) &&
-      remote.beginTransportAEGIS(false, psk.data(), "runtime-projection"_ctv, brainUUID, neuronUUID) &&
-      completeProjectionTransportHandshake(remote, stream);
+  const bool authenticated = beginProjectionBrainControlTransport(neuron, stream, remote, original);
   suite.expect(authenticated, "runtime_persistence_projection_uses_authenticated_aegis_control_stream");
   if (!authenticated) return;
   stream.connected = true;
@@ -1198,7 +1491,6 @@ static void testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(
   stream.isFixedFile = false;
   neuron.brain = &stream;
 
-  const ProdigyTransportCredentialBootstrap original = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   ProdigyTransportCredentialBootstrap projection = original;
   OPENSSL_cleanse(projection.self.secret, sizeof(projection.self.secret));
   projection.committedAuthorityGeneration = 11;
@@ -1270,21 +1562,164 @@ static void testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(
   stream.fd = -1;
 }
 
+static void testNeuronTransportCredentialLifecycleProjectionDurabilityAndCandidateFence(TestSuite& suite)
+{
+  constexpr uint128_t neuronUUID = uint128_t(0x7135), brainUUID = uint128_t(0x7134);
+  PersistenceRing ring = {};
+  (void)ring;
+  ProjectionReceiptTestNeuron neuron = {};
+  NeuronBrainControlStream stream = {};
+  ProdigyTransportTLSStream remote = {};
+  const auto original = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  const auto prepared = projectionCredentialRotation(original, 0x7140);
+  auto active = prepared;
+  active.operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::active;
+  active.operation.predecessor.state = ProdigyTransportCredentialEnrollmentState::revoked;
+  active.operation.successor.state = ProdigyTransportCredentialEnrollmentState::active;
+  active.operation.activationGeneration = active.operation.transitionGeneration = prepared.operation.transitionGeneration + 1;
+  active.committedAuthorityGeneration = active.target.committedAuthorityGeneration = active.operation.transitionGeneration;
+  reserveProjectionTransport(stream);
+  reserveProjectionTransport(remote);
+  const bool authenticated = beginProjectionBrainControlTransport(neuron, stream, remote, original);
+  suite.expect(authenticated, "runtime_transport_lifecycle_uses_scoped_current_control_stream");
+  if (!authenticated) return;
+  stream.connected = true;
+  stream.tlsPeerVerified = true;
+  stream.tlsPeerUUID = brainUUID;
+  stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  neuron.brain = &stream;
+
+  ProdigyTransportCredentialBootstrap unchanged = {};
+  bool revoked = false;
+  auto identityRewrite = prepared;
+  ++identityRewrite.operation.predecessor.nodeUUID;
+  auto operationRewrite = prepared;
+  ++operationRewrite.operation.successor.operationUUID;
+  suite.expect(!neuron.prepareTransportCredentialLifecycleProjection(active, unchanged, revoked) &&
+      !neuron.prepareTransportCredentialLifecycleProjection(identityRewrite, unchanged, revoked) &&
+      !neuron.prepareTransportCredentialLifecycleProjection(operationRewrite, unchanged, revoked),
+      "runtime_transport_lifecycle_requires_exact_stage_identity_and_operation");
+
+  neuron.receiveTransportCredentialLifecycleProjection(0x7141, prepared);
+  const bool awaitingFailedReceipt = neuron.lifecycleProjectionPersistenceCalls == 1 &&
+      neuron.transportPeerProjectionPersistencePending &&
+      neuron.controlTransportCredentialLifecycleProjection.protocolVersion == 0 &&
+      neuron.controlTransportCredentials.self.operationUUID == original.self.operationUUID;
+  stream.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(false);
+  suite.expect(awaitingFailedReceipt && projectionLifecycleAck(stream, 0x7141,
+      prepared.committedAuthorityGeneration, false) &&
+      neuron.controlTransportCredentialLifecycleProjection.protocolVersion == 0,
+      "runtime_transport_lifecycle_failed_receipt_does_not_stage_or_install");
+  stream.wBuffer.clear();
+
+  neuron.receiveTransportCredentialLifecycleProjection(0x7142, prepared);
+  ++stream.ioGeneration;
+  stream.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(true);
+  suite.expect(neuron.controlTransportCredentialLifecycleProjection.protocolVersion == 0 && stream.wBuffer.empty(),
+      "runtime_transport_lifecycle_stale_io_receipt_cannot_stage_or_ack");
+
+  neuron.receiveTransportCredentialLifecycleProjection(0x7143, prepared);
+  stream.connectionLifetime = std::make_shared<uint8_t>(0);
+  stream.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(true);
+  suite.expect(neuron.controlTransportCredentialLifecycleProjection.protocolVersion == 0 && stream.wBuffer.empty(),
+      "runtime_transport_lifecycle_retired_connection_receipt_cannot_stage_or_ack");
+
+  neuron.receiveTransportCredentialLifecycleProjection(0x7144, prepared);
+  const bool awaitingStage = neuron.transportPeerProjectionPersistencePending &&
+      neuron.lifecycleProjectionPersistenceCalls == 4 && neuron.controlTransportCredentials.self.operationUUID == original.self.operationUUID;
+  stream.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(true);
+  suite.expect(awaitingStage && projectionLifecycleAck(stream, 0x7144, prepared.committedAuthorityGeneration, true) &&
+      neuron.controlTransportCredentialLifecycleProjection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::prepared &&
+      neuron.controlTransportCredentials.self.operationUUID == original.self.operationUUID,
+      "runtime_transport_lifecycle_durable_stage_preserves_current_credential_until_activation");
+  stream.wBuffer.clear();
+  stream.pendingSend = false;
+
+  auto secretRewrite = prepared;
+  secretRewrite.target.self.secret[0] ^= 1;
+  suite.expect(!neuron.prepareTransportCredentialLifecycleProjection(secretRewrite, unchanged, revoked),
+      "runtime_transport_lifecycle_durable_stage_pins_exact_successor_secret");
+
+  NeuronBrainControlStream alternating = {};
+  ProdigyTransportTLSStream alternatingRemote = {};
+  reserveProjectionTransport(alternating);
+  reserveProjectionTransport(alternatingRemote);
+  const bool oldAuthenticated = beginProjectionBrainControlTransport(neuron, alternating, alternatingRemote, original, false);
+  alternating.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  suite.expect(oldAuthenticated && !alternating.transportLifecycleCandidate,
+      "runtime_transport_lifecycle_first_staged_reconnect_retains_current_credential");
+
+  NeuronBrainControlStream candidate = {};
+  ProdigyTransportTLSStream candidateRemote = {};
+  reserveProjectionTransport(candidate);
+  reserveProjectionTransport(candidateRemote);
+  const bool candidateAuthenticated = beginProjectionBrainControlTransport(neuron, candidate, candidateRemote,
+      prepared.target, false);
+  candidate.connected = candidateAuthenticated;
+  candidate.tlsPeerVerified = candidateAuthenticated;
+  candidate.tlsPeerUUID = brainUUID;
+  candidate.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  neuron.brain = &candidate;
+  ProdigyLocalClusterPairControlProjection ordinary = {};
+  ordinary.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
+  ordinary.localClusterUUID = original.self.clusterUUID;
+  ordinary.nodeUUID = neuronUUID;
+  ordinary.committedAuthorityGeneration = prepared.committedAuthorityGeneration;
+  neuron.receiveClusterPairControlProjection(0x7145, ordinary);
+  suite.expect(candidateAuthenticated && candidate.transportLifecycleCandidate &&
+      neuron.pairProjectionPersistenceCalls == 0 && candidate.wBuffer.empty(),
+      "runtime_transport_lifecycle_candidate_allows_only_lifecycle_before_activation");
+
+  neuron.brain = &candidate;
+  candidate.wBuffer.clear();
+  neuron.receiveTransportCredentialLifecycleProjection(0x7146, active);
+  const bool awaitingActivation = neuron.transportPeerProjectionPersistencePending &&
+      neuron.lifecycleProjectionPersistenceCalls == 5;
+  candidate.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(true);
+  suite.expect(awaitingActivation && projectionLifecycleAck(candidate, 0x7146, active.committedAuthorityGeneration, true) &&
+      !candidate.closeAfterTransportLifecycleAck && !candidate.transportLifecycleCandidate &&
+      neuron.controlPeerCurrentlyAuthorized(brainUUID) &&
+      neuron.controlTransportCredentials.self.operationUUID == active.operation.successor.operationUUID &&
+      neuron.controlTransportCredentialLifecycleProjection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active,
+      "runtime_transport_lifecycle_candidate_activates_only_after_exact_durable_stage");
+
+  const auto revocation = projectionCredentialRevocation(neuron.controlTransportCredentials, 0x7150);
+  candidate.wBuffer.clear();
+  candidate.pendingSend = false;
+  neuron.receiveTransportCredentialLifecycleProjection(0x7151, revocation);
+  candidate.pendingSend = true;
+  neuron.finishLifecycleProjectionPersistence(true);
+  NeuronBrainControlStream blocked = {};
+  reserveProjectionTransport(blocked);
+  suite.expect(projectionLifecycleAck(candidate, 0x7151, revocation.committedAuthorityGeneration, true) &&
+      neuron.controlTransportCredentialLifecycleProjection.operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke &&
+      neuron.controlTransportCredentials.self.secretIsZero() &&
+      !neuron.beginAcceptedBrainTransportTLS(&blocked) && !blocked.transportAEGISEnabled(),
+      "runtime_transport_lifecycle_terminal_revocation_blocks_reconnect_without_tls_fallback");
+
+  ::close(stream.fd);
+  ::close(candidate.fd);
+  ::close(alternating.fd);
+  stream.fd = candidate.fd = alternating.fd = -1;
+}
+
 static void testNeuronClusterPairControlProjectionDurabilityAndStreamFence(TestSuite& suite)
 {
   constexpr uint128_t neuronUUID = uint128_t(0x7205), brainUUID = uint128_t(0x7204);
   PersistenceRing ring = {}; ProjectionReceiptTestNeuron neuron = {};
   NeuronBrainControlStream stream = {}; ProdigyTransportTLSStream remote = {};
+  const ProdigyTransportCredentialBootstrap credentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   reserveProjectionTransport(stream); reserveProjectionTransport(remote);
-  std::array<uint8_t, 32> psk = {}; psk.fill(0x42);
-  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "pair-projection"_ctv, neuronUUID, brainUUID) &&
-      remote.beginTransportAEGIS(false, psk.data(), "pair-projection"_ctv, brainUUID, neuronUUID) &&
-      completeProjectionTransportHandshake(remote, stream);
+  const bool authenticated = beginProjectionBrainControlTransport(neuron, stream, remote, credentials);
   suite.expect(authenticated, "runtime_pair_projection_uses_authenticated_control_stream");
   if (!authenticated) return;
   stream.connected = true; stream.tlsPeerVerified = true; stream.tlsPeerUUID = brainUUID;
   stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); neuron.brain = &stream;
-  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   ProdigyLocalClusterPairControlProjection projection = {};
   projection.protocolVersion = ProdigyLocalClusterPairControlProjection::version;
   projection.localClusterUUID = neuron.controlTransportCredentials.self.clusterUUID;
@@ -1509,16 +1944,13 @@ static void testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChann
   constexpr uint128_t neuronUUID = uint128_t(0x72e1), brainUUID = uint128_t(0x72e2), remoteNodeUUID = uint128_t(0x72e3);
   ProjectionReceiptTestNeuron neuron = {};
   NeuronBrainControlStream stream = {}; ProdigyTransportTLSStream remote = {};
+  const ProdigyTransportCredentialBootstrap credentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   reserveProjectionTransport(stream); reserveProjectionTransport(remote);
-  std::array<uint8_t, 32> psk = {}; psk.fill(0x6b);
-  const bool authenticated = stream.beginTransportAEGIS(true, psk.data(), "pair-epoch-forward"_ctv, neuronUUID, brainUUID) &&
-      remote.beginTransportAEGIS(false, psk.data(), "pair-epoch-forward"_ctv, brainUUID, neuronUUID) &&
-      completeProjectionTransportHandshake(remote, stream);
+  const bool authenticated = beginProjectionBrainControlTransport(neuron, stream, remote, credentials);
   suite.expect(authenticated, "runtime_pair_epoch_status_uses_authenticated_control_stream");
   if (!authenticated) return;
   stream.connected = true; stream.tlsPeerVerified = true; stream.tlsPeerUUID = brainUUID;
   stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); neuron.brain = &stream;
-  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   ProdigyLocalClusterPairControlProjection remoteProjection = {};
   const bool projectionBuilt = buildRuntimePairControlProjections(neuronUUID, remoteNodeUUID,
       neuron.clusterPairControlProjection, remoteProjection);
@@ -1615,11 +2047,8 @@ static void testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(Tes
 
   reserveProjectionTransport(stream);
   reserveProjectionTransport(remoteBrain);
-  std::array<uint8_t, 32> controlPSK = {};
-  controlPSK.fill(0x44);
-  const bool authenticated = stream.beginTransportAEGIS(true, controlPSK.data(), "pair-restart-projection"_ctv, neuronUUID, brainUUID) &&
-      remoteBrain.beginTransportAEGIS(false, controlPSK.data(), "pair-restart-projection"_ctv, brainUUID, neuronUUID) &&
-      completeProjectionTransportHandshake(remoteBrain, stream);
+  const ProdigyTransportCredentialBootstrap credentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
+  const bool authenticated = beginProjectionBrainControlTransport(neuron, stream, remoteBrain, credentials);
   suite.expect(authenticated, "runtime_pair_restart_fresh_master_control_stream_is_authenticated");
   if (!authenticated) return;
 
@@ -1628,7 +2057,6 @@ static void testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(Tes
   stream.tlsPeerUUID = brainUUID;
   stream.fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   neuron.brain = &stream;
-  neuron.controlTransportCredentials = projectionCredentialBootstrap(neuronUUID, brainUUID, 10);
   neuron.clusterPairControlProjection = cached;
 
   const bool remoteInstalled = remoteCarrier.installProjection(remoteProjection);
@@ -1774,6 +2202,8 @@ int main(void)
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);
+  testPersistentWriterPreservesTransportLifecycleSchema(suite);
+  testTerminalLocalBrainFenceOverridesOlderSnapshot(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);
   testProductionTopologySnapshotOverlap(suite);
   testPersistentWriterDetachesViewBackedSchemaFields(suite);
@@ -1784,6 +2214,7 @@ int main(void)
   testBootPersistenceAdmissionRejectionHasNoReceipt(suite);
   testDurableMaterializedRecoveryHistoricalCull(suite);
   testNeuronTransportCredentialPeerProjectionDurabilityAndStreamFence(suite);
+  testNeuronTransportCredentialLifecycleProjectionDurabilityAndCandidateFence(suite);
   testLocalPairProjectionMarkerBindsProjectionVersion(suite);
   testPersistentLocalCousinServicePermissions(suite);
   testNeuronForwardsFirstPairEpochProposalOnlyOnCurrentAuthorizedChannel(suite);

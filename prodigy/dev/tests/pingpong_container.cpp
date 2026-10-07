@@ -1511,6 +1511,12 @@ public:
     }
 #endif
 
+    if (const char *ipv6 = getenv("PINGPONG_IPV6_LISTENER"))
+    {
+      if (strcmp(ipv6, "1") != 0) std::exit(EXIT_FAILURE);
+      server.useIPv6Listener();
+    }
+
     if (const char *portEnv = getenv("PINGPONG_PORT"); portEnv && *portEnv)
     {
       long value = strtol(portEnv, nullptr, 10);

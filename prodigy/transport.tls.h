@@ -458,6 +458,7 @@ private:
   uint128_t aegisLocalUUID = 0;
   uint128_t aegisExpectedPeerUUID = 0;
   String aegisLocalPrelude;
+  String aegisPeerPrelude;
   bool aegisDeferredServerPrelude = false;
   AEGISPeerResolver aegisPeerResolver;
   AEGISDeferredServerPreludeResolver aegisDeferredServerPreludeResolver;
@@ -486,6 +487,7 @@ private:
     aegisPeerResolver = {};
     aegisDeferredServerPreludeResolver = {};
     aegisDeferredServerPrelude = false;
+    aegisPeerPrelude.reset();
     nEncryptedBytesToSend = 0;
     return false;
   }
@@ -630,6 +632,7 @@ private:
         }
         if (ok) ok = startTransportAEGISKeys(psk.data(), credentialContext, aegisLocalUUID, peerUUID,
                                             aegisLocalPrelude, peerPrelude);
+        if (ok) aegisPeerPrelude = std::move(peerPrelude);
         OPENSSL_cleanse(psk.data(), psk.size());
         if (selectedLocalPrelude.ownsMemory()) OPENSSL_cleanse(selectedLocalPrelude.data(), selectedLocalPrelude.size());
         aegisPeerResolver = {};
@@ -772,6 +775,20 @@ public:
 
   bool tlsPeerVerified = false;
   uint128_t tlsPeerUUID = 0;
+
+  // These exact public descriptors are bound to the authenticated Noise
+  // transcript. Credential owners use them to fence a live stream after a
+  // rotation/revocation; a UUID alone cannot distinguish successive keys.
+  // Returned views belong to this stream and must not survive reset/reuse.
+  bool authenticatedTransportAEGISPreludes(const String *&local, const String *&peer) const
+  {
+    local = peer = nullptr;
+    if (!aegisEnabled || !aegisSession.authenticated() || !tlsPeerVerified ||
+        aegisLocalPrelude.empty() || aegisPeerPrelude.empty()) return false;
+    local = &aegisLocalPrelude;
+    peer = &aegisPeerPrelude;
+    return true;
+  }
 
   // The existing stream remains the sole send/receive owner. This explicit
   // entry point is used only after credential policy has authorized both
@@ -1138,6 +1155,7 @@ private:
     aegisLocalUUID = 0;
     aegisExpectedPeerUUID = 0;
     aegisLocalPrelude.reset();
+    aegisPeerPrelude.reset();
     aegisDeferredServerPrelude = false;
     aegisPeerResolver = {};
     aegisDeferredServerPreludeResolver = {};

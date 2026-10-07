@@ -1431,12 +1431,68 @@ int main(void)
     frame.clear(); Message::construct(frame, BrainTopic::advertiseCapabilities, uint64_t(1)); message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal()), "upgrade_capability_ingress_valid");
     suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal() - 1), "upgrade_capability_ingress_truncated");
+    for (uint8_t response : {uint8_t(0), uint8_t(1)})
+    {
+      String digest;
+      if (response) digest.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+      frame.clear(); Message::construct(frame, BrainTopic::observeAuthorityElection, response, uint64_t(7),
+          response ? uint64_t(14) : uint64_t(0), digest);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal()),
+          "authority_election_frontier_ingress_valid");
+      suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal() - 1),
+          "authority_election_frontier_ingress_truncated");
+      suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal() + 1),
+          "authority_election_frontier_ingress_trailing");
+      frame.clear(); Message::construct(frame, BrainTopic::observeAuthorityElection, response, uint64_t(0),
+          response ? uint64_t(14) : uint64_t(0), digest);
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(!ProdigyIngressValidation::validateBrainPayload(message->topic, message->args, message->terminal()),
+          "authority_election_frontier_ingress_zero_nonce_rejected");
+    }
     ProdigyDeploymentPlacementPolicy placement = {}; placement.applicationID=1; placement.versionID=2;
     placement.operationID.assign("00000000-0000-4000-8000-000000000001"_ctv); placement.eligibleMachineUUIDs.push_back(3);
     String placementPayload = {}; BitseryEngine::serialize(placementPayload, placement);
     frame.clear(); Message::construct(frame, MothershipTopic::commitDeploymentPlacementPolicy, placementPayload); message = reinterpret_cast<Message *>(frame.data());
     suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic,message->args,message->terminal()), "placement_policy_ingress_valid");
     suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic,message->args,message->terminal()-1), "placement_policy_ingress_truncated");
+
+    String lifecyclePayload;
+    for (unsigned index = 0; index < 4096; ++index) lifecyclePayload.append('x');
+    for (const auto topic : {MothershipTopic::requestTransportCredentialLifecycle, MothershipTopic::pullTransportCredentialLifecycle})
+    {
+      frame.clear(); Message::construct(frame, topic, lifecyclePayload); message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()) &&
+          !ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal() - 1),
+          "transport_lifecycle_operator_ingress_accepts_bound_and_rejects_truncation");
+      auto oversized = lifecyclePayload; oversized.append('x');
+      frame.clear(); Message::construct(frame, topic, oversized); message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(!ProdigyIngressValidation::validateMothershipPayload(message->topic, message->args, message->terminal()),
+          "transport_lifecycle_operator_ingress_rejects_oversized_payload");
+    }
+    frame.clear(); Message::construct(frame, NeuronTopic::transportCredentialLifecycle, uint128_t(1), lifecyclePayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()) &&
+        !ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal() - 1),
+        "transport_lifecycle_projection_ingress_checks_frame_boundaries");
+    frame.clear(); Message::construct(frame, NeuronTopic::transportCredentialLifecycle, uint128_t(0), lifecyclePayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "transport_lifecycle_projection_ingress_rejects_zero_nonce");
+    lifecyclePayload.clear();
+    for (unsigned index = 0; index < 1048577; ++index) lifecyclePayload.append('x');
+    frame.clear(); Message::construct(frame, NeuronTopic::transportCredentialLifecycle, uint128_t(1), lifecyclePayload);
+    message = reinterpret_cast<Message *>(frame.data());
+    suite.expect(!ProdigyIngressValidation::validateNeuronPayloadForNeuron(message->topic, message->args, message->terminal()),
+        "transport_lifecycle_projection_ingress_rejects_oversized_payload");
+    for (const uint8_t invalid : {uint8_t(0), uint8_t(1), uint8_t(2), uint8_t(3)})
+    {
+      frame.clear(); Message::construct(frame, NeuronTopic::transportCredentialLifecycleAck,
+          uint128_t(invalid == 1 ? 0 : 1), uint64_t(invalid == 2 ? 0 : 2), uint8_t(invalid == 3 ? 2 : 1));
+      message = reinterpret_cast<Message *>(frame.data());
+      suite.expect(ProdigyIngressValidation::validateNeuronPayloadForBrain(message->topic, message->args, message->terminal()) == (invalid == 0),
+          "transport_lifecycle_ack_ingress_checks_nonce_generation_and_boolean");
+    }
 
     ProdigyUpgradeAdmissionReportRequest admissionRequest = {};
     admissionRequest.operationID.assignItoh(uint128_t(1));

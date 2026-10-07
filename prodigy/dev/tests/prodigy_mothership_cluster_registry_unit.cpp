@@ -139,7 +139,7 @@ static bool equalOSUpdatePolicies(const Vector<OperatingSystemUpdatePolicy>& lhs
 
 static bool equalTestConfig(const MothershipProdigyClusterTestConfig& lhs, const MothershipProdigyClusterTestConfig& rhs)
 {
-  return lhs.specified == rhs.specified && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.machineLogicalCores == rhs.machineLogicalCores && lhs.machineMemoryMB == rhs.machineMemoryMB && lhs.machineStorageMB == rhs.machineStorageMB && lhs.storageDeviceCount == rhs.storageDeviceCount && lhs.storageDeviceMB == rhs.storageDeviceMB && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.interContainerMTU == rhs.interContainerMTU;
+  return lhs.specified == rhs.specified && lhs.workspaceRoot.equals(rhs.workspaceRoot) && lhs.machineCount == rhs.machineCount && lhs.spareMachineCount == rhs.spareMachineCount && lhs.machineLogicalCores == rhs.machineLogicalCores && lhs.machineMemoryMB == rhs.machineMemoryMB && lhs.machineStorageMB == rhs.machineStorageMB && lhs.storageDeviceCount == rhs.storageDeviceCount && lhs.storageDeviceMB == rhs.storageDeviceMB && lhs.brainBootstrapFamily == rhs.brainBootstrapFamily && lhs.enableFakeIpv4Boundary == rhs.enableFakeIpv4Boundary && lhs.interContainerMTU == rhs.interContainerMTU;
 }
 
 static bool equalGcpConfig(const MothershipProdigyClusterGcpConfig& lhs, const MothershipProdigyClusterGcpConfig& rhs)
@@ -885,6 +885,16 @@ int main(void)
   invalidTestMachineCount.name = "test-machine-count-invalid"_ctv;
   invalidTestMachineCount.test.machineCount = 1;
 
+  MothershipProdigyCluster invalidTestSpareCount = testLocal;
+  invalidTestSpareCount.name = "test-spare-count-invalid"_ctv;
+  invalidTestSpareCount.test.spareMachineCount = 2;
+
+  MothershipProdigyCluster invalidTestSpareCapacity = testLocal;
+  invalidTestSpareCapacity.name = "test-spare-capacity-invalid"_ctv;
+  invalidTestSpareCapacity.test.machineCount = 2;
+  invalidTestSpareCapacity.test.spareMachineCount = 1;
+  invalidTestSpareCapacity.test.storageDeviceCount = 0;
+
   MothershipProdigyCluster invalidNonTestWithTestConfig = local;
   invalidNonTestWithTestConfig.name = "local-with-test-config"_ctv;
   invalidNonTestWithTestConfig.test.specified = true;
@@ -1342,7 +1352,15 @@ int main(void)
 
     bool createTestMachineCount = registry.createCluster(invalidTestMachineCount, nullptr, &failure);
     suite.expect(createTestMachineCount == false, "create_test_machine_count_rejected");
-    suite.expect(failure.equals("test.machineCount is below nBrains"_ctv), "create_test_machine_count_reason");
+    suite.expect(failure.equals("test.machineCount minus spareMachineCount is below nBrains"_ctv), "create_test_machine_count_reason");
+
+    bool createTestSpareCount = registry.createCluster(invalidTestSpareCount, nullptr, &failure);
+    suite.expect(createTestSpareCount == false, "create_test_spare_count_rejected");
+    suite.expect(failure.equals("test.spareMachineCount must be 0 or 1"_ctv), "create_test_spare_count_reason");
+
+    bool createTestSpareCapacity = registry.createCluster(invalidTestSpareCapacity, nullptr, &failure);
+    suite.expect(createTestSpareCapacity == false, "create_test_spare_capacity_rejected");
+    suite.expect(failure.equals("test.machineCount minus spareMachineCount is below nBrains"_ctv), "create_test_spare_capacity_reason");
 
     bool createNonTestWithTestConfig = registry.createCluster(invalidNonTestWithTestConfig, nullptr, &failure);
     suite.expect(createNonTestWithTestConfig == false, "create_non_test_with_test_config_rejected");
@@ -1360,6 +1378,73 @@ int main(void)
     }
     suite.expect(listClusters, "list_clusters");
     suite.expect(clusters.size() == 10, "list_clusters_count");
+  }
+
+  {
+    constexpr auto v6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
+    String spareDbPath = {};
+    spareDbPath.snprintf<"{}/test-spare-v6"_ctv>(dbPath);
+    MothershipProdigyCluster spare = testLocal;
+    spare.name = "test-spare-v6"_ctv;
+    spare.test.workspaceRoot = "/tmp/nametag-test-spare-v6"_ctv;
+    spare.test.spareMachineCount = 1;
+    spare.test.storageDeviceCount = 0;
+    spare.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
+    MothershipProdigyCluster storedSpare = {};
+    String failure = {};
+    MothershipProdigyCluster unsupportedSpare = spare;
+    unsupportedSpare.test.storageDeviceCount = 1;
+    suite.expect(!MothershipClusterRegistry(spareDbPath).createCluster(unsupportedSpare, nullptr, &failure), "test_spare_rejects_extra_storage");
+    unsupportedSpare.test.storageDeviceCount = 0;
+    unsupportedSpare.test.enableFakeIpv4Boundary = true;
+    suite.expect(!MothershipClusterRegistry(spareDbPath).createCluster(unsupportedSpare, nullptr, &failure), "test_spare_rejects_fake_boundary");
+    suite.expect(MothershipClusterRegistry(spareDbPath).createCluster(spare, &storedSpare, &failure), "create_test_spare_v6");
+    suite.expect(storedSpare.test.spareMachineCount == 1, "create_test_spare_preserves_count");
+    suite.expect(storedSpare.bootstrapSshUser.equals(defaultMothershipClusterSSHUser()), "create_test_spare_defaults_root_user");
+    suite.expect(storedSpare.bootstrapSshPrivateKeyPath.equals(prodigyDefaultBootstrapSSHPrivateKeyPath()), "create_test_spare_defaults_private_path");
+    suite.expect(prodigyBootstrapSSHKeyPackageConfigured(storedSpare.bootstrapSshKeyPackage), "create_test_spare_generates_client_key");
+    suite.expect(prodigyBootstrapSSHKeyPackageConfigured(storedSpare.bootstrapSshHostKeyPackage), "create_test_spare_generates_host_key");
+    suite.expect(storedSpare.remoteProdigyPath.equals(defaultMothershipRemoteProdigyPath()), "create_test_spare_defaults_remote_path");
+
+    String encoded = {};
+    {
+      TidesDB database(spareDbPath);
+      suite.expect(database.read("clusters"_ctv, spare.name, encoded, &failure), "test_spare_v6_record_read");
+    }
+    const bool hasV6Header = encoded.size() >= v6Header.size() && std::memcmp(encoded.data(), v6Header.data(), v6Header.size()) == 0;
+    suite.expect(hasV6Header, "test_spare_v6_header");
+    MothershipProdigyCluster loadedSpare = {};
+    suite.expect(MothershipClusterRegistry(spareDbPath).getCluster(spare.name, loadedSpare, &failure) && equalClusters(storedSpare, loadedSpare), "test_spare_v6_roundtrip");
+
+    MothershipProdigyClusterRecordV6 invalidV6 = {};
+    invalidV6.cluster = storedSpare;
+    invalidV6.internalTransportProfile = storedSpare.internalTransportProfile;
+    invalidV6.spareMachineCount = 0;
+    String invalidPayload = {};
+    BitseryEngine::serialize(invalidPayload, invalidV6);
+    String invalidEncoded = {};
+    invalidEncoded.append(v6Header);
+    invalidEncoded.append(invalidPayload);
+    {
+      TidesDB database(spareDbPath);
+      suite.expect(database.write("clusters"_ctv, "invalid-spare-v6"_ctv, invalidEncoded, &failure), "test_spare_v6_invalid_record_written");
+    }
+    MothershipProdigyCluster ignored = {};
+    suite.expect(!MothershipClusterRegistry(spareDbPath).getCluster("invalid-spare-v6"_ctv, ignored, &failure), "test_spare_v6_rejects_zero_tail");
+
+    invalidV6 = {};
+    invalidV6.cluster = storedSpare;
+    invalidV6.cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    invalidV6.internalTransportProfile = storedSpare.internalTransportProfile;
+    invalidV6.spareMachineCount = 1;
+    BitseryEngine::serialize(invalidPayload, invalidV6);
+    invalidEncoded.assign(v6Header);
+    invalidEncoded.append(invalidPayload);
+    {
+      TidesDB database(spareDbPath);
+      suite.expect(database.write("clusters"_ctv, "invalid-spare-v6-deployment"_ctv, invalidEncoded, &failure), "test_spare_v6_invalid_deployment_written");
+    }
+    suite.expect(!MothershipClusterRegistry(spareDbPath).getCluster("invalid-spare-v6-deployment"_ctv, ignored, &failure), "test_spare_v6_rejects_non_test_deployment");
   }
 
   {
@@ -1644,6 +1729,7 @@ int main(void)
       suite.expect(false, "rack_v3_values_preserved");
     }
     suite.expect(equalClusters(storedTestLocal, loadedTestLocal), "reopen_test_local_roundtrip");
+    suite.expect(loadedTestLocal.test.spareMachineCount == 0, "reopen_v4_test_record_defaults_spare_zero");
     suite.expect(equalClusters(storedRemoteCreated, loadedRemoteCreated), "reopen_remote_created_roundtrip");
     suite.expect(equalClusters(storedRemoteCreated, loadedRemoteCreatedByUUID), "reopen_remote_created_uuid_roundtrip");
     suite.expect(equalClusters(storedRemoteAdopted, loadedRemoteAdopted), "reopen_remote_adopted_roundtrip");

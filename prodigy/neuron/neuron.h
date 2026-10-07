@@ -44,6 +44,7 @@
 #include <prodigy/neuron/containers.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/artifact.io.h>
+#include <prodigy/persistent.state.h>
 #include <prodigy/machine.hardware.h>
 #include <prodigy/netdev.detect.h>
 #include <prodigy/transport.artifact.h>
@@ -65,6 +66,8 @@ public:
   bool connected = false;
   bool initialMachineHardwareProfileQueued = false;
   bool transitionAfterBundleAck = false;
+  bool transportLifecycleCandidate = false;
+  bool closeAfterTransportLifecycleAck = false;
   std::shared_ptr<uint8_t> connectionLifetime = std::make_shared<uint8_t>(0);
 
   void reset(void) override
@@ -74,6 +77,8 @@ public:
     connected = false;
     initialMachineHardwareProfileQueued = false;
     transitionAfterBundleAck = false;
+    transportLifecycleCandidate = false;
+    closeAfterTransportLifecycleAck = false;
   }
 };
 
@@ -701,13 +706,34 @@ protected:
   {
     if (controlTransportCredentials.enabled)
     {
-      if (!prodigyTransportCredentialBootstrapValid(controlTransportCredentials) ||
-          controlTransportCredentials.self.role != ProdigyTransportCredentialNodeRole::neuron) return false;
-      String prelude = {};
-      if (!prodigyRenderLocalTransportCredentialPrelude(controlTransportCredentials, prelude)) return false;
-      return stream->beginTransportAEGISWithPrelude(true, controlTransportCredentials.self.nodeUUID, prelude,
-          [this](const String& peer, std::array<uint8_t, 32>& psk, String& context, uint128_t& peerUUID) {
-            return prodigyResolveTransportCredentialBootstrapPeer(controlTransportCredentials, peer,
+      if (!stream) return false;
+      if (controlTransportCredentialLifecycleProjection.protocolVersion == 1 &&
+          controlTransportCredentialLifecycleProjection.operation.predecessor.role == ProdigyTransportCredentialNodeRole::neuron &&
+          controlTransportCredentialLifecycleProjection.operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke &&
+          uint8_t(controlTransportCredentialLifecycleProjection.operation.lifecyclePhase) >= uint8_t(ProdigyTransportCredentialLifecyclePhase::active))
+      {
+        const auto& operation = controlTransportCredentialLifecycleProjection.operation;
+        std::fprintf(stderr, "transport lifecycle credential-refused role=neuron node=%016llx%016llx operation=%016llx%016llx generation=%llu reason=revoked\n",
+            (unsigned long long)(uuid >> 64), (unsigned long long)uuid,
+            (unsigned long long)(operation.lifecycleOperationUUID >> 64), (unsigned long long)operation.lifecycleOperationUUID,
+            (unsigned long long)controlTransportCredentialLifecycleProjection.committedAuthorityGeneration);
+        return false;
+      }
+      // A server cannot initiate a retry with its staged credential. Alternate
+      // only on new accepted connections, retaining the selected bundle for
+      // this handshake. Ordinary commands stay fenced until activation.
+      const bool staged = controlTransportCredentialLifecycleProjection.protocolVersion == 1 &&
+          uint8_t(controlTransportCredentialLifecycleProjection.operation.lifecyclePhase) < uint8_t(ProdigyTransportCredentialLifecyclePhase::active);
+      stream->transportLifecycleCandidate = staged && tryStagedTransportCredentialOnNextAccept;
+      tryStagedTransportCredentialOnNextAccept = staged && !tryStagedTransportCredentialOnNextAccept;
+      auto selected = stream->transportLifecycleCandidate ? controlTransportCredentialLifecycleProjection.target : controlTransportCredentials;
+      if (!prodigyTransportCredentialBootstrapValid(selected) ||
+          selected.self.role != ProdigyTransportCredentialNodeRole::neuron) return false;
+      String prelude;
+      if (!prodigyRenderLocalTransportCredentialPrelude(selected, prelude)) return false;
+      return stream->beginTransportAEGISWithPrelude(true, selected.self.nodeUUID, prelude,
+          [selected = std::move(selected)](const String& peer, std::array<uint8_t, 32>& psk, String& context, uint128_t& peerUUID) {
+            return prodigyResolveTransportCredentialBootstrapPeer(selected, peer,
                 "brain-neuron"_ctv, psk.data(), context, peerUUID);
           });
     }
@@ -941,7 +967,8 @@ protected:
     {
       // The stream has just published the mutual proof. Preserve the same
       // post-authentication hardware-profile kick as the TLS path.
-      (void)queueMachineHardwareProfileToBrainIfReady("transport-aegis-peer-verified");
+      if (!brain->transportLifecycleCandidate)
+        (void)queueMachineHardwareProfileToBrainIfReady("transport-aegis-peer-verified");
       return true;
     }
     if (brain == nullptr || brain->transportEncryptionEnabled() == false || brain->tlsPeerVerified)
@@ -1340,7 +1367,7 @@ protected:
     // before it advances the next worker.
     if (controlTransportCredentials.enabled)
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
-                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2), uint8_t(1));
+                         haveFragments(), installedBundleDigest, uint8_t(1), uint8_t(2), uint8_t(1), uint8_t(1));
     else
       Message::construct(outbound, NeuronTopic::registration, bootTimeMs, kernel, osID, osVersionID,
                          haveFragments(), installedBundleDigest);
@@ -1354,6 +1381,11 @@ protected:
     }
     stream->initialMachineHardwareProfileQueued = false;
     appendInitialBrainControlFrames(stream->wBuffer);
+    if (stream->transportLifecycleCandidate)
+    {
+      Ring::queueSend(stream);
+      return;
+    }
     for (const auto& [deploymentID, coros] : pendingContainerDownloads)
     {
       (void)coros;
@@ -3151,6 +3183,8 @@ public:
   TCPSocket brainListener;
   NeuronBrainControlStream *brain = nullptr;
   ProdigyTransportCredentialBootstrap controlTransportCredentials;
+  ProdigyTransportCredentialLifecycleProjection controlTransportCredentialLifecycleProjection;
+  bool tryStagedTransportCredentialOnNextAccept = false;
   bool transportPeerProjectionPersistencePending = false;
   ProdigyLocalClusterPairControlProjection clusterPairControlProjection;
   bool clusterPairControlProjectionPersistencePending = false;
@@ -3605,9 +3639,40 @@ public:
     Ring::queueSend(stream);
   }
 
+  bool controlPeerAuthorizedByBootstrap(uint128_t peerUUID, const ProdigyTransportCredentialBootstrap& bootstrap) const
+  {
+    if (!brain || brain->tlsPeerUUID != peerUUID ||
+        !bootstrap.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain)) return false;
+    const String *localBytes = nullptr, *peerBytes = nullptr;
+    ProdigyTransportCredentialPrelude local, peer;
+    const auto& self = bootstrap.self;
+    if (!brain->authenticatedTransportAEGISPreludes(localBytes, peerBytes) ||
+        !prodigyParseTransportCredentialPrelude(*localBytes, local) ||
+        local.operationUUID != self.operationUUID || local.nodeUUID != self.nodeUUID || local.role != self.role ||
+        local.authorityEpoch != self.authorityEpoch || local.keyEpoch != self.keyEpoch ||
+        local.authorityGeneration != self.authorityGeneration ||
+        !prodigyParseTransportCredentialPrelude(*peerBytes, peer) ||
+        peer.nodeUUID != peerUUID || peer.role != ProdigyTransportCredentialNodeRole::brain) return false;
+    return std::count_if(bootstrap.authorizedPeers.begin(),
+        bootstrap.authorizedPeers.end(), [&](const auto& entry) {
+          return prodigyTransportCredentialPreludeMatches(peer, entry);
+        }) == 1;
+  }
+
   bool controlPeerCurrentlyAuthorized(uint128_t peerUUID) const
   {
-    return controlTransportCredentials.currentlyAuthorizes(peerUUID, ProdigyTransportCredentialNodeRole::brain);
+    return controlPeerAuthorizedByBootstrap(peerUUID, controlTransportCredentials);
+  }
+
+  bool transportLifecycleControlAuthorized(uint128_t peerUUID) const
+  {
+    return controlPeerCurrentlyAuthorized(peerUUID) ||
+        (brain && brain->transportLifecycleCandidate &&
+         controlTransportCredentialLifecycleProjection.protocolVersion == 1 &&
+         (controlTransportCredentialLifecycleProjection.operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate ||
+          controlTransportCredentialLifecycleProjection.operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain) &&
+         uint8_t(controlTransportCredentialLifecycleProjection.operation.lifecyclePhase) < uint8_t(ProdigyTransportCredentialLifecyclePhase::active) &&
+         controlPeerAuthorizedByBootstrap(peerUUID, controlTransportCredentialLifecycleProjection.target));
   }
 
   void receiveCousinDiscoverySnapshot(const ProdigyCousinDiscoveryPublication& publication)
@@ -3650,7 +3715,7 @@ public:
     NeuronBrainControlStream *stream = brain;
     const uint64_t generation = stream ? stream->ioGeneration : 0;
     const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
-    if (nonce == 0 || !controlTransportCredentials.enabled ||
+    if (nonce == 0 || !controlTransportCredentials.enabled || !controlPeerCurrentlyAuthorized(peerUUID) ||
         !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
     ProdigyTransportCredentialBootstrap updated = {};
     if (!prodigyApplyTransportCredentialPeerProjection(controlTransportCredentials, projection, updated) ||
@@ -3670,7 +3735,8 @@ public:
         [this, lifetime, connectionLifetime, stream, generation, peerUUID, updated = std::move(updated), reply](bool durable) mutable {
           if (lifetime.expired()) return;
           transportPeerProjectionPersistencePending = false;
-          if (connectionLifetime.expired() || !transportPeerProjectionControlCurrent(stream, generation, peerUUID)) return;
+          if (connectionLifetime.expired() || !transportPeerProjectionControlCurrent(stream, generation, peerUUID) ||
+              !controlPeerCurrentlyAuthorized(peerUUID)) return;
           if (!durable) { reply(false); return; }
           // The live receiver still owns this exact stream and credential
           // identity. Publish only after the sole local-record owner commits.
@@ -3680,6 +3746,82 @@ public:
                      (unsigned long long)controlTransportCredentials.committedAuthorityGeneration,
                      size_t(controlTransportCredentials.authorizedPeers.size()));
           std::fflush(stderr);
+          reply(true);
+        });
+    if (!admitted) { transportPeerProjectionPersistencePending = false; reply(false); }
+  }
+
+  virtual bool persistTransportCredentialLifecycleProjection(
+      const ProdigyTransportCredentialLifecycleProjection&, std::function<void(bool)> completion)
+  {
+    (void)completion;
+    return false;
+  }
+
+  bool prepareTransportCredentialLifecycleProjection(
+      const ProdigyTransportCredentialLifecycleProjection& projection,
+      ProdigyTransportCredentialBootstrap& updated, bool& revoked) const
+  {
+    ProdigyPersistentLocalBrainState local;
+    local.uuid = controlTransportCredentials.self.nodeUUID;
+    local.ownerClusterUUID = controlTransportCredentials.self.clusterUUID;
+    local.transportCredentials = controlTransportCredentials;
+    local.transportCredentialLifecycleProjection = controlTransportCredentialLifecycleProjection;
+    return prodigyApplyLocalTransportCredentialLifecycleProjection(local, projection, updated, revoked);
+  }
+
+  void receiveTransportCredentialLifecycleProjection(uint128_t nonce,
+      const ProdigyTransportCredentialLifecycleProjection& projection)
+  {
+    auto *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (nonce == 0 || !controlTransportCredentials.enabled ||
+        !transportPeerProjectionControlCurrent(stream, generation, peerUUID) ||
+        !transportLifecycleControlAuthorized(peerUUID)) return;
+    ProdigyTransportCredentialBootstrap updated;
+    bool revoked = false;
+    if (!prepareTransportCredentialLifecycleProjection(projection, updated, revoked))
+    { queueCloseIfActive(stream); return; }
+    auto reply = [this, stream, nonce, revision = projection.committedAuthorityGeneration](bool accepted) {
+      Message::construct(stream->wBuffer, NeuronTopic::transportCredentialLifecycleAck, nonce, revision, uint8_t(accepted));
+      Ring::queueSend(stream);
+    };
+    if (transportPeerProjectionPersistencePending) { reply(false); return; }
+    transportPeerProjectionPersistencePending = true;
+    const std::weak_ptr<uint8_t> lifetime = asyncOperationLifetime;
+    const std::weak_ptr<uint8_t> connectionLifetime = stream->connectionLifetime;
+    const bool admitted = persistTransportCredentialLifecycleProjection(projection,
+        [this, lifetime, connectionLifetime, stream, generation, peerUUID, projection, reply](bool durable) mutable {
+          if (lifetime.expired()) return;
+          transportPeerProjectionPersistencePending = false;
+          if (connectionLifetime.expired() || !transportPeerProjectionControlCurrent(stream, generation, peerUUID) ||
+              !transportLifecycleControlAuthorized(peerUUID)) return;
+          ProdigyTransportCredentialBootstrap updated;
+          bool revoked = false;
+          if (!durable || !prepareTransportCredentialLifecycleProjection(projection, updated, revoked))
+          { reply(false); return; }
+          controlTransportCredentialLifecycleProjection = projection;
+          if (revoked)
+          {
+            OPENSSL_cleanse(controlTransportCredentials.self.secret, sizeof(controlTransportCredentials.self.secret));
+            controlTransportCredentials.committedAuthorityGeneration = projection.committedAuthorityGeneration;
+          }
+          else controlTransportCredentials = std::move(updated);
+          const bool activated = uint8_t(projection.operation.lifecyclePhase) >= uint8_t(ProdigyTransportCredentialLifecyclePhase::active);
+          if (activated)
+          {
+            // Flush this exact receipt before retiring its old session.
+            stream->closeAfterTransportLifecycleAck = revoked || !controlPeerCurrentlyAuthorized(peerUUID);
+            if (!stream->closeAfterTransportLifecycleAck) stream->transportLifecycleCandidate = false;
+            tryStagedTransportCredentialOnNextAccept = false;
+          }
+          std::fprintf(stderr, "transport lifecycle local-durable node=%016llx%016llx operation=%016llx%016llx phase=%u generation=%llu revoked=%u\n",
+              (unsigned long long)(uuid >> 64), (unsigned long long)uuid,
+              (unsigned long long)(projection.operation.lifecycleOperationUUID >> 64),
+              (unsigned long long)projection.operation.lifecycleOperationUUID,
+              unsigned(projection.operation.lifecyclePhase), (unsigned long long)projection.committedAuthorityGeneration,
+              unsigned(revoked));
           reply(true);
         });
     if (!admitted) { transportPeerProjectionPersistencePending = false; reply(false); }
@@ -4790,7 +4932,7 @@ public:
 
     if (alreadyPending == false)
     {
-      PRODIGY_DEBUG_LOG( "neuron downloadContainer request deploymentID=%llu brainPresent=%d brainActive=%d pendingCount=%llu pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d\n",
+      PRODIGY_DEBUG_LOG("neuron downloadContainer request deploymentID=%llu brainPresent=%d brainActive=%d pendingCount=%llu pendingSend=%d pendingRecv=%d tlsNegotiated=%d peerVerified=%d fd=%d fslot=%d\n",
                    (unsigned long long)deploymentID,
                    int(brain != nullptr),
                    int(streamIsActive(brain)),
@@ -5544,6 +5686,15 @@ public:
 
   void neuronHandler(Message *message)
   {
+    if (controlTransportCredentials.enabled &&
+        (!brain || (!controlPeerCurrentlyAuthorized(brain->tlsPeerUUID) &&
+         !((NeuronTopic(message->topic) == NeuronTopic::transportCredentialLifecycle ||
+            NeuronTopic(message->topic) == NeuronTopic::registration) &&
+           transportLifecycleControlAuthorized(brain->tlsPeerUUID)))))
+    {
+      if (brain) { brain->rBuffer.clear(); queueCloseIfActive(brain); }
+      return;
+    }
     uint8_t *args = message->args;
     uint8_t *terminal = message->terminal();
 
@@ -5559,6 +5710,19 @@ public:
 
     switch (NeuronTopic(message->topic))
     {
+      case NeuronTopic::transportCredentialLifecycle:
+        {
+          uint128_t nonce = 0;
+          String serialized;
+          Message::extractArg<ArgumentNature::fixed>(args, nonce);
+          Message::extractToStringView(args, serialized);
+          ProdigyTransportCredentialLifecycleProjection projection;
+          if (!BitseryEngine::deserializeSafe(serialized, projection) ||
+              !prodigyTransportCredentialLifecycleProjectionValid(projection))
+          { if (brain) queueCloseIfActive(brain); break; }
+          receiveTransportCredentialLifecycleProjection(nonce, projection);
+          break;
+        }
       case NeuronTopic::transportCredentialPeers:
         {
           uint128_t nonce = 0;
@@ -5641,6 +5805,11 @@ public:
         }
       case NeuronTopic::registration:
         {
+          if (brain && brain->transportLifecycleCandidate)
+          {
+            queueAttestedInitialBrainControlFrames(brain);
+            break;
+          }
           // requiresState(1)
 
           bool requiresState;
@@ -6098,7 +6267,7 @@ public:
 
           String containerBlob;
           Message::extractToStringView(args, containerBlob);
-          PRODIGY_DEBUG_LOG( "neuron requestContainerBlob response deploymentID=%llu bytes=%u pendingWaiters=%llu\n",
+          PRODIGY_DEBUG_LOG("neuron requestContainerBlob response deploymentID=%llu bytes=%u pendingWaiters=%llu\n",
                        (unsigned long long)deploymentID,
                        unsigned(containerBlob.size()),
                        (unsigned long long)(pendingContainerDownloads.contains(deploymentID) ? pendingContainerDownloads.countEntriesFor(deploymentID) : 0));
@@ -6153,7 +6322,7 @@ public:
             basics_log("neuron spinContainer plan deserialize failed\n");
             break;
           }
-          PRODIGY_DEBUG_LOG( "neuron spinContainer deploymentID=%llu appID=%u replaceUUID=%llu blobBytes=%llu blobSHA=%s\n",
+          PRODIGY_DEBUG_LOG("neuron spinContainer deploymentID=%llu appID=%u replaceUUID=%llu blobBytes=%llu blobSHA=%s\n",
                        (unsigned long long)plan.config.deploymentID(),
                        unsigned(plan.config.applicationID),
                        (unsigned long long)replaceContainerUUID,
@@ -7105,6 +7274,13 @@ public:
 
       if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
       {
+        if (stream->closeAfterTransportLifecycleAck && !queueAnotherSend && stream->wBuffer.outstandingBytes() == 0 &&
+            stream == brain && streamIsActive(stream))
+        {
+          stream->closeAfterTransportLifecycleAck = false;
+          queueCloseIfActive(stream);
+          return;
+        }
         if (stream->transitionAfterBundleAck && queueAnotherSend == false && stream->wBuffer.outstandingBytes() == 0 &&
             stream == brain && streamIsActive(stream))
         {

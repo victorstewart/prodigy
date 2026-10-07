@@ -1,4 +1,5 @@
 #include <prodigy/transport.tls.h>
+#include <prodigy/transport.credentials.h>
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -90,6 +91,157 @@ static bool pumpSocket(ProdigyTransportTLSStream& source, ProdigyTransportTLSStr
 int main()
 {
   const auto psk = testPSK();
+  {
+    ProdigyTransportCredentialEnrollment predecessor = {};
+    predecessor.operationUUID = 0x1001;
+    predecessor.nodeUUID = 0x1002;
+    predecessor.clusterUUID = 0x1003;
+    predecessor.authorityEpoch = 7;
+    predecessor.keyEpoch = 9;
+    predecessor.authorityGeneration = 20;
+    predecessor.role = ProdigyTransportCredentialNodeRole::brain;
+    predecessor.state = ProdigyTransportCredentialEnrollmentState::active;
+    ProdigyTransportCredentialEnrollment successor = predecessor;
+    successor.operationUUID = 0x1004;
+    successor.authorityGeneration = 21;
+    successor.state = ProdigyTransportCredentialEnrollmentState::pending;
+    ProdigyTransportCredentialEnrollmentOperation operation = {};
+    operation.protocolVersion = 2;
+    operation.lifecycleOperationUUID = 0x1005;
+    operation.lifecycleKind = ProdigyTransportCredentialLifecycleKind::rotate;
+    operation.predecessor = predecessor;
+    operation.successor = successor;
+    operation.electorate = {0x1010, 0x1011, 0x1012};
+    operation.frozenAuthorityGeneration = 20;
+    operation.pinnedMasterAuthorityEpoch = 8;
+    operation.transitionGeneration = 21;
+    operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::prepared;
+
+    ProdigyTransportCredentialLifecycleRequest request = {};
+    request.clusterUUID = predecessor.clusterUUID;
+    request.operationUUID = operation.lifecycleOperationUUID;
+    request.nodeUUID = predecessor.nodeUUID;
+    request.role = predecessor.role;
+    request.kind = operation.lifecycleKind;
+    request.expectedAuthorityGeneration = operation.frozenAuthorityGeneration;
+    String requestBytes = {};
+    ProdigyTransportCredentialLifecycleRequest decodedRequest = {};
+    expect(request.valid() && BitseryEngine::serialize(requestBytes, request) > 0 &&
+               BitseryEngine::deserializeSafe(requestBytes, decodedRequest) && decodedRequest.valid() &&
+               decodedRequest.clusterUUID == request.clusterUUID && decodedRequest.operationUUID == request.operationUUID &&
+               decodedRequest.nodeUUID == request.nodeUUID && decodedRequest.role == request.role &&
+               decodedRequest.kind == request.kind &&
+               decodedRequest.expectedAuthorityGeneration == request.expectedAuthorityGeneration,
+           "transport_lifecycle_request_roundtrip");
+    for (unsigned invalid = 0; invalid != 7; ++invalid)
+    {
+      auto malformed = request;
+      if (invalid == 0) malformed.protocolVersion = 2;
+      if (invalid == 1) malformed.clusterUUID = 0;
+      if (invalid == 2) malformed.operationUUID = 0;
+      if (invalid == 3) malformed.nodeUUID = 0;
+      if (invalid == 4) malformed.expectedAuthorityGeneration = 0;
+      if (invalid == 5) malformed.role = ProdigyTransportCredentialNodeRole(99);
+      if (invalid == 6) malformed.kind = ProdigyTransportCredentialLifecycleKind(99);
+      String malformedBytes = {};
+      ProdigyTransportCredentialLifecycleRequest decoded = {};
+      expect(!malformed.valid() && BitseryEngine::serialize(malformedBytes, malformed) > 0 &&
+                 BitseryEngine::deserializeSafe(malformedBytes, decoded) && !decoded.valid(),
+             "transport_lifecycle_request_rejects_invalid_version_identity_role_kind_or_generation");
+    }
+
+    ProdigyTransportCredentialLifecycleQuery query = {};
+    query.clusterUUID = predecessor.clusterUUID;
+    query.operationUUID = operation.lifecycleOperationUUID;
+    String queryBytes = {};
+    ProdigyTransportCredentialLifecycleQuery decodedQuery = {};
+    expect(query.valid() && BitseryEngine::serialize(queryBytes, query) > 0 &&
+               BitseryEngine::deserializeSafe(queryBytes, decodedQuery) && decodedQuery.valid() &&
+               decodedQuery.clusterUUID == query.clusterUUID && decodedQuery.operationUUID == query.operationUUID,
+           "transport_lifecycle_query_roundtrip");
+    for (unsigned invalid = 0; invalid != 3; ++invalid)
+    {
+      auto malformed = query;
+      if (invalid == 0) malformed.protocolVersion = 2;
+      if (invalid == 1) malformed.clusterUUID = 0;
+      if (invalid == 2) malformed.operationUUID = 0;
+      String malformedBytes = {};
+      ProdigyTransportCredentialLifecycleQuery decoded = {};
+      expect(!malformed.valid() && BitseryEngine::serialize(malformedBytes, malformed) > 0 &&
+                 BitseryEngine::deserializeSafe(malformedBytes, decoded) && !decoded.valid(),
+             "transport_lifecycle_query_rejects_invalid_version_or_identity");
+    }
+
+    ProdigyTransportCredentialLifecycleResponse found = {};
+    found.success = true;
+    found.found = true;
+    found.durable = true;
+    found.qualified = true;
+    found.localClusterUUID = predecessor.clusterUUID;
+    found.currentMasterUUID = 0x1006;
+    found.currentAuthorityGeneration = operation.transitionGeneration;
+    found.operation = operation;
+    String foundBytes = {};
+    ProdigyTransportCredentialLifecycleResponse decodedResponse = {};
+    expect(BitseryEngine::serialize(foundBytes, found) > 0 &&
+               BitseryEngine::deserializeSafe(foundBytes, decodedResponse) && decodedResponse.protocolVersion == 1 &&
+               decodedResponse.success && decodedResponse.found && decodedResponse.durable && decodedResponse.qualified &&
+               decodedResponse.localClusterUUID == found.localClusterUUID && decodedResponse.currentMasterUUID == found.currentMasterUUID &&
+               decodedResponse.currentAuthorityGeneration == found.currentAuthorityGeneration && decodedResponse.operation == operation &&
+               decodedResponse.failure.empty(),
+           "transport_lifecycle_found_response_roundtrip");
+
+    ProdigyTransportCredentialLifecycleResponse notFound = {};
+    notFound.success = true;
+    notFound.localClusterUUID = predecessor.clusterUUID;
+    notFound.currentMasterUUID = 0x1007;
+    notFound.currentAuthorityGeneration = operation.frozenAuthorityGeneration;
+    notFound.failure = "operation absent"_ctv;
+    String notFoundBytes = {};
+    expect(BitseryEngine::serialize(notFoundBytes, notFound) > 0 &&
+               BitseryEngine::deserializeSafe(notFoundBytes, decodedResponse) && decodedResponse.success && !decodedResponse.found &&
+               !decodedResponse.durable && !decodedResponse.qualified &&
+               decodedResponse.localClusterUUID == notFound.localClusterUUID && decodedResponse.currentMasterUUID == notFound.currentMasterUUID &&
+               decodedResponse.currentAuthorityGeneration == notFound.currentAuthorityGeneration &&
+               decodedResponse.operation == ProdigyTransportCredentialEnrollmentOperation{} &&
+               decodedResponse.failure == notFound.failure && notFoundBytes.size() < foundBytes.size(),
+           "transport_lifecycle_not_found_response_resets_reused_reader_and_omits_operation");
+
+    auto badResponse = found;
+    badResponse.protocolVersion = 2;
+    String badResponseBytes = {};
+    ProdigyTransportCredentialLifecycleResponse rejectedResponse = {};
+    expect(BitseryEngine::serialize(badResponseBytes, badResponse) > 0 &&
+               !BitseryEngine::deserializeSafe(badResponseBytes, rejectedResponse),
+           "transport_lifecycle_response_rejects_unknown_version");
+    badResponse = found;
+    badResponse.operation = {};
+    badResponse.operation.protocolVersion = 2;
+    badResponse.operation.lifecycleOperationUUID = operation.lifecycleOperationUUID;
+    String malformedOperationBytes = {};
+    expect(BitseryEngine::serialize(malformedOperationBytes, badResponse) > 0 &&
+               !BitseryEngine::deserializeSafe(malformedOperationBytes, rejectedResponse),
+           "transport_lifecycle_response_rejects_malformed_found_operation");
+    String truncated = foundBytes;
+    truncated.resize(truncated.size() - 1);
+    expect(!BitseryEngine::deserializeSafe(truncated, rejectedResponse),
+           "transport_lifecycle_response_rejects_truncation");
+
+    ProdigyTransportCredentialLifecycleResponse boundedFailure = notFound;
+    boundedFailure.failure = {};
+    for (unsigned i = 0; i != 4096; ++i) boundedFailure.failure.append('x');
+    String boundedFailureBytes = {};
+    ProdigyTransportCredentialLifecycleResponse boundedFailureDecoded = {};
+    expect(boundedFailure.failure.size() == 4096 && BitseryEngine::serialize(boundedFailureBytes, boundedFailure) > 0 &&
+               BitseryEngine::deserializeSafe(boundedFailureBytes, boundedFailureDecoded) &&
+               boundedFailureDecoded.failure.size() == 4096,
+           "transport_lifecycle_response_accepts_bounded_failure");
+    boundedFailure.failure.append('x');
+    String oversizedFailureBytes = {};
+    expect(boundedFailure.failure.size() == 4097 && BitseryEngine::serialize(oversizedFailureBytes, boundedFailure) > 0 &&
+               !BitseryEngine::deserializeSafe(oversizedFailureBytes, boundedFailureDecoded),
+           "transport_lifecycle_response_rejects_oversized_failure");
+  }
   {
     ProdigyAegisSession client, server;
     expect(establish(client, server), "fresh_noise_and_mutual_aegis_confirmation");
@@ -224,6 +376,10 @@ int main()
     bool ok = client.beginTransportAEGISWithPrelude(false, 11, clientHint, clientResolver) &&
               server.beginTransportAEGISWithPrelude(true, 22, serverHint, serverResolver) &&
               !client.tlsPeerVerified && !server.tlsPeerVerified && connectedPair(client.fd, server.fd);
+    const String *localProof = &clientHint, *peerProof = &serverHint;
+    expect(!client.authenticatedTransportAEGISPreludes(localProof, peerProof) &&
+               localProof == nullptr && peerProof == nullptr,
+           "public_lookup_hint_is_not_an_authenticated_credential_proof");
     if (ok && variant == 2)
     {
       ok = client.prepareTransportTLSSend() && client.encryptedBytesToSend() > 8;
@@ -233,14 +389,30 @@ int main()
     for (unsigned i = 0; ok && i < 10000 && (!client.isTransportNegotiated() || !server.isTransportNegotiated()); ++i)
       if (!pumpSocket(client, server, 7, 5) || !pumpSocket(server, client, 11, 3)) { rejected = true; break; }
     if (variant == 0)
+    {
       expect(ok && !rejected && client.isTransportNegotiated() && server.isTransportNegotiated() &&
                  client.tlsPeerUUID == 22 && server.tlsPeerUUID == 11,
              "bounded_public_prelude_lookup_then_mutual_identity_proof");
+      expect(client.authenticatedTransportAEGISPreludes(localProof, peerProof) &&
+                 *localProof == clientHint && *peerProof == serverHint &&
+                 server.authenticatedTransportAEGISPreludes(localProof, peerProof) &&
+                 *localProof == serverHint && *peerProof == clientHint,
+             "authenticated_credential_proof_preserves_exact_directional_descriptors");
+    }
     else
+    {
       expect(ok && rejected && !server.tlsPeerVerified && !server.isTransportNegotiated(),
              "unauthorized_or_transcript_tampered_public_prelude_fails_closed");
+      expect(!server.authenticatedTransportAEGISPreludes(localProof, peerProof) &&
+                 localProof == nullptr && peerProof == nullptr,
+             "rejected_prelude_cannot_publish_credential_proof");
+    }
     if (client.fd >= 0) { close(client.fd); client.fd = -1; }
     if (server.fd >= 0) { close(server.fd); server.fd = -1; }
+    client.reset();
+    expect(!client.authenticatedTransportAEGISPreludes(localProof, peerProof) &&
+               localProof == nullptr && peerProof == nullptr,
+           "stream_reset_clears_authenticated_credential_proof");
   }
   for (unsigned variant = 0; variant < 4; ++variant)
   {

@@ -467,6 +467,37 @@ int main(void)
   suite.expect(containsAddress(topology.machines[0].addresses.publicAddresses, "2001:db8:100::a", 64), "topology_first_public_ipv6");
   suite.expect(topology.machines[0].peerAddresses.size() == 2, "topology_multihome_peer_addresses");
 
+  MothershipProdigyCluster spareCluster = cluster;
+  spareCluster.test.machineCount = 4;
+  spareCluster.test.spareMachineCount = 1;
+  spareCluster.bootstrapSshUser = defaultMothershipClusterSSHUser();
+  spareCluster.bootstrapSshPrivateKeyPath = prodigyDefaultBootstrapSSHPrivateKeyPath();
+  spareCluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH.assign("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture prodigy-test"_ctv);
+  ClusterTopology spareTopology = {};
+  suite.expect(mothershipBuildVirtualDatacenterTopology(spareCluster, spareTopology, &failure) &&
+                   spareTopology.machines.size() == 3 && clusterTopologyBrainCount(spareTopology) == 2,
+               "spare_topology_excludes_final_machine_from_initial_members");
+  suite.expect(spareTopology.machines.size() == 3 && containsAddress(spareTopology.machines.back().addresses.privateAddresses, "10.0.0.12", 24),
+               "spare_topology_keeps_last_initial_machine_address");
+  ClusterMachine spareMachine = {};
+  suite.expect(mothershipBuildVirtualDatacenterSpareMachine(spareCluster, spareMachine, &failure),
+               "spare_descriptor_builds");
+  suite.expect(spareMachine.uuid == 0 && spareMachine.source == ClusterMachineSource::adopted &&
+                   spareMachine.backing == ClusterMachineBacking::owned && spareMachine.isBrain == false &&
+                   spareMachine.hasCloud == false && spareMachine.ssh.address.equals("10.0.0.13"_ctv) &&
+                   spareMachine.ssh.port == 22 && spareMachine.ssh.user.equals(defaultMothershipClusterSSHUser()) &&
+                   spareMachine.ssh.privateKeyPath.equals(prodigyDefaultBootstrapSSHPrivateKeyPath()) &&
+                   spareMachine.ssh.hostPublicKeyOpenSSH.equals(spareCluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH),
+               "spare_descriptor_is_ordinary_owned_ssh_adoption_candidate");
+  MothershipProdigyCluster malformedSpare = spareCluster;
+  malformedSpare.bootstrapSshHostKeyPackage.publicKeyOpenSSH.clear();
+  suite.expect(!mothershipBuildVirtualDatacenterSpareMachine(malformedSpare, spareMachine, &failure),
+               "spare_descriptor_rejects_missing_pinned_host_key");
+  malformedSpare = spareCluster;
+  malformedSpare.test.spareMachineCount = 0;
+  suite.expect(!mothershipBuildVirtualDatacenterSpareMachine(malformedSpare, spareMachine, &failure),
+               "spare_descriptor_rejects_absent_spare_shape");
+
   MothershipProdigyCluster independentCluster = cluster;
   independentCluster.datacenterFragment = 2;
   ClusterTopology independentTopology = {};

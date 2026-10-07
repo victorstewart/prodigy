@@ -61,6 +61,7 @@ public:
   uint64_t artifactCapabilityValidationGeneration = 0;
 
   bool transportPeerProjectionCapable = false;
+  bool transportCredentialLifecycleCapable = false;
   uint64_t transportPeerProjectionIOGeneration = 0;
   uint64_t transportPeerProjectionAuthorityEpoch = 0;
   uint128_t transportPeerProjectionNonce = 0;
@@ -91,6 +92,7 @@ public:
     hadSuccessfulConnection = false;
     artifactCapabilityPending = false;
     transportPeerProjectionCapable = false;
+    transportCredentialLifecycleCapable = false;
     transportPeerProjectionIOGeneration = 0;
     transportPeerProjectionAuthorityEpoch = 0;
     transportPeerProjectionNonce = 0;

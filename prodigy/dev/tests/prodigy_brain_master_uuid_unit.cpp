@@ -1389,6 +1389,37 @@ static bool queuedBrainBundleUpdateOrTransition(String& buffer)
 
 static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 {
+  // These fixtures exercise the real missing-peer and gossip owners.  A
+  // synthetic fixed-file index is not a transport: reconnect cleanup may
+  // legitimately retire it, so give every participating peer an owned
+  // descriptor and keep its other end until fixture teardown.
+  auto installFixturePeerSocket = [&](BrainView *peer) {
+    int fds[2] = {-1, -1};
+    const bool created = peer != nullptr && ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0;
+    suite.expect(created, "pending_designated_master_fixture_creates_peer_socket");
+    if (!created) return -1;
+    peer->fd = fds[0];
+    Ring::installFDIntoFixedFileSlot(peer);
+    const bool installed = peer->isFixedFile && peer->fslot >= 0;
+    suite.expect(installed, "pending_designated_master_fixture_installs_peer_socket");
+    if (!installed)
+    {
+      if (peer->fd >= 0) ::close(peer->fd);
+      peer->fd = -1;
+      ::close(fds[1]);
+      return -1;
+    }
+    return fds[1];
+  };
+  auto cleanupFixturePeerSocket = [](BrainView *peer, int otherFD) {
+    if (peer != nullptr)
+    {
+      if (peer->isFixedFile) Ring::uninstallFromFixedFileSlot(peer);
+      else if (peer->fd >= 0) ::close(peer->fd);
+    }
+    if (otherFD >= 0) ::close(otherFD);
+  };
+
   {
     ScopedRing scopedRing = {};
 
@@ -1421,16 +1452,14 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     BrainView *designatedPeer = makePeer(uint128_t(0x220), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
     designatedPeer->connected = true;
-    designatedPeer->isFixedFile = true;
-    designatedPeer->fslot = 34;
+    const int designatedPeerFD = installFixturePeerSocket(designatedPeer);
     brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
     brain.brains.insert(designatedPeer);
 
     BrainView *reachablePeer = makePeer(uint128_t(0x200), 21, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
     reachablePeer->connected = true;
     reachablePeer->isMasterMissing = true;
-    reachablePeer->isFixedFile = true;
-    reachablePeer->fslot = 35;
+    const int reachablePeerFD = installFixturePeerSocket(reachablePeer);
     brain.brains.insert(reachablePeer);
 
     brain.testBrainMissing(designatedPeer);
@@ -1452,6 +1481,8 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     brain.brains.erase(designatedPeer);
     brain.brains.erase(reachablePeer);
+    cleanupFixturePeerSocket(designatedPeer, designatedPeerFD);
+    cleanupFixturePeerSocket(reachablePeer, reachablePeerFD);
     delete designatedPeer;
     delete reachablePeer;
     ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
@@ -1470,15 +1501,13 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     BrainView *designatedPeer = makePeer(uint128_t(0x420), 30, IPAddress("10.0.0.21", false).v4, "10.0.0.21");
     designatedPeer->connected = true;
-    designatedPeer->isFixedFile = true;
-    designatedPeer->fslot = 44;
+    const int designatedPeerFD = installFixturePeerSocket(designatedPeer);
     brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
     brain.brains.insert(designatedPeer);
 
     BrainView *ordinaryPeer = makePeer(uint128_t(0x430), 31, IPAddress("10.0.0.22", false).v4, "10.0.0.22");
     ordinaryPeer->connected = true;
-    ordinaryPeer->isFixedFile = true;
-    ordinaryPeer->fslot = 45;
+    const int ordinaryPeerFD = installFixturePeerSocket(ordinaryPeer);
     brain.brains.insert(ordinaryPeer);
 
     brain.testBrainMissing(ordinaryPeer);
@@ -1492,6 +1521,8 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     brain.brains.erase(designatedPeer);
     brain.brains.erase(ordinaryPeer);
+    cleanupFixturePeerSocket(designatedPeer, designatedPeerFD);
+    cleanupFixturePeerSocket(ordinaryPeer, ordinaryPeerFD);
     delete designatedPeer;
     delete ordinaryPeer;
   }
@@ -1514,16 +1545,14 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     BrainView *designatedPeer = makePeer(uint128_t(0x520), 40, IPAddress("10.0.0.31", false).v4, "10.0.0.31");
     designatedPeer->connected = true;
-    designatedPeer->isFixedFile = true;
-    designatedPeer->fslot = 54;
+    const int designatedPeerFD = installFixturePeerSocket(designatedPeer);
     brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
     brain.brains.insert(designatedPeer);
 
     BrainView *reachablePeer = makePeer(uint128_t(0x530), 41, IPAddress("10.0.0.32", false).v4, "10.0.0.32");
     reachablePeer->connected = true;
     reachablePeer->isMasterMissing = true;
-    reachablePeer->isFixedFile = true;
-    reachablePeer->fslot = 55;
+    const int reachablePeerFD = installFixturePeerSocket(reachablePeer);
     brain.brains.insert(reachablePeer);
 
     brain.testBrainMissing(designatedPeer);
@@ -1535,6 +1564,8 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     brain.brains.erase(designatedPeer);
     brain.brains.erase(reachablePeer);
+    cleanupFixturePeerSocket(designatedPeer, designatedPeerFD);
+    cleanupFixturePeerSocket(reachablePeer, reachablePeerFD);
     delete designatedPeer;
     delete reachablePeer;
   }
@@ -1551,15 +1582,13 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     BrainView *commandPeer = makePeer(uint128_t(0x620), 50, IPAddress("10.0.0.41", false).v4, "10.0.0.41");
     commandPeer->connected = true;
-    commandPeer->isFixedFile = true;
-    commandPeer->fslot = 64;
+    const int commandPeerFD = installFixturePeerSocket(commandPeer);
     brain.brains.insert(commandPeer);
 
     BrainView *designatedPeer = makePeer(uint128_t(0x630), 51, IPAddress("10.0.0.42", false).v4, "10.0.0.42");
     designatedPeer->connected = false;
     designatedPeer->quarantined = true;
-    designatedPeer->isFixedFile = true;
-    designatedPeer->fslot = 65;
+    const int designatedPeerFD = installFixturePeerSocket(designatedPeer);
     brain.brains.insert(designatedPeer);
 
     String buffer = {};
@@ -1586,6 +1615,8 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     brain.brains.erase(commandPeer);
     brain.brains.erase(designatedPeer);
+    cleanupFixturePeerSocket(commandPeer, commandPeerFD);
+    cleanupFixturePeerSocket(designatedPeer, designatedPeerFD);
     delete commandPeer;
     delete designatedPeer;
   }
@@ -1602,15 +1633,13 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     BrainView *commandPeer = makePeer(uint128_t(0x720), 60, IPAddress("10.0.0.51", false).v4, "10.0.0.51");
     commandPeer->connected = true;
-    commandPeer->isFixedFile = true;
-    commandPeer->fslot = 74;
+    const int commandPeerFD = installFixturePeerSocket(commandPeer);
     brain.brains.insert(commandPeer);
 
     BrainView *designatedPeer = makePeer(uint128_t(0x730), 61, IPAddress("10.0.0.52", false).v4, "10.0.0.52");
     designatedPeer->connected = false;
     designatedPeer->quarantined = true;
-    designatedPeer->isFixedFile = true;
-    designatedPeer->fslot = 75;
+    const int designatedPeerFD = installFixturePeerSocket(designatedPeer);
     brain.pendingDesignatedMasterPeerKey = designatedPeer->uuid;
     brain.brains.insert(designatedPeer);
 
@@ -1636,6 +1665,8 @@ static void runPendingDesignatedMasterRecoveryFixtures(TestSuite& suite)
 
     brain.brains.erase(commandPeer);
     brain.brains.erase(designatedPeer);
+    cleanupFixturePeerSocket(commandPeer, commandPeerFD);
+    cleanupFixturePeerSocket(designatedPeer, designatedPeerFD);
     delete commandPeer;
     delete designatedPeer;
   }
@@ -1692,6 +1723,100 @@ static void runStrandedFollowerReconnectFixture(TestSuite& suite)
       ::close(stalePair[1]);
     }
   }
+  {
+    // A missing-master transition can consume the retry timer created by the
+    // close path. A canonical follower must still reconnect after quarantine,
+    // including when it is the only remaining voter until the master restarts.
+    TestBrain follower = {};
+    follower.iaas = new NoopBrainIaaS();
+    follower.nBrains = 3;
+    follower.noMasterYet = false;
+    follower.weAreMaster = false;
+    follower.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+    follower.localBrainPeerAddressText = "127.0.0.1"_ctv;
+    follower.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+    BrainView master = {};
+    master.uuid = uint128_t(0x0713);
+    master.boottimens = 223;
+    master.isMasterBrain = true;
+    master.weConnectToIt = true;
+    master.reconnectAfterClose = true;
+    master.peerAddress = IPAddress("127.0.0.18", false);
+    master.peerAddressText = "127.0.0.18"_ctv;
+    master.connectTimeoutMs = 250;
+    master.nDefaultAttemptsBudget = 4;
+    follower.brains.insert(&master);
+    follower.testArmBrainReconnectWaiter(&master, 1000, true);
+    suite.expect(follower.testHasBrainReconnectWaiter(&master),
+                 "missing_master_follower_starts_with_close_owned_retry");
+    follower.testBrainMissing(&master);
+    suite.expect(master.quarantined && follower.isMasterMissing && !follower.weAreMaster,
+                 "missing_master_follower_preserves_quorum_fence");
+    suite.expect(master.connectAttemptPending(),
+                 "missing_master_follower_resumes_connect_after_canceling_close_retry");
+    suite.expect(master.isFixedFile && master.fslot >= 0,
+                 "missing_master_follower_installs_reconnecting_transport");
+    follower.brains.erase(&master);
+    if (master.isFixedFile) Ring::uninstallFromFixedFileSlot(&master);
+    else if (master.fd >= 0) ::close(master.fd);
+  }
+  {
+    // The same current-master report can arrive again after the peer is
+    // already quarantined.  Its persistent retry is the only reconnect owner
+    // then: retaining it must not leave an inert fixed-file generation or
+    // create a second concurrent connect.
+    TestBrain follower = {};
+    follower.iaas = new NoopBrainIaaS();
+    follower.nBrains = 3;
+    follower.noMasterYet = false;
+    follower.weAreMaster = false;
+    follower.localBrainPeerAddress = IPAddress("127.0.0.1", false);
+    follower.localBrainPeerAddressText = "127.0.0.1"_ctv;
+    follower.localBrainPeerAddresses.push_back(ClusterMachinePeerAddress {"127.0.0.1"_ctv, 8});
+    BrainView master = {};
+    master.uuid = uint128_t(0x0714);
+    master.boottimens = 224;
+    master.isMasterBrain = true;
+    master.quarantined = true;
+    master.reconnectAfterClose = true;
+    master.peerAddress = IPAddress("127.0.0.19", false);
+    master.peerAddressText = "127.0.0.19"_ctv;
+    master.connectTimeoutMs = 250;
+    master.nDefaultAttemptsBudget = 4;
+    int stalePair[2] = {-1, -1};
+    const bool madePair = ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stalePair) == 0;
+    suite.expect(madePair, "missing_master_repeated_follower_creates_owned_stale_transport");
+    if (madePair)
+    {
+      master.fd = stalePair[0];
+      Ring::installFDIntoFixedFileSlot(&master);
+      suite.expect(master.isFixedFile && master.fslot >= 0,
+                    "missing_master_repeated_follower_installs_owned_stale_transport");
+      follower.brains.insert(&master);
+      follower.testArmBrainReconnectWaiter(&master, 1000, true);
+      TimeoutPacket *firstRetry = follower.testGetBrainReconnectWaiter(&master);
+      suite.expect(firstRetry != nullptr && !master.isFixedFile && master.fd < 0,
+                    "missing_master_repeated_follower_owns_persistent_retry_after_retiring_stale_transport");
+
+      follower.testBrainMissing(&master);
+      TimeoutPacket *retainedRetry = follower.testGetBrainReconnectWaiter(&master);
+      suite.expect(retainedRetry != nullptr && master.connectAttemptPending() == false &&
+                       master.isFixedFile == false && master.fd < 0,
+                   "missing_master_repeated_follower_preserves_persistent_retry_without_concurrent_io");
+      if (retainedRetry != nullptr)
+      {
+        follower.testDispatchTimeout(retainedRetry);
+      }
+      suite.expect(follower.testHasBrainReconnectWaiter(&master) == false && master.connectAttemptPending() &&
+                       master.isFixedFile && master.fslot >= 0,
+                   "missing_master_repeated_follower_retry_callback_redials_owned_transport");
+      follower.brains.erase(&master);
+      if (master.isFixedFile) Ring::uninstallFromFixedFileSlot(&master);
+      else if (master.fd >= 0) ::close(master.fd);
+      ::close(stalePair[1]);
+    }
+  }
+
 }
 
 // A failed first outbound connect has transportEpoch == 0.  Drive its real
@@ -1868,14 +1993,17 @@ static void runPromotedCanonicalConnectorRecoveryFixture(TestSuite& suite, TestN
       brain.testDispatchTimeout(missingWaiter);
     }
 
-    suite.expect(peer->quarantined && peer->fd >= 0 && peer->isFixedFile == false &&
-                     peer->connectAttemptPending() == false && brain.testHasBrainReconnectWaiter(peer) == false,
-                 "promoted_canonical_connector_recovery_missing_waiter_leaves_stale_raw_generation");
+    suite.expect(peer->quarantined && peer->isFixedFile && peer->fslot >= 0 &&
+                     peer->connectAttemptPending() && brain.testHasBrainReconnectWaiter(peer) == false,
+                 "promoted_canonical_connector_recovery_missing_follower_already_resumes_connect");
 
+    const int reconnectSlot = peer->fslot;
+    const uint32_t reconnectEpoch = peer->transportEpoch;
     brain.weAreMaster = true;
     brain.testRunBrainPeerHeartbeatTick();
-    suite.expect(peer->connectAttemptPending() || brain.testHasBrainReconnectWaiter(peer),
-                 "promoted_canonical_connector_recovery_promoted_heartbeat_rearms_canonical_connect");
+    suite.expect(peer->connectAttemptPending() && peer->fslot == reconnectSlot &&
+                     peer->transportEpoch == reconnectEpoch,
+                 "promoted_canonical_connector_recovery_promoted_heartbeat_preserves_pending_connect");
   }
 
   brain.testEraseBrainWaiter(peer);
@@ -11014,15 +11142,15 @@ int main(void)
 
     BrainView *masterPeer = makePeer(uint128_t(0x220), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
     masterPeer->connected = true;
-    masterPeer->isFixedFile = true;
-    masterPeer->fslot = 32;
+    int masterPeerFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *masterPeer, masterPeerFD), "brain_missing_master_peer_owns_master_socket");
     masterPeer->isMasterBrain = true;
     brain.brains.insert(masterPeer);
 
     BrainView *followerPeer = makePeer(uint128_t(0x330), 21, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
     followerPeer->connected = true;
-    followerPeer->isFixedFile = true;
-    followerPeer->fslot = 33;
+    int followerPeerFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *followerPeer, followerPeerFD), "brain_missing_master_peer_owns_gossip_socket");
     brain.brains.insert(followerPeer);
 
     brain.testBrainMissing(masterPeer);
@@ -11040,7 +11168,9 @@ int main(void)
     suite.expect(sawMasterMissingFrame, "brain_missing_master_peer_gossips_master_missing_to_other_peers");
     suite.expect(brain.weAreMaster == false, "brain_missing_master_peer_does_not_self_elect_immediately");
 
+    cleanupBrainPeerSocket(*masterPeer, masterPeerFD);
     brain.brains.erase(masterPeer);
+    cleanupBrainPeerSocket(*followerPeer, followerPeerFD);
     brain.brains.erase(followerPeer);
     delete masterPeer;
     delete followerPeer;
@@ -11059,15 +11189,15 @@ int main(void)
 
     BrainView *masterPeer = makePeer(uint128_t(0x221), 25, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
     masterPeer->connected = true;
-    masterPeer->isFixedFile = true;
-    masterPeer->fslot = 36;
+    int masterPeerFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *masterPeer, masterPeerFD), "brain_missing_master_claim_owns_master_socket");
     masterPeer->existingMasterUUID = masterPeer->uuid;
     brain.brains.insert(masterPeer);
 
     BrainView *followerPeer = makePeer(uint128_t(0x331), 26, IPAddress("10.0.0.12", false).v4, "10.0.0.12");
     followerPeer->connected = true;
-    followerPeer->isFixedFile = true;
-    followerPeer->fslot = 37;
+    int followerPeerFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *followerPeer, followerPeerFD), "brain_missing_master_claim_owns_gossip_socket");
     brain.brains.insert(followerPeer);
 
     brain.testBrainMissing(masterPeer);
@@ -11084,7 +11214,9 @@ int main(void)
     suite.expect(brain.isMasterMissing, "brain_missing_master_claim_marks_master_missing");
     suite.expect(sawMasterMissingFrame, "brain_missing_master_claim_gossips_master_missing_to_other_peers");
 
+    cleanupBrainPeerSocket(*masterPeer, masterPeerFD);
     brain.brains.erase(masterPeer);
+    cleanupBrainPeerSocket(*followerPeer, followerPeerFD);
     brain.brains.erase(followerPeer);
     delete masterPeer;
     delete followerPeer;
@@ -11103,8 +11235,8 @@ int main(void)
 
     BrainView *masterPeer = makePeer(uint128_t(0x220), 20, IPAddress("10.0.0.11", false).v4, "10.0.0.11");
     masterPeer->connected = true;
-    masterPeer->isFixedFile = true;
-    masterPeer->fslot = 34;
+    int masterPeerFD = -1;
+    suite.expect(installBrainPeerSocket(brain, *masterPeer, masterPeerFD), "brain_missing_single_brain_owns_master_socket");
     masterPeer->isMasterBrain = true;
     brain.brains.insert(masterPeer);
 
@@ -11114,6 +11246,7 @@ int main(void)
     suite.expect(brain.noMasterYet == false, "brain_missing_single_brain_isolation_clears_no_master");
     suite.expect(masterPeer->quarantined, "brain_missing_single_brain_isolation_quarantines_missing_peer");
 
+    cleanupBrainPeerSocket(*masterPeer, masterPeerFD);
     brain.brains.erase(masterPeer);
     delete masterPeer;
   });

@@ -124,6 +124,10 @@ public:
   bool specified = false;
   String workspaceRoot;
   uint32_t machineCount = 0;
+  // Included in machineCount but withheld from the initial VDC topology.  This
+  // deliberately stays out of the nested config serializer: V6 records carry
+  // the nonzero extension in their versioned tail.
+  uint32_t spareMachineCount = 0;
   uint32_t machineLogicalCores = 8;
   uint32_t machineMemoryMB = 16'384;
   uint32_t machineStorageMB = 262'144;
@@ -132,6 +136,11 @@ public:
   MothershipClusterTestBootstrapFamily brainBootstrapFamily = MothershipClusterTestBootstrapFamily::ipv4;
   bool enableFakeIpv4Boundary = false;
   uint32_t interContainerMTU = 0;
+
+  uint32_t initialMachineCount() const
+  {
+    return spareMachineCount <= 1 && machineCount > spareMachineCount ? machineCount - spareMachineCount : 0;
+  }
 };
 
 template <typename S>

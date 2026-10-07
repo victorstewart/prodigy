@@ -5,6 +5,7 @@
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <types/types.containers.h>
+#include <prodigy/persistent.codec.h>
 
 // Durable control-plane contract for the internal AEGIS credential authority.
 // These records are enrollment evidence only: transport activation and live
@@ -55,6 +56,9 @@ public:
 
 enum class ProdigyTransportCredentialEnrollmentOperationPhase : uint8_t { pending = 1, active = 2, delivered = 3, revoked = 4 };
 
+enum class ProdigyTransportCredentialLifecycleKind : uint8_t { rotate = 1, revoke = 2 };
+enum class ProdigyTransportCredentialLifecyclePhase : uint8_t { prepared = 1, staged = 2, active = 3, complete = 4 };
+
 // A cohort is appended atomically at one authority-state generation. Its
 // cardinality and target roles come from the existing addMachines journal;
 // these public fields identify it without another persisted operation owner.
@@ -92,23 +96,91 @@ static inline bool prodigyTransportCredentialElectorateMatches(
 
 class ProdigyTransportCredentialEnrollmentOperation {
 public:
+  // Version one is the original enrollment receipt and its wire layout must
+  // remain byte-for-byte stable. Version two is a scoped lifecycle receipt;
+  // it deliberately carries no pending successor in the public ledger.
+  uint8_t protocolVersion = 1;
   ProdigyTransportCredentialEnrollment enrollment;
   Vector<uint128_t> electorate;
   uint64_t pinnedMasterAuthorityEpoch = 0;
   uint64_t transitionGeneration = 0;
   ProdigyTransportCredentialEnrollmentOperationPhase phase = ProdigyTransportCredentialEnrollmentOperationPhase::pending;
+  uint128_t lifecycleOperationUUID = 0;
+  ProdigyTransportCredentialLifecycleKind lifecycleKind = ProdigyTransportCredentialLifecycleKind::rotate;
+  ProdigyTransportCredentialEnrollment predecessor;
+  ProdigyTransportCredentialEnrollment successor;
+  uint64_t frozenAuthorityGeneration = 0;
+  ProdigyTransportCredentialLifecyclePhase lifecyclePhase = ProdigyTransportCredentialLifecyclePhase::prepared;
+  uint64_t activationGeneration = 0;
+
+  static bool enrollmentIsZero(const ProdigyTransportCredentialEnrollment& value)
+  {
+    return value.operationUUID == 0 && value.nodeUUID == 0 && value.clusterUUID == 0 &&
+        value.authorityEpoch == 0 && value.keyEpoch == 0 && value.authorityGeneration == 0 &&
+        value.role == ProdigyTransportCredentialNodeRole::neuron &&
+        value.state == ProdigyTransportCredentialEnrollmentState::pending;
+  }
+
+  bool lifecycle(void) const { return protocolVersion == 2; }
+
   bool valid(void) const {
-    if (!enrollment.valid() || electorate.empty() || electorate.size() > 4096 || pinnedMasterAuthorityEpoch == 0 || transitionGeneration == 0 ||
-        uint8_t(phase) < uint8_t(ProdigyTransportCredentialEnrollmentOperationPhase::pending) || uint8_t(phase) > uint8_t(ProdigyTransportCredentialEnrollmentOperationPhase::revoked)) return false;
-    if (transitionGeneration < enrollment.authorityGeneration ||
-        (phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending && enrollment.state != ProdigyTransportCredentialEnrollmentState::pending) ||
-        ((phase == ProdigyTransportCredentialEnrollmentOperationPhase::active || phase == ProdigyTransportCredentialEnrollmentOperationPhase::delivered) && enrollment.state != ProdigyTransportCredentialEnrollmentState::active) ||
-        (phase == ProdigyTransportCredentialEnrollmentOperationPhase::revoked && enrollment.state != ProdigyTransportCredentialEnrollmentState::revoked)) return false;
+    if (protocolVersion == 1)
+    {
+      if (!enrollment.valid() || electorate.empty() || electorate.size() > 4096 || pinnedMasterAuthorityEpoch == 0 || transitionGeneration == 0 ||
+          uint8_t(phase) < uint8_t(ProdigyTransportCredentialEnrollmentOperationPhase::pending) || uint8_t(phase) > uint8_t(ProdigyTransportCredentialEnrollmentOperationPhase::revoked) ||
+          lifecycleOperationUUID != 0 || !enrollmentIsZero(predecessor) || !enrollmentIsZero(successor) ||
+          frozenAuthorityGeneration != 0 || activationGeneration != 0 ||
+          lifecycleKind != ProdigyTransportCredentialLifecycleKind::rotate ||
+          lifecyclePhase != ProdigyTransportCredentialLifecyclePhase::prepared) return false;
+      if (transitionGeneration < enrollment.authorityGeneration ||
+          (phase == ProdigyTransportCredentialEnrollmentOperationPhase::pending && enrollment.state != ProdigyTransportCredentialEnrollmentState::pending) ||
+          ((phase == ProdigyTransportCredentialEnrollmentOperationPhase::active || phase == ProdigyTransportCredentialEnrollmentOperationPhase::delivered) && enrollment.state != ProdigyTransportCredentialEnrollmentState::active) ||
+          (phase == ProdigyTransportCredentialEnrollmentOperationPhase::revoked && enrollment.state != ProdigyTransportCredentialEnrollmentState::revoked)) return false;
+    }
+    else if (protocolVersion == 2)
+    {
+      if (!enrollmentIsZero(enrollment) || lifecycleOperationUUID == 0 || lifecycleOperationUUID == predecessor.operationUUID ||
+          !predecessor.valid() || electorate.empty() || electorate.size() > 4096 ||
+          pinnedMasterAuthorityEpoch == 0 || frozenAuthorityGeneration == 0 || frozenAuthorityGeneration == UINT64_MAX ||
+          phase != ProdigyTransportCredentialEnrollmentOperationPhase::pending ||
+          predecessor.authorityGeneration > frozenAuthorityGeneration || transitionGeneration <= frozenAuthorityGeneration ||
+          uint8_t(lifecycleKind) < uint8_t(ProdigyTransportCredentialLifecycleKind::rotate) || uint8_t(lifecycleKind) > uint8_t(ProdigyTransportCredentialLifecycleKind::revoke) ||
+          uint8_t(lifecyclePhase) < uint8_t(ProdigyTransportCredentialLifecyclePhase::prepared) || uint8_t(lifecyclePhase) > uint8_t(ProdigyTransportCredentialLifecyclePhase::complete)) return false;
+      const bool rotating = lifecycleKind == ProdigyTransportCredentialLifecycleKind::rotate;
+      if ((rotating && (!successor.valid() || lifecycleOperationUUID == successor.operationUUID)) || (!rotating && !enrollmentIsZero(successor)) ||
+          (rotating && (successor.nodeUUID != predecessor.nodeUUID || successor.role != predecessor.role ||
+                        successor.clusterUUID != predecessor.clusterUUID || successor.authorityEpoch != predecessor.authorityEpoch ||
+                        successor.keyEpoch != predecessor.keyEpoch || successor.operationUUID == predecessor.operationUUID ||
+                        successor.authorityGeneration != frozenAuthorityGeneration + 1))) return false;
+      if (lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::prepared || lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::staged)
+      {
+        if (predecessor.state != ProdigyTransportCredentialEnrollmentState::active ||
+            (rotating && successor.state != ProdigyTransportCredentialEnrollmentState::pending) || activationGeneration != 0) return false;
+      }
+      else if (lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active)
+      {
+        if (predecessor.state != ProdigyTransportCredentialEnrollmentState::revoked ||
+            (rotating && successor.state != ProdigyTransportCredentialEnrollmentState::active) || activationGeneration == 0) return false;
+      }
+      else if (predecessor.state != ProdigyTransportCredentialEnrollmentState::revoked ||
+               (rotating && successor.state != ProdigyTransportCredentialEnrollmentState::active) || activationGeneration == 0) return false;
+      if (activationGeneration != 0 && (activationGeneration <= frozenAuthorityGeneration || activationGeneration > transitionGeneration)) return false;
+    }
+    else return false;
     for (uint32_t i = 0; i < electorate.size(); ++i) {
       if (electorate[i] == 0) return false;
       for (uint32_t j = 0; j < i; ++j) if (electorate[j] == electorate[i]) return false;
     }
     return true;
+  }
+
+  bool operator==(const ProdigyTransportCredentialEnrollmentOperation& other) const
+  {
+    return protocolVersion == other.protocolVersion && enrollment == other.enrollment && electorate == other.electorate &&
+        pinnedMasterAuthorityEpoch == other.pinnedMasterAuthorityEpoch && transitionGeneration == other.transitionGeneration && phase == other.phase &&
+        lifecycleOperationUUID == other.lifecycleOperationUUID && lifecycleKind == other.lifecycleKind && predecessor == other.predecessor &&
+        successor == other.successor && frozenAuthorityGeneration == other.frozenAuthorityGeneration &&
+        lifecyclePhase == other.lifecyclePhase && activationGeneration == other.activationGeneration;
   }
 };
 
@@ -133,6 +205,7 @@ public:
     return authorityEpoch != 0 && keyEpoch != 0 && authorityGeneration != 0 && aggregate != 0;
   }
 };
+
 
 // A node credential is the only secret an enrolled Neuron receives.  It is
 // already bound to that node and role, so it cannot be used as an authority
@@ -319,6 +392,131 @@ static inline bool prodigyTransportCredentialBootstrapValid(const ProdigyTranspo
   }
   return true;
 }
+
+static inline bool prodigyTransportNodeCredentialMatchesEnrollment(
+    const ProdigyTransportNodeCredential& credential, const ProdigyTransportCredentialEnrollment& enrollment)
+{
+  return credential.operationUUID == enrollment.operationUUID && credential.nodeUUID == enrollment.nodeUUID &&
+      credential.clusterUUID == enrollment.clusterUUID && credential.authorityEpoch == enrollment.authorityEpoch &&
+      credential.keyEpoch == enrollment.keyEpoch && credential.authorityGeneration == enrollment.authorityGeneration &&
+      credential.role == enrollment.role;
+}
+
+static inline bool prodigyTransportCredentialLifecycleSameOperation(
+    const ProdigyTransportCredentialEnrollmentOperation& previous,
+    const ProdigyTransportCredentialEnrollmentOperation& next)
+{
+  auto normalized = next;
+  normalized.predecessor.state = previous.predecessor.state;
+  normalized.successor.state = previous.successor.state;
+  normalized.lifecyclePhase = previous.lifecyclePhase;
+  normalized.activationGeneration = previous.activationGeneration;
+  normalized.transitionGeneration = previous.transitionGeneration;
+  normalized.pinnedMasterAuthorityEpoch = previous.pinnedMasterAuthorityEpoch;
+  return normalized == previous;
+}
+
+class ProdigyTransportCredentialLifecycleRequest {
+public:
+  uint8_t protocolVersion = 1;
+  uint128_t clusterUUID = 0;
+  uint128_t operationUUID = 0;
+  uint128_t nodeUUID = 0;
+  ProdigyTransportCredentialNodeRole role = ProdigyTransportCredentialNodeRole::neuron;
+  ProdigyTransportCredentialLifecycleKind kind = ProdigyTransportCredentialLifecycleKind::rotate;
+  uint64_t expectedAuthorityGeneration = 0;
+
+  bool valid() const
+  {
+    return protocolVersion == 1 && clusterUUID != 0 && operationUUID != 0 && nodeUUID != 0 &&
+        expectedAuthorityGeneration != 0 &&
+        (role == ProdigyTransportCredentialNodeRole::brain || role == ProdigyTransportCredentialNodeRole::neuron) &&
+        (kind == ProdigyTransportCredentialLifecycleKind::rotate || kind == ProdigyTransportCredentialLifecycleKind::revoke);
+  }
+};
+
+class ProdigyTransportCredentialLifecycleQuery {
+public:
+  uint8_t protocolVersion = 1;
+  uint128_t clusterUUID = 0;
+  uint128_t operationUUID = 0;
+
+  bool valid() const { return protocolVersion == 1 && clusterUUID != 0 && operationUUID != 0; }
+};
+
+class ProdigyTransportCredentialLifecycleResponse {
+public:
+  uint8_t protocolVersion = 1;
+  bool success = false;
+  bool found = false;
+  bool durable = false;
+  bool qualified = false;
+  uint128_t localClusterUUID = 0;
+  uint128_t currentMasterUUID = 0;
+  uint64_t currentAuthorityGeneration = 0;
+  ProdigyTransportCredentialEnrollmentOperation operation = {};
+  String failure = {};
+};
+
+class ProdigyTransportCredentialLifecycleProjection {
+public:
+  uint8_t protocolVersion = 0;
+  ProdigyTransportCredentialEnrollmentOperation operation;
+  ProdigyTransportCredentialBootstrap target;
+  uint64_t committedAuthorityGeneration = 0;
+};
+
+static inline bool prodigyTransportCredentialLifecycleProjectionValid(
+    const ProdigyTransportCredentialLifecycleProjection& projection, bool requireSecret = true)
+{
+  if (projection.protocolVersion == 0)
+    return projection.operation == ProdigyTransportCredentialEnrollmentOperation{} && !projection.target.enabled &&
+        prodigyTransportCredentialBootstrapValid(projection.target, requireSecret) && projection.committedAuthorityGeneration == 0;
+  if (projection.protocolVersion != 1 || !projection.operation.valid() || !projection.operation.lifecycle() ||
+      projection.committedAuthorityGeneration < projection.operation.transitionGeneration) return false;
+  const bool revoke = projection.operation.lifecycleKind == ProdigyTransportCredentialLifecycleKind::revoke;
+  if (projection.operation.predecessor.role == ProdigyTransportCredentialNodeRole::brain)
+  {
+    // A Brain credential changes every Neuron's public Brain roster. The
+    // recipient keeps its own credential; no authority root is projected.
+    if (!projection.target.enabled || !prodigyTransportCredentialBootstrapValid(projection.target, requireSecret) ||
+        projection.target.self.role != ProdigyTransportCredentialNodeRole::neuron ||
+        projection.target.self.clusterUUID != projection.operation.predecessor.clusterUUID ||
+        projection.target.self.authorityEpoch != projection.operation.predecessor.authorityEpoch ||
+        projection.target.self.keyEpoch != projection.operation.predecessor.keyEpoch ||
+        projection.target.committedAuthorityGeneration != projection.committedAuthorityGeneration) return false;
+    uint32_t successors = 0;
+    auto successor = projection.operation.successor;
+    successor.state = ProdigyTransportCredentialEnrollmentState::active;
+    for (const auto& peer : projection.target.authorizedPeers)
+      if (peer.nodeUUID == projection.operation.predecessor.nodeUUID)
+      {
+        if (revoke || peer != successor) return false;
+        ++successors;
+      }
+    return successors == (revoke ? 0U : 1U);
+  }
+  if (revoke)
+    return !projection.target.enabled && prodigyTransportCredentialBootstrapValid(projection.target, requireSecret) &&
+        (projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active ||
+         projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::complete) &&
+        projection.operation.predecessor.role == ProdigyTransportCredentialNodeRole::neuron;
+  if (!prodigyTransportCredentialBootstrapValid(projection.target, requireSecret) ||
+      projection.target.self.role != ProdigyTransportCredentialNodeRole::neuron ||
+      projection.target.committedAuthorityGeneration != projection.committedAuthorityGeneration ||
+      projection.target.self.operationUUID != projection.operation.successor.operationUUID ||
+      projection.target.self.nodeUUID != projection.operation.successor.nodeUUID ||
+      projection.target.self.clusterUUID != projection.operation.successor.clusterUUID ||
+      projection.target.self.authorityEpoch != projection.operation.successor.authorityEpoch ||
+      projection.target.self.keyEpoch != projection.operation.successor.keyEpoch ||
+      projection.target.self.authorityGeneration != projection.operation.successor.authorityGeneration ||
+      projection.target.self.role != projection.operation.successor.role) return false;
+  return projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::prepared ||
+      projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::staged ||
+      projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::active ||
+      projection.operation.lifecyclePhase == ProdigyTransportCredentialLifecyclePhase::complete;
+}
+
 
 template <typename S>
 static void serialize(S&& serializer, ProdigyTransportNodeCredential& credential)
@@ -635,6 +833,8 @@ static void serialize(S&& serializer, ProdigyTransportCredentialEnrollment& enro
 template <typename S>
 static void serialize(S&& serializer, ProdigyTransportCredentialEnrollmentOperation& operation)
 {
+  if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value) operation = {};
+  else if (operation.protocolVersion != 1) return;
   serializer.object(operation.enrollment);
   serializer.container(operation.electorate, 4096, [](auto& nested, uint128_t& voter) { nested.value16b(voter); });
   serializer.value8b(operation.pinnedMasterAuthorityEpoch);
@@ -642,6 +842,128 @@ static void serialize(S&& serializer, ProdigyTransportCredentialEnrollmentOperat
   uint8_t phase = uint8_t(operation.phase);
   serializer.value1b(phase);
   operation.phase = ProdigyTransportCredentialEnrollmentOperationPhase(phase);
+}
+
+// Runtime-state version sixteen tags every operation row.  Keeping this
+// separate from the legacy overload is what preserves v1 rows' established
+// byte layout in snapshots and transitions written by older runtimes.
+template <typename S>
+static void prodigySerializeTransportCredentialEnrollmentOperation(
+    S&& serializer, ProdigyTransportCredentialEnrollmentOperation& operation, bool lifecycleCodec)
+{
+  if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value) operation = {};
+  if (!lifecycleCodec)
+  {
+    if (operation.protocolVersion != 1)
+    {
+      if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value)
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      return;
+    }
+    serializer.object(operation);
+    return;
+  }
+  uint8_t version = operation.protocolVersion;
+  serializer.value1b(version);
+  operation.protocolVersion = version;
+  if (version == 1)
+  {
+    serializer.object(operation.enrollment);
+    serializer.container(operation.electorate, 4096, [](auto& nested, uint128_t& voter) { nested.value16b(voter); });
+    serializer.value8b(operation.pinnedMasterAuthorityEpoch);
+    serializer.value8b(operation.transitionGeneration);
+    uint8_t phase = uint8_t(operation.phase);
+    serializer.value1b(phase);
+    operation.phase = ProdigyTransportCredentialEnrollmentOperationPhase(phase);
+    return;
+  }
+  if (version != 2)
+  {
+    if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value)
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+    return;
+  }
+  serializer.value16b(operation.lifecycleOperationUUID);
+  uint8_t kind = uint8_t(operation.lifecycleKind);
+  serializer.value1b(kind);
+  operation.lifecycleKind = ProdigyTransportCredentialLifecycleKind(kind);
+  serializer.object(operation.predecessor);
+  serializer.object(operation.successor);
+  serializer.container(operation.electorate, 4096, [](auto& nested, uint128_t& voter) { nested.value16b(voter); });
+  serializer.value8b(operation.frozenAuthorityGeneration);
+  serializer.value8b(operation.pinnedMasterAuthorityEpoch);
+  serializer.value8b(operation.transitionGeneration);
+  uint8_t lifecyclePhase = uint8_t(operation.lifecyclePhase);
+  serializer.value1b(lifecyclePhase);
+  operation.lifecyclePhase = ProdigyTransportCredentialLifecyclePhase(lifecyclePhase);
+  serializer.value8b(operation.activationGeneration);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyTransportCredentialLifecycleRequest& request)
+{
+  serializer.value1b(request.protocolVersion);
+  serializer.value16b(request.clusterUUID);
+  serializer.value16b(request.operationUUID);
+  serializer.value16b(request.nodeUUID);
+  uint8_t role = uint8_t(request.role);
+  uint8_t kind = uint8_t(request.kind);
+  serializer.value1b(role);
+  serializer.value1b(kind);
+  request.role = ProdigyTransportCredentialNodeRole(role);
+  request.kind = ProdigyTransportCredentialLifecycleKind(kind);
+  serializer.value8b(request.expectedAuthorityGeneration);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyTransportCredentialLifecycleQuery& query)
+{
+  serializer.value1b(query.protocolVersion);
+  serializer.value16b(query.clusterUUID);
+  serializer.value16b(query.operationUUID);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyTransportCredentialLifecycleResponse& response)
+{
+  if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value) response = {};
+  serializer.value1b(response.protocolVersion);
+  serializer.value1b(response.success);
+  serializer.value1b(response.found);
+  serializer.value1b(response.durable);
+  serializer.value1b(response.qualified);
+  serializer.value16b(response.localClusterUUID);
+  serializer.value16b(response.currentMasterUUID);
+  serializer.value8b(response.currentAuthorityGeneration);
+  if (response.found)
+    prodigySerializeTransportCredentialEnrollmentOperation(serializer, response.operation, true);
+  else
+    response.operation = {};
+  serializer.text1b(response.failure, 4096);
+  if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value)
+    if (response.protocolVersion != 1 || response.failure.size() > 4096 ||
+        (response.found && (!response.operation.valid() || !response.operation.lifecycle())) ||
+        (!response.found && response.operation != ProdigyTransportCredentialEnrollmentOperation{}))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+}
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyTransportCredentialLifecycleProjection& projection)
+{
+  if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value) projection = {};
+  uint8_t version = projection.protocolVersion;
+  serializer.value1b(version);
+  projection.protocolVersion = version;
+  if (version == 0) return;
+  if (version != 1)
+  {
+    if constexpr (!ProdigyPersistentSerializerIsWriter<std::remove_cvref_t<S>>::value)
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+    return;
+  }
+  prodigySerializeTransportCredentialEnrollmentOperation(serializer, projection.operation, true);
+  serializer.object(projection.target);
+  serializer.value8b(projection.committedAuthorityGeneration);
 }
 
 template <typename S>

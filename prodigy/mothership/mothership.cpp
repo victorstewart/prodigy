@@ -2449,9 +2449,10 @@ static void printManagedCluster(const MothershipProdigyCluster& cluster)
   if (cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.specified)
   {
     String workspaceRoot = cluster.test.workspaceRoot;
-    basics_log("    test workspaceRoot=%s machineCount=%u machineLogicalCores=%u machineMemoryMB=%u machineStorageMB=%u storageDeviceCount=%u storageDeviceMB=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d interContainerMTU=%u\n",
+    basics_log("    test workspaceRoot=%s machineCount=%u spareMachineCount=%u machineLogicalCores=%u machineMemoryMB=%u machineStorageMB=%u storageDeviceCount=%u storageDeviceMB=%u brainBootstrapFamily=%s enableFakeIpv4Boundary=%d interContainerMTU=%u\n",
                workspaceRoot.c_str(),
                unsigned(cluster.test.machineCount),
+               unsigned(cluster.test.spareMachineCount),
                unsigned(cluster.test.machineLogicalCores),
                unsigned(cluster.test.machineMemoryMB),
                unsigned(cluster.test.machineStorageMB),
@@ -4133,6 +4134,8 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
     uint128_t *completedOperationID, String *failure)
 {
   auto reject = [&](const char *message) { if (failure) failure->assign(message); return false; };
+  if (cluster.test.spareMachineCount != 0)
+    return reject("retained-provider bundle recovery does not support SSH spare machines");
   const bool followerReplacement = followerPreflight != nullptr;
   // A follower retains its unchanged boot record and restarts under the old
   // master, which remains the plan owner.  Bootstrap supersession/checkpoint
@@ -4627,6 +4630,57 @@ static bool mothershipRecoverVirtualDatacenterBundle(const MothershipProdigyClus
   return true;
 }
 
+// Typed Mothership owns the disposable OS boot configuration. The sealed
+// provider only installs this material into its private root and enters init;
+// the spare receives no Prodigy executable, boot record or transport secret.
+static bool mothershipPrepareVirtualDatacenterSpare(const MothershipProdigyCluster& cluster,
+    uint64_t hostNetns, String *failure)
+{
+  if (cluster.test.spareMachineCount == 0) return true;
+  if (cluster.test.spareMachineCount != 1 || cluster.test.machineCount <= cluster.nBrains ||
+      !cluster.bootstrapSshPrivateKeyPath.equals(prodigyDefaultBootstrapSSHPrivateKeyPath()) ||
+      !Vault::validateSSHKeyPackageEd25519(cluster.bootstrapSshKeyPackage, failure) ||
+      !Vault::validateSSHKeyPackageEd25519(cluster.bootstrapSshHostKeyPackage, failure))
+  {
+    if (failure && failure->empty()) failure->assign("SSH spare requires one worker and the default private-key path"_ctv);
+    return false;
+  }
+  String directory;
+  directory.snprintf<"{}/spare-bootstrap"_ctv>(cluster.test.workspaceRoot);
+  if (!prodigyEnsureLocalDirectoryPath(directory, 0700, failure)) return false;
+  auto write = [&](const char *name, const String& contents, mode_t mode = 0600) {
+    String path;
+    mothershipVirtualDatacenterPath(directory, name, path);
+    return mothershipVirtualDatacenterWriteFile(path, contents, mode, failure);
+  };
+  String environment;
+  environment.snprintf<"PRODIGY_DEV_MODE=1 PRODIGY_DEV_TEST_OVERCOMMIT_CPUS=1 PRODIGY_HOST_NETNS_INO={itoa} PRODIGY_BOOTSTRAP_BRAIN_COUNT={itoa} PRODIGY_STATE_DB=/containers/prodigy.state PRODIGY_CRASH_REPORT_PATH=/var/log/prodigy/crash.txt"_ctv>(hostNetns, uint64_t(cluster.nBrains));
+  String sshConfig;
+  sshConfig.assign("Port 22\nHostKey /etc/ssh/ssh_host_ed25519_key\nPidFile /run/sshd.pid\nAuthorizedKeysFile .ssh/authorized_keys\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitEmptyPasswords no\nUsePAM no\nAuthenticationMethods publickey\nPrintMotd no\nSubsystem sftp internal-sftp\nSetEnv "_ctv);
+  sshConfig.append(environment); sshConfig.append('\n');
+  String managerConfig;
+  managerConfig.assign("[Manager]\nDefaultEnvironment="_ctv);
+  managerConfig.append(environment); managerConfig.append('\n');
+  String prodigyServiceConfig;
+  prodigyServiceConfig.assign("[Service]\nEnvironment="_ctv);
+  prodigyServiceConfig.append(environment);
+  prodigyServiceConfig.append("\nStandardOutput=append:/var/log/prodigy/runtime.log\nStandardError=inherit\n"_ctv);
+  return write("client-private", cluster.bootstrapSshKeyPackage.privateKeyOpenSSH) &&
+      write("client-public", cluster.bootstrapSshKeyPackage.publicKeyOpenSSH) &&
+      write("host-private", cluster.bootstrapSshHostKeyPackage.privateKeyOpenSSH) &&
+      write("host-public", cluster.bootstrapSshHostKeyPackage.publicKeyOpenSSH) &&
+      write("sshd_config", sshConfig) && write("manager.conf", managerConfig) &&
+      write("prodigy.conf", prodigyServiceConfig) &&
+      write("sshd.service", "[Unit]\nDescription=Disposable machine SSH\nDefaultDependencies=no\n[Service]\nExecStart=/usr/bin/sshd -D -e -f /etc/ssh/sshd_config\nStandardOutput=append:/var/log/prodigy/sshd.log\nStandardError=inherit\n"_ctv) &&
+      write("machine.target", "[Unit]\nDescription=Disposable SSH machine\nDefaultDependencies=no\nRequires=sshd.service\nWants=multi-user.target\nAfter=sshd.service\n"_ctv) &&
+      write("empty.target", "[Unit]\nDescription=Disposable machine environment\nDefaultDependencies=no\n"_ctv) &&
+      write("passwd", "root:x:0:0:root:/root:/bin/bash\nsshd:x:74:74:SSH privilege separation:/var/empty:/usr/bin/nologin\nnobody:x:65534:65534:nobody:/:/usr/bin/nologin\n"_ctv, 0644) &&
+      write("group", "root:x:0:\nsshd:x:74:\nnobody:x:65534:\n"_ctv, 0644) &&
+      write("shadow", "root::0:0:99999:7:::\nsshd:!:0:0:99999:7:::\nnobody:!:0:0:99999:7:::\n"_ctv) &&
+      write("nsswitch.conf", "passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n"_ctv, 0644) &&
+      write("ready", "1\n"_ctv);
+}
+
 static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyCluster& cluster, String *failure = nullptr)
 {
   struct stat netns = {};
@@ -4676,7 +4730,15 @@ static bool mothershipStartVirtualDatacenterProvider(const MothershipProdigyClus
   arguments.push_back(std::move(storageDeviceCount));
   arguments.push_back(std::move(storageDeviceMB));
   arguments.push_back(std::move(controlSocketPath));
-  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+  if (cluster.test.spareMachineCount != 0)
+  {
+    arguments.emplace_back();
+    arguments.back().assignItoa(cluster.test.spareMachineCount);
+  }
+  // Launch first clears the previous disposable workspace. Publish new OS
+  // material only afterward; the provider waits for the final ready receipt.
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure) &&
+      mothershipPrepareVirtualDatacenterSpare(cluster, netns.st_ino, failure);
 }
 
 static bool mothershipStopVirtualDatacenterProvider(const MothershipProdigyCluster& cluster, String *failure = nullptr)
@@ -8539,9 +8601,8 @@ private:
     return true;
   }
 
-  bool requestAddMachines(const AddMachines& request, AddMachines& response, String& failure)
+  bool sendAddMachinesRequest(const AddMachines& request, String& failure)
   {
-    response = {};
     basics_log("mothership control request-addMachines adopted=%u ready=%u removed=%u\n",
                uint32_t(request.adoptedMachines.size()),
                uint32_t(request.readyMachines.size()),
@@ -8572,6 +8633,13 @@ private:
       return false;
     }
 
+    return true;
+  }
+
+  bool requestAddMachines(const AddMachines& request, AddMachines& response, String& failure)
+  {
+    response = {};
+    if (!sendAddMachinesRequest(request, failure)) return false;
     bool ok = mothershipAwaitAddMachinesResponse(
         [&](String& serializedResponse, String& receiveFailure) -> bool {
           Message *responseMessage = socket.recvExpectedTopic(MothershipTopic::addMachines, 512);
@@ -11077,6 +11145,30 @@ private:
                (unsigned long long)desiredCluster.topology.version,
                unsigned(desiredCluster.topology.machines.size()));
     printManagedCluster(desiredCluster);
+  }
+
+  void runAdoptTestClusterSpare(int argc, char *argv[])
+  {
+    String failure;
+    MothershipProdigyCluster cluster;
+    ClusterMachine spare;
+    AddMachines request;
+    if (argc != 1 ||
+        !loadClusterForScopedMutation("adoptTestClusterSpare", argc == 1 ? String(argv[0]) : String(), cluster, failure) ||
+        !mothershipBuildVirtualDatacenterSpareMachine(cluster, spare, &failure) ||
+        !mothershipBuildClusterBootstrapRequest(cluster, request, &failure))
+    {
+      basics_log("adoptTestClusterSpare submitted=0 failure=%s\n", failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    request.adoptedMachines.push_back(spare);
+    const bool sent = socket.configureCluster(cluster, &failure) && sendAddMachinesRequest(request, failure);
+    socket.close();
+    // Submission is deliberately distinct from a durable acceptance receipt.
+    // The existing Brain operation owns work and recovery after this client exits.
+    basics_log("adoptTestClusterSpare submitted=%u target=%s failure=%s\n",
+        unsigned(sent), spare.ssh.address.c_str(), failure.c_str());
+    if (!sent) exit(EXIT_FAILURE);
   }
 
   void runFaultTestCluster(int argc, char *argv[])
@@ -18793,6 +18885,82 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  void runTransportCredentialLifecycle(int argc, char *argv[])
+  {
+    String failure = {}, action = {};
+    MothershipProdigyCluster cluster = {};
+    ProdigyTransportCredentialLifecycleQuery query = {};
+    ProdigyTransportCredentialLifecycleResponse response = {};
+    ProdigyTransportCredentialNodeRole role = ProdigyTransportCredentialNodeRole::neuron;
+    ProdigyTransportCredentialLifecycleKind kind = ProdigyTransportCredentialLifecycleKind::rotate;
+    uint128_t nodeUUID = 0;
+    bool valid = argc >= 3 && prodigyParseCanonicalHex128(String(argv[1]), query.operationUUID);
+    if (valid) action.assign(argv[2]);
+    if (valid) valid = (action == "query"_ctv && argc == 3) ||
+        (action == "request"_ctv && argc == 6 &&
+         ((String(argv[3]) == "brain"_ctv && (role = ProdigyTransportCredentialNodeRole::brain, true)) ||
+          (String(argv[3]) == "neuron"_ctv && (role = ProdigyTransportCredentialNodeRole::neuron, true))) &&
+         ((String(argv[4]) == "rotate"_ctv && (kind = ProdigyTransportCredentialLifecycleKind::rotate, true)) ||
+          (String(argv[4]) == "revoke"_ctv && (kind = ProdigyTransportCredentialLifecycleKind::revoke, true))) &&
+         prodigyParseCanonicalHex128(String(argv[5]), nodeUUID) && nodeUUID != 0);
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure) && cluster.clusterUUID != 0;
+      query.clusterUUID = cluster.clusterUUID;
+    }
+    if (!valid && failure.empty())
+      failure.assign("usage: transportCredentialLifecycle CLUSTER OPERATION_UUID query | request brain|neuron rotate|revoke NODE_UUID"_ctv);
+
+    auto bind = [&](bool requireTarget) {
+      if (response.protocolVersion != 1 || !response.success ||
+          response.localClusterUUID != cluster.clusterUUID || response.currentMasterUUID == 0 ||
+          response.currentAuthorityGeneration == 0 ||
+          (response.found && (!response.operation.valid() || !response.operation.lifecycle() ||
+              response.operation.lifecycleOperationUUID != query.operationUUID)) ||
+          (!response.found && response.operation != ProdigyTransportCredentialEnrollmentOperation{}))
+      {
+        if (failure.empty()) failure = response.failure;
+        if (failure.empty()) failure.assign("transport credential lifecycle response conflicts with query identity"_ctv);
+        return false;
+      }
+      if (requireTarget && response.found &&
+          (response.operation.predecessor.nodeUUID != nodeUUID || response.operation.predecessor.role != role ||
+           response.operation.lifecycleKind != kind))
+      {
+        failure.assign("transport credential lifecycle operation conflicts with requested target"_ctv);
+        return false;
+      }
+      return true;
+    };
+    auto observe = [&]() {
+      return requestTopicRoundTrip(MothershipTopic::pullTransportCredentialLifecycle, query, response, failure) && bind(false);
+    };
+    if (valid) valid = configureControlTarget(argv[0], &failure) && observe();
+    if (valid && action == "request"_ctv) valid = bind(true);
+    if (valid && action == "request"_ctv)
+    {
+      ProdigyTransportCredentialLifecycleRequest request = {};
+      request.clusterUUID = cluster.clusterUUID;
+      request.operationUUID = query.operationUUID;
+      request.nodeUUID = nodeUUID;
+      request.role = role;
+      request.kind = kind;
+      request.expectedAuthorityGeneration = response.found ? response.operation.frozenAuthorityGeneration :
+          response.currentAuthorityGeneration;
+      valid = request.valid() && requestTopicRoundTrip(MothershipTopic::requestTransportCredentialLifecycle,
+          request, response, failure) && bind(true);
+    }
+    const auto phase = response.found ? unsigned(response.operation.lifecyclePhase) : 0U;
+    basics_log("transportCredentialLifecycle success=%u action=%s clusterUUID=%016llx%016llx operationUUID=%016llx%016llx found=%u durable=%u qualified=%u phase=%u currentGeneration=%llu currentMasterUUID=%016llx%016llx failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+        (unsigned long long)(query.operationUUID >> 64), (unsigned long long)query.operationUUID, unsigned(response.found),
+        unsigned(response.durable), unsigned(response.qualified), phase,
+        (unsigned long long)response.currentAuthorityGeneration,
+        (unsigned long long)(response.currentMasterUUID >> 64), (unsigned long long)response.currentMasterUUID, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   static bool parsePairControlServiceTransitJSON(const String& json,
                                                   MothershipPairControlServiceTransit& transit,
                                                   String& failure)
@@ -19479,6 +19647,16 @@ private:
             }
 
             request.test.machineCount = uint32_t(value);
+          }
+          else if (testKey.equal("spareMachineCount"_ctv))
+          {
+            uint64_t value = 0;
+            if (testField.value.get(value) != simdjson::SUCCESS || value > 1)
+            {
+              basics_log("createCluster.test.spareMachineCount must be 0 or 1\n");
+              exit(EXIT_FAILURE);
+            }
+            request.test.spareMachineCount = uint32_t(value);
           }
           else if (testKey.equal("machineLogicalCores"_ctv))
           {
@@ -22567,6 +22745,7 @@ public:
         {"acme-import-lineage",             &Mothership::runACMELineageImportHook          },
         {"acme-present-dns-01",             &Mothership::runACMEPresentDNS01ChallengeHook  },
         {"admitTestPairTarget",             &Mothership::runAdmitTestPairTarget            },
+        {"adoptTestClusterSpare",            &Mothership::runAdoptTestClusterSpare           },
         {"applicationReport",               &Mothership::runApplicationReport              },
         {"cancelDeployment",                &Mothership::runCancelDeployment               },
         {"clusterReport",                   &Mothership::runClusterReport                  },
@@ -22624,6 +22803,7 @@ public:
         {"surveyProviderMachineOffers",     &Mothership::runSurveyProviderMachineOffers    },
         {"taskReport",                      &Mothership::runTaskReport                     },
         {"testClusterPairControl",          &Mothership::runTestClusterPairControl         },
+        {"transportCredentialLifecycle",    &Mothership::runTransportCredentialLifecycle   },
         {"unregisterRoutableSubnet",        &Mothership::runUnregisterRoutableSubnet       },
         {"updateProdigy",                   &Mothership::runUpdateProdigy                  },
         {"upsertApiCredentialSet",          &Mothership::runUpsertApiCredentialSet         },
@@ -22720,6 +22900,7 @@ int main(int argc, char *argv[])
     message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
+    message.append("adoptTestClusterSpare [name|clusterUUID]\n\tsubmits the configured SSH spare to ordinary Brain AddMachines and exits; observe native durable acceptance and cluster readiness separately\n");
     message.append("migrateTidesDB9To10 [private versioned plan JSON path] [optional rollback before activation]\n");
     message.append("recoverTestClusterBundle [name|clusterUUID] [approved bundle] [machineIndex] [expected installed bundle SHA256] [optional expected incomplete worker bundle SHA256 for sole Brain]\n");
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
@@ -22757,6 +22938,7 @@ int main(int argc, char *argv[])
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
+    message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs]\n");
     message.append("\tmanages enrolled TCP control transit, one exact permission-verified Whitehole-to-protected-Wormhole test flow, and a bounded carrier-only partition fault\n");

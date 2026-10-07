@@ -81,6 +81,18 @@ public:
   bool clusterPairEpochRotationCapabilityAcknowledged = false;
   bool localCousinServicePermissionCapabilityAcknowledged = false;
   bool localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+  bool transportCredentialLifecycleCapabilityAcknowledged = false;
+  bool authorityElectionCapabilityAcknowledged = false;
+  uint64_t authorityElectionRequestNonce = 0;
+  uint64_t authorityElectionRequestEpoch = 0;
+  uint64_t authorityElectionLocalGeneration = 0;
+  uint128_t authorityElectionPeerUUID = 0;
+  int64_t authorityElectionPeerBootNs = 0;
+  uint64_t authorityElectionPeerIOGeneration = 0;
+  uint32_t authorityElectionPeerTransportEpoch = 0;
+  int64_t authorityElectionRequestMs = 0;
+  uint64_t authorityElectionGeneration = 0;
+  String authorityElectionDigest;
   uint128_t containerRetirementCapabilityUUID = 0;
   int64_t containerRetirementCapabilityBootNs = 0;
   uint64_t containerRetirementCapabilityIOGeneration = 0;
@@ -137,6 +149,20 @@ public:
     return (Ring::socketIsClosing(const_cast<BrainView *>(this)) == false);
   }
 
+  void clearAuthorityElectionObservation()
+  {
+    authorityElectionRequestNonce = 0;
+    authorityElectionRequestEpoch = 0;
+    authorityElectionLocalGeneration = 0;
+    authorityElectionPeerUUID = 0;
+    authorityElectionPeerBootNs = 0;
+    authorityElectionPeerIOGeneration = 0;
+    authorityElectionPeerTransportEpoch = 0;
+    authorityElectionRequestMs = 0;
+    authorityElectionGeneration = 0;
+    authorityElectionDigest.clear();
+  }
+
   void reset() override
   {
     ProdigyArtifactStream::reset();
@@ -156,6 +182,9 @@ public:
     clusterPairEpochRotationCapabilityAcknowledged = false;
     localCousinServicePermissionCapabilityAcknowledged = false;
     localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+    transportCredentialLifecycleCapabilityAcknowledged = false;
+    authorityElectionCapabilityAcknowledged = false;
+    clearAuthorityElectionObservation();
     containerRetirementCapabilityUUID = 0;
     containerRetirementCapabilityBootNs = 0;
     containerRetirementCapabilityIOGeneration = 0;
