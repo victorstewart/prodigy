@@ -1940,7 +1940,15 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendRemoteContainerRootCommand(plan.installCommand);
   plan.installCommand.append("; tar --no-same-owner --same-permissions -xf "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteStagePayloadPath);
-  plan.installCommand.append(" -C /; rm -f "_ctv);
+  plan.installCommand.append(" -C /; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, remoteRootParent);
+  plan.installCommand.append("; sync -f /var/lib/prodigy"_ctv);
+  if (plan.bootstrapSSHDirectory.size() > 0)
+  {
+    plan.installCommand.append("; sync -f "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, plan.bootstrapSSHDirectory);
+  }
+  plan.installCommand.append("; rm -f "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteStagePayloadPath);
   plan.installCommand.append("; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
@@ -1960,6 +1968,10 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.bundleSHA256TempPath);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, tempBundleSHA256Path);
+  // Tar extraction can leave zero-length files after a crash unless the staged
+  // filesystem is flushed before its directory is published.
+  plan.installCommand.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
   plan.installCommand.append("; mv "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteUnitTempPath);
   plan.installCommand.append(" "_ctv);
@@ -1974,6 +1986,8 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRootTemp);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.installPaths.installRoot);
+  plan.installCommand.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(plan.installCommand, remoteRootParent);
   if (plan.acme.configured())
   {
     String certbotWheelhousePath = {};
@@ -2006,7 +2020,20 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteBootJSONPath);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteTransportTLSJSONPath);
-  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; fi && systemctl daemon-reload && systemctl enable prodigy && systemctl restart prodigy"_ctv);
+  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; fi && systemctl daemon-reload && systemctl enable prodigy"_ctv);
+  // Credentials, boot state, hook links, and the enabled unit can reside on
+  // different filesystems. A failed durability barrier must prevent launch.
+  plan.installCommand.append(" && sync -f /var/lib/prodigy && sync -f /etc/systemd/system && sync -f /usr/lib/prodigy"_ctv);
+  if (plan.bootstrapSSHDirectory.size() > 0)
+  {
+    plan.installCommand.append(" && sync -f "_ctv);
+    prodigyAppendShellSingleQuoted(plan.installCommand, plan.bootstrapSSHDirectory);
+  }
+  if (plan.acme.configured())
+  {
+    plan.installCommand.append(" && sync -f /opt/prodigy"_ctv);
+  }
+  plan.installCommand.append(" && systemctl restart prodigy"_ctv);
   if (prodigyRemoteBootstrapShouldAwaitControlSocket(clusterMachine, bootState))
   {
     plan.installCommand.append(" && "_ctv);

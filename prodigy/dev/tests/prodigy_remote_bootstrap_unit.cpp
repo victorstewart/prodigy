@@ -1411,6 +1411,21 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "ufw allow 313/tcp"), "plan_install_command_ufw_allows_brain_port");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl daemon-reload"), "plan_install_command_daemon_reload");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl enable prodigy"), "plan_install_command_enable");
+  suite.expect(stringContains(singleSeedPlan.installCommand,
+      "'/tmp/prodigy.remote-bootstrap.payload.tar' -C /; sync -f '/opt'; sync -f /var/lib/prodigy"),
+      "plan_install_flushes_staged_boot_material_before_consuming_it");
+  suite.expect(stringContains(singleSeedPlan.installCommand,
+      "sync -f '/opt/prodigy-root.new'; mv '/opt/prodigy.service.tmp'"),
+      "plan_install_flushes_tree_before_publication");
+  suite.expect(stringContains(singleSeedPlan.installCommand,
+      "mv '/opt/prodigy-root.new' '/opt/prodigy-root'; sync -f '/opt'"),
+      "plan_install_flushes_published_root_parent");
+  suite.expect(stringContains(singleSeedPlan.installCommand,
+      "systemctl enable prodigy && sync -f /var/lib/prodigy && sync -f /etc/systemd/system && sync -f /usr/lib/prodigy"),
+      "plan_install_flushes_boot_material_and_enabled_unit_before_launch");
+  suite.expect(stringContains(acmePlan.installCommand,
+      "sync -f /opt/prodigy && systemctl restart prodigy"),
+      "plan_acme_install_flushes_managed_certbot_before_launch");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl restart prodigy"), "plan_install_command_restart");
   suite.expect(stringContains(singleSeedPlan.installCommand, "python3 -c"), "plan_install_command_waits_for_control_socket_with_python");
   suite.expect(stringContains(singleSeedPlan.installCommand, "/run/prodigy/control.sock"), "plan_install_command_waits_for_control_socket_path");

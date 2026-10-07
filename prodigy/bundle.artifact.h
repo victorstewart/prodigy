@@ -1349,6 +1349,10 @@ static inline void prodigyBuildBundleInstallCommand(const String& bundlePath, co
   prodigyAppendShellSingleQuoted(command, bundleSHA256Path);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, tempBundleSHA256Path);
+  // Extraction and digest checks only establish page-cache visibility. Flush
+  // the staged tree before publishing it, then persist the directory rename.
+  command.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(command, paths.installRootTemp);
   command.append("; if [ -e "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
   command.append(" ]; then mv "_ctv);
@@ -1359,6 +1363,11 @@ static inline void prodigyBuildBundleInstallCommand(const String& bundlePath, co
   prodigyAppendShellSingleQuoted(command, paths.installRootTemp);
   command.append(" "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRoot);
+  String installParent = {};
+  prodigyDirname(paths.installRoot, installParent);
+  if (installParent.empty()) installParent.assign("."_ctv);
+  command.append("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(command, installParent);
   command.append("; rm -rf "_ctv);
   prodigyAppendShellSingleQuoted(command, paths.installRootPrevious);
 

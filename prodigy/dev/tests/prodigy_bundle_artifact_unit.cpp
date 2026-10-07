@@ -439,6 +439,43 @@ int main(int argc, char *argv[])
   suite.expect(prodigyInstallBundleToRoot(bundlePath, installRoot, &failure), "install_bundle_to_root");
   suite.expect(failure.size() == 0, "install_bundle_to_root_clears_failure");
 
+  // A failed filesystem barrier must not publish the extracted runtime or
+  // acknowledge installation. Exercise the real installer with a failing sync.
+  String syncDirectory = tempDirectory;
+  syncDirectory.append("/failing-sync"_ctv);
+  std::filesystem::create_directory(syncDirectory.c_str());
+  String syncExecutable = syncDirectory;
+  syncExecutable.append("/sync"_ctv);
+  FILE *syncScript = std::fopen(syncExecutable.c_str(), "w");
+  suite.expect(syncScript != nullptr, "install_sync_failure_fixture_open");
+  if (syncScript != nullptr)
+  {
+    std::fputs("#!/bin/sh\nexit 17\n", syncScript);
+    std::fclose(syncScript);
+    suite.expect(::chmod(syncExecutable.c_str(), 0755) == 0, "install_sync_failure_fixture_executable");
+    String previousPath = {};
+    const char *pathValue = std::getenv("PATH");
+    if (pathValue != nullptr) previousPath.assign(pathValue);
+    String failingPath = syncDirectory;
+    failingPath.append(":/usr/bin:/bin"_ctv);
+    suite.expect(::setenv("PATH", failingPath.c_str(), 1) == 0, "install_sync_failure_path");
+    String rejectedRoot = tempDirectory;
+    rejectedRoot.append("/rejected-runtime"_ctv);
+    suite.expect(prodigyInstallBundleToRoot(bundlePath, rejectedRoot, &failure) == false,
+                 "install_sync_failure_rejects_success");
+    suite.expect(fileExists(rejectedRoot) == false, "install_sync_failure_does_not_publish_root");
+    if (pathValue != nullptr) ::setenv("PATH", previousPath.c_str(), 1);
+    else ::unsetenv("PATH");
+  }
+
+  String installCommand = {};
+  prodigyBuildBundleInstallCommand(bundlePath, installRoot, installCommand);
+  String durableRename = {};
+  durableRename.assign("; sync -f "_ctv);
+  prodigyAppendShellSingleQuoted(durableRename, tempDirectory);
+  durableRename.append("; rm -rf "_ctv);
+  suite.expect(stringContains(installCommand, durableRename.c_str()), "install_syncs_parent_before_retiring_previous");
+
   ProdigyInstallRootPaths installPaths = {};
   prodigyBuildInstallRootPaths(installRoot, installPaths);
   suite.expect(fileExists(installPaths.binaryPath), "installed_bundle_binary_exists");
