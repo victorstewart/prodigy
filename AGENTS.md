@@ -1,5 +1,20 @@
 # Prodigy Host Safety Rules
 
+## Shared Network Service Restarts
+
+Before restarting a shared network or underlay service, inspect its reverse
+systemd dependencies and the dependent VM units, including `Requires=`,
+`BindsTo=`, `PartOf=`, and `KillMode=`. Restarting an underlay can stop and
+relaunch its dependent QEMU guests even when the network script itself is
+idempotent. Never treat that as a harmless network refresh.
+
+Apply live underlay changes in place, or use a verified reload operation that
+does not stop dependent guests. Capture guest PID/start-time and boot identities
+before and after the change, and verify cluster health before proceeding to
+membership changes. If a restart would stop guests, treat it as an explicit
+planned cluster outage; preserve Mothership's ownership of Prodigy lifecycle
+actions. Never restart shared networking as an incidental step in adding a host.
+
 ## Container Artifact Rule
 
 Discombobulator is the only valid way to produce a Prodigy container artifact.

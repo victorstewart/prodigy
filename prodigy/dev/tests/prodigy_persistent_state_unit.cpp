@@ -12,6 +12,15 @@
 #include <algorithm>
 #include <chrono>
 
+#if defined(__linux__)
+#include <dirent.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 class TestSuite {
 public:
 
@@ -1020,6 +1029,182 @@ static int runPersistentUpdateBundleSnapshotMeasurement(TestSuite& suite, const 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+#if defined(__linux__)
+static std::string persistentStatePathText(const String& path)
+{
+  return std::string(reinterpret_cast<const char *>(path.data()), path.size());
+}
+
+static bool persistentStateChildHasODSYNCWAL(const pid_t child, const String& root)
+{
+  const std::string rootPath = std::filesystem::canonical(persistentStatePathText(root)).string();
+  const std::string fdDirectory = "/proc/" + std::to_string(child) + "/fd";
+  DIR *directory = ::opendir(fdDirectory.c_str());
+  if (directory == nullptr)
+  {
+    return false;
+  }
+
+  bool found = false;
+  for (dirent *entry = ::readdir(directory); entry != nullptr; entry = ::readdir(directory))
+  {
+    if (entry->d_name[0] == '.')
+    {
+      continue;
+    }
+
+    const std::string fdPath = fdDirectory + "/" + entry->d_name;
+    char target[4096] = {};
+    const ssize_t targetLength = ::readlink(fdPath.c_str(), target, sizeof(target) - 1);
+    if (targetLength <= 0)
+    {
+      continue;
+    }
+    target[targetLength] = '\0';
+    const std::string filePath(target, size_t(targetLength));
+    if (filePath.rfind(rootPath + "/", 0) != 0 ||
+        filePath.size() < 4 || filePath.compare(filePath.size() - 4, 4, ".log") != 0)
+    {
+      continue;
+    }
+
+    const std::string infoPath = "/proc/" + std::to_string(child) + "/fdinfo/" + entry->d_name;
+    FILE *info = std::fopen(infoPath.c_str(), "r");
+    if (info == nullptr)
+    {
+      continue;
+    }
+    char line[128] = {};
+    unsigned long flags = 0;
+    while (std::fgets(line, sizeof(line), info) != nullptr)
+    {
+      if (std::sscanf(line, "flags:\t%lo", &flags) == 1)
+      {
+        break;
+      }
+    }
+    std::fclose(info);
+    if ((flags & static_cast<unsigned long>(O_DSYNC)) != 0)
+    {
+      found = true;
+      break;
+    }
+  }
+  ::closedir(directory);
+  return found;
+}
+
+static void testPersistentStateCrashDurability(TestSuite& suite,
+                                               const ProdigyPersistentBootState& boot,
+                                               const ProdigyPersistentBrainSnapshot& snapshot)
+{
+  std::filesystem::create_directories(".run");
+  char scratch[] = ".run/nametag-prodigy-persistent-state-durability-XXXXXX";
+  char *created = ::mkdtemp(scratch);
+  suite.expect(created != nullptr, "persistent_state_durability_mkdtemp_created");
+  if (created == nullptr)
+  {
+    return;
+  }
+
+  String dbPath = {};
+  dbPath.assign(created);
+  String secretsPath = {};
+  resolveProdigyPersistentSecretsDBPath(dbPath, secretsPath);
+
+  int ready[2] = {-1, -1};
+  int release[2] = {-1, -1};
+  const bool pipesReady = ::pipe(ready) == 0 && ::pipe(release) == 0;
+  suite.expect(pipesReady, "persistent_state_durability_pipes_created");
+  if (pipesReady == false)
+  {
+    if (ready[0] >= 0) ::close(ready[0]);
+    if (ready[1] >= 0) ::close(ready[1]);
+    (void)cleanupPersistentStateRoots(dbPath);
+    return;
+  }
+
+  const pid_t child = ::fork();
+  suite.expect(child >= 0, "persistent_state_durability_child_forked");
+  if (child == 0)
+  {
+    ::close(ready[0]);
+    ::close(release[1]);
+    String failure = {};
+    ProdigyPersistentStateStore store(dbPath);
+    const char outcome = store.saveBootState(boot, &failure) &&
+                                 store.saveBrainSnapshot(snapshot, &failure)
+                             ? 'R'
+                             : 'F';
+    if (outcome == 'F') std::fprintf(stderr, "durability child save failed: %s\n", failure.c_str());
+    (void)::write(ready[1], &outcome, 1);
+    char hold = 0;
+    (void)::read(release[0], &hold, 1);
+    _exit(outcome == 'R' ? EXIT_SUCCESS : EXIT_FAILURE);
+  }
+  if (child < 0)
+  {
+    ::close(ready[0]);
+    ::close(ready[1]);
+    ::close(release[0]);
+    ::close(release[1]);
+    (void)cleanupPersistentStateRoots(dbPath);
+    return;
+  }
+
+  ::close(ready[1]);
+  ::close(release[0]);
+  pollfd readyPoll = {};
+  readyPoll.fd = ready[0];
+  readyPoll.events = POLLIN;
+  const bool readyBeforeDeadline = ::poll(&readyPoll, 1, 5000) == 1 &&
+                                   (readyPoll.revents & (POLLIN | POLLHUP)) != 0;
+  char outcome = 0;
+  const bool saved = readyBeforeDeadline && ::read(ready[0], &outcome, 1) == 1 && outcome == 'R';
+  suite.expect(saved, "persistent_state_durability_child_saved_public_and_secret_records");
+  suite.expect(saved && persistentStateChildHasODSYNCWAL(child, dbPath),
+               "persistent_state_durability_public_wal_uses_odsync");
+  suite.expect(saved && persistentStateChildHasODSYNCWAL(child, secretsPath),
+               "persistent_state_durability_secrets_wal_uses_odsync");
+
+  const bool killed = ::kill(child, SIGKILL) == 0;
+  suite.expect(killed, "persistent_state_durability_child_killed_without_close");
+  int status = 0;
+  const bool reaped = ::waitpid(child, &status, 0) == child && WIFSIGNALED(status) &&
+                      WTERMSIG(status) == SIGKILL;
+  if (!reaped) std::fprintf(stderr, "durability child wait status: %d\n", status);
+  suite.expect(reaped, "persistent_state_durability_child_reaped_after_sigkill");
+  ::close(ready[0]);
+  ::close(release[1]);
+
+  String failure = {};
+  ProdigyPersistentStateStore reopened(dbPath);
+  ProdigyPersistentBootState loadedBoot = {};
+  ProdigyPersistentBrainSnapshot loadedSnapshot = {};
+  const bool recovered = saved && reaped && reopened.loadBootState(loadedBoot, &failure) &&
+                         reopened.loadBrainSnapshot(loadedSnapshot, &failure);
+  suite.expect(recovered, "persistent_state_durability_reopens_after_killed_writer");
+  suite.expect(recovered && equalBootStates(boot, loadedBoot),
+               "persistent_state_durability_boot_roundtrips_after_killed_writer");
+  suite.expect(recovered && equalBrainSnapshots(snapshot, loadedSnapshot),
+               "persistent_state_durability_snapshot_roundtrips_after_killed_writer");
+  reopened.close();
+  suite.expect(cleanupPersistentStateRoots(dbPath), "persistent_state_durability_cleanup");
+}
+
+static void testPersistentStateCrashDurabilityFixture(TestSuite& suite)
+{
+  ProdigyPersistentBootState boot = {};
+  boot.bootstrapSshUser = "durability-test"_ctv;
+  boot.runtimeEnvironment.providerCredentialMaterial.assign("durability-boot-secret");
+  ProdigyPersistentBrainSnapshot snapshot = {};
+  snapshot.brainConfig.clusterUUID = uint128_t(0xD0A);
+  snapshot.brainConfig.dnsCredential.material.assign("durability-snapshot-secret");
+  snapshot.masterAuthority.runtimeState.generation = 1;
+  testPersistentStateCrashDurability(suite, boot, snapshot);
+}
+#endif
+
 int main(void)
 {
   TestSuite suite;
@@ -1027,6 +1212,15 @@ int main(void)
   {
     return runPersistentUpdateBundleSnapshotMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
   }
+#if defined(__linux__)
+  if (std::getenv("PRODIGY_TEST_ONLY") != nullptr &&
+      std::strcmp(std::getenv("PRODIGY_TEST_ONLY"), "durability") == 0)
+  {
+    testPersistentStateCrashDurabilityFixture(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  testPersistentStateCrashDurabilityFixture(suite);
+#endif
   testMasterAuthorityRuntimeStateRecoveryCodec(suite);
   testPersistentMapDirectionalSerialization(suite);
   testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);

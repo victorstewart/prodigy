@@ -3063,8 +3063,10 @@ private:
   // limit. Bound committed value bytes as well so frequent overwrites cannot
   // keep obsolete value-log segments pinned indefinitely waiting for idle.
   constexpr static uint64_t snapshotFlushBytes = 64ULL * 1024 * 1024;
-  TidesDB db{""_ctv, TidesDB::Durability::inherit, snapshotFlushBytes};
-  TidesDB secretsDb{""_ctv, TidesDB::Durability::inherit, snapshotFlushBytes};
+  // Boot authority and its secrets must survive a machine crash. TidesDB's
+  // inherited default does not synchronize writes, including SST publication.
+  TidesDB db{""_ctv, TidesDB::Durability::full, snapshotFlushBytes};
+  TidesDB secretsDb{""_ctv, TidesDB::Durability::full, snapshotFlushBytes};
 
   bool loadStoredBootStateRecord(ProdigyPersistentStoredBootState& record, String *failure = nullptr)
   {
