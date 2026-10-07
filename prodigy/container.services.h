@@ -121,6 +121,47 @@ static inline bool prodigyBuildContainerServiceDefinitions(
   {
     return true;
   }
+  // A protected TCP Wormhole is bound to the advertised cousin port.  The
+  // declaration is authored for group zero, but each shard group needs that
+  // same protected identity and port.  Only translate an unambiguous explicit
+  // group-zero cousin advertisement with exactly one TCP Wormhole target; all
+  // other explicit advertisements retain their declared service identity.  A
+  // predeclared current-group cousin or duplicate Wormhole target is ambiguous
+  // and must fail before map materialization can choose one declaration.
+  bool materializedProtectedCousin = false;
+  if (context.roles.cousin != 0 && deployment.stateful.cousinPrefix != 0)
+  {
+    const uint64_t groupZeroCousin = MeshServices::constrainPrefixToGroup(deployment.stateful.cousinPrefix, 0);
+    uint32_t protectedTemplate = UINT32_MAX;
+    for (uint32_t index = 0; index < deployment.advertisements.size(); ++index)
+    {
+      const Advertisement& advertisement = deployment.advertisements[index];
+      if (advertisement.service != groupZeroCousin || advertisement.port == 0) continue;
+
+      uint32_t targets = 0;
+      const Wormhole *target = nullptr;
+      for (const Wormhole& wormhole : deployment.wormholes)
+      {
+        if (wormhole.containerPort != advertisement.port) continue;
+        ++targets;
+        target = &wormhole;
+      }
+      if (targets == 0) continue;
+      if (targets != 1) return false;
+      if (target->layer4 != IPPROTO_TCP || target->isQuic) continue;
+      for (uint32_t other = 0; other < deployment.advertisements.size(); ++other)
+      {
+        if (other != index && deployment.advertisements[other].service == context.roles.cousin) return false;
+      }
+      if (protectedTemplate != UINT32_MAX) return false;
+      protectedTemplate = index;
+    }
+    if (protectedTemplate != UINT32_MAX)
+    {
+      definitions.advertisements[protectedTemplate].service = context.roles.cousin;
+      materializedProtectedCousin = true;
+    }
+  }
   auto addAdvertisement = [&](uint64_t service, ContainerState startAt) {
     definitions.advertisements.emplace_back(service, startAt, ContainerState::destroying, 0);
   };
@@ -134,7 +175,8 @@ static inline bool prodigyBuildContainerServiceDefinitions(
   if (context.advertiseClient && prodigyStatefulTopologyServesClients(context.topology))
     addAdvertisement(context.roles.client, ContainerState::healthy);
   if (!deployment.stateful.neverShard) {
-    addAdvertisement(context.roles.cousin, ContainerState::scheduled);
+    if (!materializedProtectedCousin)
+      addAdvertisement(context.roles.cousin, ContainerState::scheduled);
     addAdvertisement(context.roles.sharding, ContainerState::healthy);
   }
   addSubscription(context.roles.sibling, ContainerState::scheduled, ContainerState::destroying);

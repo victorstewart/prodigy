@@ -1054,7 +1054,7 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 7;
+  constexpr static uint8_t currentVersion = 8;
 
   uint8_t version = 1;
   bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
@@ -1078,6 +1078,8 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
         (transition.version < 7 || !prodigyLocalCousinServicePermissionsValid(
             transition.runtimeState.localCousinServicePermissions, transition.brainConfig.clusterUUID,
             transition.runtimeState.generation))) return;
+    if (std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
+          [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && transition.version < 8) return;
     if (transition.version >= 6)
     {
       auto descriptors = transition.runtimeState.clusterPairEnrollments;
@@ -1095,6 +1097,10 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
         (transition.version < 7 || !prodigyLocalCousinServicePermissionsValid(
             transition.runtimeState.localCousinServicePermissions, transition.brainConfig.clusterUUID,
             transition.runtimeState.generation)))
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    if (std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
+          [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && transition.version < 8)
       serializer.adapter().error(bitsery::ReaderError::InvalidData);
   if (transition.version >= 2)
     serializer.container(transition.servingRuntimeStates, 4096);
@@ -6840,7 +6846,9 @@ public:
         (!transition.runtimeState.localCousinServicePermissions.empty() &&
          !prodigyLocalCousinServicePermissionsValid(transition.runtimeState.localCousinServicePermissions,
            brainConfig.clusterUUID, transition.runtimeState.generation))) return false;
-    if (!transition.runtimeState.localCousinServicePermissions.empty()) transition.version = 7;
+    if (!transition.runtimeState.localCousinServicePermissions.empty()) transition.version =
+        std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
+          [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     transition.runtimeState.updateSelfFollowerConcurrency = 0;
     transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
@@ -7546,7 +7554,20 @@ public:
     for (uint128_t voter : electorate)
     {
       if (voter == selfBrainUUID()) { ++capable; continue; }
-      if (localCousinServicePermissionPeerCapabilityCurrent(findBrainViewByUUID(voter))) ++capable;
+      if (localCousinServicePermissionPeerCapabilityCurrent(findBrainViewByUUID(voter), localCousinServicePermissionsRequireBaseline())) ++capable;
+    }
+    return capable >= uint32_t(electorate.size() / 2) + 1;
+  }
+
+  bool localCousinServicePermissionBaselinePeersCapable() const
+  {
+    if (!weAreMaster || !internalTransportAEGISRequired()) return false;
+    const Vector<uint128_t> electorate = clusterPairCurrentElectorate();
+    if (electorate.empty() || std::find(electorate.begin(), electorate.end(), selfBrainUUID()) == electorate.end()) return false;
+    uint32_t capable = 0;
+    for (uint128_t voter : electorate) {
+      if (voter == selfBrainUUID()) { ++capable; continue; }
+      if (localCousinServicePermissionPeerCapabilityCurrent(findBrainViewByUUID(voter), true)) ++capable;
     }
     return capable >= uint32_t(electorate.size() / 2) + 1;
   }
@@ -7577,6 +7598,29 @@ public:
         plan.config.containerBlobBytes != permission.artifactBytes) return false;
     DeploymentPlan copy = plan;
     String serialized = {}, digest = {}, failure = {};
+    if (BitseryEngine::serialize(serialized, copy) > 0 &&
+        prodigyComputeSHA256Hex(serialized, digest, &failure) && digest == permission.canonicalPlanSHA256) return true;
+    // v1 records stay exact-only.  v2 may restore only the three verified
+    // resource values, then must reproduce the original full-plan digest.
+    if (permission.protocolVersion != ProdigyLocalCousinServicePermission::baselineVersion) return false;
+    const auto bounded = [&](ScalingDimension dimension, uint32_t current, uint32_t baseline) {
+      if (current == baseline) return true;
+      if (current < baseline) return false;
+      uint32_t minimum = baseline, maximum = 0; bool found = false;
+      for (const auto& scaler : plan.verticalScalers) if (scaler.resource == dimension) {
+        found = found || scaler.direction == Scaler::Direction::upscale;
+        if (scaler.minValue > minimum) minimum = scaler.minValue;
+        if (scaler.maxValue != 0 && (maximum == 0 || scaler.maxValue < maximum)) maximum = scaler.maxValue;
+      }
+      return found && current >= minimum && (maximum == 0 || current <= maximum);
+    };
+    if (!bounded(ScalingDimension::cpu, plan.config.nLogicalCores, permission.baselineLogicalCores) ||
+        !bounded(ScalingDimension::memory, plan.config.memoryMB, permission.baselineMemoryMB) ||
+        !bounded(ScalingDimension::storage, plan.config.storageMB, permission.baselineStorageMB)) return false;
+    copy.config.nLogicalCores = permission.baselineLogicalCores;
+    copy.config.memoryMB = permission.baselineMemoryMB;
+    copy.config.storageMB = permission.baselineStorageMB;
+    serialized.clear(); digest.clear(); failure.clear();
     return BitseryEngine::serialize(serialized, copy) > 0 &&
         prodigyComputeSHA256Hex(serialized, digest, &failure) && digest == permission.canonicalPlanSHA256;
   }
@@ -7625,7 +7669,9 @@ public:
           return value.permissionUUID == request.permission.permissionUUID;
         });
     if (existing != masterAuthorityRuntimeState.localCousinServicePermissions.end()) {
-      if (!prodigyLocalCousinServicePermissionScopeMatches(*existing, request.permission))
+      if (!prodigyLocalCousinServicePermissionIdentityScopeMatches(*existing, request.permission) ||
+          (request.permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion &&
+           !prodigyLocalCousinServicePermissionScopeMatches(*existing, request.permission)))
         return reject("local cousin permission scope conflicts with durable record");
       if (existing->state == request.permission.state && existing->generation == request.permission.generation) {
         response = queryLocalCousinServicePermission({1, request.permission.permissionUUID}); return response.success;
@@ -7634,7 +7680,11 @@ public:
           request.permission.state != ProdigyLocalCousinServicePermissionState::revoked ||
           request.permission.generation != 2) return reject("local cousin permission transition is not a terminal revoke");
     } else {
-      if (request.permission.state != ProdigyLocalCousinServicePermissionState::active || request.permission.generation != 1 ||
+      // Requests are legacy v1 form: the master alone supplies v2 baselines.
+      if (request.permission.protocolVersion != 1 || request.permission.baselineLogicalCores != 0 ||
+          request.permission.baselineMemoryMB != 0 || request.permission.baselineStorageMB != 0 ||
+          request.permission.state != ProdigyLocalCousinServicePermissionState::active || request.permission.generation != 1 ||
+          !localCousinServicePermissionBaselinePeersCapable() ||
           masterAuthorityRuntimeState.localCousinServicePermissions.size() >= ProdigyLocalCousinServicePermissionMaximumRecords ||
           !localCousinServicePermissionMatchesCurrentLivePlan(request.permission))
         return reject("local cousin permission active install is not currently eligible");
@@ -7650,6 +7700,20 @@ public:
     }
     auto previous = masterAuthorityRuntimeState;
     ProdigyLocalCousinServicePermission accepted = request.permission;
+    if (existing != masterAuthorityRuntimeState.localCousinServicePermissions.end() &&
+        existing->protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion) {
+      accepted.protocolVersion = existing->protocolVersion;
+      accepted.baselineLogicalCores = existing->baselineLogicalCores;
+      accepted.baselineMemoryMB = existing->baselineMemoryMB;
+      accepted.baselineStorageMB = existing->baselineStorageMB;
+    } else if (existing == masterAuthorityRuntimeState.localCousinServicePermissions.end()) {
+      const auto live = deployments.find(request.permission.localDeploymentID);
+      if (live == deployments.end() || live->second == nullptr) return reject("local cousin permission active plan disappeared");
+      accepted.protocolVersion = ProdigyLocalCousinServicePermission::baselineVersion;
+      accepted.baselineLogicalCores = live->second->plan.config.nLogicalCores;
+      accepted.baselineMemoryMB = live->second->plan.config.memoryMB;
+      accepted.baselineStorageMB = live->second->plan.config.storageMB;
+    }
     accepted.acceptedAuthorityGeneration = masterAuthorityRuntimeState.generation + 1;
     if (existing != masterAuthorityRuntimeState.localCousinServicePermissions.end()) *existing = accepted;
     else {
@@ -8279,10 +8343,19 @@ public:
            peer->containerRetirementCapabilityIOGeneration == peer->ioGeneration;
   }
 
-  bool localCousinServicePermissionPeerCapabilityCurrent(BrainView *peer) const
+  bool localCousinServicePermissionPeerCapabilityCurrent(BrainView *peer, bool requireBaseline = false) const
   {
     return containerRetirementPeerCapabilityCurrent(peer) && peer->transportAEGISEnabled() &&
-           peer->localCousinServicePermissionCapabilityAcknowledged;
+           peer->localCousinServicePermissionCapabilityAcknowledged &&
+           (!requireBaseline || peer->localCousinServicePermissionBaselineCapabilityAcknowledged);
+  }
+
+  bool localCousinServicePermissionsRequireBaseline() const
+  {
+    return std::any_of(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+      masterAuthorityRuntimeState.localCousinServicePermissions.end(), [](const auto& permission) {
+        return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion;
+      });
   }
 
   bool clusterPairEnrollmentPeerCapabilityCurrent(BrainView *peer, bool requireOperations = false,
@@ -9594,6 +9667,8 @@ public:
          !prodigyLocalCousinServicePermissionsValid(incoming.runtimeState.localCousinServicePermissions,
                                                      incoming.brainConfig.clusterUUID, incoming.runtimeState.generation)) ||
         (!incoming.runtimeState.localCousinServicePermissions.empty() && incoming.version < 7) ||
+        (std::any_of(incoming.runtimeState.localCousinServicePermissions.begin(), incoming.runtimeState.localCousinServicePermissions.end(),
+          [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && incoming.version < 8) ||
         (incoming.version == 1 && (!incoming.runtimeState.statefulServingAuthorities.empty() ||
                                   !incoming.runtimeState.statelessDeploymentAdmissions.empty() ||
                                   !incoming.servingRuntimeStates.empty())) ||
@@ -9793,7 +9868,9 @@ public:
            currentPeer->ioGeneration == pending->peerGeneration &&
            currentPeer->fslot == pending->peerFileSlot &&
            (pending->prepared.runtime.runtimeState.localCousinServicePermissions.empty() ||
-            localCousinServicePermissionPeerCapabilityCurrent(currentPeer)) &&
+            localCousinServicePermissionPeerCapabilityCurrent(currentPeer,
+              std::any_of(pending->prepared.runtime.runtimeState.localCousinServicePermissions.begin(), pending->prepared.runtime.runtimeState.localCousinServicePermissions.end(),
+                [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))) &&
            (pending->prepared.runtime.runtimeState.clusterPairEnrollments.empty() ||
             clusterPairEnrollmentPeerCapabilityCurrent(currentPeer, !pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.empty(),
                 std::any_of(pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.begin(), pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -9854,7 +9931,9 @@ public:
               currentPeer->ioGeneration != peerGeneration || currentPeer->fslot != peerFileSlot ||
               peerCanReplicateMasterAuthorityState(currentPeer) == false ||
               (!incoming.localCousinServicePermissions.empty() &&
-               !localCousinServicePermissionPeerCapabilityCurrent(currentPeer)))
+               !localCousinServicePermissionPeerCapabilityCurrent(currentPeer,
+                 std::any_of(incoming.localCousinServicePermissions.begin(), incoming.localCousinServicePermissions.end(),
+                   [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))))
           {
             return;
           }
@@ -9866,7 +9945,9 @@ public:
       BrainView *peer, const ProdigyMasterAuthorityStateTransition& incoming, const String& serialized)
   {
     if (!incoming.runtimeState.localCousinServicePermissions.empty() &&
-        !localCousinServicePermissionPeerCapabilityCurrent(peer)) return true;
+        !localCousinServicePermissionPeerCapabilityCurrent(peer,
+            std::any_of(incoming.runtimeState.localCousinServicePermissions.begin(), incoming.runtimeState.localCousinServicePermissions.end(),
+              [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))) return true;
     if (!incoming.runtimeState.clusterPairEnrollments.empty() &&
         !clusterPairEnrollmentPeerCapabilityCurrent(peer, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
                 std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -9918,7 +9999,9 @@ public:
     else if (!candidate.runtimeState.statefulServingAuthorities.empty()) candidate.version = 2;
     if (!candidate.runtimeState.transportCredentialEnrollments.empty()) candidate.version = 5;
     if (!candidate.runtimeState.clusterPairEnrollments.empty()) candidate.version = 6;
-    if (!candidate.runtimeState.localCousinServicePermissions.empty()) candidate.version = 7;
+    if (!candidate.runtimeState.localCousinServicePermissions.empty()) candidate.version =
+        std::any_of(candidate.runtimeState.localCousinServicePermissions.begin(), candidate.runtimeState.localCousinServicePermissions.end(),
+          [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
@@ -9996,7 +10079,8 @@ public:
   {
     return weAreMaster && peerCanExchangeMasterAuthorityState(peer) && !peer->isMasterBrain &&
            (masterAuthorityRuntimeState.localCousinServicePermissions.empty() ||
-            (masterAuthorityRuntimeStateDurable && localCousinServicePermissionPeerCapabilityCurrent(peer))) &&
+            (masterAuthorityRuntimeStateDurable && localCousinServicePermissionPeerCapabilityCurrent(peer,
+                localCousinServicePermissionsRequireBaseline()))) &&
            (masterAuthorityRuntimeState.clusterPairEnrollments.empty() ||
             (masterAuthorityRuntimeStateDurable &&
              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
@@ -26098,7 +26182,8 @@ public:
         it->second->drainMachine(machine, true);
       }
     }
-    machine->containersByDeploymentID.clear();
+    // The deployment drain removes its old entries. A replacement may already
+    // own a scheduled entry on this host; retain it for reconnect bootstrap.
   }
 
   uint32_t normalizedMaxOSDrains(void) const
@@ -32212,6 +32297,10 @@ public:
 
   void revokeCousinSession(CousinSessionState& state, bool notifyPeer = true)
   {
+    // Application and peer acknowledgements may arrive before the lease driver
+    // removes this terminal record. They must not start another revoke exchange.
+    if (state.expiresAtMs == 0) return;
+    state.expiresAtMs = 0;
     // A deposed leader cannot keep issuing commands. Independent kernel/app
     // deadlines close anything whose current owner can no longer be reached.
     if (weAreMaster && state.authorityEpoch == masterAuthorityEpoch) {
@@ -32228,7 +32317,6 @@ public:
       if (notifyPeer) if (Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID))
         (void)sendCousinSessionControl(&carrier->neuron, state, ProdigyCousinSessionControlKind::revoke);
     }
-    state.expiresAtMs = 0;
   }
 
   bool installCousinSessionDestination(CousinSessionState& state, bool renewal)
@@ -34754,6 +34842,7 @@ public:
           bv->clusterPairRevocationCapabilityAcknowledged = false;
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
+          bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
           bv->containerRetirementCapabilityBootNs = 0;
           bv->containerRetirementCapabilityIOGeneration = 0;
@@ -34761,7 +34850,7 @@ public:
           {
             const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512) : 0);
+                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -35388,7 +35477,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512) : 0);
+                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -35404,6 +35493,7 @@ public:
           bv->clusterPairRevocationCapabilityAcknowledged = false;
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
+          bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(1)) != 0)
             bv->placementPolicyCapabilityAcknowledged = true;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(2)) != 0 &&
@@ -35426,6 +35516,8 @@ public:
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(256)) != 0;
             bv->localCousinServicePermissionCapabilityAcknowledged =
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(512)) != 0;
+            bv->localCousinServicePermissionBaselineCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(1024)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -35461,7 +35553,7 @@ public:
               (incoming.version < 5 || (bv->transportAEGISEnabled() &&
                                        bv->isTransportNegotiated() && bv->tlsPeerVerified && bv->tlsPeerUUID == bv->uuid)) &&
               (incoming.runtimeState.localCousinServicePermissions.empty() ||
-               (incoming.version >= 7 && localCousinServicePermissionPeerCapabilityCurrent(bv))) &&
+               (incoming.version >= 7 && localCousinServicePermissionPeerCapabilityCurrent(bv, incoming.version >= 8))) &&
               (incoming.runtimeState.clusterPairEnrollments.empty() ||
                (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
                     std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -44988,6 +45080,7 @@ public:
             }
           }
 
+          bytell_hash_set<uint64_t> missingContainerDeployments;
           for (ContainerView *stale : staleMachineContainerPointers)
           {
             if (stale == nullptr)
@@ -44995,29 +45088,32 @@ public:
               continue;
             }
 
-            neuron->machine->removeContainerIndexEntry(stale->deploymentID, stale);
+            // Withdraw confirmed-absent serving state before recovery can wait
+            // for placement; the deployment retains the view until replacement.
+            mesh->stopAllSubscriptions(stale);
+            mesh->stopAllAdvertisments(stale);
+
             if (auto deployment = deployments.find(stale->deploymentID); deployment != deployments.end() && deployment->second)
             {
-              deployment->second->containers.erase(stale);
-              if (deployment->second->plan.isStateful)
-              {
-                while (deployment->second->containersByShardGroup.eraseEntry(stale->shardGroup, stale))
-                {
-                }
-              }
+              missingContainerDeployments.insert(stale->deploymentID);
+              continue;
             }
 
+            neuron->machine->removeContainerIndexEntry(stale->deploymentID, stale);
             if (auto canonical = containers.find(stale->uuid); canonical != containers.end() && canonical->second == stale)
             {
               containers.erase(stale->uuid);
             }
 
-            // State-upload inventory is authoritative: remove both active mesh
-            // edges and pending recovery halves before this MeshNode is freed.
-            mesh->stopAllSubscriptions(stale);
-            mesh->stopAllAdvertisments(stale);
             delete stale;
           }
+
+          // Inventory absence is a process-loss observation. The deployment
+          // failure owner must release counts and placement and schedule its
+          // replacement; deleting only the view leaves a phantom healthy fleet.
+          // The subset is consumed before drainMachine can suspend for capacity.
+          for (uint64_t deploymentID : missingContainerDeployments)
+            deployments[deploymentID]->drainMachine(neuron->machine, true, false, &staleMachineContainerUUIDs);
 
 #if PRODIGY_DEBUG
           basics_log("brain stateUpload applied private4=%u reported=%llu stale=%llu indexedBefore=%llu indexedAfter=%llu canonicalContainers=%llu malformed=%d\n",

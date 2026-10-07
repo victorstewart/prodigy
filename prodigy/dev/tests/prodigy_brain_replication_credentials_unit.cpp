@@ -23736,6 +23736,227 @@ static void testContainerLaunchWaitsForDurableRuntimeInventory(TestSuite& suite)
   }
 }
 
+static void checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(
+    TestSuite& suite, RoutableIngressScope ingressScope, MachineState failedHostState = MachineState::missing)
+{
+  ScopedRing ring = {};
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.brainConfig.datacenterFragment = 1;
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  constexpr uint16_t applicationID = 62'060;
+  Rack racks[3] = {};
+  Machine machines[3] = {};
+  ContainerView *replicas[3] = {};
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    racks[index].uuid = uint128_t(0x620600 + index);
+    machines[index].uuid = uint128_t(0x530600 + index);
+    machines[index].state = MachineState::healthy;
+    machines[index].runtimeReady = true;
+    machines[index].fragment = 0x1240 + index;
+    machines[index].rack = &racks[index];
+    machines[index].lifetime = MachineLifetime::owned;
+    machines[index].hardware.cpu.logicalCores = machines[index].ownedLogicalCores =
+        machines[index].totalLogicalCores = machines[index].nLogicalCores_available = 8;
+    machines[index].memoryMB_available = 8'192;
+    machines[index].storageMB_available = 8'192;
+    racks[index].machines.insert(&machines[index]);
+    brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    brain.machines.insert(&machines[index]);
+    brain.machinesByUUID.insert_or_assign(machines[index].uuid, &machines[index]);
+  }
+  Machine& returnedMachine = machines[0];
+  returnedMachine.neuron.machine = &returnedMachine;
+  brain.neurons.insert(&returnedMachine.neuron);
+
+  ApplicationDeployment deployment = {};
+  seedStatefulDeployRequestPlan(deployment.plan, applicationID);
+  deployment.plan.stateful.allMasters = true;
+  deployment.state = DeploymentState::running;
+  deployment.nShardGroups = 1;
+  deployment.nTargetBase = deployment.nDeployedBase = deployment.nHealthyBase = 3;
+  Wormhole ingress = {};
+  ingress.name = "restricted-ingress"_ctv;
+  ingress.externalPort = 443;
+  ingress.containerPort = 8443;
+  ingress.layer4 = IPPROTO_TCP;
+  ingress.source = ExternalAddressSource::registeredRoutablePrefix;
+  ingress.routablePrefixUUID = uint128_t(0x6206aa);
+  deployment.plan.wormholes.push_back(ingress);
+  DistributableExternalSubnet prefix = {};
+  prefix.uuid = ingress.routablePrefixUUID;
+  prefix.machineUUID = ingressScope == RoutableIngressScope::singleMachine ? returnedMachine.uuid : 0;
+  prefix.ingressScope = ingressScope;
+  prefix.usage = ExternalSubnetUsage::wormholes;
+  prefix.subnet = IPPrefix("203.0.113.0", false, 24);
+  brain.brainConfig.distributableExternalSubnets.push_back(prefix);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(applicationID, &deployment);
+
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    ContainerView *replica = new ContainerView();
+    replicas[index] = replica;
+    replica->uuid = uint128_t(0x530700 + index);
+    replica->deploymentID = deployment.plan.config.deploymentID();
+    replica->applicationID = applicationID;
+    replica->machine = &machines[index];
+    replica->lifetime = ApplicationLifetime::base;
+    replica->state = ContainerState::healthy;
+    replica->runtimeReady = true;
+    replica->isStateful = true;
+    replica->shardGroup = 0;
+    replica->fragment = 20 + index;
+    deployment.containers.insert(replica);
+    deployment.containersByShardGroup.insert(0, replica);
+    deployment.countPerMachine[&machines[index]] = 1;
+    deployment.countPerRack[&racks[index]] = 1;
+    deployment.racksByShardGroup[0].insert(&racks[index]);
+    brain.containers.insert_or_assign(replica->uuid, replica);
+    machines[index].upsertContainerIndexEntry(replica->deploymentID, replica);
+    prodigyDebitMachineScalarResources(&machines[index], deployment.plan.config, 1);
+  }
+  const auto originalCores = returnedMachine.nLogicalCores_available;
+  const auto originalSharedCPU = returnedMachine.sharedCPUMillis_available;
+  const auto originalMemory = returnedMachine.memoryMB_available;
+  const auto originalStorage = returnedMachine.storageMB_available;
+  const uint128_t oldUUID = replicas[0]->uuid;
+
+  // The two peer racks already hold the other replicas. Both fleet ingress
+  // and ingress bound to one machine must keep a scheduled seeding owner
+  // when no healthy rack can replace a replica whose original host can return.
+  // A capacity request must not hide that slot from reconnect bootstrap.
+  returnedMachine.state = failedHostState;
+  returnedMachine.runtimeReady = false;
+  brain.evacuateFailedMachineContainers(&returnedMachine);
+  ContainerView *deferredReplacement = nullptr;
+  for (ContainerView *candidate : deployment.containers)
+  {
+    if (candidate != nullptr && candidate->uuid != oldUUID && candidate->machine == &returnedMachine &&
+        candidate->state == ContainerState::scheduled && candidate->isStateful && candidate->shardGroup == 0)
+    {
+      deferredReplacement = candidate;
+      break;
+    }
+  }
+  suite.expect(brain.containers.contains(oldUUID) == false && deferredReplacement != nullptr &&
+                   returnedMachine.state == failedHostState && returnedMachine.runtimeReady == false,
+               "deferred_stateful_recovery_retires_old_owner_and_stages_one_unhealthy_returned_machine_replacement");
+  const StatefulMeshRoles roles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, applicationID, 0);
+  suite.expect(deferredReplacement != nullptr && deferredReplacement->subscriptions.contains(roles.seeding),
+               "deferred_stateful_recovery_stages_stateful_seeding_before_machine_returns");
+  suite.expect(deployment.nHealthyBase == 2 && deployment.nDeployedBase == 3 &&
+                   deployment.containers.contains(replicas[1]) && deployment.containers.contains(replicas[2]) &&
+                   replicas[1]->runtimeReady && replicas[2]->runtimeReady,
+               "deferred_stateful_recovery_preserves_live_peers_and_exact_deferred_counts");
+  suite.expect(deployment.countPerMachine.getIf(&returnedMachine) == 1 &&
+                   deployment.countPerRack.getIf(&racks[0]) == 1 &&
+                   deployment.racksByShardGroup[0].contains(&racks[0]) &&
+                   returnedMachine.nLogicalCores_available == originalCores &&
+                   returnedMachine.sharedCPUMillis_available == originalSharedCPU &&
+                   returnedMachine.memoryMB_available == originalMemory &&
+                   returnedMachine.storageMB_available == originalStorage,
+               "deferred_stateful_recovery_preserves_exact_original_reservation");
+  suite.expect(returnedMachine.claims.empty() && deployment.nSuspended == 1 &&
+                   deployment.schedulingStack.execution != nullptr && deferredReplacement != nullptr &&
+                   deployment.waitingOnContainers.size() == 1 &&
+                   deployment.waitingOnContainers.contains(deferredReplacement),
+               "deferred_stateful_recovery_retains_only_the_normal_replacement_healthy_waiter");
+  const uint128_t deferredUUID = deferredReplacement == nullptr ? 0 : deferredReplacement->uuid;
+  returnedMachine.neuron.wBuffer.clear();
+  brain.machinesAwaitingPostCloseInventory.insert(returnedMachine.uuid);
+
+  // The rebooted source returns an authenticated empty inventory. The existing
+  // scheduled/bootstrap replay owner must launch the same replacement only
+  // after the ordinary state-upload readiness barrier opens.
+  returnedMachine.state = MachineState::deploying;
+  String upload = {};
+  uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+  local_container_subnet6 subnet = {};
+  subnet.dpfx = 1;
+  subnet.mpfx[0] = 0x00;
+  subnet.mpfx[1] = 0x12;
+  subnet.mpfx[2] = 0x40;
+  Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<const uint8_t *>(&subnet), sizeof(subnet));
+  Message::finish(upload, headerOffset);
+  brain.neuronHandler(&returnedMachine.neuron, reinterpret_cast<Message *>(upload.data()));
+
+  ContainerView *replacement = nullptr;
+  for (ContainerView *candidate : deployment.containers)
+  {
+    if (candidate != nullptr && candidate->uuid == deferredUUID && candidate->machine == &returnedMachine &&
+        candidate->state == ContainerState::scheduled && candidate->isStateful && candidate->shardGroup == 0)
+    {
+      replacement = candidate;
+      break;
+    }
+  }
+  uint32_t recoveryFrames = 0;
+  uint128_t replayedUUID = 0;
+  forEachMessageInBuffer(returnedMachine.neuron.wBuffer, [&](Message *frame) {
+    if (NeuronTopic(frame->topic) != NeuronTopic::stateUpload) return;
+    uint8_t *args = frame->args;
+    local_container_subnet6 queuedFragment = {};
+    Message::extractBytes<Alignment::one>(args, reinterpret_cast<uint8_t *>(&queuedFragment), sizeof(queuedFragment));
+    if (args >= frame->terminal()) return;
+    String serialized = {};
+    Message::extractToStringView(args, serialized);
+    NeuronContainerBootstrap bootstrap = {};
+    if (BitseryEngine::deserializeSafe(serialized, bootstrap))
+    {
+      replayedUUID = bootstrap.plan.uuid;
+      ++recoveryFrames;
+    }
+  });
+  suite.expect(brain.containers.contains(oldUUID) == false && replacement != nullptr && replacement == deferredReplacement &&
+                   !returnedMachine.runtimeReady && recoveryFrames == 1 && replayedUUID == deferredUUID,
+               "deferred_stateful_recovery_empty_inventory_replays_exact_deferred_replacement_after_return");
+  suite.expect(deployment.nHealthyBase == 2 && deployment.nDeployedBase == 3 &&
+                   deployment.containers.contains(replicas[1]) && deployment.containers.contains(replicas[2]) &&
+                   replicas[1]->runtimeReady && replicas[2]->runtimeReady,
+               "deferred_stateful_recovery_launch_preserves_counts_without_mutating_live_peers");
+
+  Vector<ContainerView *> cleanup = {};
+  for (ContainerView *container : deployment.containers) cleanup.push_back(container);
+  for (ContainerView *container : cleanup)
+  {
+    if (container == nullptr) continue;
+    deployment.waitingOnContainers.erase(container);
+    deployment.containers.erase(container);
+    while (deployment.containersByShardGroup.eraseEntry(container->shardGroup, container)) {}
+    if (container->machine != nullptr) container->machine->removeContainerIndexEntry(container->deploymentID, container);
+    brain.containers.erase(container->uuid);
+    delete container;
+  }
+  brain.deploymentsByApp.erase(applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&returnedMachine.neuron);
+  for (uint32_t index = 0; index < 3; ++index)
+  {
+    brain.machinesByUUID.erase(machines[index].uuid);
+    brain.machines.erase(&machines[index]);
+    racks[index].machines.erase(&machines[index]);
+    brain.racks.erase(racks[index].uuid);
+  }
+  thisBrain = previousBrain;
+}
+
+
+static void testDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(TestSuite& suite)
+{
+  checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(suite, RoutableIngressScope::singleMachine);
+  checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(suite, RoutableIngressScope::switchboardFleet);
+  // An authenticated empty inventory can prove loss before the machine-state
+  // remediation timer has moved the otherwise healthy host to missing.
+  checkDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(
+      suite, RoutableIngressScope::switchboardFleet, MachineState::healthy);
+}
+
 static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(TestSuite& suite)
 {
   TestBrain brain = {};
@@ -23748,20 +23969,49 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
 
   Rack rack = {};
   rack.uuid = 62'030;
+  Rack replacementRack = {};
+  replacementRack.uuid = 62'031;
 
   Machine machine = {};
   machine.uuid = uint128_t(0x5301);
-  machine.state = MachineState::healthy;
+  // The fresh upload is accepted while this restarted source is still not a
+  // scheduling target.  A distinct live receiver proves the failure owner
+  // dispatches a replacement instead of merely deleting bookkeeping.
+  machine.state = MachineState::deploying;
   machine.rack = &rack;
   machine.neuron.machine = &machine;
   machine.usedContainerFragments.insert(9);
+
+  Machine replacementMachine = {};
+  replacementMachine.uuid = uint128_t(0x5305);
+  replacementMachine.state = MachineState::healthy;
+  replacementMachine.rack = &replacementRack;
+  replacementMachine.lifetime = MachineLifetime::owned;
+  replacementMachine.nLogicalCores_available = 32;
+  replacementMachine.memoryMB_available = 32'768;
+  replacementMachine.storageMB_available = 32'768;
+
+  rack.machines.insert(&machine);
+  replacementRack.machines.insert(&replacementMachine);
+  brain.racks.insert_or_assign(rack.uuid, &rack);
+  brain.racks.insert_or_assign(replacementRack.uuid, &replacementRack);
   brain.machines.insert(&machine);
+  brain.machines.insert(&replacementMachine);
   brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.machinesByUUID.insert_or_assign(replacementMachine.uuid, &replacementMachine);
   brain.neurons.insert(&machine.neuron);
 
   ApplicationDeployment deployment = {};
   deployment.plan = makeDeploymentPlan(62'030, 1);
+  deployment.plan.stateless.nBase = 3;
+  deployment.plan.stateless.maxPerRackRatio = 1.0f;
+  deployment.plan.stateless.maxPerMachineRatio = 1.0f;
   deployment.state = DeploymentState::deploying;
+  deployment.nTargetBase = 3;
+  deployment.nDeployedBase = 3;
+  deployment.nHealthyBase = 2;
+  deployment.countPerMachine.insert_or_assign(&machine, 3);
+  deployment.countPerRack.insert_or_assign(&rack, 3);
   brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
   brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
 
@@ -23798,14 +24048,22 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   brain.containers.insert_or_assign(pending->uuid, pending);
   machine.upsertContainerIndexEntry(pending->deploymentID, pending);
 
-  ContainerView liveSeed = {};
-  liveSeed.uuid = uint128_t(0x5303);
-  liveSeed.fragment = 10;
-  liveSeed.lifetime = ApplicationLifetime::base;
-  liveSeed.state = ContainerState::healthy;
-  liveSeed.createdAtMs = 123'457;
-  liveSeed.shardGroup = 0;
-  ContainerPlan livePlan = liveSeed.generatePlan(deployment.plan);
+  // A reported peer and a scheduled successor share this upload with the
+  // omitted healthy process.  Neither is a failure candidate.
+  ContainerView *reported = new ContainerView();
+  reported->uuid = uint128_t(0x5303);
+  reported->deploymentID = deployment.plan.config.deploymentID();
+  reported->applicationID = deployment.plan.config.applicationID;
+  reported->machine = &machine;
+  reported->fragment = 10;
+  reported->lifetime = ApplicationLifetime::base;
+  reported->state = ContainerState::healthy;
+  reported->createdAtMs = 123'457;
+  reported->shardGroup = 0;
+  ContainerPlan reportedPlan = reported->generatePlan(deployment.plan);
+  deployment.containers.insert(reported);
+  brain.containers.insert_or_assign(reported->uuid, reported);
+  machine.upsertContainerIndexEntry(reported->deploymentID, reported);
 
   String uploadBuffer = {};
   uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
@@ -23816,7 +24074,7 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   fragment.mpfx[2] = 0x34;
   Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
   String serializedLivePlan = {};
-  BitseryEngine::serialize(serializedLivePlan, livePlan);
+  BitseryEngine::serialize(serializedLivePlan, reportedPlan);
   Message::appendValue(uploadBuffer, serializedLivePlan);
   Message::finish(uploadBuffer, headerOffset);
 
@@ -23826,25 +24084,46 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   suite.expect(machine.runtimeReady == true, "brain_neuron_state_upload_marks_machine_runtime_ready");
   suite.expect(machine.containerFragmentAvailable(9), "brain_neuron_state_upload_releases_unreported_container_fragment");
   suite.expect(machine.containerFragmentAvailable(pendingFragment) == false, "brain_neuron_state_upload_retains_pending_container_fragment");
-  suite.expect(machine.containerFragmentAvailable(livePlan.fragment) == false, "brain_neuron_state_upload_reserves_reported_container_fragment");
-  auto liveIt = brain.containers.find(livePlan.uuid);
+  suite.expect(machine.containerFragmentAvailable(reportedPlan.fragment) == false, "brain_neuron_state_upload_reserves_reported_container_fragment");
   auto pendingIt = brain.containers.find(pendingUUID);
-  ContainerView *live = (liveIt != brain.containers.end()) ? liveIt->second : nullptr;
+  auto liveIt = brain.containers.find(reportedPlan.uuid);
+  ContainerView *live = liveIt == brain.containers.end() ? nullptr : liveIt->second;
   ContainerView *retainedPending = (pendingIt != brain.containers.end()) ? pendingIt->second : nullptr;
+  ContainerView *replacement = nullptr;
+  for (ContainerView *candidate : deployment.containers)
+  {
+    if (candidate != nullptr && candidate != live && candidate != retainedPending &&
+        candidate->machine == &replacementMachine && candidate->state == ContainerState::scheduled)
+    {
+      replacement = candidate;
+      break;
+    }
+  }
   suite.expect(live != nullptr, "brain_neuron_state_upload_tracks_reported_container");
   suite.expect(brain.containers.find(staleUUID) == brain.containers.end(), "brain_neuron_state_upload_removes_stale_canonical_container");
   suite.expect(retainedPending != nullptr, "brain_neuron_state_upload_retains_scheduled_successor");
-  suite.expect(deployment.containers.size() == 2, "brain_neuron_state_upload_keeps_pending_successor_in_deployment");
+  suite.expect(deployment.containers.size() == 3, "brain_neuron_state_upload_replaces_omitted_healthy_container");
   suite.expect(machine.containersByDeploymentID.size() == 1, "brain_neuron_state_upload_keeps_pending_machine_bin");
 
   suite.expect(live != nullptr && live->machine == &machine, "brain_neuron_state_upload_assigns_live_container_machine");
   suite.expect(live != nullptr && live->deploymentID == deployment.plan.config.deploymentID(), "brain_neuron_state_upload_assigns_live_container_deployment");
+  suite.expect(replacement != nullptr, "brain_neuron_state_upload_omitted_healthy_container_dispatches_replacement_construct");
+  suite.expect(deployment.nHealthyBase == 1 && deployment.nDeployedBase == 3,
+               "brain_neuron_state_upload_omitted_healthy_container_repairs_deployed_and_healthy_counts");
+  suite.expect(deployment.countPerMachine.getIf(&machine) == 2 &&
+                   deployment.countPerRack.getIf(&rack) == 2 &&
+                   deployment.countPerMachine.getIf(&replacementMachine) == 1 &&
+                   deployment.countPerRack.getIf(&replacementRack) == 1,
+               "brain_neuron_state_upload_omitted_healthy_container_repairs_placement_counts");
 
   if (auto indexed = machine.containersByDeploymentID.find(deployment.plan.config.deploymentID()); indexed != machine.containersByDeploymentID.end())
   {
     suite.expect(indexed->second.size() == 2, "brain_neuron_state_upload_keeps_pending_indexed_machine_container");
     suite.expect(indexed->second.size() == 2 && std::find(indexed->second.begin(), indexed->second.end(), live) != indexed->second.end(), "brain_neuron_state_upload_indexes_live_container");
     suite.expect(indexed->second.size() == 2 && retainedPending != nullptr && std::find(indexed->second.begin(), indexed->second.end(), retainedPending) != indexed->second.end(), "brain_neuron_state_upload_indexes_pending_successor");
+    suite.expect(indexed->second.size() == 2 && replacement != nullptr &&
+                     std::find(indexed->second.begin(), indexed->second.end(), replacement) == indexed->second.end(),
+                 "brain_neuron_state_upload_replacement_is_not_indexed_on_restarted_source");
   }
   else
   {
@@ -23856,25 +24135,26 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
     brain.noteLocalContainerHealthy(pendingUUID);
     suite.expect(retainedPending->state == ContainerState::healthy && deployment.nHealthyBase == 2,
                  "brain_neuron_state_upload_retained_successor_counts_later_healthy");
-    suite.expect(deployment.waitingOnContainers.empty(), "brain_neuron_state_upload_retained_successor_clears_healthy_waiter");
+    suite.expect(!deployment.waitingOnContainers.contains(retainedPending) && replacement != nullptr &&
+                     deployment.waitingOnContainers.size() == 1 && deployment.waitingOnContainers.contains(replacement),
+                 "brain_neuron_state_upload_retained_successor_clears_only_its_healthy_waiter");
   }
   else
   {
     suite.expect(false, "brain_neuron_state_upload_missing_successor_cannot_count_later_healthy");
   }
 
-  if (live != nullptr)
+  Vector<ContainerView *> cleanup = {};
+  for (const auto& [uuid, container] : brain.containers)
   {
-    deployment.containers.erase(live);
-    machine.removeContainerIndexEntry(live->deploymentID, live);
-    brain.containers.erase(live->uuid);
-    delete live;
+    (void)uuid;
+    if (container != nullptr && container->deploymentID == deployment.plan.config.deploymentID()) cleanup.push_back(container);
   }
-  if (auto retained = brain.containers.find(pendingUUID); retained != brain.containers.end())
+  for (ContainerView *container : cleanup)
   {
-    ContainerView *container = retained->second;
+    deployment.waitingOnContainers.erase(container);
     deployment.containers.erase(container);
-    machine.removeContainerIndexEntry(container->deploymentID, container);
+    if (container->machine != nullptr) container->machine->removeContainerIndexEntry(container->deploymentID, container);
     brain.containers.erase(container->uuid);
     delete container;
   }
@@ -23882,8 +24162,144 @@ static void testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(Test
   brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
   brain.deployments.erase(deployment.plan.config.deploymentID());
   brain.neurons.erase(&machine.neuron);
+  brain.machinesByUUID.erase(replacementMachine.uuid);
   brain.machinesByUUID.erase(machine.uuid);
+  brain.machines.erase(&replacementMachine);
   brain.machines.erase(&machine);
+  replacementRack.machines.erase(&replacementMachine);
+  rack.machines.erase(&machine);
+  brain.racks.erase(replacementRack.uuid);
+  brain.racks.erase(rack.uuid);
+  thisBrain = previousBrain;
+}
+
+static void testBrainNeuronStateUploadMissingInventoryWithdrawsMeshBeforeCapacityRecovery(TestSuite& suite)
+{
+  TestBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+
+  BrainBase *previousBrain = thisBrain;
+  thisBrain = &brain;
+
+  Rack rack = {};
+  rack.uuid = 62'032;
+  Machine source = {};
+  source.uuid = uint128_t(0x5306);
+  // No schedulable receiver: recovery retains the missing view while its
+  // endpoint must be removed from Mesh synchronously with stateUpload.
+  source.state = MachineState::deploying;
+  source.rack = &rack;
+  source.fragment = 0x1235;
+  source.neuron.machine = &source;
+  rack.machines.insert(&source);
+  brain.racks.insert_or_assign(rack.uuid, &rack);
+  brain.machines.insert(&source);
+  brain.machinesByUUID.insert_or_assign(source.uuid, &source);
+  brain.neurons.insert(&source.neuron);
+
+  ApplicationDeployment deployment = {};
+  deployment.plan = makeDeploymentPlan(62'032, 1);
+  deployment.plan.stateless.nBase = 2;
+  deployment.plan.stateless.maxPerRackRatio = 1.0f;
+  deployment.plan.stateless.maxPerMachineRatio = 1.0f;
+  deployment.state = DeploymentState::running;
+  deployment.nTargetBase = 2;
+  deployment.nDeployedBase = 2;
+  deployment.nHealthyBase = 2;
+  deployment.countPerMachine.insert_or_assign(&source, 2);
+  deployment.countPerRack.insert_or_assign(&rack, 2);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  brain.deploymentsByApp.insert_or_assign(deployment.plan.config.applicationID, &deployment);
+
+  constexpr uint64_t staleService = 0x620320000001ULL;
+  constexpr uint64_t reportedService = 0x620320000002ULL;
+  ContainerView *stale = new ContainerView();
+  stale->uuid = uint128_t(0x5307);
+  const uint128_t staleUUID = stale->uuid;
+  stale->deploymentID = deployment.plan.config.deploymentID();
+  stale->applicationID = deployment.plan.config.applicationID;
+  stale->machine = &source;
+  stale->lifetime = ApplicationLifetime::base;
+  stale->state = ContainerState::healthy;
+  stale->runtimeReady = true;
+  stale->fragment = 9;
+  stale->createdAtMs = 123'460;
+  stale->advertisements.insert_or_assign(
+      staleService, Advertisement(staleService, ContainerState::healthy, ContainerState::destroying, 19'103));
+
+  ContainerView *reported = new ContainerView();
+  reported->uuid = uint128_t(0x5308);
+  reported->deploymentID = deployment.plan.config.deploymentID();
+  reported->applicationID = deployment.plan.config.applicationID;
+  reported->machine = &source;
+  reported->lifetime = ApplicationLifetime::base;
+  reported->state = ContainerState::healthy;
+  reported->runtimeReady = true;
+  reported->fragment = 10;
+  reported->createdAtMs = 123'461;
+  reported->advertisements.insert_or_assign(
+      reportedService, Advertisement(reportedService, ContainerState::healthy, ContainerState::destroying, 19'104));
+
+  deployment.containers.insert(stale);
+  deployment.containers.insert(reported);
+  brain.containers.insert_or_assign(stale->uuid, stale);
+  brain.containers.insert_or_assign(reported->uuid, reported);
+  source.upsertContainerIndexEntry(stale->deploymentID, stale);
+  source.upsertContainerIndexEntry(reported->deploymentID, reported);
+  brain.mesh->advertise(staleService, stale, 19'103, false);
+  brain.mesh->advertise(reportedService, reported, 19'104, false);
+  suite.expect(brain.mesh->isAdvertising(staleService, stale) && brain.mesh->isAdvertising(reportedService, reported),
+               "brain_neuron_state_upload_missing_inventory_mesh_fixture_advertises_both_endpoints");
+
+  ContainerPlan reportedPlan = reported->generatePlan(deployment.plan);
+  String uploadBuffer = {};
+  uint32_t headerOffset = Message::appendHeader(uploadBuffer, NeuronTopic::stateUpload);
+  local_container_subnet6 fragment = {};
+  fragment.dpfx = 1;
+  fragment.mpfx[0] = 0x00;
+  fragment.mpfx[1] = 0x12;
+  fragment.mpfx[2] = 0x35;
+  Message::appendAlignedBuffer<Alignment::one>(uploadBuffer, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+  String serializedReportedPlan = {};
+  BitseryEngine::serialize(serializedReportedPlan, reportedPlan);
+  Message::appendValue(uploadBuffer, serializedReportedPlan);
+  Message::finish(uploadBuffer, headerOffset);
+  brain.neuronHandler(&source.neuron, reinterpret_cast<Message *>(uploadBuffer.data()));
+
+  suite.expect(brain.containers.contains(staleUUID) && deployment.containers.contains(stale),
+               "brain_neuron_state_upload_missing_inventory_retains_owner_while_capacity_blocked");
+  suite.expect(brain.containers.contains(staleUUID) && !brain.containers[staleUUID]->runtimeReady,
+               "brain_neuron_state_upload_missing_inventory_withdraws_runtime_readiness");
+  suite.expect(brain.mesh->isAdvertising(staleService, stale) == false,
+               "brain_neuron_state_upload_missing_inventory_withdraws_stale_mesh_immediately");
+  suite.expect(brain.containers.contains(reported->uuid) && deployment.containers.contains(reported) &&
+                   brain.mesh->isAdvertising(reportedService, reported),
+               "brain_neuron_state_upload_missing_inventory_preserves_reported_peer_mesh");
+  suite.expect(deployment.toSchedule.empty(),
+               "brain_neuron_state_upload_missing_inventory_does_not_fake_replacement_without_capacity");
+
+  for (uint128_t uuid : {staleUUID, uint128_t(0x5308)})
+  {
+    auto found = brain.containers.find(uuid);
+    if (found == brain.containers.end()) continue;
+    ContainerView *container = found->second;
+    brain.mesh->stopAllSubscriptions(container);
+    brain.mesh->stopAllAdvertisments(container);
+    deployment.waitingOnContainers.erase(container);
+    deployment.containers.erase(container);
+    source.removeContainerIndexEntry(container->deploymentID, container);
+    brain.containers.erase(container->uuid);
+    delete container;
+  }
+  brain.deploymentsByApp.erase(deployment.plan.config.applicationID);
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  brain.neurons.erase(&source.neuron);
+  brain.machinesByUUID.erase(source.uuid);
+  brain.machines.erase(&source);
+  rack.machines.erase(&source);
+  brain.racks.erase(rack.uuid);
   thisBrain = previousBrain;
 }
 
@@ -31984,7 +32400,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         peer.version = ProdigyBinaryVersion;
         String frame = {};
         permissionBrain.brainHandler(&peer, buildBrainMessage(frame,
-            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 512)));
+            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 512 | 1024)));
       };
       acknowledgePermissionCapabilities(permissionPeerA);
       acknowledgePermissionCapabilities(permissionPeerB);
@@ -31996,6 +32412,18 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       live.plan.config.versionID = 1;
       live.plan.config.containerBlobSHA256.assign("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
       live.plan.config.containerBlobBytes = 1;
+      live.plan.config.nLogicalCores = 1;
+      live.plan.config.memoryMB = 64;
+      live.plan.config.storageMB = 64;
+      // Only memory is scaler-authorized: unchanged CPU/storage must not need scalers.
+      VerticalScaler memoryScaler = {}; memoryScaler.name.assign("permission-memory-bound"_ctv);
+      memoryScaler.resource = ScalingDimension::memory; memoryScaler.increment = 1;
+      memoryScaler.minValue = 64; memoryScaler.maxValue = 256;
+      live.plan.verticalScalers.push_back(memoryScaler);
+      auto memoryDownscaler = memoryScaler;
+      memoryDownscaler.direction = Scaler::Direction::downscale;
+      memoryDownscaler.maxValue = 192;
+      live.plan.verticalScalers.push_back(memoryDownscaler);
       live.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(0x9a41, 3);
       permissionBrain.deployments.insert_or_assign(live.plan.config.deploymentID(), &live);
       String serializedLivePlan = {}, livePlanDigest = {}, digestFailure = {};
@@ -32019,6 +32447,21 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       permission.canonicalPlanSHA256 = livePlanDigest; permission.artifactSHA256 = live.plan.config.containerBlobSHA256;
       permission.artifactBytes = live.plan.config.containerBlobBytes; permission.generation = 1;
       ProdigyLocalCousinServicePermissionResponse permissionResponse = {};
+      permissionPeerA.localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+      permissionPeerB.localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(permissionRequest, permissionResponse) &&
+                       permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.empty(),
+                   "local_cousin_permission_owner_requires_baseline_capability_quorum_before_v2_install");
+      acknowledgePermissionCapabilities(permissionPeerA);
+      acknowledgePermissionCapabilities(permissionPeerB);
+      auto callerSuppliedBaseline = permissionRequest;
+      callerSuppliedBaseline.permission.protocolVersion = 2;
+      callerSuppliedBaseline.permission.baselineLogicalCores = 1;
+      callerSuppliedBaseline.permission.baselineMemoryMB = 64;
+      callerSuppliedBaseline.permission.baselineStorageMB = 64;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(callerSuppliedBaseline, permissionResponse) &&
+                       permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.empty(),
+                   "local_cousin_permission_owner_rejects_caller_supplied_baseline_on_active_install");
       auto stalePermission = permissionRequest;
       --stalePermission.expectedAuthorityGeneration;
       suite.expect(!permissionBrain.commitLocalCousinServicePermission(stalePermission, permissionResponse) &&
@@ -32035,6 +32478,54 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       suite.expect(activePermission.success && activePermission.found && activePermission.qualified &&
                        activePermission.permission.acceptedAuthorityGeneration == permissionBrain.masterAuthorityRuntimeState.generation,
                    "local_cousin_permission_owner_reports_only_durable_current_policy_as_qualified");
+      suite.expect(activePermission.permission.protocolVersion == 2 &&
+                       activePermission.permission.baselineLogicalCores == 1 &&
+                       activePermission.permission.baselineMemoryMB == 64 &&
+                       activePermission.permission.baselineStorageMB == 64,
+                   "local_cousin_permission_owner_enriches_verified_v1_request_with_immutable_baseline");
+      live.plan.config.memoryMB = 128;
+      suite.expect(permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_accepts_only_bound_vertical_resource_change");
+      auto legacyPermission = activePermission.permission;
+      legacyPermission.protocolVersion = 1;
+      legacyPermission.baselineLogicalCores = legacyPermission.baselineMemoryMB = legacyPermission.baselineStorageMB = 0;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(legacyPermission),
+                   "local_cousin_permission_owner_keeps_legacy_permission_exact_only_after_scale");
+      live.plan.config.nLogicalCores = 2;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_rejects_resource_change_without_installed_scaler");
+      live.plan.config.nLogicalCores = 1;
+      live.plan.config.memoryMB = 63;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_rejects_below_baseline_resource_change");
+      live.plan.config.memoryMB = 224;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_respects_bounds_from_all_installed_scalers");
+      live.plan.config.memoryMB = 257;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_rejects_vertical_change_outside_installed_bounds");
+      live.plan.config.memoryMB = 128;
+      ++live.plan.config.versionID;
+      suite.expect(!permissionBrain.localCousinServicePermissionMatchesCurrentLivePlan(activePermission.permission),
+                   "local_cousin_permission_owner_rejects_immutable_plan_change_after_baseline_restore");
+      --live.plan.config.versionID;
+      live.plan.config.memoryMB = 64;
+      String v2PermissionBytes = {};
+      ProdigyLocalCousinServicePermission restoredV2Permission = {};
+      suite.expect(BitseryEngine::serialize(v2PermissionBytes, activePermission.permission) > 0 &&
+                       BitseryEngine::deserializeSafe(v2PermissionBytes, restoredV2Permission) &&
+                       prodigyLocalCousinServicePermissionEqual(activePermission.permission, restoredV2Permission),
+                   "local_cousin_permission_owner_roundtrips_v2_baseline_record_for_restart");
+      auto malformedV1Permission = activePermission.permission;
+      malformedV1Permission.protocolVersion = 1;
+      suite.expect(!prodigyLocalCousinServicePermissionValid(malformedV1Permission),
+                   "local_cousin_permission_owner_rejects_v1_record_with_v2_trailing_baseline");
+      auto alteredBaselineRetry = permissionRequest;
+      alteredBaselineRetry.permission = activePermission.permission;
+      ++alteredBaselineRetry.permission.baselineMemoryMB;
+      alteredBaselineRetry.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
+      suite.expect(!permissionBrain.commitLocalCousinServicePermission(alteredBaselineRetry, permissionResponse),
+                   "local_cousin_permission_owner_rejects_altered_server_owned_baseline_on_retry");
       // Discovery is derived entirely from the currently qualified local
       // destination policy plus a live, applied Wormhole listener.  It is not
       // another authority record and must stop on any live-state fence.
@@ -32330,6 +32821,120 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
             permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front() = oldPermission;
             suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
                           "cousin_session_fixture_restores_source_permission_authority");
+
+            // Session ownership is intentionally rechecked by the ordinary
+            // lease driver.  These are local lifecycle changes, so no remote
+            // scheduler or new authority transition participates.
+            auto beginCurrentLifecycleSession = [&](uint128_t requestUUID) {
+              auto lifecycleRequest = request;
+              lifecycleRequest.requestUUID = requestUUID;
+              return permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, lifecycleRequest) &&
+                     permissionBrain.cousinSessions.size() == 1;
+            };
+            suite.require(beginCurrentLifecycleSession(0x9c4f),
+                          "cousin_session_lifecycle_creates_source_owner_before_native_close");
+            auto terminalRecord = permissionBrain.cousinSessions.front();
+            auto closeAck = ack;
+            closeAck.sessionUUID = terminalRecord.record.sessionUUID;
+            closeAck.leaseGeneration = terminalRecord.leaseGeneration;
+            closeAck.kind = ProdigyCousinSessionLocalKind::revoke;
+            selfMachine.neuron.wBuffer.clear();
+            permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, closeAck);
+            suite.expect(permissionBrain.cousinSessions.front().expiresAtMs == 0 &&
+                             !selfMachine.neuron.wBuffer.empty(),
+                         "cousin_session_native_close_emits_initial_revocation");
+            selfMachine.neuron.wBuffer.clear();
+            permissionBrain.receiveCousinSessionLocalAck(&selfMachine.neuron, sourceApp.uuid, closeAck);
+            auto terminalReceipt = readyReceipt;
+            terminalReceipt.control.session = terminalRecord.record;
+            terminalReceipt.control.leaseGeneration = terminalRecord.leaseGeneration;
+            terminalReceipt.control.kind = ProdigyCousinSessionControlKind::revoke;
+            permissionBrain.receiveCousinSessionControlReceipt(&selfMachine.neuron, terminalReceipt);
+            ++terminalReceipt.sequence;
+            terminalReceipt.control.kind = ProdigyCousinSessionControlKind::ready;
+            permissionBrain.receiveCousinSessionControlReceipt(&selfMachine.neuron, terminalReceipt);
+            suite.expect(permissionBrain.cousinSessions.front().expiresAtMs == 0 &&
+                             selfMachine.neuron.wBuffer.empty(),
+                         "cousin_session_terminal_ack_and_peer_receipts_do_not_repeat_revocation");
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty() && selfMachine.neuron.wBuffer.empty(),
+                         "cousin_session_terminal_driver_erases_without_repeating_revocation");
+            const uint32_t savedShardGroups = live.nShardGroups;
+            suite.require(beginCurrentLifecycleSession(0x9c50),
+                          "cousin_session_lifecycle_creates_source_owner_before_topology_change");
+            ++live.nShardGroups;
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_source_owner_after_shard_topology_change");
+            live.nShardGroups = savedShardGroups;
+
+            suite.require(beginCurrentLifecycleSession(0x9c51),
+                          "cousin_session_lifecycle_creates_source_owner_before_app_restart");
+            sourceApp.runtimeReady = false;
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_source_owner_after_app_incarnation_loss");
+            sourceApp.runtimeReady = true;
+
+            suite.require(beginCurrentLifecycleSession(0x9c52),
+                          "cousin_session_lifecycle_creates_source_owner_before_neuron_restart");
+            ++selfMachine.neuron.ioGeneration;
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_source_owner_after_neuron_incarnation_change");
+            --selfMachine.neuron.ioGeneration;
+
+            suite.require(beginCurrentLifecycleSession(0x9c53),
+                          "cousin_session_lifecycle_creates_source_owner_before_container_removal");
+            permissionBrain.containers.erase(sourceApp.uuid);
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_source_owner_after_container_removal");
+            permissionBrain.containers.insert_or_assign(sourceApp.uuid, &sourceApp);
+
+            suite.require(beginCurrentLifecycleSession(0x9c54),
+                          "cousin_session_lifecycle_creates_source_owner_before_successor_plan_change");
+            const uint64_t savedVersionID = live.plan.config.versionID;
+            ++live.plan.config.versionID;
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_owner_after_successor_plan_identity_change");
+            live.plan.config.versionID = savedVersionID;
+
+            suite.require(beginCurrentLifecycleSession(0x9c55),
+                          "cousin_session_lifecycle_creates_source_owner_before_successor_deployment_change");
+            const uint64_t currentDeploymentID = live.plan.config.deploymentID();
+            const uint64_t successorDeploymentID = currentDeploymentID + 1;
+            permissionBrain.deployments.erase(currentDeploymentID);
+            permissionBrain.deployments.insert_or_assign(successorDeploymentID, &live);
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_lifecycle_revokes_owner_after_successor_deployment_identity_change");
+            permissionBrain.deployments.erase(successorDeploymentID);
+            permissionBrain.deployments.insert_or_assign(currentDeploymentID, &live);
+
+            suite.require(beginCurrentLifecycleSession(0x9c56),
+                          "cousin_session_lifecycle_creates_source_owner_before_destination_replacement");
+            const auto savedDiscoveryReceipts = permissionBrain.cousinDiscoveryReceipts;
+            auto replacementReceipt = cacheReceipt;
+            replacementReceipt.sequence = cacheReceipt.sequence + 1;
+            replacementReceipt.snapshot.records.front().containerUUID++;
+            replacementReceipt.snapshot.records.front().containerID++;
+            replacementReceipt.snapshot.records.front().shardGroups = 2;
+            replacementReceipt.snapshot.records.front().shardGroup =
+                statefulServiceGroupOwnerForSlot(3, replacementReceipt.snapshot.records.front().shardGroups);
+            replacementReceipt.snapshot.records.front().service = MeshServices::constrainPrefixToGroup(
+                replacementReceipt.snapshot.records.front().permission.localCousinServicePrefix,
+                replacementReceipt.snapshot.records.front().shardGroup);
+            permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, replacementReceipt);
+            auto staleReplacementReplay = cacheReceipt;
+            permissionBrain.receiveCousinDiscoverySnapshot(&selfMachine.neuron, staleReplacementReplay);
+            const auto replacedCounterparts = permissionBrain.queryCousinCounterparts({1, permission.permissionUUID, 3});
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty() && replacedCounterparts.records.size() == 1 &&
+                             replacedCounterparts.records.front().containerUUID == replacementReceipt.snapshot.records.front().containerUUID,
+                         "cousin_session_lifecycle_rejects_stale_destination_replay_after_current_replacement");
+            permissionBrain.cousinDiscoveryReceipts = savedDiscoveryReceipts;
           }
         }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
@@ -32409,12 +33014,12 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                        !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongEpochRoute, 3, 150) &&
                        !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, wrongRoleRoute, 3, 150),
                    "local_cousin_permission_owner_rejects_foreign_role_identity_slot_bitmap_root_and_epoch");
-      const uint32_t savedLiveMemoryMB = live.plan.config.memoryMB;
-      ++live.plan.config.memoryMB;
+      const auto savedLiveThreshold = live.plan.verticalScalers.front().threshold;
+      ++live.plan.verticalScalers.front().threshold;
       suite.expect(permissionBrain.localCousinServicePermissionAuthorityAcknowledged() &&
                        !permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, 3, 150),
                    "local_cousin_permission_owner_rejects_live_plan_hash_mismatch_without_losing_authority_quorum");
-      live.plan.config.memoryMB = savedLiveMemoryMB;
+      live.plan.verticalScalers.front().threshold = savedLiveThreshold;
       permissionBrain.masterAuthorityReplicationByPeer.clear();
       suite.expect(!permissionBrain.localCousinServicePermissionAllowsRoute(permission.permissionUUID, route, 3, 150),
                    "local_cousin_permission_owner_requires_current_exact_majority_for_eligibility");
@@ -32424,15 +33029,18 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       ProdigyMasterAuthorityStateTransition permissionTransition = {};
       suite.require(permissionBrain.serializeCurrentMasterAuthorityTransition(permissionTransitionBytes, permissionTransitionDigest) &&
                         BitseryEngine::deserializeSafe(permissionTransitionBytes, permissionTransition),
-                    "local_cousin_permission_owner_serializes_runtime_v15_transition7");
-      suite.expect(permissionTransition.version == 7 &&
+                    "local_cousin_permission_owner_serializes_runtime_v15_transition8");
+      suite.expect(permissionTransition.version == 8 &&
                        permissionTransition.runtimeState.localCousinServicePermissions.size() == 1,
-                   "local_cousin_permission_owner_transition7_carries_permission_tail");
+                   "local_cousin_permission_owner_transition8_carries_permission_tail");
       auto relabeledTransition = permissionTransition;
       relabeledTransition.version = 6;
       String relabeledTransitionBytes = {};
       suite.expect(BitseryEngine::serialize(relabeledTransitionBytes, relabeledTransition) == 0 && relabeledTransitionBytes.empty(),
                    "local_cousin_permission_owner_rejects_permission_tail_in_transition6_envelope");
+      relabeledTransition.version = 7;
+      suite.expect(BitseryEngine::serialize(relabeledTransitionBytes, relabeledTransition) == 0 && relabeledTransitionBytes.empty(),
+                   "local_cousin_permission_owner_rejects_baseline_tail_in_transition7_envelope");
       TransportCredentialCohortTestBrain permissionReplica = {};
       configureAuthority(permissionReplica, pairBrain.masterAuthorityRuntimeState.generation, permissionBrain.masterAuthorityEpoch);
       permissionReplica.masterAuthorityRuntimeState = pairBrain.masterAuthorityRuntimeState;
@@ -33657,7 +34265,28 @@ int main(void)
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
-      only != nullptr && strcmp(only, "neuron-state-upload-pending-successor") == 0)
+      only != nullptr && strcmp(only, "deferred-stateful-recovery") == 0)
+  {
+    testDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "neuron-state-upload-missing-inventory-mesh") == 0)
+  {
+    testBrainNeuronStateUploadMissingInventoryWithdrawsMeshBeforeCapacityRecovery(suite);
+    if (createdRing)
+    {
+      Ring::shutdownForExec();
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && (strcmp(only, "neuron-state-upload-missing-inventory-replacement") == 0 ||
+                          strcmp(only, "neuron-state-upload-pending-successor") == 0))
   {
     testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
     if (createdRing)
@@ -33958,6 +34587,8 @@ int main(void)
   testContainerLaunchWaitsForDurableRuntimeInventory(suite);
   testBrainNeuronHandlerHealthyReplacementPointerClearsEquivalentWaiter(suite);
   testBrainNeuronStateUploadRemovesStaleCanonicalMachineContainer(suite);
+  testBrainNeuronStateUploadMissingInventoryWithdrawsMeshBeforeCapacityRecovery(suite);
+  testDeferredStatefulFailedMachineRecoveryKeepsExistingOwner(suite);
   testBrainNeuronStateUploadHealthyContainerClearsWaiters(suite);
   testCanaryRollbackPersistsTerminalApplicationReport(suite);
   testDeployingContainerFailureFailsDeployment(suite);

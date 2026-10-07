@@ -5,6 +5,8 @@
 #include <prodigy/transport.tls.h>
 #include <networking/ring.h>
 #include <memory>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <vector>
 
 // Native application credential owner. The NeuronHub callback applies commands
@@ -51,6 +53,19 @@ public:
   { return authorized() ? ProdigyTransportTLSStream::queuedSendOutstandingBytes() : 0; }
   uint128_t sessionUUID() const
   { auto current = lease.lock(); return current ? current->command.session.sessionUUID : 0; }
+  // Ring owns a fixed descriptor. An application-owned outbound stream may
+  // abort its ordinary descriptor when its fixed source tuple must be reused.
+  bool abortOwnedSocket()
+  {
+    if (isFixedFile || fd < 0) return false;
+    const int ownedFD = fd;
+    fd = -1;
+    struct linger terminal = {};
+    terminal.l_onoff = 1;
+    const bool configured = ::setsockopt(ownedFD, SOL_SOCKET, SO_LINGER, &terminal, sizeof(terminal)) == 0;
+    const bool closed = ::close(ownedFD) == 0;
+    return configured && closed;
+  }
 };
 
 class ProdigyCousinSessionClient {

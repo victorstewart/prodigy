@@ -163,6 +163,9 @@ cleanup() {
     wait "$PAIR_PARTITION_PID" || status=1
     PAIR_PARTITION_PID=0
   fi
+  if [[ -f "$ROOT/cousin-offline-start-monotonic-ms" ]]; then
+    python3 "$TEST_DIR/prodigy_dev_cousin_session_observe.py" "$ROOT" snapshot || status=1
+  fi
   copy_cluster_logs first "$FIRST_MANIFEST" || status=1
   copy_cluster_logs second "$SECOND_MANIFEST" || status=1
   local boundary_file
@@ -201,7 +204,8 @@ request() {
   # peer is confined to each fake machine's loopback; this scenario qualifies
   # the provider's explicit service transit, not upstream BGP convergence.
   jq -nc --arg name "$name" --arg workspace "$workspace" --arg probe "${PRODIGY_DEV_COUSIN_PROBE_BIN:-}" \
-    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:180,machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
+    --arg lifecycle "${PRODIGY_DEV_COUSIN_LIFECYCLE:-}" \
+    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:(if $lifecycle == "" then 180 else 2 end),machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
      (if $probe != "" then {bgp:{enabled:true,nextHop6:"::1",peers:[{peerASN:64512,peerAddress:"127.0.0.2",sourceAddress:"127.0.0.1"}]}} else {} end)'
 }
 

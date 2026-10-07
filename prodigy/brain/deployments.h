@@ -3025,6 +3025,7 @@ private:
           }
         case ContainerState::scheduled:
         case ContainerState::healthy:
+        case ContainerState::crashedRestarting:
           {
             uint32_t topologyEpoch = container->explicitStatefulTopology.topologyEpoch;
             ApplicationConfig schedulingConfig = resourceConfigForContainer(container);
@@ -3069,7 +3070,22 @@ private:
     bytell_hash_map<Machine *, MachineResourcesDelta> deltasByMachine;
     bool scheduleSurgeOnReserved = false; // obviously false for stateful
     bool allowCompaction = true;
-    bool allowNewMachines = true;
+    const auto canRecoverOnOriginalHost = [&](ContainerView *container) {
+      return container != nullptr && containers.contains(container) && container->isStateful &&
+          container->lifetime == ApplicationLifetime::base && container->machine != nullptr &&
+          thisBrain->machines.contains(container->machine) &&
+          container->machine->state != MachineState::hardwareFailure &&
+          container->machine->state != MachineState::decommissioning &&
+          (container->state == ContainerState::healthy || container->state == ContainerState::scheduled ||
+           container->state == ContainerState::crashedRestarting);
+    };
+    // A confirmed-dead replica on a registered, nonterminal host can recover
+    // through the ordinary scheduled/bootstrap owner. Try ready capacity first,
+    // but do not suspend its only owner on a new-machine ticket while its own
+    // host is recovering. Terminal host failures retain normal provisioning.
+    const bool recoverOnOriginalHosts = containersAreDead && !containersToRedeploy.empty() &&
+        std::all_of(containersToRedeploy.begin(), containersToRedeploy.end(), canRecoverOnOriginalHost);
+    bool allowNewMachines = !recoverOnOriginalHosts;
 
     auto machines = gatherMachinesForScheduling(coro, scheduleSurgeOnReserved, deltasByMachine, allowCompaction, allowNewMachines, [=, this](MachineTicket *ticket) -> void {
       if (containersToRedeploy.size() > 0)
@@ -3258,6 +3274,34 @@ private:
             }
           }
         }
+      }
+    }
+
+    // No ready capacity accepted these replicas. Their exact old reservations
+    // fund seeding replacements on the original hosts; they stay unready until
+    // Neuron acknowledges the new processes, regardless of ingress scope.
+    if (recoverOnOriginalHosts)
+    {
+      for (auto it = containersToRedeploy.begin(); it != containersToRedeploy.end();)
+      {
+        ContainerView *container = *it;
+        if (!canRecoverOnOriginalHost(container))
+        {
+          ++it;
+          continue;
+        }
+        Machine *machine = container->machine;
+        ApplicationConfig config = resourceConfigForContainer(container);
+        ++nDeployedBase;
+        ++countPerMachine[machine];
+        ++countPerRack[machine->rack];
+        racksByShardGroup[container->shardGroup].insert(machine->rack);
+        // The old scalar debit is credited by destructContainer below. GPUs
+        // must be available for the successor's reservation on this same host.
+        prodigyDebitMachineScalarResources(machine, config, 1);
+        prodigyReleaseContainerGPUs(container);
+        rescheduleContainerOntoMachine(machine, container, nullptr);
+        it = containersToRedeploy.erase(it);
       }
     }
   }
@@ -6153,6 +6197,7 @@ private:
                 recomputeStatefulBaseTargetFromShardGroups();
 
                 spinStateful(nullptr, shardGroups);
+                if (!toSchedule.empty()) schedule(nullptr);
               }
             }
           }
@@ -8266,7 +8311,8 @@ public:
 
   // it will first check which deployments were running on that machine
   // there must be some that were not marked for destruction, otherwise this function would've never been called
-  void drainMachine(Machine *machine, bool failed, bool scheduledHealthyWaitersOnly = false)
+  void drainMachine(Machine *machine, bool failed, bool scheduledHealthyWaitersOnly = false,
+                    const bytell_hash_set<uint128_t> *missingContainerUUIDs = nullptr)
   {
     Vector<ContainerView *> containersToRedeploy;
     Vector<ContainerView *> skippedScheduledContainers;
@@ -8303,6 +8349,14 @@ public:
     for (auto it = bin.begin(); it != bin.end();)
     {
       ContainerView *container = *it;
+      // An authenticated inventory can prove only a subset absent. Reuse the
+      // failed-machine lifecycle without draining its reported live owners.
+      if (missingContainerUUIDs != nullptr &&
+          (container == nullptr || !missingContainerUUIDs->contains(container->uuid)))
+      {
+        ++it;
+        continue;
+      }
       if (scheduledHealthyWaitersOnly)
       {
         if (container == nullptr)
@@ -8338,6 +8392,8 @@ public:
       {
         continue;
       }
+
+      if (failed) container->runtimeReady = false;
 
       switch (container->state)
       {

@@ -43,6 +43,9 @@ __attribute__((__always_inline__)) static inline bool switchboardPairAdmissionGr
   {
     return false;
   }
+  // A grant is immutable after BPF_NOEXIST installation so consuming its
+  // single SYN capacity cannot race a control-plane renewal.  The exact,
+  // identity-bound route policy is its renewable lease authority.
   struct switchboard_pair_admission_route_key route = {grant->pair_uuid_hi, grant->pair_uuid_lo, grant->route_uuid_hi, grant->route_uuid_lo};
   struct switchboard_pair_admission_route_policy *policy = bpf_map_lookup_elem(&wh_pair_routes, &route);
   if (policy == NULL || policy->expires_at_ns <= now ||
@@ -163,11 +166,29 @@ __attribute__((__always_inline__)) static inline bool switchboardShortenWormhole
   return observed == current || observed <= expiresAtNs;
 }
 
+// Retire stale admission owners logically, leaving physical reclamation to
+// the existing single sweeper and BPF execution grace. A lost FIN/RST must not
+// reserve a fixed tuple for the ordinary five-day TCP idle lifetime.
+__attribute__((__always_inline__)) static inline bool switchboardRetainCurrentPairAdmissionFlow(
+    struct switchboard_wormhole_flow *state, __u64 now)
+{
+  if (switchboardPairAdmissionFlowCurrent(state, now))
+  {
+    return true;
+  }
+  (void)switchboardShortenWormholeFlow(state, now);
+  return false;
+}
+
 __attribute__((__always_inline__)) static inline bool switchboardRefreshEstablishedWormholeState(struct switchboard_wormhole_flow *state,
                                                                                                   __u64 now,
                                                                                                   __u8 proto,
                                                                                                   bool closing)
 {
+  if (switchboardRetainCurrentPairAdmissionFlow(state, now) == false)
+  {
+    return false;
+  }
   __u64 transition = switchboardWormholeFlowAtomicTransition(state);
   __u32 phase = switchboardWormholeFlowTransitionPhase(transition);
   if (phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING)
@@ -177,7 +198,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRefreshEstablis
       return false;
     }
     (void)switchboardShortenWormholeFlow(state, now + WORMHOLE_FLOW_CLOSE_NS);
-    return true;
+    return switchboardRetainCurrentPairAdmissionFlow(state, bpf_ktime_get_ns());
   }
   if (phase != SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED)
   {
@@ -193,7 +214,7 @@ __attribute__((__always_inline__)) static inline bool switchboardRefreshEstablis
       return false;
     }
     (void)switchboardShortenWormholeFlow(state, now + WORMHOLE_FLOW_CLOSE_NS);
-    return true;
+    return switchboardRetainCurrentPairAdmissionFlow(state, bpf_ktime_get_ns());
   }
 
   (void)switchboardExtendWormholeFlow(state, now + switchboardWormholeFlowLifetimeNs(proto, false));
@@ -202,9 +223,11 @@ __attribute__((__always_inline__)) static inline bool switchboardRefreshEstablis
   if (phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED_CLOSING)
   {
     (void)switchboardShortenWormholeFlow(state, now + WORMHOLE_FLOW_CLOSE_NS);
-    return proto == IPPROTO_TCP;
+    return proto == IPPROTO_TCP && switchboardRetainCurrentPairAdmissionFlow(state, bpf_ktime_get_ns());
   }
-  return phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED;
+  // A concurrent revoke can race the extension after our first check.
+  return phase == SWITCHBOARD_WORMHOLE_FLOW_ESTABLISHED &&
+         switchboardRetainCurrentPairAdmissionFlow(state, bpf_ktime_get_ns());
 }
 
 enum {
@@ -229,7 +252,6 @@ __attribute__((__always_inline__)) static inline int switchboardRefreshEstablish
 
   __u64 now = bpf_ktime_get_ns();
   bool matches = switchboardWormholeFlowAtomicExpiry(state) > now &&
-                 switchboardPairAdmissionFlowCurrent(state, now) &&
                  switchboardWormholeFlowMatches(state, binding, container, disposition) &&
                  switchboardRefreshEstablishedWormholeState(state, now, proto, closing);
   return matches ? SWITCHBOARD_WORMHOLE_OWNER_MATCH : SWITCHBOARD_WORMHOLE_OWNER_CONFLICT;
@@ -495,8 +517,7 @@ __attribute__((__always_inline__)) static inline bool switchboardSelectPairAdmis
   __u64 consumption = __sync_val_compare_and_swap(&grant->consumption, 0, 0);
   __u32 consumeState = switchboardPairAdmissionConsumptionState(consumption);
   if ((consumeState == SWITCHBOARD_PAIR_ADMISSION_CONSUMED && grant->consumed_expires_at_ns <= now) ||
-      (consumeState != SWITCHBOARD_PAIR_ADMISSION_CONSUMED &&
-       (grant->expires_at_ns <= now || consumeState != SWITCHBOARD_PAIR_ADMISSION_PENDING)) ||
+      (consumeState != SWITCHBOARD_PAIR_ADMISSION_CONSUMED && consumeState != SWITCHBOARD_PAIR_ADMISSION_PENDING) ||
       switchboardPairAdmissionGrantCurrent(grant, now, consumeState == SWITCHBOARD_PAIR_ADMISSION_CONSUMED) == false)
   {
     return false;
@@ -550,7 +571,7 @@ __attribute__((__always_inline__)) static inline bool switchboardAuthorizePairAd
   identity->root_generation = grant->root_generation;
   identity->key_epoch = grant->key_epoch;
   struct switchboard_pair_admission_route_policy *policy = bpf_map_lookup_elem(&wh_pair_routes, &identity->route);
-  if (grant->expires_at_ns <= now || policy == NULL || policy->expires_at_ns <= now ||
+  if (policy == NULL || policy->expires_at_ns <= now ||
       policy->state != SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE ||
       policy->route_generation != identity->route_generation || policy->root_generation != identity->root_generation ||
       policy->key_epoch != identity->key_epoch)
@@ -928,6 +949,7 @@ __attribute__((__always_inline__)) static inline int switchboardResolveWormholeR
   __u64 transition = switchboardWormholeFlowAtomicTransition(pending);
   __u32 phase = switchboardWormholeFlowTransitionPhase(transition);
   bool valid = configured != NULL && switchboardWormholeFlowAtomicExpiry(pending) > now &&
+               switchboardRetainCurrentPairAdmissionFlow(pending, now) &&
                (phase == SWITCHBOARD_WORMHOLE_FLOW_PENDING || phase == SWITCHBOARD_WORMHOLE_FLOW_REVERSE_SEEN) &&
                (pending->disposition == SWITCHBOARD_WORMHOLE_FLOW_PRIVATE ||
                 pending->disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC) &&
@@ -955,6 +977,7 @@ __attribute__((__always_inline__)) static inline int switchboardResolveWormholeR
     {
       (void)switchboardExtendWormholeFlow(pending, now + WORMHOLE_FLOW_CLOSE_NS);
     }
+    valid = valid && switchboardRetainCurrentPairAdmissionFlow(pending, bpf_ktime_get_ns());
     if (valid && disposition == SWITCHBOARD_WORMHOLE_FLOW_PUBLIC)
     {
       *binding = pending->binding;

@@ -2149,7 +2149,18 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
                   updateProgramMapElement(host, "wh_pair_grants"_ctv, protectedGrantKey, protectedGrant),
               "installs_exact_protected_pair_grant");
-  expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT, "protected_ipv6_exact_syn_is_admitted");
+  protectedGrant.state = 0;
+  expectNamed(updateProgramMapElement(host, "wh_pair_grants"_ctv, protectedGrantKey, protectedGrant) &&
+                  runHost(publicTCPOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_malformed_grant_state_drops_before_flow_learning");
+  // A fleet ingress replica can retain this still-pending immutable grant
+  // while a different target replica consumes its copy.  Renewal advances
+  // the matching route policy, never the grant's consumption word.
+  protectedGrant.state = SWITCHBOARD_PAIR_ADMISSION_PENDING;
+  protectedGrant.expires_at_ns = 1;
+  expectNamed(updateProgramMapElement(host, "wh_pair_grants"_ctv, protectedGrantKey, protectedGrant) &&
+                  runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT,
+              "protected_ipv6_renewed_route_keeps_pending_grant_admissible");
   expectNamed(runHost(publicTCPOverlay, hostOutput) == TC_ACT_REDIRECT, "protected_ipv6_same_syn_retransmit_is_admitted");
   std::vector<uint8_t> differentSynInner = publicTCPInner;
   struct tcphdr *differentSyn = reinterpret_cast<struct tcphdr *>(differentSynInner.data() + sizeof(struct ethhdr) + sizeof(struct ipv6hdr));
@@ -2218,6 +2229,21 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
                   runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
               "protected_ipv6_revoked_route_drops_pending_ack");
   protectedRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  protectedRoute.root_generation = 80;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_mismatched_root_route_drops_pending_ack");
+  protectedRoute.root_generation = 8;
+  protectedRoute.key_epoch = 90;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_mismatched_key_epoch_route_drops_pending_ack");
+  protectedRoute.key_epoch = 9;
+  protectedRoute.route_generation = 70;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_SHOT,
+              "protected_ipv6_mismatched_route_generation_drops_pending_ack");
+  protectedRoute.route_generation = 7;
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
                   runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_REDIRECT &&
                   runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
@@ -2231,6 +2257,59 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, protectedRouteKey, protectedRoute) &&
                   runHost(publicTCPOverlay, hostOutput) == TC_ACT_SHOT,
               "protected_ipv6_revoked_route_drops_cached_owner");
+  // A partition can lose the old socket's FIN/RST. An invalid admission
+  // must retire its cached five-day TCP owner before a new session can reuse
+  // the exact Whitehole tuple; packets still cannot replace owners directly.
+  switchboard_wormhole_flow revokedOwner = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, revokedOwner) &&
+                  revokedOwner.expiresAtNs < protectedEstablishedTCP.expiresAtNs,
+              "protected_revoked_ingress_retires_cached_owner");
+  // Restore the pre-revocation snapshot so egress must independently validate
+  // its admission instead of merely observing ingress's expired marker.
+  expectNamed(updateProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, protectedEstablishedTCP),
+              "seeds_live_cached_owner_for_independent_revoked_reply");
+  expectNamed(runNetkit(egress, tcpReply, 0, packetOutput) == NETKIT_DROP &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, revokedOwner) &&
+                  revokedOwner.expiresAtNs < protectedEstablishedTCP.expiresAtNs,
+              "protected_revoked_reply_drops_and_retires_cached_owner");
+  SwitchboardWormholeFlowGCCursor revokedFlowCursor = {};
+  uint32_t revokedFlowDeleted = 0;
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host, revokedOwner.expiresAtNs,
+                  revokedFlowCursor, &revokedFlowDeleted) && revokedFlowDeleted == 0 &&
+                  lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, revokedOwner),
+              "protected_retired_owner_retains_execution_grace");
+  revokedFlowCursor = {};
+  expectNamed(switchboardCleanupExpiredWormholeFlows(&host,
+                  revokedOwner.expiresAtNs + WORMHOLE_FLOW_RECLAIM_GRACE_NS + 1,
+                  revokedFlowCursor, &revokedFlowDeleted) && revokedFlowDeleted == 1 &&
+                  !lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, revokedOwner),
+              "protected_retired_owner_is_reclaimed_after_execution_grace");
+  switchboard_pair_admission_route_key replacementRouteKey = protectedRouteKey;
+  ++replacementRouteKey.route_uuid_lo;
+  switchboard_pair_admission_route_policy replacementRoute = protectedRoute;
+  replacementRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  switchboard_pair_admission_grant replacementGrant = protectedGrant;
+  replacementGrant.route_uuid_lo = replacementRouteKey.route_uuid_lo;
+  replacementGrant.consumption = 0;
+  replacementGrant.state = SWITCHBOARD_PAIR_ADMISSION_PENDING;
+  replacementGrant.consumed_expires_at_ns = 0;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, replacementRouteKey, replacementRoute) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, protectedGrantKey, replacementGrant) &&
+                  runHost(differentSynOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS &&
+                  runNetkit(egress, tcpReply, 0, packetOutput) == NETKIT_PASS &&
+                  runHost(protectedTCPAckOverlay, hostOutput) == TC_ACT_REDIRECT &&
+                  runNetkit(ingress, hostOutput, SWITCHBOARD_WORMHOLE_SKB_MARK, packetOutput) == NETKIT_PASS,
+              "protected_new_session_reclaims_exact_tuple_after_old_route_retirement");
+  switchboard_wormhole_flow protectedReplacementOwner = {};
+  expectNamed(lookupProgramMapElement(host, "wh_flows"_ctv, tcpOwnerKey, protectedReplacementOwner) &&
+                  protectedReplacementOwner.admission.route.route_uuid_lo == replacementRouteKey.route_uuid_lo &&
+                  runNetkit(egress, tcpReply, 0, packetOutput) == NETKIT_PASS,
+              "protected_replacement_owner_carries_new_session_and_reply");
+  // Retiring a stale route must not shorten an idle owner whose exact lease
+  // remains renewable; ordinary five-day TCP lifetime still applies to it.
+  expectNamed(protectedReplacementOwner.expiresAtNs >= protectedEstablishedTCP.expiresAtNs,
+              "protected_live_route_retains_normal_tcp_idle_lifetime");
   tcpBinding.admission_profile = SWITCHBOARD_WORMHOLE_ADMISSION_NONE;
   expectNamed(updateProgramMapElement(host, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
                   updateProgramMapElement(ingress, "wh_egress"_ctv, protectedExposure, tcpBinding) &&
@@ -2759,20 +2838,40 @@ static void exerciseWormholeSharedFlowOwnership(TestSuite& suite)
   admissionGrant.expires_at_ns = 1;
   admissionGrant.state = SWITCHBOARD_PAIR_ADMISSION_CONSUMED;
   admissionGrant.consumed_expires_at_ns = 50;
+  switchboard_pair_admission_grant_key renewedPendingKey = admissionKey;
+  renewedPendingKey.flow.port16[0] = htons(49'157);
+  switchboard_pair_admission_grant renewedPendingGrant = admissionGrant;
+  renewedPendingGrant.state = SWITCHBOARD_PAIR_ADMISSION_PENDING;
+  renewedPendingGrant.consumed_expires_at_ns = 0;
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
-                  updateProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant),
-              "seeds_consumed_pair_admission_for_gc");
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, renewedPendingKey, renewedPendingGrant),
+              "seeds_consumed_and_renewed_pending_pair_admissions_for_gc");
   SwitchboardPairAdmissionGCCursor admissionCursor = {};
   uint32_t admissionDeleted = 0;
   expectNamed(switchboardCleanupExpiredPairAdmissionMaps(&host, 2, admissionCursor, &admissionDeleted) && admissionDeleted == 0 &&
-                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant),
-              "gc_retains_consumed_grant_before_policy_and_session_expiry");
-  admissionRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, renewedPendingKey, renewedPendingGrant),
+              "gc_retains_consumed_and_route_renewed_pending_grants_before_policy_expiry");
+  admissionRoute.expires_at_ns = 2;
   expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
                   switchboardCleanupExpiredPairAdmissionMaps(&host, 3, admissionCursor, &admissionDeleted) &&
-                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) == false,
-              "gc_reclaims_consumed_grant_after_route_revocation");
-
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) == false &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, renewedPendingKey, renewedPendingGrant) == false,
+              "gc_reclaims_consumed_and_pending_grants_after_renewed_route_expiry");
+  admissionRoute.expires_at_ns = 100;
+  admissionRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE;
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) &&
+                  updateProgramMapElement(host, "wh_pair_grants"_ctv, renewedPendingKey, renewedPendingGrant),
+              "reseeds_pair_admissions_for_revoked_route_gc");
+  admissionRoute.state = SWITCHBOARD_PAIR_ADMISSION_ROUTE_REVOKED;
+  SwitchboardPairAdmissionGCCursor revokedAdmissionCursor = {};
+  expectNamed(updateProgramMapElement(host, "wh_pair_routes"_ctv, admissionRouteKey, admissionRoute) &&
+                  switchboardCleanupExpiredPairAdmissionMaps(&host, 4, revokedAdmissionCursor, &admissionDeleted) &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, admissionKey, admissionGrant) == false &&
+                  lookupProgramMapElement(host, "wh_pair_grants"_ctv, renewedPendingKey, renewedPendingGrant) == false,
+              "gc_reclaims_consumed_and_pending_grants_after_route_revocation");
   clearWormholeFlows();
   (void)unlink(establishedPinPath.c_str());
   (void)unlink(pendingPinPath.c_str());

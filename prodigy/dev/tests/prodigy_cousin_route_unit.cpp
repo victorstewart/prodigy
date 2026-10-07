@@ -250,6 +250,43 @@ int main(void)
   ProdigyLocalCousinServicePermission permission = validLocalCousinPermission();
   suite.require(prodigyLocalCousinServicePermissionValid(permission),
                 "local_cousin_permission_accepts_asymmetric_application_mapping");
+  auto requestedPermission = validLocalCousinPermission(false);
+  auto acceptedV2Permission = requestedPermission;
+  acceptedV2Permission.protocolVersion = 2;
+  acceptedV2Permission.baselineLogicalCores = 1;
+  acceptedV2Permission.baselineMemoryMB = 64;
+  acceptedV2Permission.baselineStorageMB = 64;
+  acceptedV2Permission.acceptedAuthorityGeneration = 8;
+  suite.require(prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, acceptedV2Permission),
+                "local_cousin_permission_receipt_accepts_only_server_v1_to_v2_baseline_enrichment");
+  auto exactV1Permission = requestedPermission;
+  exactV1Permission.acceptedAuthorityGeneration = 8;
+  suite.require(prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, exactV1Permission),
+                "local_cousin_permission_receipt_accepts_exact_legacy_v1_record");
+  auto requestedV2Revoke = acceptedV2Permission;
+  requestedV2Revoke.acceptedAuthorityGeneration = 0;
+  requestedV2Revoke.state = ProdigyLocalCousinServicePermissionState::revoked;
+  requestedV2Revoke.generation = 2;
+  auto acceptedV2Revoke = requestedV2Revoke;
+  acceptedV2Revoke.acceptedAuthorityGeneration = 9;
+  suite.require(prodigyLocalCousinServicePermissionRequestAccepted(requestedV2Revoke, acceptedV2Revoke),
+                "local_cousin_permission_receipt_requires_exact_v2_revoke_baseline");
+  auto requestedV2Permission = acceptedV2Permission;
+  requestedV2Permission.acceptedAuthorityGeneration = 0;
+  auto alteredReceipt = acceptedV2Permission; ++alteredReceipt.baselineMemoryMB;
+  suite.require(!prodigyLocalCousinServicePermissionRequestAccepted(requestedV2Permission, alteredReceipt),
+                "local_cousin_permission_receipt_rejects_altered_v2_baseline");
+  alteredReceipt = acceptedV2Permission; ++alteredReceipt.logicalServiceUUID;
+  suite.require(!prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, alteredReceipt),
+                "local_cousin_permission_receipt_rejects_identity_change");
+  alteredReceipt = acceptedV2Permission; alteredReceipt.state = ProdigyLocalCousinServicePermissionState::revoked; alteredReceipt.generation = 2;
+  suite.require(!prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, alteredReceipt),
+                "local_cousin_permission_receipt_rejects_state_generation_change");
+  auto malformedV1Request = requestedPermission; malformedV1Request.baselineMemoryMB = 64;
+  auto invalidV2Receipt = acceptedV2Permission; invalidV2Receipt.baselineLogicalCores = 0;
+  suite.require(!prodigyLocalCousinServicePermissionRequestAccepted(malformedV1Request, acceptedV2Permission) &&
+                    !prodigyLocalCousinServicePermissionRequestAccepted(requestedPermission, invalidV2Receipt),
+                "local_cousin_permission_receipt_rejects_malformed_v1_or_invalid_v2_record");
   ProdigyCousinDiscoverySnapshot discovery = validCousinDiscoverySnapshot();
   suite.require(prodigyCousinDiscoverySnapshotValid(discovery),
                 "cousin_discovery_accepts_exact_destination_counterpart_slots");
@@ -716,6 +753,31 @@ int main(void)
                 "pair_control_boundary_endpoint_csv_rejects_duplicate_address");
   suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, "mismatched receipt"_ctv),
                 "pair_control_boundary_rejects_mismatched_prepared_receipt");
+  MothershipPairControlFault fault = {};
+  fault.delayMilliseconds = 125;
+  fault.durationMilliseconds = 1000;
+  Vector<String> faultArguments = {};
+  suite.require(mothershipPairControlFaultValid(fault) &&
+                mothershipPairControlFaultArguments(controlBoundary, fault, faultArguments, &failure) &&
+                faultArguments.size() == 16 && faultArguments[0] == "--pair-control-action"_ctv &&
+                faultArguments[1] == "fault"_ctv && faultArguments[2] == "0x0900"_ctv &&
+                faultArguments[11] == "fd42:4242:4242:1::4"_ctv &&
+                faultArguments[12] == "fd42:4242:4242:2::5"_ctv && faultArguments[13] == "315"_ctv &&
+                faultArguments[14] == "125"_ctv && faultArguments[15] == "1000"_ctv,
+                "pair_control_fault_encodes_only_the_admitted_boundary_and_bounded_window");
+  MothershipPairControlFault parsedFault = {};
+  suite.require(mothershipPairControlFaultParse("0"_ctv, "1"_ctv, parsedFault, &failure) &&
+                parsedFault.delayMilliseconds == 0 && parsedFault.durationMilliseconds == 1,
+                "pair_control_fault_accepts_zero_delay_and_positive_duration");
+  suite.require(!mothershipPairControlFaultParse("01"_ctv, "1"_ctv, parsedFault, &failure) &&
+                !mothershipPairControlFaultParse("1"_ctv, "0"_ctv, parsedFault, &failure) &&
+                !mothershipPairControlFaultParse("30001"_ctv, "1"_ctv, parsedFault, &failure) &&
+                !mothershipPairControlFaultParse("1"_ctv, "60001"_ctv, parsedFault, &failure),
+                "pair_control_fault_rejects_noncanonical_or_unbounded_windows");
+  MothershipPairControlBoundaryDescriptor faultChangedBoundary = controlBoundary;
+  faultChangedBoundary.firstRuntimeIdentity = controlBoundary.secondRuntimeIdentity;
+  suite.require(!mothershipPairControlFaultArguments(faultChangedBoundary, fault, faultArguments, &failure),
+                "pair_control_fault_rejects_non_distinct_boundary_identity");
   auto unresolvedTransit = serviceTransit; unresolvedTransit.sourceIngressPrivate6 = {};
   suite.require(!mothershipPairControlServiceTransitValid(unresolvedTransit, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
                 "pair_control_service_transit_rejects_unresolved_ingress_owner");

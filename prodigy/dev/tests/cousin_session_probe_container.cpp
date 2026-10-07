@@ -87,6 +87,9 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   int64_t nextRequestAtMs = 0;
   int64_t nextEchoAtMs = 0;
   int64_t outboundStartedAtMs = 0;
+  bool lifecycleProfile = false;
+  int64_t firstPayloadAtMs = 0;
+  int64_t nextScaleMetricAtMs = 0;
 
   void closeStream(std::unique_ptr<ProdigyCousinSessionStream>& stream)
   {
@@ -152,6 +155,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
       outboundCloseNotified = true;
       (void)hub->closeCousinSession(activeSessionUUID, outboundLeaseGeneration);
     }
+    if (outbound) (void)outbound->abortOwnedSocket();
     closeStream(outbound); activeSessionUUID = 0;
   }
 
@@ -159,7 +163,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   {
     const int64_t now = Time::msSinceBoot();
     if (!source || outbound || !sourceWhitehole || permissionUUID == 0 || now < nextRequestAtMs ||
-        requestAttempts >= maximumRequests || now - startedAtMs > maximumDurationMs) return;
+        requestAttempts >= maximumRequests || now - startedAtMs > (lifecycleProfile ? 360000 : maximumDurationMs)) return;
     ProdigyCousinSessionRequest request = {};
     request.requestUUID = ++nextRequestUUID;
     request.permissionUUID = permissionUUID;
@@ -181,12 +185,19 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
     if (!source || outbound || command.kind != ProdigyCousinSessionLocalKind::activate) return false;
     auto stream = std::make_unique<ProdigyCousinSessionStream>();
     stream->rBuffer.reserve(8192); stream->wBuffer.reserve(8192);
+    errno = 0;
     if (!sessions->prepareOutbound(command.session.sessionUUID, *stream)) {
+      std::printf("cousin_session_probe.transportFailure operation=prepareOutbound errno=%d monotonicMs=%lld\n",
+                  errno, (long long)Time::msSinceBoot());
       if (stream->fd >= 0) ::close(stream->fd);
       return false;
     }
     int result = ::connect(stream->fd, stream->daddr<sockaddr>(), stream->daddrLen);
-    if (result != 0 && errno != EINPROGRESS) { ::close(stream->fd); stream->fd = -1; return false; }
+    if (result != 0 && errno != EINPROGRESS) {
+      std::printf("cousin_session_probe.transportFailure operation=connect errno=%d monotonicMs=%lld\n",
+                  errno, (long long)Time::msSinceBoot());
+      ::close(stream->fd); stream->fd = -1; return false;
+    }
     outbound = std::move(stream); payloadQueued = false;
     activeRequestUUID = command.requestUUID; activeSessionUUID = command.session.sessionUUID;
     outboundLeaseGeneration = command.leaseGeneration;
@@ -196,11 +207,30 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
                (unsigned long long)(command.requestUUID >> 64), (unsigned long long)command.requestUUID,
                (unsigned long long)(command.session.sessionUUID >> 64), (unsigned long long)command.session.sessionUUID,
                (unsigned long long)command.leaseGeneration, (long long)nextEchoAtMs);
+    std::printf("cousin_session_probe.binding session=%016llx%016llx sourceGroups=%u destinationGroups=%u sourceGroup=%u destinationGroup=%u slot=%u destination=%016llx%016llx monotonicMs=%lld\n",
+               (unsigned long long)(command.session.sessionUUID >> 64), (unsigned long long)command.session.sessionUUID,
+               unsigned(command.session.sourceShardGroups), unsigned(command.session.destination.shardGroups),
+               unsigned(command.session.sourceShardGroup), unsigned(command.session.destination.shardGroup),
+               unsigned(command.session.slot),
+               (unsigned long long)(command.session.destination.containerUUID >> 64),
+               (unsigned long long)command.session.destination.containerUUID, (long long)nextEchoAtMs);
     return true;
   }
 
 public:
   void beginShutdown() override { failClosed("shutdown"); }
+
+  void resourceDelta(uint16_t cores, uint32_t memoryMB, uint32_t storageMB, bool downscale, uint32_t) override
+  {
+    // This fixed-buffer probe accepts the declared memory-only growth through
+    // the ordinary application ACK. Neuron owns the resource change itself.
+    const bool accepted = lifecycleProfile && !downscale && cores == 1 && memoryMB == 384 && storageMB == 64;
+    hub->acknowledgeResourceDelta(accepted);
+    std::printf("cousin_session_probe.resources uuid=%016llx%016llx cores=%u memoryMB=%u storageMB=%u downscale=%u accepted=%u monotonicMs=%lld\n",
+               (unsigned long long)(hub->parameters.uuid >> 64), (unsigned long long)hub->parameters.uuid,
+               unsigned(cores), unsigned(memoryMB), unsigned(storageMB), unsigned(downscale), unsigned(accepted),
+               (long long)Time::msSinceBoot());
+  }
 
   bool cousinSessionCommand(const ProdigyCousinSessionLocalCommand& command) override
   {
@@ -264,9 +294,18 @@ public:
     if (inbound && inbound->isTransportNegotiated() && inbound->rBuffer.size() == probePayload.size() &&
         std::memcmp(inbound->rBuffer.data(), probePayload.data(), probePayload.size()) == 0) {
       inbound->rBuffer.clear(); inbound->wBuffer.append(probePayload);
+      if (firstPayloadAtMs == 0) firstPayloadAtMs = now;
       std::printf("cousin_session_probe.echo peer=%016llx%016llx session=%016llx%016llx payload=exact\n",
                  (unsigned long long)(inbound->tlsPeerUUID >> 64), (unsigned long long)inbound->tlsPeerUUID,
                  (unsigned long long)(inbound->sessionUUID() >> 64), (unsigned long long)inbound->sessionUUID());
+    }
+    if (lifecycleProfile && !source && firstPayloadAtMs != 0 &&
+        now >= firstPayloadAtMs + 60000 && now >= nextScaleMetricAtMs) {
+      // An application metric exercises the installed ordinary local scaler,
+      // including while the external pair boundary is partitioned.
+      hub->publishStatistic(ProdigyMetrics::metricKeyForName("cousin.probe.scale"_ctv), uint64_t(1));
+      nextScaleMetricAtMs = now + 1000;
+      std::printf("cousin_session_probe.scaleMetric monotonicMs=%lld\n", (long long)now);
     }
     requestIfNeeded(); armTick();
   }
@@ -280,6 +319,8 @@ public:
       if (validSourceWhitehole(whitehole)) { sourceWhitehole = &whitehole; ++matches; }
     if (matches > 1) { failClosed("ambiguous_source_whiteholes"); std::exit(EXIT_FAILURE); }
     source = matches == 1;
+    const char *lifecycle = std::getenv("COUSIN_PROBE_LIFECYCLE");
+    lifecycleProfile = lifecycle && std::strcmp(lifecycle, "1") == 0;
     if (source && !readPermissionUUID(permissionUUID)) { failClosed("source_config"); std::exit(EXIT_FAILURE); }
     startedAtMs = Time::msSinceBoot();
     sessions = std::make_unique<ProdigyCousinSessionClient>(hub->parameters.uuid);
@@ -289,11 +330,20 @@ public:
                  (long long)Time::msSinceBoot());
       if (outbound && activeSessionUUID == sessionUUID) {
         if (!applyingRevocation) notifyOutboundFailure();
-        else { closeStream(outbound); activeSessionUUID = 0; }
+        else {
+          (void)outbound->abortOwnedSocket();
+          closeStream(outbound); activeSessionUUID = 0;
+        }
       }
       if (inbound && inboundSessionUUID == sessionUUID) closeStream(inbound);
     };
     hub->signalReady(); hub->signalRuntimeReady(); armTick();
+    std::printf("cousin_session_probe.ready uuid=%016llx%016llx deployment=%llu source=%u group=%u workers=%u cores=%u memoryMB=%u storageMB=%u monotonicMs=%lld\n",
+               (unsigned long long)(hub->parameters.uuid >> 64), (unsigned long long)hub->parameters.uuid,
+               (unsigned long long)hub->parameters.deploymentID, unsigned(source),
+               unsigned(hub->parameters.statefulTopology.shardGroup), unsigned(hub->parameters.statefulTopology.workerCount),
+               unsigned(hub->parameters.nLogicalCores), unsigned(hub->parameters.memoryMB), unsigned(hub->parameters.storageMB),
+               (long long)startedAtMs);
   }
 
   void start() { Ring::start(); }

@@ -12,6 +12,8 @@ PY_CLOCK
 
 prodigy_dev_qualify_cousin_session() {
   local probe=${PRODIGY_DEV_COUSIN_PROBE_BIN:?} side cluster app name
+  local lifecycle=${PRODIGY_DEV_COUSIN_LIFECYCLE:-}
+  case "$lifecycle" in ''|horizontal|vertical) ;; *) echo 'FAIL: unsupported COUSIN lifecycle profile' >&2; return 1 ;; esac
   [[ -x "$probe" ]] || return 1
   local source_name="CousinSource-${OPERATION#0x}" destination_name="CousinDestination-${OPERATION#0x}"
   local source_permission destination_permission source_cluster destination_cluster source_prefix destination_prefix
@@ -74,10 +76,11 @@ SURVIVE /root/cousin_session_probe
 SURVIVE /cousin-probe-config
 PLAN
   prodigy_dev_write_common_prodigy_assets "$artifact/Cousin.DiscombobuFile"
+  if [[ -n "$lifecycle" ]]; then echo 'ENV COUSIN_PROBE_LIFECYCLE=1' >>"$artifact/Cousin.DiscombobuFile"; fi
   echo 'EXECUTE ["/root/cousin_session_probe"]' >>"$artifact/Cousin.DiscombobuFile"
   prodigy_dev_run_discombobulator_build "$artifact" "$artifact/Cousin.DiscombobuFile" "$blob" \
     "bin=$(dirname "$probe")" "config=$artifact" "ebpf=$(dirname "$PRODIGY_BIN")" || return
-  python3 - "$ROOT" "$ARCH" "$source_app" "$destination_app" "$source_name" "$destination_name" "$destination_prefix_uuid" <<'PY'
+  python3 - "$ROOT" "$ARCH" "$source_app" "$destination_app" "$source_name" "$destination_name" "$destination_prefix_uuid" "$lifecycle" <<'PY'
 import json,pathlib,sys
 root=pathlib.Path(sys.argv[1]); arch=sys.argv[2]
 for side,app,name in [('source',int(sys.argv[3]),sys.argv[5]),('destination',int(sys.argv[4]),sys.argv[6])]:
@@ -92,6 +95,11 @@ for side,app,name in [('source',int(sys.argv[3]),sys.argv[5]),('destination',int
         plan['advertisements']=[{'service':'${service:'+name+'/cousin.group0}','startAt':'ContainerState::scheduled','stopAt':'ContainerState::destroying','port':9443}]
         plan['wormholes']=[{'name':'cousin','source':'registeredRoutablePrefix','routablePrefixUUID':sys.argv[7],
                            'externalPort':9443,'containerPort':9443,'layer4':'TCP','isQuic':False}]
+        scaler={'name':'cousin.probe.scale','percentile':90,'lookbackSeconds':3,'threshold':0.000001,'direction':'upscale'}
+        if sys.argv[8]=='horizontal':
+            plan['horizontalScalers']=[dict(scaler,lifetime='ApplicationLifetime::base',minValue=3,maxValue=6)]
+        elif sys.argv[8]=='vertical':
+            plan['verticalScalers']=[dict(scaler,resource='ScalingDimension::memory',increment=128,minValue=256,maxValue=384)]
     (root/f'cousin-{side}-plan.json').write_text(json.dumps(plan))
 PY
   if m cousin-reject-unprotected-stateful 15 "$ROOT/cousin-reject-unprotected-stateful.log" deploy "$SECOND" \
@@ -173,7 +181,18 @@ PY
   # during observation, and require the successful request to start after this.
   prodigy_dev_cousin_mark_time "$ROOT/cousin-offline-start"
   COUSIN_OFFLINE=1
-  python3 "$TEST_DIR/prodigy_dev_cousin_session_observe.py" "$ROOT" qualify || return
+  python3 "$TEST_DIR/prodigy_dev_cousin_session_observe.py" "$ROOT" qualify cousin-offline-start 1 || return
+  if [[ -n "$lifecycle" ]]; then
+    # The initial one-group payload proof precedes this explicit fault request.
+    # Local application metrics and the existing Brain scaler own the scale.
+    COUSIN_OFFLINE=0
+    m cousin-lifecycle-partition 100 "$ROOT/cousin-lifecycle-partition.log" \
+      testClusterPairControl "$OPERATION" fault 15000 60000 &
+    PAIR_PARTITION_PID=$!
+    COUSIN_OFFLINE=1
+    source "$TEST_DIR/prodigy_dev_cousin_lifecycle_qualification.sh"
+    prodigy_dev_qualify_cousin_lifecycle "$lifecycle" "$destination_name" || return
+  fi
   COUSIN_OFFLINE=0
   # This marker bounds delivery of the synchronous Mothership revoke command;
   # its local revoke/close may happen before the completion marker below.

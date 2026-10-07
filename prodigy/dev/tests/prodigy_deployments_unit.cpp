@@ -1519,6 +1519,114 @@ static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
   deployment.masterForShardGroup.clear();
 }
 
+static void testProtectedCousinServiceDefinitions(TestSuite& suite)
+{
+  constexpr uint16_t applicationID = 19'212;
+  DeploymentPlan plan = {};
+  plan.isStateful = true;
+  plan.config.applicationID = applicationID;
+  plan.stateful.clientPrefix = MeshServices::generateStatefulService(applicationID, 1);
+  plan.stateful.siblingPrefix = MeshServices::generateStatefulService(applicationID, 2);
+  plan.stateful.cousinPrefix = MeshServices::generateStatefulService(applicationID, 3);
+  plan.stateful.seedingPrefix = MeshServices::generateStatefulService(applicationID, 4);
+  plan.stateful.shardingPrefix = MeshServices::generateStatefulService(applicationID, 5);
+
+  const StatefulMeshRoles group0 = StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 0);
+  const StatefulMeshRoles group1 = StatefulMeshRoles::forShardGroup(plan.stateful, plan.config.applicationID, 1);
+  Advertisement protectedCousin(group0.cousin, ContainerState::scheduled, ContainerState::destroying, 9443);
+  protectedCousin.userCapacity.maximum = 37;
+  plan.advertisements.push_back(protectedCousin);
+  Advertisement unrelated(0xfeedbeefULL, ContainerState::healthy, ContainerState::destroying, 8443);
+  unrelated.userCapacity.maximum = 19;
+  plan.advertisements.push_back(unrelated);
+
+  Wormhole protectedWormhole = {};
+  protectedWormhole.externalAddress = IPAddress("2001:db8::192:12", true);
+  protectedWormhole.deliveryAddress = protectedWormhole.externalAddress;
+  protectedWormhole.externalPort = 443;
+  protectedWormhole.containerPort = 9443;
+  protectedWormhole.layer4 = IPPROTO_TCP;
+  plan.wormholes.push_back(protectedWormhole);
+
+  auto build = [&](const StatefulMeshRoles& roles, ProdigyContainerServiceDefinitions& definitions) {
+    ProdigyContainerServiceDefinitionContext context = {};
+    context.isStateful = true;
+    context.roles = roles;
+    context.nShardGroups = 2;
+    return prodigyBuildContainerServiceDefinitions(plan, context, definitions);
+  };
+  auto materialize = [](const ProdigyContainerServiceDefinitions& definitions) {
+    bytell_hash_map<uint64_t, Advertisement> advertisements = {};
+    for (const Advertisement& advertisement : definitions.advertisements)
+      advertisements.emplace(advertisement.service, advertisement);
+    return advertisements;
+  };
+
+  ProdigyContainerServiceDefinitions group0Definitions = {};
+  ProdigyContainerServiceDefinitions group1Definitions = {};
+  const bool group0Built = build(group0, group0Definitions);
+  const bool group1Built = build(group1, group1Definitions);
+  const auto group0Advertisements = materialize(group0Definitions);
+  const auto group1Advertisements = materialize(group1Definitions);
+  SwitchboardWormholeDesiredState group0Desired = {};
+  SwitchboardWormholeDesiredState group1Desired = {};
+  const bool group0Protected = group0Built && prodigyBuildCousinWormholeDesiredState(
+      plan.wormholes, true, group0.cousin, group0Advertisements, group0Desired);
+  const bool group1Protected = group1Built && prodigyBuildCousinWormholeDesiredState(
+      plan.wormholes, true, group1.cousin, group1Advertisements, group1Desired);
+  suite.expect(group0Protected && prodigyWormholeRequiresPairAdmission(group0Desired, 9443, IPPROTO_TCP),
+               "protected_cousin_service_definitions_group0_preserves_pair_admission");
+  suite.expect(group1Protected && prodigyWormholeRequiresPairAdmission(group1Desired, 9443, IPPROTO_TCP),
+               "protected_cousin_service_definitions_group1_materializes_pair_admission");
+  suite.expect(group1Advertisements.contains(group1.cousin) &&
+                   group1Advertisements.at(group1.cousin).port == 9443 &&
+                   group1Advertisements.at(group1.cousin).startAt == ContainerState::scheduled &&
+                   group1Advertisements.at(group1.cousin).userCapacity.maximum == 37 &&
+                   group1Advertisements.contains(group0.cousin) == false,
+               "protected_cousin_service_definitions_group1_replaces_group0_template");
+  suite.expect(group1Advertisements.contains(unrelated.service) &&
+                   group1Advertisements.at(unrelated.service).port == unrelated.port &&
+                   group1Advertisements.at(unrelated.service).startAt == unrelated.startAt &&
+                   group1Advertisements.at(unrelated.service).userCapacity.maximum == unrelated.userCapacity.maximum,
+               "protected_cousin_service_definitions_preserves_unrelated_explicit_advertisement");
+
+  DeploymentPlan unprotected = plan;
+  unprotected.wormholes.clear();
+  ProdigyContainerServiceDefinitions unprotectedGroup1 = {};
+  ProdigyContainerServiceDefinitionContext unprotectedContext = {};
+  unprotectedContext.isStateful = true;
+  unprotectedContext.roles = group1;
+  unprotectedContext.nShardGroups = 2;
+  const bool unprotectedBuilt = prodigyBuildContainerServiceDefinitions(unprotected, unprotectedContext, unprotectedGroup1);
+  const auto unprotectedAdvertisements = materialize(unprotectedGroup1);
+  suite.expect(unprotectedBuilt && unprotectedAdvertisements.contains(group0.cousin) &&
+                   unprotectedAdvertisements.at(group0.cousin).port == 9443 &&
+                   unprotectedAdvertisements.contains(group1.cousin) &&
+                   unprotectedAdvertisements.at(group1.cousin).port == 0,
+               "protected_cousin_service_definitions_does_not_infer_unprotected_group0_template");
+
+  DeploymentPlan ambiguous = plan;
+  ambiguous.advertisements.push_back(protectedCousin);
+  ProdigyContainerServiceDefinitions ambiguousDefinitions = {};
+  suite.expect(prodigyBuildContainerServiceDefinitions(ambiguous, unprotectedContext, ambiguousDefinitions) == false,
+               "protected_cousin_service_definitions_rejects_ambiguous_protected_templates");
+
+  DeploymentPlan currentGroupConflict = plan;
+  currentGroupConflict.advertisements.emplace_back(
+      group1.cousin, ContainerState::healthy, ContainerState::destroying, 9443);
+  ProdigyContainerServiceDefinitions currentGroupConflictDefinitions = {};
+  suite.expect(prodigyBuildContainerServiceDefinitions(
+                   currentGroupConflict, unprotectedContext, currentGroupConflictDefinitions) == false,
+               "protected_cousin_service_definitions_rejects_current_group_cousin_duplicate");
+
+  DeploymentPlan duplicateWormholeTarget = plan;
+  duplicateWormholeTarget.wormholes.push_back(protectedWormhole);
+  ProdigyContainerServiceDefinitions duplicateWormholeTargetDefinitions = {};
+  suite.expect(prodigyBuildContainerServiceDefinitions(
+                   duplicateWormholeTarget, unprotectedContext, duplicateWormholeTargetDefinitions) == false,
+               "protected_cousin_service_definitions_rejects_duplicate_wormhole_target");
+}
+
 static void testRecoveredStatefulMasterAdvertisementFence(TestSuite& suite)
 {
   auto initializePlan = [](ApplicationDeployment& deployment) {
@@ -2408,9 +2516,93 @@ static void testPartialGreenRecoveryScheduling(TestSuite& suite)
   thisBrain = savedBrain;
 }
 
+static void testStatefulHorizontalAutoscaleDispatch(TestSuite& suite)
+{
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    Rack racks[3]; Machine machines[3]; ScopedSocketPair sockets[3];
+    bool ready = true;
+    for (uint32_t index = 0; index < 3; ++index) {
+      racks[index].uuid = 0x19604000 + index;
+      ready = ready && sockets[index].create(suite, "stateful_horizontal_dispatch_socket") &&
+          seedSchedulableMachine(brain, racks[index], machines[index], 0x19604100 + index,
+              0x0a000401 + index, "stateful-horizontal-dispatch"_ctv, sockets[index]);
+      brain.racks.insert_or_assign(racks[index].uuid, &racks[index]);
+    }
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.config.architecture = nametagCurrentBuildMachineArchitecture();
+    deployment.plan.stateful.clientPrefix = MeshServices::generateStatefulService(999, 1);
+    deployment.plan.stateful.siblingPrefix = MeshServices::generateStatefulService(999, 2);
+    deployment.plan.stateful.cousinPrefix = MeshServices::generateStatefulService(999, 3);
+    deployment.plan.stateful.seedingPrefix = MeshServices::generateStatefulService(999, 4);
+    deployment.plan.stateful.shardingPrefix = MeshServices::generateStatefulService(999, 5);
+    deployment.plan.stateful.allMasters = true;
+    deployment.state = DeploymentState::running;
+    deployment.nShardGroups = 1; deployment.recomputeStatefulBaseTargetFromShardGroups();
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+    ContainerView existing[3];
+    for (uint32_t index = 0; index < 3; ++index) {
+      existing[index].uuid = 0x19604200 + index; existing[index].deploymentID = deployment.plan.config.deploymentID();
+      existing[index].applicationID = deployment.plan.config.applicationID; existing[index].machine = &machines[index];
+      existing[index].isStateful = true; existing[index].shardGroup = 0; existing[index].lifetime = ApplicationLifetime::base;
+      existing[index].state = ContainerState::healthy; existing[index].runtimeReady = true;
+      existing[index].explicitStatefulMeshRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful, deployment.plan.config.applicationID, 0);
+      deployment.containers.insert(&existing[index]); deployment.containersByShardGroup.insert(0, &existing[index]);
+      deployment.countPerMachine[&machines[index]] += 1; deployment.countPerRack[&racks[index]] += 1;
+      deployment.racksByShardGroup[0].insert(&racks[index]); brain.containers.insert_or_assign(existing[index].uuid, &existing[index]);
+      machines[index].upsertContainerIndexEntry(deployment.plan.config.deploymentID(), &existing[index]);
+    }
+    HorizontalScaler scaler = {}; scaler.name.assign(ProdigyMetrics::runtimeContainerCpuUtilPctName);
+    scaler.percentile = 95.; scaler.lookbackSeconds = 60; scaler.threshold = .5;
+    scaler.direction = Scaler::Direction::upscale; scaler.lifetime = ApplicationLifetime::base;
+    scaler.minValue = 3; scaler.maxValue = 6; deployment.plan.horizontalScalers.push_back(scaler);
+    brain.metrics.record(deployment.plan.config.deploymentID(), 0x19604300,
+        ProdigyMetrics::runtimeContainerCpuUtilPctKey(), Time::now<TimeResolution::ms>(), .95);
+    TimeoutPacket autoscalePacket = {}; autoscalePacket.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
+    deployment.dispatchTimeout(&autoscalePacket);
+    uint32_t queuedSpins = 0;
+    for (auto& machine : machines) if (machine.neuron.pendingSend && machine.neuron.wBuffer.size() > 0) ++queuedSpins;
+    suite.expect(ready && deployment.nShardGroups == 2 && deployment.nTargetBase == 6 &&
+                     deployment.toSchedule.empty() && deployment.waitingOnContainers.size() == 3 && queuedSpins == 3,
+                 "stateful_horizontal_autoscale_dispatches_new_group_constructs_immediately");
+    Vector<ContainerView *> created;
+    for (auto *container : deployment.containers)
+      if (container != &existing[0] && container != &existing[1] && container != &existing[2])
+        created.push_back(container);
+    for (auto *container : created)
+    {
+      deployment.waitingOnContainers.erase(container);
+      deployment.containers.erase(container);
+      while (deployment.containersByShardGroup.eraseEntry(container->shardGroup, container)) {}
+      container->machine->removeContainerIndexEntry(container->deploymentID, container);
+      brain.containers.erase(container->uuid);
+      delete container;
+    }
+    for (uint32_t index = 0; index < 3; ++index)
+    {
+      deployment.containers.erase(&existing[index]);
+      while (deployment.containersByShardGroup.eraseEntry(existing[index].shardGroup, &existing[index])) {}
+      machines[index].removeContainerIndexEntry(existing[index].deploymentID, &existing[index]);
+      brain.containers.erase(existing[index].uuid);
+      brain.machines.erase(&machines[index]);
+      brain.racks.erase(racks[index].uuid);
+    }
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    thisBrain = savedBrain;
+}
+
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_STATEFUL_HORIZONTAL_DISPATCH_ONLY") != nullptr)
+  {
+    testStatefulHorizontalAutoscaleDispatch(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_INPLACE_PAIRING_ONLY") != nullptr)
   {
     testInplacePairingOrder(suite);
@@ -2426,6 +2618,11 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_RECOVERED_STATEFUL_MASTER_ADVERTISEMENT_ONLY") != nullptr)
   {
     testRecoveredStatefulMasterAdvertisementFence(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_PROTECTED_COUSIN_SERVICE_DEFINITIONS_ONLY") != nullptr)
+  {
+    testProtectedCousinServiceDefinitions(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (std::getenv("PRODIGY_TEST_MATERIALIZED_STATEFUL_RECOVERY_ONLY") != nullptr)
@@ -2547,6 +2744,7 @@ int main(void)
   }
 
   testRecoveredStatefulMasterAdvertisementFence(suite);
+  testProtectedCousinServiceDefinitions(suite);
 
   // Exercise the CLI's parser directly; this path needs no runtime resources.
   {
@@ -7318,6 +7516,8 @@ int main(void)
     brain.racks.erase(rack.uuid);
     thisBrain = savedBrain;
   }
+
+  testStatefulHorizontalAutoscaleDispatch(suite);
 
   {
     ScopedFreshRing ring;

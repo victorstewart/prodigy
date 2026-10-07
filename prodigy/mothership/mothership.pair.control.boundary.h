@@ -13,6 +13,54 @@
 
 constexpr static uint16_t mothershipPairControlBoundaryPort = 315;
 constexpr static uint32_t mothershipPairControlBoundaryMaximumEndpoints = 16;
+constexpr static uint32_t mothershipPairControlFaultMaximumDelayMilliseconds = 30000;
+constexpr static uint32_t mothershipPairControlFaultMaximumDurationMilliseconds = 60000;
+
+// A test-only fault is deliberately limited to the already admitted pair
+// carrier.  It carries no interface, namespace, route, or cluster selector.
+class MothershipPairControlFault {
+public:
+  uint32_t delayMilliseconds = 0;
+  uint32_t durationMilliseconds = 0;
+};
+
+static inline bool mothershipPairControlFaultValid(const MothershipPairControlFault& fault,
+                                                   String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  if (fault.delayMilliseconds > mothershipPairControlFaultMaximumDelayMilliseconds ||
+      fault.durationMilliseconds == 0 ||
+      fault.durationMilliseconds > mothershipPairControlFaultMaximumDurationMilliseconds)
+  {
+    if (failure) failure->assign("pair-control fault delay or duration is outside the bounded test window");
+    return false;
+  }
+  return true;
+}
+
+static inline bool mothershipPairControlFaultParse(const String& delayText, const String& durationText,
+                                                   MothershipPairControlFault& fault, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  auto parse = [](const String& text, uint32_t& value) {
+    if (text.empty() || (text.size() > 1 && text[0] == '0')) return false;
+    uint64_t parsed = 0;
+    for (char byte : text)
+    {
+      if (byte < '0' || byte > '9' || parsed > (UINT32_MAX - uint64_t(byte - '0')) / 10) return false;
+      parsed = parsed * 10 + uint64_t(byte - '0');
+    }
+    value = uint32_t(parsed);
+    return true;
+  };
+  if (!parse(delayText, fault.delayMilliseconds) || !parse(durationText, fault.durationMilliseconds) ||
+      !mothershipPairControlFaultValid(fault, failure))
+  {
+    if (failure && failure->empty()) failure->assign("pair-control fault delay and duration must be canonical milliseconds");
+    return false;
+  }
+  return true;
+}
 
 // One operation-scoped, direct TCP flow is optional after the pair-control
 // carrier is prepared.  It deliberately names both deployed workloads and the
@@ -386,6 +434,22 @@ static inline bool mothershipPairControlServiceTransitArguments(
     if (::inet_ntop(AF_INET6, address.v6, buffer, sizeof(buffer)) == nullptr) return false;
     text.assign(buffer); arguments.push_back(std::move(text));
   }
+  return true;
+}
+
+static inline bool mothershipPairControlFaultArguments(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const MothershipPairControlFault& fault,
+    Vector<String>& arguments, String *failure = nullptr)
+{
+  arguments.clear();
+  if (!mothershipPairControlFaultValid(fault, failure) ||
+      !mothershipPairControlBoundaryArguments(descriptor, "query"_ctv, arguments, failure)) return false;
+  arguments[1] = "fault"_ctv;
+  String delay = {}, duration = {};
+  delay.assignItoa(fault.delayMilliseconds);
+  duration.assignItoa(fault.durationMilliseconds);
+  arguments.push_back(std::move(delay));
+  arguments.push_back(std::move(duration));
   return true;
 }
 

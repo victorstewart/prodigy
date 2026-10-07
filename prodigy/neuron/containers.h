@@ -1644,8 +1644,11 @@ public:
     bool routeCurrent = false;
     bool grantInstalled = false;
     program->openMap("wh_pair_routes"_ctv, [&](int mapFD) -> void {
+      // The immutable grant captures the initial authenticated lease exactly.
+      // Later authenticated renewals advance only the route policy, which is
+      // deliberately the sole renewable deadline for this capability.
       routeCurrent = mapFD >= 0 && bpf_map_lookup_elem(mapFD, &routeKey, &route) == 0 &&
-                     route.state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE && route.expires_at_ns >= grant.expires_at_ns &&
+                     route.state == SWITCHBOARD_PAIR_ADMISSION_ROUTE_ACTIVE && route.expires_at_ns == grant.expires_at_ns &&
                      route.route_generation == grant.route_generation && route.root_generation == grant.root_generation &&
                      route.key_epoch == grant.key_epoch;
     });

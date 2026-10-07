@@ -70,9 +70,10 @@ constexpr inline uint32_t ProdigyLocalCousinServicePermissionMaximumRecords = 25
 
 class ProdigyLocalCousinServicePermission {
 public:
-  static constexpr uint32_t version = 1;
+  static constexpr uint32_t version = 2;
+  static constexpr uint32_t baselineVersion = 2;
 
-  uint32_t protocolVersion = version;
+  uint32_t protocolVersion = 1;
   uint128_t permissionUUID = 0;
   uint128_t pairUUID = 0;
   uint128_t logicalWorkloadUUID = 0;
@@ -92,6 +93,10 @@ public:
   uint64_t generation = 0;
   uint64_t acceptedAuthorityGeneration = 0;
   ProdigyLocalCousinServicePermissionState state = ProdigyLocalCousinServicePermissionState::active;
+  // v2 only: immutable resources from the full plan that the Brain verified.
+  uint32_t baselineLogicalCores = 0;
+  uint32_t baselineMemoryMB = 0;
+  uint32_t baselineStorageMB = 0;
 };
 
 class ProdigyLocalCousinServicePermissionRequest {
@@ -152,6 +157,12 @@ static void serialize(S&& serializer, ProdigyLocalCousinServicePermission& permi
   serializer.value8b(permission.generation);
   serializer.value8b(permission.acceptedAuthorityGeneration);
   serializer.value1b(permission.state);
+  // Keep the v1 byte layout exact: old records have no trailing resource baseline.
+  if (permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion) {
+    serializer.value4b(permission.baselineLogicalCores);
+    serializer.value4b(permission.baselineMemoryMB);
+    serializer.value4b(permission.baselineStorageMB);
+  }
 }
 
 template <typename S>
@@ -200,7 +211,7 @@ static inline bool prodigyLocalCousinServicePermissionValid(
     const ProdigyLocalCousinServicePermission& permission,
     bool requireAcceptedAuthorityGeneration = true)
 {
-  if (permission.protocolVersion != ProdigyLocalCousinServicePermission::version ||
+  if ((permission.protocolVersion != 1 && permission.protocolVersion != ProdigyLocalCousinServicePermission::baselineVersion) ||
       permission.permissionUUID == 0 || permission.pairUUID == 0 ||
       permission.logicalWorkloadUUID == 0 || permission.logicalServiceUUID == 0 ||
       permission.localClusterUUID == 0 || permission.peerClusterUUID == 0 ||
@@ -220,6 +231,10 @@ static inline bool prodigyLocalCousinServicePermissionValid(
   {
     return false;
   }
+  if ((permission.protocolVersion == 1 && (permission.baselineLogicalCores != 0 || permission.baselineMemoryMB != 0 || permission.baselineStorageMB != 0)) ||
+      (permission.protocolVersion == ProdigyLocalCousinServicePermission::baselineVersion &&
+       (permission.baselineLogicalCores == 0 || permission.baselineLogicalCores > UINT16_MAX ||
+        permission.baselineMemoryMB == 0 || permission.baselineStorageMB == 0))) return false;
   if (permission.state == ProdigyLocalCousinServicePermissionState::active) {
     if (permission.generation != 1) return false;
   } else if (permission.generation != 2) {
@@ -229,20 +244,28 @@ static inline bool prodigyLocalCousinServicePermissionValid(
       permission.acceptedAuthorityGeneration == 0;
 }
 
+static inline bool prodigyLocalCousinServicePermissionIdentityScopeMatches(
+    const ProdigyLocalCousinServicePermission& left, const ProdigyLocalCousinServicePermission& right)
+{
+  return left.permissionUUID == right.permissionUUID && left.pairUUID == right.pairUUID &&
+         left.logicalWorkloadUUID == right.logicalWorkloadUUID && left.logicalServiceUUID == right.logicalServiceUUID &&
+         left.localClusterUUID == right.localClusterUUID && left.peerClusterUUID == right.peerClusterUUID &&
+         left.localHalf == right.localHalf && left.localApplicationID == right.localApplicationID &&
+         left.peerApplicationID == right.peerApplicationID && left.localCousinServicePrefix == right.localCousinServicePrefix &&
+         left.peerCousinServicePrefix == right.peerCousinServicePrefix && left.slots == right.slots &&
+         left.localDeploymentID == right.localDeploymentID && left.canonicalPlanSHA256 == right.canonicalPlanSHA256 &&
+         left.artifactSHA256 == right.artifactSHA256 && left.artifactBytes == right.artifactBytes;
+}
+
 static inline bool prodigyLocalCousinServicePermissionScopeMatches(
     const ProdigyLocalCousinServicePermission& left,
     const ProdigyLocalCousinServicePermission& right)
 {
-  return left.protocolVersion == right.protocolVersion && left.permissionUUID == right.permissionUUID &&
-         left.pairUUID == right.pairUUID && left.logicalWorkloadUUID == right.logicalWorkloadUUID &&
-         left.logicalServiceUUID == right.logicalServiceUUID && left.localClusterUUID == right.localClusterUUID &&
-         left.peerClusterUUID == right.peerClusterUUID && left.localHalf == right.localHalf &&
-         left.localApplicationID == right.localApplicationID && left.peerApplicationID == right.peerApplicationID &&
-         left.localCousinServicePrefix == right.localCousinServicePrefix &&
-         left.peerCousinServicePrefix == right.peerCousinServicePrefix && left.slots == right.slots &&
-         left.localDeploymentID == right.localDeploymentID &&
-         left.canonicalPlanSHA256 == right.canonicalPlanSHA256 && left.artifactSHA256 == right.artifactSHA256 &&
-         left.artifactBytes == right.artifactBytes;
+  return left.protocolVersion == right.protocolVersion &&
+         left.baselineLogicalCores == right.baselineLogicalCores &&
+         left.baselineMemoryMB == right.baselineMemoryMB &&
+         left.baselineStorageMB == right.baselineStorageMB &&
+         prodigyLocalCousinServicePermissionIdentityScopeMatches(left, right);
 }
 
 static inline bool prodigyLocalCousinServicePermissionEqual(
@@ -252,6 +275,25 @@ static inline bool prodigyLocalCousinServicePermissionEqual(
   return prodigyLocalCousinServicePermissionScopeMatches(left, right) &&
          left.generation == right.generation &&
          left.acceptedAuthorityGeneration == right.acceptedAuthorityGeneration && left.state == right.state;
+}
+
+// A controller request has no acceptance generation.  The only permitted
+// owner enrichment is converting a baseline-free legacy v1 request into the
+// validated v2 record that carries Brain-owned resource baselines.
+static inline bool prodigyLocalCousinServicePermissionRequestAccepted(
+    const ProdigyLocalCousinServicePermission& requested,
+    const ProdigyLocalCousinServicePermission& observed)
+{
+  if (!prodigyLocalCousinServicePermissionValid(requested, false) ||
+      !prodigyLocalCousinServicePermissionValid(observed) ||
+      !prodigyLocalCousinServicePermissionIdentityScopeMatches(requested, observed) ||
+      requested.state != observed.state || requested.generation != observed.generation) return false;
+  if (requested.protocolVersion == 1)
+  {
+    if (observed.protocolVersion == 1) return prodigyLocalCousinServicePermissionScopeMatches(requested, observed);
+    return observed.protocolVersion == ProdigyLocalCousinServicePermission::baselineVersion;
+  }
+  return prodigyLocalCousinServicePermissionScopeMatches(requested, observed);
 }
 
 static inline bool prodigyLocalCousinServicePermissionsValid(

@@ -469,8 +469,12 @@ static inline bool switchboardCleanupExpiredPairAdmissionMaps(Program *program,
       {
         const switchboard_pair_admission_grant& grant = values[i];
         const __u32 state = grant.state;
-        bool reclaim = state != SWITCHBOARD_PAIR_ADMISSION_CONSUMED ? grant.expires_at_ns <= nowNs
-                                                                      : grant.consumed_expires_at_ns <= nowNs;
+        // Pending grants inherit the exact route policy's renewable lease;
+        // their immutable initial expiry is only the installation fence.
+        // Never retain malformed consumption states, and retain a consumed
+        // grant only for its separately bounded established-session window.
+        bool reclaim = state == SWITCHBOARD_PAIR_ADMISSION_CONSUMED ? grant.consumed_expires_at_ns <= nowNs
+                                                                     : state != SWITCHBOARD_PAIR_ADMISSION_PENDING;
         switchboard_pair_admission_route_key routeKey = {grant.pair_uuid_hi, grant.pair_uuid_lo, grant.route_uuid_hi, grant.route_uuid_lo};
         switchboard_pair_admission_route_policy route = {};
         bool routeCurrent = bpf_map_lookup_elem(routeFD, &routeKey, &route) == 0 &&

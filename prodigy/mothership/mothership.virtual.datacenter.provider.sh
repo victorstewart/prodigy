@@ -1599,10 +1599,12 @@ PAIR_PROBE
 # two currently-live VDC parent namespaces.
 pair_control_parse()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
    pair_control_args=("${@:1:12}")
    pair_control_service_args=()
+   pair_control_fault_delay_ms=""; pair_control_fault_duration_ms=""
    if [[ "$#" -eq 25 ]]; then pair_control_service_args=("${@:13:13}"); fi
+   if [[ "$#" -eq 14 ]]; then pair_control_fault_delay_ms="${13}"; pair_control_fault_duration_ms="${14}"; fi
    pair_control_id="$1"; pair_control_first_uuid="$2"; pair_control_second_uuid="$3"
    pair_control_first_workspace="$4"; pair_control_second_workspace="$5"
    pair_control_first_runtime="$6"; pair_control_second_runtime="$7"
@@ -1638,6 +1640,17 @@ roster(first_csv,first_network); roster(second_csv,second_network)
 PAIR_CONTROL_PARSE
    then
       return 2
+   fi
+   if [[ "$#" -eq 14 ]]; then
+      if ! python3 - "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" <<'PAIR_CONTROL_FAULT_PARSE'
+import sys
+delay,duration=sys.argv[1:]
+assert all(value.isdecimal() and str(int(value))==value for value in (delay,duration))
+assert 0<=int(delay)<=30000 and 1<=int(duration)<=60000
+PAIR_CONTROL_FAULT_PARSE
+      then
+         return 2
+      fi
    fi
    pair_control_dir="/mnt/prodigy-vdc-pair-control/$pair_control_id"
    [[ ! -L "$pair_control_dir" ]] || return 2
@@ -2104,12 +2117,12 @@ pair_control_validate_service_inside()
    pair_control_service_route_journal_valid service-router-destination-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
    pair_control_service_route_journal_valid service-source-local-route "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
    pair_control_service_route_journal_valid service-destination-local-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
-   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
-   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
-   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
-   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
-   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
-   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || { echo "pair-control service rejected: service-source-route" >&2; return 1; }
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || { echo "pair-control service rejected: service-destination-route" >&2; return 1; }
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || { echo "pair-control service rejected: service-router-source-route" >&2; return 1; }
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || { echo "pair-control service rejected: service-router-destination-route" >&2; return 1; }
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || { echo "pair-control service rejected: service-source-local-route" >&2; return 1; }
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || { echo "pair-control service rejected: service-destination-local-route" >&2; return 1; }
 }
 
 pair_control_remove_service_route()
@@ -2325,10 +2338,159 @@ pair_control_query_inside()
    fi
 }
 
+# This fault owns only two temporary FORWARD drops in the existing pair router.
+# It never changes either VDC bridge, link state, route, or runtime interface,
+# so each cluster retains its internal connectivity and service routes.
+pair_control_fault_monotonic_ns()
+{
+   # Match the probe and lifecycle observer scale: unlike monotonic time,
+   # BOOTTIME includes suspended time and therefore brackets guest pauses.
+   python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_BOOTTIME))'
+}
+
+pair_control_fault_sleep()
+{
+   python3 - "$1" <<'PAIR_CONTROL_FAULT_SLEEP'
+import sys,time
+time.sleep(int(sys.argv[1]) / 1000)
+PAIR_CONTROL_FAULT_SLEEP
+}
+
+pair_control_fault_rule_text()
+{
+   [[ "$1" == first || "$1" == second ]] || return 2
+   if [[ "$1" == first ]]; then printf '%s\n' 'FORWARD -i first0 -o second0 -j DROP';
+   else printf '%s\n' 'FORWARD -i second0 -o first0 -j DROP'; fi
+}
+
+pair_control_fault_rule_present()
+{
+   [[ "$1" == first || "$1" == second ]] || return 2
+   if [[ "$1" == first ]]; then
+      ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i first0 -o second0 -j DROP
+   else
+      ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i second0 -o first0 -j DROP
+   fi
+}
+
+pair_control_fault_add_rule()
+{
+   local side="$1" expected="$2" name="fault-$1-rule"
+   [[ "$expected" == "$(pair_control_fault_rule_text "$side")" ]] || return 1
+   pair_control_fault_rule_present "$side" && return 1
+   local present=$?
+   [[ "$present" == 1 ]] || return 1
+   pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
+   if [[ "$side" == first ]]; then
+      ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i first0 -o second0 -j DROP || return 1
+   else
+      ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i second0 -o first0 -j DROP || return 1
+   fi
+   pair_control_fault_rule_present "$side" || return 1
+   pair_write "$pair_control_dir/$name" "$expected"
+}
+
+pair_control_fault_remove_rule()
+{
+   local side="$1" expected="$2" name="fault-$1-rule" present status
+   [[ "$expected" == "$(pair_control_fault_rule_text "$side")" ]] || return 1
+   [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ||
+      -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]] || return 0
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" &&
+      "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
+      [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" &&
+         "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
+   fi
+   if pair_control_fault_rule_present "$side"; then
+      if [[ "$side" == first ]]; then
+         ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i first0 -o second0 -j DROP || return 1
+      else
+         ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i second0 -o first0 -j DROP || return 1
+      fi
+   else
+      present=$?
+      # An interrupted add can leave only the intent; a recorded rule must
+      # still exist so this owner never accepts someone else's removal.
+      [[ "$present" == 1 && ! -e "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" ]] || return 1
+   fi
+   rm -f -- "$pair_control_dir/$name" "$pair_control_dir/$name-intent" || return 1
+}
+
+pair_control_fault_restore_inside()
+{
+   if [[ "${pair_control_fault_touched:-0}" != 1 ]]; then
+      [[ -f "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
+      rm -f -- "$pair_control_dir/fault-active"
+      return
+   fi
+   local first_rule second_rule status=0 end
+   first_rule="$(pair_control_fault_rule_text first)" || return 1
+   second_rule="$(pair_control_fault_rule_text second)" || return 1
+   pair_control_fault_remove_rule first "$first_rule" || status=1
+   pair_control_fault_remove_rule second "$second_rule" || status=1
+   [[ "$status" == 0 ]] || return 1
+   [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
+      "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
+      "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || return 1
+   end="$(pair_control_fault_monotonic_ns)" || return 1
+   pair_write "$pair_control_dir/fault-end-ns" "$end" || return 1
+   if [[ -f "$pair_control_dir/fault-begin-ns" && ! -L "$pair_control_dir/fault-begin-ns" ]]; then
+      pair_write "$pair_control_dir/fault-last" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms beginNs=$(<"$pair_control_dir/fault-begin-ns") endNs=$end firstRule=$first_rule secondRule=$second_rule" || return 1
+   fi
+   [[ -f "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
+   rm -f -- "$pair_control_dir/fault-active"
+   pair_control_fault_touched=0
+}
+
+pair_control_fault_inside()
+{
+   # The caller keeps both lifecycle locks through this bounded operation.
+   # Refuse a stale or malformed active receipt rather than touching a second
+   # resource set after an interrupted provider invocation.
+   pair_control_query_inside || return 1
+   if [[ -e "$pair_control_dir/fault-active" || -L "$pair_control_dir/fault-active" ]]; then
+      return 1
+   fi
+   local journal
+   for journal in fault-begin-ns fault-end-ns fault-first-rule fault-first-rule-intent fault-second-rule fault-second-rule-intent; do
+      if [[ -e "$pair_control_dir/$journal" || -L "$pair_control_dir/$journal" ]]; then
+         [[ -f "$pair_control_dir/$journal" && ! -L "$pair_control_dir/$journal" ]] || return 1
+         rm -f -- "$pair_control_dir/$journal"
+      fi
+   done
+   pair_write "$pair_control_dir/fault-active" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms" || return 1
+   pair_control_fault_touched=0
+   trap 'pair_control_fault_restore_inside' EXIT
+   trap 'exit 130' TERM INT HUP
+   pair_control_fault_sleep "$pair_control_fault_delay_ms" || return 1
+   # Install direction-specific drops above the boundary's accepts. The existing
+   # router namespace and its saved policy digest prove both rules are ours.
+   pair_control_fault_touched=1
+   local first_rule second_rule
+   first_rule="$(pair_control_fault_rule_text first)" || return 1
+   second_rule="$(pair_control_fault_rule_text second)" || return 1
+   pair_control_fault_rule_present first && return 1
+   [[ "$?" == 1 ]] || return 1
+   pair_control_fault_rule_present second && return 1
+   [[ "$?" == 1 ]] || return 1
+   pair_control_fault_add_rule first "$first_rule" || return 1
+   pair_control_fault_add_rule second "$second_rule" || return 1
+   local begin end
+   begin="$(pair_control_fault_monotonic_ns)" || return 1
+   pair_write "$pair_control_dir/fault-begin-ns" "$begin" || return 1
+   pair_control_fault_sleep "$pair_control_fault_duration_ms" || return 1
+   pair_control_fault_restore_inside || return 1
+   end="$(<"$pair_control_dir/fault-end-ns")"
+   printf 'PAIR_CONTROL_FAULT operationID=%s clock=CLOCK_BOOTTIME delayMs=%s durationMs=%s beginNs=%s endNs=%s\n' \
+      "$pair_control_id" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" "$begin" "$end"
+   trap - EXIT TERM INT HUP
+}
+
 pair_control_action()
 {
    local action="$1"; shift
-   [[ "$action" == query || "$action" == remove || "$action" == service ]] || return 2
+   [[ "$action" == query || "$action" == remove || "$action" == service || "$action" == fault ]] || return 2
    pair_control_parse "$@" || return
    if [[ "$action" == remove && ! -e "$pair_control_dir" ]]; then return 0; fi
    [[ -r "$pair_control_dir/descriptor" && ! -L "$pair_control_dir/descriptor" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" &&
@@ -2346,6 +2508,9 @@ pair_control_action()
       for _ in $(seq 1 100); do [[ "$(<"$pair_control_dir/phase")" == removed ]] && return 0; sleep 0.1; done
       return 1
    fi
+   if [[ "$action" == fault ]]; then
+      exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside fault "$@"
+   fi
    pair_control_unlock_both
    if [[ "$action" == service ]]; then
       exec nsenter -t "$pair_control_pid" -m -- bash "$0" --pair-control-inside service "$@"
@@ -2356,7 +2521,7 @@ pair_control_action()
 pair_control_inside()
 {
    local action=query
-   if [[ "${1:-}" == service ]]; then action=service; shift; fi
+   if [[ "${1:-}" == service || "${1:-}" == fault ]]; then action="$1"; shift; fi
    pair_control_parse "$@" || return
    pair_control_owner_live || { echo "pair-control query rejected: live-owner" >&2; return 1; }
    [[ "$(stat -Lc %i /proc/self/ns/mnt)" == "$pair_control_mount" && "$(pair_control_descriptor)" == "$(<"$pair_control_dir/descriptor")" ]] || { echo "pair-control query rejected: owner-mount-or-descriptor" >&2; return 1; }
@@ -2368,6 +2533,10 @@ pair_control_inside()
    read -r _ pair_control_first_router _ pair_control_second_router <<< "$addresses" || return 1
    if [[ "$action" == service ]]; then
       pair_control_install_service_inside || return 1
+   fi
+   if [[ "$action" == fault ]]; then
+      pair_control_fault_inside
+      return
    fi
    pair_control_query_inside
 }

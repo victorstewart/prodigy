@@ -72,12 +72,13 @@ static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nod
 }
 
 static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounterpart& destination,
-                                                       uint64_t rootGeneration, uint64_t keyEpoch)
+                                                       uint64_t rootGeneration, uint64_t keyEpoch,
+                                                       uint128_t sessionUUID = 0x7f01, uint128_t requestUUID = 0x7f02)
 {
   ProdigyCousinSessionControl control = {};
   control.kind = ProdigyCousinSessionControlKind::propose;
   auto& session = control.session;
-  session.sessionUUID = 0x7f01; session.requestUUID = 0x7f02;
+  session.sessionUUID = sessionUUID; session.requestUUID = requestUUID;
   session.rootGeneration = rootGeneration; session.keyEpoch = keyEpoch; session.slot = 3;
   session.destination = destination;
   session.sourcePermission = destination.permission;
@@ -96,10 +97,11 @@ static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounte
 }
 
 
-static ProdigyCousinSessionLocalCommand fixture(CousinRouteHalf half)
+static ProdigyCousinSessionLocalCommand fixture(CousinRouteHalf half, uint128_t sessionUUID = 0x7f01,
+                                                uint128_t requestUUID = 0x7f02)
 {
   auto publication = buildDiscoveryPublication(0x222, 0x300, 0x200, 0x100, 7, 9, 11);
-  auto session = buildSessionControl(publication.snapshot.records[0], 7, 9).session;
+  auto session = buildSessionControl(publication.snapshot.records[0], 7, 9, sessionUUID, requestUUID).session;
   session.destination.publicAddress = IPAddress("fd00:ffff:1234::2", true);
   session.destination.publicTCPPort = 49192;
   ProdigyCousinSessionLocalCommand command = {};
@@ -205,7 +207,6 @@ int main()
   }
   sockaddr_storage observed = {}; socklen_t observedLength = sizeof(observed);
   if (ok) { server.fd = accept4(listener, reinterpret_cast<sockaddr *>(&observed), &observedLength, SOCK_CLOEXEC | SOCK_NONBLOCK); ok = server.fd >= 0; }
-  if (listener >= 0) close(listener);
   if (ok) ok = setsockopt(client.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0 &&
       setsockopt(server.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
   expect(ok && reinterpret_cast<sockaddr_in6&>(observed).sin6_port == htons(source.session.sourceTCPPort) &&
@@ -229,7 +230,52 @@ int main()
   expect(clientOwner.applyCommand(revoke) && !client.isTransportNegotiated() && !client.prepareTransportTLSSend() &&
          !client.decryptTransportTLS(0) && client.nBytesToSend() == 0 && client.pBytesToSend() == nullptr,
          "revocation_closes_send_receive_and_queued_ciphertext");
-  if (client.fd >= 0) { close(client.fd); client.fd = -1; }
+  ProdigyCousinSessionStream unowned, fixed;
+  fixed.isFixedFile = true; fixed.fd = 42;
+  expect(!unowned.abortOwnedSocket() && !fixed.abortOwnedSocket() && fixed.fd == 42,
+         "abortive_close_rejects_unowned_and_ring_fixed_descriptors");
+  fixed.fd = -1;
+  expect(client.abortOwnedSocket() && client.fd == -1,
+         "revoked_fixed_whitehole_outbound_uses_abortive_owner_close");
   if (server.fd >= 0) { close(server.fd); server.fd = -1; }
+  auto reconnectSource = fixture(CousinRouteHalf::source, 0x7f11, 0x7f12);
+  auto reconnectDestination = fixture(CousinRouteHalf::destination, 0x7f11, 0x7f12);
+  ProdigyCousinSessionClient reconnectClientOwner(reconnectSource.session.sourceContainerUUID);
+  ProdigyCousinSessionClient reconnectServerOwner(reconnectDestination.session.destination.containerUUID);
+  ProdigyCousinSessionStream reconnectClient, reconnectServer;
+  reconnectClient.rBuffer.reserve(8192); reconnectServer.rBuffer.reserve(8192);
+  reconnectClient.wBuffer.reserve(8192); reconnectServer.wBuffer.reserve(8192);
+  bool reconnected = reconnectClientOwner.applyCommand(reconnectSource) &&
+      reconnectServerOwner.applyCommand(reconnectDestination) &&
+      reconnectClientOwner.prepareOutbound(reconnectSource.session.sessionUUID, reconnectClient);
+  if (reconnected) {
+    const int connected = connect(reconnectClient.fd, reconnectClient.daddr<sockaddr>(), reconnectClient.daddrLen);
+    reconnected = connected == 0 || errno == EINPROGRESS;
+  }
+  sockaddr_storage reconnectObserved = {}; socklen_t reconnectObservedLength = sizeof(reconnectObserved);
+  if (reconnected) {
+    reconnectServer.fd = accept4(listener, reinterpret_cast<sockaddr *>(&reconnectObserved), &reconnectObservedLength,
+                                 SOCK_CLOEXEC | SOCK_NONBLOCK);
+    reconnected = reconnectServer.fd >= 0 &&
+        reconnectServerOwner.prepareInbound(reconnectServer, reconnectObserved, reconnectObservedLength);
+  }
+  expect(reconnected, "abortive_close_releases_fixed_tuple_before_kernel_tcp_timeout");
+  if (reconnected) reconnected = setsockopt(reconnectClient.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0 &&
+      setsockopt(reconnectServer.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
+  for (unsigned i = 0; reconnected && i < 10000 &&
+       (!reconnectClient.isTransportNegotiated() || !reconnectServer.isTransportNegotiated()); ++i)
+    reconnected = pump(reconnectClient, reconnectServer) && pump(reconnectServer, reconnectClient);
+  expect(reconnected && reconnectSource.session.sessionUUID != source.session.sessionUUID &&
+         reconnectObserved.ss_family == AF_INET6 &&
+         reinterpret_cast<sockaddr_in6&>(reconnectObserved).sin6_port == htons(reconnectSource.session.sourceTCPPort) &&
+         std::memcmp(&reinterpret_cast<sockaddr_in6&>(reconnectObserved).sin6_addr,
+                     reconnectSource.session.sourceAddress.v6, 16) == 0 &&
+         reconnectClient.isTransportNegotiated() && reconnectServer.isTransportNegotiated() &&
+         reconnectClient.tlsPeerUUID == reconnectDestination.session.destination.containerUUID &&
+         reconnectServer.tlsPeerUUID == reconnectSource.session.sourceContainerUUID,
+         "abortive_close_allows_immediate_fresh_same_whitehole_tuple_reconnect");
+  if (reconnectClient.fd >= 0) { close(reconnectClient.fd); reconnectClient.fd = -1; }
+  if (reconnectServer.fd >= 0) { close(reconnectServer.fd); reconnectServer.fd = -1; }
+  if (listener >= 0) close(listener);
   return failures ? 1 : 0;
 }

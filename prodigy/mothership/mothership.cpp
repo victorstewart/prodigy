@@ -18778,12 +18778,8 @@ private:
         valid = observe();
       }
       if (valid) {
-        auto actual = response.permission;
-        actual.acceptedAuthorityGeneration = 0;
-        String requestedBytes, actualBytes;
-        BitseryEngine::serialize(requestedBytes, permission);
-        BitseryEngine::serialize(actualBytes, actual);
-        valid = response.found && response.qualified && requestedBytes == actualBytes;
+        valid = response.found && response.qualified &&
+            prodigyLocalCousinServicePermissionRequestAccepted(permission, response.permission);
         if (!valid) failure.assign("cousin permission awaits a qualified exact policy; retry the same request"_ctv);
       }
     }
@@ -19039,12 +19035,15 @@ private:
     String failure = {}, action = {};
     uint128_t operationUUID = 0;
     MothershipPairControlServiceTransit service = {};
+    MothershipPairControlFault fault = {};
     TestPairLifecycleLock lock = {};
-    bool valid = argc >= 2 && argc <= 3 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    bool valid = argc >= 2 && argc <= 4 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
-    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv);
+    valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "fault"_ctv);
     if (valid && action == "service"_ctv)
       valid = argc == 3 && parsePairControlServiceTransitJSON(String(argv[2]), service, failure);
+    else if (valid && action == "fault"_ctv)
+      valid = argc == 4 && mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), fault, &failure);
     else valid = valid && argc == 2;
     valid = valid && lockTestPairLifecycle(lock, failure);
 
@@ -19065,7 +19064,7 @@ private:
       valid = intent.testControlBoundaryAdmitted;
       boundary = intent.testControlBoundary;
       if (!valid) failure.assign("pair-control boundary was not admitted"_ctv);
-      if (valid && action == "query"_ctv && intent.testControlBoundaryClosed)
+      if (valid && (action == "query"_ctv || action == "service"_ctv || action == "fault"_ctv) && intent.testControlBoundaryClosed)
       { failure.assign("pair-control boundary is closed"_ctv); valid = false; }
     }
     if (valid && action == "service"_ctv)
@@ -19096,6 +19095,11 @@ private:
         valid = mothershipPairControlServiceTransitArguments(boundary, service, arguments, &failure) &&
             mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
       }
+      else if (action == "fault"_ctv)
+      {
+        valid = mothershipPairControlFaultArguments(boundary, fault, arguments, &failure) &&
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+      }
       if (valid && action != "remove"_ctv)
       {
         String output = {};
@@ -19119,9 +19123,9 @@ private:
       if (::inet_ntop(AF_INET6, service.sourceWhiteholeAddress.v6, source, sizeof(source))) sourceAddress.assign(source);
       if (::inet_ntop(AF_INET6, service.destinationWormholeAddress.v6, destination, sizeof(destination))) destinationAddress.assign(destination);
     }
-    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u source=%s:%u destination=%s:%u failure=%s\n",
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u faultDelayMs=%u faultDurationMs=%u source=%s:%u destination=%s:%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
-        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), sourceAddress.c_str(),
+        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), fault.delayMilliseconds, fault.durationMilliseconds, sourceAddress.c_str(),
         unsigned(action == "service"_ctv ? service.sourceTCPPort : 0), destinationAddress.c_str(),
         unsigned(action == "service"_ctv ? service.destinationTCPPort : 0), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
@@ -22754,8 +22758,8 @@ int main(int argc, char *argv[])
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
-    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON]\n");
-    message.append("\tmanages enrolled TCP control transit and one exact permission-verified Whitehole-to-protected-Wormhole test flow\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs]\n");
+    message.append("\tmanages enrolled TCP control transit, one exact permission-verified Whitehole-to-protected-Wormhole test flow, and a bounded carrier-only partition fault\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");
