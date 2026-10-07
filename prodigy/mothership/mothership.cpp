@@ -19271,11 +19271,10 @@ private:
       if (valid && action != "remove"_ctv)
       {
         String output = {};
-        const MothershipPairControlServiceTransit *expectedService =
-            intent.testControlServiceTransitAdmitted ? &intent.testControlServiceTransit : nullptr;
         valid = mothershipPairControlBoundaryArguments(boundary, "query"_ctv, arguments, &failure) &&
             mothershipRunVirtualDatacenterProvider(std::move(arguments), &output, &failure) &&
-            mothershipPairControlBoundaryPreparedReceiptValid(boundary, output, expectedService);
+            mothershipPairControlBoundaryPreparedReceiptValid(boundary, output, intent.testControlServiceTransits);
+        if (valid && action == "query"_ctv) basics_log("%s", output.c_str());
         if (!valid && failure.empty()) failure.assign("pair-control provider did not prove the exact prepared boundary"_ctv);
       }
       if (valid && action == "remove"_ctv)

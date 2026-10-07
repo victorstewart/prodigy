@@ -134,6 +134,82 @@ run_case owned
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlServiceDescriptorStatusIsolation(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_service_status_fixture_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_service_status_fixture_reads_provider"); return; }
+  std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const auto extract = [&](const char *first, const char *after) {
+    const size_t begin = text.find(first), end = text.find(after, begin);
+    return begin == std::string::npos || end == std::string::npos ? std::string{} : text.substr(begin, end - begin);
+  };
+  const std::string descriptors = extract("pair_control_service_suffix()\n{\n", "\npair_control_service_side()\n");
+  const std::string validation = extract("pair_control_validate_service_one_inside()\n{\n", "\npair_control_remove_service_route()\n");
+  const std::string cleanup = extract("pair_control_cleanup_inside()\n{\n", "\npair_control_bind_parents()\n");
+  suite.expect(!descriptors.empty() && !validation.empty() && !cleanup.empty(),
+               "pair_service_status_fixture_extracts_real_provider_helpers");
+  if (descriptors.empty() || validation.empty() || cleanup.empty()) return;
+
+  // The external route and namespace operations are mocked.  The status
+  // plumbing itself is real extracted provider code: absence is optional only
+  // for a missing descriptor, never for malformed state or a failed owned
+  // route removal.
+  const std::string script = "set -euo pipefail\n" + descriptors + validation + cleanup + R"TEST(
+pair_control_dir="$PWD/pair"
+pair_control_router_ns=""
+pair_control_first_link=""
+pair_control_second_link=""
+pair_control_first_subnet="fd42:1::/64"
+pair_control_second_subnet="fd42:2::/64"
+mkdir -p "$pair_control_dir"
+mode=valid
+pair_control_parse_service_args() {
+  pair_control_service_source_uuid=0x01; pair_control_service_destination_uuid=0x02
+  pair_control_service_source_address=2001:db8:1::2; pair_control_service_destination_address=2001:db8:2::3
+  pair_control_service_source_ingress_private6=fd42:1::4; pair_control_service_destination_ingress_private6=fd42:2::5
+  pair_control_service_source_side=first; pair_control_service_destination_side=second
+  pair_control_service_source_router=fd42:1::1; pair_control_service_destination_router=fd42:2::1
+  return 0
+}
+pair_control_service_side() { return 0; }
+pair_control_service_route_journal_valid() { [[ "$mode" != validation_fail ]]; }
+pair_control_service_route_exact() { [[ "$mode" != validation_fail ]]; }
+pair_control_remove_service_route() { [[ "$mode" != cleanup_fail ]]; }
+pair_write() { printf '%s\n' "$2" > "$1"; }
+write_descriptor() { for _ in $(seq 1 13); do printf x; printf '\n'; done > "$pair_control_dir/service-descriptor"; }
+status_of() { if "$@"; then printf 0; else printf '%s' "$?"; fi; }
+[[ "$(status_of pair_control_load_service_descriptor base)" == 3 ]]
+printf x > "$pair_control_dir/service-descriptor"
+[[ "$(status_of pair_control_load_service_descriptor base)" == 2 ]]
+rm -f "$pair_control_dir/service-descriptor"
+[[ "$(status_of pair_control_validate_service_inside)" == 0 ]]
+write_descriptor
+printf prepared > "$pair_control_dir/service-phase"
+mode=validation_fail
+[[ "$(status_of pair_control_validate_service_inside)" == 1 ]]
+mode=cleanup_fail
+if pair_control_cleanup_inside; then exit 1; fi
+[[ ! -e "$pair_control_dir/phase" ]]
+)TEST";
+  char temporary[] = "./pair-service-status-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_service_status_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_service_absence_is_distinct_from_invalid_descriptor_validation_and_cleanup_failure");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
 static MothershipVirtualDatacenterPairBoundaryDescriptor testPairDrainBoundary()
 {
   MothershipVirtualDatacenterPairBoundaryDescriptor boundary = {};
@@ -550,6 +626,7 @@ int main()
 {
   TestSuite suite;
   testPairOwnedLinkCleanupRace(suite);
+  testPairControlServiceDescriptorStatusIsolation(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
   testPairGuestResetAbsenceProofFailsClosed(suite);

@@ -64,14 +64,15 @@ new_operation() {
   python3 - <<'PY'
 import secrets
 value = secrets.randbits(128) or 1
-print("0x" + value.to_bytes(16, "big").hex())
+print("0x" + value.to_bytes(max(1, (value.bit_length()+7)//8), "big").hex())
 PY
 }
 OPERATION=$(new_operation)
 CONFLICT_OPERATION=$(python3 - "$OPERATION" <<'PY'
 import sys
 value = int(sys.argv[1], 16) ^ 1
-print("0x" + (value or 2).to_bytes(16, "big").hex())
+value = value or 2
+print("0x" + value.to_bytes(max(1, (value.bit_length()+7)//8), "big").hex())
 PY
 )
 
@@ -132,14 +133,17 @@ assert (root/'phase').read_text().strip()=='removed'
 # receipt. Its cleanup owner writes phase=removed only after it has removed the
 # service routes, router namespace, and both owned veths. Do not require these
 # files after an ordinary or partially prepared pair-control scenario.
-if (root/'service-phase').exists():
+for suffix in ('', '-opposite'):
+    if not (root/('service-phase'+suffix)).exists(): continue
     for name in ('service-descriptor','service-phase','service-source-route',
                  'service-destination-route','service-source-local-route',
                  'service-destination-local-route','service-router-source-route',
-                 'service-router-destination-route','router-namespace','first-link','second-link'):
-        receipt=root/name
-        assert receipt.is_file() and not receipt.is_symlink(), f'missing provider cleanup receipt: {name}'
-    assert (root/'service-phase').read_text().strip()=='prepared'
+                 'service-router-destination-route'):
+        receipt=root/(name+suffix)
+        assert receipt.is_file() and not receipt.is_symlink(), f'missing provider cleanup receipt: {name}{suffix}'
+    assert (root/('service-phase'+suffix)).read_text().strip()=='prepared'
+    for name in ('router-namespace','first-link','second-link'):
+        assert (root/name).is_file() and not (root/name).is_symlink()
 if not (root/'owner').exists(): raise SystemExit(0)
 pid,start,mount=(root/'owner').read_text().split()
 deadline=time.monotonic()+5
@@ -200,12 +204,15 @@ trap 'exit 143' TERM
 
 request() {
   local name=$1 workspace=$2
+  local machine_cores=4
+  [[ ${PRODIGY_DEV_COUSIN_GRAPH:-0} != 1 ]] || machine_cores=8
   # Fleet prefixes require the ordinary BGP-enabled environment. The inactive
   # peer is confined to each fake machine's loopback; this scenario qualifies
   # the provider's explicit service transit, not upstream BGP convergence.
   jq -nc --arg name "$name" --arg workspace "$workspace" --arg probe "${PRODIGY_DEV_COUSIN_PROBE_BIN:-}" \
+    --argjson machineCores "$machine_cores" \
     --arg lifecycle "${PRODIGY_DEV_COUSIN_LIFECYCLE:-}" \
-    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:(if $lifecycle == "" then 180 else 2 end),machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
+    '{name:$name,deploymentMode:"test",internalTransportProfile:"aegis-x25519-v1",nBrains:3,autoscaleIntervalSeconds:(if $lifecycle == "" then 180 else 2 end),machineSchemas:[{schema:"pair-enrollment-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:$machineCores,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
      (if $probe != "" then {bgp:{enabled:true,nextHop6:"::1",peers:[{peerASN:64512,peerAddress:"127.0.0.2",sourceAddress:"127.0.0.1"}]}} else {} end)'
 }
 
@@ -300,6 +307,7 @@ while True:
         with path.open('rb') as stream:
             stream.seek(offsets.get(str(path),0)); data=stream.read().decode(errors='replace')
         for own,peer,pair,generation,epoch in re.findall(r'switchboard pair-control ready local=([0-9a-f]{32}) peer=([0-9a-f]{32}) pair=([0-9a-f]{32}) rootGeneration=(\d+) keyEpoch=(\d+)',data):
+            if (own,peer) not in expected: continue
             assert own==local and generation=='1' and epoch=='1'
             seen.add((own,peer)); pairs.add(pair)
     if expected <= seen and len(pairs)==1:
@@ -327,6 +335,12 @@ for block in re.findall(r'(?ms)^[ \t]*Machine:.*?(?=^[ \t]*Machine:|\Z)', pathli
 raise SystemExit('no exact current master identity')
 PY2
 }
+
+# G3A sources this file for the ordinary Mothership-client helpers without
+# entering the historical two-cluster scenario below.
+if [[ ${PRODIGY_DEV_PAIR_ENROLLMENT_LIBRARY:-0} == 1 ]]; then
+  return 0
+fi
 
 sha256sum "$PRODIGY_BIN" "$MOTHERSHIP_BIN" "$BUNDLE" >"$ROOT/artifact-identities.sha256"
 printf 'operationUUID=%s\nconflictingOperationUUID=%s\n' "$OPERATION" "$CONFLICT_OPERATION" >"$ROOT/scenario.txt"

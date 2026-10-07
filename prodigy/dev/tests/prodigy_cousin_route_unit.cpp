@@ -739,6 +739,26 @@ int main(void)
 
   MothershipPairControlBoundaryDescriptor controlBoundary = validPairControlBoundary(pairIntent);
   MothershipPairControlServiceTransit serviceTransit = validPairControlServiceTransit(pairIntent);
+  MothershipPairControlServiceTransit reverseTransit = serviceTransit;
+  std::swap(reverseTransit.sourceClusterUUID, reverseTransit.destinationClusterUUID);
+  std::swap(reverseTransit.sourceDeploymentID, reverseTransit.destinationDeploymentID);
+  std::swap(reverseTransit.sourcePermissionUUID, reverseTransit.destinationPermissionUUID);
+  std::swap(reverseTransit.sourceIngressPrivate6, reverseTransit.destinationIngressPrivate6);
+  reverseTransit.sourceWhiteholeAddress = IPAddress("2001:db8:200:2::2", true);
+  reverseTransit.destinationWormholeAddress = IPAddress("2001:db8:200:1::3", true);
+  reverseTransit.sourceTCPPort = 42002;
+  Vector<MothershipPairControlServiceTransit> transits = {serviceTransit, reverseTransit};
+  suite.require(mothershipPairControlServiceTransitsValid(transits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_allow_both_exact_directions");
+  Vector<MothershipPairControlServiceTransit> invalidTransits = {serviceTransit, serviceTransit};
+  suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_reject_duplicate_direction");
+  invalidTransits = {reverseTransit, serviceTransit};
+  suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_reject_noncanonical_direction_order");
+  invalidTransits = transits; invalidTransits.push_back(serviceTransit);
+  suite.require(!mothershipPairControlServiceTransitsValid(invalidTransits, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
+                "pair_control_transits_reject_more_than_two_directions");
   Vector<ClusterPairControlEndpoint> numericOrder = controlBoundary.firstEndpoints;
   numericOrder.push_back(validPairEndpoint(pairIntent.firstClusterUUID, 0x906, 16));
   String endpointCSV = {};
@@ -810,9 +830,22 @@ int main(void)
   serviceReceipt.append(controlBoundary.firstPrivateIPv6Subnet);
   serviceReceipt.append(" secondPrivate6Subnet=");
   serviceReceipt.append(controlBoundary.secondPrivateIPv6Subnet);
+  String reverseReceipt = serviceReceipt;
   serviceReceipt.append(" port=315 phase=prepared service=1 source=2001:db8:100:1::2:42001 destination=2001:db8:100:2::3:9443 sourceIngress=fd42:4242:4242:1::4 destinationIngress=fd42:4242:4242:2::5\n"_ctv);
   suite.require(mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, &serviceTransit),
                 "pair_control_service_transit_receipt_binds_exact_source_and_destination_tuples");
+  reverseReceipt.append(" port=315 phase=prepared service=1 source=2001:db8:200:2::2:42002 destination=2001:db8:200:1::3:9443 sourceIngress=fd42:4242:4242:2::5 destinationIngress=fd42:4242:4242:1::4\n"_ctv);
+  String bothReceipts = serviceReceipt; bothReceipts.append(reverseReceipt);
+  suite.require(mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, bothReceipts, transits),
+                "pair_control_receipt_requires_both_admitted_directions");
+  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, transits),
+                "pair_control_receipt_rejects_missing_reverse_direction");
+  String badReceipts = bothReceipts; badReceipts.append(reverseReceipt);
+  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, badReceipts, transits),
+                "pair_control_receipt_rejects_extra_direction_receipt");
+  badReceipts = reverseReceipt; badReceipts.append(serviceReceipt);
+  suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, badReceipts, transits),
+                "pair_control_receipt_rejects_reordered_direction_receipts");
   MothershipPairControlServiceTransit receiptChangedTransit = serviceTransit;
   receiptChangedTransit.sourceTCPPort++;
   suite.require(!mothershipPairControlBoundaryPreparedReceiptValid(controlBoundary, serviceReceipt, &receiptChangedTransit),
@@ -839,8 +872,8 @@ int main(void)
                   "pair_control_boundary_rejects_changed_delivered_roster");
     suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, serviceTransit,
                                                                             pairRecorded, &failure) &&
-                  pairRecorded.testControlServiceTransitAdmitted &&
-                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransit, serviceTransit),
+                  !pairRecorded.testControlServiceTransits.empty() &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransits[0], serviceTransit),
                   "pair_control_service_transit_records_open_exact_qualified_boundary");
     suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, serviceTransit,
                                                                             pairRecorded, &failure),
@@ -850,25 +883,79 @@ int main(void)
     suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, changedServiceTransit,
                                                                              pairRecorded, &failure),
                   "pair_control_service_transit_rejects_changed_immutable_tuple");
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, reverseTransit, pairRecorded, &failure) &&
+                  pairRecorded.testControlServiceTransits.size() == 2 &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransits[1], reverseTransit),
+                  "pair_control_service_transit_admits_reverse_without_replacing_original");
+    suite.require(pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, reverseTransit, pairRecorded, &failure) &&
+                  pairRecorded.testControlServiceTransits.size() == 2,
+                  "pair_control_service_transit_reverse_retry_preserves_both_directions");
+    changedServiceTransit = reverseTransit; changedServiceTransit.sourcePermissionUUID++;
+    suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, changedServiceTransit, pairRecorded, &failure),
+                  "pair_control_service_transit_rejects_reverse_permission_change");
+    changedServiceTransit = reverseTransit; changedServiceTransit.sourceClusterUUID++;
+    suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, changedServiceTransit, pairRecorded, &failure),
+                  "pair_control_service_transit_rejects_foreign_source_cluster");
+
   }
   {
     MothershipClusterRegistry pairRegistry {String(pairDirectory)};
     suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure) &&
                   pairRecorded.testControlBoundaryAdmitted && !pairRecorded.testControlBoundaryClosed &&
-                  pairRecorded.testControlServiceTransitAdmitted &&
-                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransit, serviceTransit),
-                  "pair_control_boundary_cold_reopen_preserves_exact_open_descriptor");
+                  !pairRecorded.testControlServiceTransits.empty() &&
+                  pairRecorded.testControlServiceTransits.size() == 2 &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransits[0], serviceTransit) &&
+                  mothershipPairControlServiceTransitEqual(pairRecorded.testControlServiceTransits[1], reverseTransit),
+                  "pair_control_boundary_cold_reopen_preserves_both_exact_directions");
+    // Construct the historical V3 tail independently of the new vector codec.
+    // The V2 prefix is unchanged, followed by its old admitted byte and one
+    // standalone service-transit object.
+    MothershipClusterPairEnrollmentIntent oldPrefix = pairRecorded;
+    oldPrefix.protocolVersion = 2; oldPrefix.testControlServiceTransits.clear();
+    String oldBytes, transitBytes;
+    BitseryEngine::serialize(oldBytes, oldPrefix);
+    oldBytes[0] = 3;
+    oldBytes.append(uint8_t(1));
+    BitseryEngine::serialize(transitBytes, serviceTransit);
+    oldBytes.append(transitBytes);
+    MothershipClusterPairEnrollmentIntent oldDecoded = {};
+    suite.require(BitseryEngine::deserializeSafe(oldBytes, oldDecoded) && mothershipClusterPairEnrollmentIntentValid(oldDecoded) &&
+                  oldDecoded.protocolVersion == 3 && oldDecoded.testControlServiceTransits.size() == 1 &&
+                  mothershipPairControlServiceTransitEqual(oldDecoded.testControlServiceTransits[0], serviceTransit),
+                  "pair_control_v3_wire_loads_only_original_direction");
+    MothershipClusterPairEnrollmentIntent invalidIntent = pairRecorded;
+    invalidIntent.protocolVersion = 3;
+    suite.require(!mothershipClusterPairEnrollmentIntentValid(invalidIntent),
+                  "pair_control_v3_cannot_encode_two_directions");
+    invalidIntent = pairRecorded; invalidIntent.testControlBoundaryAdmitted = false;
+    suite.require(!mothershipClusterPairEnrollmentIntentValid(invalidIntent),
+                  "pair_control_service_set_requires_admitted_boundary");
+    String currentBytes; BitseryEngine::serialize(currentBytes, pairRecorded);
+    for (uint32_t cut : {uint32_t(currentBytes.size()-1), uint32_t(currentBytes.size()/2)})
+    {
+      MothershipClusterPairEnrollmentIntent truncated = {};
+      String bytes = currentBytes.substr(0, cut, Copy::yes);
+      suite.require(!BitseryEngine::deserializeSafe(bytes, truncated), "pair_control_service_set_rejects_truncated_wire");
+    }
+    currentBytes[0] = 5;
+    MothershipClusterPairEnrollmentIntent unsupported = {};
+    suite.require(!BitseryEngine::deserializeSafe(currentBytes, unsupported) || !mothershipClusterPairEnrollmentIntentValid(unsupported),
+                  "pair_control_service_set_rejects_unknown_wire_version");
     bool guardOpen = false;
     suite.require(pairRegistry.clusterHasOpenTestPairControlBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && guardOpen &&
                   pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.secondClusterUUID, guardOpen, &failure) && guardOpen,
                   "pair_control_boundary_open_guard_blocks_cluster_removal");
     suite.require(pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, true, pairRecorded, &failure) &&
-                  pairRecorded.testControlBoundaryClosed && pairRecorded.testControlServiceTransitAdmitted,
+                  pairRecorded.testControlBoundaryClosed && !pairRecorded.testControlServiceTransits.empty(),
                   "pair_control_boundary_closes_durable_guard");
     suite.require(pairRegistry.clusterHasOpenTestPairBoundary(pairIntent.firstClusterUUID, guardOpen, &failure) && !guardOpen,
                   "pair_control_boundary_closed_guard_no_longer_blocks_removal");
     suite.require(!pairRegistry.recordClusterPairTestControlBoundary(controlBoundary, false, pairRecorded, &failure),
                   "pair_control_boundary_closed_descriptor_cannot_reopen");
+    suite.require(!pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, serviceTransit, pairRecorded, &failure) &&
+                  !pairRegistry.recordClusterPairTestControlServiceTransit(pairIntent.operationUUID, reverseTransit, pairRecorded, &failure),
+                  "pair_control_closed_boundary_rejects_both_service_retries");
+
   }
 
   char legacyPairDirectoryTemplate[] = "/tmp/prodigy-pair-enrollment-v1-unit-XXXXXX";

@@ -2026,27 +2026,41 @@ pair_control_cleanup_inside()
          fi
       fi
    done
-   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
-      pair_control_load_service_descriptor || status=1
-      if [[ "$status" == 0 ]]; then
-         pair_control_service_side || status=1
-         pair_control_remove_service_route "pc-$pair_control_service_source_side" service-source-route \
-            "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || status=1
-         pair_control_remove_service_route "pc-$pair_control_service_destination_side" service-destination-route \
-            "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || status=1
-         pair_control_remove_service_route "pc-$pair_control_service_source_side" service-source-local-route \
-            "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || status=1
-         pair_control_remove_service_route "pc-$pair_control_service_destination_side" service-destination-local-route \
-            "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || status=1
-         # The namespace removal below disposes of these router routes too, but
-         # validating and removing them here proves cleanup owns no foreign
-         # route after a partial service install.
-         pair_control_remove_service_route "$pair_control_router_ns" service-router-source-route \
-            "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || status=1
-         pair_control_remove_service_route "$pair_control_router_ns" service-router-destination-route \
-            "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || status=1
+   pair_control_cleanup_service_one_inside()
+   {
+      local slot="$1" loaded name
+      if pair_control_load_service_descriptor "$slot"; then
+         loaded=0
+      else
+         loaded=$?
       fi
-   fi
+      [[ "$loaded" == 0 ]] || return "$loaded"
+      pair_control_service_side || return 1
+      name="$(pair_control_service_name service-source-route "$slot")" || return 1
+      pair_control_remove_service_route "pc-$pair_control_service_source_side" "$name" \
+         "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+      name="$(pair_control_service_name service-destination-route "$slot")" || return 1
+      pair_control_remove_service_route "pc-$pair_control_service_destination_side" "$name" \
+         "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+      name="$(pair_control_service_name service-source-local-route "$slot")" || return 1
+      pair_control_remove_service_route "pc-$pair_control_service_source_side" "$name" \
+         "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+      name="$(pair_control_service_name service-destination-local-route "$slot")" || return 1
+      pair_control_remove_service_route "pc-$pair_control_service_destination_side" "$name" \
+         "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+      name="$(pair_control_service_name service-router-source-route "$slot")" || return 1
+      pair_control_remove_service_route "$pair_control_router_ns" "$name" \
+         "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+      name="$(pair_control_service_name service-router-destination-route "$slot")" || return 1
+      pair_control_remove_service_route "$pair_control_router_ns" "$name" \
+         "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0"
+   }
+   local service_cleanup
+   if pair_control_cleanup_service_one_inside base; then service_cleanup=0; else service_cleanup=$?; fi
+   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
+   if [[ "$service_cleanup" == 3 ]] && { [[ -e "$(pair_control_service_path service-descriptor opposite)" || -L "$(pair_control_service_path service-descriptor opposite)" ]]; }; then status=1; fi
+   if pair_control_cleanup_service_one_inside opposite; then service_cleanup=0; else service_cleanup=$?; fi
+   [[ "$service_cleanup" == 0 || "$service_cleanup" == 3 ]] || status=1
    # The router is owned only by this supervisor's private mount namespace.
    if [[ -n "${pair_control_router_ns:-}" && -e "/run/netns/$pair_control_router_ns" ]]; then
       [[ -f "$pair_control_dir/router-namespace" && "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]] || status=1
@@ -2121,14 +2135,79 @@ print(rows[0]["mtu"])
 '
 }
 
+pair_control_service_suffix()
+{
+   [[ "$1" == base || "$1" == opposite ]] || return 2
+   [[ "$1" == base ]] || printf '%s' '-opposite'
+}
+
+pair_control_service_path()
+{
+   local name="$1" slot="$2"
+   printf '%s/%s%s\n' "$pair_control_dir" "$name" "$(pair_control_service_suffix "$slot")"
+}
+
+pair_control_service_name()
+{
+   local name="$1" slot="$2"
+   printf '%s%s\n' "$name" "$(pair_control_service_suffix "$slot")"
+}
+
 pair_control_load_service_descriptor()
 {
+   local slot="${1:-base}" path
+   path="$(pair_control_service_path service-descriptor "$slot")" || return 2
    pair_control_service_args=()
-   [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]] || return 1
-   [[ -f "$pair_control_dir/service-descriptor" && ! -L "$pair_control_dir/service-descriptor" ]] || return 2
-   mapfile -t pair_control_service_args < "$pair_control_dir/service-descriptor"
+   # Status 3 is reserved for a genuinely absent optional slot. Every
+   # malformed, unsafe, or unparsable descriptor is a hard failure.
+   [[ -e "$path" || -L "$path" ]] || return 3
+   [[ -f "$path" && ! -L "$path" ]] || return 2
+   mapfile -t pair_control_service_args < "$path" || return 2
    [[ ${#pair_control_service_args[@]} -eq 13 ]] || return 2
-   pair_control_parse_service_args "${pair_control_service_args[@]}"
+   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 2
+}
+
+# Keep the legacy root descriptor as the first service.  A second, opposite
+# direction is stored in an explicitly named sibling, never folded into a
+# mutable aggregate.  This leaves old one-service journals byte-for-byte
+# usable during query and recovery cleanup.
+pair_control_select_service_slot()
+{
+   local requested existing=() base_source opposite_path
+   requested="$(pair_control_service_descriptor)" || return 1
+   if pair_control_load_service_descriptor base; then
+      existing=("${pair_control_service_args[@]}")
+   else
+      local loaded=$?
+      [[ "$loaded" == 3 ]] || return 1
+      pair_control_service_transit_slot=base
+      pair_control_service_args=()
+      mapfile -t pair_control_service_args <<< "$requested"
+      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
+      return 0
+   fi
+   if [[ "$(printf '%s\n' "${existing[@]}")" == "$requested" ]]; then
+      pair_control_service_transit_slot=base
+      pair_control_service_args=("${existing[@]}")
+      return 0
+   fi
+   base_source="$pair_control_service_source_uuid"
+   pair_control_service_args=()
+   mapfile -t pair_control_service_args <<< "$requested"
+   pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
+   # There are exactly two cluster identities. A second tuple may only be the
+   # reverse direction of the legacy/root tuple.
+   [[ "$pair_control_service_source_uuid" != "$base_source" ]] || return 1
+   opposite_path="$(pair_control_service_path service-descriptor opposite)" || return 1
+   if [[ -e "$opposite_path" || -L "$opposite_path" ]]; then
+      pair_control_load_service_descriptor opposite || return 1
+      [[ "$(pair_control_service_descriptor)" == "$requested" ]] || return 1
+   else
+      pair_control_service_args=()
+      mapfile -t pair_control_service_args <<< "$requested"
+      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
+   fi
+   pair_control_service_transit_slot=opposite
 }
 
 pair_control_service_side()
@@ -2228,55 +2307,87 @@ pair_control_install_service_route()
 pair_control_install_service_inside()
 {
    [[ ${#pair_control_service_args[@]} -eq 13 ]] || return 1
-   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
-      local existing=()
-      [[ -f "$pair_control_dir/service-descriptor" && ! -L "$pair_control_dir/service-descriptor" ]] || return 1
-      mapfile -t existing < "$pair_control_dir/service-descriptor"
-      [[ "$(printf '%s\n' "${existing[@]}")" == "$(pair_control_service_descriptor)" ]] || return 1
+   local requested descriptor_path name
+   requested="$(pair_control_service_descriptor)" || return 1
+   pair_control_select_service_slot || return 1
+   descriptor_path="$(pair_control_service_path service-descriptor "$pair_control_service_transit_slot")" || return 1
+   if [[ -e "$descriptor_path" || -L "$descriptor_path" ]]; then
+      [[ -f "$descriptor_path" && ! -L "$descriptor_path" && "$(<"$descriptor_path")" == "$requested" ]] || return 1
    else
-      pair_write "$pair_control_dir/service-descriptor" "$(pair_control_service_descriptor)"
+      pair_write "$descriptor_path" "$requested" || return 1
+      pair_control_service_args=()
+      mapfile -t pair_control_service_args <<< "$requested"
+      pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1
    fi
    pair_control_service_side || return 1
-   # Rebuild the restrictive firewall with the tuple before either external
-   # /128 route becomes live.
+   # Rebuild the restrictive policy with every descriptor persisted before
+   # either of this direction's external /128 routes becomes live.
    pair_control_firewall || return 1
-   # The two parent cross-routes select the pair router.  Router-local routes
-   # then select the exact current ingress node, and the parent-local routes
-   # return traffic from that ingress node to the selected endpoint.
-   pair_control_install_service_route "pc-$pair_control_service_source_side" service-source-route \
+   name="$(pair_control_service_name service-source-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "pc-$pair_control_service_source_side" "$name" \
       "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
-   pair_control_install_service_route "pc-$pair_control_service_destination_side" service-destination-route \
+   name="$(pair_control_service_name service-destination-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "pc-$pair_control_service_destination_side" "$name" \
       "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
-   pair_control_install_service_route "$pair_control_router_ns" service-router-source-route \
+   name="$(pair_control_service_name service-router-source-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "$pair_control_router_ns" "$name" \
       "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
-   pair_control_install_service_route "$pair_control_router_ns" service-router-destination-route \
+   name="$(pair_control_service_name service-router-destination-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "$pair_control_router_ns" "$name" \
       "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
-   pair_control_install_service_route "pc-$pair_control_service_source_side" service-source-local-route \
+   name="$(pair_control_service_name service-source-local-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "pc-$pair_control_service_source_side" "$name" \
       "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
-   pair_control_install_service_route "pc-$pair_control_service_destination_side" service-destination-local-route \
+   name="$(pair_control_service_name service-destination-local-route "$pair_control_service_transit_slot")" || return 1
+   pair_control_install_service_route "pc-$pair_control_service_destination_side" "$name" \
       "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
-   pair_write "$pair_control_dir/service-phase" prepared
+   pair_write "$(pair_control_service_path service-phase "$pair_control_service_transit_slot")" prepared
+}
+
+pair_control_validate_service_one_inside()
+{
+   local slot="$1" loaded name phase
+   if pair_control_load_service_descriptor "$slot"; then
+      loaded=0
+   else
+      loaded=$?
+   fi
+   [[ "$loaded" == 0 ]] || return "$loaded"
+   pair_control_service_side || return 1
+   phase="$(pair_control_service_path service-phase "$slot")" || return 1
+   [[ -f "$phase" && ! -L "$phase" && "$(<"$phase")" == prepared ]] || return 1
+   name="$(pair_control_service_name service-source-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+   name="$(pair_control_service_name service-destination-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+   name="$(pair_control_service_name service-router-source-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+   name="$(pair_control_service_name service-router-destination-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
+   name="$(pair_control_service_name service-source-local-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+   name="$(pair_control_service_name service-destination-local-route "$slot")" || return 1
+   pair_control_service_route_journal_valid "$name" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
+   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
+   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0
 }
 
 pair_control_validate_service_inside()
 {
-   pair_control_load_service_descriptor
-   local loaded=$?
-   [[ "$loaded" == 0 ]] || { [[ "$loaded" == 1 ]] && return 0; return 1; }
-   pair_control_service_side || return 1
-   [[ -f "$pair_control_dir/service-phase" && ! -L "$pair_control_dir/service-phase" && "$(<"$pair_control_dir/service-phase")" == prepared ]] || return 1
-   pair_control_service_route_journal_valid service-source-route "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || return 1
-   pair_control_service_route_journal_valid service-destination-route "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || return 1
-   pair_control_service_route_journal_valid service-router-source-route "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || return 1
-   pair_control_service_route_journal_valid service-router-destination-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || return 1
-   pair_control_service_route_journal_valid service-source-local-route "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || return 1
-   pair_control_service_route_journal_valid service-destination-local-route "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || return 1
-   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_destination_address}/128" "$pair_control_service_source_router" vdcbr0 || { echo "pair-control service rejected: service-source-route" >&2; return 1; }
-   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_source_address}/128" "$pair_control_service_destination_router" vdcbr0 || { echo "pair-control service rejected: service-destination-route" >&2; return 1; }
-   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" "${pair_control_service_source_side}0" || { echo "pair-control service rejected: service-router-source-route" >&2; return 1; }
-   pair_control_service_route_exact "$pair_control_router_ns" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" "${pair_control_service_destination_side}0" || { echo "pair-control service rejected: service-router-destination-route" >&2; return 1; }
-   pair_control_service_route_exact "pc-$pair_control_service_source_side" "${pair_control_service_source_address}/128" "$pair_control_service_source_ingress_private6" vdcbr0 || { echo "pair-control service rejected: service-source-local-route" >&2; return 1; }
-   pair_control_service_route_exact "pc-$pair_control_service_destination_side" "${pair_control_service_destination_address}/128" "$pair_control_service_destination_ingress_private6" vdcbr0 || { echo "pair-control service rejected: service-destination-local-route" >&2; return 1; }
+   local loaded opposite_descriptor
+   if pair_control_validate_service_one_inside base; then loaded=0; else loaded=$?; fi
+   if [[ "$loaded" == 3 ]]; then
+      opposite_descriptor="$(pair_control_service_path service-descriptor opposite)" || return 1
+      [[ ! -e "$opposite_descriptor" && ! -L "$opposite_descriptor" ]] || return 1
+      return 0
+   fi
+   [[ "$loaded" == 0 ]] || return 1
+   if pair_control_validate_service_one_inside opposite; then loaded=0; else loaded=$?; fi
+   [[ "$loaded" == 0 || "$loaded" == 3 ]] || return 1
 }
 
 pair_control_remove_service_route()
@@ -2320,16 +2431,19 @@ pair_control_firewall()
    done; done
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i first0 -o second0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
    ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD -i second0 -o first0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-   if pair_control_load_service_descriptor; then
-      pair_control_service_side || return 1
-      ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
-         -i "${pair_control_service_source_side}0" -o "${pair_control_service_destination_side}0" \
-         -s "$pair_control_service_source_address" -d "$pair_control_service_destination_address" \
-         -p tcp --sport "$pair_control_service_source_port" --dport "$pair_control_service_destination_port" -j ACCEPT
-   else
-      local service_load=$?
-      [[ "$service_load" == 1 ]] || return 1
-   fi
+   local service_slot service_load
+   for service_slot in base opposite; do
+      if pair_control_load_service_descriptor "$service_slot"; then
+         pair_control_service_side || return 1
+         ip netns exec "$pair_control_router_ns" ip6tables -A FORWARD \
+            -i "${pair_control_service_source_side}0" -o "${pair_control_service_destination_side}0" \
+            -s "$pair_control_service_source_address" -d "$pair_control_service_destination_address" \
+            -p tcp --sport "$pair_control_service_source_port" --dport "$pair_control_service_destination_port" -j ACCEPT || return 1
+      else
+         service_load=$?
+         [[ "$service_load" == 3 ]] || return 1
+      fi
+   done
    # NDP is link-local to each VDC bridge and router interface. It never
    # traverses this router's FORWARD hook, so there is no broad ICMPv6 rule.
    digest="$(pair_control_firewall_digest)" || return 1
@@ -2481,12 +2595,37 @@ pair_control_query_inside()
    [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
       "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
       "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || { echo "pair-control query rejected: firewall" >&2; return 1; }
-   if [[ -e "$pair_control_dir/service-descriptor" || -L "$pair_control_dir/service-descriptor" ]]; then
+   pair_control_emit_service_receipt()
+   {
       printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared service=1 source=%s:%s destination=%s:%s sourceIngress=%s destinationIngress=%s\n' \
          "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port" \
          "$pair_control_service_source_address" "$pair_control_service_source_port" "$pair_control_service_destination_address" "$pair_control_service_destination_port" \
          "$pair_control_service_source_ingress_private6" "$pair_control_service_destination_ingress_private6"
+   }
+   local load_status base_source opposite_source base_args=() opposite_args=()
+   if pair_control_load_service_descriptor base; then
+      base_args=("${pair_control_service_args[@]}"); base_source="$pair_control_service_source_uuid"
+      if pair_control_load_service_descriptor opposite; then
+         opposite_args=("${pair_control_service_args[@]}"); opposite_source="$pair_control_service_source_uuid"
+         [[ "$base_source" != "$opposite_source" ]] || return 1
+         # The receipt order is the boundary's first cluster then second
+         # cluster, independent of which direction was admitted first.
+         if [[ "$base_source" == "$pair_control_first_uuid" ]]; then
+            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
+            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
+         else
+            [[ "$opposite_source" == "$pair_control_first_uuid" ]] || return 1
+            pair_control_service_args=("${opposite_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
+            pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
+         fi
+      else
+         load_status=$?
+         [[ "$load_status" == 3 ]] || return 1
+         pair_control_service_args=("${base_args[@]}"); pair_control_parse_service_args "${pair_control_service_args[@]}" || return 1; pair_control_emit_service_receipt
+      fi
    else
+      load_status=$?
+      [[ "$load_status" == 3 && ! -e "$(pair_control_service_path service-descriptor opposite)" && ! -L "$(pair_control_service_path service-descriptor opposite)" ]] || return 1
       printf 'PAIR_CONTROL operationID=%s firstClusterUUID=%s secondClusterUUID=%s firstRuntimeIdentity=%s secondRuntimeIdentity=%s firstPrivate6Subnet=%s secondPrivate6Subnet=%s port=%s phase=prepared\n' \
          "$pair_control_id" "$pair_control_first_uuid" "$pair_control_second_uuid" "$pair_control_first_runtime" "$pair_control_second_runtime" "$pair_control_first_subnet" "$pair_control_second_subnet" "$pair_control_port"
    fi

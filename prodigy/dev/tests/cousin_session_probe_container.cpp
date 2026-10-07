@@ -88,6 +88,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   int64_t nextEchoAtMs = 0;
   int64_t outboundStartedAtMs = 0;
   bool lifecycleProfile = false;
+  bool graphProfile = false;
   int64_t firstPayloadAtMs = 0;
   int64_t nextScaleMetricAtMs = 0;
 
@@ -163,7 +164,8 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   {
     const int64_t now = Time::msSinceBoot();
     if (!source || outbound || !sourceWhitehole || permissionUUID == 0 || now < nextRequestAtMs ||
-        requestAttempts >= maximumRequests || now - startedAtMs > (lifecycleProfile ? 360000 : maximumDurationMs)) return;
+        requestAttempts >= (graphProfile ? 512 : maximumRequests) ||
+        now - startedAtMs > (graphProfile ? 1800000 : (lifecycleProfile ? 360000 : maximumDurationMs))) return;
     ProdigyCousinSessionRequest request = {};
     request.requestUUID = ++nextRequestUUID;
     request.permissionUUID = permissionUUID;
@@ -278,7 +280,7 @@ public:
     const int64_t now = Time::msSinceBoot();
     // Keep each connection attempt bounded and exercise fresh requests after
     // setup completes, including when an earlier request raced the offline marker.
-    if (outbound && now - outboundStartedAtMs >= maximumSessionDurationMs) notifyOutboundFailure();
+    if (outbound && now - outboundStartedAtMs >= (graphProfile ? 120000 : maximumSessionDurationMs)) notifyOutboundFailure();
     if (outbound && outbound->isTransportNegotiated()) {
       if (!payloadQueued && now >= nextEchoAtMs) { outbound->wBuffer.append(probePayload); payloadQueued = true; }
       if (payloadQueued && outbound->rBuffer.size() == probePayload.size() &&
@@ -321,6 +323,8 @@ public:
     source = matches == 1;
     const char *lifecycle = std::getenv("COUSIN_PROBE_LIFECYCLE");
     lifecycleProfile = lifecycle && std::strcmp(lifecycle, "1") == 0;
+    const char *graph = std::getenv("COUSIN_PROBE_GRAPH");
+    graphProfile = graph && std::strcmp(graph, "1") == 0;
     if (source && !readPermissionUUID(permissionUUID)) { failClosed("source_config"); std::exit(EXIT_FAILURE); }
     startedAtMs = Time::msSinceBoot();
     sessions = std::make_unique<ProdigyCousinSessionClient>(hub->parameters.uuid);

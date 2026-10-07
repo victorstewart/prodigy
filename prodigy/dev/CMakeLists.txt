@@ -2479,6 +2479,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_cousin_session_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_session_observe_unit.py)
    set_tests_properties(prodigy_cousin_session_observe_unit PROPERTIES TIMEOUT 15)
+   add_test(NAME prodigy_cousin_multicluster_observe_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_multicluster_observe_unit.py)
+   set_tests_properties(prodigy_cousin_multicluster_observe_unit PROPERTIES TIMEOUT 15)
    add_test(NAME prodigy_cousin_lifecycle_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_lifecycle_observe_unit.py)
    set_tests_properties(prodigy_cousin_lifecycle_observe_unit PROPERTIES TIMEOUT 15)

@@ -153,6 +153,23 @@ static inline bool mothershipPairControlServiceTransitEqual(
       left.destinationIngressPrivate6.equals(right.destinationIngressPrivate6);
 }
 
+static constexpr uint32_t MothershipPairControlMaximumServiceTransits = 2;
+
+static inline bool mothershipPairControlServiceTransitsValid(
+    const Vector<MothershipPairControlServiceTransit>& transits,
+    uint128_t firstClusterUUID, uint128_t secondClusterUUID)
+{
+  if (transits.size() > MothershipPairControlMaximumServiceTransits) return false;
+  uint128_t previousSource = 0;
+  for (const auto& transit : transits)
+  {
+    if (!mothershipPairControlServiceTransitValid(transit, firstClusterUUID, secondClusterUUID) ||
+        transit.sourceClusterUUID <= previousSource) return false;
+    previousSource = transit.sourceClusterUUID;
+  }
+  return true;
+}
+
 class MothershipPairControlBoundaryDescriptor {
 public:
   static constexpr uint32_t version = 1;
@@ -453,14 +470,15 @@ static inline bool mothershipPairControlFaultArguments(
   return true;
 }
 
-static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
-    const MothershipPairControlBoundaryDescriptor& descriptor, const String& receipt,
+static inline bool mothershipPairControlBoundaryPreparedReceipt(
+    const MothershipPairControlBoundaryDescriptor& descriptor, String& expected,
     const MothershipPairControlServiceTransit *transit = nullptr)
 {
   if (!mothershipPairControlBoundaryValid(descriptor) ||
       (transit != nullptr && !mothershipPairControlServiceTransitValid(*transit,
           descriptor.firstClusterUUID, descriptor.secondClusterUUID))) return false;
-  String operation = {}, firstCluster = {}, secondCluster = {}, expected = {};
+  expected.clear();
+  String operation = {}, firstCluster = {}, secondCluster = {};
   operation.assignItoh(descriptor.operationUUID);
   firstCluster.assignItoh(descriptor.firstClusterUUID);
   secondCluster.assignItoh(descriptor.secondClusterUUID);
@@ -470,7 +488,7 @@ static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
         "PAIR_CONTROL operationID={} firstClusterUUID={} secondClusterUUID={} firstRuntimeIdentity={} secondRuntimeIdentity={} firstPrivate6Subnet={} secondPrivate6Subnet={} port=315 phase=prepared\n"_ctv>(
         operation, firstCluster, secondCluster, descriptor.firstRuntimeIdentity, descriptor.secondRuntimeIdentity,
         descriptor.firstPrivateIPv6Subnet, descriptor.secondPrivateIPv6Subnet);
-    return receipt == expected;
+    return true;
   }
   String source = {}, destination = {}, sourceIngress = {}, destinationIngress = {};
   char sourceBuffer[INET6_ADDRSTRLEN] = {}, destinationBuffer[INET6_ADDRSTRLEN] = {};
@@ -485,5 +503,29 @@ static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
       operation, firstCluster, secondCluster, descriptor.firstRuntimeIdentity, descriptor.secondRuntimeIdentity,
       descriptor.firstPrivateIPv6Subnet, descriptor.secondPrivateIPv6Subnet,
       source, uint64_t(transit->sourceTCPPort), destination, uint64_t(transit->destinationTCPPort), sourceIngress, destinationIngress);
+  return true;
+}
+
+static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const String& receipt,
+    const MothershipPairControlServiceTransit *transit = nullptr)
+{
+  String expected;
+  return mothershipPairControlBoundaryPreparedReceipt(descriptor, expected, transit) && receipt == expected;
+}
+
+static inline bool mothershipPairControlBoundaryPreparedReceiptValid(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const String& receipt,
+    const Vector<MothershipPairControlServiceTransit>& transits)
+{
+  if (!mothershipPairControlServiceTransitsValid(transits, descriptor.firstClusterUUID, descriptor.secondClusterUUID)) return false;
+  if (transits.empty()) return mothershipPairControlBoundaryPreparedReceiptValid(descriptor, receipt);
+  String expected;
+  for (const auto& transit : transits)
+  {
+    String line;
+    if (!mothershipPairControlBoundaryPreparedReceipt(descriptor, line, &transit)) return false;
+    expected.append(line);
+  }
   return receipt == expected;
 }

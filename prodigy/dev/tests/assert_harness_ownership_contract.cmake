@@ -256,7 +256,7 @@ foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "
    endif()
 endforeach()
 
-foreach(_cousin_client IN ITEMS prodigy_dev_cousin_session_qualification.sh prodigy_dev_cousin_lifecycle_qualification.sh prodigy_dev_cousin_session_observe.py)
+foreach(_cousin_client IN ITEMS prodigy_dev_cousin_session_qualification.sh prodigy_dev_cousin_lifecycle_qualification.sh prodigy_dev_cousin_session_observe.py prodigy_dev_cousin_multicluster_qualification.sh prodigy_dev_cousin_multicluster_observe.py)
    file(READ "${PRODIGY_ROOT}/prodigy/dev/tests/${_cousin_client}" _cousin_source)
    foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "bpftool" "mount --" "kill -" "--pair-control-launch" "--pair-control-action" "container exec" "os.kill" "subprocess.")
       string(FIND "${_cousin_source}" "${_forbidden}" _position)

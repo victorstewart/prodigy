@@ -286,7 +286,7 @@ static void serialize(S&& serializer, MothershipUpgradeAdmissionRecord& record)
 // retry-safe while each Brain remains the sole runtime authority owner.
 class MothershipClusterPairEnrollmentIntent {
 public:
-  static constexpr uint32_t version = 3;
+  static constexpr uint32_t version = 4;
   uint32_t protocolVersion = version;
   uint128_t pairUUID = 0;
   uint128_t operationUUID = 0;
@@ -314,10 +314,8 @@ public:
   bool testControlBoundaryAdmitted = false;
   bool testControlBoundaryClosed = false;
   MothershipPairControlBoundaryDescriptor testControlBoundary;
-  // Added after the carrier boundary is prepared. This is one exact,
-  // operation-bound application tuple, never an ambient VDC route.
-  bool testControlServiceTransitAdmitted = false;
-  MothershipPairControlServiceTransit testControlServiceTransit;
+  // At most one exact application tuple per direction, owned by this pair.
+  Vector<MothershipPairControlServiceTransit> testControlServiceTransits;
 
   ~MothershipClusterPairEnrollmentIntent()
   {
@@ -341,13 +339,12 @@ static inline bool mothershipClusterPairEnrollmentIntentValid(const MothershipCl
       mothershipPairControlBoundaryValid(boundary) && boundary.operationUUID == intent.operationUUID &&
       boundary.firstClusterUUID == intent.firstClusterUUID && boundary.secondClusterUUID == intent.secondClusterUUID &&
       boundary.firstEndpoints == intent.firstEndpoints && boundary.secondEndpoints == intent.secondEndpoints;
-  const bool validServiceTransit = intent.protocolVersion < 3 ? !intent.testControlServiceTransitAdmitted :
-      (!intent.testControlServiceTransitAdmitted ||
-       (validBoundary &&
-        mothershipPairControlServiceTransitValid(intent.testControlServiceTransit,
-                                                  intent.firstClusterUUID, intent.secondClusterUUID)));
-  return (intent.protocolVersion == 1 || intent.protocolVersion == 2 ||
-          intent.protocolVersion == MothershipClusterPairEnrollmentIntent::version) &&
+  const bool validServiceTransit = intent.testControlServiceTransits.empty() ||
+      (intent.protocolVersion >= 3 && intent.testControlBoundaryAdmitted && validBoundary &&
+       (intent.protocolVersion >= 4 || intent.testControlServiceTransits.size() == 1) &&
+       mothershipPairControlServiceTransitsValid(intent.testControlServiceTransits,
+                                                 intent.firstClusterUUID, intent.secondClusterUUID));
+  return (intent.protocolVersion >= 1 && intent.protocolVersion <= MothershipClusterPairEnrollmentIntent::version) &&
       validBoundary && validServiceTransit && intent.pairUUID != 0 &&
       intent.operationUUID != 0 && intent.firstClusterUUID != 0 && intent.secondClusterUUID != 0 &&
       intent.firstClusterUUID < intent.secondClusterUUID && intent.rootGeneration != 0 && intent.keyEpoch != 0 &&
@@ -395,10 +392,21 @@ static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& int
     serializer.value1b(intent.testControlBoundaryClosed);
     serializer.object(intent.testControlBoundary);
   }
-  if (intent.protocolVersion >= 3)
+  if (intent.protocolVersion == 3)
   {
-    serializer.value1b(intent.testControlServiceTransitAdmitted);
-    serializer.object(intent.testControlServiceTransit);
+    // Preserve the original single-transit wire shape. Legacy records acquire
+    // only that one direction; a reverse direction requires new admission.
+    bool admitted = !intent.testControlServiceTransits.empty();
+    MothershipPairControlServiceTransit transit = admitted ? intent.testControlServiceTransits[0] : MothershipPairControlServiceTransit {};
+    serializer.value1b(admitted);
+    serializer.object(transit);
+    intent.testControlServiceTransits.clear();
+    if (admitted) intent.testControlServiceTransits.push_back(std::move(transit));
+  }
+  else if (intent.protocolVersion >= 4)
+  {
+    serializer.container(intent.testControlServiceTransits, MothershipPairControlMaximumServiceTransits,
+        [](auto& nested, auto& transit) { nested.object(transit); });
   }
 }
 
@@ -3359,15 +3367,30 @@ public:
       if (failure) failure->assign("pair-control service transit requires an open exact enrolled boundary"_ctv);
       return false;
     }
-    if (current.testControlServiceTransitAdmitted &&
-        !mothershipPairControlServiceTransitEqual(current.testControlServiceTransit, transit))
+    bool alreadyAdmitted = false;
+    for (const auto& existing : current.testControlServiceTransits)
     {
-      if (failure) failure->assign("pair-control service transit conflicts with its immutable operation tuple"_ctv);
-      return false;
+      if (existing.sourceClusterUUID != transit.sourceClusterUUID) continue;
+      if (!mothershipPairControlServiceTransitEqual(existing, transit))
+      {
+        if (failure) failure->assign("pair-control service transit conflicts with its immutable direction tuple"_ctv);
+        return false;
+      }
+      alreadyAdmitted = true;
     }
     current.protocolVersion = MothershipClusterPairEnrollmentIntent::version;
-    current.testControlServiceTransit = transit;
-    current.testControlServiceTransitAdmitted = true;
+    if (!alreadyAdmitted)
+    {
+      if (current.testControlServiceTransits.size() >= MothershipPairControlMaximumServiceTransits)
+      {
+        if (failure) failure->assign("pair-control service transit direction capacity exceeded"_ctv);
+        return false;
+      }
+      current.testControlServiceTransits.push_back(transit);
+      if (current.testControlServiceTransits.size() == 2 &&
+          current.testControlServiceTransits[0].sourceClusterUUID > current.testControlServiceTransits[1].sourceClusterUUID)
+        std::swap(current.testControlServiceTransits[0], current.testControlServiceTransits[1]);
+    }
     if (!mothershipClusterPairEnrollmentIntentValid(current))
     {
       if (failure) failure->assign("pair-control service transit conflicts with durable enrollment state"_ctv);

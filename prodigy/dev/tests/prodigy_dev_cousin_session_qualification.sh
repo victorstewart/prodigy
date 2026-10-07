@@ -12,15 +12,17 @@ PY_CLOCK
 
 prodigy_dev_qualify_cousin_session() {
   local probe=${PRODIGY_DEV_COUSIN_PROBE_BIN:?} side cluster app name
+  local route_id=${PRODIGY_DEV_COUSIN_ROUTE_ID:-$OPERATION}
   local lifecycle=${PRODIGY_DEV_COUSIN_LIFECYCLE:-}
   case "$lifecycle" in ''|horizontal|vertical) ;; *) echo 'FAIL: unsupported COUSIN lifecycle profile' >&2; return 1 ;; esac
   [[ -x "$probe" ]] || return 1
-  local source_name="CousinSource-${OPERATION#0x}" destination_name="CousinDestination-${OPERATION#0x}"
+  local source_name="CousinSource-${route_id#0x}" destination_name="CousinDestination-${route_id#0x}"
   local source_permission destination_permission source_cluster destination_cluster source_prefix destination_prefix
-  read -r source_permission destination_permission source_prefix destination_prefix < <(python3 - "$OPERATION" <<'PY'
+  read -r source_permission destination_permission source_prefix destination_prefix < <(python3 - "$route_id" <<'PY'
 import sys
 v=int(sys.argv[1],16); part=(v>>32)&0xffffffff
-print(f'{v^0x501:032x}',f'{v^0x502:032x}',f'fdc5:{part>>16:x}:{part&65535:x}:1::/120',f'fdc5:{part>>16:x}:{part&65535:x}:2::/120')
+def canonical(n): return n.to_bytes(max(1,(n.bit_length()+7)//8),'big').hex()
+print(canonical(v^0x501),canonical(v^0x502),f'fdc5:{part>>16:x}:{part&65535:x}:1::/120',f'fdc5:{part>>16:x}:{part&65535:x}:2::/120')
 PY
 )
   source_cluster=$(rg -m1 -o 'clusterUUID=0x[0-9a-f]+' "$ROOT/create-first.log" | cut -d= -f2)
@@ -29,13 +31,20 @@ PY
   local source_app destination_app destination_prefix_uuid
   # Reserve a destination-only dummy so asymmetric application IDs are exercised.
   m cousin-reserve-dummy 30 "$ROOT/cousin-reserve-dummy.log" reserveApplicationID "$SECOND" \
-    "$(jq -nc --arg name "CousinDummy-${OPERATION#0x}" '{applicationName:$name,createIfMissing:true}')" || return
+    "$(jq -nc --arg name "CousinDummy-${route_id#0x}" '{applicationName:$name,createIfMissing:true}')" || return
   for side in source destination; do
     if [[ $side == source ]]; then cluster=$FIRST; name=$source_name; else cluster=$SECOND; name=$destination_name; fi
     m "cousin-reserve-$side" 30 "$ROOT/cousin-reserve-$side.log" reserveApplicationID "$cluster" \
       "$(jq -nc --arg name "$name" '{applicationName:$name,createIfMissing:true}')" || return
     app=$(rg -m1 -o 'appID=[1-9][0-9]*' "$ROOT/cousin-reserve-$side.log" | cut -d= -f2)
     [[ $app =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ $side == destination && $app == "$source_app" ]]; then
+      destination_name+="-distinct"; name=$destination_name
+      m cousin-reserve-destination-distinct 30 "$ROOT/cousin-reserve-destination.log" reserveApplicationID "$cluster" \
+        "$(jq -nc --arg name "$name" '{applicationName:$name,createIfMissing:true}')" || return
+      app=$(rg -m1 -o 'appID=[1-9][0-9]*' "$ROOT/cousin-reserve-destination.log" | cut -d= -f2)
+      [[ $app =~ ^[1-9][0-9]*$ && $app != "$source_app" ]] || return 1
+    fi
     m "cousin-service-$side" 30 "$ROOT/cousin-service-$side.log" reserveServiceID "$cluster" \
       "$(jq -nc --argjson app "$app" '{applicationID:$app,serviceName:"cousin",requestedServiceSlot:3,kind:"stateful",createIfMissing:true}')" || return
     local prefix
@@ -53,12 +62,12 @@ PY_PREFIX
       local prefix_index machine_uuid
       while IFS=$'\t' read -r prefix_index machine_uuid prefix; do
         m "cousin-prefix-source-$prefix_index" 30 "$ROOT/cousin-prefix-source-$prefix_index.log" registerRoutableSubnet "$cluster" \
-          "$(jq -nc --arg name "cousin-source-$prefix_index-${OPERATION#0x}" --arg prefix "$prefix" --arg machine "$machine_uuid" \
+          "$(jq -nc --arg name "cousin-source-$prefix_index-${route_id#0x}" --arg prefix "$prefix" --arg machine "$machine_uuid" \
           '{name:$name,kind:"BGP",prefix:$prefix,usage:"whiteholes",ingressScope:"singleMachine",machineUUID:$machine}')" || return
       done <"$ROOT/cousin-source-prefixes.tsv"
     else
       m cousin-prefix-destination 30 "$ROOT/cousin-prefix-destination.log" registerRoutableSubnet "$cluster" \
-        "$(jq -nc --arg name "cousin-destination-${OPERATION#0x}" --arg prefix "$prefix" \
+        "$(jq -nc --arg name "cousin-destination-${route_id#0x}" --arg prefix "$prefix" \
         '{name:$name,kind:"BGP",prefix:$prefix,usage:"wormholes",ingressScope:"switchboardFleet"}')" || return
       destination_prefix_uuid=$(rg -m1 -o 'uuid=(0x)?[0-9a-fA-F]+' "$ROOT/cousin-prefix-destination.log" | cut -d= -f2)
       [[ $destination_prefix_uuid =~ ^(0x)?[0-9a-fA-F]{1,32}$ ]] || return 1
@@ -77,6 +86,7 @@ SURVIVE /cousin-probe-config
 PLAN
   prodigy_dev_write_common_prodigy_assets "$artifact/Cousin.DiscombobuFile"
   if [[ -n "$lifecycle" ]]; then echo 'ENV COUSIN_PROBE_LIFECYCLE=1' >>"$artifact/Cousin.DiscombobuFile"; fi
+  if [[ ${PRODIGY_DEV_COUSIN_GRAPH:-0} == 1 ]]; then echo 'ENV COUSIN_PROBE_GRAPH=1' >>"$artifact/Cousin.DiscombobuFile"; fi
   echo 'EXECUTE ["/root/cousin_session_probe"]' >>"$artifact/Cousin.DiscombobuFile"
   prodigy_dev_run_discombobulator_build "$artifact" "$artifact/Cousin.DiscombobuFile" "$blob" \
     "bin=$(dirname "$probe")" "config=$artifact" "ebpf=$(dirname "$PRODIGY_BIN")" || return
@@ -157,7 +167,7 @@ PY
     sleep .25
   done
   [[ $discovered == 1 ]] || return 1
-  python3 - "$ROOT" "$source_cluster" "$destination_cluster" "$source_app" "$destination_app" "$source_permission" "$destination_permission" <<'PY'
+  python3 - "$ROOT" "$source_cluster" "$destination_cluster" "$source_app" "$destination_app" "$source_permission" "$destination_permission" "${PRODIGY_DEV_COUSIN_EXISTING_ROUTES:-}" <<'PY'
 import json,pathlib,re,sys
 root=pathlib.Path(sys.argv[1]); src=int(sys.argv[4]); dst=int(sys.argv[5])
 leases=[]
@@ -165,7 +175,16 @@ for line in (root/'cousin-source-leases.log').read_text().splitlines():
     d=dict(re.findall(r'(\w+)=([^\s]+)',line))
     if d.get('kind')=='whiteholeAddressPort' and int(d.get('app','0'))==src: leases.append(d)
 assert leases, 'source Whitehole lease missing'
-source=leases[0]
+# Port allocation may reuse an existing Whitehole IP. Each graph pair owns its
+# own external /128 route, so select distinct existing addresses across pairs;
+# this is a choice among Brain-issued leases, never a runtime allocation.
+used=set()
+if sys.argv[8]:
+    for path in pathlib.Path(sys.argv[8]).glob('*/cousin-service-transit.json'):
+        prior=json.loads(path.read_text())
+        if int(prior['sourceClusterUUID'],16)==int(sys.argv[2],16): used.add(prior['sourceWhiteholeIPv6'])
+source=next((lease for lease in leases if lease['address'] not in used),None)
+assert source is not None, 'no distinct allocated source address for independent pair route'
 line=next(x for x in (root/'cousin-discovery.log').read_text().splitlines() if x.startswith('cousinCounterpart '))
 dest=dict(re.findall(r'(\w+)=([^\s]+)',line))
 record={'sourceClusterUUID':sys.argv[2],'destinationClusterUUID':sys.argv[3],
@@ -177,6 +196,7 @@ record={'sourceClusterUUID':sys.argv[2],'destinationClusterUUID':sys.argv[3],
 PY
   m cousin-transit 45 "$ROOT/cousin-transit.log" testClusterPairControl "$OPERATION" service "$(cat "$ROOT/cousin-service-transit.json")" || return
   ok "$ROOT/cousin-transit.log" testClusterPairControl || return 1
+  [[ ${PRODIGY_DEV_COUSIN_PREPARE_ONLY:-0} == 1 ]] && return 0
   # Mothership has no persistent daemon in this harness. Seal the command owner
   # during observation, and require the successful request to start after this.
   prodigy_dev_cousin_mark_time "$ROOT/cousin-offline-start"
