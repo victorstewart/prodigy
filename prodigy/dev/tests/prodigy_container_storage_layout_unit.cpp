@@ -40,6 +40,8 @@ int main(void)
     Vector<MachineDiskHardwareProfile> disks;
     disks.push_back(makeDisk("/"));
     disks.push_back(makeDisk("/boot"));
+    disks.push_back(makeDisk("/boot/efi"));
+    disks.push_back(makeDisk("/efi"));
     disks.push_back(makeDisk("/containers"));
     disks.push_back(makeDisk("/mnt/data-b"));
     disks.push_back(makeDisk("/mnt/data-a"));
@@ -54,6 +56,19 @@ int main(void)
   }
 
   suite.expect(prodigySelectContainerStorageDeviceCount(64, 4) == 0, "container_storage_device_count_rejects_too_small_total");
+  {
+    // A single-disk UEFI guest must use the existing /containers storage path,
+    // not allocate a dedicated storage loop on its small EFI system partition.
+    Vector<MachineDiskHardwareProfile> disks;
+    disks.push_back(makeDisk("/"));
+    disks.push_back(makeDisk("/efi"));
+    Vector<String> mountPaths;
+    prodigyCollectUniqueContainerStorageMountPaths(disks, mountPaths);
+    Vector<ProdigyContainerStorageDevicePlan> devices;
+    prodigyBuildContainerStorageDevicePlan(mountPaths, "uefi-guest"_ctv, 640, devices);
+    suite.expect(mountPaths.empty() && devices.empty(), "container_storage_uefi_guest_uses_existing_container_storage");
+  }
+
   suite.expect(prodigySelectContainerStorageDeviceCount(128, 4) == 1, "container_storage_device_count_single_device_floor");
   suite.expect(prodigySelectContainerStorageDeviceCount(300, 3) == 2, "container_storage_device_count_limits_by_minimum_device_size");
   suite.expect(prodigySelectContainerStorageDeviceCount(768, 5) == 5, "container_storage_device_count_uses_all_when_large_enough");

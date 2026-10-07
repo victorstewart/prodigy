@@ -18,7 +18,7 @@ public:
 
 static inline bool prodigyContainerStorageMountPathIsReserved(const String& mountPath)
 {
-  if (mountPath.size() == 0 || mountPath.equal("/"_ctv) || mountPath.equal("/boot"_ctv) || mountPath.equal("/boot/efi"_ctv))
+  if (mountPath.size() == 0 || mountPath.equal("/"_ctv) || mountPath.equal("/boot"_ctv) || mountPath.equal("/boot/efi"_ctv) || mountPath.equal("/efi"_ctv))
   {
     return true;
   }
