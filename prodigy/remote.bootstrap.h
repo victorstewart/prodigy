@@ -1544,6 +1544,36 @@ static inline void prodigyAppendRemoteContainerRootCommand(String& command, bool
   command.append(" /containers 2>/dev/null || true); if [ \"$fs\" != btrfs ]; then if mountpoint -q /containers; then echo '/containers must be btrfs' >&2; exit 1; fi; img=/var/lib/prodigy/containers.btrfs.loop; if [ ! -e \"$img\" ]; then truncate -s 16G \"$img\" && mkfs.btrfs -f \"$img\" >/dev/null; fi; mount -o loop,nosuid,nodev \"$img\" /containers; fi; mkdir -p /containers/store /containers/storage"_ctv);
 }
 
+// Builds the remote half of an explicit Mothership-managed pool expansion.
+// It only grows Prodigy's own loop-backed Btrfs filesystem; an existing host
+// mount or loop device that does not prove that ownership is rejected.
+constexpr uint64_t prodigyRemoteContainerPoolDefaultBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t prodigyRemoteContainerPoolRootReserveBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+
+static inline bool prodigyBuildRemoteContainerPoolGrowthCommand(
+    uint64_t requestedBytes,
+    String& command,
+    String *failure = nullptr)
+{
+  command.clear();
+  if (failure != nullptr)
+  {
+    failure->clear();
+  }
+  if (requestedBytes < prodigyRemoteContainerPoolDefaultBytes ||
+      requestedBytes > uint64_t(INT64_MAX) - prodigyRemoteContainerPoolRootReserveBytes)
+  {
+    if (failure != nullptr)
+    {
+      failure->assign("requested /containers pool size is outside the supported grow-only range"_ctv);
+    }
+    return false;
+  }
+
+  command.snprintf<"set -eu; img=/var/lib/prodigy/containers.btrfs.loop; target={itoa}; reserve={itoa}; mountpoint -q /containers || { echo '/containers must already be mounted' >&2; exit 1; }; fs=$(findmnt -n -o FSTYPE --target /containers 2>/dev/null || true); [ \"$fs\" = btrfs ] || { echo '/containers must be btrfs' >&2; exit 1; }; loop=$(findmnt -n -o SOURCE --target /containers 2>/dev/null || true); case \"$loop\" in /dev/loop[0-9]*) ;; *) echo '/containers must be mounted from a loop device' >&2; exit 1;; esac; [ -f \"$img\" ] && [ ! -L \"$img\" ] || { echo 'expected Prodigy container pool backing file is not a regular file' >&2; exit 1; }; expected=$(readlink -f \"$img\"); actual=$(losetup -n -O BACK-FILE \"$loop\" 2>/dev/null || true); [ \"$actual\" = \"$expected\" ] || { echo '/containers loop backing file is not the Prodigy pool' >&2; exit 1; }; current=$(stat -c %s \"$img\"); case \"$current\" in ''|*[!0-9]*) echo 'invalid Prodigy container pool size' >&2; exit 1;; esac; [ \"$current\" -le \"$target\" ] || { echo 'requested pool size would shrink an existing Prodigy backing file' >&2; exit 1; }; allocated=$(du -B1 \"$img\" | awk 'NR==1 {print $1}'); case \"$allocated\" in ''|*[!0-9]*) echo 'unable to determine allocated Prodigy pool bytes' >&2; exit 1;; esac; [ \"$allocated\" -le \"$target\" ] || { echo 'allocated Prodigy pool bytes exceed requested size' >&2; exit 1; }; if [ \"$allocated\" -lt \"$target\" ]; then available=$(df -B1 --output=avail /var/lib/prodigy | awk 'NR==2 {print $1}'); case \"$available\" in ''|*[!0-9]*) echo 'unable to determine available root storage' >&2; exit 1;; esac; required=$((target-allocated)); [ \"$available\" -ge $((required+reserve)) ] || { echo 'insufficient root storage while preserving Prodigy reserve' >&2; exit 1; }; fallocate -l \"$target\" \"$img\"; sync -f \"$img\"; allocated=$(du -B1 \"$img\" | awk 'NR==1 {print $1}'); [ \"$allocated\" -ge \"$target\" ] || { echo 'backing file allocation did not reach requested pool size' >&2; exit 1; }; fi; loopBytes=$(blockdev --getsize64 \"$loop\"); case \"$loopBytes\" in ''|*[!0-9]*) echo 'unable to determine loop capacity' >&2; exit 1;; esac; if [ \"$loopBytes\" -lt \"$target\" ]; then losetup -c \"$loop\"; loopBytes=$(blockdev --getsize64 \"$loop\"); [ \"$loopBytes\" -ge \"$target\" ] || { echo 'loop capacity did not refresh to requested pool size' >&2; exit 1; }; fi; btrfs filesystem resize max /containers"_ctv>(requestedBytes, prodigyRemoteContainerPoolRootReserveBytes);
+  return true;
+}
+
 static inline void renderProdigySystemdUnit(const String& remoteBinaryPath, const String& remoteLibraryDirectory, const String& controlSocketDirectory, String& unit)
 {
   String containerRootCommand = {};

@@ -1,5 +1,6 @@
 #include <prodigy/mothership/mothership.cluster.remove.h>
 #include <prodigy/mothership/mothership.additional.ingress.retire.h>
+#include <prodigy/mothership/mothership.machine.resize.h>
 #include <services/debug.h>
 
 #include <cstdio>
@@ -913,6 +914,58 @@ int main(void)
     info.tag[0] ^= 1; info.nr_map_ids--;
     suite.expect(!mothershipAdditionalIngressRetirementProgramMatches(request, info),
                  "additional_ingress_retirement_rejects_changed_map_inventory");
+  }
+
+  {
+    MothershipMachineResizePlan plan = {};
+    plan.schema = "prodigy.mothership.kvm-resize.v1"_ctv; plan.clusterUUID = "0x1"_ctv; plan.targetMachineUUID = "0x2"_ctv;
+    plan.controllerMachineID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv; plan.guestMachineID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv; plan.expectedGuestBootID = "01234567-0123-0123-0123-0123456789ab"_ctv;
+    plan.hypervisorAddress = "fd72:6e61:6d65::2"_ctv; plan.hypervisorPort = 22; plan.hypervisorUser = "root"_ctv; plan.hypervisorPrivateKeyPath = "/root/.ssh/nuc.ed25519"_ctv; plan.hypervisorHostPublicKey = "ssh-ed25519 AAAA"_ctv; plan.hypervisorNativeID = "cccccccccccccccccccccccccccccccc"_ctv;
+    plan.supervisorPath = "/opt/nametag/kvm-supervisor"_ctv; plan.supervisorSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv;
+    plan.configPath = "/opt/nametag/guest.json"_ctv; plan.configSHA256 = plan.supervisorSHA256; plan.ingressPolicyPath = "/opt/nametag/ingress.json"_ctv; plan.ingressPolicySHA256 = plan.supervisorSHA256; plan.unit = "nametag-nuc2.service"_ctv; plan.expectedPID = 9; plan.expectedStarttime = 10; plan.targetCPUs = 16; plan.targetMemoryMiB = 22528; plan.operationID = "abcd0000-0000-4000-8000-000000000001"_ctv;
+    String failure = {}, command = {};
+    suite.expect(mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::preflight, command, &failure) && stringContains(command, " preflight") && stringContains(command, "--operation-id 'abcd0000-0000-4000-8000-000000000001'"),
+                 "machine_resize_builds_pinned_preflight_command");
+    suite.expect(mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::prepare, command, &failure) && stringContains(command, " prepare"),
+                 "machine_resize_builds_pinned_prepare_command");
+    suite.expect(mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::resize, command, &failure) && stringContains(command, " resize"),
+                 "machine_resize_builds_pinned_resize_command");
+    suite.expect(mothershipBuildMachineResizeGuestShutdownCommand(plan, command, &failure) && stringContains(command, "systemd-detect-virt") && stringContains(command, "prodigy-mothership-resize-abcd0000-0000-4000-8000-000000000001") && stringContains(command, "systemctl poweroff"),
+                 "machine_resize_builds_guarded_guest_shutdown_command");
+    plan.supervisorSHA256.assign("not-a-digest"_ctv);
+    suite.expect(!mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::resize, command, &failure), "machine_resize_rejects_unpinned_executable");
+    plan.supervisorSHA256 = plan.configSHA256; plan.configPath.assign("relative.json"_ctv);
+    suite.expect(!mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::resize, command, &failure), "machine_resize_rejects_relative_config_path");
+  }
+
+  {
+    MothershipMachineResizePlan plan = {}; plan.targetMachineUUID = "0x2"_ctv; plan.targetCPUs = 16; plan.targetMemoryMiB = 22528;
+    ClusterStatusReport report = {}; report.nMachines = 1; report.nApplications = 1; MachineStatusReport machine = {}; machine.machineUUID = "0x2"_ctv; machine.controlPlaneReachable = true; machine.runtimeReady = true; machine.totalLogicalCores = 14; machine.totalMemoryMB = 16384; report.machineReports.push_back(machine);
+    ApplicationStatusReport application = {}; application.applicationID = 6; DeploymentStatusReport deployment = {}; deployment.versionID = 9; deployment.state = DeploymentState::running; deployment.nTarget = 2; deployment.nHealthy = 2; application.deploymentReports.push_back(deployment); report.applicationReports.push_back(application);
+    MothershipMachineResizeHealthWitness before = {}, after = {}; String failure = {};
+    suite.expect(mothershipCaptureMachineResizeHealthWitness(report, plan, false, before, failure), "machine_resize_captures_healthy_preflight_witness");
+    report.machineReports[0].totalLogicalCores = 16; report.machineReports[0].totalMemoryMB = 22150;
+    suite.expect(mothershipCaptureMachineResizeHealthWitness(report, plan, true, after, failure) && mothershipMachineResizeHealthWitnessMatches(before, after, failure), "machine_resize_accepts_same_members_and_replicas_after_recovery");
+    report.applicationReports[0].deploymentReports[0].nHealthy = 1;
+    suite.expect(!mothershipCaptureMachineResizeHealthWitness(report, plan, true, after, failure), "machine_resize_rejects_replica_deficit");
+    report.applicationReports[0].deploymentReports[0].nHealthy = 2; report.machineReports[0].machineUUID = "0x3"_ctv;
+    suite.expect(!mothershipCaptureMachineResizeHealthWitness(report, plan, true, after, failure), "machine_resize_rejects_missing_member");
+  }
+
+
+  {
+    const char *json = R"JSON({"schema":"prodigy.mothership.kvm-resize.v1","clusterUUID":"0x1","targetMachineUUID":"0x2","controllerMachineID":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","guestMachineID":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expectedGuestBootID":"abcd0000-0000-4000-8000-000000000002","hypervisorAddress":"10.0.0.25","hypervisorPort":22,"hypervisorUser":"root","hypervisorPrivateKeyPath":"/root/key","hypervisorHostPublicKey":"ssh-ed25519 AAAA","hypervisorNativeID":"cccccccccccccccccccccccccccccccc","supervisorPath":"/opt/supervisor","supervisorSHA256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","configPath":"/opt/config.json","configSHA256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","ingressPolicyPath":"/opt/ingress.json","ingressPolicySHA256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","unit":"test.service","expectedPID":42,"expectedStarttime":100,"targetCPUs":16,"targetMemoryMiB":22528,"operationID":"abcd0000-0000-4000-8000-000000000001"})JSON";
+    MothershipMachineResizePlan parsed = {}; String failure = {}, command = {};
+    suite.expect(parseMothershipMachineResizePlanJSON(json, parsed, failure), "machine_resize_parses_small_positive_json_numbers");
+    suite.expect(mothershipBuildMachineResizeCommand(parsed, MothershipMachineResizePhase::resize, command, &failure) && stringContains(command, "--cpus '16'") && parsed.hypervisorAddress.equals("10.0.0.25"_ctv), "machine_resize_parsed_strings_survive_parser_destruction");
+    std::string duplicate(json); duplicate.pop_back(); duplicate += ",\"targetCPUs\":2}";
+    MothershipMachineResizePlan rejected = {};
+    suite.expect(!parseMothershipMachineResizePlanJSON(duplicate.c_str(), rejected, failure), "machine_resize_rejects_duplicate_plan_fields");
+    String receipt = {};
+    receipt.assign(R"JSON({"schema":"nametag.kvm-resize.v1","state":"COMPLETE","operationID":"abcd0000-0000-4000-8000-000000000001","nativeID":"cccccccccccccccccccccccccccccccc","unit":"test.service","configPath":"/opt/config.json","requested":{"cpus":16,"memoryMiB":22528},"before":{"pid":42,"starttime":"100","configSHA256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"after":{"pid":43,"starttime":"200","configSHA256":"1111111111111111111111111111111111111111111111111111111111111111"}})JSON");
+    suite.expect(mothershipValidateMachineResizeReceipt(receipt, parsed, MothershipMachineResizePhase::resize, failure), "machine_resize_accepts_bound_new_runtime_receipt");
+    parsed.expectedPID = 99;
+    suite.expect(!mothershipValidateMachineResizeReceipt(receipt, parsed, MothershipMachineResizePhase::resize, failure), "machine_resize_rejects_receipt_for_other_process");
   }
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cerrno>
 #include <filesystem>
+#include <string>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -186,6 +187,45 @@ static bool writeFileWithMode(const String& path, const String& content, mode_t 
   }
 
   return ::chmod(pathText.c_str(), mode) == 0;
+}
+
+static bool replaceAllText(String& text, const char *needle, const String& replacement)
+{
+  std::string value(reinterpret_cast<const char *>(text.data()), text.size());
+  const std::string match(needle);
+  const std::string replacementText(reinterpret_cast<const char *>(replacement.data()), replacement.size());
+  bool replaced = false;
+  for (size_t position = value.find(match); position != std::string::npos;
+       position = value.find(match, position + replacementText.size()))
+  {
+    value.replace(position, match.size(), replacementText);
+    replaced = true;
+  }
+  text.assign(value.data(), value.size());
+  return replaced;
+}
+
+static bool runShellCommand(const String& command, int& exitStatus)
+{
+  exitStatus = -1;
+  const pid_t pid = ::fork();
+  if (pid < 0)
+  {
+    return false;
+  }
+  if (pid == 0)
+  {
+    String commandText = command;
+    execl("/bin/sh", "sh", "-c", commandText.c_str(), nullptr);
+    _exit(127);
+  }
+  int status = 0;
+  if (::waitpid(pid, &status, 0) != pid)
+  {
+    return false;
+  }
+  exitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+  return true;
 }
 
 static bool resolveSSHDExecutablePath(String& path)
@@ -1431,6 +1471,112 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "/run/prodigy/control.sock"), "plan_install_command_waits_for_control_socket_path");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl restart prodigy && python3 -c"), "plan_install_command_restart_waits_for_socket");
   suite.expect(stringContains(singleSeedPlan.installCommand, "stat -f -c %T /containers"), "plan_install_command_checks_container_fs_type");
+  String containerPoolGrowthCommand = {};
+  constexpr uint64_t expandedContainerPoolBytes = 128ULL * 1024ULL * 1024ULL * 1024ULL;
+  suite.expect(
+      prodigyBuildRemoteContainerPoolGrowthCommand(
+          expandedContainerPoolBytes, containerPoolGrowthCommand, &failure),
+      "container_pool_growth_command_builds");
+  suite.expect(failure.size() == 0, "container_pool_growth_command_clears_failure");
+  suite.expect(stringContains(containerPoolGrowthCommand, "mountpoint -q /containers"), "container_pool_growth_requires_existing_mount");
+  suite.expect(stringContains(containerPoolGrowthCommand, "findmnt -n -o FSTYPE --target /containers"), "container_pool_growth_requires_btrfs");
+  suite.expect(stringContains(containerPoolGrowthCommand, "findmnt -n -o SOURCE --target /containers"), "container_pool_growth_reads_loop_source");
+  suite.expect(stringContains(containerPoolGrowthCommand, "losetup -n -O BACK-FILE"), "container_pool_growth_verifies_loop_backing_file");
+  suite.expect(stringContains(containerPoolGrowthCommand, "[ ! -L \"$img\" ]"), "container_pool_growth_rejects_symlink_backing_file");
+  suite.expect(stringContains(containerPoolGrowthCommand, "df -B1 --output=avail /var/lib/prodigy"), "container_pool_growth_checks_root_capacity");
+  suite.expect(stringContains(containerPoolGrowthCommand, "insufficient root storage while preserving Prodigy reserve"), "container_pool_growth_preserves_root_reserve");
+  suite.expect(stringContains(containerPoolGrowthCommand, "fallocate -l \"$target\" \"$img\"; sync -f \"$img\""), "container_pool_growth_allocates_and_syncs_backing_before_resize");
+  suite.expect(stringContains(containerPoolGrowthCommand, "losetup -c \"$loop\""), "container_pool_growth_refreshes_loop_capacity");
+  suite.expect(stringContains(containerPoolGrowthCommand, "btrfs filesystem resize max /containers"), "container_pool_growth_resizes_btrfs_after_loop_refresh");
+  String expectedPoolTarget = {};
+  expectedPoolTarget.snprintf<"target={itoa}"_ctv>(expandedContainerPoolBytes);
+  suite.expect(stringContains(containerPoolGrowthCommand, expectedPoolTarget.c_str()), "container_pool_growth_renders_explicit_target");
+  suite.expect(
+      prodigyBuildRemoteContainerPoolGrowthCommand(
+          prodigyRemoteContainerPoolDefaultBytes - 1, containerPoolGrowthCommand, &failure) == false,
+      "container_pool_growth_rejects_shrink_target");
+  suite.expect(failure.equals("requested /containers pool size is outside the supported grow-only range"_ctv), "container_pool_growth_rejects_shrink_target_failure");
+  suite.expect(
+      prodigyBuildRemoteContainerPoolGrowthCommand(
+          expandedContainerPoolBytes, containerPoolGrowthCommand, &failure),
+      "container_pool_growth_command_rebuilds_after_rejected_target");
+  suite.expect(stringContains(containerPoolGrowthCommand, "df -B1 --output=avail /var/lib/prodigy"), "container_pool_growth_uses_compatible_df_capacity_mode");
+  suite.expect(stringContains(containerPoolGrowthCommand, "current=$(stat -c %s \"$img\")"), "container_pool_growth_renders_stat_size_format");
+  suite.expect(stringContains(containerPoolGrowthCommand, "requested pool size would shrink"), "container_pool_growth_rejects_existing_larger_file");
+  suite.expect(stringContains(containerPoolGrowthCommand, "allocated=$(du -B1 \"$img\"") &&
+                   stringContains(containerPoolGrowthCommand, "backing file allocation did not reach requested pool size"),
+               "container_pool_growth_verifies_full_backing_allocation");
+
+  char poolMockScratch[] = "/tmp/prodigy-container-pool-mock-XXXXXX";
+  char *poolMockRootRaw = ::mkdtemp(poolMockScratch);
+  suite.expect(poolMockRootRaw != nullptr, "container_pool_growth_mock_root_created");
+  if (poolMockRootRaw != nullptr)
+  {
+    String poolMockRoot = {}; poolMockRoot.assign(poolMockRootRaw);
+    String poolMockBin = {}; poolMockBin.snprintf<"{}/bin"_ctv>(poolMockRoot);
+    String poolImage = {}; poolImage.snprintf<"{}/containers.btrfs.loop"_ctv>(poolMockRoot);
+    String allocationMarker = {}; allocationMarker.snprintf<"{}/allocated"_ctv>(poolMockRoot);
+    String refreshMarker = {}; refreshMarker.snprintf<"{}/refreshed"_ctv>(poolMockRoot);
+    String btrfsMarker = {}; btrfsMarker.snprintf<"{}/btrfs-resized"_ctv>(poolMockRoot);
+    suite.expect(ensureDirectory(poolMockBin), "container_pool_growth_mock_bin_created");
+    suite.expect(writeFileWithMode(poolImage, "pool"_ctv, 0600), "container_pool_growth_mock_backing_created");
+    const char *mockNames[] = {"mountpoint", "findmnt", "readlink", "losetup", "stat", "du", "df", "fallocate", "sync", "blockdev", "btrfs"};
+    const char *mockBodies[] = {
+        "#!/bin/sh\nexit 0\n",
+        "#!/bin/sh\nif [ \"$3\" = FSTYPE ]; then echo btrfs; else echo /dev/loop7; fi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$2\"\n",
+        "#!/bin/sh\nif [ \"$1\" = -c ]; then touch \"$MOCK_REFRESHED\"; else printf '%s\\n' \"$MOCK_BACKING\"; fi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$MOCK_CURRENT\"\n",
+        "#!/bin/sh\nif [ -e \"$MOCK_ALLOCATED_MARKER\" ]; then printf '%s %s\\n' \"$MOCK_TARGET\" \"$1\"; else printf '%s %s\\n' \"$MOCK_ALLOCATED\" \"$1\"; fi\n",
+        "#!/bin/sh\necho Avail\necho \"$MOCK_AVAILABLE\"\n",
+        "#!/bin/sh\ntouch \"$MOCK_ALLOCATED_MARKER\"\n",
+        "#!/bin/sh\nexit 0\n",
+        "#!/bin/sh\nif [ -e \"$MOCK_REFRESHED\" ]; then echo \"$MOCK_TARGET\"; else echo \"$MOCK_LOOP_BYTES\"; fi\n",
+        "#!/bin/sh\ntouch \"$MOCK_BTRFS_MARKER\"\n"};
+    bool mocksWritten = true;
+    for (size_t index = 0; index < std::size(mockNames); ++index)
+    {
+      String mockPath = poolMockBin; mockPath.append('/'); mockPath.append(mockNames[index]);
+      String mockBody = {}; mockBody.assign(mockBodies[index]);
+      mocksWritten &= writeFileWithMode(mockPath, mockBody, 0700);
+    }
+    suite.expect(mocksWritten, "container_pool_growth_mock_commands_created");
+    String shellPath = poolMockBin; shellPath.append(':'); shellPath.append(std::getenv("PATH") != nullptr ? std::getenv("PATH") : "");
+    String targetText = {}; targetText.snprintf<"{itoa}"_ctv>(expandedContainerPoolBytes);
+    String defaultText = {}; defaultText.snprintf<"{itoa}"_ctv>(prodigyRemoteContainerPoolDefaultBytes);
+    String sufficientText = {}; sufficientText.snprintf<"{itoa}"_ctv>(expandedContainerPoolBytes - prodigyRemoteContainerPoolDefaultBytes + prodigyRemoteContainerPoolRootReserveBytes);
+    String insufficientText = {}; insufficientText.snprintf<"{itoa}"_ctv>(expandedContainerPoolBytes - prodigyRemoteContainerPoolDefaultBytes + prodigyRemoteContainerPoolRootReserveBytes - 1);
+    String mockCommand = containerPoolGrowthCommand;
+    suite.expect(replaceAllText(mockCommand, "/var/lib/prodigy/containers.btrfs.loop", poolImage), "container_pool_growth_mock_rewrites_backing_path");
+    ScopedEnvVar mockPath("PATH", shellPath);
+    ScopedEnvVar mockBacking("MOCK_BACKING", poolImage);
+    ScopedEnvVar mockCurrent("MOCK_CURRENT", targetText);
+    ScopedEnvVar mockAllocated("MOCK_ALLOCATED", defaultText);
+    ScopedEnvVar mockTarget("MOCK_TARGET", targetText);
+    ScopedEnvVar mockAvailable("MOCK_AVAILABLE", sufficientText);
+    ScopedEnvVar mockLoopBytes("MOCK_LOOP_BYTES", defaultText);
+    ScopedEnvVar mockAllocationMarker("MOCK_ALLOCATED_MARKER", allocationMarker);
+    ScopedEnvVar mockRefreshMarker("MOCK_REFRESHED", refreshMarker);
+    ScopedEnvVar mockBtrfsMarker("MOCK_BTRFS_MARKER", btrfsMarker);
+    int shellStatus = -1;
+    String wrongBacking = {}; wrongBacking.snprintf<"{}/unrelated.loop"_ctv>(poolMockRoot);
+    setenv("MOCK_BACKING", wrongBacking.c_str(), 1);
+    suite.expect(runShellCommand(mockCommand, shellStatus) && shellStatus != 0 &&
+                     std::filesystem::exists(allocationMarker.c_str()) == false,
+                 "container_pool_growth_mock_rejects_wrong_backing_before_allocate");
+    setenv("MOCK_BACKING", poolImage.c_str(), 1);
+    setenv("MOCK_AVAILABLE", insufficientText.c_str(), 1);
+    suite.expect(runShellCommand(mockCommand, shellStatus) && shellStatus != 0 &&
+                     std::filesystem::exists(allocationMarker.c_str()) == false,
+                 "container_pool_growth_mock_rejects_low_space_before_allocate");
+    setenv("MOCK_AVAILABLE", sufficientText.c_str(), 1);
+    suite.expect(runShellCommand(mockCommand, shellStatus) && shellStatus == 0 &&
+                     std::filesystem::exists(allocationMarker.c_str()) &&
+                     std::filesystem::exists(refreshMarker.c_str()) &&
+                     std::filesystem::exists(btrfsMarker.c_str()),
+                 "container_pool_growth_mock_completes_partial_allocation_retry");
+    std::filesystem::remove_all(poolMockRoot.c_str());
+  }
   String expectedPlanDiagnosticsNeedle = {};
   expectedPlanDiagnosticsNeedle.snprintf<"|| { timeout {itoa}s sh -lc"_ctv>(uint64_t(prodigyRemoteBootstrapSocketDiagnosticsTimeoutSeconds));
   suite.expect(stringContains(singleSeedPlan.installCommand, expectedPlanDiagnosticsNeedle.c_str()), "plan_install_command_wait_failure_collects_diagnostics");

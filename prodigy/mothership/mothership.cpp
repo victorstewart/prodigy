@@ -57,6 +57,7 @@
 #include <prodigy/mothership/mothership.ring.runtime.h>
 #include <prodigy/acme.certbot.h>
 #include <prodigy/mothership/mothership.additional.ingress.retire.h>
+#include <prodigy/mothership/mothership.machine.resize.h>
 #include <prodigy/types.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
@@ -9647,6 +9648,108 @@ private:
     return true;
   }
 
+  bool pullMachineResizeClusterReport(ClusterStatusReport& report, String& failure)
+  {
+    report = {}; failure.clear(); socket.close();
+    if (socket.connect() != 0) { failure = socket.connectFailureDetail(); if (failure.size() == 0) failure.assign("machine resize cluster report connect failed"); return false; }
+    Message::construct(socket.wBuffer, MothershipTopic::pullClusterReport);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
+    Message *response = socket.recvExpectedTopic(MothershipTopic::pullClusterReport, 1024);
+    if (response == nullptr || MothershipTopic(response->topic) != MothershipTopic::pullClusterReport) { failure = socket.ioFailureDetail(); if (failure.size() == 0) failure.assign("machine resize cluster report unavailable"); socket.close(); return false; }
+    uint8_t *args = response->args; String serialized = {}; Message::extractToStringView(args, serialized); socket.close();
+    if (!BitseryEngine::deserializeSafe(serialized, report)) { failure.assign("machine resize cluster report invalid"); return false; }
+    return true;
+  }
+
+  static bool readSingleLineMachineResizeIdentity(const String& text, String& identity)
+  {
+    String source = {}; source.assign(text); identity.clear();
+    uint64_t end = 0; while (end < source.size() && source.data()[end] != '\n' && source.data()[end] != '\r') ++end;
+    for (uint64_t trailing = end; trailing < source.size(); ++trailing)
+      if (source.data()[trailing] != '\n' && source.data()[trailing] != '\r') return false;
+    if (end == 0) return false;
+    identity.assign(source.data(), end); return mothershipMachineResizeSafeToken(identity);
+  }
+
+  bool runMachineResizeGuestIdentity(const MothershipProdigyClusterMachine& guest, const char *path, String& identity, String& failure)
+  {
+    LIBSSH2_SESSION *session = nullptr; int fd = -1;
+    if (!mothershipConnectSSHSession(guest, session, fd, &failure)) return false;
+    String output = {}; String command = {}; command.append("cat "_ctv); command.append(path);
+    bool ok = mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure); mothershipCloseSSHSession(session, fd);
+    return ok && readSingleLineMachineResizeIdentity(output, identity);
+  }
+
+  static bool validateContainerPoolClusterHealth(const ClusterStatusReport& report, String& failure)
+  {
+    if (report.nMachines == 0 || report.machineReports.size() != report.nMachines) { failure.assign("container pool report machine inventory incomplete"); return false; }
+    for (const MachineStatusReport& machine : report.machineReports)
+      if (!machine.controlPlaneReachable || !machine.runtimeReady || machine.decommissioning || machine.rebooting || machine.updatingOS || machine.hardwareFailure) { failure.assign("container pool requires every machine healthy"); return false; }
+    for (const ApplicationStatusReport& application : report.applicationReports) for (const DeploymentStatusReport& deployment : application.deploymentReports)
+      if (deployment.state != DeploymentState::running || deployment.nHealthy < deployment.nTarget) { failure.assign("container pool requires every application deployment healthy"); return false; }
+    return true;
+  }
+
+  void runGrowContainerPool(int argc, char *argv[])
+  {
+    if (argc != 3) { basics_log("growContainerPool requires [clusterUUID] [machineUUID] [sizeGiB]\n"); exit(EXIT_FAILURE); }
+    uint32_t sizeGiB = 0; if (!parseU32Arg(argv[2], sizeGiB) || sizeGiB == 0 || std::to_string(sizeGiB) != argv[2]) { basics_log("growContainerPool success=0 failure=sizeGiB invalid\n"); exit(EXIT_FAILURE); }
+    String clusterIdentity = {}; clusterIdentity.assign(argv[0]); String machineIdentity = {}; machineIdentity.assign(argv[1]); String failure = {}; MothershipProdigyCluster cluster = {};
+    if (!loadClusterForScopedMutation("growContainerPool", clusterIdentity, cluster, failure)) { basics_log("growContainerPool success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    const uint128_t machineUUID = String::numberFromHexString<uint128_t>(machineIdentity); MothershipProdigyClusterMachine guest = {}; bool found = false;
+    for (const ClusterMachine& machine : cluster.topology.machines) if (machine.uuid == machineUUID && machine.kind == MachineConfig::MachineKind::vm) { guest.ssh = machine.ssh; guest.addresses = machine.addresses; guest.isBrain = machine.isBrain; mothershipHydrateTopologyRemoteCandidateSSH(cluster, guest); found = true; break; }
+    if (!found || guest.ssh.address.size() == 0 || guest.ssh.privateKeyPath.size() == 0) { basics_log("growContainerPool success=0 failure=target VM ssh identity unavailable\n"); exit(EXIT_FAILURE); }
+    if (!configureControlTarget(argv[0], &failure)) { basics_log("growContainerPool success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    ClusterStatusReport report = {}; if (!pullMachineResizeClusterReport(report, failure) || !validateContainerPoolClusterHealth(report, failure)) { basics_log("growContainerPool success=0 phase=preflight failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    String growthCommand = {}; if (!prodigyBuildRemoteContainerPoolGrowthCommand(uint64_t(sizeGiB) * 1024ULL * 1024ULL * 1024ULL, growthCommand, &failure)) { basics_log("growContainerPool success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    String command = {}; command.assign("set -eu; [ \"$(systemd-detect-virt)\" = kvm ]; "_ctv); command.append(growthCommand);
+    LIBSSH2_SESSION *session = nullptr; int fd = -1; String output = {};
+    if (!mothershipConnectSSHSession(guest, session, fd, &failure) || !mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure, 120'000)) { mothershipCloseSSHSession(session, fd); basics_log("growContainerPool success=0 phase=remote-grow failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    mothershipCloseSSHSession(session, fd);
+    if (!pullMachineResizeClusterReport(report, failure) || !validateContainerPoolClusterHealth(report, failure)) { basics_log("growContainerPool success=0 phase=postflight failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    basics_log("growContainerPool success=1 targetMachineUUID=%s sizeGiB=%u\n", machineIdentity.c_str(), sizeGiB);
+  }
+
+  void runResizeKvmMachine(int argc, char *argv[])
+  {
+    if (argc != 2) { basics_log("resizeKvmMachine requires [clusterUUID] [json|-|@path]\n"); exit(EXIT_FAILURE); }
+    String json = {}; if (!resolveJSONArgument("resizeKvmMachine", argv[1], json)) exit(EXIT_FAILURE);
+    MothershipMachineResizePlan plan = {}; String failure = {};
+    if (!parseMothershipMachineResizePlanJSON(json.c_str(), plan, failure) || !plan.clusterUUID.equals(argv[0])) { basics_log("resizeKvmMachine success=0 failure=%s\n", failure.size() ? failure.c_str() : "cluster identity differs"); exit(EXIT_FAILURE); }
+    String controllerID = {}; if (!mothershipReadProcFile("/etc/machine-id"_ctv, controllerID) || !readSingleLineMachineResizeIdentity(controllerID, controllerID) || !controllerID.equals(plan.controllerMachineID) || controllerID.equals(plan.guestMachineID)) { basics_log("resizeKvmMachine success=0 failure=controller identity rejected\n"); exit(EXIT_FAILURE); }
+    MothershipProdigyCluster cluster = {}; if (!loadClusterForScopedMutation("resizeKvmMachine", plan.clusterUUID, cluster, failure)) { basics_log("resizeKvmMachine success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    const uint128_t targetUUID = String::numberFromHexString<uint128_t>(plan.targetMachineUUID); MothershipProdigyClusterMachine guest = {}; bool found = false;
+    for (const ClusterMachine& machine : cluster.topology.machines) if (machine.uuid == targetUUID && machine.kind == MachineConfig::MachineKind::vm) { guest.ssh = machine.ssh; guest.addresses = machine.addresses; guest.isBrain = machine.isBrain; mothershipHydrateTopologyRemoteCandidateSSH(cluster, guest); found = true; break; }
+    if (!found || guest.ssh.address.size() == 0 || guest.ssh.privateKeyPath.size() == 0) { basics_log("resizeKvmMachine success=0 failure=target guest ssh identity unavailable\n"); exit(EXIT_FAILURE); }
+    String observedGuestID = {}; String observedBootID = {};
+    if (!runMachineResizeGuestIdentity(guest, "/etc/machine-id", observedGuestID, failure) || !observedGuestID.equals(plan.guestMachineID) || !runMachineResizeGuestIdentity(guest, "/proc/sys/kernel/random/boot_id", observedBootID, failure) || !observedBootID.equals(plan.expectedGuestBootID)) { basics_log("resizeKvmMachine success=0 failure=guest identity differs\n"); exit(EXIT_FAILURE); }
+    if (!configureControlTarget(argv[0], &failure)) { basics_log("resizeKvmMachine success=0 failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    ClusterStatusReport report = {}; MothershipMachineResizeHealthWitness preflightWitness = {}; if (!pullMachineResizeClusterReport(report, failure) || !mothershipCaptureMachineResizeHealthWitness(report, plan, false, preflightWitness, failure)) { basics_log("resizeKvmMachine success=0 phase=preflight failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    MothershipProdigyClusterMachine hypervisor = {}; hypervisor.ssh.address = plan.hypervisorAddress; hypervisor.ssh.port = plan.hypervisorPort; hypervisor.ssh.user = plan.hypervisorUser; hypervisor.ssh.privateKeyPath = plan.hypervisorPrivateKeyPath; hypervisor.ssh.hostPublicKeyOpenSSH = plan.hypervisorHostPublicKey;
+    LIBSSH2_SESSION *session = nullptr; int fd = -1; String command = {}, output = {};
+    if (!mothershipConnectSSHSession(hypervisor, session, fd, &failure)) { basics_log("resizeKvmMachine success=0 phase=provider-connect failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    command.assign("sha256sum -- "_ctv); mothershipAppendMachineResizeShellQuoted(command, plan.supervisorPath);
+    if (!mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure, 25'000) || output.size() < 65 || std::memcmp(output.data(), plan.supervisorSHA256.data(), 64) != 0 || !std::isspace(static_cast<unsigned char>(output.data()[64]))) { mothershipCloseSSHSession(session, fd); basics_log("resizeKvmMachine success=0 phase=provider-executable-sha256 failure=supervisor digest differs\n"); exit(EXIT_FAILURE); }
+    if (!mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::preflight, command, &failure) || !mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure, 120'000) || !mothershipValidateMachineResizeReceipt(output, plan, MothershipMachineResizePhase::preflight, failure)) { mothershipCloseSSHSession(session, fd); basics_log("resizeKvmMachine success=0 phase=provider-preflight failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    if (!mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::prepare, command, &failure) || !mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure, 120'000) || !mothershipValidateMachineResizeReceipt(output, plan, MothershipMachineResizePhase::prepare, failure)) { mothershipCloseSSHSession(session, fd); basics_log("resizeKvmMachine success=0 phase=provider-prepare failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    String shutdownCommand = {}; LIBSSH2_SESSION *guestSession = nullptr; int guestFD = -1;
+    if (!mothershipBuildMachineResizeGuestShutdownCommand(plan, shutdownCommand, &failure) || !mothershipConnectSSHSession(guest, guestSession, guestFD, &failure) || !mothershipRunSSHCommandCaptureOutput(guestSession, guestFD, shutdownCommand, output, &failure, 30'000)) { mothershipCloseSSHSession(guestSession, guestFD); mothershipCloseSSHSession(session, fd); basics_log("resizeKvmMachine success=0 phase=guest-shutdown-submission failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    mothershipCloseSSHSession(guestSession, guestFD);
+    if (!mothershipBuildMachineResizeCommand(plan, MothershipMachineResizePhase::resize, command, &failure) || !mothershipRunSSHCommandCaptureOutput(session, fd, command, output, &failure, 600'000) || !mothershipValidateMachineResizeReceipt(output, plan, MothershipMachineResizePhase::resize, failure)) { mothershipCloseSSHSession(session, fd); basics_log("resizeKvmMachine success=0 phase=provider-resize failure=%s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    mothershipCloseSSHSession(session, fd);
+    MothershipMachineResizeHealthWitness postflightWitness = {}; bool ready = false; const int64_t deadline = Time::now<TimeResolution::ms>() + 180'000;
+    while (Time::now<TimeResolution::ms>() < deadline) {
+      String observedPostGuestID = {}; String candidateBootID = {}; String attemptFailure = {};
+      if (runMachineResizeGuestIdentity(guest, "/etc/machine-id", observedPostGuestID, attemptFailure) && observedPostGuestID.equals(plan.guestMachineID) &&
+          runMachineResizeGuestIdentity(guest, "/proc/sys/kernel/random/boot_id", candidateBootID, attemptFailure) && !candidateBootID.equals(plan.expectedGuestBootID) &&
+          pullMachineResizeClusterReport(report, attemptFailure) && mothershipCaptureMachineResizeHealthWitness(report, plan, true, postflightWitness, attemptFailure) &&
+          mothershipMachineResizeHealthWitnessMatches(preflightWitness, postflightWitness, attemptFailure)) { observedBootID = candidateBootID; ready = true; break; }
+      failure = attemptFailure; ::usleep(1'000'000);
+    }
+    if (!ready) { basics_log("resizeKvmMachine success=0 phase=postflight failure=%s\n", failure.size() ? failure.c_str() : "timed out waiting for guest and cluster recovery"); exit(EXIT_FAILURE); }
+    basics_log("resizeKvmMachine success=1 operationID=%s targetMachineUUID=%s guestBootID=%s targetCPUs=%u targetMemoryMiB=%u\n", plan.operationID.c_str(), plan.targetMachineUUID.c_str(), observedBootID.c_str(), plan.targetCPUs, plan.targetMemoryMiB);
+  }
+
   void runClusterReport(int argc, char *argv[])
   {
     if (argc < 1)
@@ -19209,6 +19312,7 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
+        {"growContainerPool",              &Mothership::runGrowContainerPool              },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
@@ -19230,6 +19334,7 @@ public:
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
+        {"resizeKvmMachine",               &Mothership::runResizeKvmMachine               },
         {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
         {"setTestClusterMachineCount",      &Mothership::runSetTestClusterMachineCount     },
@@ -19335,6 +19440,8 @@ int main(int argc, char *argv[])
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
+    message.append("growContainerPool [clusterUUID] [machineUUID] [sizeGiB]\n");
+    message.append("\tgrows only the selected VM's Mothership-owned /containers Btrfs loop pool after whole-cluster health checks\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
     message.append("upsertMachineSchemas [name|clusterUUID] [json object|array]\n");
@@ -19345,6 +19452,8 @@ int main(int argc, char *argv[])
     message.append("\tremote clusters only; removes one machine schema budget row by schema and reconciles any excess created machines away\n");
     message.append("removeCluster [name|clusterUUID]\n");
     message.append("\tremoves one managed Prodigy cluster record\n");
+    message.append("resizeKvmMachine [clusterUUID] [json|-|@path]\n");
+    message.append("\texecutes one strictly pinned, grow-only external KVM resize through the approved supervisor and verifies cluster health\n");
     message.append("retireAdditionalIngressLocal [bootID] [interface] [ifindex] [programID] [tagHex] [mapCount] [localSubnetMapID] [subnetHex]\n");
     message.append("\texplicit root-only recovery: retires one exactly witnessed additional-ingress XDP attachment with a kernel compare-and-swap; never used by normal startup\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
