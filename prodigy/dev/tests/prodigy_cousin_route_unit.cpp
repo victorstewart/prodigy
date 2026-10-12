@@ -6,6 +6,7 @@
 #include <prodigy/cousin.route.h>
 #include <prodigy/cousin.discovery.h>
 #include <prodigy/mothership/mothership.cluster.registry.h>
+#include <prodigy/mothership/mothership.cousin.route.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
 #include <prodigy/mothership/mothership.cousin.permission.h>
 
@@ -67,6 +68,15 @@ static bool parseLocalCousinPermissionJSON(const String& json,
   simdjson::dom::element document;
   return parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
          mothershipParseLocalCousinPermissionJSON(document, permission, failure);
+}
+
+static bool parseCousinRouteIntentJSON(const String& json, MothershipCousinRouteIntent& intent,
+                                       String& failure)
+{
+  simdjson::dom::parser parser;
+  simdjson::dom::element document;
+  return parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
+         mothershipParseCousinRouteIntentJSON(document, intent, failure);
 }
 
 static ProdigyCousinCounterpart validCousinCounterpart()
@@ -416,6 +426,29 @@ int main(void)
   malformed.replace(malformed.find("0x0601"), 6, "0x601");
   parserRejects(std::move(malformed), "mothership_local_cousin_permission_parser_rejects_noncanonical_uuid");
 
+  const String validRouteJSON = R"json({"routeUUID":"0x0101","operationUUID":"0x0201","logicalWorkloadUUID":"0x0301","logicalServiceUUID":"0x0302","sourcePermissionUUID":"0x0601","destinationPermissionUUID":"0x0602","slots":[3,1001],"destinationRoutablePrefixUUID":"0x0501","destinationPublicAddress":"2001:db8::1","transportProtocol":"TCP","destinationCIDR":32,"destinationTCPPort":443,"pathMTU":1500,"generation":1,"issuedAtMs":100,"expiresAtMs":200,"state":"active"})json";
+  MothershipCousinRouteIntent parsedRouteIntent = {};
+  suite.require(parseCousinRouteIntentJSON(validRouteJSON, parsedRouteIntent, parseFailure) &&
+                parsedRouteIntent.transportProtocol == IPPROTO_TCP && parsedRouteIntent.destinationCIDR == 32 &&
+                parsedRouteIntent.pathMTU == 1500,
+                "mothership_cousin_route_parser_accepts_exact_tcp_cidr_mtu_profile");
+  auto routeParserRejects = [&](const std::string& malformedRoute, const char *name) {
+    suite.require(!parseCousinRouteIntentJSON(String(malformedRoute.c_str()), parsedRouteIntent, parseFailure), name);
+  };
+  const std::string validRouteText(reinterpret_cast<const char *>(validRouteJSON.data()), validRouteJSON.size());
+  std::string malformedRoute = validRouteText;
+  malformedRoute.replace(malformedRoute.find("\"TCP\""), 5, "\"UDP\"");
+  routeParserRejects(malformedRoute, "mothership_cousin_route_parser_rejects_non_tcp_transport");
+  malformedRoute = validRouteText;
+  malformedRoute.replace(malformedRoute.find("\"destinationCIDR\":32"), 20, "\"destinationCIDR\":129");
+  routeParserRejects(malformedRoute, "mothership_cousin_route_parser_rejects_invalid_cidr");
+  malformedRoute = validRouteText;
+  malformedRoute.replace(malformedRoute.find("\"pathMTU\":1500"), 14, "\"pathMTU\":1279");
+  routeParserRejects(malformedRoute, "mothership_cousin_route_parser_rejects_small_mtu");
+  malformedRoute = validRouteText;
+  malformedRoute.replace(malformedRoute.size() - 1, 1, ",\"pathMTU\":1500}");
+  routeParserRejects(malformedRoute, "mothership_cousin_route_parser_rejects_duplicate_mtu");
+
   String encodedPermission = {};
   ProdigyLocalCousinServicePermission permissionToEncode = permission;
   BitseryEngine::serialize(encodedPermission, permissionToEncode);
@@ -634,6 +667,15 @@ int main(void)
   bool acknowledged = true;
   suite.require(registry.cousinRouteAcknowledgedAt(route.routeUUID, 150, acknowledged, &failure) && !acknowledged,
                 "registry_one_half_receipt_is_not_acknowledged");
+  CousinRouteRecord prematureReplacement = route;
+  prematureReplacement.operationUUID = 0x202;
+  prematureReplacement.generation = 2;
+  prematureReplacement.issuedAtMs = 120;
+  prematureReplacement.expiresAtMs = 300;
+  prematureReplacement.keyEpoch = 2;
+  prematureReplacement.rootGeneration = 2;
+  suite.require(!registry.recordCousinRoute(prematureReplacement, recorded, resumed, &failure),
+                "registry_rejects_generation_advance_before_both_prior_receipts");
   suite.require(registry.recordCousinRouteApplyReceipt(destinationReceipt, recordedReceipt, resumed, &failure),
                 "registry_records_destination_apply_receipt");
   suite.require(registry.cousinRouteAcknowledgedAt(route.routeUUID, 150, acknowledged, &failure) && acknowledged,

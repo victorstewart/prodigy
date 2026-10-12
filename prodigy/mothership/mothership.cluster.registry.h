@@ -3524,6 +3524,19 @@ public:
         if (failure) failure->assign("cousin route transition regresses scope or terminal tombstone"_ctv);
         return false;
       }
+      // A new desired generation may not overtake an unacknowledged current
+      // generation.  Keep both receipt reads under the route lock so a second
+      // coordinator cannot observe a partial handoff and publish ahead of it.
+      CousinRouteApplyReceipt sourceReceipt = {}, destinationReceipt = {};
+      String receiptFailure = {};
+      if (!loadCousinRouteApplyReceipt(prior.routeUUID, CousinRouteHalf::source, sourceReceipt, &receiptFailure) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(sourceReceipt, prior) ||
+          !loadCousinRouteApplyReceipt(prior.routeUUID, CousinRouteHalf::destination, destinationReceipt, &receiptFailure) ||
+          !cousinRouteApplyReceiptMatchesCurrentRoute(destinationReceipt, prior))
+      {
+        if (failure) failure->assign("cousin route transition awaits exact durable receipts for the current generation"_ctv);
+        return false;
+      }
       if (prior.priorOperationUUIDs.size() >= cousinRouteMaximumPriorOperationUUIDs)
       {
         if (failure) failure->assign("cousin route operation history reached its generation cap"_ctv);
