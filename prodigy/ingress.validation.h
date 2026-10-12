@@ -389,6 +389,8 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
     case MothershipTopic::pullCousinCounterparts:
     case MothershipTopic::requestTransportCredentialLifecycle:
     case MothershipTopic::pullTransportCredentialLifecycle:
+    case MothershipTopic::commitCousinRoute:
+    case MothershipTopic::pullCousinRoute:
       {
         String encoded;
         return extractVariableStringView(cursor, terminal, encoded) && encoded.size() <= 4096 && cursor == terminal;

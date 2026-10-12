@@ -3009,12 +3009,21 @@ stop_datacenter_locked()
 stop_datacenter()
 {
    [[ "$#" -eq 2 && "${EUID}" -eq 0 ]] || return 2
-   local workspace="$1" lifecycle_fd="" status
+   local workspace="$1" lifecycle_fd="" provider_pid="" status
    valid_workspace "${workspace}" || return 2
-   pair_lock_workspace "${workspace}" lifecycle_fd || return 1
-   stop_datacenter_locked "$@"; status=$?
-   pair_unlock_workspace "$lifecycle_fd" || return 1
-   return "$status"
+   if pair_lock_workspace "${workspace}" lifecycle_fd
+   then
+      stop_datacenter_locked "$@"; status=$?
+      pair_unlock_workspace "$lifecycle_fd" || return 1
+      return "$status"
+   fi
+   # A provider retains the startup lock until its initial members are ready.
+   # Removal must still be able to terminate a stalled partial bootstrap, but
+   # only after binding the published PID to this exact sealed workspace.
+   [[ -r "${workspace}/virtual-datacenter.pid" ]] || return 1
+   provider_pid="$(<"${workspace}/virtual-datacenter.pid")"
+   provider_process "${provider_pid}" "${workspace}" || return 1
+   stop_datacenter_locked "$@"
 }
 
 launch_datacenter()

@@ -8187,10 +8187,15 @@ static inline bool prodigyCousinRoutesValid(const Vector<CousinRouteRecord>& rou
   for (uint32_t index = 0; index < routes.size(); ++index)
   {
     if (!cousinRouteStructurallyValid(routes[index]) ||
+        !cousinRouteCurrentContract(routes[index]) ||
         (index != 0 && routes[index].routeUUID <= previousRouteUUID))
     {
       return false;
     }
+    if (!cousinRouteTerminal(routes[index]))
+      for (uint32_t other = 0; other < index; ++other)
+        if (!cousinRouteTerminal(routes[other]) &&
+            cousinRoutePeerRangeScopeMatches(routes[other], routes[index])) return false;
     previousRouteUUID = routes[index].routeUUID;
   }
   return true;
@@ -8199,7 +8204,12 @@ static inline bool prodigyCousinRoutesValid(const Vector<CousinRouteRecord>& rou
 static inline bool prodigyCousinRoutesValid(const Vector<CousinRouteRecord>& routes,
                                             uint128_t localClusterUUID)
 {
-  if (localClusterUUID == 0 || prodigyCousinRoutesValid(routes) == false) return false;
+  if (prodigyCousinRoutesValid(routes) == false) return false;
+  // Legacy and not-yet-configured Brains may restore an authority package
+  // before they have a local cluster identity. An empty route set has no
+  // cluster binding to validate; any materialized route still fails closed.
+  if (routes.empty()) return true;
+  if (localClusterUUID == 0) return false;
   for (const CousinRouteRecord& route : routes)
     if (route.sourceClusterUUID != localClusterUUID && route.destinationClusterUUID != localClusterUUID)
       return false;
@@ -9451,6 +9461,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
         [](const auto& operation) { return operation.protocolVersion >= 2; });
     hasMachineFragmentAssignments = state.machineFragmentAssignments.empty() == false;
     hasCousinRoutes = state.cousinRoutes.empty() == false;
+    // Version eighteen is cumulative through the version-seventeen fragment
+    // registry. Emit its bounded empty container when routes are present so
+    // the reader cannot consume route bytes as fragment assignments.
+    if (hasCousinRoutes) hasMachineFragmentAssignments = true;
     permitsTransportCredentialLifecycleOperations =
         hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments || hasCousinRoutes;
     // Versions sixteen and seventeen include every earlier tail, even when empty.

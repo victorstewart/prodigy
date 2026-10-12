@@ -1187,11 +1187,11 @@ static CousinRouteRecord persistentRuntimeCousinRoute(uint128_t routeUUID, uint1
   route.destinationCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
   route.destinationPermissionUUID = 0x404;
   route.slots.insert(3);
-  route.destinationRoutablePrefixUUID = 0x501;
+  route.destinationRoutablePrefixUUID = 0x500 + uint64_t(routeUUID);
   route.destinationPublicAddress.is6 = true;
   route.destinationPublicAddress.v6[0] = 0x20;
   route.destinationPublicAddress.v6[1] = 0x01;
-  route.destinationPublicAddress.v6[15] = 1;
+  route.destinationPublicAddress.v6[15] = uint8_t(routeUUID);
   route.destinationTCPPort = 443;
   route.transportProtocol = IPPROTO_TCP;
   route.destinationCIDR = 128;
@@ -1211,11 +1211,26 @@ static void testMasterAuthorityRuntimeCousinRouteCodec(TestSuite& suite)
   runtime.cousinRoutes.push_back(persistentRuntimeCousinRoute(0x101, 0x201));
   runtime.cousinRoutes.push_back(persistentRuntimeCousinRoute(0x102, 0x202));
 
+  suite.expect(cousinRouteStructurallyValid(runtime.cousinRoutes[0]),
+      "master_authority_runtime18_first_cousin_route_fixture_valid");
+  suite.expect(cousinRouteStructurallyValid(runtime.cousinRoutes[1]),
+      "master_authority_runtime18_second_cousin_route_fixture_valid");
+  suite.expect(prodigyCousinRoutesValid(runtime.cousinRoutes),
+      "master_authority_runtime18_cousin_route_collection_fixture_valid");
+
   String bytes = {};
   BitseryEngine::serialize(bytes, runtime);
   ProdigyMasterAuthorityRuntimeState restored = {};
+  const bool decoded = BitseryEngine::deserializeSafe(bytes, restored);
+  suite.expect(decoded, "master_authority_runtime18_cousin_routes_decode");
+  if (decoded)
+  {
+    suite.expect(prodigyCousinRoutesEqual(restored.cousinRoutes, runtime.cousinRoutes),
+        "master_authority_runtime18_cousin_routes_payload_equal");
+    suite.expect(restored == runtime, "master_authority_runtime18_full_runtime_equal");
+  }
   suite.expect(
-      BitseryEngine::deserializeSafe(bytes, restored) && restored == runtime &&
+      decoded && restored == runtime &&
           restored.cousinRoutes.size() == 2 &&
           restored.cousinRoutes[0].routeUUID == 0x101 && restored.cousinRoutes[1].routeUUID == 0x102,
       "master_authority_runtime18_cousin_routes_roundtrip_canonical");

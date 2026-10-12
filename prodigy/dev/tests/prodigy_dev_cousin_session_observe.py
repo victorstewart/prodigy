@@ -19,6 +19,8 @@ marker = int((root / (marker_name + '-monotonic-ms')).read_text())
 wall_marker = int((root / (marker_name + '-ms')).read_text())
 revoke_request_marker = (int((root / 'cousin-revocation-request-monotonic-ms').read_text())
                          if mode == 'revoked' else None)
+withdrawal_request_marker = (int((root / 'cousin-withdrawal-request-monotonic-ms').read_text())
+                             if mode == 'revoked' else None)
 output = root / 'cousin-native-logs'
 output.mkdir(exist_ok=True)
 transit = json.loads((root / 'cousin-service-transit.json').read_text())
@@ -94,11 +96,11 @@ while True:
         data = observed[qualified['sourceLog']]
         session = qualified['sessionUUID']
         revoked = [row for row in records(data, 'revoke')
-                   if row.get('session') == session and int(row['monotonicMs']) >= revoke_request_marker]
+                   if row.get('session') == session and int(row['monotonicMs']) >= withdrawal_request_marker]
         closed = [row for row in records(data, 'closed')
-                  if row.get('session') == session and int(row['monotonicMs']) >= revoke_request_marker]
+                  if row.get('session') == session and int(row['monotonicMs']) >= withdrawal_request_marker]
         retry_requests = [row for row in records(data, 'request')
-                          if int(row['monotonicMs']) > marker and row.get('source') == transit['sourceWhiteholeIPv6'] and
+                          if int(row['monotonicMs']) > withdrawal_request_marker and row.get('source') == transit['sourceWhiteholeIPv6'] and
                           int(row.get('sourcePort', '0')) == transit['sourceTCPPort']]
         retry_ids = {row['request'] for row in retry_requests}
         retry_rejections = [row for row in records(data, 'reject') if row.get('request') in retry_ids]
@@ -110,15 +112,17 @@ while True:
     if time.monotonic() >= deadline:
         if mode == 'revoked':
             if not revocation_evidence:
-                raise SystemExit('FAIL: no qualified-session revoke/close plus explicit rejection of a post-revocation request')
+                raise SystemExit('FAIL: no qualified-session revoke/close plus explicit rejection after route withdrawal')
             observed_for_ms = time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000 - marker
             (root / 'cousin-native-session-revoked.json').write_text(json.dumps(
                 {'revokedMs': wall_marker, 'revokedMonotonicMs': marker, 'observedForMs': observed_for_ms,
+                 'withdrawalRequestMonotonicMs': withdrawal_request_marker,
+                 'permissionRevocationRequestMonotonicMs': revoke_request_marker,
                  'sessionUUID': session, 'revocationGenerations': sorted({int(row['generation']) for row in revoked}),
                  'postRevocationRequestUUIDs': sorted(retry_ids),
                  'postRevocationRejectedRequestUUIDs': sorted({row['request'] for row in retry_rejections}),
                  'lateSuccessfulPayloads': 0}, indent=2) + '\n')
-            print('PASS: permission revocation closed the qualified session and rejected a new request', flush=True)
+            print('PASS: route withdrawal closed the qualified session, rejected a new request, and permission revocation remained terminal', flush=True)
             raise SystemExit(0)
         raise SystemExit('FAIL: no post-offline request completed exact payload exchange and >12s renewal')
     time.sleep(.2)

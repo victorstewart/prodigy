@@ -35544,7 +35544,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         peer.version = ProdigyBinaryVersion;
         String frame = {};
         permissionBrain.brainHandler(&peer, buildBrainMessage(frame,
-            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 512 | 1024)));
+            BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64 | 512 | 1024 | 8192)));
       };
       acknowledgePermissionCapabilities(permissionPeerA);
       acknowledgePermissionCapabilities(permissionPeerB);
@@ -35881,6 +35881,8 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         suite.require(cousinRouteStructurallyValid(sessionRoute),
                       "cousin_session_source_constructs_current_v2_route_authority");
         permissionBrain.masterAuthorityRuntimeState.cousinRoutes.push_back(sessionRoute);
+        suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                      "cousin_session_source_acks_route_authority_snapshot");
         const uint32_t savedFragment = selfMachine.fragment;
         const bool savedReady = selfMachine.runtimeReady;
         selfMachine.fragment = 1; selfMachine.runtimeReady = true;
@@ -35987,6 +35989,15 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
             // Requests are unassigned; only the committing owner assigns this
             // field to the resulting durable permission record.
             revokeRequest.permission.acceptedAuthorityGeneration = 0;
+            suite.expect(!permissionBrain.commitLocalCousinServicePermission(revokeRequest, permissionResponse),
+                         "cousin_session_active_route_blocks_permission_revocation");
+            permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front() = withdrawnRoute;
+            suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                          "cousin_session_withdrawn_route_qualifies_before_permission_revocation");
+            permissionBrain.driveCousinSessions();
+            suite.expect(permissionBrain.cousinSessions.empty(),
+                         "cousin_session_route_withdrawal_revokes_ephemeral_owner");
+            revokeRequest.expectedAuthorityGeneration = permissionBrain.masterAuthorityRuntimeState.generation;
             suite.require(permissionBrain.commitLocalCousinServicePermission(revokeRequest, permissionResponse),
                           "cousin_session_revoked_permission_commits_terminal_policy");
             permissionBrain.finishRuntimePersistence(true);
@@ -36020,8 +36031,9 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                            selfMachine.neuron.wBuffer.empty(),
                          "cousin_session_reject_does_not_target_stale_neuron");
             permissionBrain.masterAuthorityRuntimeState.localCousinServicePermissions.front() = oldPermission;
+            permissionBrain.masterAuthorityRuntimeState.cousinRoutes.front() = sessionRoute;
             suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
-                          "cousin_session_fixture_restores_source_permission_authority");
+                          "cousin_session_fixture_restores_source_permission_and_route_authority");
 
             // Session ownership is intentionally rechecked by the ordinary
             // lease driver.  These are local lifecycle changes, so no remote
@@ -36140,6 +36152,8 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
         permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
+        suite.require(acknowledgeCurrent(permissionBrain, permissionPeerA),
+                      "cousin_session_fixture_acks_route_authority_removal");
         permissionBrain.machinesByUUID.erase(selfMachine.uuid);
         selfMachine.fragment = savedFragment; selfMachine.runtimeReady = savedReady;
       }

@@ -84,7 +84,12 @@ enum class MothershipTopic : uint16_t {
   // Durable internal transport credential lifecycle control is independently
   // framed so legacy controllers reject it rather than decoding shifted data.
   requestTransportCredentialLifecycle,
-  pullTransportCredentialLifecycle
+  pullTransportCredentialLifecycle,
+  // Durable, local-half route authority is independently framed.  Keep these
+  // appended so an older Brain rejects the request rather than decoding it as
+  // an unrelated operation.
+  commitCousinRoute,
+  pullCousinRoute
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -195,6 +200,10 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "requestTransportCredentialLifecycle";
     case MothershipTopic::pullTransportCredentialLifecycle:
       return "pullTransportCredentialLifecycle";
+    case MothershipTopic::commitCousinRoute:
+      return "commitCousinRoute";
+    case MothershipTopic::pullCousinRoute:
+      return "pullCousinRoute";
   }
 
   return "unknown";

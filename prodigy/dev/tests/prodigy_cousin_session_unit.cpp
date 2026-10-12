@@ -113,6 +113,11 @@ static CousinRouteRecord buildRouteForSession(const ProdigyCousinSessionRecord& 
   route.destinationRoutablePrefixUUID = session.destination.routablePrefixUUID;
   route.destinationPublicAddress = session.destination.publicAddress;
   route.destinationTCPPort = session.destination.publicTCPPort;
+  route.sourcePermissionUUID = session.sourcePermission.permissionUUID;
+  route.destinationPermissionUUID = session.destination.permission.permissionUUID;
+  route.transportProtocol = IPPROTO_TCP;
+  route.destinationCIDR = 128;
+  route.pathMTU = cousinRouteMinimumPathMTU;
   route.generation = 3; route.issuedAtMs = 1000; route.expiresAtMs = 60000;
   route.keyEpoch = session.keyEpoch; route.rootGeneration = session.rootGeneration;
   route.state = CousinRouteState::active;

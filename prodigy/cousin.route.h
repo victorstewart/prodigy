@@ -9,7 +9,7 @@
 #include <services/prodigy.h>
 
 #include <prodigy/cousin.service.permission.h>
-#include <prodigy/bundle.artifact.h>
+#include <prodigy/sha256.digest.h>
 
 constexpr static int64_t cousinRouteMaximumLifetimeMs = 24LL * 60 * 60 * 1000;
 // A route UUID admits at most this many distinct operation identities over its
@@ -456,7 +456,7 @@ static inline bool cousinRouteAuthorizationDigest(const CousinRouteRecord& route
   CousinRouteRecord copy = route;
   copy.priorOperationUUIDs.clear();
   BitseryEngine::serialize(encoded, copy);
-  return prodigyComputeSHA256Hex(encoded, digest);
+  return prodigyComputeSHA256Hex(encoded, digest, nullptr);
 }
 
 static inline bool cousinRouteAllowsNewAdmissionAt(const CousinRouteRecord& route, int64_t nowMs)

@@ -140,10 +140,7 @@ static CousinRouteRecord validRoute(uint128_t routeUUID = 0x101, uint128_t opera
   route.slots.insert(3);
   route.slots.insert(1001);
   route.destinationRoutablePrefixUUID = 0x501;
-  route.destinationPublicAddress.is6 = true;
-  route.destinationPublicAddress.v6[0] = 0x20;
-  route.destinationPublicAddress.v6[1] = 0x01;
-  route.destinationPublicAddress.v6[15] = 1;
+  route.destinationPublicAddress = IPAddress("2001:db8::1", true);
   route.destinationTCPPort = 443;
   route.sourcePermissionUUID = 0x601;
   route.destinationPermissionUUID = 0x602;
@@ -753,6 +750,11 @@ int main(void)
   staleRouteReceipt.localRuntimeRevision = 2;
   suite.require(!registry.recordCousinRouteApplyReceipt(staleRouteReceipt, recordedReceipt, resumed, &failure),
                 "registry_rejects_stale_route_receipt");
+  CousinRouteApplyReceipt replacementSourceReceipt = validReceipt(replacement, CousinRouteHalf::source, 3);
+  CousinRouteApplyReceipt replacementDestinationReceipt = validReceipt(replacement, CousinRouteHalf::destination, 2);
+  suite.require(registry.recordCousinRouteApplyReceipt(replacementSourceReceipt, recordedReceipt, resumed, &failure) &&
+                registry.recordCousinRouteApplyReceipt(replacementDestinationReceipt, recordedReceipt, resumed, &failure),
+                "registry_acknowledges_both_replacement_halves_before_terminal_transition");
 
   CousinRouteRecord credentialRegression = replacement;
   credentialRegression.operationUUID = 0x204;
@@ -802,8 +804,8 @@ int main(void)
   revoked.withdrawnAtMs = 130;
   suite.require(registry.recordCousinRoute(revoked, recorded, resumed, &failure), "registry_persists_terminal_tombstone");
   suite.require(!registry.loadUsableCousinRoute(route.routeUUID, 140, loaded, &failure), "registry_terminal_route_is_not_new_admission_usable");
-  CousinRouteApplyReceipt revokedSourceReceipt = validReceipt(revoked, CousinRouteHalf::source, 3);
-  CousinRouteApplyReceipt revokedDestinationReceipt = validReceipt(revoked, CousinRouteHalf::destination, 2);
+  CousinRouteApplyReceipt revokedSourceReceipt = validReceipt(revoked, CousinRouteHalf::source, 4);
+  CousinRouteApplyReceipt revokedDestinationReceipt = validReceipt(revoked, CousinRouteHalf::destination, 3);
   suite.require(registry.recordCousinRouteApplyReceipt(revokedSourceReceipt, recordedReceipt, resumed, &failure) &&
                 registry.recordCousinRouteApplyReceipt(revokedDestinationReceipt, recordedReceipt, resumed, &failure),
                 "registry_accepts_terminal_desired_state_receipts");
@@ -824,6 +826,9 @@ int main(void)
                 "registry_allows_fresh_route_uuid_for_peer_range_after_terminal_tombstone");
 
   CousinRouteRecord expired = validRoute(0x102, 0x209);
+  expired.destinationRoutablePrefixUUID = 0x502;
+  expired.destinationPublicAddress = IPAddress("2001:db8:2::1", true);
+  expired.destinationCIDR = 48;
   expired.expiresAtMs = 150;
   suite.require(registry.recordCousinRoute(expired, recorded, resumed, &failure), "registry_persists_finite_expiry_route");
   suite.require(!registry.loadUsableCousinRoute(expired.routeUUID, 150, loaded, &failure), "registry_expiry_rejects_new_admission_after_cold_load");
@@ -834,7 +839,15 @@ int main(void)
   suite.require(!registry.recordCousinRoute(invalid, recorded, resumed, &failure), "registry_rejects_invalid_route");
 
   CousinRouteRecord drainingRoute = validRoute(0x104, 0x20b);
+  drainingRoute.destinationRoutablePrefixUUID = 0x503;
+  drainingRoute.destinationPublicAddress = IPAddress("2001:db8:3::1", true);
+  drainingRoute.destinationCIDR = 48;
   suite.require(registry.recordCousinRoute(drainingRoute, recorded, resumed, &failure), "registry_persists_draining_route_initial_generation");
+  CousinRouteApplyReceipt drainingInitialSource = validReceipt(drainingRoute, CousinRouteHalf::source, 1);
+  CousinRouteApplyReceipt drainingInitialDestination = validReceipt(drainingRoute, CousinRouteHalf::destination, 1);
+  suite.require(registry.recordCousinRouteApplyReceipt(drainingInitialSource, recordedReceipt, resumed, &failure) &&
+                registry.recordCousinRouteApplyReceipt(drainingInitialDestination, recordedReceipt, resumed, &failure),
+                "registry_acknowledges_both_initial_halves_before_draining_transition");
   CousinRouteRecord drainingGeneration = drainingRoute;
   drainingGeneration.operationUUID = 0x20c;
   drainingGeneration.generation = 2;
@@ -842,8 +855,8 @@ int main(void)
   drainingGeneration.expiresAtMs = 300;
   drainingGeneration.state = CousinRouteState::draining;
   suite.require(registry.recordCousinRoute(drainingGeneration, recorded, resumed, &failure), "registry_persists_draining_desired_state");
-  CousinRouteApplyReceipt drainingSourceReceipt = validReceipt(drainingGeneration, CousinRouteHalf::source, 1);
-  CousinRouteApplyReceipt drainingDestinationReceipt = validReceipt(drainingGeneration, CousinRouteHalf::destination, 1);
+  CousinRouteApplyReceipt drainingSourceReceipt = validReceipt(drainingGeneration, CousinRouteHalf::source, 2);
+  CousinRouteApplyReceipt drainingDestinationReceipt = validReceipt(drainingGeneration, CousinRouteHalf::destination, 2);
   suite.require(registry.recordCousinRouteApplyReceipt(drainingSourceReceipt, recordedReceipt, resumed, &failure) &&
                 registry.recordCousinRouteApplyReceipt(drainingDestinationReceipt, recordedReceipt, resumed, &failure),
                 "registry_accepts_draining_desired_state_receipts");

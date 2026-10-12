@@ -81,6 +81,7 @@ public:
   bool clusterPairEpochRotationCapabilityAcknowledged = false;
   bool localCousinServicePermissionCapabilityAcknowledged = false;
   bool localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+  bool cousinRouteCapabilityAcknowledged = false;
   bool transportCredentialLifecycleCapabilityAcknowledged = false;
   bool authorityElectionCapabilityAcknowledged = false;
   uint64_t authorityElectionRequestNonce = 0;
@@ -182,6 +183,7 @@ public:
     clusterPairEpochRotationCapabilityAcknowledged = false;
     localCousinServicePermissionCapabilityAcknowledged = false;
     localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+    cousinRouteCapabilityAcknowledged = false;
     transportCredentialLifecycleCapabilityAcknowledged = false;
     authorityElectionCapabilityAcknowledged = false;
     clearAuthorityElectionObservation();

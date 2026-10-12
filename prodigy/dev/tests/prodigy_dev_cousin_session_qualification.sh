@@ -290,6 +290,7 @@ PY_TRANSIT
     source "$TEST_DIR/prodigy_dev_cousin_lifecycle_qualification.sh"
     prodigy_dev_qualify_cousin_lifecycle "$lifecycle" "$source_name" "$destination_name" || return
   fi
+  COUSIN_OFFLINE=0
   # Route operation ordering is observed before permission revocation. A
   # recovered drain cannot admit new sessions, withdrawal is terminal, and a
   # delayed stale generation remains rejected after coordinator recovery.
@@ -305,11 +306,13 @@ PY_TRANSIT
   fi
   rg -q 'cousinRoute success=0' "$ROOT/cousin-route-stale-after-recover.log" || return 1
   prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-withdrawn.json" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" withdrawn 3 || return
+  prodigy_dev_cousin_mark_time "$ROOT/cousin-withdrawal-request"
   m cousin-route-withdrawn 60 "$ROOT/cousin-route-withdrawn.log" cousinRoute put "$OPERATION" \
     "$(cat "$ROOT/cousin-route-withdrawn.json")" || return
   ok "$ROOT/cousin-route-withdrawn.log" cousinRoute || return 1
   m cousin-route-query-withdrawn 45 "$ROOT/cousin-route-query-withdrawn.log" cousinRoute query "$route_uuid" || return
   ok "$ROOT/cousin-route-query-withdrawn.log" cousinRoute || return 1
+  prodigy_dev_cousin_mark_time "$ROOT/cousin-withdrawn"
   COUSIN_OFFLINE=0
   # This marker bounds delivery of the synchronous Mothership revoke command;
   # its local revoke/close may happen before the completion marker below.
@@ -327,11 +330,16 @@ PY_TRANSIT
 # caller-owned fields. It never writes route state outside Mothership.
 prodigy_dev_write_cousin_route_intent() {
   local output=$1 route_id=$2 source_permission=$3 destination_permission=$4 destination_prefix_uuid=$5 state=$6 generation=$7
-  python3 - "$output" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" "$state" "$generation" "$ROOT/cousin-service-transit.json" <<'PY_ROUTE'
+  python3 - "$output" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" "$state" "$generation" \
+    "$ROOT/cousin-service-transit.json" "$ROOT/cousin-source-permission.json" "$ROOT/cousin-destination-permission.json" <<'PY_ROUTE'
 import json,pathlib,sys,time
-output,route_id,source_permission,destination_permission,destination_prefix_uuid,state,generation,transit_path=sys.argv[1:]
+output,route_id,source_permission,destination_permission,destination_prefix_uuid,state,generation,transit_path,source_policy_path,destination_policy_path=sys.argv[1:]
 route_seed=int(route_id,16)
 transit=json.loads(pathlib.Path(transit_path).read_text())
+source_policy=json.loads(pathlib.Path(source_policy_path).read_text())
+destination_policy=json.loads(pathlib.Path(destination_policy_path).read_text())
+assert source_policy['logicalWorkloadUUID']==destination_policy['logicalWorkloadUUID']
+assert source_policy['logicalServiceUUID']==destination_policy['logicalServiceUUID']
 now=time.time_ns()//1_000_000
 def canonical(value):
     return '0x'+value.to_bytes(16,'big').hex()
@@ -340,8 +348,8 @@ def canonical(value):
 intent={
   'routeUUID':canonical(route_seed ^ 0x5100),
   'operationUUID':canonical(route_seed ^ (0x5200 + int(generation))),
-  'logicalWorkloadUUID':canonical(route_seed ^ 0x5300),
-  'logicalServiceUUID':canonical(route_seed ^ 0x5400),
+  'logicalWorkloadUUID':source_policy['logicalWorkloadUUID'],
+  'logicalServiceUUID':source_policy['logicalServiceUUID'],
   'sourcePermissionUUID':'0x'+source_permission.removeprefix('0x'),
   'destinationPermissionUUID':'0x'+destination_permission.removeprefix('0x'),
   'slots':[0],
@@ -363,6 +371,6 @@ PY_ROUTE
 prodigy_dev_cousin_route_uuid() {
   python3 - "$1" <<'PY_ROUTE_UUID'
 import sys
-print('0x'+((int(sys.argv[1],16)^0x5100).to_bytes(16,'big').hex())
+print('0x'+((int(sys.argv[1],16)^0x5100).to_bytes(16,'big').hex()))
 PY_ROUTE_UUID
 }

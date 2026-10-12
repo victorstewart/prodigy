@@ -1159,7 +1159,7 @@ class ProdigyMasterAuthorityStateTransition
 {
 public:
 
-  constexpr static uint8_t currentVersion = 9;
+  constexpr static uint8_t currentVersion = 10;
 
   uint8_t version = 1;
   bool supportedVersion() const { return version >= 1 && version <= currentVersion; }
@@ -1189,6 +1189,9 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
             transition.runtimeState.generation))) return;
     if (std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && transition.version < 8) return;
+    if (!transition.runtimeState.cousinRoutes.empty() &&
+        (transition.version < 10 || !prodigyCousinRoutesValid(
+            transition.runtimeState.cousinRoutes, transition.brainConfig.clusterUUID))) return;
     if (transition.version >= 6)
     {
       auto descriptors = transition.runtimeState.clusterPairEnrollments;
@@ -1212,9 +1215,14 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
             transition.runtimeState.localCousinServicePermissions, transition.brainConfig.clusterUUID,
             transition.runtimeState.generation)))
       serializer.adapter().error(bitsery::ReaderError::InvalidData);
-  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
-    if (std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
+    if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+      if (std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) && transition.version < 8)
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
+    if (!transition.runtimeState.cousinRoutes.empty() &&
+        (transition.version < 10 || !prodigyCousinRoutesValid(
+            transition.runtimeState.cousinRoutes, transition.brainConfig.clusterUUID)))
       serializer.adapter().error(bitsery::ReaderError::InvalidData);
   if (transition.version >= 2)
     serializer.container(transition.servingRuntimeStates, 4096);
@@ -7974,11 +7982,14 @@ public:
           transition.servingRuntimeStates, transition.runtimeState.generation) ||
         (!transition.runtimeState.localCousinServicePermissions.empty() &&
          !prodigyLocalCousinServicePermissionsValid(transition.runtimeState.localCousinServicePermissions,
-           brainConfig.clusterUUID, transition.runtimeState.generation))) return false;
+           brainConfig.clusterUUID, transition.runtimeState.generation)) ||
+        !prodigyCousinRoutesValid(transition.runtimeState.cousinRoutes,
+                                  brainConfig.clusterUUID)) return false;
     if (!transition.runtimeState.localCousinServicePermissions.empty()) transition.version =
         std::any_of(transition.runtimeState.localCousinServicePermissions.begin(), transition.runtimeState.localCousinServicePermissions.end(),
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
     if (transportCredentialLifecycleOperationsPresent()) transition.version = 9;
+    if (!transition.runtimeState.cousinRoutes.empty()) transition.version = 10;
     transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     transition.runtimeState.updateSelfFollowerConcurrency = 0;
     transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
@@ -8007,6 +8018,7 @@ public:
     }
     if ((onlyUnacknowledged || internalTransportAEGISRequired() || !masterAuthorityRuntimeState.clusterPairEnrollments.empty() || !masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
          !masterAuthorityRuntimeState.statelessDeploymentAdmissions.empty() ||
+         !masterAuthorityRuntimeState.cousinRoutes.empty() ||
          masterAuthorityRuntimeState.pendingElasticAddressAssignments.empty() == false ||
          masterAuthorityRuntimeState.pendingElasticAddressReleases.empty() == false) &&
         (masterAuthorityRuntimeStateDurable == false ||
@@ -8705,11 +8717,42 @@ public:
     return capable >= uint32_t(electorate.size() / 2) + 1;
   }
 
+  bool cousinRoutePeerCapabilityCurrent(BrainView *peer) const
+  {
+    return localCousinServicePermissionPeerCapabilityCurrent(peer, true) &&
+           peer->cousinRouteCapabilityAcknowledged;
+  }
+
+  bool cousinRoutePeersCapable() const
+  {
+    if (!weAreMaster || !internalTransportAEGISRequired()) return false;
+    const Vector<uint128_t> electorate = clusterPairCurrentElectorate();
+    if (electorate.empty() ||
+        std::find(electorate.begin(), electorate.end(), selfBrainUUID()) == electorate.end()) return false;
+    uint32_t capable = 0;
+    for (uint128_t voter : electorate)
+    {
+      if (voter == selfBrainUUID()) { ++capable; continue; }
+      if (cousinRoutePeerCapabilityCurrent(findBrainViewByUUID(voter))) ++capable;
+    }
+    return capable >= uint32_t(electorate.size() / 2) + 1;
+  }
+
   bool localCousinServicePermissionAuthorityAcknowledged() const
   {
     if (!weAreMaster || !masterAuthorityRuntimeStateDurable ||
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
         !localCousinServicePermissionPeersCapable()) return false;
+    String serialized = {}, digest = {};
+    return serializeCurrentMasterAuthorityTransition(serialized, digest) &&
+        transportCredentialElectorateHasQualifiedQuorum(clusterPairCurrentElectorate(), digest);
+  }
+
+  bool cousinRouteAuthorityAcknowledged() const
+  {
+    if (!weAreMaster || !masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
+        !cousinRoutePeersCapable()) return false;
     String serialized = {}, digest = {};
     return serializeCurrentMasterAuthorityTransition(serialized, digest) &&
         transportCredentialElectorateHasQualifiedQuorum(clusterPairCurrentElectorate(), digest);
@@ -8812,6 +8855,12 @@ public:
       if (existing->state != ProdigyLocalCousinServicePermissionState::active ||
           request.permission.state != ProdigyLocalCousinServicePermissionState::revoked ||
           request.permission.generation != 2) return reject("local cousin permission transition is not a terminal revoke");
+      if (std::any_of(masterAuthorityRuntimeState.cousinRoutes.begin(),
+          masterAuthorityRuntimeState.cousinRoutes.end(), [&](const auto& route) {
+            const uint128_t localPermissionUUID = route.sourceClusterUUID == brainConfig.clusterUUID ?
+                route.sourcePermissionUUID : route.destinationPermissionUUID;
+            return localPermissionUUID == existing->permissionUUID && !cousinRouteTerminal(route);
+          })) return reject("local cousin permission revoke requires its routes withdrawn or revoked first");
     } else {
       // Requests are legacy v1 form: the master alone supplies v2 baselines.
       if (request.permission.protocolVersion != 1 || request.permission.baselineLogicalCores != 0 ||
@@ -8871,15 +8920,34 @@ public:
     return response.success;
   }
 
+  bool localCousinServicePermissionScopeAllowsRoute(
+      const ProdigyLocalCousinServicePermission& permission,
+      const CousinRouteRecord& route) const
+  {
+    if (!cousinRouteCurrentContract(route) ||
+        permission.state != ProdigyLocalCousinServicePermissionState::active) return false;
+    for (uint16_t candidateSlot = 0; candidateSlot < CousinRouteSlotBitmap::slotCount; ++candidateSlot)
+      if (route.slots.contains(candidateSlot) && !permission.slots.contains(candidateSlot)) return false;
+    const bool source = permission.localHalf == CousinRouteHalf::source;
+    return (source ? route.sourcePermissionUUID : route.destinationPermissionUUID) == permission.permissionUUID &&
+        route.pairUUID == permission.pairUUID && route.logicalWorkloadUUID == permission.logicalWorkloadUUID &&
+        route.logicalServiceUUID == permission.logicalServiceUUID &&
+        (source ? route.sourceClusterUUID == permission.localClusterUUID && route.destinationClusterUUID == permission.peerClusterUUID &&
+             route.sourceApplicationID == permission.localApplicationID && route.destinationApplicationID == permission.peerApplicationID &&
+             route.sourceCousinServicePrefix == permission.localCousinServicePrefix && route.destinationCousinServicePrefix == permission.peerCousinServicePrefix :
+             route.destinationClusterUUID == permission.localClusterUUID && route.sourceClusterUUID == permission.peerClusterUUID &&
+             route.destinationApplicationID == permission.localApplicationID && route.sourceApplicationID == permission.peerApplicationID &&
+             route.destinationCousinServicePrefix == permission.localCousinServicePrefix && route.sourceCousinServicePrefix == permission.peerCousinServicePrefix);
+  }
+
   bool localCousinServicePermissionAllowsRoute(uint128_t permissionUUID, const CousinRouteRecord& route,
                                                 uint16_t slot, int64_t nowMs) const
   {
     if (!cousinRouteAllowsNewAdmissionAt(route, nowMs) || !clusterPairAuthorityQualified() ||
-        !localCousinServicePermissionAuthorityAcknowledged()) return false;
+        !localCousinServicePermissionAuthorityAcknowledged() || !cousinRouteCurrentContract(route)) return false;
     const auto permission = std::find_if(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
         masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& value) { return value.permissionUUID == permissionUUID; });
     if (permission == masterAuthorityRuntimeState.localCousinServicePermissions.end() ||
-        permission->state != ProdigyLocalCousinServicePermissionState::active ||
         !permission->slots.contains(slot) || !localCousinServicePermissionMatchesCurrentLivePlan(*permission)) return false;
     const auto pair = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
         masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& enrollment) {
@@ -8887,17 +8955,171 @@ public:
               enrollment.rootGeneration == route.rootGeneration && enrollment.agreedKeyEpoch == route.keyEpoch;
         });
     if (pair == masterAuthorityRuntimeState.clusterPairEnrollments.end()) return false;
-    for (uint16_t candidateSlot = 0; candidateSlot < CousinRouteSlotBitmap::slotCount; ++candidateSlot)
-      if (route.slots.contains(candidateSlot) && !permission->slots.contains(candidateSlot)) return false;
-    const bool source = permission->localHalf == CousinRouteHalf::source;
-    return route.pairUUID == permission->pairUUID && route.logicalWorkloadUUID == permission->logicalWorkloadUUID &&
-        route.logicalServiceUUID == permission->logicalServiceUUID && route.slots.contains(slot) &&
-        (source ? route.sourceClusterUUID == permission->localClusterUUID && route.destinationClusterUUID == permission->peerClusterUUID &&
-             route.sourceApplicationID == permission->localApplicationID && route.destinationApplicationID == permission->peerApplicationID &&
-             route.sourceCousinServicePrefix == permission->localCousinServicePrefix && route.destinationCousinServicePrefix == permission->peerCousinServicePrefix :
-             route.destinationClusterUUID == permission->localClusterUUID && route.sourceClusterUUID == permission->peerClusterUUID &&
-             route.destinationApplicationID == permission->localApplicationID && route.sourceApplicationID == permission->peerApplicationID &&
-             route.destinationCousinServicePrefix == permission->localCousinServicePrefix && route.sourceCousinServicePrefix == permission->peerCousinServicePrefix);
+    return route.slots.contains(slot) && localCousinServicePermissionScopeAllowsRoute(*permission, route);
+  }
+
+  bool cousinRouteMatchesCounterpart(const CousinRouteRecord& route,
+                                     const ProdigyCousinCounterpart& candidate) const
+  {
+    if (candidate.permission.permissionUUID != route.destinationPermissionUUID ||
+        candidate.routablePrefixUUID != route.destinationRoutablePrefixUUID ||
+        !candidate.publicAddress.equals(route.destinationPublicAddress) ||
+        candidate.publicTCPPort != route.destinationTCPPort ||
+        candidate.permission.localClusterUUID != route.destinationClusterUUID ||
+        candidate.permission.peerClusterUUID != route.sourceClusterUUID ||
+        candidate.permission.localApplicationID != route.destinationApplicationID ||
+        candidate.permission.peerApplicationID != route.sourceApplicationID ||
+        candidate.permission.localCousinServicePrefix != route.destinationCousinServicePrefix ||
+        candidate.permission.peerCousinServicePrefix != route.sourceCousinServicePrefix) return false;
+    for (uint16_t slot = 0; slot < CousinRouteSlotBitmap::slotCount; ++slot)
+      if (route.slots.contains(slot) && !candidate.ownedSlots.contains(slot)) return false;
+    return true;
+  }
+
+  bool cousinRouteMatchesCurrentDestination(const CousinRouteRecord& route, CousinRouteHalf localHalf) const
+  {
+    if (!cousinRouteCurrentContract(route) || route.state != CousinRouteState::active) return true;
+    auto matches = [&](const ProdigyCousinCounterpart& candidate) {
+      return cousinRouteMatchesCounterpart(route, candidate);
+    };
+    if (localHalf == CousinRouteHalf::destination)
+    {
+      const DistributableExternalSubnet *range = findRegisteredRoutablePrefix(
+          brainConfig.distributableExternalSubnets, route.destinationRoutablePrefixUUID);
+      if (range == nullptr || !cousinRouteDestinationRangeContainsAddress(route, range->subnet)) return false;
+      ProdigyCousinDiscoverySnapshot snapshot = {};
+      if (!buildCousinDiscoverySnapshot(route.pairUUID, snapshot)) return false;
+      return std::any_of(snapshot.records.begin(), snapshot.records.end(), matches);
+    }
+    uint16_t firstSlot = 0;
+    while (firstSlot < CousinRouteSlotBitmap::slotCount && !route.slots.contains(firstSlot)) ++firstSlot;
+    if (firstSlot == CousinRouteSlotBitmap::slotCount) return false;
+    const ProdigyCousinDiscoveryResponse response = queryCousinCounterparts(
+        {ProdigyCousinDiscoveryQuery::version, route.sourcePermissionUUID, firstSlot});
+    return response.success && std::any_of(response.records.begin(), response.records.end(), matches);
+  }
+
+  ProdigyCousinRouteResponse queryCousinRoute(const ProdigyCousinRouteQuery& query) const
+  {
+    ProdigyCousinRouteResponse response = {};
+    response.localClusterUUID = brainConfig.clusterUUID;
+    response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    response.currentMasterUUID = getExistingMasterUUID();
+    if (response.currentMasterUUID == selfBrainUUID()) response.currentMasterBootNs = boottimens;
+    else if (BrainView *master = findBrainViewByUUID(response.currentMasterUUID)) response.currentMasterBootNs = master->boottimens;
+    if (!prodigyCousinRouteQueryValid(query)) {
+      response.failure.assign("invalid cousin route query"_ctv); return response;
+    }
+    const auto route = std::find_if(masterAuthorityRuntimeState.cousinRoutes.begin(),
+        masterAuthorityRuntimeState.cousinRoutes.end(), [&](const auto& value) { return value.routeUUID == query.routeUUID; });
+    response.success = true;
+    if (route == masterAuthorityRuntimeState.cousinRoutes.end()) return response;
+    response.found = true; response.route = *route;
+    response.applyReceipt.routeUUID = route->routeUUID;
+    response.applyReceipt.generation = route->generation;
+    response.applyReceipt.localClusterUUID = brainConfig.clusterUUID;
+    response.applyReceipt.localHalf = route->sourceClusterUUID == brainConfig.clusterUUID ?
+        CousinRouteHalf::source : CousinRouteHalf::destination;
+    response.applyReceipt.keyEpoch = route->keyEpoch;
+    response.applyReceipt.localRuntimeRevision = masterAuthorityRuntimeState.generation;
+    response.applyReceipt.installedState = route->state;
+    if (!cousinRouteAuthorizationDigest(*route, response.applyReceipt.authorizationSHA256)) {
+      response = {}; response.failure.assign("durable cousin route digest failed"_ctv); return response;
+    }
+    response.qualified = cousinRouteAuthorityAcknowledged();
+    return response;
+  }
+
+  bool commitCousinRoute(const ProdigyCousinRouteRequest& request,
+                         ProdigyCousinRouteResponse& response)
+  {
+    auto reject = [&](const char *failure) {
+      response = {}; response.localClusterUUID = brainConfig.clusterUUID;
+      response.currentAuthorityGeneration = masterAuthorityRuntimeState.generation;
+      response.currentMasterUUID = getExistingMasterUUID();
+      if (response.currentMasterUUID == selfBrainUUID()) response.currentMasterBootNs = boottimens;
+      else if (BrainView *master = findBrainViewByUUID(response.currentMasterUUID)) response.currentMasterBootNs = master->boottimens;
+      response.failure.assign(failure); return false;
+    };
+    const auto& route = request.route;
+    const uint128_t expectedLocal = request.localHalf == CousinRouteHalf::source ?
+        route.sourceClusterUUID : route.destinationClusterUUID;
+    if (!prodigyCousinRouteRequestValid(request) || expectedLocal != brainConfig.clusterUUID ||
+        !weAreMaster || masterAuthorityEpoch == 0 || masterAuthorityPersistencePending != 0 ||
+        !clusterPairAuthorityQualified() || !cousinRoutePeersCapable() ||
+        request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
+        request.expectedMasterUUID != selfBrainUUID() || request.expectedMasterBootNs != boottimens ||
+        masterAuthorityRuntimeState.generation == UINT64_MAX)
+      return reject("cousin route requires exact current local master authority");
+    const uint128_t localPermissionUUID = request.localHalf == CousinRouteHalf::source ?
+        route.sourcePermissionUUID : route.destinationPermissionUUID;
+    const auto permission = std::find_if(masterAuthorityRuntimeState.localCousinServicePermissions.begin(),
+        masterAuthorityRuntimeState.localCousinServicePermissions.end(), [&](const auto& value) {
+          return value.permissionUUID == localPermissionUUID;
+        });
+    auto existing = std::find_if(masterAuthorityRuntimeState.cousinRoutes.begin(),
+        masterAuthorityRuntimeState.cousinRoutes.end(), [&](const auto& value) { return value.routeUUID == route.routeUUID; });
+    const bool terminalTransition = existing != masterAuthorityRuntimeState.cousinRoutes.end() && cousinRouteTerminal(route);
+    if (permission == masterAuthorityRuntimeState.localCousinServicePermissions.end() ||
+        (!terminalTransition && (!localCousinServicePermissionScopeAllowsRoute(*permission, route) ||
+          !localCousinServicePermissionMatchesCurrentLivePlan(*permission))))
+      return reject("cousin route conflicts with the exact current local deployment permission");
+    const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
+          return value.pairUUID == route.pairUUID && value.localClusterUUID == brainConfig.clusterUUID;
+        });
+    if (!terminalTransition && (enrollment == masterAuthorityRuntimeState.clusterPairEnrollments.end() ||
+        enrollment->state != ProdigyClusterPairEnrollmentState::active ||
+        enrollment->rootGeneration != route.rootGeneration || enrollment->agreedKeyEpoch != route.keyEpoch ||
+        !cousinRouteMatchesCurrentDestination(route, request.localHalf)))
+      return reject("cousin route endpoint, range, or pair epoch is not current");
+    if (existing == masterAuthorityRuntimeState.cousinRoutes.end())
+    {
+      if (route.generation != 1 || route.state != CousinRouteState::active ||
+          !route.priorOperationUUIDs.empty() ||
+          masterAuthorityRuntimeState.cousinRoutes.size() >= ProdigyCousinRouteMaximumRecords)
+        return reject("initial cousin route must be active generation one");
+    }
+    else
+    {
+      if (route.operationUUID == existing->operationUUID && route.generation == existing->generation &&
+          route.priorOperationUUIDs == existing->priorOperationUUIDs &&
+          cousinRouteExactMatches(*existing, route)) {
+        response = queryCousinRoute({ProdigyCousinRouteQuery::version, route.routeUUID});
+        return response.success;
+      }
+      if (!cousinRouteTransitionAllowed(*existing, route) ||
+          route.priorOperationUUIDs.size() != existing->priorOperationUUIDs.size() + 1 ||
+          !cousinRouteOperationUUIDWasUsed(route, existing->operationUUID))
+        return reject("cousin route transition is stale, conflicting, or revives a terminal route");
+      for (uint128_t prior : existing->priorOperationUUIDs)
+        if (!cousinRouteOperationUUIDWasUsed(route, prior))
+          return reject("cousin route operation history is incomplete");
+    }
+    if (!cousinRouteTerminal(route)) for (const auto& other : masterAuthorityRuntimeState.cousinRoutes)
+      if (other.routeUUID != route.routeUUID && !cousinRouteTerminal(other) &&
+          cousinRoutePeerRangeScopeMatches(other, route))
+        return reject("cousin route peer/range is already owned by another live route");
+    auto previous = masterAuthorityRuntimeState;
+    if (existing == masterAuthorityRuntimeState.cousinRoutes.end()) {
+      auto insert = masterAuthorityRuntimeState.cousinRoutes.begin();
+      while (insert != masterAuthorityRuntimeState.cousinRoutes.end() && insert->routeUUID < route.routeUUID) ++insert;
+      masterAuthorityRuntimeState.cousinRoutes.insert(insert, route);
+    } else *existing = route;
+    if (!prodigyCousinRoutesValid(masterAuthorityRuntimeState.cousinRoutes, brainConfig.clusterUUID)) {
+      masterAuthorityRuntimeState = std::move(previous); return reject("cousin route durable set is invalid");
+    }
+    const uint64_t epoch = masterAuthorityEpoch;
+    const uint64_t generation = masterAuthorityRuntimeState.generation + 1;
+    commitMasterAuthorityStateChangeAsync([this, epoch, generation, previous = std::move(previous)](bool durable) mutable {
+      if (!durable && masterAuthorityEpoch == epoch && masterAuthorityRuntimeState.generation == generation) {
+        masterAuthorityRuntimeState = std::move(previous);
+        masterAuthorityRuntimeStateDurable = false;
+        durableMasterAuthorityRuntimeStateGeneration = 0;
+      }
+    });
+    response = queryCousinRoute({ProdigyCousinRouteQuery::version, route.routeUUID});
+    return response.success;
   }
 
   bool statelessDeploymentAdmissionIsDurable(const ProdigyStatelessDeploymentAdmission& admission) const
@@ -10110,8 +10332,22 @@ public:
             brainConfig.datacenterFragment) ||
         !prodigyStatelessDeploymentAdmissionsValid(restoredRuntimeState.statelessDeploymentAdmissions,
                                                    restoredRuntimeState.generation) ||
+        !prodigyCousinRoutesValid(restoredRuntimeState.cousinRoutes,
+                                  brainConfig.clusterUUID) ||
         !statelessDeploymentAdmissionsMatchPersistentPlans(
             restoredRuntimeState.statelessDeploymentAdmissions, package.deploymentPlans)) return false;
+    for (const auto& route : restoredRuntimeState.cousinRoutes)
+    {
+      const uint128_t localPermissionUUID = route.sourceClusterUUID == brainConfig.clusterUUID ?
+          route.sourcePermissionUUID : route.destinationPermissionUUID;
+      const auto permission = std::find_if(restoredRuntimeState.localCousinServicePermissions.begin(),
+          restoredRuntimeState.localCousinServicePermissions.end(), [&](const auto& candidate) {
+            return candidate.permissionUUID == localPermissionUUID;
+          });
+      if (permission == restoredRuntimeState.localCousinServicePermissions.end() ||
+          (!cousinRouteTerminal(route) &&
+           !localCousinServicePermissionScopeAllowsRoute(*permission, route))) return false;
+    }
     if (!prodigyValidateStatefulServingAuthorities(restoredRuntimeState.statefulServingAuthorities,
           package.servingRuntimeStates, restoredRuntimeState.generation)) return false;
     ProdigyMachineRetirementJournal retirementJournal = {};
@@ -10357,7 +10593,8 @@ public:
             incoming.generation) ||
         !transportCredentialLifecycleHistoryMatches(incoming) ||
         !prodigyValidateClusterPairEnrollmentOperations(incoming.clusterPairEnrollments,
-            incoming.clusterPairEnrollmentOperations, incoming.generation, &incoming.transportCredentialEnrollments))
+            incoming.clusterPairEnrollmentOperations, incoming.generation, &incoming.transportCredentialEnrollments) ||
+        !prodigyCousinRoutesValid(incoming.cousinRoutes, credentialConfig.clusterUUID))
     {
       return false;
     }
@@ -10374,6 +10611,31 @@ public:
              next->state == ProdigyLocalCousinServicePermissionState::revoked && next->generation == 2 &&
              next->acceptedAuthorityGeneration > previous.acceptedAuthorityGeneration &&
              prodigyLocalCousinServicePermissionScopeMatches(previous, *next)))) return false;
+    }
+    for (const auto& route : incoming.cousinRoutes)
+    {
+      const uint128_t localPermissionUUID = route.sourceClusterUUID == credentialConfig.clusterUUID ?
+          route.sourcePermissionUUID : route.destinationPermissionUUID;
+      const auto permission = std::find_if(incoming.localCousinServicePermissions.begin(),
+          incoming.localCousinServicePermissions.end(), [&](const auto& candidate) {
+            return candidate.permissionUUID == localPermissionUUID;
+          });
+      if (permission == incoming.localCousinServicePermissions.end() ||
+          (!cousinRouteTerminal(route) &&
+           !localCousinServicePermissionScopeAllowsRoute(*permission, route))) return false;
+    }
+    for (const auto& previous : masterAuthorityRuntimeState.cousinRoutes)
+    {
+      const auto next = std::find_if(incoming.cousinRoutes.begin(), incoming.cousinRoutes.end(),
+          [&](const auto& route) { return route.routeUUID == previous.routeUUID; });
+      if (next == incoming.cousinRoutes.end()) return false;
+      if (next->operationUUID == previous.operationUUID && next->generation == previous.generation &&
+          next->priorOperationUUIDs == previous.priorOperationUUIDs && cousinRouteExactMatches(previous, *next)) continue;
+      if (!cousinRouteTransitionAllowed(previous, *next) ||
+          next->priorOperationUUIDs.size() != previous.priorOperationUUIDs.size() + 1 ||
+          !cousinRouteOperationUUIDWasUsed(*next, previous.operationUUID)) return false;
+      for (uint128_t prior : previous.priorOperationUUIDs)
+        if (!cousinRouteOperationUUIDWasUsed(*next, prior)) return false;
     }
     // Enrollment identities and revoked tombstones survive later authority
     // revisions. A new generation alone cannot resurrect or silently rekey a
@@ -10860,7 +11122,8 @@ public:
   {
     if (!incoming.clusterPairEnrollments.empty() || !incoming.statefulServingAuthorities.empty() ||
         !incoming.statelessDeploymentAdmissions.empty() ||
-        !incoming.localCousinServicePermissions.empty()) return false; // Requires the paired transition payload.
+        !incoming.localCousinServicePermissions.empty() ||
+        !incoming.cousinRoutes.empty()) return false; // Requires the paired transition payload.
     PreparedMasterAuthorityRuntimeState prepared;
     return prepareReplicatedMasterAuthorityRuntimeState(incoming, prepared) &&
            applyPreparedMasterAuthorityRuntimeState(std::move(prepared), persist);
@@ -10902,6 +11165,9 @@ public:
         (std::any_of(incoming.runtimeState.transportCredentialEnrollmentOperations.begin(),
           incoming.runtimeState.transportCredentialEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 2; }) && incoming.version < 9) ||
+        (!incoming.runtimeState.cousinRoutes.empty() &&
+         (incoming.version < 10 || !prodigyCousinRoutesValid(
+             incoming.runtimeState.cousinRoutes, incoming.brainConfig.clusterUUID))) ||
         (incoming.version == 1 && (!incoming.runtimeState.statefulServingAuthorities.empty() ||
                                   !incoming.runtimeState.statelessDeploymentAdmissions.empty() ||
                                   !incoming.servingRuntimeStates.empty())) ||
@@ -11113,6 +11379,8 @@ public:
             localCousinServicePermissionPeerCapabilityCurrent(currentPeer,
               std::any_of(pending->prepared.runtime.runtimeState.localCousinServicePermissions.begin(), pending->prepared.runtime.runtimeState.localCousinServicePermissions.end(),
                 [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))) &&
+           (pending->prepared.runtime.runtimeState.cousinRoutes.empty() ||
+            cousinRoutePeerCapabilityCurrent(currentPeer)) &&
            (pending->prepared.runtime.runtimeState.clusterPairEnrollments.empty() ||
             clusterPairEnrollmentPeerCapabilityCurrent(currentPeer, !pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.empty(),
                 std::any_of(pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.begin(), pending->prepared.runtime.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -11175,7 +11443,9 @@ public:
               (!incoming.localCousinServicePermissions.empty() &&
                !localCousinServicePermissionPeerCapabilityCurrent(currentPeer,
                  std::any_of(incoming.localCousinServicePermissions.begin(), incoming.localCousinServicePermissions.end(),
-                   [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))))
+                   [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))) ||
+              (!incoming.cousinRoutes.empty() &&
+               !cousinRoutePeerCapabilityCurrent(currentPeer)))
           {
             return;
           }
@@ -11194,6 +11464,8 @@ public:
         !localCousinServicePermissionPeerCapabilityCurrent(peer,
             std::any_of(incoming.runtimeState.localCousinServicePermissions.begin(), incoming.runtimeState.localCousinServicePermissions.end(),
               [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }))) return true;
+    if (!incoming.runtimeState.cousinRoutes.empty() &&
+        !cousinRoutePeerCapabilityCurrent(peer)) return true;
     if (!incoming.runtimeState.clusterPairEnrollments.empty() &&
         !clusterPairEnrollmentPeerCapabilityCurrent(peer, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
                 std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -11251,6 +11523,7 @@ public:
     if (std::any_of(candidate.runtimeState.transportCredentialEnrollmentOperations.begin(),
           candidate.runtimeState.transportCredentialEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 2; })) candidate.version = 9;
+    if (!candidate.runtimeState.cousinRoutes.empty()) candidate.version = 10;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
     const UpdateSelfPersistenceAdmission ownershipAdmission =
         claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
@@ -11333,6 +11606,8 @@ public:
            (masterAuthorityRuntimeState.localCousinServicePermissions.empty() ||
             (masterAuthorityRuntimeStateDurable && localCousinServicePermissionPeerCapabilityCurrent(peer,
                 localCousinServicePermissionsRequireBaseline()))) &&
+           (masterAuthorityRuntimeState.cousinRoutes.empty() ||
+            (masterAuthorityRuntimeStateDurable && cousinRoutePeerCapabilityCurrent(peer))) &&
            (masterAuthorityRuntimeState.clusterPairEnrollments.empty() ||
             (masterAuthorityRuntimeStateDurable &&
              durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation &&
@@ -33394,6 +33669,10 @@ public:
     if (enrollment->state == ProdigyClusterPairEnrollmentState::revoked ||
         !clusterPairAuthorityQualified() || request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation ||
         masterAuthorityRuntimeState.generation == UINT64_MAX) return reject("pair revocation awaits exact current qualified authority");
+    if (std::any_of(masterAuthorityRuntimeState.cousinRoutes.begin(),
+        masterAuthorityRuntimeState.cousinRoutes.end(), [&](const auto& route) {
+          return route.pairUUID == request.pairUUID && !cousinRouteTerminal(route);
+        })) return reject("pair revocation requires all cousin routes withdrawn or revoked first");
     Vector<uint128_t> electorate = clusterPairCurrentElectorate();
     if (!clusterPairRevocationElectorateCapable(electorate))
       return reject("pair revocation requires a current AEGIS revocation-capable voter majority");
@@ -34084,7 +34363,8 @@ public:
     if (!weAreMaster || !neuron || !neuron->machine || neuron != &neuron->machine->neuron ||
         !prodigyCousinSessionRequestValid(request) ||
         !cousinDiscoveryNeuronAuthorized(neuron) || cousinSessions.size() >= ProdigyCousinSessionMaximumRecords ||
-        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged()) return false;
+        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged() ||
+        !cousinRouteAuthorityAcknowledged()) return false;
     Machine *machine = neuron->machine;
     ContainerView *container = nullptr;
     auto live = containers.find(containerUUID);
@@ -34113,7 +34393,19 @@ public:
           return session.record.sourceContainerUUID == containerUUID && session.record.sourceBindingNonce == request.bindingNonce && session.expiresAtMs > Time::msSinceBoot(); })) return false;
     ProdigyCousinDiscoveryResponse counterparts = queryCousinCounterparts({1, request.permissionUUID, request.slot});
     if (!counterparts.success || counterparts.records.empty()) return false;
-    const ProdigyCousinCounterpart& destination = counterparts.records.front();
+    const int64_t routeNowMs = Time::now<TimeResolution::ms>();
+    const CousinRouteRecord *selectedRoute = nullptr;
+    const ProdigyCousinCounterpart *selectedDestination = nullptr;
+    for (const auto& route : masterAuthorityRuntimeState.cousinRoutes)
+    {
+      if (!localCousinServicePermissionAllowsRoute(request.permissionUUID, route, request.slot, routeNowMs)) continue;
+      const auto destination = std::find_if(counterparts.records.begin(), counterparts.records.end(),
+          [&](const auto& candidate) { return cousinRouteMatchesCounterpart(route, candidate); });
+      if (destination == counterparts.records.end()) continue;
+      selectedRoute = &route; selectedDestination = &*destination; break;
+    }
+    if (selectedRoute == nullptr || selectedDestination == nullptr) return reject();
+    const ProdigyCousinCounterpart& destination = *selectedDestination;
     const auto enrollment = std::find_if(masterAuthorityRuntimeState.clusterPairEnrollments.begin(),
         masterAuthorityRuntimeState.clusterPairEnrollments.end(), [&](const auto& value) {
           return value.pairUUID == permission->pairUUID && value.state == ProdigyClusterPairEnrollmentState::active &&
@@ -34130,6 +34422,7 @@ public:
     record.sourceShardGroups = deployment->nShardGroups; record.sourceService = container->effectiveStatefulMeshRoles(deployment->plan).cousin;
     record.sourceBindingNonce = whitehole->bindingNonce; record.sourceAddress = whitehole->address;
     record.sourceTCPPort = whitehole->sourcePort; record.destination = destination;
+    if (!prodigyCousinSessionRouteBindingForRoute(*selectedRoute, record.route)) return false;
     if (!prodigyCousinSessionRecordValid(record)) return false;
     CousinSessionState state = {}; state.record = record; state.sourceMachineUUID = machine->uuid;
     state.authorityEpoch = masterAuthorityEpoch; state.carrierIOGeneration = neuron->ioGeneration;
@@ -34192,7 +34485,15 @@ public:
   bool cousinSessionLocalCurrent(const CousinSessionState& state)
   {
     if (!weAreMaster || state.authorityEpoch != masterAuthorityEpoch || state.expiresAtMs <= Time::msSinceBoot() ||
-        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged()) return false;
+        !clusterPairAuthorityQualified() || !localCousinServicePermissionAuthorityAcknowledged() ||
+        !cousinRouteAuthorityAcknowledged()) return false;
+    const auto route = std::find_if(masterAuthorityRuntimeState.cousinRoutes.begin(),
+        masterAuthorityRuntimeState.cousinRoutes.end(), [&](const auto& candidate) {
+          return candidate.routeUUID == state.record.route.authorizedRoute.routeUUID;
+        });
+    if (route == masterAuthorityRuntimeState.cousinRoutes.end() ||
+        !prodigyCousinSessionCurrentForRoute(state.record, *route,
+                                             Time::now<TimeResolution::ms>())) return false;
     Machine *carrier = findMachineByUUID(state.localEndpoint.nodeUUID);
     if (!carrier || !cousinDiscoveryNeuronAuthorized(&carrier->neuron) ||
         carrier->neuron.ioGeneration != state.carrierIOGeneration ||
@@ -37241,6 +37542,7 @@ public:
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
           bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+          bv->cousinRouteCapabilityAcknowledged = false;
           bv->transportCredentialLifecycleCapabilityAcknowledged = false;
           bv->authorityElectionCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityUUID = 0;
@@ -37250,7 +37552,7 @@ public:
           {
             const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096) : 0);
+                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
             Ring::queueSend(bv);
           }
@@ -37908,7 +38210,7 @@ public:
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
           const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
-                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096) : 0);
+                                     (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
           Ring::queueSend(bv);
           break;
@@ -37925,6 +38227,7 @@ public:
           bv->clusterPairEpochRotationCapabilityAcknowledged = false;
           bv->localCousinServicePermissionCapabilityAcknowledged = false;
           bv->localCousinServicePermissionBaselineCapabilityAcknowledged = false;
+          bv->cousinRouteCapabilityAcknowledged = false;
           bv->transportCredentialLifecycleCapabilityAcknowledged = false;
           bv->authorityElectionCapabilityAcknowledged = false;
           if (bv != nullptr && bv->registrationFresh && (capabilities & uint64_t(1)) != 0)
@@ -37955,6 +38258,8 @@ public:
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(2048)) != 0;
             bv->authorityElectionCapabilityAcknowledged =
                 bv->transportAEGISEnabled() && (capabilities & uint64_t(4096)) != 0;
+            bv->cousinRouteCapabilityAcknowledged =
+                bv->transportAEGISEnabled() && (capabilities & uint64_t(8192)) != 0;
             bv->containerRetirementCapabilityUUID = bv->uuid;
             bv->containerRetirementCapabilityBootNs = bv->boottimens;
             bv->containerRetirementCapabilityIOGeneration = bv->ioGeneration;
@@ -38006,6 +38311,8 @@ public:
                                        bv->isTransportNegotiated() && bv->tlsPeerVerified && bv->tlsPeerUUID == bv->uuid)) &&
               (incoming.runtimeState.localCousinServicePermissions.empty() ||
                (incoming.version >= 7 && localCousinServicePermissionPeerCapabilityCurrent(bv, incoming.version >= 8))) &&
+              (incoming.runtimeState.cousinRoutes.empty() ||
+               (incoming.version >= 10 && cousinRoutePeerCapabilityCurrent(bv))) &&
               (incoming.runtimeState.clusterPairEnrollments.empty() ||
                (incoming.version >= 6 && clusterPairEnrollmentPeerCapabilityCurrent(bv, !incoming.runtimeState.clusterPairEnrollmentOperations.empty(),
                     std::any_of(incoming.runtimeState.clusterPairEnrollmentOperations.begin(), incoming.runtimeState.clusterPairEnrollmentOperations.end(),
@@ -44715,6 +45022,30 @@ public:
           else response.failure.assign("invalid cousin counterpart query"_ctv);
           String serialized = {}; BitseryEngine::serialize(serialized, response);
           Message::construct(mothership->wBuffer, MothershipTopic::pullCousinCounterparts, serialized);
+          break;
+        }
+      case MothershipTopic::commitCousinRoute:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCousinRouteRequest request = {};
+          ProdigyCousinRouteResponse response = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, request))
+            (void)commitCousinRoute(request, response);
+          else response.failure.assign("invalid cousin route request"_ctv);
+          String serialized = {}; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::commitCousinRoute, serialized);
+          break;
+        }
+      case MothershipTopic::pullCousinRoute:
+        {
+          String encoded = {}; Message::extractToStringView(args, encoded);
+          ProdigyCousinRouteQuery query = {};
+          ProdigyCousinRouteResponse response = {};
+          if (args == message->terminal() && BitseryEngine::deserializeSafe(encoded, query))
+            response = queryCousinRoute(query);
+          else response.failure.assign("invalid cousin route query"_ctv);
+          String serialized = {}; BitseryEngine::serialize(serialized, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::pullCousinRoute, serialized);
           break;
         }
       case MothershipTopic::pullStatelessDeploymentAdmission:

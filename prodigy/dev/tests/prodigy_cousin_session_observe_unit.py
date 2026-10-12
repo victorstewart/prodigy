@@ -14,14 +14,14 @@ renew='cousin_session_probe.renew request=r session=s generation=2 monotonicMs=4
 revoke='cousin_session_probe.revoke request=r session=s generation=3 monotonicMs=15100\ncousin_session_probe.closed session=s monotonicMs=15100\n'
 retry='cousin_session_probe.request request=r2 source=fd00::1 sourcePort=45000 monotonicMs=16100\n'
 reject='cousin_session_probe.reject request=r2 generation=1 monotonicMs=16101\n'
-cases=[('qualifies_with_renewal','qualify',request+rounds+renew,0),('rejects_traffic_without_renewal','qualify',request+rounds,1),('revocation_events_before_completion_marker','revoked',revoke+retry+reject,0),('rejects_silence_without_explicit_denial','revoked',revoke+retry,1),('rejects_post_revoke_payload','revoked',revoke+retry+reject+'cousin_session_probe.round request=r session=s payload=exact monotonicMs=18000\n',1)]
+cases=[('qualifies_with_renewal','qualify',request+rounds+renew,0),('rejects_traffic_without_renewal','qualify',request+rounds,1),('withdrawal_events_before_permission_completion_marker','revoked',revoke+retry+reject,0),('rejects_silence_without_explicit_denial','revoked',revoke+retry,1),('rejects_post_revoke_payload','revoked',revoke+retry+reject+'cousin_session_probe.round request=r session=s payload=exact monotonicMs=18000\n',1)]
 results=[]
 binding='cousin_session_probe.binding session=s destinationGroups=2 monotonicMs=1200\n'
 cases += [('accepts_current_scaled_binding','qualify',request+rounds+renew+binding,0),('rejects_stale_group_binding','qualify',request+rounds+renew+binding.replace('destinationGroups=2','destinationGroups=1'),1)]
 for name,mode,log,wanted in cases:
  with tempfile.TemporaryDirectory(prefix='cousin-observer-fixture-') as directory:
   root=pathlib.Path(directory)
-  for marker,value in [('cousin-offline-start',1000),('cousin-revocation-request',15000),('cousin-revoked',16000)]:
+  for marker,value in [('cousin-offline-start',1000),('cousin-withdrawal-request',15000),('cousin-revocation-request',15000),('cousin-revoked',16000)]:
    (root/(marker+'-ms')).write_text(str(value)); (root/(marker+'-monotonic-ms')).write_text(str(value))
   (root/'cousin-service-transit.json').write_text(json.dumps({'sourceWhiteholeIPv6':'fd00::1','sourceTCPPort':45000}))
   (root/'cousin-native-session-qualified.json').write_text(json.dumps({'sourceLog':'first-1-c','sessionUUID':'s'}))

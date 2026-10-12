@@ -53,6 +53,7 @@
 #include <prodigy/mothership/mothership.ssh.h>
 #include <prodigy/mothership/mothership.deployment.plan.helpers.h>
 #include <prodigy/mothership/mothership.cousin.permission.h>
+#include <prodigy/mothership/mothership.cousin.route.h>
 #include <prodigy/cousin.discovery.h>
 #include <prodigy/mothership/mothership.gcp.managed.template.plan.h>
 #include <prodigy/mothership/mothership.tunnel.auth.h>
@@ -19038,6 +19039,296 @@ private:
     }
   }
 
+  bool observeCousinRouteSide(MothershipProdigyCluster& cluster,
+                              const CousinRouteRecord& desired,
+                              CousinRouteHalf half,
+                              ProdigyCousinRouteResponse& response,
+                              String& failure)
+  {
+    response = {};
+    ProdigyCousinRouteQuery query = {};
+    query.routeUUID = desired.routeUUID;
+    if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+        !requestTopicRoundTrip(MothershipTopic::pullCousinRoute, query, response, failure) ||
+        response.protocolVersion != ProdigyCousinRouteResponse::version || !response.success ||
+        response.localClusterUUID != cluster.clusterUUID || response.currentAuthorityGeneration == 0 ||
+        response.currentMasterUUID == 0 || response.currentMasterBootNs <= 0)
+    {
+      if (failure.empty()) failure.assign("cousin route observation is invalid"_ctv);
+      return false;
+    }
+    if (!response.found) return true;
+    if (!prodigyCousinRouteResponseValid(response) || response.applyReceipt.localHalf != half ||
+        response.route.routeUUID != desired.routeUUID || response.route.generation > desired.generation ||
+        (response.route.generation == desired.generation &&
+         (response.route.priorOperationUUIDs != desired.priorOperationUUIDs ||
+          !cousinRouteExactMatches(response.route, desired))))
+    {
+      failure.assign("cousin route observation conflicts with the durable desired generation"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool applyCousinRouteSide(MothershipProdigyCluster& cluster,
+                            const CousinRouteRecord& route,
+                            CousinRouteHalf half,
+                            ProdigyCousinRouteResponse& response,
+                            String& failure)
+  {
+    if (!observeCousinRouteSide(cluster, route, half, response, failure)) return false;
+    auto exactQualified = [&]() {
+      return response.found && response.qualified && response.applyReceipt.localHalf == half &&
+          response.route.priorOperationUUIDs == route.priorOperationUUIDs &&
+          cousinRouteExactMatches(response.route, route) &&
+          cousinRouteApplyReceiptMatchesCurrentRoute(response.applyReceipt, route);
+    };
+    if (!exactQualified())
+    {
+      ProdigyCousinRouteRequest request = {};
+      request.expectedAuthorityGeneration = response.currentAuthorityGeneration;
+      request.expectedMasterUUID = response.currentMasterUUID;
+      request.expectedMasterBootNs = response.currentMasterBootNs;
+      request.localHalf = half;
+      request.route = route;
+      if (!configureControlTarget(cluster.name.c_str(), &failure) ||
+          !requestTopicRoundTrip(MothershipTopic::commitCousinRoute, request, response, failure)) return false;
+      if (!response.success && failure.empty()) failure = response.failure;
+    }
+    for (uint32_t attempt = 0; response.success && !exactQualified() && attempt < 60; ++attempt)
+    {
+      ::usleep(500'000);
+      if (!observeCousinRouteSide(cluster, route, half, response, failure)) return false;
+    }
+    if (!response.success || !exactQualified())
+    {
+      if (failure.empty()) failure.assign("cousin route awaits a qualified exact durable half; retry the same operation"_ctv);
+      return false;
+    }
+    MothershipClusterRegistry registry = openClusterRegistry();
+    CousinRouteApplyReceipt recorded = {};
+    bool resumed = false;
+    return registry.recordCousinRouteApplyReceipt(response.applyReceipt, recorded, resumed, &failure);
+  }
+
+  bool loadCousinRouteClusters(MothershipClusterRegistry& registry,
+                               const CousinRouteRecord& route,
+                               MothershipProdigyCluster& source,
+                               MothershipProdigyCluster& destination,
+                               String& failure)
+  {
+    String sourceID = {}, destinationID = {};
+    sourceID.assignItoh(route.sourceClusterUUID);
+    destinationID.assignItoh(route.destinationClusterUUID);
+    if (!registry.getClusterByIdentity(sourceID, source, &failure) ||
+        !registry.getClusterByIdentity(destinationID, destination, &failure)) return false;
+    if (source.clusterUUID == destination.clusterUUID ||
+        source.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1 ||
+        destination.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)
+    {
+      failure.assign("cousin route requires two distinct managed AEGIS clusters"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool applyCousinRoute(const CousinRouteRecord& route,
+                        MothershipProdigyCluster& source,
+                        MothershipProdigyCluster& destination,
+                        ProdigyCousinRouteResponse& sourceResponse,
+                        ProdigyCousinRouteResponse& destinationResponse,
+                        String& failure)
+  {
+    if (!applyCousinRouteSide(source, route, CousinRouteHalf::source, sourceResponse, failure)) return false;
+    const char *interrupt = std::getenv("PRODIGY_MOTHERSHIP_TEST_COUSIN_ROUTE_INTERRUPT_AFTER_SOURCE");
+    if (interrupt != nullptr && std::strcmp(interrupt, "1") == 0 &&
+        source.deploymentMode == MothershipClusterDeploymentMode::test &&
+        destination.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      failure.assign("test-only cousin route coordinator interruption after source receipt"_ctv);
+      return false;
+    }
+    return applyCousinRouteSide(destination, route, CousinRouteHalf::destination,
+                                destinationResponse, failure);
+  }
+
+  void runCousinRoute(int argc, char *argv[])
+  {
+    String action = {}, failure = {};
+    CousinRouteRecord route = {};
+    MothershipProdigyCluster source = {}, destination = {};
+    ProdigyCousinRouteResponse sourceResponse = {}, destinationResponse = {};
+    bool resumed = false;
+    bool valid = argc >= 2;
+    if (valid) action.assign(argv[0]);
+    if (valid && (action == "query"_ctv || action == "recover"_ctv))
+    {
+      uint128_t routeUUID = 0;
+      valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[1]), routeUUID) && routeUUID != 0;
+      if (valid) {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        valid = registry.loadCousinRoute(routeUUID, route, &failure) &&
+            loadCousinRouteClusters(registry, route, source, destination, failure);
+      }
+      if (valid && action == "query"_ctv)
+        valid = observeCousinRouteSide(source, route, CousinRouteHalf::source, sourceResponse, failure) &&
+            observeCousinRouteSide(destination, route, CousinRouteHalf::destination, destinationResponse, failure);
+      else if (valid)
+        valid = applyCousinRoute(route, source, destination, sourceResponse, destinationResponse, failure);
+    }
+    else if (valid && action == "put"_ctv)
+    {
+      uint128_t pairOperationUUID = 0;
+      MothershipCousinRouteIntent requested = {};
+      MothershipClusterPairEnrollmentIntent pair = {};
+      simdjson::dom::parser parser;
+      simdjson::dom::element document;
+      String json = {};
+      valid = argc == 3 && prodigyParseCanonicalHex128(String(argv[1]), pairOperationUUID) &&
+          pairOperationUUID != 0;
+      if (valid) {
+        json.assign(argv[2]);
+        valid = json.size() <= 65536 && parser.parse(json.data(), json.size()).get(document) == simdjson::SUCCESS &&
+            mothershipParseCousinRouteIntentJSON(document, requested, failure);
+      }
+      MothershipProdigyCluster first = {}, second = {};
+      if (valid) {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        String firstID = {}, secondID = {};
+        valid = registry.loadClusterPairEnrollmentIntent(pairOperationUUID, pair, &failure);
+        if (valid) {
+          firstID.assignItoh(pair.firstClusterUUID); secondID.assignItoh(pair.secondClusterUUID);
+          valid = registry.getClusterByIdentity(firstID, first, &failure) &&
+              registry.getClusterByIdentity(secondID, second, &failure) &&
+              pair.firstQualified && pair.secondQualified;
+          if (!valid && failure.empty())
+            failure.assign("cousin route requires a fully qualified durable pair enrollment"_ctv);
+        }
+      }
+      auto observePermission = [&](MothershipProdigyCluster& cluster, uint128_t permissionUUID,
+                                   ProdigyLocalCousinServicePermissionResponse& response) {
+        response = {};
+        ProdigyLocalCousinServicePermissionQuery query = {};
+        query.permissionUUID = permissionUUID;
+        return configureControlTarget(cluster.name.c_str(), &failure) &&
+            requestTopicRoundTrip(MothershipTopic::pullLocalCousinServicePermission, query, response, failure) &&
+            response.protocolVersion == ProdigyLocalCousinServicePermissionResponse::version && response.success &&
+            response.localClusterUUID == cluster.clusterUUID && response.currentAuthorityGeneration != 0 &&
+            (!response.found || (prodigyLocalCousinServicePermissionValid(response.permission) &&
+              response.permission.permissionUUID == permissionUUID));
+      };
+      ProdigyLocalCousinServicePermissionResponse sourceFirst = {}, sourceSecond = {};
+      ProdigyLocalCousinServicePermissionResponse destinationFirst = {}, destinationSecond = {};
+      if (valid) valid = observePermission(first, requested.sourcePermissionUUID, sourceFirst) &&
+          observePermission(second, requested.sourcePermissionUUID, sourceSecond) &&
+          observePermission(first, requested.destinationPermissionUUID, destinationFirst) &&
+          observePermission(second, requested.destinationPermissionUUID, destinationSecond);
+      const ProdigyLocalCousinServicePermissionResponse *sourcePermission = nullptr;
+      const ProdigyLocalCousinServicePermissionResponse *destinationPermission = nullptr;
+      if (valid) {
+        const bool sourceOnFirst = sourceFirst.found && sourceFirst.qualified &&
+            sourceFirst.permission.localHalf == CousinRouteHalf::source;
+        const bool sourceOnSecond = sourceSecond.found && sourceSecond.qualified &&
+            sourceSecond.permission.localHalf == CousinRouteHalf::source;
+        const bool destinationOnFirst = destinationFirst.found && destinationFirst.qualified &&
+            destinationFirst.permission.localHalf == CousinRouteHalf::destination;
+        const bool destinationOnSecond = destinationSecond.found && destinationSecond.qualified &&
+            destinationSecond.permission.localHalf == CousinRouteHalf::destination;
+        valid = sourceOnFirst != sourceOnSecond && destinationOnFirst != destinationOnSecond &&
+            sourceOnFirst != destinationOnFirst;
+        if (valid) {
+          source = sourceOnFirst ? first : second;
+          destination = destinationOnFirst ? first : second;
+          sourcePermission = sourceOnFirst ? &sourceFirst : &sourceSecond;
+          destinationPermission = destinationOnFirst ? &destinationFirst : &destinationSecond;
+        } else failure.assign("cousin route requires one exact source permission and one exact destination permission on opposite enrolled clusters"_ctv);
+      }
+      ProdigyClusterPairEnrollmentResponse sourceEnrollment = {}, destinationEnrollment = {};
+      if (valid) valid = queryClusterPairEnrollment(source, pairOperationUUID, sourceEnrollment, failure) &&
+          queryClusterPairEnrollment(destination, pairOperationUUID, destinationEnrollment, failure) &&
+          sourceEnrollment.found && destinationEnrollment.found && sourceEnrollment.qualified && destinationEnrollment.qualified &&
+          sourceEnrollment.enrollment.state == ProdigyClusterPairEnrollmentState::active &&
+          destinationEnrollment.enrollment.state == ProdigyClusterPairEnrollmentState::active &&
+          sourceEnrollment.enrollment.pairUUID == pair.pairUUID &&
+          destinationEnrollment.enrollment.pairUUID == pair.pairUUID &&
+          sourceEnrollment.enrollment.rootGeneration == destinationEnrollment.enrollment.rootGeneration &&
+          sourceEnrollment.enrollment.agreedKeyEpoch == destinationEnrollment.enrollment.agreedKeyEpoch;
+      if (valid) {
+        const auto& sourcePolicy = sourcePermission->permission;
+        const auto& destinationPolicy = destinationPermission->permission;
+        valid = sourcePolicy.state == ProdigyLocalCousinServicePermissionState::active &&
+            destinationPolicy.state == ProdigyLocalCousinServicePermissionState::active &&
+            sourcePolicy.pairUUID == pair.pairUUID && destinationPolicy.pairUUID == pair.pairUUID &&
+            sourcePolicy.logicalWorkloadUUID == requested.logicalWorkloadUUID &&
+            destinationPolicy.logicalWorkloadUUID == requested.logicalWorkloadUUID &&
+            sourcePolicy.logicalServiceUUID == requested.logicalServiceUUID &&
+            destinationPolicy.logicalServiceUUID == requested.logicalServiceUUID &&
+            sourcePolicy.peerClusterUUID == destination.clusterUUID &&
+            destinationPolicy.peerClusterUUID == source.clusterUUID &&
+            sourcePolicy.peerApplicationID == destinationPolicy.localApplicationID &&
+            destinationPolicy.peerApplicationID == sourcePolicy.localApplicationID &&
+            sourcePolicy.peerCousinServicePrefix == destinationPolicy.localCousinServicePrefix &&
+            destinationPolicy.peerCousinServicePrefix == sourcePolicy.localCousinServicePrefix;
+        for (uint16_t slot = 0; valid && slot < CousinRouteSlotBitmap::slotCount; ++slot)
+          if (requested.slots.contains(slot) &&
+              (!sourcePolicy.slots.contains(slot) || !destinationPolicy.slots.contains(slot))) valid = false;
+        if (!valid) failure.assign("cousin route conflicts with the paired permission scope"_ctv);
+        if (valid) {
+          route.routeUUID = requested.routeUUID; route.operationUUID = requested.operationUUID;
+          route.pairUUID = pair.pairUUID; route.logicalWorkloadUUID = requested.logicalWorkloadUUID;
+          route.logicalServiceUUID = requested.logicalServiceUUID;
+          route.sourceClusterUUID = source.clusterUUID; route.sourceApplicationID = sourcePolicy.localApplicationID;
+          route.sourceCousinServicePrefix = sourcePolicy.localCousinServicePrefix;
+          route.destinationClusterUUID = destination.clusterUUID;
+          route.destinationApplicationID = destinationPolicy.localApplicationID;
+          route.destinationCousinServicePrefix = destinationPolicy.localCousinServicePrefix;
+          route.slots = requested.slots; route.destinationRoutablePrefixUUID = requested.destinationRoutablePrefixUUID;
+          route.destinationPublicAddress = requested.destinationPublicAddress;
+          route.destinationTCPPort = requested.destinationTCPPort;
+          route.sourcePermissionUUID = requested.sourcePermissionUUID;
+          route.destinationPermissionUUID = requested.destinationPermissionUUID;
+          route.transportProtocol = requested.transportProtocol; route.destinationCIDR = requested.destinationCIDR;
+          route.pathMTU = requested.pathMTU; route.generation = requested.generation;
+          route.issuedAtMs = requested.issuedAtMs; route.expiresAtMs = requested.expiresAtMs;
+          route.rootGeneration = sourceEnrollment.enrollment.rootGeneration;
+          route.keyEpoch = sourceEnrollment.enrollment.agreedKeyEpoch; route.state = requested.state;
+          if (cousinRouteTerminal(route)) {
+            route.withdrawalGeneration = route.generation; route.withdrawnAtMs = route.issuedAtMs;
+          }
+          valid = cousinRouteStructurallyValid(route) && cousinRouteCurrentContract(route);
+        }
+      }
+      if (valid && route.state == CousinRouteState::active) {
+        RoutableSubnetRegistryReport ranges = {};
+        valid = readRoutableSubnets(destination, ranges, failure);
+        const auto range = valid ? std::find_if(ranges.subnets.begin(), ranges.subnets.end(), [&](const auto& candidate) {
+          return candidate.uuid == route.destinationRoutablePrefixUUID;
+        }) : ranges.subnets.end();
+        valid = valid && range != ranges.subnets.end() &&
+            cousinRouteDestinationRangeContainsAddress(route, range->subnet);
+        if (!valid && failure.empty()) failure.assign("cousin route destination CIDR does not bind the registered destination range"_ctv);
+      }
+      if (valid) {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        CousinRouteRecord recorded = {};
+        valid = registry.recordCousinRoute(route, recorded, resumed, &failure);
+        if (valid) route = std::move(recorded);
+      }
+      if (valid) valid = applyCousinRoute(route, source, destination, sourceResponse, destinationResponse, failure);
+    }
+    else valid = false;
+
+    if (!valid && failure.empty())
+      failure.assign("usage: cousinRoute put PAIR_OPERATION_UUID JSON | query ROUTE_UUID | recover ROUTE_UUID"_ctv);
+    basics_log("cousinRoute success=%u action=%s routeUUID=%016llx%016llx operationUUID=%016llx%016llx generation=%llu state=%u resumed=%u sourceFound=%u sourceQualified=%u destinationFound=%u destinationQualified=%u failure=%s\n",
+        unsigned(valid), action.c_str(), (unsigned long long)(route.routeUUID >> 64), (unsigned long long)route.routeUUID,
+        (unsigned long long)(route.operationUUID >> 64), (unsigned long long)route.operationUUID,
+        (unsigned long long)route.generation, unsigned(route.state), unsigned(resumed),
+        unsigned(sourceResponse.found), unsigned(sourceResponse.qualified),
+        unsigned(destinationResponse.found), unsigned(destinationResponse.qualified), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runCousinPermission(int argc, char *argv[])
   {
     if (argc >= 2 && std::strcmp(argv[1], "discover") == 0) {
@@ -22994,6 +23285,7 @@ public:
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
         {"cousinPermission",                &Mothership::runCousinPermission               },
+        {"cousinRoute",                     &Mothership::runCousinRoute                    },
         {"createCluster",                   &Mothership::runCreateCluster                  },
         {"createProviderCredential",        &Mothership::runCreateProviderCredential       },
         {"credentialExpiryNotifications",   &Mothership::runCredentialExpiryNotifications },
@@ -23184,6 +23476,8 @@ int main(int argc, char *argv[])
     message.append("\tpermanently revokes both enrolled sides and waits for durable credential withdrawal\n");
     message.append("rotateClusterPairEpoch [enrollment operationUUID canonical hex] [request|query]\n");
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
+    message.append("cousinRoute [put PAIR_OPERATION_UUID JSON|query ROUTE_UUID|recover ROUTE_UUID]\n");
+    message.append("\tpersists one permission-bound TCP route generation and applies or resumes both enrolled cluster halves\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
     message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");

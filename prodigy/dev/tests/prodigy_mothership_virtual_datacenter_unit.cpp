@@ -619,6 +619,18 @@ static void testStopCleanupContractFailsClosed(TestSuite& suite)
   suite.expect(verifier != std::string::npos && receiptWrite != std::string::npos && cleanupExit != std::string::npos &&
                verifier < receiptWrite && receiptWrite < cleanupExit,
                "provider_writes_success_receipt_only_after_owned_resource_verifier");
+  const size_t wrapperBegin = text.find("stop_datacenter()\n{\n", end);
+  const size_t wrapperEnd = text.find("\nlaunch_datacenter()\n", wrapperBegin);
+  const std::string wrapper = wrapperBegin == std::string::npos || wrapperEnd == std::string::npos ?
+      std::string() : text.substr(wrapperBegin, wrapperEnd - wrapperBegin);
+  const size_t lockAttempt = wrapper.find("if pair_lock_workspace \"${workspace}\" lifecycle_fd");
+  const size_t publishedPID = wrapper.find("[[ -r \"${workspace}/virtual-datacenter.pid\" ]] || return 1");
+  const size_t exactProvider = wrapper.find("provider_process \"${provider_pid}\" \"${workspace}\" || return 1");
+  const size_t fallbackStop = wrapper.rfind("stop_datacenter_locked \"$@\"");
+  suite.expect(lockAttempt != std::string::npos && publishedPID != std::string::npos &&
+                   exactProvider != std::string::npos && fallbackStop != std::string::npos &&
+                   lockAttempt < publishedPID && publishedPID < exactProvider && exactProvider < fallbackStop,
+               "stop_verifies_exact_provider_before_cleaning_stalled_partial_bootstrap");
 }
 
 int main(void)
