@@ -8,7 +8,6 @@ version = "0.10.0"
 authors = ["Jake McGinty <me@jakebot.org>", "trevp"]
 license = "Apache-2.0 OR MIT"
 categories = ["cryptography"]
-readme = "README.md"
 keywords = ["noise", "protocol", "crypto"]
 edition = "2024"
 rust-version = "1.85"
@@ -33,7 +32,6 @@ default-resolver-crypto = [
 nightly = ["blake2/simd_opt", "subtle/nightly"]
 ring-resolver = ["ring", "std"]
 ring-accelerated = ["ring-resolver", "default-resolver", "std"]
-vector-tests = []
 hfs = []
 risky-raw-split = []
 
@@ -60,13 +58,6 @@ use-pqcrypto-kyber1024 = [
 ]
 use-p256 = ["p256", "default-resolver"]
 
-[[bench]]
-name = "benches"
-harness = false
-
-[badges]
-travis-ci = { repository = "mcginty/snow", branch = "master" }
-
 [dependencies]
 subtle = { version = "2.4", default-features = false }
 zeroize = { version = "1.8", default-features = false }
@@ -89,13 +80,7 @@ pqcrypto-traits = { version = "0.3", optional = true }
 ring = { version = "0.17.12", optional = true }
 
 [dev-dependencies]
-criterion = "0.6"
-serde = "1.0"
-serde_json = "1.0"
-serde_derive = "1.0"
 hex = "0.4"
-x25519-dalek = "2.0"
-rand_core = { version = "0.9", default-features = false }
 
 [build-dependencies]
 rustc_version = "0.4"

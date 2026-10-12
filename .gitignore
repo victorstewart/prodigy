@@ -13,6 +13,10 @@
 /default.profraw
 /dev
 /prodigy/dev/build/
+/prodigy/dev/tests/__pycache__/
+/prodigy/crypto/noise/target/
+/prodigy/crypto/noise/vendor/snow/Cargo.lock
+/prodigy/crypto/noise/vendor/snow/target/
 /prodigy/discombobulator/target/
 /prodigy/sdk/python/__pycache__/
 /prodigy/sdk/python/build/
