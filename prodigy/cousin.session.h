@@ -4,6 +4,7 @@
 #include <array>
 #include <openssl/crypto.h>
 #include <prodigy/cousin.discovery.h>
+#include <prodigy/cousin.route.h>
 #include <prodigy/cluster.pair.keys.h>
 
 constexpr inline uint32_t ProdigyCousinSessionMaximumRecords = 64;
@@ -11,6 +12,8 @@ constexpr inline uint32_t ProdigyCousinSessionMaximumBytes = 16384;
 constexpr inline uint32_t ProdigyCousinSessionLeaseMs = 10000;
 constexpr inline uint32_t ProdigyCousinSessionPendingMs = 5000;
 constexpr inline uint32_t ProdigyCousinSessionRenewMs = 2000;
+constexpr inline uint32_t ProdigyCousinSessionLegacyProtocolVersion = 1;
+constexpr inline uint32_t ProdigyCousinSessionProtocolVersion = 2;
 
 // The local Neuron supplies caller identity. Applications can select only a
 // permission, logical slot and an already allocated Whitehole lease.
@@ -24,8 +27,19 @@ struct ProdigyCousinSessionRequest {
 
 // Public, immutable identity of one ephemeral session. Neither enrollment roots
 // nor application PSKs belong on the pair-control carrier.
+struct ProdigyCousinSessionRouteBinding {
+  // Preserve the complete authority which admitted the session. The current
+  // route may advance into draining while this authority remains eligible for
+  // its already-open flow, so a digest of only the new route is insufficient.
+  CousinRouteRecord authorizedRoute = {};
+  String authorizationSHA256 = {};
+};
+
 struct ProdigyCousinSessionRecord {
-  uint32_t protocolVersion = 1;
+  // Version 1 did not carry route authority. It remains decodable only so
+  // persisted/queued legacy messages can be rejected or retired by their
+  // caller without a codec ambiguity. New sessions use version 2.
+  uint32_t protocolVersion = ProdigyCousinSessionProtocolVersion;
   uint128_t sessionUUID = 0;
   uint128_t requestUUID = 0;
   uint64_t rootGeneration = 0;
@@ -42,6 +56,7 @@ struct ProdigyCousinSessionRecord {
   IPAddress sourceAddress = {};
   uint16_t sourceTCPPort = 0;
   ProdigyCousinCounterpart destination = {};
+  ProdigyCousinSessionRouteBinding route = {};
 };
 
 enum class ProdigyCousinSessionControlKind : uint8_t {
@@ -139,6 +154,10 @@ static void serialize(S&& s, ProdigyCousinSessionRecord& v)
   s.value4b(v.sourceContainerID); s.value2b(v.sourceShardGroup); s.value2b(v.sourceShardGroups);
   s.value8b(v.sourceService); s.value8b(v.sourceBindingNonce); s.object(v.sourceAddress);
   s.value2b(v.sourceTCPPort); s.object(v.destination);
+  if (v.protocolVersion >= ProdigyCousinSessionProtocolVersion)
+  {
+    s.object(v.route.authorizedRoute); s.text1b(v.route.authorizationSHA256, 64);
+  }
 }
 
 template <typename S>
@@ -197,9 +216,39 @@ static inline bool prodigyCousinSessionRequestValid(const ProdigyCousinSessionRe
       v.bindingNonce != 0 && v.slot < nStatefulServiceGroupSlots;
 }
 
+static inline bool prodigyCousinSessionRouteBindingValid(const ProdigyCousinSessionRouteBinding& v)
+{
+  String digest = {};
+  return v.authorizedRoute.state == CousinRouteState::active &&
+      cousinRouteAuthorizationDigest(v.authorizedRoute, digest) &&
+      prodigyIsSHA256HexDigest(v.authorizationSHA256) && v.authorizationSHA256 == digest;
+}
+
+static inline bool prodigyCousinSessionRouteBindingForRoute(const CousinRouteRecord& route,
+                                                            ProdigyCousinSessionRouteBinding& binding)
+{
+  String digest = {};
+  if (route.state != CousinRouteState::active || !cousinRouteAuthorizationDigest(route, digest)) return false;
+  binding.authorizedRoute = route;
+  binding.authorizationSHA256 = std::move(digest);
+  return true;
+}
+
+static inline bool prodigyCousinSessionRouteBindingMatchesRoute(const ProdigyCousinSessionRouteBinding& binding,
+                                                                 const CousinRouteRecord& route)
+{
+  String digest = {}, authorizedBytes = {}, routeBytes = {};
+  CousinRouteRecord authorizedCopy = binding.authorizedRoute, routeCopy = route;
+  return prodigyCousinSessionRouteBindingValid(binding) && cousinRouteAuthorizationDigest(route, digest) &&
+      BitseryEngine::serialize(authorizedBytes, authorizedCopy) && BitseryEngine::serialize(routeBytes, routeCopy) &&
+      authorizedBytes == routeBytes && binding.authorizationSHA256 == digest;
+}
+
 static inline bool prodigyCousinSessionRecordValid(const ProdigyCousinSessionRecord& v)
 {
-  return v.protocolVersion == 1 && v.sessionUUID != 0 && v.requestUUID != 0 &&
+  return (v.protocolVersion == ProdigyCousinSessionLegacyProtocolVersion ||
+          v.protocolVersion == ProdigyCousinSessionProtocolVersion) &&
+      v.sessionUUID != 0 && v.requestUUID != 0 &&
       v.rootGeneration != 0 && v.keyEpoch != 0 && v.sourceContainerUUID != 0 && v.sourceNodeUUID != 0 &&
       v.sourceContainerID != 0 && v.sourceShardGroups != 0 &&
       v.sourceShardGroups < nStatefulServiceGroupSlots - 1 && v.sourceShardGroup < v.sourceShardGroups &&
@@ -207,7 +256,46 @@ static inline bool prodigyCousinSessionRecordValid(const ProdigyCousinSessionRec
       v.sourcePermission.state == ProdigyLocalCousinServicePermissionState::active &&
       prodigyCousinCounterpartMatchesPermission(v.destination, v.sourcePermission, v.slot) &&
       v.sourceService == MeshServices::constrainPrefixToGroup(v.sourcePermission.localCousinServicePrefix, v.sourceShardGroup) &&
-      statefulServiceGroupOwnerForSlot(v.slot, v.sourceShardGroups) == v.sourceShardGroup;
+      statefulServiceGroupOwnerForSlot(v.slot, v.sourceShardGroups) == v.sourceShardGroup &&
+      (v.protocolVersion == ProdigyCousinSessionLegacyProtocolVersion || prodigyCousinSessionRouteBindingValid(v.route));
+}
+
+// A v1 record is structurally decodable for compatibility but can never satisfy
+// this predicate, so it cannot become a current route session. A higher
+// generation may preserve an immediately-prior active authority only while it
+// is draining, remains in the same immutable scope/root/key epoch, and the
+// originally authorized route has not expired. It never authorizes a new flow.
+static inline bool prodigyCousinSessionCurrentForRoute(const ProdigyCousinSessionRecord& session,
+                                                       const CousinRouteRecord& route, int64_t nowMs)
+{
+  if (session.protocolVersion != ProdigyCousinSessionProtocolVersion || !prodigyCousinSessionRecordValid(session) ||
+      !cousinRouteAllowsExistingFlowAt(route, nowMs) || session.rootGeneration != route.rootGeneration ||
+      session.keyEpoch != route.keyEpoch || session.sourcePermission.pairUUID != route.pairUUID ||
+      session.sourcePermission.logicalWorkloadUUID != route.logicalWorkloadUUID ||
+      session.sourcePermission.logicalServiceUUID != route.logicalServiceUUID ||
+      session.sourcePermission.localClusterUUID != route.sourceClusterUUID ||
+      session.sourcePermission.peerClusterUUID != route.destinationClusterUUID ||
+      session.sourcePermission.localApplicationID != route.sourceApplicationID ||
+      session.destination.permission.localApplicationID != route.destinationApplicationID ||
+      session.sourcePermission.localCousinServicePrefix != route.sourceCousinServicePrefix ||
+      session.destination.permission.localCousinServicePrefix != route.destinationCousinServicePrefix ||
+      !route.slots.contains(session.slot)) return false;
+  if (prodigyCousinSessionRouteBindingMatchesRoute(session.route, route)) return true;
+  const CousinRouteRecord& authorized = session.route.authorizedRoute;
+  return route.state == CousinRouteState::draining && cousinRouteAllowsExistingFlowAt(authorized, nowMs) &&
+      cousinRouteScopeMatches(authorized, route) && authorized.rootGeneration == route.rootGeneration &&
+      authorized.keyEpoch == route.keyEpoch && route.generation == authorized.generation + 1 &&
+      (route.operationUUID == authorized.operationUUID || cousinRouteOperationUUIDWasUsed(route, authorized.operationUUID));
+}
+
+// Unlike the existing-flow predicate above, opening a new session requires the
+// exact active route that authorized it. A draining successor may preserve an
+// old session but can never admit another one through that authority.
+static inline bool prodigyCousinSessionCanOpenForRoute(const ProdigyCousinSessionRecord& session,
+                                                       const CousinRouteRecord& route, int64_t nowMs)
+{
+  return prodigyCousinSessionCurrentForRoute(session, route, nowMs) &&
+      cousinRouteAllowsNewAdmissionAt(route, nowMs) && prodigyCousinSessionRouteBindingMatchesRoute(session.route, route);
 }
 
 static inline bool prodigyCousinSessionDigest(const ProdigyCousinSessionRecord& session, String& digest)

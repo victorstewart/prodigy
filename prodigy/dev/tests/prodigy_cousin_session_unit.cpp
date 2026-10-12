@@ -96,6 +96,29 @@ static ProdigyCousinSessionControl buildSessionControl(const ProdigyCousinCounte
   return control;
 }
 
+static CousinRouteRecord buildRouteForSession(const ProdigyCousinSessionRecord& session)
+{
+  CousinRouteRecord route = {};
+  route.routeUUID = 0x7f10; route.operationUUID = 0x7f11;
+  route.pairUUID = session.sourcePermission.pairUUID;
+  route.logicalWorkloadUUID = session.sourcePermission.logicalWorkloadUUID;
+  route.logicalServiceUUID = session.sourcePermission.logicalServiceUUID;
+  route.sourceClusterUUID = session.sourcePermission.localClusterUUID;
+  route.sourceApplicationID = session.sourcePermission.localApplicationID;
+  route.sourceCousinServicePrefix = session.sourcePermission.localCousinServicePrefix;
+  route.destinationClusterUUID = session.destination.permission.localClusterUUID;
+  route.destinationApplicationID = session.destination.permission.localApplicationID;
+  route.destinationCousinServicePrefix = session.destination.permission.localCousinServicePrefix;
+  route.slots.insert(session.slot);
+  route.destinationRoutablePrefixUUID = session.destination.routablePrefixUUID;
+  route.destinationPublicAddress = session.destination.publicAddress;
+  route.destinationTCPPort = session.destination.publicTCPPort;
+  route.generation = 3; route.issuedAtMs = 1000; route.expiresAtMs = 60000;
+  route.keyEpoch = session.keyEpoch; route.rootGeneration = session.rootGeneration;
+  route.state = CousinRouteState::active;
+  return route;
+}
+
 
 static ProdigyCousinSessionLocalCommand fixture(CousinRouteHalf half, uint128_t sessionUUID = 0x7f01,
                                                 uint128_t requestUUID = 0x7f02)
@@ -104,6 +127,8 @@ static ProdigyCousinSessionLocalCommand fixture(CousinRouteHalf half, uint128_t 
   auto session = buildSessionControl(publication.snapshot.records[0], 7, 9, sessionUUID, requestUUID).session;
   session.destination.publicAddress = IPAddress("fd00:ffff:1234::2", true);
   session.destination.publicTCPPort = 49192;
+  const CousinRouteRecord route = buildRouteForSession(session);
+  if (!prodigyCousinSessionRouteBindingForRoute(route, session.route)) session.protocolVersion = 0;
   ProdigyCousinSessionLocalCommand command = {};
   command.session = session; command.requestUUID = session.requestUUID; command.localHalf = half;
   command.kind = half == CousinRouteHalf::source ? ProdigyCousinSessionLocalKind::activate : ProdigyCousinSessionLocalKind::install;
@@ -136,6 +161,59 @@ static bool pump(ProdigyCousinSessionStream& from, ProdigyCousinSessionStream& t
 int main()
 {
   auto source = fixture(CousinRouteHalf::source), destination = fixture(CousinRouteHalf::destination);
+  const CousinRouteRecord liveRoute = buildRouteForSession(source.session);
+  expect(prodigyCousinSessionCurrentForRoute(source.session, liveRoute, 2000),
+         "v2_session_binds_exact_live_route_authority");
+  expect(prodigyCousinSessionCanOpenForRoute(source.session, liveRoute, 2000),
+         "exact_active_route_can_open_new_session");
+  {
+    auto legacy = source.session;
+    legacy.protocolVersion = ProdigyCousinSessionLegacyProtocolVersion;
+    legacy.route = {};
+    String legacyWire = {}; ProdigyCousinSessionRecord decoded = {};
+    expect(prodigyCousinSessionRecordValid(legacy) && BitseryEngine::serialize(legacyWire, legacy) &&
+             BitseryEngine::deserializeSafe(legacyWire, decoded) && decoded.protocolVersion == 1 &&
+             prodigyCousinSessionRecordValid(decoded) && !prodigyCousinSessionCurrentForRoute(decoded, liveRoute, 2000),
+           "v1_session_codec_remains_decodable_but_is_not_current_route_authority");
+  }
+  {
+    auto stale = liveRoute; ++stale.generation;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, stale, 2000),
+           "session_rejects_stale_route_generation");
+    auto replaced = liveRoute; replaced.operationUUID++; ++replaced.generation;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, replaced, 2000),
+           "session_rejects_replaced_route_operation");
+    auto draining = liveRoute;
+    draining.operationUUID++;
+    draining.priorOperationUUIDs.push_back(liveRoute.operationUUID);
+    ++draining.generation;
+    draining.state = CousinRouteState::draining;
+    expect(prodigyCousinSessionCurrentForRoute(source.session, draining, 2000),
+           "prior_active_session_survives_immediate_same_scope_draining_update");
+    expect(!prodigyCousinSessionCanOpenForRoute(source.session, draining, 2000),
+           "draining_successor_denies_new_session_from_prior_authority");
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, draining, liveRoute.expiresAtMs),
+           "draining_route_does_not_extend_original_session_expiry");
+    auto revived = draining; revived.state = CousinRouteState::active;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, revived, 2000),
+           "active_revival_cannot_preserve_prior_session");
+    auto epochChanged = draining; ++epochChanged.keyEpoch;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, epochChanged, 2000),
+           "epoch_change_invalidates_prior_session");
+    auto scopeChanged = draining; ++scopeChanged.logicalServiceUUID;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, scopeChanged, 2000),
+           "scope_change_invalidates_prior_session");
+    auto withdrawn = liveRoute; withdrawn.state = CousinRouteState::withdrawn;
+    withdrawn.withdrawalGeneration = withdrawn.generation; withdrawn.withdrawnAtMs = 2000;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, withdrawn, 2000),
+           "session_rejects_withdrawn_route");
+    auto revoked = withdrawn; revoked.state = CousinRouteState::revoked;
+    expect(!prodigyCousinSessionCurrentForRoute(source.session, revoked, 2000),
+           "session_rejects_revoked_route");
+    auto tampered = source.session; tampered.route.authorizationSHA256[0] = '0';
+    expect(!prodigyCousinSessionRecordValid(tampered) || !prodigyCousinSessionCurrentForRoute(tampered, liveRoute, 2000),
+           "session_rejects_tampered_route_binding");
+  }
   expect(prodigyCousinSessionLocalCommandValid(source) && prodigyCousinSessionLocalCommandValid(destination) &&
          source.psk == destination.psk && source.session.sourceService != source.session.destination.service,
          "asymmetric_service_ids_share_only_canonical_session_key");
