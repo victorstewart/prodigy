@@ -135,6 +135,11 @@ static CousinRouteRecord validRoute(uint128_t routeUUID = 0x101, uint128_t opera
   route.destinationPublicAddress.v6[1] = 0x01;
   route.destinationPublicAddress.v6[15] = 1;
   route.destinationTCPPort = 443;
+  route.sourcePermissionUUID = 0x601;
+  route.destinationPermissionUUID = 0x602;
+  route.transportProtocol = IPPROTO_TCP;
+  route.destinationCIDR = 32;
+  route.pathMTU = 1500;
   route.generation = 1;
   route.issuedAtMs = 100;
   route.expiresAtMs = 200;
@@ -436,6 +441,22 @@ int main(void)
   String routeDigest = {};
   suite.require(cousinRouteAuthorizationDigest(route, routeDigest), "route_digest_constructs");
   suite.require(routeDigest.size() == 64, "route_digest_is_sha256");
+  ProdigyCousinRouteRequest routeRequest = {};
+  routeRequest.expectedAuthorityGeneration = 7;
+  routeRequest.expectedMasterUUID = 0x701;
+  routeRequest.expectedMasterBootNs = 100;
+  routeRequest.localHalf = CousinRouteHalf::source;
+  routeRequest.route = route;
+  String routeRequestBytes = {};
+  ProdigyCousinRouteRequest decodedRouteRequest = {};
+  BitseryEngine::serialize(routeRequestBytes, routeRequest);
+  suite.require(prodigyCousinRouteRequestValid(routeRequest) &&
+                BitseryEngine::deserializeSafe(routeRequestBytes, decodedRouteRequest) &&
+                prodigyCousinRouteRequestValid(decodedRouteRequest),
+                "route_brain_request_round_trip_binds_current_half_and_authority");
+  ProdigyCousinRouteQuery routeQuery = {};
+  routeQuery.routeUUID = route.routeUUID;
+  suite.require(prodigyCousinRouteQueryValid(routeQuery), "route_brain_query_requires_route_identity");
   CousinRouteRecord changedBinding = route;
   changedBinding.pairUUID++;
   String changedDigest = {};
@@ -446,11 +467,44 @@ int main(void)
   suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
                 !cousinRouteScopeMatches(route, changedBinding), "route_canonical_service_identity_is_bound");
   changedBinding = route;
+  changedBinding.sourcePermissionUUID++;
+  suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
+                !cousinRouteScopeMatches(route, changedBinding), "route_source_permission_is_bound");
+  changedBinding = route;
+  changedBinding.destinationPermissionUUID++;
+  suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
+                !cousinRouteScopeMatches(route, changedBinding), "route_destination_permission_is_bound");
+  changedBinding = route;
+  changedBinding.pathMTU++;
+  suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
+                !cousinRouteScopeMatches(route, changedBinding), "route_path_mtu_is_bound");
+  changedBinding = route;
+  changedBinding.destinationCIDR = 48;
+  suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
+                !cousinRouteScopeMatches(route, changedBinding), "route_destination_cidr_is_bound");
+  changedBinding = route;
   changedBinding.rootGeneration++;
   suite.require(cousinRouteAuthorizationDigest(changedBinding, changedDigest) && changedDigest != routeDigest &&
                 !cousinRouteKeyEpochTransitionValid(route, changedBinding), "route_root_rotation_requires_new_key_epoch");
   changedBinding.keyEpoch++;
   suite.require(cousinRouteKeyEpochTransitionValid(route, changedBinding), "route_root_rotation_accepts_new_key_epoch");
+  CousinRouteRecord transition = route;
+  transition.operationUUID = 0x220;
+  transition.generation = 2;
+  transition.issuedAtMs = 120;
+  transition.expiresAtMs = 300;
+  transition.keyEpoch = 2;
+  transition.rootGeneration = 2;
+  suite.require(cousinRouteTransitionAllowed(route, transition), "route_transition_helper_accepts_ordered_exact_scope_update");
+  transition.state = CousinRouteState::draining;
+  suite.require(cousinRouteTransitionAllowed(route, transition), "route_transition_helper_accepts_ordered_drain");
+  CousinRouteRecord reviveTransition = transition;
+  reviveTransition.operationUUID = 0x221;
+  reviveTransition.generation = 3;
+  reviveTransition.issuedAtMs = 140;
+  reviveTransition.expiresAtMs = 320;
+  reviveTransition.state = CousinRouteState::active;
+  suite.require(!cousinRouteTransitionAllowed(transition, reviveTransition), "route_transition_helper_rejects_drain_revival");
 
   // The route carries logical slots. Each cluster independently maps them to
   // its own physical group count, so unequal application/group mappings remain
@@ -472,6 +526,36 @@ int main(void)
   CousinRouteRecord prefixMismatch = route;
   prefixMismatch.sourceApplicationID = 8;
   suite.require(!cousinRouteStructurallyValid(prefixMismatch), "source_prefix_must_encode_source_application");
+  CousinRouteRecord missingPermission = route;
+  missingPermission.sourcePermissionUUID = 0;
+  suite.require(!cousinRouteStructurallyValid(missingPermission), "route_current_contract_requires_source_permission");
+  CousinRouteRecord wrongTransport = route;
+  wrongTransport.transportProtocol = IPPROTO_UDP;
+  suite.require(!cousinRouteStructurallyValid(wrongTransport), "route_current_contract_accepts_tcp_only");
+  IPPrefix matchingDestinationRange("2001:db8::", true, 32);
+  IPPrefix foreignDestinationRange("2001:db9::", true, 32);
+  suite.require(cousinRouteDestinationRangeContainsAddress(route, matchingDestinationRange) &&
+                !cousinRouteDestinationRangeContainsAddress(route, foreignDestinationRange),
+                "route_current_contract_binds_destination_address_to_registered_cidr");
+  CousinRouteRecord invalidCIDR = route;
+  invalidCIDR.destinationCIDR = 129;
+  suite.require(!cousinRouteStructurallyValid(invalidCIDR), "route_current_contract_rejects_invalid_destination_cidr");
+  CousinRouteRecord tooSmallMTU = route;
+  tooSmallMTU.pathMTU = cousinRouteMinimumPathMTU - 1;
+  suite.require(!cousinRouteStructurallyValid(tooSmallMTU), "route_current_contract_rejects_small_path_mtu");
+  CousinRouteRecord legacyRoute = route;
+  legacyRoute.version = 1;
+  legacyRoute.sourcePermissionUUID = 0;
+  legacyRoute.destinationPermissionUUID = 0;
+  legacyRoute.transportProtocol = 0;
+  legacyRoute.destinationCIDR = 0;
+  legacyRoute.pathMTU = 0;
+  String legacyBytes = {};
+  BitseryEngine::serialize(legacyBytes, legacyRoute);
+  CousinRouteRecord decodedLegacyRoute = {};
+  suite.require(BitseryEngine::deserializeSafe(legacyBytes, decodedLegacyRoute) &&
+                decodedLegacyRoute.version == 1 && cousinRouteStructurallyValid(decodedLegacyRoute) &&
+                !cousinRouteCurrentContract(decodedLegacyRoute), "route_v1_wire_remains_decodable_but_not_current");
   CousinRouteRecord operationHistory = route;
   operationHistory.priorOperationUUIDs.push_back(0x202);
   suite.require(cousinRouteStructurallyValid(operationHistory), "route_accepts_distinct_prior_operation_identity");
@@ -506,8 +590,28 @@ int main(void)
   CousinRouteApplyReceipt sourceReceipt = validReceipt(route, CousinRouteHalf::source, 1);
   CousinRouteApplyReceipt destinationReceipt = validReceipt(route, CousinRouteHalf::destination, 1);
   CousinRouteApplyReceipt recordedReceipt = {}, loadedReceipt = {};
+  ProdigyCousinRouteResponse routeResponse = {};
+  routeResponse.success = true;
+  routeResponse.found = true;
+  routeResponse.qualified = true;
+  routeResponse.localClusterUUID = route.sourceClusterUUID;
+  routeResponse.currentAuthorityGeneration = 7;
+  routeResponse.currentMasterUUID = 0x701;
+  routeResponse.currentMasterBootNs = 100;
+  routeResponse.route = route;
+  routeResponse.applyReceipt = sourceReceipt;
+  suite.require(prodigyCousinRouteResponseValid(routeResponse),
+                "route_brain_response_binds_exact_current_half_receipt");
+  routeResponse.localClusterUUID = route.destinationClusterUUID;
+  suite.require(!prodigyCousinRouteResponseValid(routeResponse),
+                "route_brain_response_rejects_wrong_half_cluster_binding");
+  routeResponse.qualified = false;
+  suite.require(!prodigyCousinRouteResponseValid(routeResponse),
+                "route_brain_response_rejects_wrong_half_cluster_when_unqualified");
   {
     MothershipClusterRegistry registry {String(directory)};
+    suite.require(!registry.recordCousinRoute(legacyRoute, recorded, resumed, &failure),
+                  "registry_rejects_new_legacy_route_admission");
     suite.require(registry.recordCousinRoute(route, recorded, resumed, &failure), "registry_writes_initial_route");
     suite.require(!resumed && cousinRouteExactMatches(route, recorded), "registry_initial_write_is_not_resume");
     suite.require(registry.recordCousinRoute(route, recorded, resumed, &failure), "registry_retries_exact_operation");
@@ -578,6 +682,16 @@ int main(void)
   equalGenerationConflict.operationUUID = 0x202;
   equalGenerationConflict.destinationTCPPort = 8443;
   suite.require(!registry.recordCousinRoute(equalGenerationConflict, recorded, resumed, &failure), "registry_rejects_equal_generation_conflict");
+
+  CousinRouteRecord duplicatePeerRange = validRoute(0x10f, 0x210);
+  suite.require(!registry.recordCousinRoute(duplicatePeerRange, recorded, resumed, &failure),
+                "registry_rejects_duplicate_permission_bound_peer_range_under_new_route_uuid");
+  CousinRouteRecord distinctRange = validRoute(0x110, 0x211);
+  distinctRange.destinationCIDR = 48;
+  distinctRange.destinationPublicAddress = IPAddress("2001:db8:1::1", true);
+  suite.require(cousinRoutePeerRangeScopeMatches(route, distinctRange) == false &&
+                registry.recordCousinRoute(distinctRange, recorded, resumed, &failure),
+                "registry_allows_distinct_destination_peer_range_records");
 
   CousinRouteRecord replacement = route;
   replacement.operationUUID = 0x203;
@@ -663,6 +777,9 @@ int main(void)
   staleRevive.issuedAtMs = 140;
   staleRevive.expiresAtMs = 400;
   suite.require(!registry.recordCousinRoute(staleRevive, recorded, resumed, &failure), "registry_rejects_terminal_tombstone_revival");
+  CousinRouteRecord terminalReplacement = validRoute(0x111, 0x212);
+  suite.require(registry.recordCousinRoute(terminalReplacement, recorded, resumed, &failure) && !resumed,
+                "registry_allows_fresh_route_uuid_for_peer_range_after_terminal_tombstone");
 
   CousinRouteRecord expired = validRoute(0x102, 0x209);
   expired.expiresAtMs = 150;

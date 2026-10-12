@@ -450,6 +450,11 @@ private:
     ~ClusterPairEnrollmentLock() { if (fd >= 0) ::close(fd); }
   };
 
+  struct CousinRouteLock {
+    int fd = -1;
+    ~CousinRouteLock() { if (fd >= 0) ::close(fd); }
+  };
+
   bool lockClusterPairEnrollment(ClusterPairEnrollmentLock& lock, String *failure) const
   {
     String path = db.path();
@@ -458,6 +463,19 @@ private:
     if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
     {
       if (failure) failure->assign("cluster pair enrollment registry lock unavailable"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool lockCousinRoutes(CousinRouteLock& lock, String *failure) const
+  {
+    String path = db.path();
+    path.append(".cousin-route.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
+    {
+      if (failure) failure->assign("cousin route registry lock unavailable"_ctv);
       return false;
     }
     return true;
@@ -3149,19 +3167,6 @@ public:
     return true;
   }
 
-  static bool cousinRouteTransitionAllowed(const CousinRouteRecord& prior, const CousinRouteRecord& next)
-  {
-    if (prior.routeUUID != next.routeUUID || next.generation <= prior.generation ||
-        cousinRouteScopeMatches(prior, next) == false || cousinRouteTerminal(prior) ||
-        cousinRouteKeyEpochTransitionValid(prior, next) == false)
-    {
-      return false;
-    }
-    if (cousinRouteTerminal(next)) return true;
-    if (prior.state == CousinRouteState::draining && next.state == CousinRouteState::active) return false;
-    return true;
-  }
-
   // The flock spans lookup and write, unlike TidesDB's per-call transactions.
   // This prevents two Mothership processes from allocating different roots for
   // one operation before either durable record is visible.
@@ -3438,11 +3443,13 @@ public:
   {
     recorded = {};
     resumed = false;
-    if (!cousinRouteStructurallyValid(requested))
+    if (!cousinRouteStructurallyValid(requested) || !cousinRouteCurrentContract(requested))
     {
-      if (failure) failure->assign("cousin route record is invalid"_ctv);
+      if (failure) failure->assign("cousin route record is invalid or not current"_ctv);
       return false;
     }
+    CousinRouteLock lock;
+    if (!lockCousinRoutes(lock, failure)) return false;
     if (!requested.priorOperationUUIDs.empty())
     {
       if (failure) failure->assign("cousin route operation history is registry-owned"_ctv);
@@ -3454,6 +3461,29 @@ public:
     String encoded = {}, readFailure = {};
     CousinRouteRecord prior = {};
     bool replacing = false;
+
+    // A route UUID identifies its generation history.  The permission-bound
+    // peer/range identity below identifies one live path, so reject a second
+    // UUID which would make that path's owner ambiguous while still allowing
+    // distinct peers or ranges for the same workload.
+    Vector<String> existingRoutes = {};
+    if (!db.listValues(cousinRoutesColumnFamily, existingRoutes, failure)) return false;
+    for (const auto& existing : existingRoutes)
+    {
+      CousinRouteRecord candidate = {};
+      if (!BitseryEngine::deserializeSafe(existing, candidate) || !cousinRouteStructurallyValid(candidate))
+      {
+        if (failure) failure->assign("cousin route record is corrupt or unsupported"_ctv);
+        return false;
+      }
+      if (candidate.routeUUID != requested.routeUUID && !cousinRouteTerminal(candidate) &&
+          !cousinRouteTerminal(requested) &&
+          cousinRoutePeerRangeScopeMatches(candidate, requested))
+      {
+        if (failure) failure->assign("cousin route peer/range scope is already owned by another route UUID"_ctv);
+        return false;
+      }
+    }
     if (db.read(cousinRoutesColumnFamily, key, encoded, &readFailure))
     {
       if (!BitseryEngine::deserializeSafe(encoded, prior) || !cousinRouteStructurallyValid(prior) ||
@@ -3574,6 +3604,8 @@ public:
       if (failure) failure->assign("cousin route receipt is structurally invalid"_ctv);
       return false;
     }
+    CousinRouteLock lock;
+    if (!lockCousinRoutes(lock, failure)) return false;
     CousinRouteRecord route = {};
     if (!loadCousinRoute(requested.routeUUID, route, failure)) return false;
     if (!cousinRouteApplyReceiptMatchesCurrentRoute(requested, route))
