@@ -290,6 +290,26 @@ static ProdigyCousinSessionLocalCommand validNeuronHubCousinSessionCommand()
   session.sourceAddress = IPAddress("fd00:ffff:1234::1", true);
   session.sourceTCPPort = 40001;
 
+  CousinRouteRecord route = {};
+  route.routeUUID = 0x7f10; route.operationUUID = 0x7f11;
+  route.pairUUID = session.sourcePermission.pairUUID;
+  route.logicalWorkloadUUID = session.sourcePermission.logicalWorkloadUUID;
+  route.logicalServiceUUID = session.sourcePermission.logicalServiceUUID;
+  route.sourceClusterUUID = session.sourcePermission.localClusterUUID;
+  route.sourceApplicationID = session.sourcePermission.localApplicationID;
+  route.sourceCousinServicePrefix = session.sourcePermission.localCousinServicePrefix;
+  route.destinationClusterUUID = session.destination.permission.localClusterUUID;
+  route.destinationApplicationID = session.destination.permission.localApplicationID;
+  route.destinationCousinServicePrefix = session.destination.permission.localCousinServicePrefix;
+  route.slots.insert(session.slot); route.destinationRoutablePrefixUUID = session.destination.routablePrefixUUID;
+  route.destinationPublicAddress = session.destination.publicAddress; route.destinationTCPPort = session.destination.publicTCPPort;
+  route.sourcePermissionUUID = session.sourcePermission.permissionUUID;
+  route.destinationPermissionUUID = session.destination.permission.permissionUUID;
+  route.transportProtocol = IPPROTO_TCP; route.destinationCIDR = 64; route.pathMTU = 1280;
+  route.generation = 1; route.issuedAtMs = 1; route.expiresAtMs = 60000;
+  route.keyEpoch = session.keyEpoch; route.rootGeneration = session.rootGeneration;
+  if (!prodigyCousinSessionRouteBindingForRoute(route, session.route)) session.protocolVersion = 0;
+
   command.requestUUID = session.requestUUID;
   command.localHalf = CousinRouteHalf::destination;
   command.kind = ProdigyCousinSessionLocalKind::install;

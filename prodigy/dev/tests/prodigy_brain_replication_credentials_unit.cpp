@@ -35855,6 +35855,32 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                        cacheQuery.records.front().containerUUID == remoteCounterpart.containerUUID,
                    "cousin_discovery_owner_returns_current_matching_remote_candidate");
       {
+        CousinRouteRecord sessionRoute = {};
+        sessionRoute.routeUUID = 0x9c40; sessionRoute.operationUUID = 0x9c41;
+        sessionRoute.pairUUID = permission.pairUUID;
+        sessionRoute.logicalWorkloadUUID = permission.logicalWorkloadUUID;
+        sessionRoute.logicalServiceUUID = permission.logicalServiceUUID;
+        sessionRoute.sourceClusterUUID = permission.localClusterUUID;
+        sessionRoute.sourceApplicationID = permission.localApplicationID;
+        sessionRoute.sourceCousinServicePrefix = permission.localCousinServicePrefix;
+        sessionRoute.destinationClusterUUID = remotePermission.localClusterUUID;
+        sessionRoute.destinationApplicationID = remotePermission.localApplicationID;
+        sessionRoute.destinationCousinServicePrefix = remotePermission.localCousinServicePrefix;
+        sessionRoute.slots.insert(3);
+        sessionRoute.destinationRoutablePrefixUUID = remoteCounterpart.routablePrefixUUID;
+        sessionRoute.destinationPublicAddress = remoteCounterpart.publicAddress;
+        sessionRoute.destinationTCPPort = remoteCounterpart.publicTCPPort;
+        sessionRoute.sourcePermissionUUID = permission.permissionUUID;
+        sessionRoute.destinationPermissionUUID = remotePermission.permissionUUID;
+        sessionRoute.transportProtocol = IPPROTO_TCP; sessionRoute.destinationCIDR = 64; sessionRoute.pathMTU = 1280;
+        const int64_t sessionRouteNow = Time::now<TimeResolution::ms>();
+        sessionRoute.generation = 1; sessionRoute.issuedAtMs = std::max<int64_t>(1, sessionRouteNow - 1);
+        sessionRoute.expiresAtMs = sessionRoute.issuedAtMs + 60000;
+        sessionRoute.keyEpoch = cacheCredential.keyEpoch; sessionRoute.rootGeneration = cacheCredential.rootGeneration;
+        sessionRoute.state = CousinRouteState::active;
+        suite.require(cousinRouteStructurallyValid(sessionRoute),
+                      "cousin_session_source_constructs_current_v2_route_authority");
+        permissionBrain.masterAuthorityRuntimeState.cousinRoutes.push_back(sessionRoute);
         const uint32_t savedFragment = selfMachine.fragment;
         const bool savedReady = selfMachine.runtimeReady;
         selfMachine.fragment = 1; selfMachine.runtimeReady = true;
@@ -35873,9 +35899,40 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, invalid),
                      "cousin_session_source_rejects_unallocated_whitehole");
         bool created = permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, request);
-        suite.expect(created && permissionBrain.cousinSessions.size() == 1,
-                     "cousin_session_source_authorizes_current_permission_without_mothership");
+        suite.expect(created && permissionBrain.cousinSessions.size() == 1 &&
+                         permissionBrain.cousinSessions.front().record.protocolVersion == ProdigyCousinSessionProtocolVersion &&
+                         prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record, sessionRoute,
+                                                             Time::now<TimeResolution::ms>()),
+                     "cousin_session_source_authorizes_current_route_bound_permission_without_mothership");
         if (created && permissionBrain.cousinSessions.size() == 1) {
+          auto staleSessionRoute = sessionRoute; ++staleSessionRoute.generation;
+          suite.expect(!prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record,
+                                                             staleSessionRoute, Time::now<TimeResolution::ms>()),
+                       "cousin_session_source_rejects_stale_route_generation_before_carrier_ready");
+          auto drainingSuccessor = sessionRoute;
+          drainingSuccessor.operationUUID++;
+          drainingSuccessor.priorOperationUUIDs.push_back(sessionRoute.operationUUID);
+          ++drainingSuccessor.generation;
+          drainingSuccessor.state = CousinRouteState::draining;
+          suite.expect(prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record,
+                                                            drainingSuccessor, Time::now<TimeResolution::ms>()) &&
+                           !prodigyCousinSessionCanOpenForRoute(permissionBrain.cousinSessions.front().record,
+                                                                 drainingSuccessor, Time::now<TimeResolution::ms>()),
+                       "cousin_session_source_preserves_only_existing_flow_across_immediate_draining_successor");
+          auto withdrawnRoute = sessionRoute;
+          withdrawnRoute.state = CousinRouteState::withdrawn;
+          withdrawnRoute.withdrawalGeneration = withdrawnRoute.generation;
+          withdrawnRoute.withdrawnAtMs = Time::now<TimeResolution::ms>();
+          suite.expect(!prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record,
+                                                             withdrawnRoute, Time::now<TimeResolution::ms>()),
+                       "cousin_session_source_rejects_withdrawn_route_authority");
+          auto rekeyedRoute = sessionRoute; ++rekeyedRoute.keyEpoch;
+          auto rescopingRoute = sessionRoute; ++rescopingRoute.logicalServiceUUID;
+          suite.expect(!prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record,
+                                                             rekeyedRoute, Time::now<TimeResolution::ms>()) &&
+                           !prodigyCousinSessionCurrentForRoute(permissionBrain.cousinSessions.front().record,
+                                                                 rescopingRoute, Time::now<TimeResolution::ms>()),
+                       "cousin_session_source_rejects_epoch_or_scope_changed_route_authority");
           suite.expect(!permissionBrain.cousinSessionSourceRequest(&selfMachine.neuron, sourceApp.uuid, request),
                        "cousin_session_source_rejects_second_session_on_same_binding");
           auto initial = permissionBrain.cousinSessions.front();
@@ -36082,6 +36139,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
           }
         }
         permissionBrain.cousinSessions.clear(); permissionBrain.containers.erase(sourceApp.uuid);
+        permissionBrain.masterAuthorityRuntimeState.cousinRoutes.clear();
         permissionBrain.machinesByUUID.erase(selfMachine.uuid);
         selfMachine.fragment = savedFragment; selfMachine.runtimeReady = savedReady;
       }
@@ -36133,6 +36191,8 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
       route.destinationCousinServicePrefix = permission.peerCousinServicePrefix;
       route.slots.insert(3); route.destinationRoutablePrefixUUID = 0x9c13;
       route.destinationTCPPort = uint16_t(ReservedPorts::clusterPairControl);
+      route.sourcePermissionUUID = permission.permissionUUID; route.destinationPermissionUUID = 0x9c31;
+      route.transportProtocol = IPPROTO_TCP; route.destinationCIDR = 64; route.pathMTU = 1280;
       suite.require(ClusterMachine::parseIPAddressLiteral("fd00:9b::1", route.destinationPublicAddress),
                     "local_cousin_permission_owner_route_fixture_address");
       route.generation = 1; route.issuedAtMs = 100; route.expiresAtMs = 200;
