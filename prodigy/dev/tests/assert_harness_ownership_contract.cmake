@@ -10,6 +10,24 @@ set(_pair_control_boundary "${PRODIGY_ROOT}/prodigy/mothership/mothership.pair.c
 set(_mothership_cluster_test "${PRODIGY_ROOT}/prodigy/mothership/mothership.cluster.test.h")
 set(_virtual_datacenter "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.h")
 file(READ "${_harness}" _source)
+set(_g5_pair_endpoint "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_pair_endpoint_qualification.sh")
+if(EXISTS "${_g5_pair_endpoint}")
+   file(READ "${_g5_pair_endpoint}" _g5_source)
+   foreach(_required IN ITEMS
+      "createCluster"
+      "enrollClusterPair"
+      "testClusterPairControl"
+      "cousinRoute"
+      "cousinPermission"
+      "prepareTestPairMigration"
+      "retireTestPairSource"
+      "removeCluster")
+      string(FIND "${_g5_source}" "${_required}" _position)
+      if(_position EQUAL -1)
+         message(FATAL_ERROR "G5 pair transfer must remain a Mothership-client scenario: ${_required}")
+      endif()
+   endforeach()
+endif()
 file(READ "${_launcher}" _launcher_source)
 file(READ "${_provider}" _provider_source)
 file(READ "${_mothership}" _mothership_source)

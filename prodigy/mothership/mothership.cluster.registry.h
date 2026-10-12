@@ -31,6 +31,12 @@ public:
   uint128_t endpointMachineUUID = 0;
   uint32_t commissionedBrainCount = 0;
   uint32_t declaredStatelessWorkloadCount = 0;
+  // Version two is the first final-transport fixture.  Its whole-destination
+  // barrier includes the independently deployed COUSIN transport workload;
+  // the stateless successor is never considered the whole cluster by itself.
+  uint64_t cousinTransportDeploymentID = 0;
+  uint32_t cousinTransportReplicaCount = 0;
+  uint32_t declaredCousinTransportWorkloadCount = 0;
 };
 
 template <typename S>
@@ -41,11 +47,19 @@ static void serialize(S&& serializer, MothershipTestPairTargetReadinessIntent& i
   serializer.value16b(intent.endpointMachineUUID);
   serializer.value4b(intent.commissionedBrainCount);
   serializer.value4b(intent.declaredStatelessWorkloadCount);
+  if (intent.version >= 2)
+  {
+    serializer.value8b(intent.cousinTransportDeploymentID);
+    serializer.value4b(intent.cousinTransportReplicaCount);
+    serializer.value4b(intent.declaredCousinTransportWorkloadCount);
+  }
 }
 
 static inline bool mothershipBuildTestPairTargetReadinessIntent(const ClusterTopology& topology,
                                                                  const String& endpointIPv4,
-                                                                 MothershipTestPairTargetReadinessIntent& intent)
+                                                                 MothershipTestPairTargetReadinessIntent& intent,
+                                                                 uint64_t cousinTransportDeploymentID = 0,
+                                                                 uint32_t cousinTransportReplicaCount = 0)
 {
   intent = {};
   if (topology.machines.size() != 3 || endpointIPv4.empty()) return false;
@@ -62,6 +76,14 @@ static inline bool mothershipBuildTestPairTargetReadinessIntent(const ClusterTop
   std::sort(intent.commissionedBrainUUIDs.begin(), intent.commissionedBrainUUIDs.end());
   intent.commissionedBrainCount = 3;
   intent.declaredStatelessWorkloadCount = 1;
+  if (cousinTransportDeploymentID != 0 || cousinTransportReplicaCount != 0)
+  {
+    if (cousinTransportDeploymentID == 0 || cousinTransportReplicaCount == 0) return false;
+    intent.version = 2;
+    intent.cousinTransportDeploymentID = cousinTransportDeploymentID;
+    intent.cousinTransportReplicaCount = cousinTransportReplicaCount;
+    intent.declaredCousinTransportWorkloadCount = 1;
+  }
   return true;
 }
 
@@ -72,6 +94,31 @@ static inline bool mothershipTestPairTargetReadinessIntentMatchesTopology(
   return mothershipBuildTestPairTargetReadinessIntent(topology, endpointIPv4, observed) &&
          observed.commissionedBrainUUIDs == intent.commissionedBrainUUIDs &&
          observed.endpointMachineUUID == intent.endpointMachineUUID;
+}
+
+// G5 does not invent another route or workload authority.  This immutable
+// intent is a receipt-bound reference to the exact active COUSIN generation
+// and the two existing Brain-owned service permissions used while the narrow
+// stateless transfer is in progress.
+class MothershipTestPairCousinTransportIntent {
+public:
+  uint32_t version = 1;
+  CousinRouteRecord route;
+  ProdigyLocalCousinServicePermission sourcePermission;
+  ProdigyLocalCousinServicePermission destinationPermission;
+  CousinRouteApplyReceipt sourceApplyReceipt;
+  CousinRouteApplyReceipt destinationApplyReceipt;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipTestPairCousinTransportIntent& intent)
+{
+  serializer.value4b(intent.version);
+  serializer.object(intent.route);
+  serializer.object(intent.sourcePermission);
+  serializer.object(intent.destinationPermission);
+  serializer.object(intent.sourceApplyReceipt);
+  serializer.object(intent.destinationApplyReceipt);
 }
 
 class MothershipTestPairBoundaryRecord {
@@ -105,6 +152,9 @@ public:
   MothershipVirtualDatacenterPairGuestResetFence guestResetFence;
   // Written only after the lifecycle owner observes a different boot.
   String guestResetCompletedBootID;
+  // Version five binds the local stateless lifecycle to the final COUSIN
+  // transport. Version six is the corresponding armed guest-reset state.
+  MothershipTestPairCousinTransportIntent cousinTransport;
 };
 
 template <typename S>
@@ -137,6 +187,7 @@ static void serialize(S&& serializer, MothershipTestPairBoundaryRecord& record)
     serializer.object(record.guestResetFence);
     serializer.text1b(record.guestResetCompletedBootID, 128);
   }
+  if (record.version >= 5) serializer.object(record.cousinTransport);
 }
 
 class MothershipProdigyClusterRecordV3 {
@@ -2626,10 +2677,13 @@ public:
     if (lhs.version >= 3 && rhs.version >= 3)
     {
       lhs.sourceDrainObservation.clear(); rhs.sourceDrainObservation.clear();
-      // A v4 reset arm is an immutable transition over the v3 identity.
+      // Reset arms are immutable transitions over their corresponding base
+      // identity: v3->v4 for P6 and v5->v6 for the final-transport profile.
       // Normal callers separately reject an armed record.
       if (lhs.version == 4) { lhs.version = 3; lhs.guestResetFence = {}; lhs.guestResetCompletedBootID.clear(); }
       if (rhs.version == 4) { rhs.version = 3; rhs.guestResetFence = {}; rhs.guestResetCompletedBootID.clear(); }
+      if (lhs.version == 6) { lhs.version = 5; lhs.guestResetFence = {}; lhs.guestResetCompletedBootID.clear(); }
+      if (rhs.version == 6) { rhs.version = 5; rhs.guestResetFence = {}; rhs.guestResetCompletedBootID.clear(); }
     }
     String left = {}, right = {};
     BitseryEngine::serialize(left, lhs);
@@ -2667,11 +2721,74 @@ public:
 
   static bool testPairTargetReadinessIntentValid(const MothershipTestPairTargetReadinessIntent& intent)
   {
-    return intent.version == 1 && intent.commissionedBrainCount == 3 &&
-           intent.declaredStatelessWorkloadCount == 1 && intent.commissionedBrainUUIDs.size() == 3 &&
-           intent.endpointMachineUUID != 0 && intent.commissionedBrainUUIDs[0] != 0 &&
-           intent.commissionedBrainUUIDs[0] < intent.commissionedBrainUUIDs[1] &&
-           intent.commissionedBrainUUIDs[1] < intent.commissionedBrainUUIDs[2];
+    if ((intent.version != 1 && intent.version != 2) || intent.commissionedBrainCount != 3 ||
+        intent.declaredStatelessWorkloadCount != 1 || intent.commissionedBrainUUIDs.size() != 3 ||
+        intent.endpointMachineUUID == 0 || intent.commissionedBrainUUIDs[0] == 0 ||
+        intent.commissionedBrainUUIDs[0] >= intent.commissionedBrainUUIDs[1] ||
+        intent.commissionedBrainUUIDs[1] >= intent.commissionedBrainUUIDs[2]) return false;
+    if (intent.version == 1)
+      return intent.cousinTransportDeploymentID == 0 && intent.cousinTransportReplicaCount == 0 &&
+             intent.declaredCousinTransportWorkloadCount == 0;
+    return intent.cousinTransportDeploymentID != 0 && intent.cousinTransportReplicaCount != 0 &&
+           intent.declaredCousinTransportWorkloadCount == 1;
+  }
+
+  static bool testPairCousinTransportIntentEmpty(const MothershipTestPairCousinTransportIntent& intent)
+  {
+    MothershipTestPairCousinTransportIntent copy = intent, empty = {};
+    String encoded = {}, emptyEncoded = {};
+    BitseryEngine::serialize(encoded, copy);
+    BitseryEngine::serialize(emptyEncoded, empty);
+    return encoded == emptyEncoded;
+  }
+
+  static bool testPairCousinTransportIntentValid(const MothershipTestPairBoundaryRecord& record)
+  {
+    const auto& intent = record.cousinTransport;
+    const auto& route = intent.route;
+    const auto& source = intent.sourcePermission;
+    const auto& destination = intent.destinationPermission;
+    uint128_t sourceClusterUUID = 0, destinationClusterUUID = 0;
+    if (intent.version != 1 || !prodigyParseCanonicalHex128(record.boundary.sourceClusterUUID, sourceClusterUUID) ||
+        !prodigyParseCanonicalHex128(record.boundary.targetClusterUUID, destinationClusterUUID) ||
+        !cousinRouteCurrentContract(route) || !cousinRouteStructurallyValid(route) ||
+        route.state != CousinRouteState::active || route.sourceClusterUUID != sourceClusterUUID ||
+        route.destinationClusterUUID != destinationClusterUUID ||
+        !prodigyLocalCousinServicePermissionValid(source) ||
+        !prodigyLocalCousinServicePermissionValid(destination) ||
+        source.state != ProdigyLocalCousinServicePermissionState::active ||
+        destination.state != ProdigyLocalCousinServicePermissionState::active ||
+        source.localHalf != CousinRouteHalf::source || destination.localHalf != CousinRouteHalf::destination ||
+        source.localClusterUUID != sourceClusterUUID || source.peerClusterUUID != destinationClusterUUID ||
+        destination.localClusterUUID != destinationClusterUUID || destination.peerClusterUUID != sourceClusterUUID ||
+        source.permissionUUID != route.sourcePermissionUUID ||
+        destination.permissionUUID != route.destinationPermissionUUID ||
+        source.pairUUID != route.pairUUID || destination.pairUUID != route.pairUUID ||
+        source.logicalWorkloadUUID != route.logicalWorkloadUUID ||
+        destination.logicalWorkloadUUID != route.logicalWorkloadUUID ||
+        source.logicalServiceUUID != route.logicalServiceUUID ||
+        destination.logicalServiceUUID != route.logicalServiceUUID ||
+        source.localApplicationID != route.sourceApplicationID ||
+        source.peerApplicationID != route.destinationApplicationID ||
+        destination.localApplicationID != route.destinationApplicationID ||
+        destination.peerApplicationID != route.sourceApplicationID ||
+        source.localCousinServicePrefix != route.sourceCousinServicePrefix ||
+        source.peerCousinServicePrefix != route.destinationCousinServicePrefix ||
+        destination.localCousinServicePrefix != route.destinationCousinServicePrefix ||
+        destination.peerCousinServicePrefix != route.sourceCousinServicePrefix ||
+        source.slots != route.slots || destination.slots != route.slots ||
+        source.localDeploymentID == record.sourceDeploymentID ||
+        destination.localDeploymentID == record.targetDeploymentID ||
+        source.localApplicationID == ApplicationConfig::extractApplicationID(record.sourceDeploymentID) ||
+        destination.localApplicationID == ApplicationConfig::extractApplicationID(record.targetDeploymentID) ||
+        record.targetReadinessIntent.version != 2 ||
+        record.targetReadinessIntent.cousinTransportDeploymentID != destination.localDeploymentID ||
+        !cousinRouteApplyReceiptMatchesCurrentRoute(intent.sourceApplyReceipt, route) ||
+        !cousinRouteApplyReceiptMatchesCurrentRoute(intent.destinationApplyReceipt, route) ||
+        intent.sourceApplyReceipt.localHalf != CousinRouteHalf::source ||
+        intent.destinationApplyReceipt.localHalf != CousinRouteHalf::destination)
+      return false;
+    return true;
   }
 
   static bool testPairSourceDrainObservationValid(const MothershipTestPairBoundaryRecord& record,
@@ -2684,17 +2801,20 @@ public:
            observation.selectedTarget && observation.drainCapability && observation.sourceFlows == 0;
   }
 
-  // This is a pure P6 fixture predicate. The caller must obtain both reports
-  // freshly immediately before handoff or retirement; neither observation is
-  // persisted as an admission or health receipt.
+  // The caller must obtain every report freshly immediately before handoff or
+  // retirement; none is persisted as an admission or health receipt.  V3 is
+  // the one-workload P6 fixture. V5 additionally requires the exact live
+  // destination-side COUSIN workload that carries the final transport.
   static bool testPairWholeDestinationReady(const MothershipTestPairBoundaryRecord& record,
                                             const ClusterStatusReport& clusterReport,
                                             const DeploymentIdentityReport& deploymentReport,
-                                            String *failure = nullptr)
+                                            String *failure = nullptr,
+                                            const DeploymentIdentityReport *cousinTransportReport = nullptr)
   {
     auto reject = [&](auto message) -> bool { if (failure) failure->assign(message); return false; };
     if (record.version < 3 || !testPairBoundaryRecordValid(record) || record.targetAdmissionReceipt.empty())
       return reject("paired destination readiness requires a recorded v3 admission"_ctv);
+    const bool finalTransport = record.version >= 5;
     if (!clusterReport.hasTopology || !mothershipTestPairTargetReadinessIntentMatchesTopology(
             record.targetReadinessIntent, clusterReport.topology, record.boundary.targetMachinePrivate4) || clusterReport.nMachines != 3 ||
         clusterReport.machineReports.size() != 3) return reject("paired destination commissioned topology differs from intent"_ctv);
@@ -2718,13 +2838,18 @@ public:
           return reject("paired destination Brain identity is duplicated"_ctv);
       if (machine.currentMaster) { ++masters; masterUUID = uuid; }
     }
-    if (masters != 1 || clusterReport.nApplications != 1 || clusterReport.applicationReports.size() != 1)
-      return reject("paired destination fixture does not have one current master and one workload"_ctv);
-    const ApplicationStatusReport& application = clusterReport.applicationReports[0];
+    const uint32_t expectedApplications = finalTransport ? 2 : 1;
+    if (masters != 1 || clusterReport.nApplications != expectedApplications ||
+        clusterReport.applicationReports.size() != expectedApplications)
+      return reject("paired destination fixture does not have one current master and its complete declared workload set"_ctv);
+    const uint16_t targetApplicationID = ApplicationConfig::extractApplicationID(record.targetDeploymentID);
+    const ApplicationStatusReport *application = nullptr;
+    for (const ApplicationStatusReport& candidate : clusterReport.applicationReports)
+      if (candidate.applicationID == targetApplicationID) application = &candidate;
     const uint64_t versionID = record.targetDeploymentID & ((uint64_t(1) << 48) - 1);
-    if (application.applicationID != ApplicationConfig::extractApplicationID(record.targetDeploymentID) ||
-        application.deploymentReports.size() != 1) return reject("paired destination workload identity differs from admission"_ctv);
-    const DeploymentStatusReport& deployment = application.deploymentReports[0];
+    if (application == nullptr || application->deploymentReports.size() != 1)
+      return reject("paired destination workload identity differs from admission"_ctv);
+    const DeploymentStatusReport& deployment = application->deploymentReports[0];
     if (deployment.versionID != versionID || deployment.state != DeploymentState::running || deployment.isStateful ||
         deployment.nTarget != 1 || deployment.nDeployed != 1 || deployment.nHealthy != 1)
       return reject("paired destination workload is not the declared healthy stateless fixture"_ctv);
@@ -2744,13 +2869,41 @@ public:
         deploymentReport.observedEndpointMachineUUID != endpointMachineUUID || deploymentReport.authorityGeneration == 0 ||
         deploymentReport.masterUUID != masterUUID || deploymentReport.masterBootNs <= 0)
       return reject("paired destination live deployment identity differs from admission"_ctv);
+    if (finalTransport)
+    {
+      const auto& permission = record.cousinTransport.destinationPermission;
+      const uint64_t transportVersionID = permission.localDeploymentID & ((uint64_t(1) << 48) - 1);
+      const ApplicationStatusReport *transportApplication = nullptr;
+      for (const ApplicationStatusReport& candidate : clusterReport.applicationReports)
+        if (candidate.applicationID == permission.localApplicationID) transportApplication = &candidate;
+      if (transportApplication == nullptr || transportApplication == application ||
+          transportApplication->deploymentReports.size() != 1 || cousinTransportReport == nullptr)
+        return reject("paired destination COUSIN transport workload is missing or ambiguous"_ctv);
+      const DeploymentStatusReport& transport = transportApplication->deploymentReports[0];
+      if (transport.versionID != transportVersionID || transport.state != DeploymentState::running ||
+          !transport.isStateful || transport.nTarget != record.targetReadinessIntent.cousinTransportReplicaCount ||
+          transport.nDeployed != transport.nTarget || transport.nHealthy != transport.nTarget)
+        return reject("paired destination COUSIN transport workload is not wholly healthy"_ctv);
+      const DeploymentIdentityReport& identity = *cousinTransportReport;
+      if (identity.version != 1 || !identity.found || !identity.live ||
+          identity.clusterUUID != receipt.admission.clusterUUID ||
+          identity.applicationID != permission.localApplicationID || identity.versionID != transportVersionID ||
+          identity.deploymentID != permission.localDeploymentID || identity.state != DeploymentState::running ||
+          !identity.isStateful || identity.canonicalPlanSHA256 != permission.canonicalPlanSHA256 ||
+          identity.containerBlobSHA256 != permission.artifactSHA256 ||
+          identity.containerBlobBytes != permission.artifactBytes ||
+          identity.nTarget != record.targetReadinessIntent.cousinTransportReplicaCount ||
+          identity.nDeployed != identity.nTarget || identity.nHealthy != identity.nTarget ||
+          identity.authorityGeneration == 0 || identity.masterUUID != masterUUID || identity.masterBootNs <= 0)
+        return reject("paired destination live COUSIN transport identity differs from its bound permission"_ctv);
+    }
     if (failure) failure->clear();
     return true;
   }
 
   static bool testPairBoundaryRecordValid(const MothershipTestPairBoundaryRecord& record)
   {
-    if ((record.version != 1 && record.version != 2 && record.version != 3 && record.version != 4) || record.selectorGeneration > 1 ||
+    if ((record.version < 1 || record.version > 6) || record.selectorGeneration > 1 ||
         !mothershipVirtualDatacenterPairBoundaryDescriptorValid(record.boundary) ||
         record.sourceDeploymentID == 0 || record.targetDeploymentID == 0 ||
         !prodigyIsSHA256HexDigest(record.sourcePlanSHA256) ||
@@ -2761,9 +2914,12 @@ public:
              record.targetRequestPlanSHA256.empty() && record.targetBlobBytes == 0 && record.targetAdmissionReceipt.empty() &&
              record.targetReadinessIntent.version == 1 && record.targetReadinessIntent.commissionedBrainUUIDs.empty() &&
              record.targetReadinessIntent.endpointMachineUUID == 0 && record.targetReadinessIntent.commissionedBrainCount == 0 && record.targetReadinessIntent.declaredStatelessWorkloadCount == 0 &&
+             record.targetReadinessIntent.cousinTransportDeploymentID == 0 && record.targetReadinessIntent.cousinTransportReplicaCount == 0 &&
+             record.targetReadinessIntent.declaredCousinTransportWorkloadCount == 0 &&
              record.sourceDrainObservation.empty() && record.guestResetFence.operationID.empty() &&
              record.guestResetFence.descriptorSHA256.empty() && record.guestResetFence.bootID.empty() &&
-             record.guestResetFence.guestID.empty() && record.guestResetCompletedBootID.empty();
+             record.guestResetFence.guestID.empty() && record.guestResetCompletedBootID.empty() &&
+             testPairCousinTransportIntentEmpty(record.cousinTransport);
     DeploymentPlan request = {};
     String requestSHA = {};
     if (record.targetRequestPlan.empty() || record.targetRequestPlan.size() > 1024 * 1024 ||
@@ -2773,15 +2929,22 @@ public:
         record.targetBlobBytes == 0 ||
         (record.version == 2 && (!record.targetReadinessIntent.commissionedBrainUUIDs.empty() || record.targetReadinessIntent.endpointMachineUUID != 0 ||
                                  record.targetReadinessIntent.commissionedBrainCount != 0 ||
-                                 record.targetReadinessIntent.declaredStatelessWorkloadCount != 0 || !record.sourceDrainObservation.empty() ||
+                                 record.targetReadinessIntent.declaredStatelessWorkloadCount != 0 ||
+                                 record.targetReadinessIntent.cousinTransportDeploymentID != 0 ||
+                                 record.targetReadinessIntent.cousinTransportReplicaCount != 0 ||
+                                 record.targetReadinessIntent.declaredCousinTransportWorkloadCount != 0 ||
+                                 !record.sourceDrainObservation.empty() ||
                                  !record.guestResetFence.operationID.empty() || !record.guestResetFence.descriptorSHA256.empty() ||
                                  !record.guestResetFence.bootID.empty() || !record.guestResetFence.guestID.empty() ||
                                  !record.guestResetCompletedBootID.empty())) ||
-        (record.version == 3 && (!record.guestResetFence.operationID.empty() || !record.guestResetFence.descriptorSHA256.empty() ||
+        ((record.version == 3 || record.version == 5) &&
+                                (!record.guestResetFence.operationID.empty() || !record.guestResetFence.descriptorSHA256.empty() ||
                                  !record.guestResetFence.bootID.empty() || !record.guestResetFence.guestID.empty() ||
                                  !record.guestResetCompletedBootID.empty())) ||
         (record.version >= 3 && !testPairTargetReadinessIntentValid(record.targetReadinessIntent))) return false;
-    if (record.version == 4 &&
+    if ((record.version <= 4 && !testPairCousinTransportIntentEmpty(record.cousinTransport)) ||
+        (record.version >= 5 && !testPairCousinTransportIntentValid(record))) return false;
+    if ((record.version == 4 || record.version == 6) &&
         (!mothershipVirtualDatacenterPairGuestResetFenceValid(record.guestResetFence, record.boundary) ||
          (!record.guestResetCompletedBootID.empty() &&
           (!mothershipVirtualDatacenterBootIDValid(record.guestResetCompletedBootID) ||
@@ -2855,12 +3018,14 @@ public:
                                        MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
   {
     if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
-    const bool expectedIsBase = expected.version == 3 && expected.guestResetFence.operationID.empty() && expected.guestResetCompletedBootID.empty();
-    const bool expectedIsArmed = expected.version == 4 && expected.guestResetFence.operationID == fence.operationID &&
+    const bool expectedIsBase = (expected.version == 3 || expected.version == 5) &&
+                                expected.guestResetFence.operationID.empty() && expected.guestResetCompletedBootID.empty();
+    const bool expectedIsArmed = (expected.version == 4 || expected.version == 6) &&
+                                 expected.guestResetFence.operationID == fence.operationID &&
                                  expected.guestResetFence.descriptorSHA256 == fence.descriptorSHA256 &&
                                  expected.guestResetFence.bootID == fence.bootID && expected.guestResetFence.guestID == fence.guestID &&
                                  expected.guestResetCompletedBootID.empty();
-    if (recorded.closed || (recorded.version != 3 && recorded.version != 4) ||
+    if (recorded.closed || (recorded.version != 3 && recorded.version != 4 && recorded.version != 5 && recorded.version != 6) ||
         !mothershipVirtualDatacenterPairGuestResetFenceValid(fence, recorded.boundary) ||
         !testPairBoundaryIdentityMatches(recorded, expected) ||
         recorded.selectorGeneration != expected.selectorGeneration ||
@@ -2870,7 +3035,7 @@ public:
       if (failure) failure->assign("guest reset fence conflicts with the paired boundary"_ctv);
       return false;
     }
-    if (recorded.version == 4)
+    if (recorded.version == 4 || recorded.version == 6)
     {
       if (recorded.guestResetFence.operationID != fence.operationID ||
           recorded.guestResetFence.descriptorSHA256 != fence.descriptorSHA256 ||
@@ -2883,7 +3048,7 @@ public:
       if (failure) failure->clear();
       return true;
     }
-    recorded.version = 4;
+    recorded.version = recorded.version == 3 ? 4 : 6;
     recorded.guestResetFence = fence;
     recorded.guestResetCompletedBootID.clear();
     if (!testPairBoundaryRecordValid(recorded)) return false;
@@ -2897,7 +3062,7 @@ public:
                                           MothershipTestPairBoundaryRecord& recorded, String *failure = nullptr)
   {
     if (!loadTestPairBoundary(expected.boundary.operationID, recorded, failure)) return false;
-    if (recorded.closed || recorded.version != 4 || recorded.guestResetFence.operationID.empty() ||
+    if (recorded.closed || (recorded.version != 4 && recorded.version != 6) || recorded.guestResetFence.operationID.empty() ||
         !testPairBoundaryIdentityMatches(recorded, expected) || recorded.selectorGeneration != expected.selectorGeneration ||
         recorded.targetPlanSHA256 != expected.targetPlanSHA256 || recorded.targetAdmissionReceipt != expected.targetAdmissionReceipt ||
         recorded.sourceDrainObservation != expected.sourceDrainObservation ||
@@ -2978,7 +3143,7 @@ public:
   {
     recorded = {};
     if (!testPairBoundaryRecordValid(requested) || requested.selectorGeneration != 0 || requested.closed ||
-        (requested.version >= 2 && !requested.targetAdmissionReceipt.empty()) || requested.version == 4)
+        (requested.version >= 2 && !requested.targetAdmissionReceipt.empty()) || requested.version == 4 || requested.version == 6)
     {
       if (failure) failure->assign("invalid initial test pair boundary identity"_ctv);
       return false;
@@ -3042,7 +3207,8 @@ public:
         recorded.guestResetCompletedBootID != expected.guestResetCompletedBootID ||
         (recorded.version >= 2 && nextSelectorGeneration != 0 && recorded.targetAdmissionReceipt.empty()) ||
         nextSelectorGeneration < recorded.selectorGeneration || nextSelectorGeneration > 1 ||
-        (recorded.version == 4 && (nextSelectorGeneration != recorded.selectorGeneration || !closed || recorded.guestResetCompletedBootID.empty())) ||
+        ((recorded.version == 4 || recorded.version == 6) &&
+         (nextSelectorGeneration != recorded.selectorGeneration || !closed || recorded.guestResetCompletedBootID.empty())) ||
         (recorded.closed && !closed))
     {
       if (failure) failure->assign("test pair boundary transition is stale or regresses ownership"_ctv);

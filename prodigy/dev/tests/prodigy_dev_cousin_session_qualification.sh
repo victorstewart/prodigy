@@ -17,6 +17,11 @@ prodigy_dev_qualify_cousin_session() {
   case "$lifecycle" in ''|horizontal|vertical|source-horizontal-destination-vertical|source-vertical-destination-horizontal) ;; *) echo 'FAIL: unsupported COUSIN lifecycle profile' >&2; return 1 ;; esac
   [[ -x "$probe" ]] || return 1
   local source_name="CousinSource-${route_id#0x}" destination_name="CousinDestination-${route_id#0x}"
+  # Reuse the session preparation from another Mothership-client scenario
+  # without coupling it to the enrollment harness' evidence file names.
+  local first_create_log=${PRODIGY_DEV_COUSIN_FIRST_CREATE_LOG:-$ROOT/create-first.log}
+  local second_create_log=${PRODIGY_DEV_COUSIN_SECOND_CREATE_LOG:-$ROOT/create-second.log}
+  local first_report_log=${PRODIGY_DEV_COUSIN_FIRST_REPORT_LOG:-$ROOT/first-cluster-report.log}
   local source_permission destination_permission source_cluster destination_cluster source_prefix destination_prefix
   read -r source_permission destination_permission source_prefix destination_prefix < <(python3 - "$route_id" <<'PY'
 import sys
@@ -25,8 +30,8 @@ def canonical(n): return n.to_bytes(max(1,(n.bit_length()+7)//8),'big').hex()
 print(canonical(v^0x501),canonical(v^0x502),f'fdc5:{part>>16:x}:{part&65535:x}:1::/120',f'fdc5:{part>>16:x}:{part&65535:x}:2::/120')
 PY
 )
-  source_cluster=$(rg -m1 -o 'clusterUUID=0x[0-9a-f]+' "$ROOT/create-first.log" | cut -d= -f2)
-  destination_cluster=$(rg -m1 -o 'clusterUUID=0x[0-9a-f]+' "$ROOT/create-second.log" | cut -d= -f2)
+  source_cluster=$(rg -m1 -o 'clusterUUID=0x[0-9a-f]+' "$first_create_log" | cut -d= -f2)
+  destination_cluster=$(rg -m1 -o 'clusterUUID=0x[0-9a-f]+' "$second_create_log" | cut -d= -f2)
   [[ -n "$source_cluster" && -n "$destination_cluster" && "$source_cluster" != "$destination_cluster" ]] || return 1
   local source_app destination_app destination_prefix_uuid
   # Reserve a destination-only dummy so asymmetric application IDs are exercised.
@@ -51,7 +56,7 @@ PY
     if [[ $side == source ]]; then prefix=$source_prefix; source_app=$app
     else prefix=$destination_prefix; destination_app=$app; fi
     if [[ $side == source ]]; then
-      python3 - "$ROOT/first-cluster-report.log" "$source_prefix" >"$ROOT/cousin-source-prefixes.tsv" <<'PY_PREFIX'
+      python3 - "$first_report_log" "$source_prefix" >"$ROOT/cousin-source-prefixes.tsv" <<'PY_PREFIX'
 import ipaddress,pathlib,re,sys
 machines=re.findall(r'(?m)^\s*identity uuid=(0x[0-9a-f]+) ',pathlib.Path(sys.argv[1]).read_text())
 assert len(machines)==3 and len(set(machines))==3
@@ -206,7 +211,7 @@ if sys.argv[8]:
         if int(prior['sourceClusterUUID'],16)==int(sys.argv[2],16): used.add(prior['sourceWhiteholeIPv6'])
 role=None
 if sys.argv[9].startswith('source-'):
- report=(root/'first-cluster-report.log').read_text(); masters=[]; machines=[]
+ report=pathlib.Path(__import__('os').environ.get('PRODIGY_DEV_COUSIN_FIRST_REPORT_LOG',root/'first-cluster-report.log')).read_text(); masters=[]; machines=[]
  for block in re.findall(r'(?ms)^\s*Machine:.*?(?=^\s*Machine:|\Z)',report):
   ident=re.search(r'identity uuid=(0x[0-9a-f]+)',block)
   assert ident, 'source machine identity is missing'

@@ -431,3 +431,46 @@ This qualification covers the declared new-to-new local stateless test profile.
 Ordinary baseline/candidate load and performance, COUSIN/WAN routing, stateful
 application correctness and legacy production migration remain separate gates.
 No live Nametag or other production action was performed.
+
+### G5 COUSIN-bound local stateless qualification — 2026-10-12
+
+The supported G5 profile composes that stateless lifecycle with the final local
+COUSIN transport. It is available only to two independent three-Brain
+`deploymentMode: "test"` clusters using `aegis-x25519-v1`. The immutable
+operation binds one active COUSIN route, its exact source and destination
+service permissions, both durable route-apply receipts, and the exact wholly
+healthy transport deployment in each cluster. The destination barrier covers
+the complete declared fixture: three commissioned Brains, the one-replica
+stateless successor, and the separate three-replica stateful COUSIN transport.
+Mothership freshly revalidates those owners before admission replay, target
+selection, zero-flow drain, and source retirement. Changed, withdrawn, stale,
+unhealthy, or unacknowledged transport state fails closed.
+
+The final local matrix passed the `cousin-stateless-transfer`,
+`cousin-stateless-transfer-master-crash`,
+`cousin-stateless-transfer-cold`, and
+`cousin-stateless-transfer-source-crash` selectors. Each case used
+Discombobulator-built application artifacts and two Mothership-created virtual
+datacenters. The target fault cases kept one 48-request source connection live
+across the controller or full-cluster restart, restored all three transport
+replicas, and resumed the exact admission. The source fault case interrupted
+the first retirement caller after its durable seal, recovered the source
+authority and transport, and completed with the same operation. Every case
+preserved 30 held source requests while five new requests reached the target,
+observed an actual zero-source-flow drain, reached sealed terminal retirement,
+and left the retired source workload absent.
+
+After retirement, the qualification advances the COUSIN route through draining
+and withdrawn generations, rejects stale active and draining replays, revokes
+both permissions and the cluster pair, closes the test boundary, and removes
+both clusters through Mothership. The focused registry, route, pair-key,
+observer, and harness-ownership tests passed on the candidate, and the pinned
+Apple Linux guest was stopped after the serial matrix.
+
+This is not stateful application migration: the COUSIN deployment is transport,
+not transferred workload state. G5 does not qualify database writes, volume or
+writer ownership, legacy/runtime19b migration, WAN or cloud behavior,
+performance or soak, live Nametag, or a general cross-cluster control plane.
+Clusters retain separate Brain authority; foreign traffic enters the
+destination through Switchboard, and Mothership remains the only migration and
+test-lifecycle coordinator.

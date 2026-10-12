@@ -13,6 +13,53 @@ static String digest(char value)
   return result;
 }
 
+static ProdigyLocalCousinServicePermission testPairCousinPermission(
+    uint128_t permissionUUID, uint128_t pairUUID, uint128_t localClusterUUID,
+    uint128_t peerClusterUUID, CousinRouteHalf localHalf, uint16_t localApplicationID,
+    uint16_t peerApplicationID, uint64_t localDeploymentID, uint64_t localCousinServicePrefix,
+    uint64_t peerCousinServicePrefix, char planDigest, char artifactDigest)
+{
+  ProdigyLocalCousinServicePermission permission = {};
+  permission.protocolVersion = ProdigyLocalCousinServicePermission::baselineVersion;
+  permission.permissionUUID = permissionUUID;
+  permission.pairUUID = pairUUID;
+  permission.logicalWorkloadUUID = 0x510;
+  permission.logicalServiceUUID = 0x511;
+  permission.localClusterUUID = localClusterUUID;
+  permission.peerClusterUUID = peerClusterUUID;
+  permission.localHalf = localHalf;
+  permission.localApplicationID = localApplicationID;
+  permission.peerApplicationID = peerApplicationID;
+  permission.localCousinServicePrefix = localCousinServicePrefix;
+  permission.peerCousinServicePrefix = peerCousinServicePrefix;
+  permission.slots.insert(3);
+  permission.localDeploymentID = localDeploymentID;
+  permission.canonicalPlanSHA256 = digest(planDigest);
+  permission.artifactSHA256 = digest(artifactDigest);
+  permission.artifactBytes = 8192;
+  permission.generation = 1;
+  permission.acceptedAuthorityGeneration = 7;
+  permission.baselineLogicalCores = 2;
+  permission.baselineMemoryMB = 1024;
+  permission.baselineStorageMB = 1024;
+  return permission;
+}
+
+static CousinRouteApplyReceipt testPairCousinRouteReceipt(
+    const CousinRouteRecord& route, CousinRouteHalf localHalf, uint64_t localRuntimeRevision)
+{
+  CousinRouteApplyReceipt receipt = {};
+  receipt.routeUUID = route.routeUUID;
+  receipt.generation = route.generation;
+  assert(cousinRouteAuthorizationDigest(route, receipt.authorizationSHA256));
+  receipt.localClusterUUID = localHalf == CousinRouteHalf::source ? route.sourceClusterUUID : route.destinationClusterUUID;
+  receipt.localHalf = localHalf;
+  receipt.keyEpoch = route.keyEpoch;
+  receipt.localRuntimeRevision = localRuntimeRevision;
+  receipt.installedState = route.state;
+  return receipt;
+}
+
 class TestPairBoundaryRecordV1Fixture {
 public:
   uint32_t version = 1;
@@ -410,6 +457,164 @@ int main(void)
     assert(registry.recordTestPairGuestResetCompletion(pairLoaded, earlyCompletedBootID, pairStored, &failure));
     assert(registry.advanceTestPairBoundary(pairStored, 0, true, pairLoaded, &failure));
     assert(pairLoaded.closed && pairLoaded.guestResetCompletedBootID == earlyCompletedBootID);
+
+    // V5 binds the narrow transfer to the exact active COUSIN transport
+    // workload and its two Brain-owned permissions.  None of those identities
+    // may be replaced by a later route/permission observation.
+    MothershipTestPairBoundaryRecord finalTransport = readiness;
+    finalTransport.version = 5;
+    finalTransport.boundary.operationID = "0x0ac2"_ctv;
+    finalTransport.boundary.sourceClusterUUID = "0x0d11"_ctv;
+    finalTransport.boundary.targetClusterUUID = "0x0d22"_ctv;
+    finalTransport.sourceDeploymentID = (uint64_t(11) << 48) | 1;
+    finalTransport.targetPlanSHA256.clear();
+    finalTransport.targetAdmissionReceipt.clear();
+    finalTransport.selectorGeneration = 0;
+    finalTransport.closed = false;
+    finalTransport.sourceDrainObservation.clear();
+    finalTransport.guestResetFence = {};
+    finalTransport.guestResetCompletedBootID.clear();
+    const uint64_t sourceTransportDeploymentID = (uint64_t(19) << 48) | 1;
+    const uint64_t targetTransportDeploymentID = (uint64_t(23) << 48) | 2;
+    assert(mothershipBuildTestPairTargetReadinessIntent(
+        commissionedTopology, finalTransport.boundary.targetMachinePrivate4,
+        finalTransport.targetReadinessIntent, targetTransportDeploymentID, 3));
+
+    auto& transport = finalTransport.cousinTransport;
+    transport.route.routeUUID = 0x520;
+    transport.route.operationUUID = 0x521;
+    transport.route.pairUUID = 0x500;
+    transport.route.logicalWorkloadUUID = 0x510;
+    transport.route.logicalServiceUUID = 0x511;
+    transport.route.sourceClusterUUID = uint128_t(0xd11);
+    transport.route.destinationClusterUUID = uint128_t(0xd22);
+    transport.route.sourceApplicationID = 19;
+    transport.route.destinationApplicationID = 23;
+    transport.route.sourceCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+    transport.route.destinationCousinServicePrefix = MeshServices::generateStatefulService(23, 3);
+    transport.route.slots.insert(3);
+    transport.route.destinationRoutablePrefixUUID = 0x522;
+    transport.route.destinationPublicAddress = IPAddress("2001:db8::1", true);
+    transport.route.destinationTCPPort = 443;
+    transport.route.sourcePermissionUUID = 0x523;
+    transport.route.destinationPermissionUUID = 0x524;
+    transport.route.transportProtocol = IPPROTO_TCP;
+    transport.route.destinationCIDR = 64;
+    transport.route.pathMTU = 1500;
+    transport.route.generation = 1;
+    transport.route.issuedAtMs = 100;
+    transport.route.expiresAtMs = 200;
+    transport.route.keyEpoch = 1;
+    transport.route.rootGeneration = 1;
+    transport.sourcePermission = testPairCousinPermission(
+        transport.route.sourcePermissionUUID, transport.route.pairUUID, transport.route.sourceClusterUUID,
+        transport.route.destinationClusterUUID, CousinRouteHalf::source, 19, 23,
+        sourceTransportDeploymentID, MeshServices::generateStatefulService(19, 3),
+        MeshServices::generateStatefulService(23, 3), 'a', 'b');
+    transport.destinationPermission = testPairCousinPermission(
+        transport.route.destinationPermissionUUID, transport.route.pairUUID, transport.route.destinationClusterUUID,
+        transport.route.sourceClusterUUID, CousinRouteHalf::destination, 23, 19,
+        targetTransportDeploymentID, MeshServices::generateStatefulService(23, 3),
+        MeshServices::generateStatefulService(19, 3), 'c', 'd');
+    transport.sourceApplyReceipt = testPairCousinRouteReceipt(transport.route, CousinRouteHalf::source, 31);
+    transport.destinationApplyReceipt = testPairCousinRouteReceipt(transport.route, CousinRouteHalf::destination, 32);
+    assert(MothershipClusterRegistry::testPairCousinTransportIntentValid(finalTransport));
+    assert(MothershipClusterRegistry::testPairBoundaryRecordValid(finalTransport));
+    assert(registry.admitTestPairBoundary(finalTransport, pairStored, &failure));
+    assert(registry.admitTestPairBoundary(finalTransport, pairLoaded, &failure)); // exact pending retry
+    auto changedTransport = finalTransport;
+    changedTransport.cousinTransport.route.state = CousinRouteState::draining;
+    assert(!registry.admitTestPairBoundary(changedTransport, pairLoaded, &failure));
+    changedTransport = finalTransport;
+    changedTransport.cousinTransport.destinationPermission.permissionUUID += 1;
+    assert(!registry.admitTestPairBoundary(changedTransport, pairLoaded, &failure));
+
+    auto v5Receipt = receipt;
+    v5Receipt.admission.operationID = uint128_t(0xac2);
+    v5Receipt.admission.clusterUUID = uint128_t(0xd22);
+    assert(registry.recordTestPairTargetAdmission(pairStored, v5Receipt, pairLoaded, &failure));
+    pairStored = pairLoaded;
+    assert(registry.admitTestPairBoundary(finalTransport, pairLoaded, &failure)); // exact accepted retry
+
+    ClusterStatusReport v5Status = clusterReport;
+    v5Status.nApplications = 2;
+    ApplicationStatusReport& transportApplication = v5Status.applicationReports.emplace_back();
+    transportApplication.applicationID = transport.destinationPermission.localApplicationID;
+    DeploymentStatusReport& transportDeployment = transportApplication.deploymentReports.emplace_back();
+    transportDeployment.versionID = targetTransportDeploymentID & ((uint64_t(1) << 48) - 1);
+    transportDeployment.state = DeploymentState::running;
+    transportDeployment.isStateful = true;
+    transportDeployment.nTarget = transportDeployment.nDeployed = transportDeployment.nHealthy = 3;
+    DeploymentIdentityReport v5Identity = identity;
+    v5Identity.clusterUUID = uint128_t(0xd22);
+    v5Identity.deploymentID = finalTransport.targetDeploymentID;
+    v5Identity.canonicalPlanSHA256 = pairStored.targetPlanSHA256;
+    DeploymentIdentityReport transportIdentity = {};
+    transportIdentity.found = transportIdentity.live = transportIdentity.isStateful = true;
+    transportIdentity.clusterUUID = uint128_t(0xd22);
+    transportIdentity.applicationID = transport.destinationPermission.localApplicationID;
+    transportIdentity.deploymentID = targetTransportDeploymentID;
+    transportIdentity.versionID = targetTransportDeploymentID & ((uint64_t(1) << 48) - 1);
+    transportIdentity.canonicalPlanSHA256 = transport.destinationPermission.canonicalPlanSHA256;
+    transportIdentity.containerBlobSHA256 = transport.destinationPermission.artifactSHA256;
+    transportIdentity.containerBlobBytes = transport.destinationPermission.artifactBytes;
+    transportIdentity.authorityGeneration = 9;
+    transportIdentity.masterUUID = commissionedTopology.machines[0].uuid;
+    transportIdentity.masterBootNs = 11;
+    transportIdentity.state = DeploymentState::running;
+    transportIdentity.nTarget = transportIdentity.nDeployed = transportIdentity.nHealthy = 3;
+    assert(MothershipClusterRegistry::testPairWholeDestinationReady(
+        pairStored, v5Status, v5Identity, &failure, &transportIdentity));
+    auto missingTransport = v5Status;
+    missingTransport.nApplications = 1;
+    missingTransport.applicationReports.pop_back();
+    assert(!MothershipClusterRegistry::testPairWholeDestinationReady(
+        pairStored, missingTransport, v5Identity, &failure, &transportIdentity));
+    auto extraTransport = v5Status;
+    extraTransport.nApplications = 3;
+    extraTransport.applicationReports.emplace_back();
+    extraTransport.applicationReports.back().applicationID = 31;
+    assert(!MothershipClusterRegistry::testPairWholeDestinationReady(
+        pairStored, extraTransport, v5Identity, &failure, &transportIdentity));
+    auto unhealthyTransport = v5Status;
+    unhealthyTransport.applicationReports[1].deploymentReports[0].nHealthy = 2;
+    assert(!MothershipClusterRegistry::testPairWholeDestinationReady(
+        pairStored, unhealthyTransport, v5Identity, &failure, &transportIdentity));
+    auto staleTransportIdentity = transportIdentity;
+    staleTransportIdentity.canonicalPlanSHA256 = digest('e');
+    assert(!MothershipClusterRegistry::testPairWholeDestinationReady(
+        pairStored, v5Status, v5Identity, &failure, &staleTransportIdentity));
+
+    MothershipVirtualDatacenterPairDrainObservation v5Drain = {};
+    v5Drain.operationID = finalTransport.boundary.operationID;
+    v5Drain.sourceClusterUUID = finalTransport.boundary.sourceClusterUUID;
+    v5Drain.targetClusterUUID = finalTransport.boundary.targetClusterUUID;
+    v5Drain.sourceRuntimeIdentity = finalTransport.boundary.sourceRuntimeIdentity;
+    v5Drain.targetRuntimeIdentity = finalTransport.boundary.targetRuntimeIdentity;
+    v5Drain.sourceMachineIndex = finalTransport.boundary.sourceMachineIndex;
+    v5Drain.targetMachineIndex = finalTransport.boundary.targetMachineIndex;
+    v5Drain.selectedTarget = v5Drain.drainCapability = true;
+    v5Drain.sourceFlows = 0;
+    v5Drain.targetFlows = 4;
+    assert(registry.advanceTestPairBoundary(pairStored, 1, false, pairLoaded, &failure));
+    pairStored = pairLoaded;
+    assert(registry.recordTestPairSourceDrain(pairStored, v5Drain, pairLoaded, &failure));
+    assert(registry.recordTestPairSourceDrain(pairLoaded, v5Drain, pairStored, &failure)); // exact drain retry
+
+    MothershipVirtualDatacenterPairGuestResetFence v5Fence = {};
+    v5Fence.operationID = pairStored.boundary.operationID;
+    assert(mothershipVirtualDatacenterPairDescriptorSHA256(pairStored.boundary, v5Fence.descriptorSHA256));
+    v5Fence.bootID = "77777777-7777-4777-8777-777777777777"_ctv;
+    v5Fence.guestID = "nametag-prodigy"_ctv;
+    assert(registry.recordTestPairGuestResetFence(pairStored, v5Fence, pairLoaded, &failure));
+    assert(pairLoaded.version == 6 && pairLoaded.cousinTransport.route.routeUUID == transport.route.routeUUID);
+    assert(registry.recordTestPairGuestResetFence(pairStored, v5Fence, pairLoaded, &failure)); // v5 identity retry
+    String v5CompletedBootID = "88888888-8888-4888-8888-888888888888"_ctv;
+    assert(registry.recordTestPairGuestResetCompletion(pairLoaded, v5CompletedBootID, pairStored, &failure));
+    assert(registry.advanceTestPairBoundary(pairStored, 1, true, pairLoaded, &failure));
+    assert(pairLoaded.closed && pairLoaded.version == 6 &&
+           pairLoaded.guestResetCompletedBootID == v5CompletedBootID &&
+           pairLoaded.cousinTransport.destinationPermission.permissionUUID == transport.destinationPermission.permissionUUID);
   }
   return 0;
 }

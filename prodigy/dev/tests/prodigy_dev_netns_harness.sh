@@ -284,6 +284,16 @@ then
          exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \
             "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" "${pair_admission_mode}"
          ;;
+      cousin-stateless-transfer|cousin-stateless-transfer-master-crash|cousin-stateless-transfer-cold|cousin-stateless-transfer-source-crash)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         export PRODIGY_DEV_COUSIN_PROBE_BIN="$(dirname "${prodigy_bin}")/prodigy_cousin_session_probe_container"
+         g5_mode=g5
+         [[ "${runtime_qualification}" == cousin-stateless-transfer-master-crash ]] && g5_mode=g5-master-crash
+         [[ "${runtime_qualification}" == cousin-stateless-transfer-cold ]] && g5_mode=g5-cold
+         [[ "${runtime_qualification}" == cousin-stateless-transfer-source-crash ]] && g5_mode=g5-source-crash
+         exec timeout 2400 bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" \
+            "${prodigy_bin}" "${mothership_bin}" "$(dirname "${prodigy_bin}")/prodigy_pingpong_container" "${g5_mode}"
+         ;;
       pair-enrollment)
          [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
          exec timeout 900 bash "${script_dir}/prodigy_dev_pair_enrollment_qualification.sh" "${prodigy_bin}" "${mothership_bin}"

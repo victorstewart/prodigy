@@ -11816,6 +11816,127 @@ private:
     return true;
   }
 
+  bool testPairCousinTransportDeploymentReady(const MothershipProdigyCluster& cluster,
+                                              const ProdigyLocalCousinServicePermission& permission,
+                                              DeploymentIdentityReport& report, String& failure)
+  {
+    if (!readDeploymentIdentity(cluster, permission.localDeploymentID, report, failure)) return false;
+    const uint64_t versionID = permission.localDeploymentID & ((uint64_t(1) << 48) - 1);
+    if (report.clusterUUID != cluster.clusterUUID || report.deploymentID != permission.localDeploymentID ||
+        report.applicationID != permission.localApplicationID || report.versionID != versionID ||
+        report.state != DeploymentState::running || !report.isStateful ||
+        report.canonicalPlanSHA256 != permission.canonicalPlanSHA256 ||
+        report.containerBlobSHA256 != permission.artifactSHA256 ||
+        report.containerBlobBytes != permission.artifactBytes || report.nTarget == 0 ||
+        report.nDeployed != report.nTarget || report.nHealthy != report.nTarget ||
+        report.authorityGeneration == 0 || report.masterUUID == 0 || report.masterBootNs <= 0)
+    {
+      failure.assign("COUSIN transport permission does not name an exact wholly healthy live deployment"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool bindTestPairCousinTransport(uint128_t routeUUID,
+                                   const MothershipProdigyCluster& source,
+                                   const MothershipProdigyCluster& target,
+                                   MothershipTestPairBoundaryRecord& record,
+                                   DeploymentIdentityReport& sourceReport,
+                                   DeploymentIdentityReport& targetReport,
+                                   String& failure)
+  {
+    auto& intent = record.cousinTransport;
+    intent = {};
+    {
+      // Release the registry's process-exclusive lock before authenticated
+      // cluster observations, whose target resolution opens the same registry.
+      auto registry = openClusterRegistry();
+      if (!registry.loadUsableCousinRoute(routeUUID, Time::now<TimeResolution::ms>(), intent.route, &failure) ||
+          intent.route.sourceClusterUUID != source.clusterUUID || intent.route.destinationClusterUUID != target.clusterUUID ||
+          !registry.loadCurrentCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::source,
+                                                       intent.sourceApplyReceipt, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::destination,
+                                                       intent.destinationApplyReceipt, &failure))
+      {
+        if (failure.empty()) failure.assign("stateless transfer requires an active acknowledged COUSIN route from source to target"_ctv);
+        return false;
+      }
+    }
+    ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, destinationPermission = {};
+    if (!readLocalCousinServicePermission(source, intent.route.sourcePermissionUUID, sourcePermission, failure) ||
+        !readLocalCousinServicePermission(target, intent.route.destinationPermissionUUID, destinationPermission, failure))
+      return false;
+    intent.sourcePermission = sourcePermission.permission;
+    intent.destinationPermission = destinationPermission.permission;
+    if (!testPairCousinTransportDeploymentReady(source, intent.sourcePermission, sourceReport, failure) ||
+        !testPairCousinTransportDeploymentReady(target, intent.destinationPermission, targetReport, failure)) return false;
+    return true;
+  }
+
+  bool testPairCousinTransportReady(const MothershipTestPairBoundaryRecord& record,
+                                    MothershipProdigyCluster& source,
+                                    MothershipProdigyCluster& target,
+                                    String& failure)
+  {
+    if (record.version < 5) return true;
+    if (!MothershipClusterRegistry::testPairCousinTransportIntentValid(record))
+    {
+      failure.assign("stateless transfer COUSIN transport intent is invalid"_ctv);
+      return false;
+    }
+    const auto& expected = record.cousinTransport;
+    CousinRouteRecord route = {};
+    CousinRouteApplyReceipt sourceReceipt = {}, destinationReceipt = {};
+    auto receiptCurrent = [&](const CousinRouteApplyReceipt& observed,
+                              const CousinRouteApplyReceipt& original) {
+      return cousinRouteApplyReceiptMatchesCurrentRoute(observed, route) &&
+             observed.localHalf == original.localHalf &&
+             observed.authorizationSHA256 == original.authorizationSHA256 &&
+             observed.localClusterUUID == original.localClusterUUID &&
+             observed.localRuntimeRevision >= original.localRuntimeRevision;
+    };
+    {
+      auto registry = openClusterRegistry();
+      if (!registry.loadUsableCousinRoute(expected.route.routeUUID, Time::now<TimeResolution::ms>(), route, &failure) ||
+          route.priorOperationUUIDs != expected.route.priorOperationUUIDs ||
+          !cousinRouteExactMatches(route, expected.route) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, sourceReceipt, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, destinationReceipt, &failure) ||
+          !receiptCurrent(sourceReceipt, expected.sourceApplyReceipt) ||
+          !receiptCurrent(destinationReceipt, expected.destinationApplyReceipt))
+      {
+        if (failure.empty()) failure.assign("stateless transfer COUSIN route or durable receipt changed"_ctv);
+        return false;
+      }
+    }
+    ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, destinationPermission = {};
+    if (!readLocalCousinServicePermission(source, route.sourcePermissionUUID, sourcePermission, failure) ||
+        !readLocalCousinServicePermission(target, route.destinationPermissionUUID, destinationPermission, failure) ||
+        !prodigyLocalCousinServicePermissionEqual(sourcePermission.permission, expected.sourcePermission) ||
+        !prodigyLocalCousinServicePermissionEqual(destinationPermission.permission, expected.destinationPermission))
+    {
+      if (failure.empty()) failure.assign("stateless transfer COUSIN permission changed or is no longer qualified"_ctv);
+      return false;
+    }
+    DeploymentIdentityReport sourceDeployment = {}, destinationDeployment = {};
+    if (!testPairCousinTransportDeploymentReady(source, expected.sourcePermission, sourceDeployment, failure) ||
+        !testPairCousinTransportDeploymentReady(target, expected.destinationPermission, destinationDeployment, failure)) return false;
+    ProdigyCousinRouteResponse sourceResponse = {}, destinationResponse = {};
+    if (!observeCousinRouteSide(source, route, CousinRouteHalf::source, sourceResponse, failure) ||
+        !observeCousinRouteSide(target, route, CousinRouteHalf::destination, destinationResponse, failure) ||
+        !sourceResponse.found || !sourceResponse.qualified || !destinationResponse.found || !destinationResponse.qualified ||
+        sourceResponse.route.priorOperationUUIDs != route.priorOperationUUIDs ||
+        destinationResponse.route.priorOperationUUIDs != route.priorOperationUUIDs ||
+        !cousinRouteExactMatches(sourceResponse.route, route) || !cousinRouteExactMatches(destinationResponse.route, route) ||
+        !receiptCurrent(sourceResponse.applyReceipt, expected.sourceApplyReceipt) ||
+        !receiptCurrent(destinationResponse.applyReceipt, expected.destinationApplyReceipt))
+    {
+      if (failure.empty()) failure.assign("stateless transfer COUSIN route is not freshly qualified on both clusters"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool testPairDeploymentReady(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
                                uint32_t machineIndex, const String& vip, uint16_t port,
                                DeploymentIdentityReport& report, String& failure)
@@ -11885,9 +12006,24 @@ private:
     // to select traffic or request source retirement.
     ClusterStatusReport clusterReport = {};
     DeploymentIdentityReport deploymentReport = {};
+    DeploymentIdentityReport cousinTransportReport = {};
+    MothershipProdigyCluster source = {};
+    if (record.version >= 5)
+    {
+      {
+        auto registry = openClusterRegistry();
+        if (!registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure)) return false;
+      }
+      MothershipProdigyCluster targetCopy = target;
+      if (!testPairCousinTransportReady(record, source, targetCopy, failure) ||
+          !readDeploymentIdentity(target, record.cousinTransport.destinationPermission.localDeploymentID,
+                                  cousinTransportReport, failure)) return false;
+    }
     return readTestPairClusterStatus(target, clusterReport, failure) &&
            readDeploymentIdentity(target, record.targetDeploymentID, deploymentReport, failure) &&
-           MothershipClusterRegistry::testPairWholeDestinationReady(record, clusterReport, deploymentReport, &failure);
+           MothershipClusterRegistry::testPairWholeDestinationReady(
+               record, clusterReport, deploymentReport, &failure,
+               record.version >= 5 ? &cousinTransportReport : nullptr);
   }
 
   bool runTestPairProvider(const MothershipTestPairBoundaryRecord& record, const char *action,
@@ -11924,7 +12060,7 @@ private:
 
   bool observeAndRecordTestPairSourceDrain(MothershipTestPairBoundaryRecord& record, String& failure)
   {
-    if (record.version != 3 || record.closed || record.selectorGeneration != 1)
+    if ((record.version != 3 && record.version != 5) || record.closed || record.selectorGeneration != 1)
     {
       failure.assign("source drain requires an open migration with the destination selected"_ctv);
       return false;
@@ -12008,7 +12144,7 @@ private:
   {
     if (!record.guestResetFence.bootID.empty())
     { failure.assign("test pair awaits guest reset cleanup"_ctv); return false; }
-    if ((record.version != 2 && record.version != 3) || record.closed)
+    if ((record.version != 2 && record.version != 3 && record.version != 5) || record.closed)
     {
       failure.assign("operation has no open paired target request"_ctv);
       return false;
@@ -12028,6 +12164,7 @@ private:
       failure.assign("paired cluster runtime identity changed"_ctv);
       return false;
     }
+    if (record.version >= 5 && !testPairCousinTransportReady(record, source, target, failure)) return false;
     String digest = {}; uint64_t bytes = 0;
     if (!mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) ||
         !prodigyComputeFileSHA256Hex(artifactPath, digest, &bytes, &failure) ||
@@ -12115,7 +12252,8 @@ private:
     bool valid = argc == 2 && lockTestPairLifecycle(lock, failure);
     if (valid) { auto registry = openClusterRegistry(); valid = registry.loadTestPairBoundary(String(argv[0]), record, &failure); }
     valid = valid && admitTestPairTarget(record, String(argv[1]), failure);
-    basics_log("admitTestPairTarget success=%u accepted=%u migrationQualified=0 failure=%s\n", unsigned(valid), unsigned(valid), failure.c_str());
+    basics_log("admitTestPairTarget success=%u accepted=%u migrationQualified=%u failure=%s\n",
+               unsigned(valid), unsigned(valid), unsigned(valid && record.version >= 5), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -12257,20 +12395,21 @@ private:
     if (valid) valid = receipt.sealed && receipt.terminal && matchesFence();
     socket.close();
     if (!valid && failure.empty()) failure.assign("source retirement is pending; resume the same paired operation"_ctv);
-    basics_log("retireTestPairSource success=%u sealed=%u terminal=%u migrationQualified=0 failure=%s\n",
-               unsigned(valid), unsigned(receipt.sealed), unsigned(receipt.terminal), failure.c_str());
+    basics_log("retireTestPairSource success=%u sealed=%u terminal=%u migrationQualified=%u failure=%s\n",
+               unsigned(valid), unsigned(receipt.sealed), unsigned(receipt.terminal),
+               unsigned(valid && record.version >= 5), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
   void runPrepareTestPairMigration(int argc, char *argv[])
   {
     String failure = {}; TestPairLifecycleLock lock;
-    bool valid = argc == 10 && lockTestPairLifecycle(lock, failure);
+    bool valid = (argc == 10 || argc == 11) && lockTestPairLifecycle(lock, failure);
     MothershipTestPairBoundaryRecord requested = {}, recorded = {};
-    requested.version = 3;
+    requested.version = argc == 11 ? 5 : 3;
     MothershipProdigyCluster source = {}, target = {};
     DeploymentPlan plan = {}; String artifactPath = {}; bool returnAfterOkay = false;
-    uint128_t op = 0; uint64_t si = 0, ti = 0, port = 0;
+    uint128_t op = 0, cousinRouteUUID = 0; uint64_t si = 0, ti = 0, port = 0;
     auto& d = requested.boundary;
     if (valid)
     {
@@ -12280,6 +12419,8 @@ private:
               mothershipParseUnsignedArgument(argv[4], 3, si) && si > 0 &&
               mothershipParseUnsignedArgument(argv[5], 3, ti) && ti > 0 &&
               mothershipParseUnsignedArgument(argv[7], UINT16_MAX, port) && port > 0;
+      if (valid && argc == 11)
+        valid = prodigyParseCanonicalHex128(String(argv[10]), cousinRouteUUID) && cousinRouteUUID != 0;
       d.sourceMachineIndex = uint32_t(si); d.targetMachineIndex = uint32_t(ti); d.endpointPort = uint16_t(port);
     }
     if (valid)
@@ -12307,19 +12448,60 @@ private:
               mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) &&
               prodigyComputeFileSHA256Hex(artifactPath, requested.targetBlobSHA256, &requested.targetBlobBytes, &failure);
     }
+    DeploymentIdentityReport sourceTransportReport = {}, targetTransportReport = {};
+    if (valid && requested.version >= 5)
+    {
+      valid = bindTestPairCousinTransport(cousinRouteUUID, source, target, requested,
+                                          sourceTransportReport, targetTransportReport, failure) &&
+              requested.cousinTransport.destinationPermission.localApplicationID != plan.config.applicationID;
+      if (!valid && failure.empty())
+        failure.assign("stateless successor must be distinct from the bound COUSIN transport workload"_ctv);
+    }
     if (valid)
     {
       ClusterStatusReport targetReport = {};
       auto& intent = requested.targetReadinessIntent;
       valid = readTestPairClusterStatus(target, targetReport, failure) && targetReport.hasTopology &&
-              mothershipBuildTestPairTargetReadinessIntent(targetReport.topology, d.targetMachinePrivate4, intent);
+              mothershipBuildTestPairTargetReadinessIntent(
+                  targetReport.topology, d.targetMachinePrivate4, intent,
+                  requested.version >= 5 ? requested.cousinTransport.destinationPermission.localDeploymentID : 0,
+                  requested.version >= 5 ? targetTransportReport.nTarget : 0);
+      if (valid && requested.version >= 5)
+      {
+        const auto& permission = requested.cousinTransport.destinationPermission;
+        const uint64_t transportVersionID = permission.localDeploymentID & ((uint64_t(1) << 48) - 1);
+        bool foundTransport = false, foundSuccessor = false;
+        valid = (targetReport.nApplications == 1 || targetReport.nApplications == 2) &&
+                targetReport.applicationReports.size() == targetReport.nApplications;
+        for (const ApplicationStatusReport& application : targetReport.applicationReports)
+        {
+          if (application.applicationID == permission.localApplicationID && application.deploymentReports.size() == 1)
+          {
+            const auto& deployment = application.deploymentReports[0];
+            foundTransport = deployment.versionID == transportVersionID && deployment.state == DeploymentState::running &&
+                             deployment.isStateful && deployment.nTarget == targetTransportReport.nTarget &&
+                             deployment.nDeployed == deployment.nTarget && deployment.nHealthy == deployment.nTarget;
+          }
+          else if (application.applicationID == plan.config.applicationID && application.deploymentReports.size() == 1)
+          {
+            const auto& deployment = application.deploymentReports[0];
+            foundSuccessor = deployment.versionID == plan.config.versionID && deployment.state == DeploymentState::running &&
+                             !deployment.isStateful && deployment.nTarget == 1 && deployment.nDeployed == 1 && deployment.nHealthy == 1;
+          }
+          else valid = false;
+        }
+        valid = valid && foundTransport && (targetReport.nApplications == 1 ? !foundSuccessor : foundSuccessor) &&
+                MothershipClusterRegistry::testPairCousinTransportIntentValid(requested) &&
+                testPairCousinTransportReady(requested, source, target, failure);
+      }
       if (!valid && failure.empty()) failure.assign("paired target commissioned topology is unavailable or unsupported"_ctv);
     }
     if (valid) { auto registry = openClusterRegistry(); valid = registry.admitTestPairBoundary(requested, recorded, &failure); }
     // The immutable pair is durable before any target launch request. A lost
     // response leaves this owner open; admitTestPairTarget queries the same op.
     valid = valid && admitTestPairTarget(recorded, artifactPath, failure);
-    basics_log("prepareTestPairMigration success=%u targetAccepted=%u migrationQualified=0 failure=%s\n", unsigned(valid), unsigned(valid), failure.c_str());
+    basics_log("prepareTestPairMigration success=%u targetAccepted=%u migrationQualified=%u failure=%s\n",
+               unsigned(valid), unsigned(valid), unsigned(valid && recorded.version >= 5), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -12399,6 +12581,7 @@ private:
       }
       MothershipProdigyCluster source = {}, target = {};
       { auto registry = openClusterRegistry(); valid = valid && registry.getClusterByIdentity(record.boundary.sourceClusterUUID, source, &failure) && registry.getClusterByIdentity(record.boundary.targetClusterUUID, target, &failure); }
+      if (valid && record.version >= 5) valid = testPairCousinTransportReady(record, source, target, failure);
       DeploymentIdentityReport sr = {}, tr = {};
       valid = valid && testPairDeploymentReady(source, record.sourceDeploymentID, record.boundary.sourceMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, sr, failure) &&
                        testPairDeploymentReady(target, record.targetDeploymentID, record.boundary.targetMachineIndex, record.boundary.endpointIPv4, record.boundary.endpointPort, tr, failure) &&
@@ -12414,7 +12597,7 @@ private:
     if (valid && armReset)
     {
       MothershipVirtualDatacenterPairGuestResetFence fence = {};
-      valid = (record.version == 3 || record.version == 4) &&
+      valid = (record.version == 3 || record.version == 4 || record.version == 5 || record.version == 6) &&
               runTestPairProvider(record, argv[1], {}, failure, nullptr, &fence);
       if (valid)
       {
@@ -12440,7 +12623,8 @@ private:
     else if (valid && drain && record.version >= 2) valid = observeAndRecordTestPairSourceDrain(record, failure);
     else valid = valid && runTestPairProvider(record, argv[1], {}, failure);
     if (valid && remove) { auto registry = openClusterRegistry(); MothershipTestPairBoundaryRecord updated = {}; valid = registry.advanceTestPairBoundary(record, record.selectorGeneration, true, updated, &failure); }
-    basics_log("pairBoundary success=%u operation=%s migrationQualified=0 failure=%s\n", unsigned(valid), argv[1], failure.c_str());
+    basics_log("pairBoundary success=%u operation=%s migrationQualified=%u failure=%s\n",
+               unsigned(valid), argv[1], unsigned(valid && record.version >= 5), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -18806,6 +18990,14 @@ private:
                unsigned(secondResponse.qualified), unsigned(secondResponse.initialProjectionDelivered),
                unsigned(!(firstResponse.qualified && firstResponse.initialProjectionDelivered &&
                           secondResponse.qualified && secondResponse.initialProjectionDelivered)), failure.c_str());
+    // The pair UUID is public routing identity, not key material. Emit it only
+    // with the completed receipt so later ordinary Mothership operations can
+    // bind service permissions to this exact enrollment without reading the
+    // registry or provider-owned state directly.
+    if (valid)
+      basics_log("enrollClusterPairIdentity pairUUID=0x%016llx%016llx\n",
+                 (unsigned long long)(finalIntent.pairUUID >> 64),
+                 (unsigned long long)finalIntent.pairUUID);
     if (!valid) exit(EXIT_FAILURE);
   }
 
@@ -23451,7 +23643,7 @@ int main(int argc, char *argv[])
     message.append("probeTestClusterTraffic [name|clusterUUID] [address] [port] [payload] [expected] [requestTimeoutMs] [sourceMachineIndex] [clients] [requestsPerClient] [intervalMs]\n");
     message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
     message.append("retireTestPairSource [operationID] (test migration; fresh whole destination readiness and source drain required)\n");
-    message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] (test clusters only; target admission prerequisite)\n");
+    message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] [optional activeCousinRouteUUID] (test clusters only; final-transport route qualifies G5)\n");
     message.append("admitTestPairTarget [operationID] [containerBlob] (resume the same durable target admission)\n");
     message.append("prepareTestPairBoundary [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport]\n");
     message.append("\tqualifies one shared TCP endpoint between two independent three-Brain test clusters; both exact deployments must already be healthy\n");

@@ -4,12 +4,18 @@ set -Eeuo pipefail
 if [[ "${1:-}" == "--validate-only" && "$#" = 1 ]]; then bash -n "$0"; exit 0; fi
 PRODIGY_BIN="${1:-}"; MOTHERSHIP_BIN="${2:-}"; PINGPONG_BIN="${3:-}"
 MODE="${4:-endpoint}"
-[[ ( $# = 3 || $# = 4 ) && ( "$MODE" = endpoint || "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash ) && -x "$PRODIGY_BIN" && -x "$MOTHERSHIP_BIN" && -x "$PINGPONG_BIN" ]] || { echo "usage: $0 prodigy mothership pingpong [endpoint|admission|admission-master-crash|admission-cold|admission-source-crash]" >&2; exit 2; }
+[[ ( $# = 3 || $# = 4 ) && ( "$MODE" = endpoint || "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash || "$MODE" = g5 || "$MODE" = g5-master-crash || "$MODE" = g5-cold || "$MODE" = g5-source-crash ) && -x "$PRODIGY_BIN" && -x "$MOTHERSHIP_BIN" && -x "$PINGPONG_BIN" ]] || { echo "usage: $0 prodigy mothership pingpong [endpoint|admission|admission-master-crash|admission-cold|admission-source-crash|g5|g5-master-crash|g5-cold|g5-source-crash]" >&2; exit 2; }
 [[ $EUID = 0 ]] || { echo "SKIP: Mothership test clusters require root" >&2; exit 77; }
 for x in awk cat date jq mktemp python3 readlink rg sed sha256sum sleep timeout uname; do command -v "$x" >/dev/null || { echo "SKIP: missing $x" >&2; exit 77; }; done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
 source "$SCRIPT_DIR/prodigy_dev_discombobulator_artifact_helpers.sh"
+G5=0
+case "$MODE" in g5|g5-master-crash|g5-cold|g5-source-crash) G5=1;; esac
+if (( G5 )); then
+   COUSIN_PROBE="${PRODIGY_DEV_COUSIN_PROBE_BIN:-}"
+   [[ -x "$COUSIN_PROBE" ]] || { echo "FAIL: G5 requires PRODIGY_DEV_COUSIN_PROBE_BIN" >&2; exit 2; }
+fi
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 prodigy_dev_reexec_in_private_mount_namespace_once PRODIGY_DEV_PAIR_ENDPOINT_MOUNT_NS_READY bash "$SCRIPT_SELF" "$@"
 PRODIGY_BIN="$(readlink -f "$PRODIGY_BIN")"; MOTHERSHIP_BIN="$(readlink -f "$MOTHERSHIP_BIN")"; PINGPONG_BIN="$(readlink -f "$PINGPONG_BIN")"
@@ -20,6 +26,12 @@ BUNDLE="$(dirname "$PRODIGY_BIN")/prodigy.$ARCH.bundle.tar.zst"
 EXPECTED_BUNDLE_SHA256="$(sha256sum "$BUNDLE" | cut -d' ' -f1)"
 ROOT="$(mktemp -d "$REPO_ROOT/.run/prodigy-pair-endpoint.XXXXXX")"; DB="$ROOT/mothership.tidesdb"; mkdir -p "$ROOT/receipts"
 S="pair-source-$$-$RANDOM"; T="pair-target-$$-$RANDOM"; SW="$ROOT/source-workspace"; TW="$ROOT/target-workspace"; SM="$SW/test-cluster-manifest.json"; TM="$TW/test-cluster-manifest.json"
+if (( G5 )); then
+   # Reuse the canonical COUSIN observer's evidence layout without creating a
+   # second runtime or filesystem owner.
+   SW="$ROOT/first-workspace"; TW="$ROOT/second-workspace"
+   SM="$SW/test-cluster-manifest.json"; TM="$TW/test-cluster-manifest.json"
+fi
 OP="$(python3 - <<'PY'
 import secrets
 n=secrets.randbits(128) or 1
@@ -32,7 +44,9 @@ print("0x"+n.to_bytes((n.bit_length()+7)//8,"big").hex())
 PY
 )"
 SA=0; TA=0; OPEN=0; HELD=; SOURCE_SAMPLER=; RETIRE_PID=; RC="$ROOT/held.rc"; VIP=198.18.0.1; PORT=19090
-printf 'scenario=pair-%s migrationCoverage=0 vip=%s port=%s sourceMachineIndex=1 targetMachineIndex=1\n' "$MODE" "$VIP" "$PORT" >"$ROOT/scenario.txt"
+PAIR_CONTROL=0; PAIR_REVOKED=0; COUSIN_REVOKED=0; G5_ROUTE_UUID=
+printf 'scenario=pair-%s migrationCoverage=%s vip=%s port=%s sourceMachineIndex=1 targetMachineIndex=1\n' \
+   "$MODE" "$G5" "$VIP" "$PORT" >"$ROOT/scenario.txt"
 sha256sum "$PRODIGY_BIN" "$MOTHERSHIP_BIN" "$PINGPONG_BIN" "$BUNDLE" >"$ROOT/artifact-identities.sha256"
 m() { local l=$1 sec=$2 log=$3; shift 3; local a b st op=$1; a=$(date +%s%3N); if timeout "${sec}s" env PRODIGY_MOTHERSHIP_TIDESDB_PATH="$DB" "$MOTHERSHIP_BIN" "$@" >"$log" 2>&1; then st=0; else st=$?; fi; b=$(date +%s%3N); jq -nc --arg label "$l" --arg operation "$op" --argjson status "$st" --argjson startedMs "$a" --argjson endedMs "$b" '{label:$label,operation:$operation,status:$status,startedMs:$startedMs,endedMs:$endedMs}' >"$ROOT/receipts/$l-$a-$BASHPID.json"; return "$st"; }
 ok() {
@@ -40,6 +54,9 @@ ok() {
 }
 accepted_deploy() {
    rg -q 'SpinApplicationResponseCode::okay$' "$1"
+}
+is_migration_mode() {
+   [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash || "$G5" = 1 ]]
 }
 expect_reason() {
    local log="$1" reason="$2"
@@ -76,13 +93,41 @@ rmcluster() {
    fi
 }
 
+retry_pair_enrollment() {
+   local deadline=$(( $(date +%s%3N) + 180000 )) attempt=0
+   while [[ $(date +%s%3N) -lt $deadline ]]; do
+      if m "pair-enroll-$attempt" 45 "$ROOT/pair-enroll.log" enrollClusterPair "$S" "$T" "$OP" &&
+         rg -q 'enrollClusterPair success=1 .*firstQualified=1 .*firstProjection=1 .*secondQualified=1 .*secondProjection=1 .*pending=0' \
+            "$ROOT/pair-enroll.log"; then
+         return 0
+      fi
+      rg -q 'enrollClusterPair success=0 .*pending=1' "$ROOT/pair-enroll.log" || return 1
+      attempt=$((attempt + 1))
+      sleep .25
+   done
+   return 1
+}
+
+retry_pair_revocation() {
+   local log="$1" deadline=$(( $(date +%s%3N) + 180000 )) attempt=0
+   while [[ $(date +%s%3N) -lt $deadline ]]; do
+      if m "pair-revoke-$attempt" 45 "$log" revokeClusterPair "$OP" &&
+         rg -q 'revokeClusterPair success=1 .*firstRevoked=1 .*firstWithdrawn=1 .*secondRevoked=1 .*secondWithdrawn=1 .*pending=0' "$log"; then
+         return 0
+      fi
+      rg -q 'revokeClusterPair success=0 .*pending=1' "$log" || return 1
+      attempt=$((attempt + 1))
+      sleep .25
+   done
+   return 1
+}
+
 cleanup() {
    local st=$?
    trap - EXIT HUP INT TERM
    set +e
    [[ -z "$HELD" ]] || wait "$HELD" || st=1
    if [[ -n "$SOURCE_SAMPLER" ]]; then
-      : >"$ROOT/source-fault-sampler.stop"
       wait "$SOURCE_SAMPLER" || st=1
    fi
    # A bounded retirement client can own the pair lifecycle lock; do not remove
@@ -92,10 +137,29 @@ cleanup() {
       RETIRE_PID=
    fi
    copy_pair_observations
+   # The G5 boundary can only be closed while its bound route and permissions
+   # remain current. Tear down that owner before revoking the transport.
    [[ $OPEN != 1 ]] || {
       m boundary-remove-cleanup 180 "$ROOT/boundary-remove-cleanup.log" pairBoundary "$OP" remove &&
          ok "$ROOT/boundary-remove-cleanup.log" pairBoundary || st=1
+      OPEN=0
    }
+   if (( G5 && !COUSIN_REVOKED )); then
+      cleanup_g5_cousin_route || st=1
+   fi
+   if (( G5 && !COUSIN_REVOKED )); then
+      [[ ! -r "$ROOT/cousin-source-permission.json" ]] ||
+         m cousin-permission-source-cleanup 45 "$ROOT/cousin-permission-source-cleanup.log" cousinPermission "$S" revoke "$(jq -r .permissionUUID "$ROOT/cousin-source-permission.json")" || st=1
+      [[ ! -r "$ROOT/cousin-destination-permission.json" ]] ||
+         m cousin-permission-destination-cleanup 45 "$ROOT/cousin-permission-destination-cleanup.log" cousinPermission "$T" revoke "$(jq -r .permissionUUID "$ROOT/cousin-destination-permission.json")" || st=1
+   fi
+   if (( G5 && !PAIR_REVOKED )); then
+      retry_pair_revocation "$ROOT/pair-revoke-cleanup.log" || st=1
+   fi
+   if (( PAIR_CONTROL )); then
+      m pair-control-remove-cleanup 45 "$ROOT/pair-control-remove-cleanup.log" testClusterPairControl "$OP" remove || st=1
+      PAIR_CONTROL=0
+   fi
    [[ $SA != 1 ]] || rmcluster "$S" "$ROOT/remove-source-cleanup.log" || st=1
    [[ $TA != 1 ]] || rmcluster "$T" "$ROOT/remove-target-cleanup.log" || st=1
    [[ ! -e "$SM" && ! -e "$TM" ]] || st=1
@@ -105,7 +169,11 @@ cleanup() {
    exit "$st"
 }
 trap cleanup EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
-request() { jq -nc --arg name "$1" --arg workspace "$2" '{name:$name,deploymentMode:"test",nBrains:3,autoscaleIntervalSeconds:180,machineSchemas:[{schema:"pair-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}}'; }
+request() {
+   jq -nc --arg name "$1" --arg workspace "$2" --argjson g5 "$G5" '
+      {name:$name,deploymentMode:"test",internalTransportProfile:(if $g5 == 1 then "aegis-x25519-v1" else "tls" end),nBrains:3,autoscaleIntervalSeconds:180,machineSchemas:[{schema:"pair-machine",kind:"vm",vmImageURI:"test://virtual-datacenter"}],test:{workspaceRoot:$workspace,machineCount:3,machineLogicalCores:4,machineMemoryMB:8192,machineStorageMB:8192,brainBootstrapFamily:"ipv4",enableFakeIpv4Boundary:false,interContainerMTU:9000}} +
+      (if $g5 == 1 then {bgp:{enabled:true,nextHop6:"::1",peers:[{peerASN:64512,peerAddress:"127.0.0.2",sourceAddress:"127.0.0.1"}]}} else {} end)'
+}
 create() { local q; q="$(request "$1" "$2")"; printf '%s\n' "$q" >"$ROOT/$1-request.json"; m "create-$1" 180 "$3" createCluster "$q" && ok "$3" createCluster; }
 ready() {
    [[ $(rg -c '^[[:space:]]*Machine: state=healthy role=brain ' "$1" || true) = 3 &&
@@ -199,6 +267,52 @@ wait_recovered_target_app() {
    return 1
 }
 
+wait_recovered_cousin_transport() {
+   (( G5 )) || return 0
+   local name report="$ROOT/cousin-target-after-fault-app.log"
+   local end=$(( $(date +%s%3N) + 120000 ))
+   name=$(jq -r .destinationName "$ROOT/cousin-endpoints.json") || return 1
+   while [[ $(date +%s%3N) -lt $end ]]; do
+      if m cousin-app-target-after-fault 8 "$report" applicationReport "$T" "$name" &&
+         python3 - "$report" 2>/dev/null <<'PY2'
+import pathlib,re,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8',errors='replace')
+assert re.findall(r'(?m)^\s*state:\s*DeploymentState::(\w+)\s*$',text)==['running']
+for field in ('nTarget','nDeployed','nHealthy'):
+    assert re.findall(r'(?m)^\s*'+field+r':\s*(\d+)\s*$',text)==['3']
+PY2
+      then
+         return 0
+      fi
+      sleep .25
+   done
+   sed -n '1,220p' "$report" >&2
+   return 1
+}
+
+wait_recovered_source_cousin_transport() {
+   (( G5 )) || return 0
+   local name report="$ROOT/cousin-source-after-fault-app.log"
+   local end=$(( $(date +%s%3N) + 120000 ))
+   name=$(jq -r .sourceName "$ROOT/cousin-endpoints.json") || return 1
+   while [[ $(date +%s%3N) -lt $end ]]; do
+      if m cousin-app-source-after-fault 8 "$report" applicationReport "$S" "$name" &&
+         python3 - "$report" 2>/dev/null <<'PY2'
+import pathlib,re,sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8',errors='replace')
+assert re.findall(r'(?m)^\s*state:\s*DeploymentState::(\w+)\s*$',text)==['running']
+for field in ('nTarget','nDeployed','nHealthy'):
+    assert re.findall(r'(?m)^\s*'+field+r':\s*(\d+)\s*$',text)==['3']
+PY2
+      then
+         return 0
+      fi
+      sleep .25
+   done
+   sed -n '1,220p' "$report" >&2
+   return 1
+}
+
 faulted_cluster_incarnations_changed() {
    python3 - "$1" "$2" "$3" "$4" <<'PY2'
 import json,pathlib,re,sys
@@ -216,31 +330,6 @@ old,new=boots(before),boots(after)
 for index in map(int,indices.split(',')):
     assert index in old and index in new and old[index] != new[index], (index,old,new)
 PY2
-}
-
-# Recovery prepares the existing pair router before the fault while its selector
-# remains source.  The sampler uses that router's typed probe, which verifies
-# pingpong's identity:<sequence> reply from the Neuron-provided deployment and
-# container identity.  Each CLI owns only a brief registry read before its
-# provider probe; no lifecycle lock is held.
-source_fault_sampler() {
-   local sequence=0 start end status log
-   while [[ ! -e "$ROOT/source-fault-sampler.stop" ]]; do
-      log="$ROOT/source-fault-probe-$sequence.log"
-      start="$(date +%s%3N)"
-      if m "source-fault-probe-$sequence" 8 "$log" probePairBoundary "$OP" "$AD" 1 0 &&
-         ok "$log" probePairBoundary &&
-         rg -q '^PAIR_BOUNDARY_REQUEST .*"ok": true' "$log"; then
-         status=0
-      else
-         status=1
-      fi
-      end="$(date +%s%3N)"
-      printf '%s\t%s\t%s\t%s\n' "$start" "$end" "$status" "$log" >>"$ROOT/source-fault-observations.tsv"
-      : >"$ROOT/source-fault-sampler.ready"
-      sequence=$((sequence + 1))
-      sleep .1
-   done
 }
 
 target_master_identity() {
@@ -263,16 +352,17 @@ archive_fault_phase() {
    local -a files receipts
    out="$ROOT/$phase"
    mkdir -p "$out/receipts"
-   files=("$ROOT/target-before-fault-report.log" "$ROOT/target-master-fault.log"
-      "$ROOT/source-fault-observations.tsv" "$ROOT/target-fault-window.tsv"
-      "$ROOT/target-after-fault-report.log" "$ROOT/target-after-fault-app.log"
-      "$ROOT/admit-target-after-fault.log" "$ROOT/prepare-target-after-fault.log"
-      "$ROOT"/source-fault-probe-*.log)
+   files=("$ROOT/target-before-fault-report.log" "$ROOT/target-master-fault.log" "$ROOT/target-cold-fault.log"
+      "$ROOT/source-fault-continuity.log" "$ROOT/source-fault-continuity.tsv" "$ROOT/target-fault-window.tsv"
+      "$ROOT/target-after-fault-report.log" "$ROOT/target-after-fault-app.log" "$ROOT/cousin-target-after-fault-app.log"
+      "$ROOT/admit-target-after-fault.log" "$ROOT/prepare-target-after-fault.log")
    for file in "${files[@]}"; do
       [[ -e "$file" ]] && cp -p "$file" "$out/"
    done
    receipts=("$ROOT"/receipts/report-target-before-fault-*.json "$ROOT"/receipts/target-master-fault-*.json
-      "$ROOT"/receipts/source-fault-probe-*.json "$ROOT"/receipts/app-target-after-fault-*.json
+      "$ROOT"/receipts/target-cold-fault-*.json
+      "$ROOT"/receipts/source-fault-continuity-*.json "$ROOT"/receipts/app-target-after-fault-*.json
+      "$ROOT"/receipts/cousin-app-target-after-fault-*.json
       "$ROOT"/receipts/admit-target-after-fault-*.json "$ROOT"/receipts/prepare-target-after-fault-*.json)
    for receipt in "${receipts[@]}"; do
       [[ -e "$receipt" ]] && cp -p "$receipt" "$out/receipts/"
@@ -343,6 +433,9 @@ run_source_retirement_fault() {
       "$retire_rc" "$completed_ms" >>"$ROOT/scenario.txt"
    waitready "$S" source-after-retirement-fault || return 1
    faulted_cluster_incarnations_changed "$before" "$after" "$SM" "$master" || return 1
+   # Retirement revalidates both live COUSIN permissions.  A new Brain master
+   # can be ready before the source transport's three replicas are restored.
+   wait_recovered_source_cousin_transport || return 1
    m target-after-source-fault 45 "$ROOT/target-after-source-fault.log" probePairBoundary "$OP" "$BD" 5 0 &&
       ok "$ROOT/target-after-source-fault.log" probePairBoundary && rg -q '"ok": true' "$ROOT/target-after-source-fault.log" || return 1
    m retire-source-resume 210 "$ROOT/retire-source-resume.log" retireTestPairSource "$OP" &&
@@ -359,48 +452,36 @@ run_target_admission_fault() {
    printf 'targetFaultPhase=%s targetFaultKind=%s oldMasterUUID=%s oldMasterIndex=%s targetFaultIndices=%s wholeMachineRecovery=1 quorumContinuity=0 retainedRuntime=0\n' \
       "$phase" "$kind" "$old_uuid" "$master" "$indices" >>"$ROOT/scenario.txt"
 
-   rm -f "$ROOT/source-fault-sampler.stop" "$ROOT/source-fault-sampler.ready" "$ROOT/source-fault-observations.tsv"
-   source_fault_sampler & SOURCE_SAMPLER=$!
+   rm -f "$ROOT/source-fault-continuity.log" "$ROOT/source-fault-continuity.tsv"
+   # Keep one provider-owned connection alive across the target fault. The
+   # Mothership process releases its short registry read before entering this
+   # bounded probe, so the concurrent fault command never contends for TidesDB.
+   m source-fault-continuity 20 "$ROOT/source-fault-continuity.log" probePairBoundary "$OP" "$AD" 48 250 &
+   SOURCE_SAMPLER=$!
    sampler="$SOURCE_SAMPLER"
    local sampler_deadline=$(( $(date +%s%3N) + 15000 ))
-   while [[ ! -e "$ROOT/source-fault-sampler.ready" && $(date +%s%3N) -lt $sampler_deadline ]]; do sleep .05; done
-   [[ -e "$ROOT/source-fault-sampler.ready" ]] || { : >"$ROOT/source-fault-sampler.stop"; wait "$sampler" || true; SOURCE_SAMPLER=; return 1; }
+   while ! rg -q '^PAIR_BOUNDARY_REQUEST .*"ok": true' "$ROOT/source-fault-continuity.log" 2>/dev/null &&
+      [[ $(date +%s%3N) -lt $sampler_deadline ]]; do
+      kill -0 "$sampler" 2>/dev/null || break
+      sleep .05
+   done
+   rg -q '^PAIR_BOUNDARY_REQUEST .*"ok": true' "$ROOT/source-fault-continuity.log" 2>/dev/null &&
+      kill -0 "$sampler" 2>/dev/null || { wait "$sampler" || true; SOURCE_SAMPLER=; return 1; }
 
    fault_start="$(date +%s%3N)"
    if ! m "target-$kind-fault" 45 "$ROOT/target-$kind-fault.log" faultTestCluster "$T" crash "$indices" 3000 0 0 0 ||
       ! ok "$ROOT/target-$kind-fault.log" faultTestCluster; then
-      : >"$ROOT/source-fault-sampler.stop"; wait "$sampler" || true; SOURCE_SAMPLER=; return 1
+      wait "$sampler" || true; SOURCE_SAMPLER=; return 1
    fi
    fault_end="$(date +%s%3N)"
-   local post_deadline=$(( $(date +%s%3N) + 15000 )) post_observed=0
-   while [[ $(date +%s%3N) -lt $post_deadline ]]; do
-      if python3 - "$ROOT/source-fault-observations.tsv" "$fault_end" <<'PY2'
-import pathlib,sys
-end=int(sys.argv[2])
-sys.exit(not any(int(line.split('	',1)[0]) >= end for line in pathlib.Path(sys.argv[1]).read_text().splitlines()))
-PY2
-      then
-         post_observed=1
-         break
-      fi
-      sleep .05
-   done
-   : >"$ROOT/source-fault-sampler.stop"
-   wait "$sampler" || true
+   kill -0 "$sampler" 2>/dev/null || { wait "$sampler" || true; SOURCE_SAMPLER=; return 1; }
+   if ! wait "$sampler"; then SOURCE_SAMPLER=; return 1; fi
    SOURCE_SAMPLER=
-   [[ "$post_observed" = 1 ]] || return 1
    printf '%s\t%s\t%s\t%s\n' "$fault_start" "$fault_end" "$kind" "$indices" >"$ROOT/target-fault-window.tsv"
-
-   python3 - "$ROOT/source-fault-observations.tsv" "$fault_start" "$fault_end" <<'PY2'
-import pathlib,sys
-rows=[]
-for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
-    start,end,status,log=line.split('	',3)
-    rows.append((int(start),int(end),int(status),log))
-lo,hi=map(int,sys.argv[2:])
-assert rows and any(row[0] < hi and row[1] > lo for row in rows), 'no source probe overlapped fault command interval'
-assert all(row[2] == 0 for row in rows), 'a source probe failed before, during, or after fault command'
-PY2
+   [[ $(rg -c '^PAIR_BOUNDARY_REQUEST .*"ok": true' "$ROOT/source-fault-continuity.log" || true) = 48 ]] &&
+      ok "$ROOT/source-fault-continuity.log" probePairBoundary || return 1
+   printf 'faultStartMs\tfaultEndMs\trequests\tconnectionSpannedFault\n%s\t%s\t48\t1\n' \
+      "$fault_start" "$fault_end" >"$ROOT/source-fault-continuity.tsv"
 
    waitready "$T" target-after-fault || return 1
    faulted_cluster_incarnations_changed "$report" "$ROOT/target-after-fault-report.log" "$TM" "$indices" || return 1
@@ -416,15 +497,100 @@ PY2
       printf 'targetFaultPhase=%s oldMasterUUID=%s currentMasterUUID=%s currentMasterIndex=%s observedConnectionDirection=%s\n' \
          "$phase" "$old_uuid" "$current_uuid" "$current" "$FAULT_DIRECTION" >>"$ROOT/scenario.txt"
    fi
+   wait_recovered_cousin_transport || return 1
    # Resume the durable operation before waiting for the application: replay
    # itself is allowed to trigger the target's recovery scheduling.
    m admit-target-after-fault 45 "$ROOT/admit-target-after-fault.log" admitTestPairTarget "$OP" "$BLOB" &&
       ok "$ROOT/admit-target-after-fault.log" admitTestPairTarget || return 1
-   m prepare-target-after-fault 45 "$ROOT/prepare-target-after-fault.log" prepareTestPairMigration \
-      "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/target-plan.json" "$BLOB" &&
+   prepare_migration prepare-target-after-fault 45 "$ROOT/prepare-target-after-fault.log" &&
       ok "$ROOT/prepare-target-after-fault.log" prepareTestPairMigration || return 1
    wait_recovered_target_app || return 1
    archive_fault_phase "$phase"
+}
+
+# G5 reuses the ordinary COUSIN setup, but keeps the route active while the
+# separate stateless endpoint is cut over and retired.  The harness only sends
+# typed Mothership requests; all runtime/network state belongs to the provider.
+prepare_g5_cousin() {
+   FIRST=$S SECOND=$T OPERATION=$OP TEST_DIR=$SCRIPT_DIR ARCH=$ARCH
+   export FIRST SECOND OPERATION TEST_DIR ARCH
+   export PRODIGY_DEV_COUSIN_PROBE_BIN="$COUSIN_PROBE"
+   export PRODIGY_DEV_COUSIN_FIRST_CREATE_LOG="$ROOT/create-source.log"
+   export PRODIGY_DEV_COUSIN_SECOND_CREATE_LOG="$ROOT/create-target.log"
+   export PRODIGY_DEV_COUSIN_FIRST_REPORT_LOG="$ROOT/source-report.log"
+   retry_pair_enrollment || return 1
+   m pair-control-prepare 45 "$ROOT/pair-control-prepare.log" testClusterPairControl "$OP" prepare || return 1
+   ok "$ROOT/pair-control-prepare.log" testClusterPairControl || return 1
+   PAIR_CONTROL=1
+   local pair_uuid
+   pair_uuid=$(rg -m1 -o 'pairUUID=0x[0-9a-f]+' "$ROOT/pair-enroll.log" | cut -d= -f2)
+   [[ "$pair_uuid" =~ ^0x[0-9a-f]+$ ]] || return 1
+   jq -nc --arg pairUUID "${pair_uuid#0x}" '{pairUUIDs:[$pairUUID]}' >"$ROOT/pair-control-initial.json"
+   source "$SCRIPT_DIR/prodigy_dev_cousin_session_qualification.sh"
+   PRODIGY_DEV_COUSIN_PREPARE_ONLY=1 prodigy_dev_qualify_cousin_session || return 1
+   G5_ROUTE_UUID=$(prodigy_dev_cousin_route_uuid "$OP") || return 1
+   prodigy_dev_cousin_mark_time "$ROOT/cousin-gfive-active"
+   COUSIN_OFFLINE=1 python3 "$SCRIPT_DIR/prodigy_dev_cousin_session_observe.py" \
+      "$ROOT" qualify cousin-gfive-active 1 || return 1
+   printf 'g5RouteUUID=%s cousinRouteState=active cousinRouteGeneration=1\n' "$G5_ROUTE_UUID" >>"$ROOT/scenario.txt"
+}
+
+prepare_migration() {
+   if (( G5 )); then
+      m "$1" "$2" "$3" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/target-plan.json" "$BLOB" "$G5_ROUTE_UUID"
+   else
+      m "$1" "$2" "$3" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/target-plan.json" "$BLOB"
+   fi
+}
+
+cleanup_g5_cousin_route() {
+   [[ -r "$ROOT/cousin-route-active.json" && -r "$ROOT/cousin-source-permission.json" &&
+      -r "$ROOT/cousin-destination-permission.json" ]] || return 0
+   local source_permission destination_permission destination_prefix route_uuid
+   source_permission=$(jq -r .permissionUUID "$ROOT/cousin-source-permission.json") || return 1
+   destination_permission=$(jq -r .permissionUUID "$ROOT/cousin-destination-permission.json") || return 1
+   destination_prefix=$(jq -r .destinationRoutablePrefixUUID "$ROOT/cousin-route-active.json") || return 1
+   route_uuid=${G5_ROUTE_UUID:-}
+   [[ -n "$route_uuid" ]] || route_uuid=$(prodigy_dev_cousin_route_uuid "$OP") || return 1
+   if ! ok "$ROOT/cousin-route-query-active.log" cousinRoute 2>/dev/null; then
+      m cousin-route-recover-cleanup 90 "$ROOT/cousin-route-recover-cleanup.log" cousinRoute recover "$route_uuid" || return 1
+   fi
+   if ! ok "$ROOT/cousin-route-draining.log" cousinRoute 2>/dev/null; then
+      [[ -r "$ROOT/cousin-route-draining.json" ]] ||
+         prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-draining.json" "$OP" "$source_permission" "$destination_permission" "$destination_prefix" draining 2 || return 1
+      m cousin-route-draining-cleanup 60 "$ROOT/cousin-route-draining-cleanup.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-draining.json")" || return 1
+   fi
+   if ! ok "$ROOT/cousin-route-withdrawn.log" cousinRoute 2>/dev/null; then
+      [[ -r "$ROOT/cousin-route-withdrawn.json" ]] ||
+         prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-withdrawn.json" "$OP" "$source_permission" "$destination_permission" "$destination_prefix" withdrawn 3 || return 1
+      m cousin-route-withdrawn-cleanup 60 "$ROOT/cousin-route-withdrawn-cleanup.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-withdrawn.json")" || return 1
+   fi
+}
+
+finish_g5_cousin() {
+   local source_permission destination_permission destination_prefix
+   source_permission=$(jq -r .permissionUUID "$ROOT/cousin-source-permission.json")
+   destination_permission=$(jq -r .permissionUUID "$ROOT/cousin-destination-permission.json")
+   destination_prefix=$(jq -r .destinationRoutablePrefixUUID "$ROOT/cousin-route-active.json")
+   prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-draining.json" "$OP" "$source_permission" "$destination_permission" "$destination_prefix" draining 2 || return 1
+   m cousin-route-draining 60 "$ROOT/cousin-route-draining.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-draining.json")" || return 1
+   ok "$ROOT/cousin-route-draining.log" cousinRoute || return 1
+   if m cousin-route-stale-active 45 "$ROOT/cousin-route-stale-active.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-active.json")"; then return 1; fi
+   rg -q 'cousinRoute success=0' "$ROOT/cousin-route-stale-active.log" || return 1
+   prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-withdrawn.json" "$OP" "$source_permission" "$destination_permission" "$destination_prefix" withdrawn 3 || return 1
+   m cousin-route-withdrawn 60 "$ROOT/cousin-route-withdrawn.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-withdrawn.json")" || return 1
+   ok "$ROOT/cousin-route-withdrawn.log" cousinRoute || return 1
+   m cousin-route-query-withdrawn 45 "$ROOT/cousin-route-query-withdrawn.log" cousinRoute query "$G5_ROUTE_UUID" || return 1
+   ok "$ROOT/cousin-route-query-withdrawn.log" cousinRoute || return 1
+   if m cousin-route-stale-draining 45 "$ROOT/cousin-route-stale-draining.log" cousinRoute put "$OP" "$(cat "$ROOT/cousin-route-draining.json")"; then return 1; fi
+   rg -q 'cousinRoute success=0' "$ROOT/cousin-route-stale-draining.log" || return 1
+   m cousin-permission-source-revoke 45 "$ROOT/cousin-permission-source-revoke.log" cousinPermission "$S" revoke "$source_permission" || return 1
+   m cousin-permission-destination-revoke 45 "$ROOT/cousin-permission-destination-revoke.log" cousinPermission "$T" revoke "$destination_permission" || return 1
+   COUSIN_REVOKED=1
+   retry_pair_revocation "$ROOT/pair-revoke.log" || return 1
+   PAIR_REVOKED=1
+   m pair-control-remove 45 "$ROOT/pair-control-remove.log" testClusterPairControl "$OP" remove || return 1
+   PAIR_CONTROL=0
 }
 
 SA=1; create "$S" "$SW" "$ROOT/create-source.log"; TA=1; create "$T" "$TW" "$ROOT/create-target.log"
@@ -432,6 +598,7 @@ waitready "$S" source || { echo "FAIL: source readiness" >&2; exit 1; }; waitrea
 SOURCE_CLUSTER_UUID="$(rg -o 'clusterUUID=0x[0-9a-f]+' "$ROOT/create-source.log" | head -n1 | cut -d= -f2)"; TARGET_CLUSTER_UUID="$(rg -o 'clusterUUID=0x[0-9a-f]+' "$ROOT/create-target.log" | head -n1 | cut -d= -f2)"
 [[ -n "$SOURCE_CLUSTER_UUID" && -n "$TARGET_CLUSTER_UUID" && "$SOURCE_CLUSTER_UUID" != "$TARGET_CLUSTER_UUID" && "$(jq -r .privateIPv4Subnet "$SM")" != "$(jq -r .privateIPv4Subnet "$TM")" && "$(jq -r .privateIPv6Subnet "$SM")" != "$(jq -r .privateIPv6Subnet "$TM")" ]] || { echo "FAIL: cluster identities or boundaries overlap" >&2; exit 1; }
 printf 'sourceClusterUUID=%s\ntargetClusterUUID=%s\n' "$SOURCE_CLUSTER_UUID" "$TARGET_CLUSTER_UUID" >>"$ROOT/scenario.txt"
+if (( G5 )); then prepare_g5_cousin || { echo "FAIL: G5 COUSIN preparation" >&2; exit 1; }; fi
 SU="$(uuid "$ROOT/source-report.log" "$SM")"; TU="$(uuid "$ROOT/target-report.log" "$TM")"; [[ $SU =~ ^0x[0-9a-f]+$ && $TU =~ ^0x[0-9a-f]+$ ]] || exit 1
 for side in source target; do
  [[ $side = source ]] && c=$S u=$SU || { c=$T; u=$TU; }
@@ -450,7 +617,7 @@ SURVIVE /root/pair_endpoint_container
 EOF
 prodigy_dev_write_common_prodigy_assets "$F"; echo 'EXECUTE ["/root/pair_endpoint_container"]' >>"$F"; prodigy_dev_run_discombobulator_build "$ROOT/artifact" "$F" "$BLOB" "bin=$(dirname "$PINGPONG_BIN")" "ebpf=$(dirname "$PRODIGY_BIN")"
 plan "$ROOT/source-plan.json" "$A" "$SOURCE_PREFIX_UUID"; plan "$ROOT/target-plan.json" "$B" "$TARGET_PREFIX_UUID"
-if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash ]]; then
+if is_migration_mode; then
    for role in source target; do
       jq '.moveConstructively=false' "$ROOT/$role-plan.json" >"$ROOT/$role-admission-plan.json"
       mv "$ROOT/$role-admission-plan.json" "$ROOT/$role-plan.json"
@@ -461,18 +628,24 @@ waitapp "$S" "PairSource-${OP#0x}" source || exit 1
 MISSING_BD="$(python3 -c 'import sys; print(int(sys.argv[1])+1)' "$BD")"
 expect_reason "$ROOT/source-only-reject.log" "exact live deployment identity is unavailable" prepareTestPairBoundary "$S" "$T" "$BAD" "$AD" "$MISSING_BD" 1 1 "$VIP" "$PORT" || exit 1
 OPEN=1
-if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash ]]; then
+if is_migration_mode; then
    # This first independent-cluster profile has no local predecessor chain.
-   m admit-target 90 "$ROOT/admit-target.log" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/target-plan.json" "$BLOB" && ok "$ROOT/admit-target.log" prepareTestPairMigration || exit 1
+   prepare_migration admit-target 90 "$ROOT/admit-target.log" && ok "$ROOT/admit-target.log" prepareTestPairMigration || exit 1
    # Every invocation is a new coordinator process and registry reopen. An
    # exact retry must adopt the original Brain receipt, not issue a second spin.
    m admit-target-retry 45 "$ROOT/admit-target-retry.log" admitTestPairTarget "$OP" "$BLOB" && ok "$ROOT/admit-target-retry.log" admitTestPairTarget || exit 1
-   m prepare-retry 45 "$ROOT/prepare-retry.log" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/target-plan.json" "$BLOB" && ok "$ROOT/prepare-retry.log" prepareTestPairMigration || exit 1
+   prepare_migration prepare-retry 45 "$ROOT/prepare-retry.log" && ok "$ROOT/prepare-retry.log" prepareTestPairMigration || exit 1
    jq '.config.versionID=2' "$ROOT/target-plan.json" >"$ROOT/conflicting-target-plan.json"
-   expect_reason "$ROOT/conflicting-target.log" "test pair boundary operation identity conflicts or is closed" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/conflicting-target-plan.json" "$BLOB" || exit 1
+   if (( G5 )); then
+      # The final-transport profile rejects the changed target version at its
+      # fresh whole-destination barrier before the registry identity check.
+      expect_reason "$ROOT/conflicting-target.log" "paired target commissioned topology is unavailable or unsupported" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/conflicting-target-plan.json" "$BLOB" "$G5_ROUTE_UUID" || exit 1
+   else
+      expect_reason "$ROOT/conflicting-target.log" "test pair boundary operation identity conflicts or is closed" prepareTestPairMigration "$S" "$T" "$OP" "$AD" 1 1 "$VIP" "$PORT" "@$ROOT/conflicting-target-plan.json" "$BLOB" || exit 1
+   fi
    waitapp "$T" "PairTarget-${OP#0x}" target || exit 1
    case "$MODE" in
-      admission-master-crash|admission-cold)
+      admission-master-crash|admission-cold|g5-master-crash|g5-cold)
          # fakeIpv4Boundary=false has no parent route for the VIP.  The pair
          # router supplies the route before the fault, but keeps source as the
          # selector until the ordinary post-recovery handoff.
@@ -484,7 +657,7 @@ if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admis
          ;;
    esac
    case "$MODE" in
-      admission-master-crash)
+      admission-master-crash|g5-master-crash)
          run_target_admission_fault master phase1 || { echo "FAIL: target master admission recovery" >&2; exit 1; }
          if [[ "$FAULT_DIRECTION" = oldmaster_dials_after_restart_second_fault_required ]]; then
             # Preserve phase1 before this second and final Mothership fault: it
@@ -498,8 +671,8 @@ if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admis
             printf 'targetFaultDirectionCoverage=canonical-new-master-lower sequentialMasterFaults=1\n' >>"$ROOT/scenario.txt"
          fi
          ;;
-      admission-cold) run_target_admission_fault cold || { echo "FAIL: target cold admission recovery" >&2; exit 1; } ;;
-      admission-source-crash) : ;;
+      admission-cold|g5-cold) run_target_admission_fault cold || { echo "FAIL: target cold admission recovery" >&2; exit 1; } ;;
+      admission-source-crash|g5-source-crash) : ;;
    esac
    # This is an idempotent revalidation after recovery; the first prepare above
    # established the source-selected route used for the fault observations.
@@ -518,7 +691,7 @@ m source-flow-gate 30 "$ROOT/source-flow-gate.log" pairBoundary "$OP" query && o
 ( m held-source 45 "$ROOT/held-source.log" probePairBoundary "$OP" "$AD" 30 750 && echo 0 >"$RC" || echo $? >"$RC" ) & HELD=$!
 e=$(( $(date +%s%3N)+15000 )); while [[ $(date +%s%3N) -lt $e ]] && ! rg -q '"ok": true' "$ROOT/held-source.log" 2>/dev/null; do kill -0 "$HELD" 2>/dev/null || break; sleep .05; done; rg -q '"ok": true' "$ROOT/held-source.log" || { echo "FAIL: held source no first reply" >&2; exit 1; }
 m select-target 45 "$ROOT/select-target.log" pairBoundary "$OP" selectTarget && ok "$ROOT/select-target.log" pairBoundary || exit 1; m target-probe 45 "$ROOT/target-probe.log" probePairBoundary "$OP" "$BD" 5 0 && ok "$ROOT/target-probe.log" probePairBoundary && rg -q '"ok": true' "$ROOT/target-probe.log" || exit 1
-if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash ]]; then
+if is_migration_mode; then
    expect_reason "$ROOT/retire-source-wrong-operation.log" "record not found" retireTestPairSource "$BAD" || exit 1
    m selector-after-wrong-retire 30 "$ROOT/selector-after-wrong-retire.log" pairBoundary "$OP" query && ok "$ROOT/selector-after-wrong-retire.log" pairBoundary && rg -q 'selected=2([[:space:]]|$)' "$ROOT/selector-after-wrong-retire.log" || exit 1
    waitapp "$S" "PairSource-${OP#0x}" source-after-wrong-retire || { echo "FAIL: wrong operation changed the source workload" >&2; exit 1; }
@@ -548,8 +721,8 @@ while [[ $(date +%s%3N) -lt $drain_deadline ]]; do
 done
 [[ $drained = 1 ]] || { echo "FAIL: source flows did not drain within provider TIME_WAIT window" >&2; exit 1; }
 m drain 30 "$ROOT/drain.log" pairBoundary "$OP" drain && ok "$ROOT/drain.log" pairBoundary || exit 1
-if [[ "$MODE" = admission || "$MODE" = admission-master-crash || "$MODE" = admission-cold || "$MODE" = admission-source-crash ]]; then
-   if [[ "$MODE" = admission-source-crash ]]; then
+if is_migration_mode; then
+   if [[ "$MODE" = admission-source-crash || "$MODE" = g5-source-crash ]]; then
       run_source_retirement_fault || { echo "FAIL: source retirement interruption/recovery" >&2; exit 1; }
    elif ! { m retire-source 210 "$ROOT/retire-source.log" retireTestPairSource "$OP" && ok "$ROOT/retire-source.log" retireTestPairSource && rg -q 'sealed=1[[:space:]]+terminal=1([[:space:]]|$)' "$ROOT/retire-source.log"; }; then
       m source-retirement-pending-report 30 "$ROOT/source-retirement-pending-report.log" applicationReport "$S" "PairSource-${OP#0x}" || true
@@ -570,6 +743,13 @@ fi
 # dead endpoint owner. This explicit interruption is not traffic fault tolerance.
 m crash-owner 30 "$ROOT/crash-owner.log" pairBoundary "$OP" crashOwner && ok "$ROOT/crash-owner.log" pairBoundary || exit 1
 m boundary-remove 60 "$ROOT/boundary-remove.log" pairBoundary "$OP" remove && ok "$ROOT/boundary-remove.log" pairBoundary || exit 1; OPEN=0
+if (( G5 )); then
+   finish_g5_cousin || { echo "FAIL: G5 route/pair retirement closure" >&2; exit 1; }
+   m source-post-withdrawal-report 30 "$ROOT/source-post-withdrawal-report.log" \
+      applicationReport "$S" "PairSource-${OP#0x}" &&
+      source_report_retired "$ROOT/source-post-withdrawal-report.log" || {
+         echo "FAIL: withdrawn transport resurrected the retired source workload" >&2; exit 1; }
+fi
 copy_pair_observations
 rmcluster "$S" "$ROOT/remove-source.log"; SA=0; rmcluster "$T" "$ROOT/remove-target.log"; TA=0
 [[ ! -e "$SM" && ! -e "$TM" ]] || exit 1
