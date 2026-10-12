@@ -239,6 +239,40 @@ if role:
 PY_TRANSIT
   m cousin-transit 45 "$ROOT/cousin-transit.log" testClusterPairControl "$OPERATION" service "$(cat "$ROOT/cousin-service-transit.json")" || return
   ok "$ROOT/cousin-transit.log" testClusterPairControl || return 1
+  local route_uuid
+  route_uuid=$(prodigy_dev_cousin_route_uuid "$route_id") || return
+  prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-active.json" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" active 1 || return
+  # Network profile failures are Mothership parsing/admission failures, never
+  # direct map/runtime changes. Each must leave the first valid generation
+  # unrecorded so the coordinator-interrupt recovery below owns it.
+  for case_name in unsupported-protocol invalid-cidr invalid-mtu; do
+    local rejected_intent
+    rejected_intent=$(jq --arg case "$case_name" '
+      if $case == "unsupported-protocol" then .transportProtocol="UDP"
+      elif $case == "invalid-cidr" then .destinationCIDR=129
+      else .pathMTU=1279 end' "$ROOT/cousin-route-active.json") || return
+    if m "cousin-route-$case_name" 45 "$ROOT/cousin-route-$case_name.log" cousinRoute put "$OPERATION" "$rejected_intent"; then
+      echo "FAIL: cousin route $case_name was accepted" >&2; return 1
+    fi
+    rg -q 'cousinRoute success=0' "$ROOT/cousin-route-$case_name.log" || return 1
+  done
+  # Test-only interruption occurs after the source durable receipt. Recovery
+  # must finish the exact saved operation through the normal Mothership owner.
+  if PRODIGY_MOTHERSHIP_TEST_COUSIN_ROUTE_INTERRUPT_AFTER_SOURCE=1 \
+      m cousin-route-interrupt-after-source 60 "$ROOT/cousin-route-interrupt-after-source.log" \
+        cousinRoute put "$OPERATION" "$(cat "$ROOT/cousin-route-active.json")"; then
+    echo 'FAIL: test-only route coordinator interruption unexpectedly succeeded' >&2; return 1
+  fi
+  rg -q 'test-only cousin route coordinator interruption after source receipt' \
+    "$ROOT/cousin-route-interrupt-after-source.log" || return 1
+  m cousin-route-recover 90 "$ROOT/cousin-route-recover.log" cousinRoute recover "$route_uuid" || return
+  ok "$ROOT/cousin-route-recover.log" cousinRoute || return 1
+  m cousin-route-query-active 45 "$ROOT/cousin-route-query-active.log" cousinRoute query "$route_uuid" || return
+  ok "$ROOT/cousin-route-query-active.log" cousinRoute || return 1
+  # Exact same-generation retry is the only accepted retry form.
+  m cousin-route-exact-retry 60 "$ROOT/cousin-route-exact-retry.log" cousinRoute put "$OPERATION" \
+    "$(cat "$ROOT/cousin-route-active.json")" || return
+  rg -q 'cousinRoute success=1 .*resumed=1' "$ROOT/cousin-route-exact-retry.log" || return 1
   [[ ${PRODIGY_DEV_COUSIN_PREPARE_ONLY:-0} == 1 ]] && return 0
   # Mothership has no persistent daemon in this harness. Seal the command owner
   # during observation, and require the successful request to start after this.
@@ -256,6 +290,26 @@ PY_TRANSIT
     source "$TEST_DIR/prodigy_dev_cousin_lifecycle_qualification.sh"
     prodigy_dev_qualify_cousin_lifecycle "$lifecycle" "$source_name" "$destination_name" || return
   fi
+  # Route operation ordering is observed before permission revocation. A
+  # recovered drain cannot admit new sessions, withdrawal is terminal, and a
+  # delayed stale generation remains rejected after coordinator recovery.
+  prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-draining.json" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" draining 2 || return
+  m cousin-route-draining 60 "$ROOT/cousin-route-draining.log" cousinRoute put "$OPERATION" \
+    "$(cat "$ROOT/cousin-route-draining.json")" || return
+  ok "$ROOT/cousin-route-draining.log" cousinRoute || return 1
+  m cousin-route-recover-draining 90 "$ROOT/cousin-route-recover-draining.log" cousinRoute recover "$route_uuid" || return
+  ok "$ROOT/cousin-route-recover-draining.log" cousinRoute || return 1
+  if m cousin-route-stale-after-recover 45 "$ROOT/cousin-route-stale-after-recover.log" cousinRoute put "$OPERATION" \
+      "$(cat "$ROOT/cousin-route-active.json")"; then
+    echo 'FAIL: delayed stale route generation was accepted after recovery' >&2; return 1
+  fi
+  rg -q 'cousinRoute success=0' "$ROOT/cousin-route-stale-after-recover.log" || return 1
+  prodigy_dev_write_cousin_route_intent "$ROOT/cousin-route-withdrawn.json" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" withdrawn 3 || return
+  m cousin-route-withdrawn 60 "$ROOT/cousin-route-withdrawn.log" cousinRoute put "$OPERATION" \
+    "$(cat "$ROOT/cousin-route-withdrawn.json")" || return
+  ok "$ROOT/cousin-route-withdrawn.log" cousinRoute || return 1
+  m cousin-route-query-withdrawn 45 "$ROOT/cousin-route-query-withdrawn.log" cousinRoute query "$route_uuid" || return
+  ok "$ROOT/cousin-route-query-withdrawn.log" cousinRoute || return 1
   COUSIN_OFFLINE=0
   # This marker bounds delivery of the synchronous Mothership revoke command;
   # its local revoke/close may happen before the completion marker below.
@@ -265,4 +319,50 @@ PY_TRANSIT
   COUSIN_OFFLINE=1
   python3 "$TEST_DIR/prodigy_dev_cousin_session_observe.py" "$ROOT" revoked || return
   COUSIN_OFFLINE=0
+}
+
+# Build the only route-intent shape this harness uses. The Mothership command
+# derives cluster, application and service identities from the active pair and
+# the two installed permissions; this fixture supplies just the retry-stable
+# caller-owned fields. It never writes route state outside Mothership.
+prodigy_dev_write_cousin_route_intent() {
+  local output=$1 route_id=$2 source_permission=$3 destination_permission=$4 destination_prefix_uuid=$5 state=$6 generation=$7
+  python3 - "$output" "$route_id" "$source_permission" "$destination_permission" "$destination_prefix_uuid" "$state" "$generation" "$ROOT/cousin-service-transit.json" <<'PY_ROUTE'
+import json,pathlib,sys,time
+output,route_id,source_permission,destination_permission,destination_prefix_uuid,state,generation,transit_path=sys.argv[1:]
+route_seed=int(route_id,16)
+transit=json.loads(pathlib.Path(transit_path).read_text())
+now=time.time_ns()//1_000_000
+def canonical(value):
+    return '0x'+value.to_bytes(16,'big').hex()
+# The per-directed-route seed is already collision-avoiding in the graph
+# harness. Distinct operation UUIDs encode ordered durable generations.
+intent={
+  'routeUUID':canonical(route_seed ^ 0x5100),
+  'operationUUID':canonical(route_seed ^ (0x5200 + int(generation))),
+  'logicalWorkloadUUID':canonical(route_seed ^ 0x5300),
+  'logicalServiceUUID':canonical(route_seed ^ 0x5400),
+  'sourcePermissionUUID':'0x'+source_permission.removeprefix('0x'),
+  'destinationPermissionUUID':'0x'+destination_permission.removeprefix('0x'),
+  'slots':[0],
+  'destinationRoutablePrefixUUID':destination_prefix_uuid,
+  'destinationPublicAddress':transit['destinationWormholeIPv6'],
+  'transportProtocol':'TCP',
+  'destinationCIDR':120,
+  'destinationTCPPort':int(transit['destinationTCPPort']),
+  'pathMTU':9000,
+  'generation':int(generation),
+  'issuedAtMs':now,
+  'expiresAtMs':now+60*60*1000,
+  'state':state,
+}
+pathlib.Path(output).write_text(json.dumps(intent,sort_keys=True)+'\n')
+PY_ROUTE
+}
+
+prodigy_dev_cousin_route_uuid() {
+  python3 - "$1" <<'PY_ROUTE_UUID'
+import sys
+print('0x'+((int(sys.argv[1],16)^0x5100).to_bytes(16,'big').hex())
+PY_ROUTE_UUID
 }
