@@ -1170,6 +1170,96 @@ static void testMasterAuthorityRuntimeStateRecoveryCodec(TestSuite& suite)
       "persistent_master_authority_package_reads_pre_container_runtime_state_format");
 }
 
+static CousinRouteRecord persistentRuntimeCousinRoute(uint128_t routeUUID, uint128_t operationUUID)
+{
+  CousinRouteRecord route = {};
+  route.routeUUID = routeUUID;
+  route.operationUUID = operationUUID;
+  route.pairUUID = 0x300;
+  route.logicalWorkloadUUID = 0x301;
+  route.logicalServiceUUID = 0x302;
+  route.sourceClusterUUID = 0x401;
+  route.sourceApplicationID = 7;
+  route.sourceCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  route.sourcePermissionUUID = 0x403;
+  route.destinationClusterUUID = 0x402;
+  route.destinationApplicationID = 19;
+  route.destinationCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  route.destinationPermissionUUID = 0x404;
+  route.slots.insert(3);
+  route.destinationRoutablePrefixUUID = 0x501;
+  route.destinationPublicAddress.is6 = true;
+  route.destinationPublicAddress.v6[0] = 0x20;
+  route.destinationPublicAddress.v6[1] = 0x01;
+  route.destinationPublicAddress.v6[15] = 1;
+  route.destinationTCPPort = 443;
+  route.transportProtocol = IPPROTO_TCP;
+  route.destinationCIDR = 128;
+  route.pathMTU = 1500;
+  route.generation = 1;
+  route.issuedAtMs = 100;
+  route.expiresAtMs = 200;
+  route.keyEpoch = 1;
+  route.rootGeneration = 1;
+  return route;
+}
+
+static void testMasterAuthorityRuntimeCousinRouteCodec(TestSuite& suite)
+{
+  ProdigyMasterAuthorityRuntimeState runtime = {};
+  runtime.generation = 17;
+  runtime.cousinRoutes.push_back(persistentRuntimeCousinRoute(0x101, 0x201));
+  runtime.cousinRoutes.push_back(persistentRuntimeCousinRoute(0x102, 0x202));
+
+  String bytes = {};
+  BitseryEngine::serialize(bytes, runtime);
+  ProdigyMasterAuthorityRuntimeState restored = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(bytes, restored) && restored == runtime &&
+          restored.cousinRoutes.size() == 2 &&
+          restored.cousinRoutes[0].routeUUID == 0x101 && restored.cousinRoutes[1].routeUUID == 0x102,
+      "master_authority_runtime18_cousin_routes_roundtrip_canonical");
+
+  ProdigyMasterAuthorityRuntimeState duplicate = runtime;
+  duplicate.cousinRoutes[1].routeUUID = duplicate.cousinRoutes[0].routeUUID;
+  String duplicateBytes = {};
+  BitseryEngine::serialize(duplicateBytes, duplicate);
+  ProdigyMasterAuthorityRuntimeState rejectedDuplicate = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(duplicateBytes, rejectedDuplicate) == false,
+      "master_authority_runtime18_rejects_duplicate_cousin_route_identity");
+
+  ProdigyMasterAuthorityRuntimeState unordered = runtime;
+  std::swap(unordered.cousinRoutes[0], unordered.cousinRoutes[1]);
+  String unorderedBytes = {};
+  BitseryEngine::serialize(unorderedBytes, unordered);
+  ProdigyMasterAuthorityRuntimeState rejectedUnordered = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(unorderedBytes, rejectedUnordered) == false,
+      "master_authority_runtime18_rejects_noncanonical_cousin_route_order");
+
+  ProdigyMasterAuthorityRuntimeState legacy = {};
+  legacy.generation = runtime.generation;
+  String legacyBytes = {};
+  BitseryEngine::serialize(legacyBytes, legacy);
+  ProdigyMasterAuthorityRuntimeState restoredLegacy = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(legacyBytes, restoredLegacy) && restoredLegacy.cousinRoutes.empty() &&
+          restoredLegacy == legacy,
+      "master_authority_runtime18_preserves_pre_route_decode");
+
+  ProdigyMasterAuthorityRuntimeState versionSeventeen = {};
+  versionSeventeen.generation = runtime.generation;
+  versionSeventeen.machineFragmentAssignments.push_back({0x701, 1});
+  String versionSeventeenBytes = {};
+  BitseryEngine::serialize(versionSeventeenBytes, versionSeventeen);
+  ProdigyMasterAuthorityRuntimeState restoredVersionSeventeen = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(versionSeventeenBytes, restoredVersionSeventeen) &&
+          restoredVersionSeventeen == versionSeventeen && restoredVersionSeventeen.cousinRoutes.empty(),
+      "master_authority_runtime18_decodes_version17_machine_fragment_tail");
+}
+
 static int runPersistentUpdateBundleSnapshotMeasurement(TestSuite& suite, const char *bundlePath)
 {
   if (bundlePath == nullptr || bundlePath[0] == '\0')
@@ -1256,6 +1346,7 @@ int main(void)
     return runPersistentUpdateBundleSnapshotMeasurement(suite, std::getenv("PRODIGY_TEST_RUNTIME_BUNDLE"));
   }
   testMasterAuthorityRuntimeStateRecoveryCodec(suite);
+  testMasterAuthorityRuntimeCousinRouteCodec(suite);
   testPersistentMapDirectionalSerialization(suite);
   testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);
   testPersistentBrainSnapshotLargeMetricSampleRoundtrip(suite);

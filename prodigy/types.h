@@ -14,6 +14,7 @@
 #include <prodigy/container.contract.h>
 #include <prodigy/cluster.pair.enrollment.h>
 #include <prodigy/cluster.pair.authority.h>
+#include <prodigy/cousin.route.h>
 #include <prodigy/cousin.service.permission.h>
 #include <prodigy/transport.credentials.h>
 #include <prodigy/biphasal.key.h>
@@ -8173,6 +8174,53 @@ static inline bool prodigyMachineFragmentAssignmentsValid(
   return true;
 }
 
+constexpr uint32_t ProdigyCousinRouteMaximumRecords = 256;
+
+// Route UUID is the durable collection identity.  Store records in that
+// canonical order so a quorum never has two encodings for the same authority
+// set.  CousinRouteRecord validates the complete immutable route scope and its
+// operation-history invariants.
+static inline bool prodigyCousinRoutesValid(const Vector<CousinRouteRecord>& routes)
+{
+  if (routes.size() > ProdigyCousinRouteMaximumRecords) return false;
+  uint128_t previousRouteUUID = 0;
+  for (uint32_t index = 0; index < routes.size(); ++index)
+  {
+    if (!cousinRouteStructurallyValid(routes[index]) ||
+        (index != 0 && routes[index].routeUUID <= previousRouteUUID))
+    {
+      return false;
+    }
+    previousRouteUUID = routes[index].routeUUID;
+  }
+  return true;
+}
+
+static inline bool prodigyCousinRoutesValid(const Vector<CousinRouteRecord>& routes,
+                                            uint128_t localClusterUUID)
+{
+  if (localClusterUUID == 0 || prodigyCousinRoutesValid(routes) == false) return false;
+  for (const CousinRouteRecord& route : routes)
+    if (route.sourceClusterUUID != localClusterUUID && route.destinationClusterUUID != localClusterUUID)
+      return false;
+  return true;
+}
+
+static inline bool prodigyCousinRoutesEqual(const Vector<CousinRouteRecord>& lhs,
+                                            const Vector<CousinRouteRecord>& rhs)
+{
+  if (lhs.size() != rhs.size()) return false;
+  for (uint32_t index = 0; index < lhs.size(); ++index)
+  {
+    String left = {}, right = {};
+    CousinRouteRecord leftCopy = lhs[index], rightCopy = rhs[index];
+    BitseryEngine::serialize(left, leftCopy);
+    BitseryEngine::serialize(right, rightCopy);
+    if (left != right) return false;
+  }
+  return true;
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -8223,6 +8271,9 @@ public:
   // Public enrollment ledger; its one authority root is in the snapshot sidecar.
   Vector<ProdigyTransportCredentialEnrollment> transportCredentialEnrollments;
   Vector<ProdigyTransportCredentialEnrollmentOperation> transportCredentialEnrollmentOperations;
+  // Version-eighteen replicated route authority.  These are canonical public
+  // authorization records, not route-application receipts or secret material.
+  Vector<CousinRouteRecord> cousinRoutes;
   // Never serialized in this public runtime record. Persistence extracts it to
   // ProdigyPersistentBrainSnapshotSecrets before writing the snapshot.
   ProdigyTransportCredentialAuthorityRoot transportCredentialAuthorityRoot;
@@ -8238,6 +8289,7 @@ public:
         machineFragmentAssignments != other.machineFragmentAssignments ||
         transportCredentialEnrollments != other.transportCredentialEnrollments ||
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
+        prodigyCousinRoutesEqual(cousinRoutes, other.cousinRoutes) == false ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
         transportCredentialAuthorityRoot.keyEpoch != other.transportCredentialAuthorityRoot.keyEpoch ||
         transportCredentialAuthorityRoot.authorityGeneration != other.transportCredentialAuthorityRoot.authorityGeneration ||
@@ -9339,9 +9391,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // version 15 adds root-free, epoch-neutral local COUSIN deployment policy;
   // version 16 tags each transport operation row so lifecycle receipts cannot
   // be misread as the legacy enrollment layout; version 17 appends the
-  // canonical machine-to-container-network-fragment registry.
+  // canonical machine-to-container-network-fragment registry; version 18
+  // appends canonical replicated COUSIN route authority records.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 17;
+  constexpr uint64_t explicitVersion = 18;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9362,6 +9415,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool hasLocalCousinServicePermissions = false;
   bool permitsTransportCredentialLifecycleOperations = false;
   bool hasMachineFragmentAssignments = false;
+  bool hasCousinRoutes = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9396,11 +9450,12 @@ static void prodigySerializeMasterAuthorityRuntimeState(
         state.transportCredentialEnrollmentOperations.begin(), state.transportCredentialEnrollmentOperations.end(),
         [](const auto& operation) { return operation.protocolVersion >= 2; });
     hasMachineFragmentAssignments = state.machineFragmentAssignments.empty() == false;
+    hasCousinRoutes = state.cousinRoutes.empty() == false;
     permitsTransportCredentialLifecycleOperations =
-        hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments;
+        hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments || hasCousinRoutes;
     // Versions sixteen and seventeen include every earlier tail, even when empty.
     hasLocalCousinServicePermissions = !state.localCousinServicePermissions.empty() ||
-                                       permitsTransportCredentialLifecycleOperations;
+                                       permitsTransportCredentialLifecycleOperations || hasCousinRoutes;
     // Version fifteen is cumulative through the v12 operation container.
     // Emit that bounded empty container when the new policy tail is present.
     if (hasLocalCousinServicePermissions) hasClusterPairEnrollmentOperations = true;
@@ -9436,10 +9491,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasCousinRoutes ? 18 : (hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9485,6 +9540,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasLocalCousinServicePermissions = version >= 15;
       permitsTransportCredentialLifecycleOperations = version >= 16;
       hasMachineFragmentAssignments = version >= 17;
+      hasCousinRoutes = version >= 18;
     }
   }
 
@@ -9696,6 +9752,18 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.machineFragmentAssignments.clear();
+  }
+  if (hasCousinRoutes)
+  {
+    serializer.container(state.cousinRoutes, ProdigyCousinRouteMaximumRecords,
+        [](auto& nested, CousinRouteRecord& route) { nested.object(route); });
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+      if (prodigyCousinRoutesValid(state.cousinRoutes) == false)
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.cousinRoutes.clear();
   }
 }
 
