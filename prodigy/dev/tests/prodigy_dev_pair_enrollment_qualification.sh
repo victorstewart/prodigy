@@ -250,6 +250,25 @@ enrollment_complete() {
     rg -q 'firstQualified=1 firstProjection=1 secondQualified=1 secondProjection=1 pending=0' "$log"
 }
 
+enroll_pair() {
+  if m enroll 45 "$ROOT/enroll.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION"; then
+    enrollment_complete "$ROOT/enroll.log"
+    return
+  fi
+  # The CLI bounds its own wait and explicitly returns an immutable operation
+  # for resumption. Retry that exact request once; preserve both receipts and
+  # never retry a rejection, transport failure, or conflicting operation.
+  python3 - "$ROOT/enroll.log" "$OPERATION" <<'PY_ENROLL_PENDING' || return
+import pathlib,re,sys
+rows=[line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.startswith('enrollClusterPair ')]
+assert len(rows)==1
+m=re.fullmatch(r'enrollClusterPair success=0 operationUUID=([0-9a-f]{32}) resumed=[01] firstQualified=[01] firstProjection=[01] secondQualified=[01] secondProjection=[01] pending=1 failure=cluster pair enrollment remains pending qualified active projection; retry the same operation UUID',rows[0])
+assert m and int(m[1],16)==int(sys.argv[2],16)
+PY_ENROLL_PENDING
+  m enroll-resume 45 "$ROOT/enroll-resume.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION" || return
+  enrollment_complete "$ROOT/enroll-resume.log" && rg -q 'resumed=1 ' "$ROOT/enroll-resume.log"
+}
+
 revocation_complete() {
   ok "$1" revokeClusterPair &&
     rg -q 'firstRevoked=1 firstWithdrawn=1 secondRevoked=1 secondWithdrawn=1 pending=0' "$1"
@@ -352,8 +371,7 @@ create_cluster "$SECOND" "$SECOND_WORKSPACE" "$ROOT/create-second.log"
 wait_ready "$FIRST" first
 wait_ready "$SECOND" second
 
-m enroll 45 "$ROOT/enroll.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION"
-enrollment_complete "$ROOT/enroll.log"
+enroll_pair
 m enroll-reversed-retry 45 "$ROOT/enroll-reversed-retry.log" enrollClusterPair "$SECOND" "$FIRST" "$OPERATION"
 enrollment_complete "$ROOT/enroll-reversed-retry.log"
 if m enroll-conflicting-operation 45 "$ROOT/enroll-conflicting-operation.log" \

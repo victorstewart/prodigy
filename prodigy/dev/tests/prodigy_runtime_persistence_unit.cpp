@@ -458,6 +458,51 @@ static void testPersistentWriterDetachesViewBackedSchemaFields(TestSuite& suite)
   suite.expect(detachedMap && nested != snapshot.brainConfig.dnsCredential.metadata.end() &&
                    nested->second.equals("nested-secret"_ctv),
                "runtime_persistence_writer_detaches_nested_map_views");
+
+  ProdigyLocalClusterPairControlProjection localProjection = {}, remoteProjection = {};
+  const bool builtPairProjection = buildRuntimePairControlProjections(0x7301, 0x7302,
+                                                                        localProjection, remoteProjection);
+  if (!builtPairProjection || localProjection.credentials.size() != 1)
+  {
+    suite.expect(false, "runtime_persistence_writer_builds_pair_projection_view_fixture");
+    return;
+  }
+  auto& credential = localProjection.credentials[0];
+  String localClaimBacking(const_cast<uint8_t *>(credential.localClaim.data()), credential.localClaim.size(), Copy::yes,
+                           credential.localClaim.size());
+  String remoteClaimBacking(const_cast<uint8_t *>(credential.remoteClaim.data()), credential.remoteClaim.size(), Copy::yes,
+                            credential.remoteClaim.size());
+  String contextBacking(const_cast<uint8_t *>(credential.canonicalContext.data()), credential.canonicalContext.size(), Copy::yes,
+                        credential.canonicalContext.size());
+  const String expectedLocalClaim(const_cast<uint8_t *>(localClaimBacking.data()), localClaimBacking.size(), Copy::yes,
+                                  localClaimBacking.size());
+  const String expectedRemoteClaim(const_cast<uint8_t *>(remoteClaimBacking.data()), remoteClaimBacking.size(), Copy::yes,
+                                   remoteClaimBacking.size());
+  const String expectedContext(const_cast<uint8_t *>(contextBacking.data()), contextBacking.size(), Copy::yes,
+                               contextBacking.size());
+  credential.localClaim = String(const_cast<uint8_t *>(localClaimBacking.data()), localClaimBacking.size(), Copy::no,
+                                 localClaimBacking.size());
+  credential.remoteClaim = String(const_cast<uint8_t *>(remoteClaimBacking.data()), remoteClaimBacking.size(), Copy::no,
+                                  remoteClaimBacking.size());
+  credential.canonicalContext = String(const_cast<uint8_t *>(contextBacking.data()), contextBacking.size(), Copy::no,
+                                       contextBacking.size());
+  ProdigyPersistentLocalBrainState pairState = {};
+  pairState.uuid = localProjection.nodeUUID;
+  pairState.ownerClusterUUID = localProjection.localClusterUUID;
+  pairState.clusterPairControlProjection = std::move(localProjection);
+  const bool detachedPair = ProdigyPersistentStateWriter::detach(pairState);
+  std::memset(localClaimBacking.data(), 'l', localClaimBacking.size());
+  std::memset(remoteClaimBacking.data(), 'r', remoteClaimBacking.size());
+  std::memset(contextBacking.data(), 'c', contextBacking.size());
+  const auto& detachedCredential = pairState.clusterPairControlProjection.credentials[0];
+  suite.expect(detachedPair &&
+                   pairState.clusterPairControlProjection.protocolVersion == ProdigyLocalClusterPairControlProjection::version &&
+                   detachedCredential.localClaim.ownsMemory() &&
+                   detachedCredential.remoteClaim.ownsMemory() && detachedCredential.canonicalContext.ownsMemory() &&
+                   detachedCredential.localClaim.equals(expectedLocalClaim) &&
+                   detachedCredential.remoteClaim.equals(expectedRemoteClaim) &&
+                   detachedCredential.canonicalContext.equals(expectedContext),
+               "runtime_persistence_writer_detaches_pair_projection_claim_context_views");
 }
 
 static void testPersistentWriterPreservesTransportLifecycleSchema(TestSuite& suite)
@@ -803,7 +848,8 @@ static void testProductionPersistenceAPI(TestSuite& suite)
           drainInsideCallback = writer->drainForExec();
           Ring::exit = true;
         });
-      }), "runtime_api_ownership_admitted");
+      }) == BrainBase::UpdateSelfPersistenceAdmission::admitted,
+      "runtime_api_ownership_admitted");
       suite.expect(ownershipReceipts == 0 && snapshotReceipts == 0,
                    "runtime_api_no_inline_success_for_pending_disk");
       ring.tickAction = [&] {
@@ -1932,10 +1978,20 @@ static void testPersistentLocalCousinServicePermissions(TestSuite& suite)
   const bool malformedReadRejected =
       !prodigyApplyPersistentBrainSnapshotSecrets(malformed, secrets, &malformedFailure) &&
       malformedFailure.equals("persistent brain snapshot local cousin service permission is malformed"_ctv);
+
+  ProdigyPersistentBrainSnapshot malformedMachineFragments = snapshot;
+  malformedMachineFragments.masterAuthority.runtimeState.machineFragmentAssignments.push_back(
+      {uint128_t(0x73b3), 0x01000000u});
+  malformedFailure.clear();
+  const bool malformedMachineFragmentsWriteRejected =
+      !prodigyExtractPersistentBrainSnapshotSecrets(
+          malformedMachineFragments, publicSnapshot, secrets, &malformedFailure) &&
+      malformedFailure.equals("persistent brain snapshot machine fragment registry is malformed"_ctv);
   secrets.clear();
 
   suite.expect(runtimeRoundTrip && legacyRelabelRejected && legacyCatchupClearsPermissions &&
-                   restartRoundTrip && malformedWriteRejected && malformedReadRejected,
+                   restartRoundTrip && malformedWriteRejected && malformedReadRejected &&
+                   malformedMachineFragmentsWriteRejected,
                "runtime_persistence_local_cousin_service_permissions_roundtrip_relabel_catchup_and_validation");
 }
 
@@ -2176,6 +2232,12 @@ static void testProductionPairProjectionWriterUsesColocatedNeuronAuthority(TestS
 int main(void)
 {
   TestSuite suite;
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "machine-fragment-registry") == 0)
+  {
+    testPersistentLocalCousinServicePermissions(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   testProductionPairProjectionWriterUsesColocatedNeuronAuthority(suite);
   testNeuronClusterPairControlProjectionDurabilityAndStreamFence(suite);
   testClusterPairRuntimeRequiresFreshDurableProjectionAfterRestart(suite);
@@ -2196,6 +2258,13 @@ int main(void)
       std::strcmp(only, "topology-snapshot-overlap") == 0)
   {
     testProductionTopologySnapshotOverlap(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "writer-schema-detachment") == 0)
+  {
+    testPersistentWriterPreservesTransportLifecycleSchema(suite);
+    testPersistentWriterDetachesViewBackedSchemaFields(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);

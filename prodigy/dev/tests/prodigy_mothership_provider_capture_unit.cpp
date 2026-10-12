@@ -23,6 +23,51 @@ static bool writeAll(int fd, const uint8_t *bytes, size_t size)
   return true;
 }
 
+static bool recordConcurrentFaultInterval(const MothershipTestClusterCrashFault& request, String *failure)
+{
+  String path = request.cluster.test.workspaceRoot;
+  path.append("/interval"_ctv);
+  FILE *file = std::fopen(path.c_str(), "w");
+  if (file == nullptr)
+  {
+    if (failure) failure->assign("cannot record concurrent fault interval"_ctv);
+    return false;
+  }
+  const auto nowMs = [] {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  const long long started = nowMs();
+  std::fprintf(file, "%lld ", started);
+  std::fflush(file);
+  ::usleep(150'000);
+  std::fprintf(file, "%lld\n", static_cast<long long>(nowMs()));
+  std::fclose(file);
+  if (failure) failure->clear();
+  return true;
+}
+
+static bool recordConcurrentFaultIntervalWithSecondFailure(
+    const MothershipTestClusterCrashFault& request,
+    String *failure)
+{
+  if (recordConcurrentFaultInterval(request, failure) == false) return false;
+  if (request.cluster.clusterUUID != 2) return true;
+  if (failure) failure->assign("injected runner failure"_ctv);
+  return false;
+}
+
+static bool readInterval(const String& workspace, long long& started, long long& ended)
+{
+  String path = workspace;
+  path.append("/interval"_ctv);
+  FILE *file = std::fopen(path.c_str(), "r");
+  if (file == nullptr) return false;
+  const bool read = std::fscanf(file, "%lld %lld", &started, &ended) == 2;
+  std::fclose(file);
+  return read;
+}
+
 int main()
 {
   int failed = 0;
@@ -84,6 +129,94 @@ int main()
     const pid_t descendant = ::waitpid(-1, &descendantStatus, 0);
     expect(descendant > 0 && WIFSIGNALED(descendantStatus) && WTERMSIG(descendantStatus) == SIGKILL,
            "timeout kills and reaps the descendant process group after direct child exit");
+  }
+
+  char concurrentRoot[] = "./mothership-concurrent-fault-unit.XXXXXX";
+  char *createdConcurrentRoot = ::mkdtemp(concurrentRoot);
+  expect(createdConcurrentRoot != nullptr, "create concurrent fault fixture root");
+  if (createdConcurrentRoot != nullptr)
+  {
+    String firstWorkspace = {};
+    String secondWorkspace = {};
+    firstWorkspace.snprintf<"{}/first"_ctv>(String(concurrentRoot));
+    secondWorkspace.snprintf<"{}/second"_ctv>(String(concurrentRoot));
+    expect(::mkdir(firstWorkspace.c_str(), 0700) == 0 && ::mkdir(secondWorkspace.c_str(), 0700) == 0,
+           "create distinct concurrent fault workspaces");
+
+    MothershipProdigyCluster firstCluster = {};
+    firstCluster.clusterUUID = 1;
+    firstCluster.deploymentMode = MothershipClusterDeploymentMode::test;
+    firstCluster.test.workspaceRoot = firstWorkspace;
+    firstCluster.test.machineCount = 3;
+    MothershipProdigyCluster secondCluster = firstCluster;
+    secondCluster.clusterUUID = 2;
+    secondCluster.test.workspaceRoot = secondWorkspace;
+    MothershipTestClusterCrashFault first = {};
+    MothershipTestClusterCrashFault second = {};
+    String failure = {};
+    expect(mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv,
+               secondCluster, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure),
+           "validate two distinct bounded test-cluster crash faults");
+    expect(first.machineIndex.equals("1"_ctv) && second.machineIndex.equals("3"_ctv) &&
+               first.durationMs == 12000 && second.durationMs == 12000,
+           "normalize concurrent crash fault targets");
+
+    MothershipProdigyCluster invalid = secondCluster;
+    invalid.deploymentMode = MothershipClusterDeploymentMode::remote;
+    expect(!mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv, invalid, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure),
+           "reject non-test concurrent crash target");
+    invalid = secondCluster;
+    invalid.clusterUUID = firstCluster.clusterUUID;
+    expect(!mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv, invalid, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure),
+           "reject duplicate concurrent crash cluster UUID");
+    invalid = secondCluster;
+    invalid.test.workspaceRoot = firstWorkspace;
+    expect(!mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv, invalid, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure),
+           "reject duplicate concurrent crash workspace");
+    expect(!mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "0"_ctv, secondCluster, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure) &&
+               !mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv, secondCluster, "second"_ctv, "4"_ctv,
+               12000, first, second, &failure),
+           "reject out-of-range concurrent crash machine index");
+    expect(!mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv, secondCluster, "second"_ctv, "3"_ctv,
+               0, first, second, &failure),
+           "reject zero concurrent crash duration");
+
+    expect(mothershipBuildConcurrentTestClusterCrashFaults(
+               firstCluster, "first"_ctv, "1"_ctv,
+               secondCluster, "second"_ctv, "3"_ctv,
+               12000, first, second, &failure) &&
+               mothershipRunConcurrentTestClusterCrashFaults(
+                   first, second, &failure, recordConcurrentFaultInterval),
+           "launch and reap both concurrent crash provider workers");
+    long long firstStarted = 0, firstEnded = 0, secondStarted = 0, secondEnded = 0;
+    expect(readInterval(firstWorkspace, firstStarted, firstEnded) &&
+               readInterval(secondWorkspace, secondStarted, secondEnded) &&
+               firstStarted < secondEnded && secondStarted < firstEnded,
+           "concurrent crash provider worker intervals overlap");
+
+    const bool injectedFailureRejected = !mothershipRunConcurrentTestClusterCrashFaults(
+        first, second, &failure, recordConcurrentFaultIntervalWithSecondFailure);
+    expect(injectedFailureRejected &&
+               failure.equals("test-cluster fault failed for identity=second: injected runner failure"_ctv),
+           "reap both workers and attribute one concurrent crash failure");
+    errno = 0;
+    expect(::waitpid(-1, nullptr, WNOHANG) == -1 && errno == ECHILD,
+           "concurrent crash helper leaves no child process");
+    std::error_code cleanupError;
+    std::filesystem::remove_all(concurrentRoot, cleanupError);
+    expect(cleanupError.value() == 0, "remove concurrent fault fixture root");
   }
   return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

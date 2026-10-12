@@ -414,6 +414,213 @@ printf '701\n' > "$workspace/virtual-datacenter.identity"
   ::rmdir(temporary);
 }
 
+static void testFreshProviderOwnsPrivateNetnsHandleDirectory(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "fresh_netns_fixture_locates_provider_owner"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (!mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024))
+  { suite.expect(false, "fresh_netns_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  const size_t begin = text.find("fresh_provider_netns_handles()\n{\n");
+  const size_t end = text.find("\nadopted_mode=0\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "fresh_netns_fixture_extracts_provider_owner");
+  if (begin == std::string::npos || end == std::string::npos) return;
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+PRODIGY_VDC_MOUNT_NAMESPACE_READY=1
+provider_netns_handle_root="$PWD/netns"
+adopted_mode=0
+stat() { [[ "$*" == *'/proc/self/ns/mnt'* ]] && { printf 11; return; }; [[ "$*" == *'/proc/1/ns/mnt'* ]] && { printf 1; return; }; command stat "$@"; }
+mount() { printf '%s\n' "$*" >> "$PWD/mounts"; }
+findmnt() { printf tmpfs; }
+fresh_provider_netns_handles
+[[ -d "$provider_netns_handle_root" && -f "$PWD/mounts" ]]
+rm -rf "$provider_netns_handle_root" "$PWD/mounts"; mkdir "$PWD/target"; ln -s "$PWD/target" "$provider_netns_handle_root"
+if fresh_provider_netns_handles; then exit 1; fi
+[[ ! -e "$PWD/mounts" ]]
+rm -f "$provider_netns_handle_root"; adopted_mode=1
+fresh_provider_netns_handles
+[[ ! -e "$PWD/mounts" && ! -e "$provider_netns_handle_root" ]]
+adopted_mode=0
+stat() { return 1; }
+if fresh_provider_netns_handles; then exit 1; fi
+[[ ! -e "$PWD/mounts" && ! -e "$provider_netns_handle_root" ]]
+stat() { printf 1; }
+if fresh_provider_netns_handles; then exit 1; fi
+[[ ! -e "$PWD/mounts" && ! -e "$provider_netns_handle_root" ]]
+)TEST";
+  char temporary[] = "./vdc-fresh-netns-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "fresh_netns_fixture_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "fresh_provider_private_netns_handles_create_absent_directory_reject_symlink_and_preserve_adoption");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testCleanupReceiptBindsExactOwnedRuntime(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "cleanup_receipt_fixture_locates_provider_owner"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (!mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024))
+  { suite.expect(false, "cleanup_receipt_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  const size_t begin = text.find("pair_regular_root_receipt()\n{\n");
+  const size_t end = text.find("\npair_workspace_persisted_identity()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "cleanup_receipt_fixture_extracts_exact_owner");
+  if (begin == std::string::npos || end == std::string::npos) return;
+  // Model root ownership and mode checks without requiring privileged files.
+  // File/symlink identity and exact bytes remain real filesystem operations.
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+receipt="$PWD/receipt"
+receipt_mode=600
+stat() {
+  if [[ "$1" == -Lc && "$2" == %u ]]; then printf '0\n'; return 0; fi
+  if [[ "$1" == -Lc && "$2" == %a ]]; then printf '%s\n' "$receipt_mode"; return 0; fi
+  command stat "$@"
+}
+printf 'version=1\nruntimeIdentity=700\ncleanup=complete\n' > "$receipt"
+vdc_cleanup_receipt_exact "$receipt" 700
+! vdc_cleanup_receipt_exact "$receipt" 701
+printf 'version=1\nruntimeIdentity=700\ncleanup=failed\n' > "$receipt"
+! vdc_cleanup_receipt_exact "$receipt" 700
+printf 'version=1\nruntimeIdentity=700\ncleanup=complete\nextra=1\n' > "$receipt"
+! vdc_cleanup_receipt_exact "$receipt" 700
+rm -f "$receipt"
+! vdc_cleanup_receipt_exact "$receipt" 700
+printf 'version=1\nruntimeIdentity=700\ncleanup=complete\n' > "$PWD/target"
+ln -s "$PWD/target" "$receipt"
+! vdc_cleanup_receipt_exact "$receipt" 700
+rm -f "$receipt"
+printf 'version=1\nruntimeIdentity=700\ncleanup=complete\n' > "$receipt"
+receipt_mode=666
+! vdc_cleanup_receipt_exact "$receipt" 700
+)TEST";
+  char temporary[] = "./vdc-cleanup-receipt-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "cleanup_receipt_fixture_creates_owned_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "cleanup_receipt_accepts_only_exact_root_owned_runtime_complete_record");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testCleanupResourceVerifierRejectsOwnedResidue(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "cleanup_resource_fixture_locates_provider_owner"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (!mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024))
+  { suite.expect(false, "cleanup_resource_fixture_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  const size_t begin = text.find("vdc_owned_resources_absent()\n{\n");
+  const size_t end = text.find("\ncleanup()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "cleanup_resource_fixture_extracts_provider_verifier");
+  if (begin == std::string::npos || end == std::string::npos) return;
+  std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+parent_ns="vdc-clean-parent-${RANDOM}-${RANDOM}"
+child_names=("vdc-clean-child-${RANDOM}-${RANDOM}")
+storage_mounts=()
+machine_count=1
+workspace="$PWD/workspace"
+filesystem_root="$PWD/filesystem-root"
+filesystem_image="$PWD/filesystem-image"
+control_socket_path="$PWD/control/mothership.sock"
+fake_boundary=0
+machine_bpffs_path() { printf '%s/machine%s\n' "$filesystem_root/bpffs" "$1"; }
+mountpoint() { return 1; }
+vdc_owned_resources_absent
+mkdir "$filesystem_root"
+! vdc_owned_resources_absent
+rmdir "$filesystem_root"
+mkdir -p "${control_socket_path%/*}"
+: > "$control_socket_path"
+! vdc_owned_resources_absent
+rm -f "$control_socket_path"
+rmdir "${control_socket_path%/*}"
+fake_boundary=1
+boundary_bpffs="$PWD/boundary-bpffs"
+boundary_lock="$PWD/boundary-lock"
+host_edge=vdc-clean-edge
+private4_subnet=10.0.0.0/24
+host_ipv4_forward=""
+host_ipv6_forward=""
+edge_present=0
+ip() { [[ "$1" == link && "$2" == show && "$3" == dev && "$4" == "$host_edge" && "$edge_present" == 1 ]]; }
+iptables() { return 1; }
+ip6tables() { return 1; }
+vdc_owned_resources_absent
+edge_present=1
+! vdc_owned_resources_absent
+)TEST";
+  char temporary[] = "./vdc-cleanup-resource-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "cleanup_resource_fixture_creates_owned_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "cleanup_resource_verifier_accepts_clean_state_and_rejects_owned_residue");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testStopCleanupContractFailsClosed(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "cleanup_stop_contract_locates_provider_owner"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  String source = {};
+  if (!mothershipVDCRead(String(sourcePath.c_str()), source, 1024 * 1024))
+  { suite.expect(false, "cleanup_stop_contract_reads_provider_owner"); return; }
+  std::string text(reinterpret_cast<const char *>(source.data()), source.size());
+  const size_t begin = text.find("stop_datacenter_locked()\n{\n");
+  const size_t end = text.find("\nstop_datacenter()\n", begin);
+  if (begin == std::string::npos || end == std::string::npos)
+  { suite.expect(false, "cleanup_stop_contract_extracts_stop_owner"); return; }
+  const std::string stop = text.substr(begin, end - begin);
+  const size_t receipt = stop.find("vdc_cleanup_receipt_exact");
+  const size_t cgroup = stop.find("[[ ! -d \"${cgroup_root}\" ]] || cleanup_receipt_ok=0");
+  const size_t workspaceRemoval = stop.find("rm -rf -- \"${workspace}\"");
+  const size_t finalAbsence = stop.find("! -e \"${workspace}\" && ! -L \"${workspace}\"");
+  suite.expect(receipt != std::string::npos && cgroup != std::string::npos && workspaceRemoval != std::string::npos &&
+               finalAbsence != std::string::npos && receipt < workspaceRemoval && cgroup < workspaceRemoval &&
+               workspaceRemoval < finalAbsence,
+               "stop_requires_cleanup_receipt_and_cgroup_absence_before_workspace_removal");
+  const size_t verifier = text.find("vdc_owned_resources_absent()\n{\n");
+  const size_t receiptWrite = text.find("atomic_write \"${cleanup_receipt_path}\" \"$(vdc_cleanup_receipt_text", verifier);
+  const size_t cleanupExit = text.find("exit \"${status}\"", receiptWrite);
+  suite.expect(verifier != std::string::npos && receiptWrite != std::string::npos && cleanupExit != std::string::npos &&
+               verifier < receiptWrite && receiptWrite < cleanupExit,
+               "provider_writes_success_receipt_only_after_owned_resource_verifier");
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -422,6 +629,10 @@ int main(void)
   testUnexpectedRuntimeExitPreservesLiveApplicationCgroup(suite);
   testFaultDatacenterBindsResetTicketToKilledPID(suite);
   testFaultLinkRebindsPublishedProvider(suite);
+  testFreshProviderOwnsPrivateNetnsHandleDirectory(suite);
+  testCleanupReceiptBindsExactOwnedRuntime(suite);
+  testCleanupResourceVerifierRejectsOwnedResidue(suite);
+  testStopCleanupContractFailsClosed(suite);
 
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/vdc"_ctv), "workspace_accepts_nested_absolute_path");
   suite.expect(mothershipTestClusterWorkspaceRootValid("/tmp/space dir/vdc"_ctv), "workspace_accepts_spaces");

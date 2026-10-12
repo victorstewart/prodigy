@@ -34,6 +34,7 @@ static inline cppsort::verge_adapter<cppsort::ska_sorter> sorter;
 
 #include <prodigy/bootstrap.config.h>
 #include <prodigy/bundle.upgrade.h>
+#include <prodigy/container.mesh.identity.h>
 #include <prodigy/container.retirement.h>
 #include <prodigy/stateful.serving.authority.h>
 #include <prodigy/application.container.privileges.h>
@@ -671,13 +672,38 @@ static inline bool prodigyWormholeRuntimeTargetMachine(const Machine *machine)
          machine->state != MachineState::decommissioning;
 }
 
-static inline void prodigyQueueSwitchboardWormholeOperation(Machine *machine,
+static inline bool prodigyQueueSwitchboardWormholeOperation(Machine *machine,
+                                                            ContainerView *container,
                                                             const SwitchboardWormholeOperation& operation)
 {
+  if (machine == nullptr)
+  {
+    return false;
+  }
+  if (container != nullptr && machine->fragment != 0 &&
+      container->wormholeRuntimePendingMachines.contains(machine->fragment))
+  {
+    const auto pending = container->wormholeRuntimePendingIOGenerations.find(machine->fragment);
+    if (pending != container->wormholeRuntimePendingIOGenerations.end() &&
+        pending->second == machine->neuron.ioGeneration)
+    {
+      // The legacy operation frame has no negotiated delivery nonce. An exact
+      // request already outstanding on this ordered stream is the one owner;
+      // a reconnect supplies the next unambiguous request incarnation.
+      return false;
+    }
+  }
   String serialized = {};
   SwitchboardWormholeOperation wire = operation;
   BitseryEngine::serialize(serialized, wire);
   Message::construct(machine->neuron.wBuffer, NeuronTopic::openSwitchboardWormholes, serialized);
+  if (container != nullptr && machine != nullptr && machine->fragment != 0 &&
+      container->wormholeRuntimePendingMachines.contains(machine->fragment))
+  {
+    container->wormholeRuntimePendingIOGenerations.insert_or_assign(
+        machine->fragment, machine->neuron.ioGeneration);
+  }
+  return true;
 }
 
 static inline void prodigyCancelWormholeRuntimeAckDeadline(ContainerView *container)
@@ -710,12 +736,77 @@ static inline void prodigyResetWormholeRuntimeRetries(ContainerView *container,
   }
 }
 
-inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
+inline bool BrainBase::neuronSwitchboardStateSyncBlocked(Machine *machine) const
+{
+  if (machine == nullptr || machine->fragment == 0)
+  {
+    return false;
+  }
+
+  for (const auto& [uuid, container] : containers)
+  {
+    (void)uuid;
+    if (container == nullptr ||
+        container->wormholeRuntimePendingMachines.contains(machine->fragment) == false)
+    {
+      continue;
+    }
+    const auto pending = container->wormholeRuntimePendingIOGenerations.find(machine->fragment);
+    if (pending != container->wormholeRuntimePendingIOGenerations.end() &&
+        pending->second == machine->neuron.ioGeneration)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline void BrainBase::driveDeferredNeuronSwitchboardStateSync(Machine *machine)
+{
+  if (machine == nullptr || machine->switchboardStateSyncPending == false ||
+      machine->switchboardStateSyncIOGeneration != machine->neuron.ioGeneration)
+  {
+    return;
+  }
+  sendNeuronSwitchboardStateSync(machine, machine->switchboardStateSyncReplayContainerRoutes);
+}
+
+inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine, bool replayContainerRoutes)
 {
   if (neuronControlStreamActive(machine) == false)
   {
     return;
   }
+
+  // resetSwitchboardState invalidates every earlier apply receipt. Never
+  // reset while an operation from this same ordered stream is outstanding;
+  // its eventual acknowledgement drives the strongest deferred sync request.
+  if (neuronSwitchboardStateSyncBlocked(machine))
+  {
+    if (machine->switchboardStateSyncPending == false ||
+        machine->switchboardStateSyncIOGeneration != machine->neuron.ioGeneration)
+    {
+      machine->switchboardStateSyncPending = true;
+      machine->switchboardStateSyncReplayContainerRoutes = replayContainerRoutes;
+      machine->switchboardStateSyncIOGeneration = machine->neuron.ioGeneration;
+    }
+    else
+    {
+      machine->switchboardStateSyncReplayContainerRoutes =
+          machine->switchboardStateSyncReplayContainerRoutes || replayContainerRoutes;
+    }
+    return;
+  }
+
+  if (machine->switchboardStateSyncPending &&
+      machine->switchboardStateSyncIOGeneration == machine->neuron.ioGeneration)
+  {
+    replayContainerRoutes = replayContainerRoutes ||
+                            machine->switchboardStateSyncReplayContainerRoutes;
+  }
+  machine->switchboardStateSyncPending = false;
+  machine->switchboardStateSyncReplayContainerRoutes = false;
+  machine->switchboardStateSyncIOGeneration = 0;
 
   Message::appendEcho(machine->neuron.wBuffer, static_cast<uint16_t>(NeuronTopic::resetSwitchboardState));
 
@@ -741,6 +832,15 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
     String serializedOverlayConfig = {};
     BitseryEngine::serialize(serializedOverlayConfig, overlayConfig);
     Message::construct(machine->neuron.wBuffer, NeuronTopic::configureSwitchboardOverlayRoutes, serializedOverlayConfig);
+  }
+
+  if (replayContainerRoutes == false)
+  {
+    // Registration still establishes the baseline Switchboard contract before
+    // inventory arrives. Container routes wait for the accepted state upload,
+    // so no legacy acknowledgement can race a newly discovered container.
+    Ring::queueSend(&machine->neuron);
+    return;
   }
 
   for (const auto& [uuid, container] : containers)
@@ -792,7 +892,7 @@ inline void BrainBase::sendNeuronSwitchboardStateSync(Machine *machine)
       armWormholeRuntimeAckDeadline(container);
       replicateContainerRuntimeStateToFollowers(container);
     }
-    prodigyQueueSwitchboardWormholeOperation(machine, operation);
+    prodigyQueueSwitchboardWormholeOperation(machine, container, operation);
   }
 
   for (const auto& [uuid, container] : containers)
@@ -860,6 +960,7 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
     return;
   }
 
+  const bool sameRevision = container->wormholeRuntimeRevision.equals(operation.revision);
   container->wormholeRuntimeRevision = operation.revision;
   container->wormholeRuntimeDesired = operation.desired;
   prodigyCancelWormholeRuntimeAckDeadline(container);
@@ -867,6 +968,10 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
   container->wormholeRuntimeRetryRevision.assign(operation.revision);
   container->wormholeRuntimePendingMachines.clear();
   container->wormholeRuntimeFailedMachines.clear();
+  if (sameRevision == false)
+  {
+    container->wormholeRuntimePendingIOGenerations.clear();
+  }
   container->wormholeRuntimeFailure.clear();
   for (Machine *machine : machines)
   {
@@ -903,7 +1008,7 @@ inline void BrainBase::sendNeuronOpenSwitchboardWormholes(ContainerView *contain
       sendNeuronSwitchboardHostedIngressPrefixes(machine);
     }
 
-    prodigyQueueSwitchboardWormholeOperation(machine, operation);
+    prodigyQueueSwitchboardWormholeOperation(machine, container, operation);
     Ring::queueSend(&machine->neuron);
   }
 }
@@ -1074,6 +1179,7 @@ static void serialize(S&& serializer, ProdigyMasterAuthorityStateTransition& tra
   Vector<ProdigyPersistentClusterPairEnrollmentRootSecret> roots;
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
+    if (prodigyMachineFragmentAssignmentsValid(transition.runtimeState.machineFragmentAssignments) == false) return;
     if (std::any_of(transition.runtimeState.transportCredentialEnrollmentOperations.begin(),
           transition.runtimeState.transportCredentialEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 2; }) && transition.version < 9) return;
@@ -1619,9 +1725,23 @@ public:
   // the exact accepted plans separately from scheduler indexes: planned views
   // can survive an upload that did not observe a corresponding process.
   bytell_hash_set<uint128_t> persistedMachineInventoryUploaded;
+  // An individual upload can prove one inherited view absent, but replacement
+  // scheduling must wait until every machine has attested: a live successor may
+  // still arrive in a later upload.  This set is ephemeral to one recovery
+  // barrier and is reconciled only after the complete fleet inventory exists.
+  bytell_hash_set<uint128_t> persistedInventoryConfirmedAbsentContainers;
   // Derived from successfully restored records, never a new launch authority.
   // An inventory received before those records materialize cannot attest them.
   bytell_hash_set<uint128_t> pendingRestoredContainerInventory;
+  // A replay can start an asynchronous launch whose immediate stateUpload still
+  // lacks that UUID. Bound retries per control generation so accepted empty
+  // replies cannot form a feedback loop or suppress recovery forever.
+  struct RestoredContainerInventoryReplay {
+    uint64_t ioGeneration = 0;
+    uint8_t attempts = 0;
+    bool awaitingInventory = false;
+  };
+  bytell_hash_map<uint128_t, RestoredContainerInventoryReplay> restoredContainerInventoryReplayByMachine;
   bytell_hash_map<uint128_t, Vector<String>> persistedMachineStateUploadPlansByMachine;
   struct ContainerRetirementInventory {
     uint64_t authorityEpoch = 0;
@@ -1817,7 +1937,10 @@ public:
     Mothership *stream = nullptr;
     uint64_t streamIncarnation = 0;
     uint64_t authorityEpoch = 0;
+    uint128_t clusterUUID = 0;
+    bool ownershipPersistencePending = false;
     bool ownershipDurable = false;
+    bool configurationPersistencePending = false;
     String serializedConfig;
   };
   std::shared_ptr<PendingConfigureOwnershipReceipt> pendingConfigureOwnershipReceipt;
@@ -2856,6 +2979,813 @@ public:
       restored[deploymentID].wormholes.insert_or_assign(wormholeName, std::move(state));
     }
     tlsResumptionStateByDeployment = std::move(restored);
+  }
+
+  static const ProdigyMachineFragmentAssignment *findMachineFragmentAssignment(
+      const Vector<ProdigyMachineFragmentAssignment>& assignments, uint128_t machineUUID)
+  {
+    auto assignment = std::lower_bound(
+        assignments.begin(), assignments.end(), machineUUID,
+        [](const ProdigyMachineFragmentAssignment& candidate, uint128_t uuid) {
+          return candidate.machineUUID < uuid;
+        });
+    return assignment != assignments.end() && assignment->machineUUID == machineUUID
+               ? &*assignment
+               : nullptr;
+  }
+
+  static bool upsertMachineFragmentAssignment(
+      Vector<ProdigyMachineFragmentAssignment>& assignments,
+      uint128_t machineUUID,
+      uint32_t fragment,
+      bool& changed)
+  {
+    changed = false;
+    if (!prodigyMachineFragmentAssignmentsValid(assignments) ||
+        machineUUID == 0 || fragment == 0 || fragment > 0x00ffffffu)
+    {
+      return false;
+    }
+
+    auto assignment = std::lower_bound(
+        assignments.begin(), assignments.end(), machineUUID,
+        [](const ProdigyMachineFragmentAssignment& candidate, uint128_t uuid) {
+          return candidate.machineUUID < uuid;
+        });
+    if (assignment != assignments.end() && assignment->machineUUID == machineUUID)
+    {
+      return assignment->fragment == fragment;
+    }
+    if (assignments.size() >= ProdigyMachineFragmentAssignmentMaximumRecords)
+    {
+      return false;
+    }
+    if (std::any_of(assignments.begin(), assignments.end(), [fragment](const auto& candidate) {
+          return candidate.fragment == fragment;
+        }))
+    {
+      return false;
+    }
+
+    assignments.insert(assignment, ProdigyMachineFragmentAssignment {machineUUID, fragment});
+    changed = true;
+    return true;
+  }
+
+  bool masterAuthorityMachineFragmentAssignmentsPreserved(
+      const Vector<ProdigyMachineFragmentAssignment>& incoming) const
+  {
+    if (prodigyMachineFragmentAssignmentsValid(
+            masterAuthorityRuntimeState.machineFragmentAssignments) == false ||
+        prodigyMachineFragmentAssignmentsValid(incoming) == false)
+    {
+      return false;
+    }
+    for (const ProdigyMachineFragmentAssignment& current :
+         masterAuthorityRuntimeState.machineFragmentAssignments)
+    {
+      const ProdigyMachineFragmentAssignment *candidate =
+          findMachineFragmentAssignment(incoming, current.machineUUID);
+      if (candidate == nullptr || candidate->fragment != current.fragment)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool machineFragmentAssignmentsMatchContainerRuntimeStates(
+      const Vector<ProdigyMachineFragmentAssignment>& assignments,
+      const Vector<BrainReplicatedContainerRuntimeState>& runtimeStates,
+      uint8_t datacenterFragment)
+  {
+    if (assignments.empty())
+    {
+      return true; // Pre-v17 snapshots enter the authenticated legacy recovery path.
+    }
+    for (const BrainReplicatedContainerRuntimeState& state : runtimeStates)
+    {
+      uint32_t observedMachineFragment = 0;
+      for (const IPPrefix& address : state.plan.addresses)
+      {
+        if (!address.network.is6 || address.cidr != 128 ||
+            std::memcmp(address.network.v6, container_network_subnet6.value, 11) != 0)
+        {
+          continue;
+        }
+        if (datacenterFragment == 0 || address.network.v6[11] != datacenterFragment)
+        {
+          return false;
+        }
+        const uint32_t candidate = (uint32_t(address.network.v6[12]) << 16) |
+                                   (uint32_t(address.network.v6[13]) << 8) |
+                                   uint32_t(address.network.v6[14]);
+        if (candidate == 0 || (observedMachineFragment != 0 && observedMachineFragment != candidate))
+        {
+          return false;
+        }
+        observedMachineFragment = candidate;
+      }
+      if (observedMachineFragment == 0)
+      {
+        continue;
+      }
+      const ProdigyMachineFragmentAssignment *assignment =
+          findMachineFragmentAssignment(assignments, state.machineUUID);
+      if (assignment == nullptr || assignment->fragment != observedMachineFragment)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool machineFragmentAssignmentsMatchLiveContainers(
+      const Vector<ProdigyMachineFragmentAssignment>& assignments,
+      uint8_t datacenterFragment) const
+  {
+    if (assignments.empty())
+    {
+      return true;
+    }
+    // A containerless Machine still owns its prefix. Requiring every live
+    // nonzero fragment in the first v17 transition makes legacy migration
+    // atomic and prevents a later projection from colliding with an idle peer.
+    for (Machine *machine : machines)
+    {
+      if (machine == nullptr || machine->fragment == 0)
+      {
+        continue;
+      }
+      const ProdigyMachineFragmentAssignment *assignment =
+          findMachineFragmentAssignment(assignments, machine->uuid);
+      if (assignment == nullptr || assignment->fragment != machine->fragment)
+      {
+        return false;
+      }
+    }
+    for (const auto& [uuid, container] : containers)
+    {
+      (void)uuid;
+      if (container == nullptr || container->machine == nullptr)
+      {
+        continue;
+      }
+      uint32_t observedMachineFragment = 0;
+      for (const IPPrefix& address : container->addresses)
+      {
+        if (!address.network.is6 || address.cidr != 128 ||
+            std::memcmp(address.network.v6, container_network_subnet6.value, 11) != 0)
+        {
+          continue;
+        }
+        if (datacenterFragment == 0 || address.network.v6[11] != datacenterFragment)
+        {
+          return false;
+        }
+        const uint32_t candidate = (uint32_t(address.network.v6[12]) << 16) |
+                                   (uint32_t(address.network.v6[13]) << 8) |
+                                   uint32_t(address.network.v6[14]);
+        if (candidate == 0 || (observedMachineFragment != 0 && observedMachineFragment != candidate))
+        {
+          return false;
+        }
+        observedMachineFragment = candidate;
+      }
+      if (observedMachineFragment == 0)
+      {
+        continue;
+      }
+      const ProdigyMachineFragmentAssignment *assignment =
+          findMachineFragmentAssignment(assignments, container->machine->uuid);
+      if (assignment == nullptr || assignment->fragment != observedMachineFragment)
+      {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool projectMachineFragmentAssignment(Machine *machine)
+  {
+    if (machine == nullptr || machine->uuid == 0)
+    {
+      return true;
+    }
+    const ProdigyMachineFragmentAssignment *assignment = findMachineFragmentAssignment(
+        masterAuthorityRuntimeState.machineFragmentAssignments, machine->uuid);
+    if (assignment == nullptr)
+    {
+      return true;
+    }
+
+    usedMachineFragments.insert(assignment->fragment);
+    if (machine->fragment != assignment->fragment)
+    {
+      machine->fragment = assignment->fragment;
+      machine->reportedDatacenterFragment = 0;
+      machine->reportedFragment = 0;
+      machine->runtimeReady = false;
+    }
+    return true;
+  }
+
+  bool projectMachineFragmentAssignmentsFromMasterAuthorityState(void)
+  {
+    if (prodigyMachineFragmentAssignmentsValid(
+            masterAuthorityRuntimeState.machineFragmentAssignments) == false)
+    {
+      return false;
+    }
+    for (const ProdigyMachineFragmentAssignment& assignment :
+         masterAuthorityRuntimeState.machineFragmentAssignments)
+    {
+      usedMachineFragments.insert(assignment.fragment);
+    }
+    for (Machine *machine : machines)
+    {
+      (void)projectMachineFragmentAssignment(machine);
+    }
+    return true;
+  }
+
+  bool captureLiveMachineFragmentAssignmentsForCommit(
+      Vector<ProdigyMachineFragmentAssignment>& assignments,
+      bool& changed) const
+  {
+    for (Machine *candidate : machines)
+    {
+      if (candidate == nullptr || candidate->uuid == 0 || candidate->fragment == 0)
+      {
+        continue;
+      }
+      bool candidateChanged = false;
+      if (upsertMachineFragmentAssignment(
+              assignments, candidate->uuid, candidate->fragment, candidateChanged) == false)
+      {
+        return false;
+      }
+      changed = changed || candidateChanged;
+    }
+    return true;
+  }
+
+  enum class MachineFragmentAssignmentPersistence : uint8_t
+  {
+    rejected,
+    pending,
+    durable,
+    durablePublished,
+  };
+
+  static bool machineFragmentAssignmentIsDurable(
+      MachineFragmentAssignmentPersistence result)
+  {
+    return result == MachineFragmentAssignmentPersistence::durable ||
+           result == MachineFragmentAssignmentPersistence::durablePublished;
+  }
+
+  struct PendingMachineFragmentAssignmentPersistence
+  {
+    uint128_t machineUUID = 0;
+    uint32_t fragment = 0;
+    uint64_t authorityEpoch = 0;
+    ProdigyMasterAuthorityRuntimeState baseRuntimeState;
+    ProdigyMasterAuthorityRuntimeState candidateRuntimeState;
+    bool published = false;
+  };
+
+  std::shared_ptr<PendingMachineFragmentAssignmentPersistence>
+      pendingMachineFragmentAssignmentPersistence;
+  bool machineFragmentAssignmentContinuationPending = false;
+  uint64_t deferredMachineFragmentAssignmentEpoch = 0;
+  uint128_t deferredMachineFragmentAssignmentUUID = 0;
+  uint32_t deferredMachineFragmentAssignmentFragment = 0;
+
+  void clearDeferredMachineFragmentAssignment(void)
+  {
+    deferredMachineFragmentAssignmentEpoch = 0;
+    deferredMachineFragmentAssignmentUUID = 0;
+    deferredMachineFragmentAssignmentFragment = 0;
+  }
+
+  void deferMachineFragmentAssignmentContinuation(
+      uint128_t machineUUID = 0, uint32_t fragment = 0)
+  {
+    if (!weAreMaster)
+    {
+      return;
+    }
+    machineFragmentAssignmentContinuationPending = true;
+    if (machineUUID != 0 && fragment != 0 && fragment <= 0x00ffffffu)
+    {
+      deferredMachineFragmentAssignmentEpoch = masterAuthorityEpoch;
+      deferredMachineFragmentAssignmentUUID = machineUUID;
+      deferredMachineFragmentAssignmentFragment = fragment;
+    }
+  }
+
+  void publishDurableMachineFragmentAssignment(uint128_t machineUUID, uint32_t fragment)
+  {
+    auto machineIt = machinesByUUID.find(machineUUID);
+    if (machineIt == machinesByUUID.end() || machineIt->second == nullptr)
+    {
+      return;
+    }
+    Machine *machine = machineIt->second;
+    const ProdigyMachineFragmentAssignment *assignment =
+        findMachineFragmentAssignment(
+            masterAuthorityRuntimeState.machineFragmentAssignments, machineUUID);
+    if (assignment == nullptr || assignment->fragment != fragment ||
+        projectMachineFragmentAssignment(machine) == false)
+    {
+      return;
+    }
+
+    machine->reportedDatacenterFragment = 0;
+    machine->reportedFragment = 0;
+    machine->runtimeReady = false;
+    struct local_container_subnet6 subnet = {};
+    subnet.dpfx = brainConfig.datacenterFragment;
+    subnet.mpfx[0] = static_cast<uint8_t>((fragment >> 16) & 0xffu);
+    subnet.mpfx[1] = static_cast<uint8_t>((fragment >> 8) & 0xffu);
+    subnet.mpfx[2] = static_cast<uint8_t>(fragment & 0xffu);
+    const uint32_t headerOffset =
+        Message::appendHeader(machine->neuron.wBuffer, NeuronTopic::assignFragment);
+    Message::appendAlignedBuffer<Alignment::one>(
+        machine->neuron.wBuffer,
+        reinterpret_cast<uint8_t *>(&subnet),
+        sizeof(subnet));
+    Message::finish(machine->neuron.wBuffer, headerOffset);
+    if (streamIsActive(&machine->neuron))
+    {
+      Ring::queueSend(&machine->neuron);
+    }
+    sendNeuronSwitchboardOverlayRoutes();
+  }
+
+  void finalizePendingMachineFragmentAssignmentPersistence(void)
+  {
+    const auto pending = pendingMachineFragmentAssignmentPersistence;
+    if (!pending || !weAreMaster || pending->authorityEpoch != masterAuthorityEpoch ||
+        !masterAuthorityRuntimeStateDurable ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+    {
+      return;
+    }
+    const ProdigyMachineFragmentAssignment *assignment =
+        findMachineFragmentAssignment(
+            masterAuthorityRuntimeState.machineFragmentAssignments,
+            pending->machineUUID);
+    if (assignment == nullptr || assignment->fragment != pending->fragment)
+    {
+      return;
+    }
+    pending->published = true;
+    if (deferredMachineFragmentAssignmentEpoch == pending->authorityEpoch &&
+        deferredMachineFragmentAssignmentUUID == pending->machineUUID &&
+        deferredMachineFragmentAssignmentFragment == pending->fragment)
+    {
+      clearDeferredMachineFragmentAssignment();
+    }
+    pendingMachineFragmentAssignmentPersistence.reset();
+    publishDurableMachineFragmentAssignment(pending->machineUUID, pending->fragment);
+    // The single detached writer serializes fragment assignment. Continue the
+    // remaining connected machines on the next heartbeat, after this writer
+    // completion has released its capacity lease.
+    deferMachineFragmentAssignmentContinuation();
+  }
+
+  bool buildMachineFragmentAssignmentTransitionCandidate(
+      const ProdigyMasterAuthorityRuntimeState& runtimeState,
+      ProdigyMasterAuthorityStateTransition& candidate) const
+  {
+    candidate = {};
+    candidate.runtimeState = runtimeState;
+    candidate.servingRuntimeStates = statefulServingRuntimeStates;
+    for (const ProdigyStatelessDeploymentAdmission& admission :
+         runtimeState.statelessDeploymentAdmissions)
+    {
+      auto plan = deploymentPlans.find(admission.deploymentID);
+      if (plan == deploymentPlans.end() ||
+          !statelessDeploymentAdmissionMatchesPlan(admission, plan->second))
+      {
+        return false;
+      }
+      candidate.statelessAdmissionPlans.push_back(plan->second);
+    }
+    ownBrainConfig(brainConfig, candidate.brainConfig);
+    return true;
+  }
+
+  bool submitPendingMachineFragmentAssignmentPersistence(
+      const std::shared_ptr<PendingMachineFragmentAssignmentPersistence>& pending)
+  {
+    ProdigyMasterAuthorityStateTransition candidate;
+    if (!pending || pendingMachineFragmentAssignmentPersistence != pending ||
+        !buildMachineFragmentAssignmentTransitionCandidate(
+            pending->candidateRuntimeState, candidate))
+    {
+      return false;
+    }
+
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    const std::weak_ptr<PendingMachineFragmentAssignmentPersistence> weakPending = pending;
+    return persistMasterAuthorityTransitionCandidate(
+        candidate,
+        [this, lifetime, weakPending](bool durable) {
+          if (lifetime.expired())
+          {
+            return;
+          }
+          const auto pending = weakPending.lock();
+          if (!pending || pendingMachineFragmentAssignmentPersistence != pending)
+          {
+            return;
+          }
+          if (!durable)
+          {
+            if (weAreMaster && pending->authorityEpoch == masterAuthorityEpoch)
+            {
+              deferMachineFragmentAssignmentContinuation(
+                  pending->machineUUID, pending->fragment);
+            }
+            pendingMachineFragmentAssignmentPersistence.reset();
+            return;
+          }
+          if (!weAreMaster || pending->authorityEpoch != masterAuthorityEpoch)
+          {
+            pendingMachineFragmentAssignmentPersistence.reset();
+            return;
+          }
+
+          refreshMasterAuthorityRuntimeStateFromLiveFields();
+          if (masterAuthorityRuntimeState != pending->baseRuntimeState)
+          {
+            Vector<ProdigyMachineFragmentAssignment> merged =
+                masterAuthorityRuntimeState.machineFragmentAssignments;
+            bool changed = false;
+            if (masterAuthorityRuntimeState.generation == UINT64_MAX ||
+                !upsertMachineFragmentAssignment(
+                    merged, pending->machineUUID, pending->fragment, changed) ||
+                !captureLiveMachineFragmentAssignmentsForCommit(merged, changed) ||
+                !prodigyMachineFragmentAssignmentsValid(merged) ||
+                !machineFragmentAssignmentsMatchLiveContainers(
+                    merged, brainConfig.datacenterFragment))
+            {
+              deferMachineFragmentAssignmentContinuation();
+              pendingMachineFragmentAssignmentPersistence.reset();
+              return;
+            }
+
+            // The first candidate is durable, but another authority mutation
+            // won the live revision while it was in flight. Rebase into a new
+            // detached candidate and require that candidate's own receipt.
+            // Never expose the registry row to a generic persistence retry.
+            pending->baseRuntimeState = masterAuthorityRuntimeState;
+            pending->candidateRuntimeState = masterAuthorityRuntimeState;
+            pending->candidateRuntimeState.machineFragmentAssignments =
+                std::move(merged);
+            ++pending->candidateRuntimeState.generation;
+            if (!submitPendingMachineFragmentAssignmentPersistence(pending) &&
+                pendingMachineFragmentAssignmentPersistence == pending)
+            {
+              deferMachineFragmentAssignmentContinuation(
+                  pending->machineUUID, pending->fragment);
+              pendingMachineFragmentAssignmentPersistence.reset();
+            }
+            return;
+          }
+
+          masterAuthorityRuntimeState = pending->candidateRuntimeState;
+          masterAuthorityRuntimeStateDurable = true;
+          durableMasterAuthorityRuntimeStateGeneration =
+              masterAuthorityRuntimeState.generation;
+          captureDurableElasticAddressOperations();
+          (void)projectMachineFragmentAssignmentsFromMasterAuthorityState();
+          finalizePendingMachineFragmentAssignmentPersistence();
+          queueMasterAuthorityRuntimeStateReplication();
+        });
+  }
+
+  MachineFragmentAssignmentPersistence persistMachineFragmentAssignmentsAsync(
+      Vector<ProdigyMachineFragmentAssignment> assignments,
+      uint128_t machineUUID,
+      uint32_t fragment)
+  {
+    if (!prodigyMachineFragmentAssignmentsValid(assignments) ||
+        !machineFragmentAssignmentsMatchLiveContainers(
+            assignments, brainConfig.datacenterFragment))
+    {
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    if (pendingMachineFragmentAssignmentPersistence)
+    {
+      return MachineFragmentAssignmentPersistence::pending;
+    }
+
+    refreshMasterAuthorityRuntimeStateFromLiveFields();
+    if (masterAuthorityRuntimeState.generation == UINT64_MAX ||
+        !masterAuthorityMachineFragmentAssignmentsPreserved(assignments))
+    {
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    auto pending = std::make_shared<PendingMachineFragmentAssignmentPersistence>();
+    pending->machineUUID = machineUUID;
+    pending->fragment = fragment;
+    pending->authorityEpoch = masterAuthorityEpoch;
+    pending->baseRuntimeState = masterAuthorityRuntimeState;
+    pending->candidateRuntimeState = masterAuthorityRuntimeState;
+    pending->candidateRuntimeState.machineFragmentAssignments = std::move(assignments);
+    ++pending->candidateRuntimeState.generation;
+    pendingMachineFragmentAssignmentPersistence = pending;
+    const bool admitted = submitPendingMachineFragmentAssignmentPersistence(pending);
+    if (!admitted && pendingMachineFragmentAssignmentPersistence == pending)
+    {
+      deferMachineFragmentAssignmentContinuation(machineUUID, fragment);
+      pendingMachineFragmentAssignmentPersistence.reset();
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    if (pendingMachineFragmentAssignmentPersistence != pending)
+    {
+      const ProdigyMachineFragmentAssignment *assignment =
+          findMachineFragmentAssignment(
+              masterAuthorityRuntimeState.machineFragmentAssignments, machineUUID);
+      return masterAuthorityRuntimeStateDurable &&
+                     durableMasterAuthorityRuntimeStateGeneration ==
+                         masterAuthorityRuntimeState.generation &&
+                     assignment != nullptr && assignment->fragment == fragment
+                 ? (pending->published
+                        ? MachineFragmentAssignmentPersistence::durablePublished
+                        : MachineFragmentAssignmentPersistence::durable)
+                 : MachineFragmentAssignmentPersistence::rejected;
+    }
+    return MachineFragmentAssignmentPersistence::pending;
+  }
+
+  bool persistMachineFragmentAssignments(
+      Vector<ProdigyMachineFragmentAssignment> assignments,
+      bool changed)
+  {
+    if (!prodigyMachineFragmentAssignmentsValid(assignments) ||
+        !machineFragmentAssignmentsMatchLiveContainers(
+            assignments, brainConfig.datacenterFragment))
+    {
+      return false;
+    }
+    if (!changed && masterAuthorityRuntimeStateDurable &&
+        durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
+    {
+      return true;
+    }
+
+    // A failed receipt must not leave a candidate row for the generic
+    // heartbeat retry to persist without repeating these collision checks.
+    ProdigyMasterAuthorityRuntimeState previousState = masterAuthorityRuntimeState;
+    const bool previousDurable = masterAuthorityRuntimeStateDurable;
+    const uint64_t previousDurableGeneration = durableMasterAuthorityRuntimeStateGeneration;
+    masterAuthorityRuntimeState.machineFragmentAssignments = std::move(assignments);
+    if (commitMasterAuthorityStateChange())
+    {
+      return true;
+    }
+    masterAuthorityRuntimeState = std::move(previousState);
+    masterAuthorityRuntimeStateDurable = previousDurable;
+    durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+    return false;
+  }
+
+  MachineFragmentAssignmentPersistence requestDurableMachineFragmentAssignment(
+      Machine *machine)
+  {
+    if (machine == nullptr || machine->uuid == 0 || machine->fragment == 0 ||
+        machine->fragment > 0x00ffffffu || weAreMaster == false)
+    {
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    if (machineFragmentAssignmentContinuationPending &&
+        deferredMachineFragmentAssignmentEpoch == masterAuthorityEpoch &&
+        deferredMachineFragmentAssignmentUUID != 0 &&
+        (deferredMachineFragmentAssignmentUUID != machine->uuid ||
+         deferredMachineFragmentAssignmentFragment != machine->fragment))
+    {
+      return MachineFragmentAssignmentPersistence::pending;
+    }
+
+    Vector<ProdigyMachineFragmentAssignment> assignments =
+        masterAuthorityRuntimeState.machineFragmentAssignments;
+    bool changed = false;
+    if (upsertMachineFragmentAssignment(
+            assignments, machine->uuid, machine->fragment, changed) == false)
+    {
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    if (captureLiveMachineFragmentAssignmentsForCommit(assignments, changed) == false)
+    {
+      return MachineFragmentAssignmentPersistence::rejected;
+    }
+    if (!changed && masterAuthorityRuntimeStateDurable &&
+        durableMasterAuthorityRuntimeStateGeneration ==
+            masterAuthorityRuntimeState.generation)
+    {
+      return MachineFragmentAssignmentPersistence::durable;
+    }
+    if (usesAsyncMasterAuthorityPersistence())
+    {
+      return persistMachineFragmentAssignmentsAsync(
+          std::move(assignments), machine->uuid, machine->fragment);
+    }
+    return persistMachineFragmentAssignments(std::move(assignments), changed)
+               ? MachineFragmentAssignmentPersistence::durable
+               : MachineFragmentAssignmentPersistence::rejected;
+  }
+
+  bool adoptReportedMachineFragment(
+      Machine *machine,
+      uint8_t reportedDatacenterFragment,
+      uint32_t reportedFragment)
+  {
+    if (machine == nullptr || machine->uuid == 0 ||
+        reportedDatacenterFragment == 0 ||
+        reportedDatacenterFragment != brainConfig.datacenterFragment ||
+        reportedFragment == 0 || reportedFragment > 0x00ffffffu ||
+        (machine->fragment != 0 && machine->fragment != reportedFragment))
+    {
+      return false;
+    }
+
+    const ProdigyMachineFragmentAssignment *registered =
+        findMachineFragmentAssignment(
+            masterAuthorityRuntimeState.machineFragmentAssignments, machine->uuid);
+    if ((registered != nullptr && registered->fragment != reportedFragment) ||
+        (!weAreMaster && registered == nullptr) ||
+        (usedMachineFragments.contains(reportedFragment) &&
+         (registered == nullptr || registered->fragment != reportedFragment)))
+    {
+      return false;
+    }
+    for (Machine *other : machines)
+    {
+      if (other != nullptr && other != machine && other->fragment == reportedFragment)
+      {
+        return false;
+      }
+    }
+    for (const ProdigyPersistentUpdateSelfMachineRecoveryWitness& witness :
+         updateSelfMachineRecoveryWitnesses)
+    {
+      if (witness.machineUUID == machine->uuid)
+      {
+        continue;
+      }
+      uint32_t witnessFragment = 0;
+      if (deriveMachineFragmentFromCapturedBootstraps(
+              witness.containerBootstraps, witnessFragment) &&
+          witnessFragment == reportedFragment)
+      {
+        return false;
+      }
+    }
+    if (updateSelfLocalMachineUUID != 0 &&
+        updateSelfLocalMachineUUID != machine->uuid &&
+        updateSelfLocalMachineFragment == reportedFragment)
+    {
+      return false;
+    }
+
+    const uint32_t previousFragment = machine->fragment;
+    machine->fragment = reportedFragment;
+    machine->runtimeReady = false;
+    if (weAreMaster &&
+        !machineFragmentAssignmentIsDurable(
+            requestDurableMachineFragmentAssignment(machine)))
+    {
+      machine->fragment = previousFragment;
+      return false;
+    }
+    usedMachineFragments.insert(reportedFragment);
+    return true;
+  }
+
+  struct ValidatedStateUploadPlan {
+    ContainerPlan plan = {};
+    uint16_t observedLogicalCores = 0;
+    uint32_t observedMemoryMB = 0;
+    uint32_t observedStorageMB = 0;
+  };
+
+  bool stateUploadPlansOwnReportedMachineFragment(
+      uint8_t *cursor,
+      uint8_t *terminal,
+      const local_container_subnet6& fragment,
+      const ProdigyContainerRetirementJournal& uploadRetirements,
+      uint128_t machineUUID,
+      bool& inventoryEmpty,
+      bool& malformedStateUpload,
+      Vector<ValidatedStateUploadPlan>& validatedPlans,
+      bytell_hash_set<uint128_t>& reportedMachineContainerUUIDs,
+      bytell_hash_set<uint32_t>& reportedMachineContainerFragments)
+  {
+    inventoryEmpty = true;
+    malformedStateUpload = false;
+    validatedPlans.clear();
+    reportedMachineContainerUUIDs.clear();
+    reportedMachineContainerFragments.clear();
+    while (cursor < terminal)
+    {
+      const uintptr_t sizeAddress =
+          (reinterpret_cast<uintptr_t>(cursor) + uintptr_t(Alignment::four) - 1u) &
+          ~(uintptr_t(Alignment::four) - 1u);
+      uint8_t *sizeCursor = reinterpret_cast<uint8_t *>(sizeAddress);
+      if (sizeCursor > terminal || uint64_t(terminal - sizeCursor) < sizeof(uint32_t))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      uint32_t serializedBytes = 0;
+      std::memcpy(&serializedBytes, sizeCursor, sizeof(serializedBytes));
+      const uintptr_t payloadAddress =
+          (reinterpret_cast<uintptr_t>(sizeCursor + sizeof(serializedBytes)) +
+           uintptr_t(Alignment::eight) - 1u) &
+          ~(uintptr_t(Alignment::eight) - 1u);
+      uint8_t *payloadCursor = reinterpret_cast<uint8_t *>(payloadAddress);
+      if (payloadCursor > terminal || serializedBytes > uint64_t(terminal - payloadCursor))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      cursor = payloadCursor + serializedBytes;
+      String serializedPlan = {};
+      uint8_t *extractCursor = sizeCursor;
+      Message::extractToStringView(extractCursor, serializedPlan);
+      ContainerPlan plan = {};
+      if (serializedPlan.data() > terminal ||
+          serializedPlan.size() > uint64_t(terminal - serializedPlan.data()) ||
+          !BitseryEngine::deserializeSafe(serializedPlan, plan))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      ValidatedStateUploadPlan validated = {};
+      validated.observedLogicalCores =
+          static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
+      validated.observedMemoryMB = plan.config.totalMemoryMB();
+      validated.observedStorageMB = plan.config.totalStorageMB();
+      inventoryEmpty = false;
+      // Every reserved mesh address must agree with the reported machine and
+      // container identity before that machine identity can become durable.
+      if (!prodigyValidateContainerPlanMeshIdentity(plan, fragment))
+      {
+        return false;
+      }
+
+      if (plan.uuid == 0 || !reportedMachineContainerUUIDs.insert(plan.uuid).second)
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      if (plan.fragment == 0 ||
+          (plan.fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
+           reportedMachineContainerFragments.contains(plan.fragment)))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      reportedMachineContainerFragments.insert(plan.fragment);
+      if (const auto *retired =
+              prodigyFindContainerRetirementIntentInValidatedJournal(uploadRetirements, plan.uuid))
+      {
+        if (retired->machineUUID != machineUUID ||
+            retired->deploymentID != plan.config.deploymentID() ||
+            retired->applicationID != plan.config.applicationID)
+        {
+          malformedStateUpload = true;
+          return false;
+        }
+        validated.plan = std::move(plan);
+        validatedPlans.push_back(std::move(validated));
+        continue;
+      }
+      if (deploymentLaunchFenced(plan.config.deploymentID()))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      if (plan.system.kind == SystemContainerKind::mothershipTunnelProvider)
+      {
+        validated.plan = std::move(plan);
+        validatedPlans.push_back(std::move(validated));
+        continue;
+      }
+      if (!projectStatefulServingPlan(plan, machineUUID))
+      {
+        malformedStateUpload = true;
+        return false;
+      }
+      validated.plan = std::move(plan);
+      validatedPlans.push_back(std::move(validated));
+    }
+    return cursor == terminal;
   }
 
   void refreshMasterAuthorityRuntimeStateFromLiveFields(void)
@@ -7184,6 +8114,7 @@ public:
         masterAuthorityRuntimeStateDurable = true;
         durableMasterAuthorityRuntimeStateGeneration = generation;
         captureDurableElasticAddressOperations();
+        finalizePendingMachineFragmentAssignmentPersistence();
         if (replicate) queueMasterAuthorityRuntimeStateReplication();
       });
       return;
@@ -7214,6 +8145,7 @@ public:
     masterAuthorityRuntimeStateDurable = true;
     durableMasterAuthorityRuntimeStateGeneration = masterAuthorityRuntimeState.generation;
     captureDurableElasticAddressOperations();
+    finalizePendingMachineFragmentAssignmentPersistence();
     queueMasterAuthorityRuntimeStateReplication();
     return true;
   }
@@ -7246,6 +8178,7 @@ public:
         masterAuthorityRuntimeStateDurable = true;
         durableMasterAuthorityRuntimeStateGeneration = generation;
         captureDurableElasticAddressOperations();
+        finalizePendingMachineFragmentAssignmentPersistence();
         queueMasterAuthorityRuntimeStateReplication();
       }
       if (completion) completion(durable && currentAuthority);
@@ -9162,7 +10095,20 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
-    if (!prodigyStatelessDeploymentAdmissionsValid(restoredRuntimeState.statelessDeploymentAdmissions,
+    if (!masterAuthorityMachineFragmentAssignmentsPreserved(
+            restoredRuntimeState.machineFragmentAssignments) ||
+        !machineFragmentAssignmentsMatchLiveContainers(
+            restoredRuntimeState.machineFragmentAssignments,
+            brainConfig.datacenterFragment) ||
+        !machineFragmentAssignmentsMatchContainerRuntimeStates(
+            restoredRuntimeState.machineFragmentAssignments,
+            package.containerRuntimeStates,
+            brainConfig.datacenterFragment) ||
+        !machineFragmentAssignmentsMatchContainerRuntimeStates(
+            restoredRuntimeState.machineFragmentAssignments,
+            package.servingRuntimeStates,
+            brainConfig.datacenterFragment) ||
+        !prodigyStatelessDeploymentAdmissionsValid(restoredRuntimeState.statelessDeploymentAdmissions,
                                                    restoredRuntimeState.generation) ||
         !statelessDeploymentAdmissionsMatchPersistentPlans(
             restoredRuntimeState.statelessDeploymentAdmissions, package.deploymentPlans)) return false;
@@ -9207,6 +10153,8 @@ public:
     failedDeployments = package.failedDeployments;
     pendingReplicatedContainerRuntimeStates.clear();
     pendingRestoredContainerInventory.clear();
+    restoredContainerInventoryReplayByMachine.clear();
+    persistedInventoryConfirmedAbsentContainers.clear();
     for (const BrainReplicatedContainerRuntimeState& state : package.containerRuntimeStates)
     {
       // Retirement intent is authoritative before views are reconstructed: a
@@ -9224,6 +10172,13 @@ public:
     if (restoreRetiredMachineIdentitiesFromRuntimeState() == false)
     {
       basics_log("persistent master-authority state rejected after apply: invalid machine-retirement journal\n");
+      return false;
+    }
+    // Project network identity only after every fallible authority restore has
+    // accepted the package. A rejected package must not alter live prefixes.
+    if (projectMachineFragmentAssignmentsFromMasterAuthorityState() == false)
+    {
+      basics_log("persistent master-authority state rejected after apply: invalid machine-fragment registry\n");
       return false;
     }
     masterAuthorityRuntimeStateDurable = true;
@@ -9385,7 +10340,10 @@ public:
       const BrainConfig *validationConfig = nullptr)
   {
     const BrainConfig& credentialConfig = validationConfig != nullptr ? *validationConfig : brainConfig;
-    if (!prodigyValidatePersistentClusterPairEnrollmentDescriptors(
+    if (!masterAuthorityMachineFragmentAssignmentsPreserved(incoming.machineFragmentAssignments) ||
+        !machineFragmentAssignmentsMatchLiveContainers(
+            incoming.machineFragmentAssignments, credentialConfig.datacenterFragment) ||
+        !prodigyValidatePersistentClusterPairEnrollmentDescriptors(
             incoming.clusterPairEnrollments, credentialConfig.clusterUUID,
             incoming.generation, true, false) ||
         !prodigyValidatePersistentTransportCredentialEnrollments(
@@ -9706,6 +10664,14 @@ public:
     // Scheduler/view ownership can change while the candidate writer holds
     // its receipt. Revalidate before projection; a rejected apply sends no
     // authority ACK, so the existing sender will retry after work settles.
+    if (!masterAuthorityMachineFragmentAssignmentsPreserved(
+            prepared.runtimeState.machineFragmentAssignments) ||
+        !machineFragmentAssignmentsMatchLiveContainers(
+            prepared.runtimeState.machineFragmentAssignments,
+            brainConfig.datacenterFragment))
+    {
+      return false;
+    }
     ProdigyContainerRetirementJournal retiring = {};
     if (!decodeContainerRetirementJournal(prepared.runtimeState, retiring)) return false;
     for (const auto& intent : retiring.intents)
@@ -9750,6 +10716,7 @@ public:
       {
         durableMasterAuthorityRuntimeStateGeneration = sanitizedIncoming.generation;
         captureDurableElasticAddressOperations();
+        (void)projectMachineFragmentAssignmentsFromMasterAuthorityState();
       }
       else
       {
@@ -9772,6 +10739,7 @@ public:
           durableMasterAuthorityRuntimeStateGeneration = sanitizedIncoming.generation;
           captureDurableElasticAddressOperations();
         }
+        (void)projectMachineFragmentAssignmentsFromMasterAuthorityState();
         return true;
       }
       return false;
@@ -9834,6 +10802,11 @@ public:
       (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
       (void)configureMachineRetirementProviderFence(masterAuthorityRuntimeState);
       (void)restoreRetiredMachineIdentitiesFromRuntimeState();
+      return false;
+    }
+
+    if (projectMachineFragmentAssignmentsFromMasterAuthorityState() == false)
+    {
       return false;
     }
 
@@ -9940,6 +10913,10 @@ public:
          !incoming.statelessAdmissionPlans.empty()) ||
         (!incomingRetirements.pairedSourceFences.empty() &&
          (incoming.version < 4 || !pairedSourceRetirementFencesMatchAuthoritativePlans(incomingRetirements))) ||
+        !machineFragmentAssignmentsMatchContainerRuntimeStates(
+            incoming.runtimeState.machineFragmentAssignments,
+            incoming.servingRuntimeStates,
+            incoming.brainConfig.datacenterFragment) ||
         !prodigyValidateStatefulServingAuthorities(incoming.runtimeState.statefulServingAuthorities,
               incoming.servingRuntimeStates, incoming.runtimeState.generation) ||
         validatePendingElasticAddressOperations(incoming.runtimeState, &incoming.brainConfig) == false ||
@@ -10061,14 +11038,15 @@ public:
   virtual bool usesAsyncMasterAuthorityPersistence() const { return false; }
 
   // An async authority transition must hold this ownership receipt before its
-  // candidate reaches persistent storage. A true result accepts exactly one
-  // Ring completion; false admits nothing and never calls completion.
-  virtual bool claimLocalClusterOwnershipAsync(
+  // candidate reaches persistent storage. An admitted result accepts exactly
+  // one Ring completion. Backpressure admits nothing and may be retried by the
+  // retained owner; rejection is terminal for that request.
+  virtual UpdateSelfPersistenceAdmission claimLocalClusterOwnershipAsync(
       uint128_t clusterUUID, std::function<void(bool)> completion)
   {
     (void)clusterUUID;
     (void)completion;
-    return false;
+    return UpdateSelfPersistenceAdmission::rejected;
   }
 
   // The candidate must be detached before the worker reads it. A true result
@@ -10274,7 +11252,8 @@ public:
           candidate.runtimeState.transportCredentialEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 2; })) candidate.version = 9;
     const std::weak_ptr<PendingReplicatedMasterAuthorityTransition> weakPending = pending;
-    const bool ownershipAdmitted = claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
+    const UpdateSelfPersistenceAdmission ownershipAdmission =
+        claimLocalClusterOwnershipAsync(candidate.brainConfig.clusterUUID,
         [this, weakPending, candidate = std::move(candidate)](bool owned) mutable {
           // A destroyed Brain releases its pending owner. Do not dereference
           // this until that lifetime token has been recovered successfully.
@@ -10318,7 +11297,8 @@ public:
             resumeQueuedReplicatedMasterAuthorityTransitions();
           }
         });
-    if (!ownershipAdmitted && pendingReplicatedMasterAuthorityTransition == pending)
+    if (ownershipAdmission != UpdateSelfPersistenceAdmission::admitted &&
+        pendingReplicatedMasterAuthorityTransition == pending)
     {
       pendingReplicatedMasterAuthorityTransition.reset();
       // Ownership admission failure leaves the candidate unapplied and unacknowledged.
@@ -10507,8 +11487,105 @@ public:
       }
 
       container->wormholes = plan.wormholes;
-      container->whiteholes = plan.whiteholes;
+      const bool retiring = container->state == ContainerState::aboutToDestroy ||
+          container->state == ContainerState::destroying ||
+          container->state == ContainerState::destroyed;
+      if (retiring)
+      {
+        // The old process can still own these sockets until its destruction
+        // acknowledgement. Keep the bindings visible so the lease sweep below
+        // cannot make their tuples available to another container early.
+        container->networkAccess = plan.networkAccess;
+        continue;
+      }
+      // Whiteholes in the deployment plan are declarations. Reconcile them
+      // against the live bindings rather than replacing every resolved tuple
+      // with a declaration: a live container owns its address, port, and
+      // binding nonce. Each prior binding can satisfy only one unchanged
+      // declaration, while deleted bindings disappear and new or changed
+      // declarations remain unresolved for the owner to allocate.
+      Vector<Whitehole> reconciledWhiteholes = {};
+      reconciledWhiteholes.reserve(plan.whiteholes.size());
+      Vector<bool> retainedBindings(container->whiteholes.size(), false);
+      for (const Whitehole& declaration : plan.whiteholes)
+      {
+        Whitehole reconciled = declaration;
+        reconciled.hasAddress = false;
+        reconciled.address = {};
+        reconciled.sourcePort = 0;
+        reconciled.bindingNonce = 0;
+        for (uint32_t index = 0; index < container->whiteholes.size(); ++index)
+        {
+          const Whitehole& binding = container->whiteholes[index];
+          if (retainedBindings[index] || binding.transport != declaration.transport ||
+              binding.family != declaration.family || binding.source != declaration.source ||
+              binding.hasAddress == false || binding.address.isNull() || binding.sourcePort == 0 ||
+              binding.bindingNonce == 0)
+          {
+            continue;
+          }
+
+          reconciled = binding;
+          retainedBindings[index] = true;
+          break;
+        }
+        reconciledWhiteholes.push_back(std::move(reconciled));
+      }
+      container->whiteholes = std::move(reconciledWhiteholes);
       container->networkAccess = plan.networkAccess;
+    }
+    if (weAreMaster)
+    {
+      const RoutableResourceLeaseOwner owner = deployment->routableResourceLeaseOwner();
+      Vector<Whitehole> staleLeaseBindings = {};
+      for (const RoutableResourceLease& lease : routableResourceLeaseRuntimeState)
+      {
+        if (lease.kind != RoutableResourceLeaseKind::whiteholeAddressPort ||
+            lease.owner.deploymentID != owner.deploymentID)
+        {
+          continue;
+        }
+
+        bool stillBound = false;
+        for (ContainerView *container : deployment->containers)
+        {
+          if (container == nullptr)
+          {
+            continue;
+          }
+          for (const Whitehole& whitehole : container->whiteholes)
+          {
+            if (whitehole.hasAddress && whitehole.address.equals(lease.address) &&
+                whitehole.sourcePort == lease.sourcePort)
+            {
+              stillBound = true;
+              break;
+            }
+          }
+          if (stillBound)
+          {
+            break;
+          }
+        }
+        if (stillBound || std::any_of(staleLeaseBindings.begin(), staleLeaseBindings.end(),
+                                      [&](const Whitehole& binding) {
+                                        return binding.address.equals(lease.address) &&
+                                               binding.sourcePort == lease.sourcePort;
+                                      }))
+        {
+          continue;
+        }
+
+        Whitehole binding = {};
+        binding.hasAddress = true;
+        binding.address = lease.address;
+        binding.sourcePort = lease.sourcePort;
+        staleLeaseBindings.push_back(std::move(binding));
+      }
+      for (const Whitehole& binding : staleLeaseBindings)
+      {
+        (void)deployment->releaseWhiteholeAddressPortLease(binding, owner);
+      }
     }
   }
 
@@ -10860,6 +11937,7 @@ public:
     container->wormholeRuntimeDesired = protectedDesiredBytes;
     container->wormholeRuntimePendingMachines.clear();
     container->wormholeRuntimeFailedMachines.clear();
+    container->wormholeRuntimePendingIOGenerations.clear();
     if (!desiredUpgraded)
     {
       for (uint32_t fragment : state.wormholeRuntimePendingMachines)
@@ -15695,6 +16773,13 @@ public:
       return true;
     }
 
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    recoveryPersistenceRetryPending = admission == UpdateSelfPersistenceAdmission::backpressured;
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      return false;
+    }
+
     const Vector<RoutableResourceLease> previousLeases = routableResourceLeaseRuntimeState;
     const ProdigyMasterAuthorityRuntimeState previousRuntimeState = masterAuthorityRuntimeState;
     const bool previousDurable = masterAuthorityRuntimeStateDurable;
@@ -15716,6 +16801,7 @@ public:
         masterAuthorityRuntimeState = previousRuntimeState;
         masterAuthorityRuntimeStateDurable = previousDurable;
         durableMasterAuthorityRuntimeStateGeneration = previousDurableGeneration;
+        recoveryPersistenceRetryPending = true;
       }
       if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
     });
@@ -15819,6 +16905,73 @@ public:
       return false;
     }
 
+    // Per-machine absence is not a fleet deficit.  A successor launched by the
+    // previous master may be reported by a later machine upload, so discard
+    // inherited absent views only after every live machine is authoritative.
+    Vector<uint128_t> resolvedAbsentContainers = {};
+    for (uint128_t uuid : persistedInventoryConfirmedAbsentContainers)
+    {
+      bool reportedPresent = false;
+      for (Machine *machine : machines)
+      {
+        if (machine == nullptr || machine->uuid == 0 ||
+            machine->state == MachineState::hardwareFailure ||
+            machine->state == MachineState::decommissioning)
+        {
+          continue;
+        }
+        auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+        if (inventory != containerRetirementInventoryByMachine.end() &&
+            inventory->second.authorityEpoch == masterAuthorityEpoch &&
+            inventory->second.ioGeneration == machine->neuron.ioGeneration &&
+            inventory->second.present.contains(uuid))
+        {
+          reportedPresent = true;
+          break;
+        }
+      }
+      if (reportedPresent)
+      {
+        resolvedAbsentContainers.push_back(uuid);
+        continue;
+      }
+
+      auto canonical = containers.find(uuid);
+      if (canonical == containers.end() || canonical->second == nullptr)
+      {
+        resolvedAbsentContainers.push_back(uuid);
+        continue;
+      }
+      ContainerView *container = canonical->second;
+      if (container->state == ContainerState::planned ||
+          container->state == ContainerState::scheduled)
+      {
+        // An exact-UUID replay has reclaimed this owner since the absence was
+        // observed.  Its normal launch/inventory path owns the next decision.
+        resolvedAbsentContainers.push_back(uuid);
+        continue;
+      }
+      auto deployment = deployments.find(container->deploymentID);
+      if (deployment == deployments.end() || deployment->second == nullptr)
+      {
+        return false;
+      }
+      prodigyCancelWormholeRuntimeAckDeadline(container);
+      if (deployment->second->discardConfirmedAbsentRecoveredContainer(container) == false)
+      {
+        return false;
+      }
+      resolvedAbsentContainers.push_back(uuid);
+    }
+    for (uint128_t uuid : resolvedAbsentContainers)
+    {
+      persistedInventoryConfirmedAbsentContainers.erase(uuid);
+    }
+    if (persistedInventoryConfirmedAbsentContainers.empty() == false)
+    {
+      return false;
+    }
+
     if (recoveredNeuronPairingsUnified == false)
     {
       mesh->unifyPairingHalves();
@@ -15862,6 +17015,7 @@ public:
     }
     if (!reconcileContainerRetirements()) return false;
     recoveringPersistedNeuronInventory = false;
+    persistedInventoryConfirmedAbsentContainers.clear();
     return true;
   }
 
@@ -15921,6 +17075,7 @@ public:
           masterAuthorityRuntimeState = before;
           masterAuthorityRuntimeStateDurable = wasDurable;
           durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+          recoveryPersistenceRetryPending = true;
         }
         return;
       }
@@ -16058,6 +17213,7 @@ public:
             masterAuthorityRuntimeState = before;
             masterAuthorityRuntimeStateDurable = wasDurable;
             durableMasterAuthorityRuntimeStateGeneration = durableGeneration;
+            recoveryPersistenceRetryPending = true;
           }
           if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
         });
@@ -16147,7 +17303,6 @@ public:
       if (head->state == DeploymentState::none) head->state = DeploymentState::waitingToDeploy;
       (void)head->beginRetainedStorageRecoverySlot(sourceMachine, retry.retryContainerUUID, retry.source);
     }
-
     // Hold accepted heads until exact inventory and real replacement health
     // permit their existing deployment owner to resume the retained handoff.
     Vector<String> completedRecoveryOperations;
@@ -16264,7 +17419,6 @@ public:
       head->materializedStatefulRecoveryOwnsTransition = true;
       head->resumeMaterializedStatefulRecovery();
     }
-
     if (!completedRecoveryOperations.empty())
     {
       const uint64_t epoch = masterAuthorityEpoch;
@@ -16277,9 +17431,12 @@ public:
         receipt->completed = true;
         receipt->durable = durable && masterAuthorityEpoch == epoch;
         if (!receipt->durable && masterAuthorityEpoch == epoch && masterAuthorityRuntimeState.generation == generation)
+        {
           for (auto& operation : masterAuthorityRuntimeState.materializedStatefulRecoveryOperations)
             for (const String& id : operationIDs)
               if (operation.operationID.equals(id)) operation.completed = false;
+          recoveryPersistenceRetryPending = true;
+        }
         if (receipt->returned && receipt->durable) recoverDeploymentsAfterNeuronState();
       });
       receipt->returned = true;
@@ -16367,6 +17524,7 @@ public:
           {
             current->second->state = DeploymentState::none;
             current->second->stateChangedAtMs = stateChangedAtMs;
+            recoveryPersistenceRetryPending = true;
             return;
           }
           receipt->durable = true;
@@ -18018,8 +19176,10 @@ public:
     // Retry before appending heartbeats, so an already queued control frame
     // suppresses duplicate authority work without starving it behind this tick.
     retryMasterAuthorityRuntimeStatePersistence();
+    retryDeferredMachineFragmentAssignments();
     retryDeferredRecoveryPersistence();
     retryDeferredPersistenceBackpressureContinuations();
+    retryPendingMothershipConfiguration();
     queueMasterAuthorityRuntimeStateReplication(true);
     driveTransportCredentialEnrollmentOperations();
     driveClusterPairEnrollmentOperations();
@@ -18626,6 +19786,12 @@ public:
       {
         Machine *machine = neuron->machine;
         discardPersistedMachineStateUploadInventory(machine);
+        restoredContainerInventoryReplayByMachine.erase(machine->uuid);
+        machine->stateUploadRequestPending = false;
+        machine->stateUploadRequestIOGeneration = 0;
+        machine->switchboardStateSyncPending = false;
+        machine->switchboardStateSyncReplayContainerRoutes = false;
+        machine->switchboardStateSyncIOGeneration = 0;
         // A transport close says nothing about a scheduled process: the
         // spinContainer frame may have reached Neuron and the process may be
         // live. Do not treat the machine as schedulable until its replacement
@@ -18844,6 +20010,53 @@ public:
     containerRetirementInventoryByMachine.erase(machine->uuid);
   }
 
+  void rebindMissingScheduledContainerMeshIdentitiesForReplay(
+      Machine *machine,
+      const bytell_hash_set<uint128_t>& reportedMachineContainerUUIDs)
+  {
+    if (machine == nullptr || brainConfig.datacenterFragment == 0 ||
+        machine->fragment == 0)
+    {
+      return;
+    }
+
+    for (const auto& [deploymentID, machineContainers] :
+         machine->containersByDeploymentID)
+    {
+      (void)deploymentID;
+      for (ContainerView *container : machineContainers)
+      {
+        if (container == nullptr || container->state != ContainerState::scheduled ||
+            container->fragment == 0 ||
+            container->fragment == prodigyMothershipTunnelProviderRuntimeFragment ||
+            reportedMachineContainerUUIDs.contains(container->uuid))
+        {
+          continue;
+        }
+
+        // A fresh authenticated inventory proves this scheduled UUID never
+        // became a live process.  Its retained launch record can predate an
+        // authoritative machine-fragment recovery, so derive the replay
+        // address from the now-attested machine identity before resubmitting
+        // that same UUID.  No live container identity is rewritten here.
+        container->setMeshAddress(container_network_subnet6,
+                                  brainConfig.datacenterFragment,
+                                  machine->fragment,
+                                  container->fragment);
+        container->addresses.erase(
+            std::remove_if(container->addresses.begin(), container->addresses.end(),
+                           [](const IPPrefix& address) {
+                             return address.network.is6 && address.cidr == 128 &&
+                                    std::memcmp(address.network.v6,
+                                                container_network_subnet6.value,
+                                                sizeof(container_network_subnet6.value)) == 0;
+                           }),
+            container->addresses.end());
+        container->addresses.emplace_back(container->meshAddress, uint8_t(128));
+      }
+    }
+  }
+
   // Normal registration/state-upload replay is scheduler-owned. It must retain
   // the original generated-plan path so a fresh Neuron, or a post-close replay
   // of a scheduled UUID, can receive its first bootstrap before any accepted
@@ -18912,6 +20125,11 @@ public:
           return false;
         }
         if (containerRuntimeStateRetired(masterAuthorityRuntimeState, container->uuid)) continue;
+        if (container->state == ContainerState::scheduled && container->isStateful &&
+            deployment->hydrateOwnedRecoveryWhiteholeBindings(machine, container) == false)
+        {
+          return false;
+        }
         ApplicationConfig replayConfig = deployment->resourceConfigForContainer(container);
         ContainerPlan planToReplay = container->generatePlan(deployment->plan, deployment->nShardGroups, &replayConfig);
         if (planToReplay.isStateful)
@@ -19023,7 +20241,8 @@ public:
     // still awaiting materialization. Retain exact UUIDs across split batches.
     if (!pendingReplicatedContainerRuntimeStates.empty()) return false;
     Vector<uint128_t> observed;
-    bytell_hash_set<Machine *> replay;
+    bytell_hash_set<Machine *> progressed;
+    bytell_hash_set<Machine *> missing;
     for (uint128_t uuid : pendingRestoredContainerInventory)
     {
       auto current = containers.find(uuid);
@@ -19040,25 +20259,136 @@ public:
       if (inventory == containerRetirementInventoryByMachine.end() ||
           inventory->second.authorityEpoch != masterAuthorityEpoch ||
           inventory->second.ioGeneration != machine->neuron.ioGeneration) continue;
-      if (inventory->second.present.contains(uuid)) observed.push_back(uuid);
-      else replay.insert(machine);
+      if (inventory->second.present.contains(uuid))
+      {
+        observed.push_back(uuid);
+        progressed.insert(machine);
+      }
+      else
+      {
+        missing.insert(machine);
+      }
     }
     for (uint128_t uuid : observed) pendingRestoredContainerInventory.erase(uuid);
-    for (Machine *machine : replay)
+    for (Machine *machine : progressed)
     {
+      restoredContainerInventoryReplayByMachine.erase(machine->uuid);
+    }
+    for (Machine *machine : missing)
+    {
+      const auto replayed = restoredContainerInventoryReplayByMachine.find(machine->uuid);
+      if (replayed != restoredContainerInventoryReplayByMachine.end() &&
+          replayed->second.ioGeneration == machine->neuron.ioGeneration &&
+          replayed->second.awaitingInventory)
+      {
+        continue;
+      }
       traceContainerRetirement("restored inventory replay private4=%u pending=%zu\n",
           unsigned(machine->private4), size_t(pendingRestoredContainerInventory.size()));
       // The ordinary replay owner invalidates the receipt immediately. It
       // adopts these same UUIDs and later reports actual runtime health.
+      const size_t bufferedBeforeReplay = machine->neuron.wBuffer.size();
       queueNeuronStateUploadForMachine(machine);
-      refreshNeuronControlHandshakeWatchdog(&machine->neuron, "restored-inventory-replay");
+      if (machine->neuron.wBuffer.size() > bufferedBeforeReplay)
+      {
+        RestoredContainerInventoryReplay replay =
+            (replayed != restoredContainerInventoryReplayByMachine.end() &&
+             replayed->second.ioGeneration == machine->neuron.ioGeneration)
+                ? replayed->second
+                : RestoredContainerInventoryReplay{};
+        replay.ioGeneration = machine->neuron.ioGeneration;
+        replay.attempts = uint8_t(std::min<unsigned>(unsigned(replay.attempts) + 1u, 2u));
+        replay.awaitingInventory = true;
+        restoredContainerInventoryReplayByMachine.insert_or_assign(machine->uuid, replay);
+        refreshNeuronControlHandshakeWatchdog(&machine->neuron, "restored-inventory-replay");
+      }
     }
-    return pendingRestoredContainerInventory.empty();
+    if (pendingRestoredContainerInventory.empty())
+    {
+      restoredContainerInventoryReplayByMachine.clear();
+      return true;
+    }
+    return false;
+  }
+
+  bool noteRestoredContainerInventoryReplayProgress(uint128_t containerUUID, Machine *machine)
+  {
+    if (!recoveringPersistedNeuronInventory || machine == nullptr || machine->uuid == 0 ||
+        !pendingRestoredContainerInventory.contains(containerUUID))
+    {
+      return false;
+    }
+    // A health or failure frame is a reason to re-run the recovery driver, but
+    // it is not an inventory attestation.  Keep this control generation's
+    // bounded replay budget until an accepted stateUpload proves the UUID is
+    // present.  Otherwise a repeatedly failing cold restart can erase the
+    // attempt counter before every empty upload and strand deployment recovery
+    // behind this barrier forever.
+    return true;
+  }
+
+  void noteRestoredContainerInventoryReplayInventoryResult(Machine *machine)
+  {
+    if (!recoveringPersistedNeuronInventory || machine == nullptr || machine->uuid == 0)
+    {
+      return;
+    }
+    auto replayed = restoredContainerInventoryReplayByMachine.find(machine->uuid);
+    if (replayed == restoredContainerInventoryReplayByMachine.end() ||
+        replayed->second.ioGeneration != machine->neuron.ioGeneration ||
+        replayed->second.awaitingInventory == false)
+    {
+      return;
+    }
+    auto inventory = containerRetirementInventoryByMachine.find(machine->uuid);
+    if (inventory == containerRetirementInventoryByMachine.end() ||
+        inventory->second.authorityEpoch != masterAuthorityEpoch ||
+        inventory->second.ioGeneration != machine->neuron.ioGeneration)
+    {
+      return;
+    }
+    bool pendingForMachine = false;
+    bool observedProgress = false;
+    for (uint128_t uuid : pendingRestoredContainerInventory)
+    {
+      auto current = containers.find(uuid);
+      if (current == containers.end() || current->second == nullptr || current->second->machine != machine)
+      {
+        continue;
+      }
+      pendingForMachine = true;
+      if (inventory->second.present.contains(uuid))
+      {
+        observedProgress = true;
+        break;
+      }
+    }
+    if (!pendingForMachine || observedProgress)
+    {
+      restoredContainerInventoryReplayByMachine.erase(replayed);
+      return;
+    }
+    if (replayed->second.attempts < 2)
+    {
+      replayed->second.awaitingInventory = false;
+      return;
+    }
+    basics_log("brain restored inventory replay exhausted machineUUID=%llu generation=%llu attempts=%u\n",
+               (unsigned long long)machine->uuid,
+               (unsigned long long)machine->neuron.ioGeneration,
+               unsigned(replayed->second.attempts));
+    queueCloseIfActive(&machine->neuron);
   }
 
   void queueNeuronStateUploadForMachine(Machine *machine)
   {
     if (machine == nullptr || brainConfig.datacenterFragment == 0 || machine->fragment == 0)
+    {
+      return;
+    }
+
+    if (machine->stateUploadRequestPending &&
+        machine->stateUploadRequestIOGeneration == machine->neuron.ioGeneration)
     {
       return;
     }
@@ -19136,12 +20466,9 @@ public:
     }
 
     Message::finish(machine->neuron.wBuffer, headerOffset);
+    machine->stateUploadRequestPending = true;
+    machine->stateUploadRequestIOGeneration = machine->neuron.ioGeneration;
 
-    std::fprintf(stderr,
-                 "brain stateUpload queued machineUUID=%llu bootstraps=%zu active=%d fragment=%u epoch=%llu\n",
-                 (unsigned long long)machine->uuid, size_t(bootstraps->size()), int(controlActive),
-                 unsigned(machine->fragment), (unsigned long long)masterAuthorityEpoch);
-    std::fflush(stderr);
     if (streamIsActive(&machine->neuron))
     {
       Ring::queueSend(&machine->neuron);
@@ -19286,6 +20613,15 @@ public:
       return false;
     }
     if (legacyLocal) updateSelfLocalMachineFragment = expectedFragment;
+    const ProdigyMachineFragmentAssignment *registered =
+        findMachineFragmentAssignment(
+            masterAuthorityRuntimeState.machineFragmentAssignments, machine->uuid);
+    if (registered != nullptr && registered->fragment != expectedFragment)
+    {
+      updateSelfWorkerFailure.assign("bootstrap recovery machine fragment conflicts with durable registry"_ctv);
+      noteMasterAuthorityRuntimeStateChanged();
+      return false;
+    }
     if (machine->fragment != 0 && machine->fragment != expectedFragment)
     {
       updateSelfWorkerFailure.assign("bootstrap recovery machine fragment conflicts with checkpoint"_ctv);
@@ -19308,10 +20644,17 @@ public:
     }
 
     machine->fragment = expectedFragment;
-    usedMachineFragments.insert(expectedFragment);
     machine->reportedDatacenterFragment = 0;
     machine->reportedFragment = 0;
     machine->runtimeReady = false;
+    if (weAreMaster &&
+        !machineFragmentAssignmentIsDurable(
+            requestDurableMachineFragmentAssignment(machine)))
+    {
+      machine->fragment = 0;
+      return false;
+    }
+    usedMachineFragments.insert(expectedFragment);
     return true;
   }
 
@@ -19349,6 +20692,16 @@ public:
       return;
     }
 
+    // Machine fragments are part of the persistent container-network address
+    // identity. A follower may retain a proven fragment for a later handoff,
+    // but it must never mint or publish a replacement before becoming master.
+    // On promotion the persisted-inventory fence below adopts the fragment
+    // reported by the live Neuron before routing or scheduling can resume.
+    if (weAreMaster == false)
+    {
+      return;
+    }
+
     if (persistedRecoveryMustAwaitReportedMachineFragment(machine) &&
         provenFreshEmptyRecoveryInventory == false)
     {
@@ -19366,49 +20719,75 @@ public:
 
     if (machine->fragment == 0)
     {
-      do
+      const ProdigyMachineFragmentAssignment *restoredAssignment =
+          findMachineFragmentAssignment(
+              masterAuthorityRuntimeState.machineFragmentAssignments, machine->uuid);
+      if (restoredAssignment != nullptr)
       {
-        if (fakeIPv4Mode)
+        machine->fragment = restoredAssignment->fragment;
+      }
+      else
+      {
+        do
         {
-          IPAddress preferredAddress = {};
-          uint32_t preferred = 0;
-          if (prodigyResolveMachinePeerAddress(*machine, preferredAddress))
+          if (fakeIPv4Mode)
           {
-            preferred = preferredAddress.is6
-                            ? uint32_t(preferredAddress.v6[15])
-                            : (ntohl(preferredAddress.v4) & 0xFFu);
-          }
-          else if (machine->private4 != 0)
-          {
-            preferred = ntohl(machine->private4) & 0xFFu;
-          }
-          if (preferred == 0)
-          {
-            preferred = 1;
-          }
-
-          machine->fragment = 0;
-          for (uint32_t offset = 0; offset < 255; ++offset)
-          {
-            uint32_t candidate = ((preferred + offset - 1u) % 255u) + 1u;
-            if (usedMachineFragments.contains(candidate) == false)
+            IPAddress preferredAddress = {};
+            uint32_t preferred = 0;
+            if (prodigyResolveMachinePeerAddress(*machine, preferredAddress))
             {
-              machine->fragment = candidate;
-              break;
+              preferred = preferredAddress.is6
+                              ? uint32_t(preferredAddress.v6[15])
+                              : (ntohl(preferredAddress.v4) & 0xFFu);
+            }
+            else if (machine->private4 != 0)
+            {
+              preferred = ntohl(machine->private4) & 0xFFu;
+            }
+            if (preferred == 0)
+            {
+              preferred = 1;
+            }
+
+            machine->fragment = 0;
+            for (uint32_t offset = 0; offset < 255; ++offset)
+            {
+              uint32_t candidate = ((preferred + offset - 1u) % 255u) + 1u;
+              if (usedMachineFragments.contains(candidate) == false)
+              {
+                machine->fragment = candidate;
+                break;
+              }
+            }
+
+            if (machine->fragment == 0)
+            {
+              machine->fragment = Random::generateNumberWithNBits<24, uint32_t>();
             }
           }
-
-          if (machine->fragment == 0)
+          else
           {
             machine->fragment = Random::generateNumberWithNBits<24, uint32_t>();
           }
-        }
-        else
-        {
-          machine->fragment = Random::generateNumberWithNBits<24, uint32_t>();
-        }
 
-      } while (usedMachineFragments.contains(machine->fragment));
+        } while (machine->fragment == 0 || usedMachineFragments.contains(machine->fragment));
+      }
+    }
+
+    const MachineFragmentAssignmentPersistence assignmentPersistence =
+        requestDurableMachineFragmentAssignment(machine);
+    if (!machineFragmentAssignmentIsDurable(assignmentPersistence))
+    {
+      machine->fragment = 0;
+      machine->reportedDatacenterFragment = 0;
+      machine->reportedFragment = 0;
+      machine->runtimeReady = false;
+      return;
+    }
+    if (assignmentPersistence ==
+        MachineFragmentAssignmentPersistence::durablePublished)
+    {
+      return;
     }
 
     usedMachineFragments.insert(machine->fragment);
@@ -19434,9 +20813,78 @@ public:
     sendNeuronSwitchboardOverlayRoutes();
   }
 
+  void retryDeferredMachineFragmentAssignments(void)
+  {
+    if (!machineFragmentAssignmentContinuationPending ||
+        pendingMachineFragmentAssignmentPersistence)
+    {
+      return;
+    }
+    if (!weAreMaster || brainConfig.datacenterFragment == 0)
+    {
+      machineFragmentAssignmentContinuationPending = false;
+      clearDeferredMachineFragmentAssignment();
+      return;
+    }
+
+    machineFragmentAssignmentContinuationPending = false;
+    if (deferredMachineFragmentAssignmentUUID != 0)
+    {
+      const uint64_t epoch = deferredMachineFragmentAssignmentEpoch;
+      const uint128_t machineUUID = deferredMachineFragmentAssignmentUUID;
+      const uint32_t fragment = deferredMachineFragmentAssignmentFragment;
+      clearDeferredMachineFragmentAssignment();
+      auto machineIt = machinesByUUID.find(machineUUID);
+      if (epoch == masterAuthorityEpoch && machineIt != machinesByUUID.end() &&
+          machineIt->second != nullptr && fragment != 0 && fragment <= 0x00ffffffu)
+      {
+        Machine *machine = machineIt->second;
+        const uint32_t previousFragment = machine->fragment;
+        if (previousFragment == 0 || previousFragment == fragment)
+        {
+          machine->fragment = fragment;
+          assignMachineFragment(machine);
+          if (pendingMachineFragmentAssignmentPersistence)
+          {
+            return;
+          }
+          const ProdigyMachineFragmentAssignment *assignment =
+              findMachineFragmentAssignment(
+                  masterAuthorityRuntimeState.machineFragmentAssignments,
+                  machineUUID);
+          if (masterAuthorityRuntimeStateDurable &&
+              durableMasterAuthorityRuntimeStateGeneration ==
+                  masterAuthorityRuntimeState.generation &&
+              assignment != nullptr && assignment->fragment == fragment &&
+              machine->fragment == fragment)
+          {
+            // An inline fixture or an already-durable retry can finish in this
+            // turn. Consume its general continuation and drain the next machine.
+            machineFragmentAssignmentContinuationPending = false;
+            refreshMachineFragmentAssignmentsIfPossible();
+            return;
+          }
+          if (previousFragment == 0 && machine->fragment == fragment)
+          {
+            machine->fragment = 0;
+          }
+          if (!machineFragmentAssignmentContinuationPending)
+          {
+            deferMachineFragmentAssignmentContinuation(machineUUID, fragment);
+          }
+          return;
+        }
+      }
+    }
+
+    refreshMachineFragmentAssignmentsIfPossible();
+  }
+
   void relinquishMachineFragment(Machine *machine)
   {
-    usedMachineFragments.erase(machine->fragment);
+    // The durable registry is append-only. A retired UUID keeps its fragment
+    // reserved so delayed retained inventory can never collide with a future
+    // machine after controller failover.
     machine->fragment = 0;
     machine->reportedDatacenterFragment = 0;
     machine->reportedFragment = 0;
@@ -19505,9 +20953,14 @@ public:
       return;
     }
 
-    for (auto it = machine->claims.begin(); it != machine->claims.end();)
+    Vector<Machine::Claim> claims = {};
+    claims.swap(machine->claims);
+    for (Machine::Claim& claim : claims)
     {
-      Machine::Claim& claim = *it;
+      // Resuming placement executes scheduler code that may append, erase, or
+      // clear this machine's claims. Detach the bounded ready batch before
+      // crossing that coroutine boundary so no vector reference or iterator
+      // survives it and newly queued work waits for the next readiness pass.
 
       MachineTicket *ticket = claim.ticket;
       ticket->nNow = claim.nFit;
@@ -19518,8 +20971,6 @@ public:
       ticket->machineNow = machine;
 
       ticket->coro->co_consume();
-
-      it = machine->claims.erase(it);
     }
   }
 
@@ -22837,6 +24288,11 @@ public:
         machinesWithHardwareToReplay.push_back(machine);
       }
       applyClusterMachineRecord(machine, clusterMachine, resolvedPrivate4, resolvedPeerAddress, resolvedPeerAddressText);
+      if (projectMachineFragmentAssignment(machine) == false)
+      {
+        if (knownMachine == false) delete machine;
+        return false;
+      }
       PRODIGY_DEBUG_LOG( "prodigy topology restore-machine applied machine=%p uuid=%llu private4=%u isBrain=%d isThisMachine=%d slug=%s cloudID=%s\n",
                    machine,
                    (unsigned long long)machine->uuid,
@@ -22962,6 +24418,8 @@ public:
     if (auto it = containers.find(containerUUID); it != containers.end())
     {
       ContainerView *container = it->second;
+      const bool restoredInventoryProgress =
+          noteRestoredContainerInventoryReplayProgress(containerUUID, container->machine);
       ApplicationDeployment *deployment = nullptr;
       if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end())
       {
@@ -23005,7 +24463,7 @@ public:
         // same guarded owner, even when no further stateUpload will arrive.
         // Wait for the complete target. Once running, repeated health receipts
         // must not trigger another recovery/routing replay.
-        if (recoveringStatefulDeployment ||
+        if (restoredInventoryProgress || recoveringStatefulDeployment ||
             (recoveringStatelessDeployment && deployment->nTarget() > 0 &&
              deployment->nHealthy() >= deployment->nTarget()))
         {
@@ -23017,6 +24475,10 @@ public:
         basics_log("brain local containerHealthy missing deployment for uuid=%llu deploymentID=%llu\n",
                    (unsigned long long)containerUUID,
                    (unsigned long long)container->deploymentID);
+        if (restoredInventoryProgress)
+        {
+          recoverDeploymentsAfterNeuronState();
+        }
       }
     }
     else
@@ -24353,6 +25815,13 @@ public:
     {
       masterAuthorityEpoch = 1;
     }
+    // Detached fragment candidates belong to the exact authority epoch that
+    // admitted them. Invalidate their singleton before a promotion refresh;
+    // a late receipt keeps only its weak candidate and cannot clear or block
+    // the new epoch's assignment.
+    pendingMachineFragmentAssignmentPersistence.reset();
+    machineFragmentAssignmentContinuationPending = false;
+    clearDeferredMachineFragmentAssignment();
     auto canceledCohortWaiters = std::move(addMachinesCohortReadinessWaiters);
     addMachinesCohortReadinessWaiters.clear();
     for (auto& [operationID, waiters] : canceledCohortWaiters)
@@ -24512,6 +25981,8 @@ public:
       persistedMachineInventoryUploaded.clear();
       persistedMachineStateUploadPlansByMachine.clear();
       pendingRestoredContainerInventory.clear();
+      restoredContainerInventoryReplayByMachine.clear();
+      persistedInventoryConfirmedAbsentContainers.clear();
       recoveredNeuronPairingsUnified = false;
     }
 
@@ -26442,6 +27913,7 @@ public:
     neuron->cancelSuspended();
     discardPersistedMachineStateUploadInventory(machine);
     machinesAwaitingPostCloseInventory.erase(machine->uuid);
+    restoredContainerInventoryReplayByMachine.erase(machine->uuid);
 
     machines.erase(machine);
     for (auto indexed = machinesByUUID.begin(); indexed != machinesByUUID.end();)
@@ -27433,6 +28905,7 @@ public:
     for (uint32_t machineFragment : container->wormholeRuntimePendingMachines)
     {
       container->wormholeRuntimeFailedMachines.insert(machineFragment);
+      container->wormholeRuntimePendingIOGenerations.erase(machineFragment);
       (void)container->wormholeRuntimeRetryAttempts[machineFragment];
       basics_log("brain wormhole runtime acknowledgement timeout containerID=%u machineFragment=%u\n",
                  container->generateContainerID(),
@@ -27482,7 +28955,7 @@ public:
       attempt += 1;
       container->wormholeRuntimeFailedMachines.erase(machine->fragment);
       container->wormholeRuntimePendingMachines.insert(machine->fragment);
-      prodigyQueueSwitchboardWormholeOperation(machine, operation);
+      prodigyQueueSwitchboardWormholeOperation(machine, container, operation);
       Ring::queueSend(&machine->neuron);
       queued = true;
     }
@@ -27528,6 +29001,7 @@ public:
       }
       bool changed = container->wormholeRuntimePendingMachines.erase(machine->fragment) > 0;
       changed = container->wormholeRuntimeFailedMachines.erase(machine->fragment) > 0 || changed;
+      container->wormholeRuntimePendingIOGenerations.erase(machine->fragment);
       container->wormholeRuntimeRetryAttempts.erase(machine->fragment);
       if (changed == false)
       {
@@ -30091,9 +31565,27 @@ public:
             break;
           }
 
-          // Missing host should release placement immediately so stateless/service
-          // workloads can move without waiting for remediation escalation timeouts.
-          evacuateFailedMachineContainers(machine);
+          // A promoted Brain does not yet know whether this process loss also
+          // removed the machine's containers.  Keep their exact canonical
+          // owners until the authenticated inventory barrier either re-adopts
+          // them or proves them absent.  A permanent host failure still drains
+          // through the durable machine-retirement owner.
+          if (recoveringPersistedNeuronInventory)
+          {
+            // A pre-disconnect upload is no longer authoritative for this
+            // control generation. Keep the canonical owners, but force the
+            // barrier to wait for a fresh authenticated inventory before it
+            // can prove either presence or absence.
+            discardPersistedMachineStateUploadInventory(machine);
+            machine->runtimeReady = false;
+            machine->stateUploadRequestPending = false;
+            machine->stateUploadRequestIOGeneration = 0;
+            requestNeuronPersistedInventory(machine);
+          }
+          else
+          {
+            evacuateFailedMachineContainers(machine);
+          }
 
           // even if the machine responded to pings, our next action would be to try
           // to SSH in and restart the neuron so there's no point of pinging, the SSH
@@ -30491,6 +31983,28 @@ public:
         return false;
       }
     }
+    auto persistCheckpointMachineFragment = [&]() -> bool {
+      Vector<ProdigyMachineFragmentAssignment> assignments =
+          masterAuthorityRuntimeState.machineFragmentAssignments;
+      bool changed = false;
+      if (upsertMachineFragmentAssignment(
+              assignments,
+              checkpoint.machineUUID,
+              checkpoint.machineFragment,
+              changed) == false ||
+          captureLiveMachineFragmentAssignmentsForCommit(assignments, changed) == false)
+      {
+        if (failure) failure->assign("bootstrap recovery checkpoint conflicts with durable machine fragment registry"_ctv);
+        return false;
+      }
+      if (persistMachineFragmentAssignments(std::move(assignments), changed))
+      {
+        usedMachineFragments.insert(checkpoint.machineFragment);
+        return true;
+      }
+      if (failure) failure->assign("bootstrap recovery checkpoint machine fragment could not be persisted"_ctv);
+      return false;
+    };
 
     if (!installedReceiptSuccessor)
     {
@@ -30516,7 +32030,7 @@ public:
       if (laterInstalledUpdate)
       {
         updateSelfLocalMachineFragment = checkpoint.machineFragment;
-        usedMachineFragments.insert(checkpoint.machineFragment);
+        if (persistCheckpointMachineFragment() == false) return false;
       }
       return true;
     }
@@ -30536,8 +32050,7 @@ public:
         return false;
       }
       updateSelfLocalMachineFragment = checkpoint.machineFragment;
-      usedMachineFragments.insert(checkpoint.machineFragment);
-      return true;
+      return persistCheckpointMachineFragment();
     }
     // Uploaded workers do not prove that the local Brain transition completed.
     // A matching nonempty operation remains pending until local inventory clears it.
@@ -30593,15 +32106,14 @@ public:
     updateSelfWorkerTransitionIssuedMachineUUIDs.clear();
     updateSelfWorkerRebootedMachineUUIDs.clear();
     updateSelfWorkerStateUploadedMachineUUIDs.clear();
-    if (commitMasterAuthorityStateChange() == false)
+    updateSelfLocalMachineFragment = checkpoint.machineFragment;
+    if (persistCheckpointMachineFragment() == false)
     {
       restorePersistentUpdateSelfState(previous);
       updateSelfTransitionAfterMothershipAck = previousTransitionAfterAck;
-      if (failure) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
+      if (failure && failure->empty()) failure->assign("bootstrap bundle supersession state could not be persisted"_ctv);
       return false;
     }
-    updateSelfLocalMachineFragment = checkpoint.machineFragment;
-    usedMachineFragments.insert(checkpoint.machineFragment);
     return true;
   }
 
@@ -34555,6 +36067,7 @@ public:
       recoveringPersistedNeuronInventory = true;
       persistedMachineInventoryUploaded.clear();
       persistedMachineStateUploadPlansByMachine.clear();
+      persistedInventoryConfirmedAbsentContainers.clear();
       recoveredNeuronPairingsUnified = false;
       completion(true);
     });
@@ -39822,13 +41335,19 @@ public:
     });
   }
 
+  bool pendingBrainConfigurationIsCurrent(
+      const std::shared_ptr<PendingConfigureOwnershipReceipt>& pending)
+  {
+    return pendingConfigureOwnershipReceipt == pending && pending != nullptr &&
+           masterAuthorityEpoch == pending->authorityEpoch &&
+           activeMotherships.contains(pending->stream) &&
+           pending->stream->connectionIncarnation == pending->streamIncarnation &&
+           streamIsActive(pending->stream) && Ring::socketIsClosing(pending->stream) == false;
+  }
+
   void resumeOwnedBrainConfiguration(const std::shared_ptr<PendingConfigureOwnershipReceipt>& pending)
   {
-    if (pendingConfigureOwnershipReceipt != pending || pending == nullptr ||
-        masterAuthorityEpoch != pending->authorityEpoch ||
-        activeMotherships.contains(pending->stream) == false ||
-        pending->stream->connectionIncarnation != pending->streamIncarnation ||
-        streamIsActive(pending->stream) == false || Ring::socketIsClosing(pending->stream))
+    if (pendingBrainConfigurationIsCurrent(pending) == false)
     {
       if (pendingConfigureOwnershipReceipt == pending) pendingConfigureOwnershipReceipt.reset();
       return;
@@ -39836,6 +41355,58 @@ public:
     String frame = {};
     Message::construct(frame, MothershipTopic::configure, pending->serializedConfig);
     mothershipHandler(pending->stream, reinterpret_cast<Message *>(frame.data()));
+  }
+
+  void drivePendingBrainConfigurationOwnership(
+      const std::shared_ptr<PendingConfigureOwnershipReceipt>& pending)
+  {
+    if (pendingBrainConfigurationIsCurrent(pending) == false)
+    {
+      if (pendingConfigureOwnershipReceipt == pending) pendingConfigureOwnershipReceipt.reset();
+      return;
+    }
+    if (pending->ownershipDurable)
+    {
+      resumeOwnedBrainConfiguration(pending);
+      return;
+    }
+    if (pending->ownershipPersistencePending) return;
+
+    pending->ownershipPersistencePending = true;
+    const std::weak_ptr<uint8_t> ownershipLifetime = persistenceLifetime;
+    const UpdateSelfPersistenceAdmission admission = claimLocalClusterOwnershipAsync(
+        pending->clusterUUID, [this, pending, ownershipLifetime](bool owned) {
+          if (ownershipLifetime.expired() || pendingConfigureOwnershipReceipt != pending) return;
+          pending->ownershipPersistencePending = false;
+          if (owned == false)
+          {
+            if (masterAuthorityEpoch == pending->authorityEpoch &&
+                activeMotherships.contains(pending->stream) &&
+                pending->stream->connectionIncarnation == pending->streamIncarnation)
+              queueCloseIfActive(pending->stream, "configure-owner-mismatch");
+            pendingConfigureOwnershipReceipt.reset();
+            return;
+          }
+          pending->ownershipDurable = true;
+          resumeOwnedBrainConfiguration(pending);
+        });
+    if (admission == UpdateSelfPersistenceAdmission::admitted ||
+        pendingConfigureOwnershipReceipt != pending)
+    {
+      return;
+    }
+
+    pending->ownershipPersistencePending = false;
+    if (admission == UpdateSelfPersistenceAdmission::backpressured) return;
+    Mothership *stream = pending->stream;
+    pendingConfigureOwnershipReceipt.reset();
+    queueCloseIfActive(stream, "configure-owner-unavailable");
+  }
+
+  void retryPendingMothershipConfiguration(void)
+  {
+    auto pending = pendingConfigureOwnershipReceipt;
+    if (pending) drivePendingBrainConfigurationOwnership(pending);
   }
 
   bool collectLocalUpgradeAdmissionObservation(
@@ -40271,15 +41842,19 @@ public:
 
           const uint64_t configureStreamIncarnation = mothership->connectionIncarnation;
           const uint64_t configureAuthorityEpoch = masterAuthorityEpoch;
-          const bool ownershipAlreadyDurable = pendingConfigureOwnershipReceipt != nullptr &&
-              pendingConfigureOwnershipReceipt->ownershipDurable &&
+          String canonicalIncomingConfig = {};
+          BitseryEngine::serialize(canonicalIncomingConfig, incomingConfig);
+          const bool pendingConfigureMatches = pendingConfigureOwnershipReceipt != nullptr &&
               pendingConfigureOwnershipReceipt->stream == mothership &&
               pendingConfigureOwnershipReceipt->streamIncarnation == configureStreamIncarnation &&
-              pendingConfigureOwnershipReceipt->authorityEpoch == configureAuthorityEpoch;
-          if (ownershipAlreadyDurable == false)
+              pendingConfigureOwnershipReceipt->authorityEpoch == configureAuthorityEpoch &&
+              pendingConfigureOwnershipReceipt->serializedConfig.equals(canonicalIncomingConfig);
+          if (pendingConfigureMatches == false)
           {
             if (pendingConfigureOwnershipReceipt != nullptr)
             {
+              if (pendingConfigureOwnershipReceipt->stream == mothership)
+                pendingConfigureOwnershipReceipt.reset();
               queueCloseIfActive(mothership, "configure-ownership-pending");
               break;
             }
@@ -40287,39 +41862,43 @@ public:
             pending->stream = mothership;
             pending->streamIncarnation = configureStreamIncarnation;
             pending->authorityEpoch = configureAuthorityEpoch;
-            BitseryEngine::serialize(pending->serializedConfig, incomingConfig);
+            pending->clusterUUID = incomingConfig.clusterUUID;
+            pending->serializedConfig = std::move(canonicalIncomingConfig);
             pendingConfigureOwnershipReceipt = pending;
-            const std::weak_ptr<uint8_t> ownershipLifetime = persistenceLifetime;
-            const bool admitted = claimLocalClusterOwnershipAsync(
-                incomingConfig.clusterUUID, [this, pending, ownershipLifetime](bool owned) {
-                  if (ownershipLifetime.expired() || pendingConfigureOwnershipReceipt != pending) return;
-                  if (owned == false)
-                  {
-                    if (masterAuthorityEpoch == pending->authorityEpoch &&
-                        activeMotherships.contains(pending->stream) &&
-                        pending->stream->connectionIncarnation == pending->streamIncarnation)
-                      queueCloseIfActive(pending->stream, "configure-owner-mismatch");
-                    pendingConfigureOwnershipReceipt.reset();
-                    return;
-                  }
-                  pending->ownershipDurable = true;
-                  resumeOwnedBrainConfiguration(pending);
-                });
-            if (admitted == false && pendingConfigureOwnershipReceipt == pending)
-            {
-              pendingConfigureOwnershipReceipt.reset();
-              queueCloseIfActive(mothership, "configure-owner-unavailable");
-            }
+            drivePendingBrainConfigurationOwnership(pending);
             break;
           }
-          pendingConfigureOwnershipReceipt.reset();
+
+          auto pendingConfigure = pendingConfigureOwnershipReceipt;
+          if (pendingConfigure->ownershipDurable == false)
+          {
+            drivePendingBrainConfigurationOwnership(pendingConfigure);
+            break;
+          }
+          if (pendingConfigure->configurationPersistencePending) break;
+
+          const UpdateSelfPersistenceAdmission configurePersistenceAdmission =
+              updateSelfPersistenceAdmission();
+          if (configurePersistenceAdmission == UpdateSelfPersistenceAdmission::backpressured)
+          {
+            break;
+          }
+          if (configurePersistenceAdmission != UpdateSelfPersistenceAdmission::admitted)
+          {
+            pendingConfigureOwnershipReceipt.reset();
+            queueCloseIfActive(mothership, "configure-persistence-unavailable");
+            break;
+          }
 
           if (incomingConfig.runtimeEnvironment.configured() &&
               elasticAddressSagaFencesRuntimeEnvironment(incomingConfig.runtimeEnvironment))
           {
+            pendingConfigureOwnershipReceipt.reset();
             queueCloseIfActive(mothership, "configure-provider-fenced-by-elastic-saga");
             break;
           }
+
+          pendingConfigure->configurationPersistencePending = true;
 
           BrainConfig previousConfig;
           ownBrainConfig(brainConfig, previousConfig);
@@ -40457,15 +42036,29 @@ public:
           const uint64_t streamIncarnation = mothership->connectionIncarnation;
           const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
           commitMasterAuthorityStateChangeAsync(
-              [this, lifetime, mothership, streamIncarnation, configureEpoch,
+              [this, lifetime, pendingConfigure, mothership, streamIncarnation, configureEpoch,
                candidateConfig = std::move(serializedBrainConfig), previousConfig = std::move(previousConfig),
                previousMasterAuthorityState = std::move(previousMasterAuthorityState),
                previousMasterAuthorityDurable, previousDurableMasterAuthorityGeneration,
                previousSharedCPUOvercommitPermille](bool durable) mutable {
-                if (lifetime.expired() || masterAuthorityEpoch != configureEpoch) return;
+                if (lifetime.expired()) return;
+                pendingConfigure->configurationPersistencePending = false;
+                if (masterAuthorityEpoch != configureEpoch)
+                {
+                  if (pendingConfigureOwnershipReceipt == pendingConfigure)
+                    pendingConfigureOwnershipReceipt.reset();
+                  return;
+                }
                 String currentConfig;
                 BitseryEngine::serialize(currentConfig, brainConfig);
-                if (currentConfig.equals(candidateConfig) == false) return;
+                if (currentConfig.equals(candidateConfig) == false)
+                {
+                  if (pendingConfigureOwnershipReceipt == pendingConfigure)
+                    pendingConfigureOwnershipReceipt.reset();
+                  if (activeMotherships.contains(mothership) && mothership->connectionIncarnation == streamIncarnation)
+                    queueCloseIfActive(mothership, "configure-state-changed-before-receipt");
+                  return;
+                }
                 if (durable == false)
                 {
                   brainConfig = std::move(previousConfig);
@@ -40473,10 +42066,14 @@ public:
                   masterAuthorityRuntimeStateDurable = previousMasterAuthorityDurable;
                   durableMasterAuthorityRuntimeStateGeneration = previousDurableMasterAuthorityGeneration;
                   (void)configurePendingElasticAddressReleaseFence(masterAuthorityRuntimeState);
+                  if (pendingConfigureOwnershipReceipt == pendingConfigure)
+                    pendingConfigureOwnershipReceipt.reset();
                   if (activeMotherships.contains(mothership) && mothership->connectionIncarnation == streamIncarnation)
                     queueCloseIfActive(mothership, "configure-master-authority-persist-failed");
                   return;
                 }
+                if (pendingConfigureOwnershipReceipt == pendingConfigure)
+                  pendingConfigureOwnershipReceipt.reset();
                 loadBrainConfigIf(); refreshMachineFragmentAssignmentsIfPossible(); armMachineUpdateTimerIfNeeded();
                 if (noMasterYet) deriveMasterBrain();
                 if (activeMotherships.contains(mothership) == false || mothership->connectionIncarnation != streamIncarnation ||
@@ -45534,7 +47131,9 @@ public:
           refreshNeuronControlHandshakeWatchdog(neuron, "registration");
           driveTransportCredentialEnrollmentOperations();
           driveClusterPairEnrollmentOperations();
-          sendNeuronSwitchboardStateSync(machine);
+          const bool stateUploadPending = machine->stateUploadRequestPending &&
+                                          machine->stateUploadRequestIOGeneration == neuron->ioGeneration;
+          sendNeuronSwitchboardStateSync(machine, stateUploadPending == false);
           recoverDeploymentsAfterNeuronState();
           armMachineUpdateTimerIfNeeded();
 
@@ -45668,137 +47267,59 @@ public:
           bytell_hash_set<uint128_t> reportedMachineContainerUUIDs = {};
           bytell_hash_set<uint32_t> reportedMachineContainerFragments = {};
           Vector<String> acceptedStateUploadPlans = {};
+          Vector<ValidatedStateUploadPlan> validatedStateUploadPlans = {};
+          bool reportedInventoryEmpty = true;
+          const bool reportedFragmentMatchesAssignment =
+              neuron->machine->fragment == 0 ||
+              (fragment.dpfx == brainConfig.datacenterFragment &&
+               reportedFragment == neuron->machine->fragment);
+          const bool reportedPlansOwnFragment = reportedFragmentMatchesAssignment &&
+              stateUploadPlansOwnReportedMachineFragment(
+                  args,
+                  terminal,
+                  fragment,
+                  uploadRetirements,
+                  neuron->machine->uuid,
+                  reportedInventoryEmpty,
+                  malformedStateUpload,
+                  validatedStateUploadPlans,
+                  reportedMachineContainerUUIDs,
+                  reportedMachineContainerFragments);
+          if (malformedStateUpload)
+          {
+            basics_log("brain stateUpload malformed plan payload from private4=%u\n",
+                       (neuron->machine ? unsigned(neuron->machine->private4) : 0u));
+            neuron->machine->runtimeReady = false;
+            neuron->rBuffer.clear();
+            if (streamIsActive(neuron))
+            {
+              Ring::queueClose(neuron);
+            }
+            break;
+          }
           if (persistedRecoveryMustAwaitReportedMachineFragment(neuron->machine))
           {
             bool fragmentProven = neuron->machine->uuid != 0 && brainConfig.datacenterFragment != 0 &&
                                  fragment.dpfx == brainConfig.datacenterFragment &&
-                                 reportedFragment > 0;
-            bool reportedInventoryEmpty = true;
-            bool validationComplete = true;
-            uint8_t *validationArgs = args;
-            while (validationArgs < terminal)
-            {
-              uintptr_t sizeAddress = (reinterpret_cast<uintptr_t>(validationArgs) +
-                                       uintptr_t(Alignment::four) - 1u) &
-                                      ~(uintptr_t(Alignment::four) - 1u);
-              uint8_t *sizeCursor = reinterpret_cast<uint8_t *>(sizeAddress);
-              if (sizeCursor > terminal || uint64_t(terminal - sizeCursor) < sizeof(uint32_t))
-              {
-                fragmentProven = false;
-                validationComplete = false;
-                break;
-              }
-              uint32_t serializedBytes = 0;
-              std::memcpy(&serializedBytes, sizeCursor, sizeof(serializedBytes));
-              uintptr_t payloadAddress = (reinterpret_cast<uintptr_t>(sizeCursor + sizeof(serializedBytes)) +
-                                          uintptr_t(Alignment::eight) - 1u) &
-                                         ~(uintptr_t(Alignment::eight) - 1u);
-              uint8_t *payloadCursor = reinterpret_cast<uint8_t *>(payloadAddress);
-              if (payloadCursor > terminal || serializedBytes > uint64_t(terminal - payloadCursor))
-              {
-                fragmentProven = false;
-                validationComplete = false;
-                break;
-              }
-              validationArgs = payloadCursor + serializedBytes;
-              String serializedPlan = {};
-              uint8_t *extractCursor = sizeCursor;
-              Message::extractToStringView(extractCursor, serializedPlan);
-              ContainerPlan plan = {};
-              if (serializedPlan.data() > terminal ||
-                  serializedPlan.size() > uint64_t(terminal - serializedPlan.data()) ||
-                  BitseryEngine::deserializeSafe(serializedPlan, plan) == false)
-              {
-                fragmentProven = false;
-                validationComplete = false;
-                break;
-              }
-              reportedInventoryEmpty = false;
-              if (fragmentProven == false)
-              {
-                continue;
-              }
-              // The tunnel provider has no container-network address. Every
-              // other uploaded plan must bind the reported machine prefix.
-              if (plan.isSystemContainer() && plan.addresses.empty())
-              {
-                continue;
-              }
+                                 reportedFragment > 0 && reportedPlansOwnFragment;
 
-              bool ownsReportedFragment = false;
-              for (const IPPrefix& address : plan.addresses)
-              {
-                if (address.network.is6 && address.cidr == 128 &&
-                    memcmp(address.network.v6, container_network_subnet6.value, 11) == 0 &&
-                    address.network.v6[11] == fragment.dpfx &&
-                    address.network.v6[12] == fragment.mpfx[0] &&
-                    address.network.v6[13] == fragment.mpfx[1] &&
-                    address.network.v6[14] == fragment.mpfx[2] &&
-                    address.network.v6[15] == plan.fragment)
-                {
-                  ownsReportedFragment = true;
-                  break;
-                }
-              }
-              if (ownsReportedFragment == false)
-              {
-                fragmentProven = false;
-              }
+            if (fragmentProven &&
+                adoptReportedMachineFragment(
+                    neuron->machine, fragment.dpfx, reportedFragment) == false)
+            {
+              fragmentProven = false;
             }
 
-            if (fragmentProven)
-            {
-              if (usedMachineFragments.contains(reportedFragment))
-              {
-                fragmentProven = false;
-              }
-            }
-
-            if (fragmentProven)
-            {
-              for (Machine *other : machines)
-              {
-                if (other != nullptr && other != neuron->machine && other->fragment == reportedFragment)
-                {
-                  fragmentProven = false;
-                  break;
-                }
-              }
-            }
-
-            if (fragmentProven)
-            {
-              for (const auto& witness : updateSelfMachineRecoveryWitnesses)
-              {
-                if (witness.machineUUID == neuron->machine->uuid)
-                {
-                  continue;
-                }
-                uint32_t witnessFragment = 0;
-                if (deriveMachineFragmentFromCapturedBootstraps(witness.containerBootstraps, witnessFragment) &&
-                    witnessFragment == reportedFragment)
-                {
-                  fragmentProven = false;
-                  break;
-                }
-              }
-            }
-
-            if (fragmentProven)
-            {
-              neuron->machine->fragment = reportedFragment;
-              usedMachineFragments.insert(reportedFragment);
-            }
-            else if (reportedFragment == 0 &&
+            if (fragmentProven == false && reportedFragment == 0 &&
                      (fragment.dpfx == brainConfig.datacenterFragment || fragment.dpfx == 0) &&
-                     reportedInventoryEmpty && validationComplete &&
+                     reportedInventoryEmpty && reportedPlansOwnFragment &&
                      (findUpdateSelfMachineRecoveryWitness(neuron->machine->uuid) == nullptr ||
                       findUpdateSelfMachineRecoveryWitness(neuron->machine->uuid)->containerBootstraps.empty()))
             {
               assignMachineFragment(neuron->machine, true);
               break;
             }
-            else
+            else if (fragmentProven == false)
             {
               basics_log("brain stateUpload rejected unproven recovery fragment private4=%u reportedDatacenter=%u reportedFragment=%u\n",
                          unsigned(neuron->machine->private4),
@@ -45808,58 +47329,35 @@ public:
               break;
             }
           }
-          else if (neuron->machine->fragment == 0 && fragment.dpfx != 0 && reportedFragment > 0)
+          else if (!reportedPlansOwnFragment)
           {
-            neuron->machine->fragment = reportedFragment;
+            basics_log("brain stateUpload rejected container prefix disagreement private4=%u reportedDatacenter=%u reportedFragment=%u\n",
+                       unsigned(neuron->machine ? neuron->machine->private4 : 0u),
+                       unsigned(fragment.dpfx),
+                       unsigned(reportedFragment));
+            neuron->machine->runtimeReady = false;
+            break;
+          }
+          else if (neuron->machine->fragment == 0 && reportedFragment > 0)
+          {
+            if (adoptReportedMachineFragment(
+                    neuron->machine, fragment.dpfx, reportedFragment) == false)
+            {
+              neuron->machine->runtimeReady = false;
+              break;
+            }
           }
 #if PRODIGY_DEBUG
           const uint64_t indexedBefore = neuron->machine ? neuron->machine->containersByDeploymentID.size() : 0u;
 #endif
-          while (args < terminal)
+          for (ValidatedStateUploadPlan& validated : validatedStateUploadPlans)
           {
-            String buffer;
-            Message::extractToStringView(args, buffer);
-            if (buffer.data() > terminal || buffer.size() > uint64_t(terminal - buffer.data()))
+            ContainerPlan& plan = validated.plan;
+            if (prodigyFindContainerRetirementIntentInValidatedJournal(
+                    uploadRetirements, plan.uuid) != nullptr)
             {
-              malformedStateUpload = true;
-              break;
-            }
-
-            ContainerPlan plan;
-            if (BitseryEngine::deserializeSafe(buffer, plan) == false)
-            {
-              malformedStateUpload = true;
-              break;
-            }
-
-            if (plan.uuid == 0 || !reportedMachineContainerUUIDs.insert(plan.uuid).second)
-            {
-              malformedStateUpload = true;
-              break;
-            }
-            if (plan.fragment == 0 ||
-                (plan.fragment != prodigyMothershipTunnelProviderRuntimeFragment &&
-                 reportedMachineContainerFragments.contains(plan.fragment)))
-            {
-              malformedStateUpload = true;
-              break;
-            }
-            reportedMachineContainerFragments.insert(plan.fragment);
-            if (const auto *retired = prodigyFindContainerRetirementIntentInValidatedJournal(uploadRetirements, plan.uuid))
-            {
-              if (retired->machineUUID != neuron->machine->uuid || retired->deploymentID != plan.config.deploymentID() ||
-                  retired->applicationID != plan.config.applicationID)
-              {
-                malformedStateUpload = true;
-                break;
-              }
               // Observed only: never re-advertise or schedule a journaled UUID.
               continue;
-            }
-            if (deploymentLaunchFenced(plan.config.deploymentID()))
-            {
-              malformedStateUpload = true;
-              break;
             }
             if (handleUploadedMothershipTunnelProviderContainer(neuron, plan))
             {
@@ -45868,14 +47366,9 @@ public:
             // Keep the Neuron's allocation observation independent of the
             // durable desired configuration. A lost resource delta must remain
             // visible so the authority owner can retry it after this upload.
-            const uint16_t observedCores = static_cast<uint16_t>(applicationSharedCPUCoreHint(plan.config));
-            const uint32_t observedMemoryMB = plan.config.totalMemoryMB();
-            const uint32_t observedStorageMB = plan.config.totalStorageMB();
-            if (!projectStatefulServingPlan(plan, neuron->machine->uuid))
-            {
-              malformedStateUpload = true;
-              break;
-            }
+            const uint16_t observedCores = validated.observedLogicalCores;
+            const uint32_t observedMemoryMB = validated.observedMemoryMB;
+            const uint32_t observedStorageMB = validated.observedStorageMB;
             String acceptedPlan = {};
             BitseryEngine::serialize(acceptedPlan, plan);
             acceptedStateUploadPlans.push_back(std::move(acceptedPlan));
@@ -46077,6 +47570,16 @@ public:
             }
           }
 
+          const bool awaitingPostCloseInventory =
+              neuron->machine->uuid != 0 &&
+              machinesAwaitingPostCloseInventory.contains(neuron->machine->uuid);
+          if (recoveringPersistedNeuronInventory)
+          {
+            for (uint128_t uuid : reportedMachineContainerUUIDs)
+            {
+              persistedInventoryConfirmedAbsentContainers.erase(uuid);
+            }
+          }
           Vector<ContainerView *> staleMachineContainerPointers;
           bytell_hash_set<uint128_t> staleMachineContainerUUIDs = {};
           for (const auto& [deploymentID, machineContainers] : neuron->machine->containersByDeploymentID)
@@ -46096,11 +47599,15 @@ public:
               if (prodigyFindContainerRetirementIntentInValidatedJournal(uploadRetirements, container->uuid) != nullptr)
                 continue; // The durable kill-ACK owner retains object lifetime.
 
-              // The scheduler indexes a successor before Neuron has created it.
-              // An in-flight state upload is authoritative only for observed
-              // processes, so it must not erase that pending owner or free its
-              // reserved fragment before the normal failure/kill owner responds.
-              if (container->state == ContainerState::planned || container->state == ContainerState::scheduled)
+              // The scheduler or restart path can own an exact UUID before
+              // Neuron has created its next process. An in-flight state upload
+              // is authoritative only for observed processes, so it must not
+              // erase that pending owner or free its reserved fragment before
+              // the normal failure/kill owner responds.
+              if (container->state == ContainerState::planned ||
+                  container->state == ContainerState::scheduled ||
+                  (container->state == ContainerState::crashedRestarting &&
+                   awaitingPostCloseInventory))
               {
                 if (container->fragment != 0)
                 {
@@ -46129,6 +47636,13 @@ public:
             // for placement; the deployment retains the view until replacement.
             mesh->stopAllSubscriptions(stale);
             mesh->stopAllAdvertisments(stale);
+
+            if (recoveringPersistedNeuronInventory)
+            {
+              stale->runtimeReady = false;
+              persistedInventoryConfirmedAbsentContainers.insert(stale->uuid);
+              continue;
+            }
 
             if (auto deployment = deployments.find(stale->deploymentID); deployment != deployments.end() && deployment->second)
             {
@@ -46163,9 +47677,9 @@ public:
                      int(malformedStateUpload));
 #endif
 
-          const bool postCloseInventory = neuron->machine->uuid != 0 &&
+          const bool postCloseInventory = awaitingPostCloseInventory &&
                                           machinesAwaitingPostCloseInventory.erase(neuron->machine->uuid) > 0;
-          bool replayMissingScheduledOwners = false;
+          bool replayMissingExactOwners = false;
           if (postCloseInventory)
           {
             // A fresh inventory can prove only that the first launch did not
@@ -46178,14 +47692,16 @@ public:
               (void)deploymentID;
               for (ContainerView *container : machineContainers)
               {
-                if (container != nullptr && container->state == ContainerState::scheduled &&
+                if (container != nullptr &&
+                    (container->state == ContainerState::scheduled ||
+                     container->state == ContainerState::crashedRestarting) &&
                     reportedMachineContainerUUIDs.contains(container->uuid) == false)
                 {
-                  replayMissingScheduledOwners = true;
+                  replayMissingExactOwners = true;
                   break;
                 }
               }
-              if (replayMissingScheduledOwners)
+              if (replayMissingExactOwners)
               {
                 break;
               }
@@ -46204,20 +47720,28 @@ public:
             containerRetirementInventoryByMachine.insert_or_assign(neuron->machine->uuid, std::move(retirementInventory));
           }
           neuron->machine->runtimeReady =
-              replayMissingScheduledOwners == false &&
+              replayMissingExactOwners == false &&
               neuron->machine->fragment > 0 && neuron->machine->reportedDatacenterFragment != 0 && (brainConfig.datacenterFragment == 0 || neuron->machine->reportedDatacenterFragment == brainConfig.datacenterFragment) && neuron->machine->reportedFragment == neuron->machine->fragment;
-          std::fprintf(stderr,
-                       "brain stateUpload accepted machineUUID=%llu ready=%d replayMissingScheduledOwners=%d\n",
-                       (unsigned long long)neuron->machine->uuid, int(neuron->machine->runtimeReady),
-                       int(replayMissingScheduledOwners));
-          std::fflush(stderr);
-          if (replayMissingScheduledOwners)
+          // Only an accepted authoritative inventory answers the outstanding
+          // request. Rejected same-generation uploads must not reopen the gate
+          // while the requested response may still be in flight. Clear before
+          // the accepted missing-owner path deliberately queues its next round.
+          if (neuron->machine->stateUploadRequestPending &&
+              neuron->machine->stateUploadRequestIOGeneration == neuron->ioGeneration)
           {
+            neuron->machine->stateUploadRequestPending = false;
+            neuron->machine->stateUploadRequestIOGeneration = 0;
+          }
+          if (replayMissingExactOwners)
+          {
+            rebindMissingScheduledContainerMeshIdentitiesForReplay(
+                neuron->machine, reportedMachineContainerUUIDs);
             queueNeuronStateUploadForMachine(neuron->machine);
             refreshNeuronControlHandshakeWatchdog(neuron, "state-upload-replay");
             noteWorkerStateUpload(neuron);
             break;
           }
+          noteRestoredContainerInventoryReplayInventoryResult(neuron->machine);
           promoteMachineToHealthyIfReady(neuron->machine);
           refreshNeuronControlHandshakeWatchdog(neuron, "state-upload");
           // A resource observation can be older/larger than the sealed desired
@@ -46292,7 +47816,8 @@ public:
           Message::extractToStringView(args, serialized);
           SwitchboardWormholeOperation operation = {};
           if (BitseryEngine::deserializeSafe(serialized, operation) == false ||
-              operation.containerID == 0 || prodigyIsSHA256HexDigest(operation.revision) == false ||
+              operation.containerID == 0 ||
+              prodigyIsSHA256HexDigest(operation.revision) == false ||
               operation.desired.empty() == false ||
               (operation.status != SwitchboardWormholeOperationStatus::applied &&
                operation.status != SwitchboardWormholeOperationStatus::rejected &&
@@ -46311,21 +47836,26 @@ public:
             }
 
             uint32_t machineFragment = neuron->machine ? neuron->machine->fragment : 0;
-            bool pending = container->wormholeRuntimePendingMachines.erase(machineFragment) > 0;
-            bool failed = container->wormholeRuntimeFailedMachines.contains(machineFragment);
-            if (machineFragment == 0 || (pending == false && failed == false))
+            bool pending = container->wormholeRuntimePendingMachines.contains(machineFragment);
+            const auto expectedGeneration = container->wormholeRuntimePendingIOGenerations.find(machineFragment);
+            if (machineFragment == 0 || pending == false ||
+                expectedGeneration == container->wormholeRuntimePendingIOGenerations.end() ||
+                expectedGeneration->second != neuron->ioGeneration)
             {
               break;
             }
+            container->wormholeRuntimePendingMachines.erase(machineFragment);
 
             if (operation.status == SwitchboardWormholeOperationStatus::applied)
             {
               container->wormholeRuntimeFailedMachines.erase(machineFragment);
+              container->wormholeRuntimePendingIOGenerations.erase(machineFragment);
               container->wormholeRuntimeRetryAttempts.erase(machineFragment);
             }
-            else if (failed == false)
+            else
             {
               container->wormholeRuntimeFailedMachines.insert(machineFragment);
+              container->wormholeRuntimePendingIOGenerations.erase(machineFragment);
               prodigyResetWormholeRuntimeRetries(container, operation.revision);
               (void)container->wormholeRuntimeRetryAttempts[machineFragment];
               if (operation.status == SwitchboardWormholeOperationStatus::rollbackFailed)
@@ -46355,6 +47885,10 @@ public:
             }
             armWormholeRuntimeAckDeadline(container);
             replicateContainerRuntimeStateToFollowers(container);
+            // Every validated terminal receipt removes the ordered-stream
+            // barrier. A deferred full reset is now safe and supersedes a
+            // rejected operation by replaying the current authoritative state.
+            driveDeferredNeuronSwitchboardStateSync(neuron->machine);
             if (recoveringPersistedNeuronInventory)
             {
               recoverDeploymentsAfterNeuronState();
@@ -46607,6 +48141,8 @@ public:
             ContainerView *container = it->second;
 
             Machine *machine = container->machine;
+            const bool restoredInventoryProgress =
+                noteRestoredContainerInventoryReplayProgress(containerUUID, machine);
 
             ApplicationDeployment *deployment = nullptr;
             if (auto deploymentIt = deployments.find(container->deploymentID); deploymentIt != deployments.end())
@@ -46631,6 +48167,11 @@ public:
             }
 
             deployment->containerFailed(container, approxTimeMs, signal, report, restarted);
+
+            if (restoredInventoryProgress)
+            {
+              recoverDeploymentsAfterNeuronState();
+            }
 
             if (restarted == false)
             {

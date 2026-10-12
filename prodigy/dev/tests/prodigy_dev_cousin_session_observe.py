@@ -14,6 +14,7 @@ if mode == 'qualify' and len(sys.argv) > 3:
     marker_name = sys.argv[3]
     assert re.fullmatch(r'cousin-[a-z-]+', marker_name)
 minimum_destination_groups = int(sys.argv[4]) if mode == 'qualify' and len(sys.argv) > 4 else 0
+minimum_source_groups = int(sys.argv[5]) if mode == 'qualify' and len(sys.argv) > 5 else 0
 marker = int((root / (marker_name + '-monotonic-ms')).read_text())
 wall_marker = int((root / (marker_name + '-ms')).read_text())
 revoke_request_marker = (int((root / 'cousin-revocation-request-monotonic-ms').read_text())
@@ -71,8 +72,7 @@ while True:
                 sessions.setdefault(row['session'], []).append(row)
             for session, rows in sessions.items():
                 bindings = [row for row in records(data, 'binding') if row.get('session') == session]
-                if minimum_destination_groups and not any(
-                        int(row.get('destinationGroups', '0')) == minimum_destination_groups for row in bindings):
+                if (minimum_destination_groups and not any(int(row.get('destinationGroups', '0')) == minimum_destination_groups for row in bindings)) or (minimum_source_groups and not any(int(row.get('sourceGroups', '0')) == minimum_source_groups for row in bindings)):
                     continue
                 rows.sort(key=lambda row: int(row['monotonicMs']))
                 span = int(rows[-1]['monotonicMs']) - int(rows[0]['monotonicMs'])

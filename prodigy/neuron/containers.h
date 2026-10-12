@@ -40,6 +40,7 @@
 #include <prodigy/build.identity.h>
 #include <prodigy/bundle.artifact.h>
 #include <prodigy/container.contract.h>
+#include <prodigy/container.mesh.identity.h>
 #include <prodigy/declared.network.policy.h>
 #include <prodigy/system.container.policy.h>
 #include <prodigy/wire.h>
@@ -396,6 +397,36 @@ constexpr static enum bpf_attach_type prodigyContainerIngressNetkitAttachType()
 constexpr static enum bpf_attach_type prodigyContainerEgressNetkitAttachType()
 {
   return BPF_NETKIT_PEER;
+}
+
+struct ProdigyResidualNetkitEvidence {
+  uint32_t ifindex = 0;
+  uint32_t peerIfindex = 0;
+  bool exactName = false;
+  bool netkit = false;
+  bool l3 = false;
+};
+
+enum class ProdigyResidualNetkitAction : uint8_t {
+  absent,
+  destroy,
+  reject,
+};
+
+constexpr static ProdigyResidualNetkitAction prodigyResidualNetkitAction(
+    bool queryComplete, const ProdigyResidualNetkitEvidence& evidence)
+{
+  if (queryComplete == false)
+  {
+    return ProdigyResidualNetkitAction::reject;
+  }
+  if (evidence.ifindex == 0)
+  {
+    return ProdigyResidualNetkitAction::absent;
+  }
+  return evidence.exactName && evidence.netkit && evidence.l3 && evidence.peerIfindex != 0
+             ? ProdigyResidualNetkitAction::destroy
+             : ProdigyResidualNetkitAction::reject;
 }
 
 static void installDatacenterMeshRoutes(NetDevice& device, uint8_t datacenterFragment)
@@ -960,19 +991,6 @@ static void removeAddressFromDevice(NetDevice& device, const IPPrefix& prefix)
   device.removeIP(address, prefix.cidr, AF_INET);
 }
 
-static bool hasAddress(const Vector<IPPrefix>& addresses, const IPPrefix& candidate)
-{
-  for (const IPPrefix& prefix : addresses)
-  {
-    if (prefix.equals(candidate))
-    {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 template <typename T>
 static bool needsAnyExternalAddressFamily(const T& value, ExternalAddressFamily family)
 {
@@ -995,14 +1013,6 @@ static bool needsAnyExternalAddressFamily(const T& value, ExternalAddressFamily 
   }
 
   return false;
-}
-
-static void addAddressIfMissing(Vector<IPPrefix>& addresses, const IPPrefix& candidate)
-{
-  if (hasAddress(addresses, candidate) == false)
-  {
-    addresses.emplace_back(candidate);
-  }
 }
 
 static bool writeProcSysctlValue(const char *path, const char *value)
@@ -2802,6 +2812,159 @@ public:
     return true;
   }
 
+  bool removeVerifiedResidualColdRestartNetkit(String *failureReport = nullptr)
+  {
+    if (plan.useHostNetworkNamespace)
+    {
+      return true;
+    }
+
+    NetkitPair probe;
+    probe.setNames(String {plan.fragment});
+    ProdigyResidualNetkitEvidence evidence = {};
+
+    auto lookup = [&]() -> bool {
+      errno = 0;
+      evidence.ifindex = if_nametoindex(probe.host.name.c_str());
+      if (evidence.ifindex == 0)
+      {
+        return errno == ENODEV || errno == ENXIO;
+      }
+      return true;
+    };
+
+    if (lookup() == false)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"cold restart netkit lookup indeterminate for {}: {}"_ctv>(
+            probe.host.name,
+            String(strerror(errno)));
+      }
+      return false;
+    }
+    if (evidence.ifindex == 0)
+    {
+      return true;
+    }
+
+    const uint32_t expectedIfindex = evidence.ifindex;
+    bool responseSeen = false;
+    bool responseComplete = false;
+    probe.generateRequest([&](NetlinkMessage *request) {
+      probe.socket.getInterface(request, 0, probe.host.name);
+    });
+    if (probe.flushChecked() == false ||
+        probe.readResponseChecked([&](uint16_t nlmsgType, uint32_t, void *messageData, uint32_t messageLength) {
+          if (responseSeen || nlmsgType != RTM_NEWLINK || messageData == nullptr ||
+              messageLength < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
+          {
+            return;
+          }
+          responseSeen = true;
+          auto *interface = static_cast<struct ifinfomsg *>(messageData);
+          if (uint32_t(interface->ifi_index) != expectedIfindex)
+          {
+            return;
+          }
+
+          bool attributesComplete = true;
+          int remaining = int(messageLength - NLMSG_LENGTH(sizeof(struct ifinfomsg)));
+          for (auto *attribute = IFLA_RTA(interface); RTA_OK(attribute, remaining);
+               attribute = RTA_NEXT(attribute, remaining))
+          {
+            const int payload = RTA_PAYLOAD(attribute);
+            if (attribute->rta_type == IFLA_IFNAME && payload > 0)
+            {
+              const char *name = static_cast<const char *>(RTA_DATA(attribute));
+              const size_t actualLength = strnlen(name, size_t(payload));
+              evidence.exactName = actualLength + 1 <= size_t(payload) &&
+                                   actualLength == probe.host.name.size() &&
+                                   std::memcmp(name, probe.host.name.c_str(), actualLength) == 0;
+            }
+            else if (attribute->rta_type == IFLA_LINK && payload >= int(sizeof(uint32_t)))
+            {
+              std::memcpy(&evidence.peerIfindex, RTA_DATA(attribute), sizeof(evidence.peerIfindex));
+            }
+            else if (attribute->rta_type == IFLA_LINKINFO)
+            {
+              int linkRemaining = payload;
+              for (auto *link = static_cast<struct rtattr *>(RTA_DATA(attribute)); RTA_OK(link, linkRemaining);
+                   link = RTA_NEXT(link, linkRemaining))
+              {
+                const int linkPayload = RTA_PAYLOAD(link);
+                if (link->rta_type == IFLA_INFO_KIND && linkPayload > 0)
+                {
+                  const char *kind = static_cast<const char *>(RTA_DATA(link));
+                  const size_t kindLength = strnlen(kind, size_t(linkPayload));
+                  evidence.netkit = kindLength == sizeof("netkit") - 1 &&
+                                    kindLength + 1 <= size_t(linkPayload) &&
+                                    std::memcmp(kind, "netkit", sizeof("netkit") - 1) == 0;
+                }
+                else if (link->rta_type == IFLA_INFO_DATA)
+                {
+                  int dataRemaining = linkPayload;
+                  for (auto *data = static_cast<struct rtattr *>(RTA_DATA(link)); RTA_OK(data, dataRemaining);
+                       data = RTA_NEXT(data, dataRemaining))
+                  {
+                    if (data->rta_type == IFLA_NETKIT_MODE &&
+                        RTA_PAYLOAD(data) >= int(sizeof(uint32_t)))
+                    {
+                      uint32_t mode = 0;
+                      std::memcpy(&mode, RTA_DATA(data), sizeof(mode));
+                      evidence.l3 = mode == NETKIT_L3;
+                    }
+                  }
+                  attributesComplete = attributesComplete && dataRemaining == 0;
+                }
+              }
+              attributesComplete = attributesComplete && linkRemaining == 0;
+            }
+          }
+          responseComplete = attributesComplete && remaining == 0;
+        }) == false)
+    {
+      responseComplete = false;
+    }
+
+    if (prodigyResidualNetkitAction(responseSeen && responseComplete, evidence) !=
+        ProdigyResidualNetkitAction::destroy)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"cold restart netkit ownership unproven for {} ifindex {itoa}"_ctv>(
+            probe.host.name,
+            uint64_t(expectedIfindex));
+      }
+      return false;
+    }
+
+    probe.generateRequest([&](NetlinkMessage *request) {
+      probe.socket.destroyNetDevice(request, 0, evidence.ifindex);
+    });
+    if (probe.flushDiscardChecked() == false)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"cold restart netkit removal failed for {} ifindex {itoa}"_ctv>(
+            probe.host.name,
+            uint64_t(evidence.ifindex));
+      }
+      return false;
+    }
+
+    evidence = {};
+    if (lookup() == false || evidence.ifindex != 0)
+    {
+      if (failureReport)
+      {
+        failureReport->snprintf<"cold restart netkit removal not observed for {}"_ctv>(probe.host.name);
+      }
+      return false;
+    }
+    return true;
+  }
+
   static bool containerBPFDetached(NetDevice& device, BPFProgram *&program, enum bpf_attach_type attachType)
   {
     if (program)
@@ -4033,6 +4196,18 @@ public:
     return cleanupRejectedOrphanedContainerArtifactsAtPath(containersRootPath, failureReport);
   }
 
+  static bool debugWriteContainerCreatePendingMarker(
+      const String& artifactRootPath, pid_t creatorPID, String *failureReport = nullptr)
+  {
+    return writeContainerCreatePendingMarker(artifactRootPath, creatorPID, failureReport);
+  }
+
+  static bool debugIsAbandonedContainerCreateArtifact(
+      const String& artifactRootPath, String *failureReport = nullptr)
+  {
+    return isAbandonedContainerCreateArtifact(artifactRootPath, failureReport);
+  }
+
   static bool debugPreserveFailedContainerArtifactsAtPath(
       const String& retentionRootPath,
       const Container *container,
@@ -4891,8 +5066,66 @@ private:
     return true;
   }
 
+  static bool readProcessStartTime(pid_t pid, uint64_t& startTime)
+  {
+    startTime = 0;
+    if (pid <= 0)
+    {
+      return false;
+    }
+
+    String path = {};
+    path.snprintf<"/proc/{itoa}/stat"_ctv>(uint64_t(pid));
+    String contents = {};
+    Filesystem::openReadAtClose(-1, path, contents);
+    if (contents.size() == 0)
+    {
+      return false;
+    }
+
+    const char *terminal = contents.c_str() + contents.size();
+    const char *closing = std::strrchr(contents.c_str(), ')');
+    if (closing == nullptr || closing + 2 >= terminal || closing[1] != ' ' || closing[2] == 'Z')
+    {
+      return false;
+    }
+
+    // The suffix starts at field 3 (state); starttime is field 22.
+    const char *cursor = closing + 2;
+    for (uint32_t field = 3; field < 22; ++field)
+    {
+      while (cursor < terminal && *cursor != ' ') ++cursor;
+      while (cursor < terminal && *cursor == ' ') ++cursor;
+      if (cursor >= terminal)
+      {
+        return false;
+      }
+    }
+
+    errno = 0;
+    char *tail = nullptr;
+    unsigned long long parsed = std::strtoull(cursor, &tail, 10);
+    if (errno != 0 || tail == cursor || parsed == 0 ||
+        (tail < terminal && *tail != ' ' && *tail != '\n'))
+    {
+      return false;
+    }
+    startTime = uint64_t(parsed);
+    return true;
+  }
+
   static bool writeContainerCreatePendingMarker(const String& artifactRootPath, pid_t creatorPID, String *failureReport = nullptr)
   {
+    uint64_t creatorStartTime = 0;
+    if (readProcessStartTime(creatorPID, creatorStartTime) == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to bind pending-create marker to creator generation"_ctv);
+      }
+      return false;
+    }
+
     int artifactRootFD = Filesystem::openDirectoryAt(
         -1,
         artifactRootPath,
@@ -4941,6 +5174,10 @@ private:
 
     String payload = {};
     payload.assignItoa(uint64_t(creatorPID));
+    payload.append(' ');
+    String startTimeText = {};
+    startTimeText.assignItoa(creatorStartTime);
+    payload.append(startTimeText);
     payload.append("\n"_ctv);
     bool wrote = writeToFileDescriptor(markerFD, payload, failureReport);
     close(markerFD);
@@ -5007,10 +5244,16 @@ private:
     return false;
   }
 
-  static bool readContainerCreatePendingMarker(const String& artifactRootPath, bool& markerPresent, pid_t& creatorPID, String *failureReport = nullptr)
+  static bool readContainerCreatePendingMarker(
+      const String& artifactRootPath,
+      bool& markerPresent,
+      pid_t& creatorPID,
+      uint64_t& creatorStartTime,
+      String *failureReport = nullptr)
   {
     markerPresent = false;
     creatorPID = -1;
+    creatorStartTime = 0;
 
     int artifactRootFD = Filesystem::openDirectoryAt(
         -1,
@@ -5098,23 +5341,55 @@ private:
       return true;
     }
 
+    errno = 0;
     char *tail = nullptr;
     long long parsed = std::strtoll(markerContents.c_str(), &tail, 10);
-    if (tail == markerContents.c_str() || (tail != nullptr && *tail != '\0') || parsed <= 0 || parsed > std::numeric_limits<pid_t>::max())
+    if (errno != 0 || tail == markerContents.c_str() || parsed <= 0 ||
+        parsed > std::numeric_limits<pid_t>::max())
     {
       creatorPID = -1;
       return true;
     }
 
     creatorPID = pid_t(parsed);
+    if (tail == nullptr || *tail == '\0')
+    {
+      return true; // Legacy PID-only marker.
+    }
+    if (*tail != ' ')
+    {
+      creatorPID = -1;
+      return true;
+    }
+    while (*tail == ' ') ++tail;
+    errno = 0;
+    char *startTail = nullptr;
+    unsigned long long parsedStartTime = std::strtoull(tail, &startTail, 10);
+    if (errno != 0 || startTail == tail || parsedStartTime == 0 ||
+        (startTail != nullptr && *startTail != '\0'))
+    {
+      creatorPID = -1;
+      creatorStartTime = 0;
+      return true;
+    }
+    creatorStartTime = uint64_t(parsedStartTime);
     return true;
   }
 
-  static bool isLivePendingCreateOwner(pid_t creatorPID)
+  static bool isLivePendingCreateOwner(pid_t creatorPID, uint64_t creatorStartTime)
   {
     if (creatorPID <= 0)
     {
       return false;
+    }
+
+    if (creatorStartTime != 0)
+    {
+      uint64_t observedStartTime = 0;
+      if (readProcessStartTime(creatorPID, observedStartTime))
+      {
+        return observedStartTime == creatorStartTime;
+      }
     }
 
     if (kill(creatorPID, 0) == 0)
@@ -5122,7 +5397,24 @@ private:
       return true;
     }
 
-    return errno == EPERM;
+    // Preserve the artifact on any indeterminate liveness result. ESRCH is the
+    // only proof that a legacy PID-only owner no longer exists.
+    return errno != ESRCH;
+  }
+
+  static bool isAbandonedContainerCreateArtifact(
+      const String& artifactRootPath, String *failureReport = nullptr)
+  {
+    bool markerPresent = false;
+    pid_t creatorPID = -1;
+    uint64_t creatorStartTime = 0;
+    if (readContainerCreatePendingMarker(
+            artifactRootPath, markerPresent, creatorPID, creatorStartTime, failureReport) == false)
+    {
+      return false;
+    }
+    return markerPresent && creatorPID > 0 &&
+           !isLivePendingCreateOwner(creatorPID, creatorStartTime);
   }
 
   static bool isJanitorExcludedContainerArtifactName(const String& entryName)
@@ -6087,8 +6379,10 @@ private:
 
       bool markerPresent = false;
       pid_t creatorPID = -1;
+      uint64_t creatorStartTime = 0;
       String markerFailure = {};
-      if (readContainerCreatePendingMarker(artifactRootPath, markerPresent, creatorPID, &markerFailure) == false)
+      if (readContainerCreatePendingMarker(
+              artifactRootPath, markerPresent, creatorPID, creatorStartTime, &markerFailure) == false)
       {
         basics_log("cleanupRejectedOrphanedContainerArtifacts marker inspection failed path=%s reason=%s\n",
                    artifactRootPath.c_str(),
@@ -6097,7 +6391,8 @@ private:
         continue;
       }
 
-      if (markerPresent == false || isLivePendingCreateOwner(creatorPID))
+      if (markerPresent == false || creatorPID <= 0 ||
+          isLivePendingCreateOwner(creatorPID, creatorStartTime))
       {
         continue;
       }
@@ -8062,6 +8357,65 @@ public:
     }
 
     return true;
+  }
+
+  struct MissingScheduledStateUploadOwnerProof {
+    bool cgroupMissing = false;
+    bool artifactMissing = false;
+    bool abandonedCreateArtifact = false;
+    bool storageMissing = false;
+  };
+
+  // A state-upload bootstrap can describe a scheduled container whose
+  // ordinary spin was queued before this Neuron accepted the upload.  Prove
+  // that neither a runtime nor a retained filesystem owner exists before
+  // resuming that fresh spin. Any uncertainty remains a cold restart.
+  static MissingScheduledStateUploadOwnerProof proveMissingScheduledStateUploadOwner(
+      const ContainerPlan& plan, int cgroup, int cgroupLookupErrno)
+  {
+    MissingScheduledStateUploadOwnerProof proof = {};
+    proof.cgroupMissing = cgroup < 0 && cgroupLookupErrno == ENOENT;
+
+    String name = {};
+    name.assignItoa(plan.uuid);
+    String artifactRoot = {};
+    artifactRoot.assign("/containers/"_ctv);
+    artifactRoot.append(name);
+    struct stat identity = {};
+    proof.artifactMissing = lstat(artifactRoot.c_str(), &identity) != 0 && errno == ENOENT;
+    if (proof.artifactMissing == false && S_ISDIR(identity.st_mode))
+    {
+      String markerFailure = {};
+      proof.abandonedCreateArtifact =
+          isAbandonedContainerCreateArtifact(artifactRoot, &markerFailure);
+    }
+
+    String storageRoot = {};
+    prodigyContainerStorageRootPathForName(name, storageRoot);
+    bool storageMissing = lstat(storageRoot.c_str(), &identity) != 0 && errno == ENOENT;
+
+    // Check every configured backing location, including one which is not
+    // currently eligible for a new allocation.  An inaccessible retained
+    // backend is still an owner; fresh creation must not overwrite it.
+    Vector<String> configuredMountPaths = {};
+    collectConfiguredContainerStorageMountPaths(configuredMountPaths);
+    for (const String& mountPath : configuredMountPaths)
+    {
+      String backingPath = {};
+      prodigyContainerStorageBackingFilePathForMount(mountPath, name, backingPath);
+      storageMissing &= lstat(backingPath.c_str(), &identity) != 0 && errno == ENOENT;
+    }
+    proof.storageMissing = storageMissing;
+
+    return proof;
+  }
+
+  static bool canFreshLaunchMissingScheduledStateUpload(
+      const ContainerPlan& plan, const MissingScheduledStateUploadOwnerProof& proof)
+  {
+    return plan.state == ContainerState::scheduled && plan.runtimeReady == false &&
+           proof.cgroupMissing && proof.storageMissing &&
+           (proof.artifactMissing || proof.abandonedCreateArtifact);
   }
 
   static bool mountLoopBackedStorage(Container *container, bool existingBackend, String *failureReport = nullptr)
@@ -10293,6 +10647,15 @@ public:
       }
       return;
     }
+    if (thisNeuron == nullptr ||
+        !prodigyValidateContainerPlanMeshIdentity(plan, thisNeuron->lcsubnet6))
+    {
+      if (failure)
+      {
+        failure->assign("container mesh identity is invalid"_ctv);
+      }
+      return;
+    }
     if (ensureRootCgroupReady(failure) == false)
     {
       return;
@@ -10337,11 +10700,6 @@ public:
       }
     }
 
-    if (container->isSystemContainer() == false)
-    {
-      IPPrefix containerNetwork6 = thisNeuron->generateAddress(container_network_subnet6, plan.fragment, 128);
-      addAddressIfMissing(container->plan.addresses, containerNetwork6);
-    }
     String rejectedArtifactJanitorFailure = {};
     if (cleanupRejectedOrphanedContainerArtifactsAtPath("/containers"_ctv, &rejectedArtifactJanitorFailure) == false && rejectedArtifactJanitorFailure.size() > 0)
     {
@@ -12782,7 +13140,9 @@ public:
                       (unsigned long long)plan.uuid,
                       (unsigned long long)replaceContainerUUID);
 #endif
-    if (thisNeuron != nullptr && thisNeuron->beginPendingContainerLaunch(plan) == false)
+    const uint64_t launchAdmissionGeneration =
+        thisNeuron != nullptr ? thisNeuron->beginPendingContainerLaunch(plan) : 0;
+    if (thisNeuron != nullptr && launchAdmissionGeneration == 0)
     {
       // Duplicate transport/recovery frames converge on the original launch.
       co_return;
@@ -12790,14 +13150,15 @@ public:
     struct PendingLaunchScope {
       NeuronBase *neuron = nullptr;
       uint128_t uuid = 0;
+      uint64_t admissionGeneration = 0;
       ~PendingLaunchScope()
       {
         if (neuron != nullptr)
         {
-          neuron->finishPendingContainerLaunch(uuid);
+          neuron->finishPendingContainerLaunch(uuid, admissionGeneration);
         }
       }
-    } pendingLaunch {thisNeuron, plan.uuid};
+    } pendingLaunch {thisNeuron, plan.uuid, launchAdmissionGeneration};
 
     bool skipLaunch = false;
     String taskGateFailure = {};
@@ -12846,6 +13207,14 @@ public:
       uint32_t suspendIndex = pullWaiter.nextSuspendIndex();
       thisNeuron->downloadContainer(&pullWaiter, deploymentID);
       co_await pullWaiter.suspendAtIndex(suspendIndex);
+    }
+
+    // A terminal kill can arrive while the artifact download owns this
+    // suspended launch. Do not resume publication for its retired UUID.
+    if (thisNeuron != nullptr &&
+        thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
+    {
+      co_return;
     }
 
     if (access(compressedContainerPath.c_str(), R_OK) != 0)
@@ -13033,6 +13402,16 @@ public:
           old->stop();
           co_await coro->suspend();
           delete coro;
+          if (thisNeuron != nullptr &&
+              thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
+          {
+            // The predecessor was already stopped for an obsolete command.
+            // Retire it without acknowledging or reporting that command on a
+            // replacement Brain stream; its next inventory owns reconciliation.
+            old->pendingKillAckToBrain = false;
+            destroyContainer(old);
+            co_return;
+          }
         }
 
         bool cgroupDrained = legacySource.size() == 0;
@@ -13047,6 +13426,13 @@ public:
             co_await coro->suspendAtIndex(suspendIndex);
           }
           delete coro;
+          if (thisNeuron != nullptr &&
+              thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
+          {
+            old->pendingKillAckToBrain = false;
+            destroyContainer(old);
+            co_return;
+          }
         }
 
         String handoffFailure;
@@ -13085,6 +13471,14 @@ public:
           }
         }
       }
+    }
+
+    // Replacement shutdown and storage handoff can also suspend. A kill for
+    // this successor remains terminal after those waits complete.
+    if (thisNeuron != nullptr &&
+        thisNeuron->pendingContainerLaunchIsCurrent(plan.uuid, launchAdmissionGeneration) == false)
+    {
+      co_return;
     }
 
     Container *container = nullptr;
@@ -13238,7 +13632,7 @@ public:
     return true;
   }
 
-  static void restartContainer(Container *container)
+  static bool restartContainer(Container *container)
   {
     // Keep the active pairing snapshot in the restart payload. The old
     // process is gone, but the replacement needs those pairings to rejoin the
@@ -13265,10 +13659,16 @@ public:
       {
         destroyContainer(container);
       }
-      return;
+      return false;
     }
 
     String failureReport;
+    if (coldRestart && container->removeVerifiedResidualColdRestartNetkit(&failureReport) == false)
+    {
+      container->deleteStorageOnCleanUp = false;
+      cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);
+      return false;
+    }
     if (coldRestart && prepareColdRestartContainer(container, &coldRestartCoresAllocated, &failureReport) == false)
     {
       std::fprintf(stderr,
@@ -13276,7 +13676,7 @@ public:
                    (unsigned long long)container->plan.uuid,
                    failureReport.c_str());
       cleanupContainerAfterFailedCreate(container, true, coldRestartCoresAllocated);
-      return;
+      return false;
     }
     if (thisNeuron != nullptr && container->plan.whiteholes.empty() == false)
     {
@@ -13314,6 +13714,7 @@ public:
       {
         destroyContainer(container);
       }
+      return false;
     }
     else
     {
@@ -13324,7 +13725,10 @@ public:
       }
       container->failedArtifactsPreserved = false;
       container->failedArtifactsObservedAtMs = 0;
+      return true;
     }
+
+    return false;
   }
 
   static void finalizeContainerDestroy(Container *container)

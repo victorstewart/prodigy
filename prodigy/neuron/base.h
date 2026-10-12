@@ -44,6 +44,13 @@ public:
   // A spin coroutine can await its artifact before pushContainer publishes a
   // live Container. Preserve the canonical UUID and plan across that gap.
   bytell_hash_map<uint128_t, ContainerPlan> pendingContainerLaunchPlans;
+  bytell_hash_map<uint128_t, uint64_t> pendingContainerLaunchGenerations;
+  // A terminal lifecycle decision can overtake an already queued spin frame.
+  // Keep that UUID retired for the current Brain-control generation so the
+  // stale frame cannot publish an owner after Brain removes its canonical view.
+  constexpr static uint32_t maximumTerminalContainerLaunchUUIDs = 4096;
+  bytell_hash_set<uint128_t> terminalContainerLaunchUUIDs;
+  uint64_t containerLaunchControlGeneration = 1;
 
   bytell_hash_map<uint128_t, Container *> quarantinedContainerNetworks;
   bytell_hash_map<pid_t, Container *> containerByPid;
@@ -100,24 +107,79 @@ public:
     return address;
   }
 
-  bool beginPendingContainerLaunch(const ContainerPlan& plan)
+  uint64_t beginPendingContainerLaunch(const ContainerPlan& plan)
   {
-    if (plan.uuid == 0 || containers.contains(plan.uuid) || pendingContainerLaunchPlans.contains(plan.uuid))
+    if (plan.uuid == 0 || terminalContainerLaunchUUIDs.contains(plan.uuid) ||
+        containers.contains(plan.uuid) || pendingContainerLaunchPlans.contains(plan.uuid))
+    {
+      return 0;
+    }
+    pendingContainerLaunchPlans.insert_or_assign(plan.uuid, plan);
+    pendingContainerLaunchGenerations.insert_or_assign(plan.uuid, containerLaunchControlGeneration);
+    return containerLaunchControlGeneration;
+  }
+
+  bool finishPendingContainerLaunch(uint128_t uuid, uint64_t admissionGeneration)
+  {
+    auto found = pendingContainerLaunchGenerations.find(uuid);
+    if (admissionGeneration == 0 || found == pendingContainerLaunchGenerations.end() ||
+        found->second != admissionGeneration)
     {
       return false;
     }
-    pendingContainerLaunchPlans.insert_or_assign(plan.uuid, plan);
-    return true;
-  }
-
-  void finishPendingContainerLaunch(uint128_t uuid)
-  {
     pendingContainerLaunchPlans.erase(uuid);
+    pendingContainerLaunchGenerations.erase(found);
+    return true;
   }
 
   bool isPendingContainerLaunch(uint128_t uuid) const
   {
     return pendingContainerLaunchPlans.contains(uuid);
+  }
+
+  bool pendingContainerLaunchIsCurrent(uint128_t uuid, uint64_t admissionGeneration) const
+  {
+    auto found = pendingContainerLaunchGenerations.find(uuid);
+    return admissionGeneration != 0 && found != pendingContainerLaunchGenerations.end() &&
+           found->second == admissionGeneration &&
+           admissionGeneration == containerLaunchControlGeneration &&
+           pendingContainerLaunchPlans.contains(uuid) &&
+           terminalContainerLaunchUUIDs.contains(uuid) == false;
+  }
+
+  bool retireContainerLaunch(uint128_t uuid)
+  {
+    if (uuid == 0)
+    {
+      return false;
+    }
+    if (terminalContainerLaunchUUIDs.contains(uuid))
+    {
+      return true;
+    }
+    if (terminalContainerLaunchUUIDs.size() >= maximumTerminalContainerLaunchUUIDs)
+    {
+      return false;
+    }
+    terminalContainerLaunchUUIDs.insert(uuid);
+    return true;
+  }
+
+  bool isContainerLaunchRetired(uint128_t uuid) const
+  {
+    return terminalContainerLaunchUUIDs.contains(uuid);
+  }
+
+  void resetContainerLaunchControlGeneration(void)
+  {
+    containerLaunchControlGeneration += 1;
+    if (containerLaunchControlGeneration == 0)
+    {
+      containerLaunchControlGeneration = 1;
+    }
+    pendingContainerLaunchPlans.clear();
+    pendingContainerLaunchGenerations.clear();
+    terminalContainerLaunchUUIDs.clear();
   }
 
   virtual void pushContainer(Container *container) = 0;

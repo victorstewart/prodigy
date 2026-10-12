@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cstring>
+#include <cstdio>
 
 #include <prodigy/cluster.pair.authority.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
@@ -18,27 +19,76 @@ constexpr static uint32_t mothershipPairControlFaultMaximumDurationMilliseconds 
 
 // A test-only fault is deliberately limited to the already admitted pair
 // carrier.  It carries no interface, namespace, route, or cluster selector.
+enum class MothershipPairControlFaultDirection : uint8_t {
+  both = 0,
+  firstToSecond = 1,
+  secondToFirst = 2,
+};
+
+static inline const char *mothershipPairControlFaultDirectionName(MothershipPairControlFaultDirection direction)
+{
+  switch (direction)
+  {
+    case MothershipPairControlFaultDirection::both: return "both";
+    case MothershipPairControlFaultDirection::firstToSecond: return "first-to-second";
+    case MothershipPairControlFaultDirection::secondToFirst: return "second-to-first";
+  }
+  return nullptr;
+}
+
+// The sealed provider reports this canonical FORWARD rule witness only after
+// it has observed the selected drop installed and then absent again after the
+// firewall digest returns to its prepared value.  Keep this mapping typed so a
+// direction label alone can never stand in for the wire it changed.
+static inline const char *mothershipPairControlFaultRuleWitness(
+    MothershipPairControlFaultDirection direction, bool restored)
+{
+  switch (direction)
+  {
+    case MothershipPairControlFaultDirection::firstToSecond:
+      return restored ? "first0-to-second0-ABSENT" : "first0-to-second0-DROP";
+    case MothershipPairControlFaultDirection::secondToFirst:
+      return restored ? "second0-to-first0-ABSENT" : "second0-to-first0-DROP";
+    case MothershipPairControlFaultDirection::both:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+static inline bool mothershipPairControlFaultDirectionParse(const String& text,
+                                                             MothershipPairControlFaultDirection& direction)
+{
+  if (text == "both"_ctv) direction = MothershipPairControlFaultDirection::both;
+  else if (text == "first-to-second"_ctv) direction = MothershipPairControlFaultDirection::firstToSecond;
+  else if (text == "second-to-first"_ctv) direction = MothershipPairControlFaultDirection::secondToFirst;
+  else return false;
+  return true;
+}
+
 class MothershipPairControlFault {
 public:
   uint32_t delayMilliseconds = 0;
   uint32_t durationMilliseconds = 0;
+  MothershipPairControlFaultDirection direction = MothershipPairControlFaultDirection::both;
 };
 
 static inline bool mothershipPairControlFaultValid(const MothershipPairControlFault& fault,
                                                    String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (fault.delayMilliseconds > mothershipPairControlFaultMaximumDelayMilliseconds ||
+  if (mothershipPairControlFaultDirectionName(fault.direction) == nullptr ||
+      fault.delayMilliseconds > mothershipPairControlFaultMaximumDelayMilliseconds ||
       fault.durationMilliseconds == 0 ||
       fault.durationMilliseconds > mothershipPairControlFaultMaximumDurationMilliseconds)
   {
-    if (failure) failure->assign("pair-control fault delay or duration is outside the bounded test window");
+    if (failure) failure->assign("pair-control fault direction, delay, or duration is outside the bounded test window");
     return false;
   }
   return true;
 }
 
 static inline bool mothershipPairControlFaultParse(const String& delayText, const String& durationText,
+                                                   const String *directionText,
                                                    MothershipPairControlFault& fault, String *failure = nullptr)
 {
   if (failure) failure->clear();
@@ -53,13 +103,21 @@ static inline bool mothershipPairControlFaultParse(const String& delayText, cons
     value = uint32_t(parsed);
     return true;
   };
+  fault.direction = MothershipPairControlFaultDirection::both;
   if (!parse(delayText, fault.delayMilliseconds) || !parse(durationText, fault.durationMilliseconds) ||
+      (directionText != nullptr && !mothershipPairControlFaultDirectionParse(*directionText, fault.direction)) ||
       !mothershipPairControlFaultValid(fault, failure))
   {
-    if (failure && failure->empty()) failure->assign("pair-control fault delay and duration must be canonical milliseconds");
+    if (failure && failure->empty()) failure->assign("pair-control fault direction and delay/duration must be canonical");
     return false;
   }
   return true;
+}
+
+static inline bool mothershipPairControlFaultParse(const String& delayText, const String& durationText,
+                                                   MothershipPairControlFault& fault, String *failure = nullptr)
+{
+  return mothershipPairControlFaultParse(delayText, durationText, nullptr, fault, failure);
 }
 
 // One operation-scoped, direct TCP flow is optional after the pair-control
@@ -467,7 +525,65 @@ static inline bool mothershipPairControlFaultArguments(
   duration.assignItoa(fault.durationMilliseconds);
   arguments.push_back(std::move(delay));
   arguments.push_back(std::move(duration));
+  if (fault.direction != MothershipPairControlFaultDirection::both)
+  {
+    String direction = {};
+    direction.assign(mothershipPairControlFaultDirectionName(fault.direction));
+    arguments.push_back(std::move(direction));
+  }
   return true;
+}
+
+static inline bool mothershipPairControlFaultReceipt(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const MothershipPairControlFault& fault,
+    uint64_t beginNanoseconds, uint64_t endNanoseconds, String& expected)
+{
+  if (!mothershipPairControlBoundaryValid(descriptor) || !mothershipPairControlFaultValid(fault) ||
+      beginNanoseconds == 0 || endNanoseconds < beginNanoseconds ||
+      endNanoseconds - beginNanoseconds < uint64_t(fault.durationMilliseconds) * 1'000'000ULL ||
+      endNanoseconds - beginNanoseconds > (uint64_t(fault.durationMilliseconds) + 5000) * 1'000'000ULL) return false;
+  String operation = {}, delay = {}, duration = {}, begin = {}, end = {};
+  operation.assignItoh(descriptor.operationUUID); delay.assignItoa(fault.delayMilliseconds);
+  duration.assignItoa(fault.durationMilliseconds); begin.assignItoa(beginNanoseconds); end.assignItoa(endNanoseconds);
+  if (fault.direction == MothershipPairControlFaultDirection::both)
+    expected.snprintf<"PAIR_CONTROL_FAULT operationID={} clock=CLOCK_BOOTTIME delayMs={} durationMs={} beginNs={} endNs={}\n"_ctv>(operation, delay, duration, begin, end);
+  else
+  {
+    const char *installed = mothershipPairControlFaultRuleWitness(fault.direction, false);
+    const char *restored = mothershipPairControlFaultRuleWitness(fault.direction, true);
+    if (installed == nullptr || restored == nullptr) return false;
+    String direction = {}, installedRule = {}, restoredRule = {};
+    direction.assign(mothershipPairControlFaultDirectionName(fault.direction));
+    installedRule.assign(installed); restoredRule.assign(restored);
+    expected.snprintf<"PAIR_CONTROL_FAULT operationID={} clock=CLOCK_BOOTTIME delayMs={} durationMs={} direction={} installRule={} restoreRule={} beginNs={} endNs={}\n"_ctv>(operation, delay, duration, direction, installedRule, restoredRule, begin, end);
+  }
+  return true;
+}
+
+static inline bool mothershipPairControlFaultReceiptValid(
+    const MothershipPairControlBoundaryDescriptor& descriptor, const MothershipPairControlFault& fault,
+    const String& receipt)
+{
+  if (!mothershipPairControlFaultValid(fault)) return false;
+  char operation[35] = {}, clock[32] = {}, direction[32] = {}, installed[64] = {}, restored[64] = {};
+  unsigned delay = 0, duration = 0;
+  unsigned long long begin = 0, end = 0;
+  String receiptText = receipt;
+  const int parsed = fault.direction == MothershipPairControlFaultDirection::both ?
+      std::sscanf(receiptText.c_str(), "PAIR_CONTROL_FAULT operationID=%34s clock=%31s delayMs=%u durationMs=%u beginNs=%llu endNs=%llu", operation, clock, &delay, &duration, &begin, &end) :
+      std::sscanf(receiptText.c_str(), "PAIR_CONTROL_FAULT operationID=%34s clock=%31s delayMs=%u durationMs=%u direction=%31s installRule=%63s restoreRule=%63s beginNs=%llu endNs=%llu", operation, clock, &delay, &duration, direction, installed, restored, &begin, &end);
+  if (parsed != (fault.direction == MothershipPairControlFaultDirection::both ? 6 : 9) ||
+      std::strcmp(clock, "CLOCK_BOOTTIME") != 0 || delay != fault.delayMilliseconds || duration != fault.durationMilliseconds)
+    return false;
+  String expectedOperation = {}; expectedOperation.assignItoh(descriptor.operationUUID);
+  String observedOperation = {}; observedOperation.assign(operation);
+  if (expectedOperation != observedOperation ||
+      (fault.direction != MothershipPairControlFaultDirection::both &&
+       (std::strcmp(direction, mothershipPairControlFaultDirectionName(fault.direction)) != 0 ||
+        std::strcmp(installed, mothershipPairControlFaultRuleWitness(fault.direction, false)) != 0 ||
+        std::strcmp(restored, mothershipPairControlFaultRuleWitness(fault.direction, true)) != 0))) return false;
+  String expected = {};
+  return mothershipPairControlFaultReceipt(descriptor, fault, uint64_t(begin), uint64_t(end), expected) && receipt == expected;
 }
 
 static inline bool mothershipPairControlBoundaryPreparedReceipt(

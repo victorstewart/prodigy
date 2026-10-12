@@ -68,6 +68,7 @@ public:
   bool transitionAfterBundleAck = false;
   bool transportLifecycleCandidate = false;
   bool closeAfterTransportLifecycleAck = false;
+  bool commandsRejected = false;
   std::shared_ptr<uint8_t> connectionLifetime = std::make_shared<uint8_t>(0);
 
   void reset(void) override
@@ -79,6 +80,7 @@ public:
     transitionAfterBundleAck = false;
     transportLifecycleCandidate = false;
     closeAfterTransportLifecycleAck = false;
+    commandsRejected = false;
   }
 };
 
@@ -170,6 +172,8 @@ protected:
     NeuronBrainControlStream *requestedStream = nullptr;
     uint64_t requestedGeneration = 0;
     bool settled = false;
+    bool terminalRetirementPending = false;
+    uint64_t launchAdmissionGeneration = 0;
     String planIdentity = {};
     std::unique_ptr<CoroutineGenerator<uint8_t>> runner;
 
@@ -1052,6 +1056,33 @@ protected:
     }
   }
 
+  void resetContainerLaunchControlForBrainReplacement(void)
+  {
+    resetContainerLaunchControlGeneration();
+    // Retained-process restoration owns an already-live process, so preserve
+    // that exact owner while invalidating ordinary queued launches. The
+    // operation still needs a new authenticated state upload before its
+    // stream identity can become current again.
+    for (auto& [containerUUID, operation] : pendingStateUploadRestores)
+    {
+      (void)containerUUID;
+      if (operation != nullptr && operation->container != nullptr &&
+          operation->container->pendingDestroy == false)
+      {
+        if (operation->terminalRetirementPending)
+        {
+          operation->launchAdmissionGeneration = 0;
+          (void)retireContainerLaunch(operation->container->plan.uuid);
+        }
+        else
+        {
+          operation->launchAdmissionGeneration =
+              beginPendingContainerLaunch(operation->container->plan);
+        }
+      }
+    }
+  }
+
   void retireBrainControlStream(NeuronBrainControlStream *stream, const char *reason = nullptr)
   {
     if (stream == nullptr)
@@ -1069,6 +1100,10 @@ protected:
 
     if (stream == brain)
     {
+      // Frames and suspended launches belong to this exact control stream.
+      // A replacement stream starts a new bounded launch generation; stale
+      // coroutines verify their generation before they can publish.
+      resetContainerLaunchControlForBrainReplacement();
       brain = nullptr;
     }
 
@@ -3070,6 +3105,13 @@ protected:
       return false;
     }
     const bool configured = ensureSwitchboard()->configureAdditionalIngress(*additionalIngressEth, tcx_ingress_program, failureReport);
+    if (configured)
+    {
+      // configureAdditionalIngress can create or replace the boundary XDP
+      // program after the earlier setupNetworking overlay sync. Populate the
+      // new program before it can receive traffic from the tunnel veth.
+      syncSwitchboardBalancerOverlayRoutingProgram();
+    }
     if (configured == false)
     {
       std::fprintf(stderr, "ensureAdditionalIngressReady failed reason=%s primaryIfidx=%d additionalIfidx=%d peerIfidx=%lu device=%s\n",
@@ -3414,6 +3456,27 @@ public:
         !Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, installed.routeKey, revoked)) return false;
     return Container::removeVerifiedPairAdmissionGrant(tcx_egress_program, installed.grantKey,
         installed.routeKey, installed.rootGeneration, installed.keyEpoch);
+  }
+
+  void invalidateCousinAdmissionsForSwitchboardReset()
+  {
+    uint32_t cleanupFailures = 0;
+    for (const CousinAdmissionInstalled& installed : cousinAdmissionInstalled)
+    {
+      if (!clearCousinAdmissionGrant(installed))
+      {
+        ++cleanupFailures;
+      }
+    }
+    // Portal slots and target bindings are recreated by resetState. Never
+    // renew the old ledger entries after that boundary, even when an exact BPF
+    // cleanup must instead age out under its already-bounded lease.
+    cousinAdmissionInstalled.clear();
+    if (cleanupFailures != 0)
+    {
+      basics_log("neuron switchboard reset could not immediately clear %u cousin admission grants\n",
+                 cleanupFailures);
+    }
   }
 
   void pruneCousinSessionEphemeralState(int64_t now)
@@ -5422,6 +5485,17 @@ public:
         }, failure);
   }
 
+  // Both ordinary Brain spin commands and an authenticated fresh
+  // state-upload replay enter through this boundary. Tests can observe their
+  // identity without changing the production launch sequencing.
+  virtual void launchContainerFromBrain(ContainerPlan plan,
+                                        uint128_t replaceContainerUUID,
+                                        NeuronContainerMetricPolicy metricPolicy,
+                                        RetainedContainerStorageSource retainedSource = {})
+  {
+    ContainerManager::spinContainer(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
+  }
+
   // Production keeps received application artifacts in the canonical store.
   // Tests override only the root to exercise the identical prepared lifecycle.
   virtual String containerArtifactStoreRoot(void) const
@@ -5484,6 +5558,7 @@ protected:
   bool stateUploadRestoreCurrent(const StateUploadRestoreOperation& operation, uint128_t containerUUID) const
   {
     return operation.container != nullptr && operation.container->pendingDestroy == false &&
+           pendingContainerLaunchIsCurrent(containerUUID, operation.launchAdmissionGeneration) &&
            operation.epoch == stateUploadRestoreEpoch &&
            memcmp(&operation.fragment, &lcsubnet6, sizeof(lcsubnet6)) == 0 &&
            brain == operation.stream && brain != nullptr &&
@@ -5552,7 +5627,7 @@ protected:
     }
 
     if (stateUploadRestoreRemaining > 0) --stateUploadRestoreRemaining;
-    finishPendingContainerLaunch(containerUUID);
+    finishPendingContainerLaunch(containerUUID, operation->launchAdmissionGeneration);
     container = operation->container.release();
     if (container != nullptr)
     {
@@ -5667,18 +5742,109 @@ protected:
   bool beginStateUploadRestore(std::unique_ptr<Container> container, uint64_t epoch)
   {
     if (container == nullptr) return false;
+    const uint64_t launchAdmissionGeneration = beginPendingContainerLaunch(container->plan);
     if (pendingStateUploadRestores.size() >= maximumPendingStateUploadRestores ||
-        beginPendingContainerLaunch(container->plan) == false)
+        launchAdmissionGeneration == 0)
     {
+      finishPendingContainerLaunch(container->plan.uuid, launchAdmissionGeneration);
       container->abandonRetainedNetworkForNeuronReplacement();
       return false;
     }
     const uint128_t containerUUID = container->plan.uuid;
     auto operation = std::make_unique<StateUploadRestoreOperation>();
     operation->container = std::move(container);
+    operation->launchAdmissionGeneration = launchAdmissionGeneration;
     BitseryEngine::serialize(operation->planIdentity, operation->container->plan);
     pendingStateUploadRestores.insert_or_assign(containerUUID, std::move(operation));
     resumeStateUploadRestore(*pendingStateUploadRestores.find(containerUUID)->second, containerUUID, epoch);
+    return true;
+  }
+
+  bool retirePendingStateUploadRestore(uint128_t containerUUID)
+  {
+    auto found = pendingStateUploadRestores.find(containerUUID);
+    if (found == pendingStateUploadRestores.end() || found->second == nullptr)
+    {
+      return false;
+    }
+
+    StateUploadRestoreOperation *pending = found->second.get();
+    if (pending->container != nullptr && pending->container->pid > 0 &&
+        pending->container->pidfd < 0)
+    {
+      // An adopted process is not this Neuron's child and a numeric PID can be
+      // recycled. Without a pidfd, retain the exact candidate and terminal
+      // fence without signalling or acknowledging an unproven identity.
+      if (pending->settled == false && stateUploadRestoreRemaining > 0)
+      {
+        --stateUploadRestoreRemaining;
+      }
+      pending->coro.cancelSuspended();
+      pending->runner.reset();
+      pending->settled = true;
+      pending->terminalRetirementPending = true;
+      stateUploadRestoreReplyPending = false;
+      return true;
+    }
+
+    std::unique_ptr<StateUploadRestoreOperation> operation = std::move(found->second);
+    pendingStateUploadRestores.erase(found);
+    if (operation->settled == false && stateUploadRestoreRemaining > 0)
+    {
+      --stateUploadRestoreRemaining;
+    }
+    operation->coro.cancelSuspended();
+    operation->runner.reset();
+    finishPendingContainerLaunch(containerUUID, operation->launchAdmissionGeneration);
+
+    std::unique_ptr<Container> ownedContainer = std::move(operation->container);
+    if (ownedContainer == nullptr)
+    {
+      return false;
+    }
+
+    // The candidate owns an already-live process but has not entered the
+    // published container map. Move it under the ordinary waitid/destroy owner
+    // before signalling it, so a kill acknowledgement still means that the
+    // exact process has exited and all runtime resources were retired.
+    Container *container = ownedContainer.release();
+    container->killedOnPurpose = true;
+    container->pendingKillAckToBrain = true;
+    containers.insert_or_assign(containerUUID, container);
+    if (container->pid > 0)
+    {
+      containerByPid.insert_or_assign(container->pid, container);
+    }
+    RingDispatcher::installMultiplexee(container, this);
+
+    if (container->pid > 0)
+    {
+      ContainerManager::queueContainerWaitid(container);
+      int signalResult = -1;
+#ifdef SYS_pidfd_send_signal
+      signalResult = int(syscall(SYS_pidfd_send_signal, container->pidfd, SIGKILL, nullptr, 0));
+#else
+      errno = ENOSYS;
+#endif
+      if (signalResult != 0 && errno != ESRCH)
+      {
+        basics_log("neuron retained restore kill failed uuid=%llu pid=%d errno=%d(%s); retaining lifecycle owner\n",
+                   (unsigned long long)containerUUID,
+                   int(container->pid),
+                   errno,
+                   strerror(errno));
+      }
+    }
+    else
+    {
+      ContainerManager::destroyContainer(container);
+    }
+
+    if (!stateUploadRestoresPending() && stateUploadRestoreReplyPending)
+    {
+      stateUploadRestoreReplyPending = false;
+      queueNeuronStateUpload();
+    }
     return true;
   }
 
@@ -5686,6 +5852,10 @@ public:
 
   void neuronHandler(Message *message)
   {
+    if (brain != nullptr && brain->commandsRejected)
+    {
+      return;
+    }
     if (controlTransportCredentials.enabled &&
         (!brain || (!controlPeerCurrentlyAuthorized(brain->tlsPeerUUID) &&
          !((NeuronTopic(message->topic) == NeuronTopic::transportCredentialLifecycle ||
@@ -5896,6 +6066,21 @@ public:
               break;
             }
 
+            if (isContainerLaunchRetired(restoredPlan.uuid))
+            {
+              if (containers.contains(restoredPlan.uuid) ||
+                  pendingStateUploadRestores.contains(restoredPlan.uuid))
+              {
+                // An explicit kill can still be draining the live owner. Its
+                // normal close/waitid path owns the terminal acknowledgement.
+                continue;
+              }
+              // Re-acknowledge the terminal decision after a repeated upload.
+              // A queued spin carrying this UUID is stale and must stay fenced.
+              String empty = {};
+              reportContainerFailed(restoredPlan.uuid, 0, 0, empty, false);
+              continue;
+            }
             if (isPendingContainerLaunch(restoredPlan.uuid))
             {
               if (!admitRepeatedStateUploadRestore(restoredPlan, metricPolicy, restoreEpoch))
@@ -5922,6 +6107,21 @@ public:
                 continue;
               }
             }
+            if (auto quarantined = quarantinedContainerNetworks.find(restoredPlan.uuid);
+                quarantined != quarantinedContainerNetworks.end())
+            {
+              Container *retained = quarantined->second;
+              if (retained == nullptr || retained->plan.uuid != restoredPlan.uuid ||
+                  retained->networkQuarantineRetained == false)
+              {
+                malformedStateUpload = true;
+                break;
+              }
+              basics_log("neuron stateUpload skipped quarantined container network uuid=%llu state=%u\n",
+                         (unsigned long long)retained->plan.uuid,
+                         unsigned(retained->plan.state));
+              continue;
+            }
 
             uint32_t userID = 0;
             uint32_t executionHostID = 0;
@@ -5945,6 +6145,7 @@ public:
             path.snprintf<"/sys/fs/cgroup/containers.slice/{}.slice/leaf"_ctv>(container->name);
 
             container->cgroup = Filesystem::openDirectoryAt(-1, path);
+            const int cgroupLookupErrno = container->cgroup < 0 ? errno : 0;
             if (container->cgroup >= 0)
             {
               Filesystem::openReadAtClose(container->cgroup, "cgroup.procs"_ctv, output);
@@ -6073,18 +6274,44 @@ public:
               }
               else
               {
+                const auto ownerProof = ContainerManager::proveMissingScheduledStateUploadOwner(
+                    container->plan, container->cgroup, cgroupLookupErrno);
+                if (container->plan.restartOnFailure &&
+                    ContainerManager::canFreshLaunchMissingScheduledStateUpload(container->plan, ownerProof))
+                {
+                  // This is a never-launched scheduled bootstrap.  It has no
+                  // process, cgroup, artifact, or storage owner, so resume
+                  // the ordinary spin instead of reporting a failed cold
+                  // restart.  spinContainer owns its UUID deduplication.
+                  ContainerPlan freshPlan = std::move(container->plan);
+                  delete container;
+                  launchContainerFromBrain(std::move(freshPlan), 0, metricPolicy);
+                  continue;
+                }
+
                 bool restarted = false;
                 uint128_t restoredUUID = container->plan.uuid;
                 if (container->plan.restartOnFailure)
                 {
-                  restarted = true;
-                  ContainerManager::restartContainer(container);
+                  restarted = ContainerManager::restartContainer(container);
                 }
                 else
                 {
                   ContainerManager::destroyContainer(container);
                 }
 
+                if (restarted == false)
+                {
+                  // The terminal failure can be followed by a spin frame that
+                  // Brain queued before this upload completed. Retire the exact
+                  // UUID before reporting failure so that frame cannot create an
+                  // owner which Brain will no longer track.
+                  if (retireContainerLaunch(restoredUUID) == false)
+                  {
+                    malformedStateUpload = true;
+                    break;
+                  }
+                }
                 String empty;
                 reportContainerFailed(restoredUUID, 0, 0, empty, restarted);
               }
@@ -6342,7 +6569,7 @@ public:
               break;
             }
           }
-          ContainerManager::spinContainer(plan, replaceContainerUUID, metricPolicy, retainedSource);
+          launchContainerFromBrain(std::move(plan), replaceContainerUUID, metricPolicy, retainedSource);
           // Replacement is asynchronous and can reject before stopping the old
           // owner. Its destruction finalizer, not dispatch, acknowledges removal.
 
@@ -6453,6 +6680,24 @@ public:
           uint128_t containerUUID;
           Message::extractArg<ArgumentNature::fixed>(args, containerUUID);
 
+          // Kill is terminal for this UUID. It can overtake a queued spin whose
+          // coroutine has not claimed the pending-launch map yet.
+          if (retireContainerLaunch(containerUUID) == false)
+          {
+            // The bounded control-local fence is full. Closing this stream
+            // discards all queued frames and advances the launch generation.
+            if (brain != nullptr)
+            {
+              brain->commandsRejected = true;
+              queueCloseIfActive(brain);
+            }
+            break;
+          }
+
+          if (retirePendingStateUploadRestore(containerUUID))
+          {
+            break;
+          }
           if (auto it = containers.find(containerUUID); it != containers.end())
           {
             Container *container = it->second;
@@ -6506,6 +6751,7 @@ public:
           whiteholeBindingsByContainer.clear();
           syncWhiteholeBindingsProgram();
 
+          invalidateCousinAdmissionsForSwitchboardReset();
           ensureSwitchboard()->setLocalContainerSubnet(lcsubnet6);
           ensureSwitchboard()->resetState();
           break;
@@ -7061,6 +7307,13 @@ public:
           }
         }
         dispatch(message);
+        if constexpr (std::is_same_v<T, NeuronBrainControlStream>)
+        {
+          if (stream->commandsRejected)
+          {
+            stop = true;
+          }
+        }
       },
                                                 true, UINT32_MAX, 16, ProdigyWire::maxControlFrameBytes, parseFailed);
       if (parseFailed || artifactFailed)
@@ -7827,6 +8080,15 @@ public:
     containerByPid.insert_or_assign(container->pid, container);
     RingDispatcher::installMultiplexee(container, this);
     syncTrackedContainerPeerWhiteholeBindings();
+
+    // Network setup can request runtime-map convergence before the candidate
+    // is visible in containers. A wormhole refresh below requests another
+    // sweep after publication; containers without wormholes need the same
+    // post-publication fence for their peer and primary programs.
+    if (container->plan.wormholes.empty())
+    {
+      syncContainerSwitchboardRuntime(container);
+    }
 
     if (container->exposesNeuronSocket() == false)
     {

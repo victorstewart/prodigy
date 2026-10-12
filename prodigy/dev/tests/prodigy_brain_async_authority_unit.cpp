@@ -123,15 +123,24 @@ public:
     effectBeforeDurability |= !ownershipDurable || !snapshotDurable || !bootDurable;
   }
   bool usesAsyncMasterAuthorityPersistence() const override { return true; }
-  bool claimLocalClusterOwnershipAsync(uint128_t clusterUUID, std::function<void(bool)> completion) override
+  UpdateSelfPersistenceAdmission claimLocalClusterOwnershipAsync(
+      uint128_t clusterUUID, std::function<void(bool)> completion) override
   {
     ++claimCalls;
     ProdigyPersistentLocalBrainState local;
     local.uuid = selfBrainUUID(); local.ownerClusterUUID = clusterUUID;
-    return writer->submitLocalBrainState(std::move(local), 4 * sizeof(local) + 4096,
+    const uint64_t retainedBytes = 4 * sizeof(local) + 4096;
+    const ProdigyArtifactIO::Admission admission = writer->admission(retainedBytes);
+    if (admission == ProdigyArtifactIO::Admission::jobCapacity ||
+        admission == ProdigyArtifactIO::Admission::byteCapacity)
+      return UpdateSelfPersistenceAdmission::backpressured;
+    if (admission != ProdigyArtifactIO::Admission::admitted)
+      return UpdateSelfPersistenceAdmission::rejected;
+    const bool submitted = writer->submitLocalBrainState(std::move(local), retainedBytes,
         [this, completion = std::move(completion)](auto&& result) mutable {
           completion(result.durable); ++completions;
         });
+    return submitted ? UpdateSelfPersistenceAdmission::admitted : UpdateSelfPersistenceAdmission::rejected;
   }
   bool persistMasterAuthorityTransitionCandidate(const ProdigyMasterAuthorityStateTransition& candidate,
                                                  std::function<void(bool)> completion) override

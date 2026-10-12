@@ -14,7 +14,7 @@ prodigy_dev_qualify_cousin_session() {
   local probe=${PRODIGY_DEV_COUSIN_PROBE_BIN:?} side cluster app name
   local route_id=${PRODIGY_DEV_COUSIN_ROUTE_ID:-$OPERATION}
   local lifecycle=${PRODIGY_DEV_COUSIN_LIFECYCLE:-}
-  case "$lifecycle" in ''|horizontal|vertical) ;; *) echo 'FAIL: unsupported COUSIN lifecycle profile' >&2; return 1 ;; esac
+  case "$lifecycle" in ''|horizontal|vertical|source-horizontal-destination-vertical|source-vertical-destination-horizontal) ;; *) echo 'FAIL: unsupported COUSIN lifecycle profile' >&2; return 1 ;; esac
   [[ -x "$probe" ]] || return 1
   local source_name="CousinSource-${route_id#0x}" destination_name="CousinDestination-${route_id#0x}"
   local source_permission destination_permission source_cluster destination_cluster source_prefix destination_prefix
@@ -85,7 +85,7 @@ SURVIVE /root/cousin_session_probe
 SURVIVE /cousin-probe-config
 PLAN
   prodigy_dev_write_common_prodigy_assets "$artifact/Cousin.DiscombobuFile"
-  if [[ -n "$lifecycle" ]]; then echo 'ENV COUSIN_PROBE_LIFECYCLE=1' >>"$artifact/Cousin.DiscombobuFile"; fi
+  if [[ -n "$lifecycle" ]]; then echo "ENV COUSIN_PROBE_LIFECYCLE=$([[ $lifecycle == source-* ]] && echo both || echo 1)" >>"$artifact/Cousin.DiscombobuFile"; fi
   if [[ ${PRODIGY_DEV_COUSIN_GRAPH:-0} == 1 ]]; then echo 'ENV COUSIN_PROBE_GRAPH=1' >>"$artifact/Cousin.DiscombobuFile"; fi
   echo 'EXECUTE ["/root/cousin_session_probe"]' >>"$artifact/Cousin.DiscombobuFile"
   prodigy_dev_run_discombobulator_build "$artifact" "$artifact/Cousin.DiscombobuFile" "$blob" \
@@ -100,18 +100,39 @@ for side,app,name in [('source',int(sys.argv[3]),sys.argv[5]),('destination',int
         'filesystemMB':64,'storageMB':64,'memoryMB':256,'isolateCPUs':False,'nLogicalCores':1,'msTilHealthy':2000,'sTilHealthcheck':3,'sTilKillable':30},
         'apiCredentials':{'applicationID':app,'requiredCredentialNames':[]},'useHostNetworkNamespace':False,
         'minimumSubscriberCapacity':1024,'isStateful':True,'stateful':roles,'moveConstructively':False,'requiresDatacenterUniqueTag':False}
+    profile=sys.argv[8]
+    horizontal=(side=='destination' and profile=='horizontal') or (side=='source' and profile=='source-horizontal-destination-vertical') or (side=='destination' and profile=='source-vertical-destination-horizontal')
+    vertical=(side=='destination' and profile=='vertical') or (side=='destination' and profile=='source-horizontal-destination-vertical') or (side=='source' and profile=='source-vertical-destination-horizontal')
+    scaler={'name':'cousin.probe.scale','percentile':90,'lookbackSeconds':3,'threshold':0.000001,'direction':'upscale'}
+    if horizontal: plan['horizontalScalers']=[dict(scaler,lifetime='ApplicationLifetime::base',minValue=3,maxValue=6)]
+    elif vertical: plan['verticalScalers']=[dict(scaler,resource='ScalingDimension::memory',increment=128,minValue=256,maxValue=384)]
     if side=='source': plan['whiteholes']=[{'transport':'tcp','family':'ipv6','source':'registeredRoutablePrefix'}]
     else:
         plan['advertisements']=[{'service':'${service:'+name+'/cousin.group0}','startAt':'ContainerState::scheduled','stopAt':'ContainerState::destroying','port':9443}]
         plan['wormholes']=[{'name':'cousin','source':'registeredRoutablePrefix','routablePrefixUUID':sys.argv[7],
                            'externalPort':9443,'containerPort':9443,'layer4':'TCP','isQuic':False}]
-        scaler={'name':'cousin.probe.scale','percentile':90,'lookbackSeconds':3,'threshold':0.000001,'direction':'upscale'}
-        if sys.argv[8]=='horizontal':
-            plan['horizontalScalers']=[dict(scaler,lifetime='ApplicationLifetime::base',minValue=3,maxValue=6)]
-        elif sys.argv[8]=='vertical':
-            plan['verticalScalers']=[dict(scaler,resource='ScalingDimension::memory',increment=128,minValue=256,maxValue=384)]
     (root/f'cousin-{side}-plan.json').write_text(json.dumps(plan))
 PY
+  jq -nc --arg sourceName "$source_name" --arg destinationName "$destination_name" --argjson sourceApplicationID "$source_app" --argjson destinationApplicationID "$destination_app" \
+    '{sourceName:$sourceName,destinationName:$destinationName,sourceApplicationID:$sourceApplicationID,destinationApplicationID:$destinationApplicationID}' >"$ROOT/cousin-endpoints.json"
+  if [[ $lifecycle == source-* ]]; then
+    for side in horizontal vertical; do
+      local rejected_plan
+      rejected_plan=$(python3 - "$ROOT/cousin-source-plan.json" "$side" <<'PY_DOWNSCALE'
+import json,pathlib,sys
+p=json.loads(pathlib.Path(sys.argv[1]).read_text());p.pop('horizontalScalers',None);p.pop('verticalScalers',None)
+metric={'name':'cousin.probe.scale','percentile':90,'lookbackSeconds':3,'threshold':0.000001,'direction':'downscale'}
+if sys.argv[2]=='horizontal': p['horizontalScalers']=[dict(metric,lifetime='ApplicationLifetime::base',minValue=3,maxValue=6)]
+else: p['verticalScalers']=[dict(metric,resource='ScalingDimension::memory',increment=128,minValue=256,maxValue=384)]
+print(json.dumps(p))
+PY_DOWNSCALE
+      ) || return
+      if m "cousin-reject-$side-downscale" 15 "$ROOT/cousin-reject-$side-downscale.log" deploy "$FIRST" "$rejected_plan" "$blob"; then
+        echo "FAIL: unsupported stateful $side downscale was accepted" >&2; return 1
+      fi
+      rg -q "stateful deployments cannot set ${side}Scalers.direction=downscale" "$ROOT/cousin-reject-$side-downscale.log" || return 1
+    done
+  fi
   if m cousin-reject-unprotected-stateful 15 "$ROOT/cousin-reject-unprotected-stateful.log" deploy "$SECOND" \
       "$(jq '.advertisements=[]' "$ROOT/cousin-destination-plan.json")" "$blob"; then
     echo 'FAIL: unprotected stateful Wormhole was accepted' >&2; return 1
@@ -167,8 +188,8 @@ PY
     sleep .25
   done
   [[ $discovered == 1 ]] || return 1
-  python3 - "$ROOT" "$source_cluster" "$destination_cluster" "$source_app" "$destination_app" "$source_permission" "$destination_permission" "${PRODIGY_DEV_COUSIN_EXISTING_ROUTES:-}" <<'PY'
-import json,pathlib,re,sys
+  python3 - "$ROOT" "$source_cluster" "$destination_cluster" "$source_app" "$destination_app" "$source_permission" "$destination_permission" "${PRODIGY_DEV_COUSIN_EXISTING_ROUTES:-}" "$lifecycle" <<'PY_TRANSIT'
+import ipaddress,json,pathlib,re,sys
 root=pathlib.Path(sys.argv[1]); src=int(sys.argv[4]); dst=int(sys.argv[5])
 leases=[]
 for line in (root/'cousin-source-leases.log').read_text().splitlines():
@@ -183,7 +204,27 @@ if sys.argv[8]:
     for path in pathlib.Path(sys.argv[8]).glob('*/cousin-service-transit.json'):
         prior=json.loads(path.read_text())
         if int(prior['sourceClusterUUID'],16)==int(sys.argv[2],16): used.add(prior['sourceWhiteholeIPv6'])
-source=next((lease for lease in leases if lease['address'] not in used),None)
+role=None
+if sys.argv[9].startswith('source-'):
+ report=(root/'first-cluster-report.log').read_text(); masters=[]; machines=[]
+ for block in re.findall(r'(?ms)^\s*Machine:.*?(?=^\s*Machine:|\Z)',report):
+  ident=re.search(r'identity uuid=(0x[0-9a-f]+)',block)
+  assert ident, 'source machine identity is missing'
+  machine=int(ident.group(1),16); machines.append(machine)
+  if re.search(r'\bcurrentMaster=1(?:\s|$)',block): masters.append(machine)
+ assert len(machines)==3 and len(set(machines))==3 and len(masters)==1, 'source master identity is unproven'
+ prefixes=[]
+ for line in (root/'cousin-source-prefixes.tsv').read_text().splitlines():
+  i,u,p=line.split('\t'); prefixes.append((int(u,16),ipaddress.IPv6Network(p)))
+ assert len(prefixes)==3 and {u for u,p in prefixes}==set(machines), 'source prefix owner mapping is ambiguous'
+ assert all(not p.overlaps(q) for index,(_,p) in enumerate(prefixes) for _,q in prefixes[index+1:]), 'source prefixes overlap'
+ target_master=sys.argv[9]=='source-vertical-destination-horizontal'
+ choices=[(u,p) for u,p in prefixes if (u==masters[0])==target_master]
+ assert len(choices)==(1 if target_master else 2), 'source role prefix mapping is ambiguous'
+ if not target_master: choices=choices[:1]
+ target_uuid,target_prefix=choices[0]; role='master' if target_master else 'follower'
+ source=next((x for x in leases if ipaddress.IPv6Address(x['address']) in target_prefix and x['address'] not in used),None)
+else: source=next((lease for lease in leases if lease['address'] not in used),None)
 assert source is not None, 'no distinct allocated source address for independent pair route'
 line=next(x for x in (root/'cousin-discovery.log').read_text().splitlines() if x.startswith('cousinCounterpart '))
 dest=dict(re.findall(r'(\w+)=([^\s]+)',line))
@@ -193,7 +234,9 @@ record={'sourceClusterUUID':sys.argv[2],'destinationClusterUUID':sys.argv[3],
     'sourceWhiteholeIPv6':source['address'],'sourceTCPPort':int(source['sourcePort']),
     'destinationWormholeIPv6':dest['publicAddress'],'destinationTCPPort':int(dest['publicTCPPort'])}
 (root/'cousin-service-transit.json').write_text(json.dumps(record))
-PY
+if role:
+ (root/'cousin-source-role-selection.json').write_text(json.dumps({'sourceRole':role,'sourceMachineUUID':hex(target_uuid),'sourceWhiteholeIPv6':source['address'],'sourceTCPPort':int(source['sourcePort'])})+'\n')
+PY_TRANSIT
   m cousin-transit 45 "$ROOT/cousin-transit.log" testClusterPairControl "$OPERATION" service "$(cat "$ROOT/cousin-service-transit.json")" || return
   ok "$ROOT/cousin-transit.log" testClusterPairControl || return 1
   [[ ${PRODIGY_DEV_COUSIN_PREPARE_ONLY:-0} == 1 ]] && return 0
@@ -211,7 +254,7 @@ PY
     PAIR_PARTITION_PID=$!
     COUSIN_OFFLINE=1
     source "$TEST_DIR/prodigy_dev_cousin_lifecycle_qualification.sh"
-    prodigy_dev_qualify_cousin_lifecycle "$lifecycle" "$destination_name" || return
+    prodigy_dev_qualify_cousin_lifecycle "$lifecycle" "$source_name" "$destination_name" || return
   fi
   COUSIN_OFFLINE=0
   # This marker bounds delivery of the synchronous Mothership revoke command;

@@ -32,7 +32,7 @@ with tempfile.TemporaryDirectory() as directory:
         destination_path = root / f'd{index}/stdout.log'
         files[source_path] = source_log(source, peer, f'r{index}')
         files[destination_path] = (f'cousin_session_probe.ready uuid={peer} deployment=19 source=0\n'
-                                   f'cousin_session_probe.echo peer={source} session=sr{index} payload=exact\n')
+                                   f'cousin_session_probe.echo peer={source} session=sr{index} monotonicMs=4000 payload=exact\n')
         routes.append({'name': f'r{index}', 'sourceLog': str(source_path), 'sourceUUID': source,
                        'sourceDeploymentID': 9, 'sourceTuple': ['fd00::1', 45000],
                        'destinationUUIDs': [peer], 'destinationLogs': [
@@ -82,6 +82,21 @@ with tempfile.TemporaryDirectory() as directory:
     run('wrong destination echo', False, lambda s: change_destination(s, 'payload=exact', 'payload=wrong'))
     run('wrong echo session', False, lambda s: change_destination(s, 'session=sr0', 'session=other'))
     run('wrong echo peer', False, lambda s: change_destination(s, f'peer={1:032x}', 'peer='+'f'*32))
+    run('missing echo timestamp', False, lambda s: change_destination(s, ' monotonicMs=4000', ''))
+    run('nonnumeric echo timestamp', False, lambda s: change_destination(s, 'monotonicMs=4000', 'monotonicMs=invalid'))
     run('retain earlier shared session', True, lambda s: pathlib.Path(s['routes'][0]['sourceLog']).write_text(
         files[pathlib.Path(s['routes'][0]['sourceLog'])] + source_log(f'{1:032x}',f'{17:032x}','later',20000)))
+    def window(spec, after=1100, before=14300):
+        for route in spec['routes']:
+            route.update(afterMonotonicMs=after, beforeMonotonicMs=before, requireFreshRequest=False)
+    run('established sessions inside witnessed fault', True, window)
+    run('payload after restore cannot extend fault window', False, lambda s: window(s, before=12000))
+    run('payload before fault cannot extend fault window', False, lambda s: window(s, after=3300))
+    run('renewal before fault cannot qualify', False, lambda s: (
+        window(s), change_source(s, 'generation=2 monotonicMs=4000', 'generation=2 monotonicMs=1099')))
+    run('echo before fault cannot qualify', False, lambda s: (
+        window(s), change_destination(s, 'monotonicMs=4000', 'monotonicMs=1099')))
+    run('echo after fault cannot qualify', False, lambda s: (
+        window(s), change_destination(s, 'monotonicMs=4000', 'monotonicMs=14301')))
+    run('inverted fault window', False, lambda s: window(s, after=15000))
 print('PASS: graph observer positive stages and independent adversarial cases')

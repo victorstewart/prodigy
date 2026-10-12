@@ -135,6 +135,8 @@ public:
   bool failRuntimeStatePersist = false;
   bool holdRuntimeStatePersist = false;
   Vector<PersistenceCompletion> pendingRuntimeStatePersistence;
+  uint32_t updateSelfPersistenceBackpressureResponses = 0;
+  bool rejectUpdateSelfPersistenceAdmission = false;
 
   void enableMachineRetirementAuthority(void)
   {
@@ -237,6 +239,16 @@ public:
   void testDeriveMasterBrainIf(void)
   {
     deriveMasterBrainIf();
+  }
+
+  void testResumeMachineClaimsIfSchedulingReady(Machine *machine)
+  {
+    resumeMachineClaimsIfSchedulingReady(machine);
+  }
+
+  bool testReplayRestoredContainerInventory(void)
+  {
+    return replayRestoredContainerInventory();
   }
 
   void testBrainHandler(BrainView *brain, Message *message)
@@ -359,6 +371,16 @@ public:
   bool testPruneRecoveredInventoryOrphanWhiteholeLeases(void)
   {
     return pruneRecoveredInventoryOrphanWhiteholeLeases();
+  }
+
+  bool testRecoveryPersistenceRetryPending(void) const
+  {
+    return recoveryPersistenceRetryPending;
+  }
+
+  void testRetryDeferredRecoveryPersistence(void)
+  {
+    retryDeferredRecoveryPersistence();
   }
 
   bool testFinalizePersistedNeuronInventoryRecoveryWithoutMesh(void)
@@ -630,6 +652,20 @@ public:
     }
   }
 
+  UpdateSelfPersistenceAdmission updateSelfPersistenceAdmission(void) override
+  {
+    if (rejectUpdateSelfPersistenceAdmission)
+    {
+      return UpdateSelfPersistenceAdmission::rejected;
+    }
+    if (updateSelfPersistenceBackpressureResponses > 0)
+    {
+      --updateSelfPersistenceBackpressureResponses;
+      return UpdateSelfPersistenceAdmission::backpressured;
+    }
+    return UpdateSelfPersistenceAdmission::admitted;
+  }
+
   void checkMetroReachabilityForMasterFailover(bool& connectedMajority, bool& reachableSwitchMajority) override
   {
     metroReachabilityChecks += 1;
@@ -834,6 +870,30 @@ static void suspendAndPopulateMachines(CoroutineStack& coro, bytell_hash_set<Mac
   }
 }
 
+static void suspendAndAppendMachineClaim(CoroutineStack& coro,
+                                         Machine *machine,
+                                         MachineTicket *appendedTicket,
+                                         uint32_t *resumeCount,
+                                         bool *reallocated)
+{
+  co_await coro.suspend();
+
+  *resumeCount += 1;
+  Machine::Claim *beforeAppend = machine->claims.data();
+  Machine::Claim appended = {};
+  appended.ticket = appendedTicket;
+  appended.nFit = 3;
+  machine->claims.push_back(std::move(appended));
+  *reallocated = machine->claims.data() != beforeAppend;
+}
+
+static void suspendAndCountMachineClaimResume(CoroutineStack& coro, uint32_t *resumeCount)
+{
+  co_await coro.suspend();
+
+  *resumeCount += 1;
+}
+
 class SuspendedGetMachinesBrainIaaS final : public NoopBrainIaaS {
 public:
 
@@ -868,6 +928,25 @@ public:
   bool deploymentPresentAtUpload = false;
   bool uploaded = false;
 
+  void uploadPlan(const ContainerPlan& uploadedPlan)
+  {
+    String upload = {};
+    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+    struct local_container_subnet6 fragment = {};
+    fragment.dpfx = brain->brainConfig.datacenterFragment;
+    fragment.mpfx[0] = static_cast<uint8_t>((machine->fragment >> 16) & 0xFF);
+    fragment.mpfx[1] = static_cast<uint8_t>((machine->fragment >> 8) & 0xFF);
+    fragment.mpfx[2] = static_cast<uint8_t>(machine->fragment & 0xFF);
+    Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, uploadedPlan);
+    Message::appendValue(upload, serializedPlan);
+    Message::finish(upload, headerOffset);
+
+    brain->testNeuronHandler(&machine->neuron, reinterpret_cast<Message *>(upload.data()));
+    uploaded = true;
+  }
+
   void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
     (void)coro;
@@ -880,22 +959,7 @@ public:
 
     machines.insert(machine);
     deploymentPresentAtUpload = brain->deployments.contains(plan.config.deploymentID());
-
-    String upload = {};
-    uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
-    struct local_container_subnet6 fragment = {};
-    fragment.dpfx = brain->brainConfig.datacenterFragment;
-    fragment.mpfx[0] = static_cast<uint8_t>((machine->fragment >> 16) & 0xFF);
-    fragment.mpfx[1] = static_cast<uint8_t>((machine->fragment >> 8) & 0xFF);
-    fragment.mpfx[2] = static_cast<uint8_t>(machine->fragment & 0xFF);
-    Message::appendAlignedBuffer<Alignment::one>(upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
-    String serializedPlan = {};
-    BitseryEngine::serialize(serializedPlan, plan);
-    Message::appendValue(upload, serializedPlan);
-    Message::finish(upload, headerOffset);
-
-    brain->testNeuronHandler(&machine->neuron, reinterpret_cast<Message *>(upload.data()));
-    uploaded = true;
+    uploadPlan(plan);
   }
 };
 
@@ -2526,6 +2590,63 @@ static void runDirectMasterClaimReconciliationFixtures(TestSuite& suite)
   delete followerPeer;
 }
 
+static void runMachineClaimResumeMutationFixture(TestSuite& suite)
+{
+  TestBrain brain = {};
+  Machine machine = {};
+  machine.state = MachineState::healthy;
+  machine.runtimeReady = true;
+
+  CoroutineStack firstCoroutine = {};
+  CoroutineStack secondCoroutine = {};
+  CoroutineStack appendedCoroutine = {};
+  MachineTicket firstTicket = {};
+  MachineTicket secondTicket = {};
+  MachineTicket appendedTicket = {};
+  firstTicket.coro = &firstCoroutine;
+  secondTicket.coro = &secondCoroutine;
+  appendedTicket.coro = &appendedCoroutine;
+
+  uint32_t firstResumes = 0;
+  uint32_t secondResumes = 0;
+  uint32_t appendedResumes = 0;
+  bool firstResumeReallocatedClaims = false;
+  suspendAndAppendMachineClaim(firstCoroutine,
+                               &machine,
+                               &appendedTicket,
+                               &firstResumes,
+                               &firstResumeReallocatedClaims);
+  suspendAndCountMachineClaimResume(secondCoroutine, &secondResumes);
+  suspendAndCountMachineClaimResume(appendedCoroutine, &appendedResumes);
+
+  machine.claims.reserve(2);
+  Machine::Claim firstClaim = {};
+  firstClaim.ticket = &firstTicket;
+  firstClaim.nFit = 1;
+  machine.claims.push_back(std::move(firstClaim));
+  Machine::Claim secondClaim = {};
+  secondClaim.ticket = &secondTicket;
+  secondClaim.nFit = 2;
+  machine.claims.push_back(std::move(secondClaim));
+
+  brain.testResumeMachineClaimsIfSchedulingReady(&machine);
+
+  suite.expect(firstResumeReallocatedClaims,
+               "resume_machine_claims_mutating_ticket_reallocates_claims");
+  suite.expect(firstResumes == 1 && secondResumes == 1 && appendedResumes == 0,
+               "resume_machine_claims_consumes_original_claims_once");
+  suite.expect(firstTicket.machineNow == &machine && firstTicket.nNow == 1 &&
+                   secondTicket.machineNow == &machine && secondTicket.nNow == 2,
+               "resume_machine_claims_projects_original_claims_before_resume");
+  suite.expect(machine.claims.size() == 1 && machine.claims[0].ticket == &appendedTicket,
+               "resume_machine_claims_defers_claim_added_during_resume");
+
+  brain.testResumeMachineClaimsIfSchedulingReady(&machine);
+
+  suite.expect(appendedResumes == 1 && machine.claims.empty(),
+               "resume_machine_claims_consumes_deferred_claim_on_next_pass");
+}
+
 int main(void)
 {
   TestSuite suite;
@@ -2926,6 +3047,165 @@ int main(void)
       ::close(peerFD);
       peerFD = -1;
     }
+  };
+
+  auto runRestoredInventoryReplayProgressFixture = [&]() -> void {
+    ScopedRing scopedRing = {};
+    TestBrain brain = {};
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
+    brain.weAreMaster = true;
+    brain.ignited = true;
+    brain.recoveringPersistedNeuronInventory = true;
+    brain.brainConfig.datacenterFragment = 0x42;
+
+    Machine machine = {};
+    machine.uuid = uint128_t(0xA201);
+    machine.fragment = 0x010203;
+    machine.state = MachineState::healthy;
+    machine.neuron.machine = &machine;
+    machine.neuron.connected = true;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.neurons.insert(&machine.neuron);
+
+    DeploymentPlan plan = makeDeploymentPlan(0xA2, 1);
+    plan.canaryCount = 0;
+    plan.hasApiCredentialPolicy = true;
+    plan.apiCredentialPolicy.applicationID = plan.config.applicationID;
+    ApplicationDeployment deployment = {};
+    deployment.plan = plan;
+    deployment.state = DeploymentState::running;
+    brain.deployments.insert_or_assign(plan.config.deploymentID(), &deployment);
+
+    ContainerView container = {};
+    container.uuid = uint128_t(0xA202);
+    container.applicationID = plan.config.applicationID;
+    container.deploymentID = plan.config.deploymentID();
+    container.lifetime = ApplicationLifetime::base;
+    container.state = ContainerState::scheduled;
+    container.machine = &machine;
+    container.fragment = 1;
+    deployment.containers.insert(&container);
+    machine.upsertContainerIndexEntry(container.deploymentID, &container);
+    brain.containers.insert_or_assign(container.uuid, &container);
+
+    int peerFD = -1;
+    if (installNeuronSocket(brain, machine, peerFD) == false)
+    {
+      suite.expect(false, "restored_inventory_replay_progress_installs_control_socket");
+      brain.containers.erase(container.uuid);
+      machine.removeContainerIndexEntry(container.deploymentID, &container);
+      deployment.containers.erase(&container);
+      brain.deployments.erase(plan.config.deploymentID());
+      brain.neurons.erase(&machine.neuron);
+      brain.machinesByUUID.erase(machine.uuid);
+      brain.machines.erase(&machine);
+      thisBrain = savedBrain;
+      return;
+    }
+
+    auto sendAcceptedEmptyInventory = [&]() -> void {
+      String upload = {};
+      const uint32_t headerOffset = Message::appendHeader(upload, NeuronTopic::stateUpload);
+      struct local_container_subnet6 fragment = {};
+      fragment.dpfx = brain.brainConfig.datacenterFragment;
+      fragment.mpfx[0] = uint8_t((machine.fragment >> 16) & 0xFF);
+      fragment.mpfx[1] = uint8_t((machine.fragment >> 8) & 0xFF);
+      fragment.mpfx[2] = uint8_t(machine.fragment & 0xFF);
+      Message::appendAlignedBuffer<Alignment::one>(
+          upload, reinterpret_cast<const uint8_t *>(&fragment), sizeof(fragment));
+      Message::finish(upload, headerOffset);
+      brain.testNeuronHandler(&machine.neuron, reinterpret_cast<Message *>(upload.data()));
+    };
+    auto countQueuedStateUploads = [&]() -> uint32_t {
+      uint32_t count = 0;
+      forEachMessageInBuffer(machine.neuron.wBuffer, [&](Message *queued) {
+        if (NeuronTopic(queued->topic) == NeuronTopic::stateUpload)
+        {
+          ++count;
+        }
+      });
+      return count;
+    };
+
+    // A post-close inventory can discover that a scheduled launch never
+    // became a process and queue the canonical UUID for replay. Fragment
+    // refresh observes the same not-ready machine before that reply arrives;
+    // both owners must share one request on this control-stream generation.
+    brain.machinesAwaitingPostCloseInventory.insert(machine.uuid);
+    sendAcceptedEmptyInventory();
+    brain.refreshMachineFragmentAssignmentsIfPossible();
+    suite.expect(countQueuedStateUploads() == 1 && machine.stateUploadRequestPending &&
+                     machine.stateUploadRequestIOGeneration == machine.neuron.ioGeneration,
+                 "post_close_inventory_and_fragment_refresh_coalesce_one_state_upload_request");
+    sendAcceptedEmptyInventory();
+    suite.expect(machine.stateUploadRequestPending == false &&
+                     machine.stateUploadRequestIOGeneration == 0,
+                 "accepted_post_close_replay_inventory_reopens_state_upload_request_gate");
+    machine.neuron.wBuffer.clear();
+
+    sendAcceptedEmptyInventory();
+    sendAcceptedEmptyInventory();
+    suite.expect(machine.runtimeReady && brain.persistedMachineInventoryUploaded.contains(machine.uuid) &&
+                     brain.containerRetirementInventoryByMachine.contains(machine.uuid) &&
+                     brain.containerRetirementInventoryByMachine[machine.uuid].ioGeneration == machine.neuron.ioGeneration,
+                 "restored_inventory_replay_progress_accepts_empty_inventory_for_current_control_generation");
+
+    ContainerPlan replayPlan = {};
+    replayPlan.uuid = container.uuid;
+    replayPlan.config = plan.config;
+    String serializedReplayPlan = {};
+    BitseryEngine::serialize(serializedReplayPlan, replayPlan);
+    Vector<String> canonicalInventory = {};
+    canonicalInventory.push_back(std::move(serializedReplayPlan));
+    brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid, canonicalInventory);
+    brain.pendingRestoredContainerInventory.insert(container.uuid);
+    machine.neuron.wBuffer.clear();
+
+    brain.testReplayRestoredContainerInventory();
+    const uint32_t firstReplayFrames = countQueuedStateUploads();
+
+    sendAcceptedEmptyInventory();
+    brain.persistedMachineInventoryEnumerated = true;
+    String restartedFailure = {};
+    brain.testNeuronHandler(
+        &machine.neuron,
+        buildNeuronMessage(restartedFailure,
+                           NeuronTopic::containerFailed,
+                           container.uuid,
+                           int64_t(1'700'000'000'001),
+                           int(SIGKILL),
+                           "restored replay restart"_ctv,
+                           true));
+    const uint32_t failureReplayFrames = countQueuedStateUploads();
+    const auto replayAfterFailure =
+        brain.restoredContainerInventoryReplayByMachine.find(machine.uuid);
+    suite.expect(container.state == ContainerState::crashedRestarting &&
+                     failureReplayFrames == 2 &&
+                     replayAfterFailure != brain.restoredContainerInventoryReplayByMachine.end() &&
+                     replayAfterFailure->second.attempts == 2 &&
+                     replayAfterFailure->second.awaitingInventory,
+                 "restored_inventory_restarted_failure_wakes_recovery_without_resetting_replay_budget");
+
+    sendAcceptedEmptyInventory();
+    suite.expect(firstReplayFrames == 1 && countQueuedStateUploads() == 2,
+                 "restored_inventory_restarted_failure_keeps_replay_budget_bounded_after_empty_inventory");
+    suite.expect(Ring::socketIsClosing(&machine.neuron),
+                 "restored_inventory_restarted_failure_closes_exhausted_control_generation");
+
+    cleanupNeuronSocket(machine.neuron, peerFD);
+    brain.pendingRestoredContainerInventory.clear();
+    brain.persistedMachineStateUploadPlansByMachine.clear();
+    brain.containerRetirementInventoryByMachine.clear();
+    brain.containers.erase(container.uuid);
+    machine.removeContainerIndexEntry(container.deploymentID, &container);
+    deployment.containers.erase(&container);
+    brain.deployments.erase(plan.config.deploymentID());
+    brain.neurons.erase(&machine.neuron);
+    brain.machinesByUUID.erase(machine.uuid);
+    brain.machines.erase(&machine);
+    thisBrain = savedBrain;
   };
 
   auto runMachineDecommissionFailedDrainSnapshotFixture = [&]() -> void {
@@ -3349,6 +3629,16 @@ int main(void)
                      brain.routableResourceLeaseRuntimeState.size() == 3,
                  "recovered_inventory_whitehole_prune_restores_leases_after_persist_failure");
     brain.failRuntimeStatePersist = false;
+
+    const uint32_t persistsBeforeRejectedAdmission = brain.persistCalls;
+    brain.rejectUpdateSelfPersistenceAdmission = true;
+    suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() == false &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3 &&
+                     brain.persistCalls == persistsBeforeRejectedAdmission &&
+                     brain.testRecoveryPersistenceRetryPending() == false,
+                 "recovered_inventory_whitehole_prune_terminal_admission_stays_fenced");
+    brain.rejectUpdateSelfPersistenceAdmission = false;
+
     suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
                      brain.routableResourceLeaseRuntimeState.size() == 2 &&
                      brain.routableResourceLeaseRuntimeState[0].kind == RoutableResourceLeaseKind::whiteholeAddressPort &&
@@ -3358,6 +3648,59 @@ int main(void)
     suite.expect(brain.testPruneRecoveredInventoryOrphanWhiteholeLeases() &&
                      brain.persistCalls == persistedAfterPrune,
                  "recovered_inventory_whitehole_prune_is_idempotent_after_cleanup");
+
+    brain.routableResourceLeaseRuntimeState.push_back(orphanLease);
+    Mesh mesh = {};
+    brain.mesh = &mesh;
+    brain.ignited = true;
+    brain.updateSelfPersistenceBackpressureResponses = 3;
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
+                     brain.testRecoveringPersistedNeuronInventory() &&
+                     brain.testRecoveryPersistenceRetryPending() &&
+                     brain.persistCalls == persistedAfterPrune &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "persisted_inventory_recovery_backpressure_arms_retry_without_pruning");
+    brain.testRetryDeferredRecoveryPersistence();
+    brain.testRetryDeferredRecoveryPersistence();
+    suite.expect(brain.testRecoveringPersistedNeuronInventory() &&
+                     brain.testRecoveryPersistenceRetryPending() &&
+                     brain.persistCalls == persistedAfterPrune &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "persisted_inventory_recovery_retry_stays_coalesced_during_backpressure");
+    brain.testRetryDeferredRecoveryPersistence();
+    suite.expect(brain.testRecoveringPersistedNeuronInventory() == false &&
+                     brain.testRecoveryPersistenceRetryPending() == false &&
+                     brain.persistCalls == persistedAfterPrune + 1 &&
+                     brain.routableResourceLeaseRuntimeState.size() == 2,
+                 "persisted_inventory_recovery_retry_finalizes_after_capacity_returns");
+
+    // Admission may succeed before the asynchronous writer rejects the
+    // snapshot. Preserve one heartbeat-owned retry after rolling the orphan
+    // lease prune back; recovered inventory can otherwise remain gated with
+    // no later Neuron upload to wake it.
+    brain.recoveringPersistedNeuronInventory = true;
+    brain.routableResourceLeaseRuntimeState.push_back(orphanLease);
+    brain.holdRuntimeStatePersist = true;
+    const uint32_t persistsBeforeRejectedCompletion = brain.persistCalls;
+    suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() == false &&
+                     brain.testRecoveringPersistedNeuronInventory() &&
+                     brain.pendingRuntimeStatePersistence.size() == 1 &&
+                     brain.routableResourceLeaseRuntimeState.size() == 2,
+                 "persisted_inventory_recovery_async_writer_rejection_waits_for_receipt");
+    brain.finishRuntimeStatePersistence(false);
+    suite.expect(brain.pendingRuntimeStatePersistence.empty() &&
+                     brain.testRecoveringPersistedNeuronInventory() &&
+                     brain.testRecoveryPersistenceRetryPending() &&
+                     brain.persistCalls == persistsBeforeRejectedCompletion &&
+                     brain.routableResourceLeaseRuntimeState.size() == 3,
+                 "persisted_inventory_recovery_async_writer_rejection_arms_retry");
+    brain.holdRuntimeStatePersist = false;
+    brain.testRetryDeferredRecoveryPersistence();
+    suite.expect(brain.testRecoveringPersistedNeuronInventory() == false &&
+                     brain.testRecoveryPersistenceRetryPending() == false &&
+                     brain.persistCalls == persistsBeforeRejectedCompletion + 1 &&
+                     brain.routableResourceLeaseRuntimeState.size() == 2,
+                 "persisted_inventory_recovery_async_writer_rejection_retries_without_upload");
 
     brain.containers.erase(retained.uuid);
     brain.machines.erase(&machine);
@@ -3449,6 +3792,16 @@ int main(void)
 
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
+    if (std::strcmp(testOnly, "machine-claim-resume-mutation") == 0)
+    {
+      runMachineClaimResumeMutationFixture(suite);
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (std::strcmp(testOnly, "restored-inventory-replay-progress") == 0)
+    {
+      runRestoredInventoryReplayProgressFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "recovered-inventory-whiteholes") == 0)
     {
       runRecoveredInventoryWhiteholeFixtures();
@@ -3533,6 +3886,8 @@ int main(void)
   runInitialConnectFailureRetryFixture(suite);
   runPromotedCanonicalConnectorRecoveryFixture(suite, neuron);
   runGhostMasterRegistrationFixtures(suite);
+  runMachineClaimResumeMutationFixture(suite);
+  runRestoredInventoryReplayProgressFixture();
   withUniqueMothershipSocket("direct_master_claim_reconciliation_socket_dir_created", [&] {
     runDirectMasterClaimReconciliationFixtures(suite);
   });
@@ -4555,8 +4910,8 @@ int main(void)
     brain.containers.insert_or_assign(failed.uuid, &failed);
 
     brain.quarantineMachineAlias(&machine);
-    suite.expect(machine.fragment == 0 && brain.usedMachineFragments.contains(fragment) == false,
-                 "machine_retirement_wormhole_cleanup_releases_fragment_after_cleanup");
+    suite.expect(machine.fragment == 0 && brain.usedMachineFragments.contains(fragment),
+                 "machine_retirement_wormhole_cleanup_retains_fragment_reservation_after_cleanup");
     suite.expect(pending.wormholeRuntimePendingMachines.empty() &&
                      failed.wormholeRuntimeFailedMachines.empty() &&
                      pending.runtimeReady && failed.runtimeReady &&
@@ -8798,9 +9153,30 @@ int main(void)
     seed.fragment = 7;
     seed.createdAtMs = 123'465;
     seed.wormholes = plan.wormholes;
+    seed.setMeshAddress(
+        container_network_subnet6, brain.brainConfig.datacenterFragment, machine.fragment, seed.fragment);
+    seed.addresses.emplace_back(seed.meshAddress, uint8_t(128));
+
+    ContainerView replacementSeed = {};
+    replacementSeed.uuid = uint128_t(0x6100505);
+    replacementSeed.deploymentID = plan.config.deploymentID();
+    replacementSeed.applicationID = plan.config.applicationID;
+    replacementSeed.machine = &machine;
+    replacementSeed.lifetime = ApplicationLifetime::base;
+    replacementSeed.state = ContainerState::healthy;
+    replacementSeed.runtimeReady = true;
+    replacementSeed.fragment = 8;
+    replacementSeed.createdAtMs = 123'466;
+    replacementSeed.wormholes = plan.wormholes;
+    replacementSeed.setMeshAddress(
+        container_network_subnet6, brain.brainConfig.datacenterFragment, machine.fragment, replacementSeed.fragment);
+    replacementSeed.addresses.emplace_back(replacementSeed.meshAddress, uint8_t(128));
 
     constexpr uint64_t recoveredService = 61'005'001;
+    constexpr uint64_t retiredService = 61'005'002;
     const uint128_t recoveredPairingSecret = uint128_t(0x6100504);
+    const uint128_t replacementPairingSecret = uint128_t(0x6100506);
+    const uint128_t retiredPairingSecret = uint128_t(0x6100507);
     iaas.brain = &brain;
     iaas.machine = &machine;
     iaas.plan = seed.generatePlan(plan);
@@ -8816,6 +9192,12 @@ int main(void)
     iaas.plan.advertisementPairings.insert(
         recoveredService,
         AdvertisementPairing(recoveredPairingSecret, seed.pairingAddress(), recoveredService));
+    iaas.plan.advertisements.insert_or_assign(
+        retiredService,
+        Advertisement(retiredService, ContainerState::scheduled, ContainerState::destroying, 8444));
+    iaas.plan.advertisementPairings.insert(
+        retiredService,
+        AdvertisementPairing(retiredPairingSecret, replacementSeed.pairingAddress(), retiredService));
 
     brain.testSelfElectAsMaster("unit-test-restart-reconstruction");
 
@@ -8842,6 +9224,40 @@ int main(void)
     suite.expect(deployment != nullptr && deployment->containers.size() == 1 && deployment->nHealthy() == 1,
                  "self_elect_restart_reconstruction_partial_inventory_schedules_no_duplicate");
 
+    if (deployment != nullptr && restored != nullptr)
+    {
+      deployment->countPerMachine[&machine] = 1;
+      deployment->countPerRack[&rack] = 1;
+      deployment->containerFailed(restored, 123'467, SIGKILL, String("recovery retirement"_ctv), false);
+      restored = nullptr;
+    }
+    ContainerPlan replacementPlan = replacementSeed.generatePlan(plan);
+    replacementPlan.subscriptions.insert_or_assign(
+        recoveredService,
+        Subscription(recoveredService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::any));
+    replacementPlan.advertisements.insert_or_assign(
+        recoveredService,
+        Advertisement(recoveredService, ContainerState::scheduled, ContainerState::destroying, 8443));
+    replacementPlan.subscriptionPairings.insert(
+        recoveredService,
+        SubscriptionPairing(replacementPairingSecret, replacementSeed.pairingAddress(), recoveredService, 8443));
+    replacementPlan.advertisementPairings.insert(
+        recoveredService,
+        AdvertisementPairing(replacementPairingSecret, replacementSeed.pairingAddress(), recoveredService));
+    replacementPlan.subscriptions.insert_or_assign(
+        retiredService,
+        Subscription(retiredService, ContainerState::scheduled, ContainerState::destroying, SubscriptionNature::all));
+    replacementPlan.subscriptionPairings.insert(
+        retiredService,
+        SubscriptionPairing(retiredPairingSecret, seed.pairingAddress(), retiredService, 8444));
+    iaas.uploadPlan(replacementPlan);
+    auto replacementIt = brain.containers.find(replacementSeed.uuid);
+    restored = replacementIt != brain.containers.end() ? replacementIt->second : nullptr;
+    suite.expect(brain.containers.contains(seed.uuid) == false && restored != nullptr,
+                 "self_elect_restart_reconstruction_retires_recovered_container_before_replacement");
+    suite.expect(deployment != nullptr && deployment->containers.size() == 1 && deployment->nHealthy() == 1,
+                 "self_elect_restart_reconstruction_replacement_restores_single_healthy_runtime");
+
     machine.runtimeReady = true;
     suite.expect(brain.testFinalizePersistedNeuronInventoryRecoveryWithoutMesh() == false &&
                      brain.testRecoveringPersistedNeuronInventory(),
@@ -8866,11 +9282,13 @@ int main(void)
     suite.expect(deployment != nullptr && deployment->nHealthy() == 1,
                  "self_elect_restart_reconstruction_keeps_single_healthy_count_after_reconcile");
     suite.expect(restored != nullptr &&
-                     brain.testPairingSecretFor(restored, restored, recoveredService) == recoveredPairingSecret,
+                     brain.testPairingSecretFor(restored, restored, recoveredService) == replacementPairingSecret,
                  "self_elect_restart_reconstruction_unifies_subscription_pairing_once");
     suite.expect(brain.testFinalizePersistedNeuronInventoryRecovery() && restored != nullptr &&
-                     brain.testPairingSecretFor(restored, restored, recoveredService) == recoveredPairingSecret,
+                     brain.testPairingSecretFor(restored, restored, recoveredService) == replacementPairingSecret,
                  "self_elect_restart_reconstruction_keeps_subscription_pairing_stable");
+    suite.expect(restored != nullptr && restored->subscribedTo.countEntriesFor(retiredService) == 0,
+                 "self_elect_restart_reconstruction_never_relinks_retired_recovery_endpoint");
 
     SwitchboardWormholeOperation operation = {};
     Vector<Wormhole> reconstructed = {};

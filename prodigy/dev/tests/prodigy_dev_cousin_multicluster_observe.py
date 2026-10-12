@@ -46,16 +46,21 @@ def candidates(root, route, minimum):
         destination_data[uuid] = text
     rounds = records(data, 'round')
     renewals = records(data, 'renew')
+    after = int(route['afterMonotonicMs'])
+    before = int(route.get('beforeMonotonicMs', 2**63 - 1))
+    fresh = route.get('requireFreshRequest', True)
+    if before <= after or not isinstance(fresh, bool):
+        raise ValueError('invalid route observation interval')
     result = []
     for request in records(data, 'request'):
         request_id = request.get('request')
         start = int(request.get('monotonicMs', '-1'))
-        if (not request_id or start < int(route['afterMonotonicMs']) or
+        if (not request_id or start < 0 or (fresh and start < after) or
                 (request.get('source'), request.get('sourcePort')) != tuple(map(str, route['sourceTuple']))):
             continue
         payloads = [x for x in rounds if x.get('request') == request_id
                     and x.get('payload') == 'exact' and x.get('peer', '').lower() in peers
-                    and int(x.get('monotonicMs', '-1')) >= start]
+                    and max(start, after) <= int(x.get('monotonicMs', '-1')) <= before]
         for session in {x['session'] for x in payloads if x.get('session')}:
             samples = [x for x in payloads if x['session'] == session]
             session_peers = {x['peer'].lower() for x in samples}
@@ -65,12 +70,13 @@ def candidates(root, route, minimum):
             end = max(int(x['monotonicMs']) for x in samples)
             generations = {int(x['generation']) for x in renewals
                            if x.get('request') == request_id and x.get('session') == session
-                           and start <= int(x.get('monotonicMs', '-1')) <= end
+                           and max(start, after) <= int(x.get('monotonicMs', '-1')) <= end
                            and x.get('generation', '').isdigit()}
             peer = next(iter(session_peers))
             echoes = [x for x in records(destination_data[peer], 'echo')
                       if x.get('session') == session and x.get('peer', '').lower() == source
-                      and x.get('payload') == 'exact']
+                      and x.get('payload') == 'exact' and x.get('monotonicMs', '').isdigit()
+                      and max(start, after) <= int(x['monotonicMs']) <= before]
             if end - begin >= minimum and any(x > 1 for x in generations) and echoes:
                 result.append({'name': route['name'], 'sourceUUID': source, 'sourceLog': source_copy,
                                'requestUUID': request_id, 'sessionUUID': session, 'peerUUIDs': [peer],

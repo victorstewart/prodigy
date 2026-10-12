@@ -794,6 +794,44 @@ int main(void)
                 !mothershipPairControlFaultParse("30001"_ctv, "1"_ctv, parsedFault, &failure) &&
                 !mothershipPairControlFaultParse("1"_ctv, "60001"_ctv, parsedFault, &failure),
                 "pair_control_fault_rejects_noncanonical_or_unbounded_windows");
+  String firstDirection = "first-to-second"_ctv;
+  suite.require(mothershipPairControlFaultParse("125"_ctv, "1000"_ctv, &firstDirection, parsedFault, &failure) &&
+                parsedFault.direction == MothershipPairControlFaultDirection::firstToSecond &&
+                mothershipPairControlFaultArguments(controlBoundary, parsedFault, faultArguments, &failure) &&
+                faultArguments.size() == 17 && faultArguments[16] == "first-to-second"_ctv,
+                "pair_control_fault_encodes_one_admitted_direction_only");
+  String receipt = {};
+  suite.require(mothershipPairControlFaultReceipt(controlBoundary, fault, 1'000'000ULL, 1'001'000'000ULL, receipt) &&
+                mothershipPairControlFaultReceiptValid(controlBoundary, fault, receipt) &&
+                receipt == "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=125 durationMs=1000 beginNs=1000000 endNs=1001000000\n"_ctv,
+                "pair_control_fault_preserves_exact_legacy_both_receipt");
+  suite.require(!mothershipPairControlFaultReceiptValid(controlBoundary, fault,
+                    "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=125 durationMs=1000 direction=both beginNs=1000000 endNs=1001000000\n"_ctv),
+                "pair_control_fault_rejects_extra_legacy_receipt_field");
+  suite.require(mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 1'001'000'000ULL, receipt) &&
+                mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault, receipt) &&
+                receipt == "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=125 durationMs=1000 direction=first-to-second installRule=first0-to-second0-DROP restoreRule=first0-to-second0-ABSENT beginNs=1000000 endNs=1001000000\n"_ctv &&
+                !mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault,
+                    "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=125 durationMs=1000 direction=first-to-second installRule=second0-to-first0-DROP restoreRule=second0-to-first0-ABSENT beginNs=1000000 endNs=1001000000\n"_ctv),
+                "pair_control_fault_receipt_binds_selected_wire_install_and_restore");
+  String invalidDirection = "second-to-firstx"_ctv;
+  MothershipPairControlFault invalidFault = {};
+  invalidFault.delayMilliseconds = 1; invalidFault.durationMilliseconds = 1;
+  invalidFault.direction = static_cast<MothershipPairControlFaultDirection>(99);
+  suite.require(!mothershipPairControlFaultParse("1"_ctv, "1"_ctv, &invalidDirection, parsedFault, &failure) &&
+                !mothershipPairControlFaultValid(invalidFault),
+                "pair_control_fault_rejects_unknown_direction");
+  String secondDirection = "second-to-first"_ctv;
+  suite.require(mothershipPairControlFaultParse("0"_ctv, "1000"_ctv, &secondDirection, parsedFault, &failure) &&
+                mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 1'001'000'000ULL, receipt) &&
+                mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault, receipt) &&
+                receipt == "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=0 durationMs=1000 direction=second-to-first installRule=second0-to-first0-DROP restoreRule=second0-to-first0-ABSENT beginNs=1000000 endNs=1001000000\n"_ctv,
+                "pair_control_fault_accepts_exact_second_direction_witness");
+  suite.require(!mothershipPairControlFaultReceiptValid(controlBoundary, invalidFault, receipt) &&
+                !mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 0, 1'001'000'000ULL, receipt) &&
+                !mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 1'000'999'999ULL, receipt) &&
+                !mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 6'001'000'001ULL, receipt),
+                "pair_control_fault_rejects_missing_short_or_unbounded_intervals");
   MothershipPairControlBoundaryDescriptor faultChangedBoundary = controlBoundary;
   faultChangedBoundary.firstRuntimeIdentity = controlBoundary.secondRuntimeIdentity;
   suite.require(!mothershipPairControlFaultArguments(faultChangedBoundary, fault, faultArguments, &failure),

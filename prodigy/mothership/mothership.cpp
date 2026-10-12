@@ -4876,6 +4876,190 @@ static bool mothershipTestMachineIndicesValid(const String& text, uint32_t machi
   return true;
 }
 
+struct MothershipTestClusterCrashFault {
+  MothershipProdigyCluster cluster;
+  String identity;
+  String machineIndex;
+  uint32_t durationMs = 0;
+};
+
+static bool mothershipBuildConcurrentTestClusterCrashFaults(
+    const MothershipProdigyCluster& firstCluster,
+    const String& firstIdentity,
+    const String& firstMachineIndex,
+    const MothershipProdigyCluster& secondCluster,
+    const String& secondIdentity,
+    const String& secondMachineIndex,
+    uint64_t durationMs,
+    MothershipTestClusterCrashFault& first,
+    MothershipTestClusterCrashFault& second,
+    String *failure = nullptr)
+{
+  first = {};
+  second = {};
+  auto reject = [&](const char *message) {
+    if (failure) failure->assign(message);
+    return false;
+  };
+  if (firstCluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+      secondCluster.deploymentMode != MothershipClusterDeploymentMode::test)
+  {
+    return reject("faultTestClusters requires deploymentMode=test for both clusters");
+  }
+  if (firstCluster.clusterUUID == 0 || secondCluster.clusterUUID == 0 ||
+      firstCluster.clusterUUID == secondCluster.clusterUUID)
+  {
+    return reject("faultTestClusters requires two distinct cluster UUIDs");
+  }
+  if (firstCluster.test.workspaceRoot.size() == 0 || secondCluster.test.workspaceRoot.size() == 0 ||
+      firstCluster.test.workspaceRoot.equal(secondCluster.test.workspaceRoot))
+  {
+    return reject("faultTestClusters requires two distinct test workspaces");
+  }
+  if (durationMs == 0 || durationMs > 3'600'000)
+  {
+    return reject("faultTestClusters durationMs must be in 1..3600000");
+  }
+
+  uint64_t firstIndex = 0;
+  uint64_t secondIndex = 0;
+  String firstMachineIndexText = firstMachineIndex;
+  String secondMachineIndexText = secondMachineIndex;
+  if (mothershipParseUnsignedArgument(firstMachineIndexText.c_str(), firstCluster.test.machineCount, firstIndex) == false ||
+      firstIndex == 0 ||
+      mothershipParseUnsignedArgument(secondMachineIndexText.c_str(), secondCluster.test.machineCount, secondIndex) == false ||
+      secondIndex == 0)
+  {
+    return reject("faultTestClusters machine indices must identify one machine in each cluster");
+  }
+
+  first.cluster = firstCluster;
+  first.identity = firstIdentity;
+  first.machineIndex.assignItoa(firstIndex);
+  first.durationMs = uint32_t(durationMs);
+  second.cluster = secondCluster;
+  second.identity = secondIdentity;
+  second.machineIndex.assignItoa(secondIndex);
+  second.durationMs = uint32_t(durationMs);
+  if (failure) failure->clear();
+  return true;
+}
+
+using MothershipTestClusterCrashFaultRunner = bool (*)(const MothershipTestClusterCrashFault&, String *);
+
+static bool mothershipRunTestClusterCrashFault(
+    const MothershipTestClusterCrashFault& request,
+    String *failure)
+{
+  return mothershipFaultVirtualDatacenterProvider(
+      request.cluster, "crash"_ctv, request.machineIndex, request.durationMs, 0, 0, 0, failure);
+}
+
+static bool mothershipRunConcurrentTestClusterCrashFaults(
+    const MothershipTestClusterCrashFault& first,
+    const MothershipTestClusterCrashFault& second,
+    String *failure = nullptr,
+    MothershipTestClusterCrashFaultRunner runner = mothershipRunTestClusterCrashFault)
+{
+  struct Child {
+    pid_t pid = -1;
+    int failureFD = -1;
+    int status = 0;
+    bool completedSuccessfully = false;
+    String detail;
+  } children[2];
+
+  auto launch = [&](const MothershipTestClusterCrashFault& request, Child& child, int inheritedReadFD) {
+    int pipeFD[2] = {-1, -1};
+    if (::pipe2(pipeFD, O_CLOEXEC) != 0)
+    {
+      return false;
+    }
+    child.pid = ::fork();
+    if (child.pid == 0)
+    {
+      ::close(pipeFD[0]);
+      if (inheritedReadFD >= 0) ::close(inheritedReadFD);
+      String childFailure = {};
+      const bool succeeded = runner(request, &childFailure);
+      const uint64_t retained = std::min<uint64_t>(childFailure.size(), 4096);
+      uint64_t offset = 0;
+      while (offset < retained)
+      {
+        const ssize_t written = ::write(pipeFD[1], childFailure.data() + offset, retained - offset);
+        if (written > 0) { offset += uint64_t(written); continue; }
+        if (written < 0 && errno == EINTR) continue;
+        break;
+      }
+      ::close(pipeFD[1]);
+      _exit(succeeded ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+    ::close(pipeFD[1]);
+    if (child.pid < 0)
+    {
+      ::close(pipeFD[0]);
+      child.failureFD = -1;
+      return false;
+    }
+    child.failureFD = pipeFD[0];
+    return true;
+  };
+
+  const bool firstLaunched = launch(first, children[0], -1);
+  const bool secondLaunched = firstLaunched && launch(second, children[1], children[0].failureFD);
+  bool succeeded = firstLaunched && secondLaunched;
+  for (Child& child : children)
+  {
+    if (child.pid <= 0) continue;
+    pid_t waited = -1;
+    do { waited = ::waitpid(child.pid, &child.status, 0); } while (waited < 0 && errno == EINTR);
+    if (waited != child.pid || WIFEXITED(child.status) == false || WEXITSTATUS(child.status) != 0)
+    {
+      succeeded = false;
+    }
+    else
+    {
+      child.completedSuccessfully = true;
+    }
+    uint8_t buffer[512];
+    while (child.failureFD >= 0)
+    {
+      const ssize_t count = ::read(child.failureFD, buffer, sizeof(buffer));
+      if (count > 0) { child.detail.append(buffer, uint64_t(count)); continue; }
+      if (count < 0 && errno == EINTR) continue;
+      break;
+    }
+    if (child.failureFD >= 0) ::close(child.failureFD);
+    child.failureFD = -1;
+  }
+
+  if (succeeded)
+  {
+    if (failure) failure->clear();
+    return true;
+  }
+  if (failure)
+  {
+    failure->clear();
+    if (firstLaunched == false || secondLaunched == false)
+    {
+      failure->assign("failed to launch both concurrent test-cluster faults"_ctv);
+    }
+    else
+    {
+      const uint32_t failed = children[0].completedSuccessfully ? 1 : 0;
+      failure->assign("test-cluster fault failed for identity="_ctv);
+      failure->append(failed == 0 ? first.identity : second.identity);
+      if (children[failed].detail.size())
+      {
+        failure->append(": "_ctv);
+        failure->append(children[failed].detail);
+      }
+    }
+  }
+  return false;
+}
+
 static bool mothershipWaitForVirtualDatacenterReady(const MothershipProdigyCluster& cluster, String *failure = nullptr, int timeoutMs = 180'000)
 {
   String readyPath = {};
@@ -11216,6 +11400,55 @@ private:
       exit(EXIT_FAILURE);
     }
     basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
+  }
+
+  void runFaultTestClusters(int argc, char *argv[])
+  {
+    if (argc != 5)
+    {
+      basics_log("wrong number of arguments. ex: faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");
+      exit(EXIT_FAILURE);
+    }
+
+    String firstIdentity = {};
+    String firstMachineIndex = {};
+    String secondIdentity = {};
+    String secondMachineIndex = {};
+    firstIdentity.assign(argv[0]);
+    firstMachineIndex.assign(argv[1]);
+    secondIdentity.assign(argv[2]);
+    secondMachineIndex.assign(argv[3]);
+
+    String failure = {};
+    MothershipProdigyCluster firstCluster = {};
+    MothershipProdigyCluster secondCluster = {};
+    uint64_t durationMs = 0;
+    bool valid = loadClusterForScopedMutation("faultTestClusters", firstIdentity, firstCluster, failure) &&
+        loadClusterForScopedMutation("faultTestClusters", secondIdentity, secondCluster, failure) &&
+        mothershipParseUnsignedArgument(argv[4], 3'600'000, durationMs);
+    MothershipTestClusterCrashFault first = {};
+    MothershipTestClusterCrashFault second = {};
+    valid = valid && mothershipBuildConcurrentTestClusterCrashFaults(
+        firstCluster, firstIdentity, firstMachineIndex,
+        secondCluster, secondIdentity, secondMachineIndex,
+        durationMs, first, second, &failure);
+    if (valid == false)
+    {
+      if (failure.empty()) failure.assign("invalid concurrent crash fault specification"_ctv);
+      basics_log("faultTestClusters success=0 firstIdentity=%s secondIdentity=%s failure=%s\n",
+                 firstIdentity.c_str(), secondIdentity.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+
+    if (mothershipRunConcurrentTestClusterCrashFaults(first, second, &failure) == false)
+    {
+      basics_log("faultTestClusters success=0 firstIdentity=%s secondIdentity=%s failure=%s\n",
+                 firstIdentity.c_str(), secondIdentity.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("faultTestClusters success=1 firstIdentity=%s firstMachineIndex=%s secondIdentity=%s secondMachineIndex=%s durationMs=%u\n",
+               firstIdentity.c_str(), first.machineIndex.c_str(), secondIdentity.c_str(), second.machineIndex.c_str(),
+               unsigned(first.durationMs));
   }
 
   void runRecoverRetainedFleet(int argc, char *argv[])
@@ -19205,13 +19438,18 @@ private:
     MothershipPairControlServiceTransit service = {};
     MothershipPairControlFault fault = {};
     TestPairLifecycleLock lock = {};
-    bool valid = argc >= 2 && argc <= 4 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    bool valid = argc >= 2 && argc <= 5 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
     valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "fault"_ctv);
     if (valid && action == "service"_ctv)
       valid = argc == 3 && parsePairControlServiceTransitJSON(String(argv[2]), service, failure);
     else if (valid && action == "fault"_ctv)
-      valid = argc == 4 && mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), fault, &failure);
+    {
+      String direction = {};
+      if (argc == 5) direction.assign(argv[4]);
+      valid = argc == 4 ? mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), fault, &failure) :
+          argc == 5 && mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), &direction, fault, &failure);
+    }
     else valid = valid && argc == 2;
     valid = valid && lockTestPairLifecycle(lock, failure);
 
@@ -19265,8 +19503,13 @@ private:
       }
       else if (action == "fault"_ctv)
       {
+        String receipt = {};
         valid = mothershipPairControlFaultArguments(boundary, fault, arguments, &failure) &&
-            mothershipRunVirtualDatacenterProvider(std::move(arguments), &failure);
+            mothershipRunVirtualDatacenterProvider(std::move(arguments), &receipt, &failure, 4096,
+                uint64_t(fault.delayMilliseconds) + fault.durationMilliseconds + 10'000, true) &&
+            mothershipPairControlFaultReceiptValid(boundary, fault, receipt);
+        if (valid) basics_log("%s", receipt.c_str());
+        if (!valid && failure.empty()) failure.assign("pair-control provider did not prove the exact bounded fault interval");
       }
       if (valid && action != "remove"_ctv)
       {
@@ -19290,9 +19533,10 @@ private:
       if (::inet_ntop(AF_INET6, service.sourceWhiteholeAddress.v6, source, sizeof(source))) sourceAddress.assign(source);
       if (::inet_ntop(AF_INET6, service.destinationWormholeAddress.v6, destination, sizeof(destination))) destinationAddress.assign(destination);
     }
-    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u faultDelayMs=%u faultDurationMs=%u source=%s:%u destination=%s:%u failure=%s\n",
+    basics_log("testClusterPairControl success=%u action=%s operationUUID=%016llx%016llx service=%u faultDelayMs=%u faultDurationMs=%u faultDirection=%s source=%s:%u destination=%s:%u failure=%s\n",
         unsigned(valid), action.c_str(), (unsigned long long)(operationUUID >> 64),
-        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), fault.delayMilliseconds, fault.durationMilliseconds, sourceAddress.c_str(),
+        (unsigned long long)operationUUID, unsigned(action == "service"_ctv), fault.delayMilliseconds, fault.durationMilliseconds,
+        mothershipPairControlFaultDirectionName(fault.direction), sourceAddress.c_str(),
         unsigned(action == "service"_ctv ? service.sourceTCPPort : 0), destinationAddress.c_str(),
         unsigned(action == "service"_ctv ? service.destinationTCPPort : 0), failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
@@ -22763,6 +23007,7 @@ public:
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
+        {"faultTestClusters",               &Mothership::runFaultTestClusters              },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
@@ -22855,7 +23100,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, faultTestClusters, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -22907,6 +23152,8 @@ int main(int argc, char *argv[])
     message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
+    message.append("faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");
+    message.append("\trequests exactly two concurrent crash faults after Mothership validates both distinct test clusters\n");
     message.append("probeTestCluster [name|clusterUUID] [address] [port] [payload] [expected] [timeoutMs] [sourceMachineIndex: 0=datacenter]\n");
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
     message.append("probeTestClusterTraffic [name|clusterUUID] [address] [port] [payload] [expected] [requestTimeoutMs] [sourceMachineIndex] [clients] [requestsPerClient] [intervalMs]\n");
@@ -22939,8 +23186,8 @@ int main(int argc, char *argv[])
     message.append("cousinPermission [target: local|clusterName|clusterUUID] [install JSON|query UUID|revoke UUID|discover UUID SLOT]\n");
     message.append("transportCredentialLifecycle [clusterName|clusterUUID] [operationUUID canonical hex] [query|request brain|neuron rotate|revoke nodeUUID canonical hex]\n");
     message.append("\trequests a new epoch from the originating cluster, or observes both sides; clusters negotiate and finish autonomously\n");
-    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs]\n");
-    message.append("\tmanages enrolled TCP control transit, one exact permission-verified Whitehole-to-protected-Wormhole test flow, and a bounded carrier-only partition fault\n");
+    message.append("testClusterPairControl [enrollment operationUUID canonical hex] [prepare|query|remove|service JSON|fault delayMs durationMs [both|first-to-second|second-to-first]]\n");
+    message.append("\tmanages enrolled TCP control transit, up to two reciprocal permission-verified Whitehole-to-protected-Wormhole test flows, and a bounded directed partition fault\n");
     message.append("clusterReport [target: local|clusterName|clusterUUID]\n");
     message.append("\tfetches the current cluster-wide machine and application status report from the master brain\n");
     message.append("\tfor stored cluster targets, it also refreshes the cached authoritative topology and refresh metadata in the local cluster registry\n");

@@ -293,6 +293,19 @@ then
          export PRODIGY_DEV_COUSIN_PROBE_BIN="$(dirname "${prodigy_bin}")/prodigy_cousin_session_probe_container"
          exec timeout 1800 bash "${script_dir}/prodigy_dev_cousin_multicluster_qualification.sh" "${prodigy_bin}" "${mothership_bin}"
          ;;
+      cousin-faults)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         export PRODIGY_DEV_COUSIN_PROBE_BIN="$(dirname "${prodigy_bin}")/prodigy_cousin_session_probe_container"
+         exec timeout 2400 bash "${script_dir}/prodigy_dev_cousin_fault_qualification.sh" "${prodigy_bin}" "${mothership_bin}"
+         ;;
+      cousin-source-horizontal|cousin-source-vertical)
+         [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
+         export PRODIGY_DEV_COUSIN_PROBE_BIN="$(dirname "${prodigy_bin}")/prodigy_cousin_session_probe_container"
+         export PRODIGY_DEV_COUSIN_SESSION_ONLY=1 PRODIGY_DEV_COUSIN_FAULT_SOURCE=1
+         export PRODIGY_DEV_COUSIN_LIFECYCLE=source-horizontal-destination-vertical
+         [[ ${runtime_qualification} != cousin-source-vertical ]] || export PRODIGY_DEV_COUSIN_LIFECYCLE=source-vertical-destination-horizontal
+         exec timeout 900 bash "${script_dir}/prodigy_dev_pair_enrollment_qualification.sh" "${prodigy_bin}" "${mothership_bin}"
+         ;;
       pair-endpoint)
          [[ "${two_cluster_coexistence}" == 0 ]] || fail "runtime qualification selects one scenario"
          exec bash "${script_dir}/prodigy_dev_pair_endpoint_qualification.sh" "${prodigy_bin}" "${mothership_bin}" \

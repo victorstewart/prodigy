@@ -6,12 +6,14 @@ set(_harness "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_netns_harness.sh")
 set(_launcher "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_test_cluster.sh")
 set(_provider "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh")
 set(_mothership "${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp")
+set(_pair_control_boundary "${PRODIGY_ROOT}/prodigy/mothership/mothership.pair.control.boundary.h")
 set(_mothership_cluster_test "${PRODIGY_ROOT}/prodigy/mothership/mothership.cluster.test.h")
 set(_virtual_datacenter "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.h")
 file(READ "${_harness}" _source)
 file(READ "${_launcher}" _launcher_source)
 file(READ "${_provider}" _provider_source)
 file(READ "${_mothership}" _mothership_source)
+file(READ "${_pair_control_boundary}" _pair_control_boundary_source)
 file(READ "${_mothership_cluster_test}" _mothership_cluster_test_source)
 file(READ "${_virtual_datacenter}" _virtual_datacenter_source)
 
@@ -256,7 +258,35 @@ foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "
    endif()
 endforeach()
 
-foreach(_cousin_client IN ITEMS prodigy_dev_cousin_session_qualification.sh prodigy_dev_cousin_lifecycle_qualification.sh prodigy_dev_cousin_session_observe.py prodigy_dev_cousin_multicluster_qualification.sh prodigy_dev_cousin_multicluster_observe.py)
+# A one-way pair fault is valid only when the sealed provider attests to the
+# exact router wire it observed installed and then absent after restoration.
+foreach(_required IN ITEMS
+   "pair_control_fault_rule_witness"
+   "first0-to-second0-DROP"
+   "second0-to-first0-DROP"
+   "installRule=%s restoreRule=%s"
+   "pair_control_fault_rule_present \"\$side\"; then return 1; else present=\$?; fi")
+   string(FIND "${_provider_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "pair-control provider must retain exact directional install/restore witnesses: ${_required}")
+   endif()
+endforeach()
+foreach(_required IN ITEMS "mothershipPairControlFaultRuleWitness" "installRule={} restoreRule={}")
+   string(FIND "${_pair_control_boundary_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "Mothership must validate the sealed directional pair-fault rule witness: ${_required}")
+   endif()
+endforeach()
+
+file(READ "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_cousin_fault_qualification.sh" _cousin_fault_source)
+foreach(_required IN ITEMS "if [[ $# == 2 ]]; then" "faultTestClusters" "masters-concurrent")
+   string(FIND "${_cousin_fault_source}" "${_required}" _position)
+   if(_position EQUAL -1)
+      message(FATAL_ERROR "concurrent COUSIN controller faults must remain one typed Mothership batch request: ${_required}")
+   endif()
+endforeach()
+
+foreach(_cousin_client IN ITEMS prodigy_dev_cousin_session_qualification.sh prodigy_dev_cousin_lifecycle_qualification.sh prodigy_dev_cousin_session_observe.py prodigy_dev_cousin_multicluster_qualification.sh prodigy_dev_cousin_multicluster_observe.py prodigy_dev_cousin_fault_qualification.sh prodigy_dev_cousin_fault_observe.py)
    file(READ "${PRODIGY_ROOT}/prodigy/dev/tests/${_cousin_client}" _cousin_source)
    foreach(_forbidden IN ITEMS "ip netns" "ip link" "ip route" "ip -6" "iptables" "bpftool" "mount --" "kill -" "--pair-control-launch" "--pair-control-action" "container exec" "os.kill" "subprocess.")
       string(FIND "${_cousin_source}" "${_forbidden}" _position)

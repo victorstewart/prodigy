@@ -489,17 +489,25 @@ public:
   // a later transform always starts from the prior durable receipt, rather
   // than from a stale whole-record copy. `durableCache` must outlive the
   // request and its completion.
-  bool submitLocalBrainMutation(
+  ProdigyArtifactIO::Admission submitLocalBrainMutationWithAdmission(
       ProdigyPersistentLocalBrainState& durableCache,
       std::function<bool(ProdigyPersistentLocalBrainState&, String&)> transform,
       Completion completion)
   {
-    if (!transform || !completion || localBrainMutationPending) return false;
+    if (!transform || !completion) return ProdigyArtifactIO::Admission::submissionRejected;
+    // Local-state transforms are serialized even when ArtifactIO still has a
+    // free job slot. This is ordinary bounded contention: the retained caller
+    // can retry after the current mutation's Ring completion updates the one
+    // authoritative cache.
+    if (localBrainMutationPending) return ProdigyArtifactIO::Admission::jobCapacity;
     ProdigyPersistentLocalBrainState candidate = durableCache;
     String failure = {};
-    if (!transform(candidate, failure) || !detach(candidate)) return false;
+    if (!transform(candidate, failure) || !detach(candidate))
+      return ProdigyArtifactIO::Admission::submissionRejected;
     const uint64_t retainedBytes = retainedBytesFor(candidate);
-    if (retainedBytes == 0) return false;
+    if (retainedBytes == 0) return ProdigyArtifactIO::Admission::submissionRejected;
+    const ProdigyArtifactIO::Admission requestAdmission = admission(retainedBytes);
+    if (requestAdmission != ProdigyArtifactIO::Admission::admitted) return requestAdmission;
 
     auto request = std::make_shared<Request>();
     request->result.sequence = nextSequence++;
@@ -515,9 +523,18 @@ public:
       if (result.durable) durableCache = std::move(published->localState);
       completion(std::move(result));
     };
-    if (submit(request, retainedBytes)) return true;
+    if (submit(request, retainedBytes)) return ProdigyArtifactIO::Admission::admitted;
     localBrainMutationPending = false;
-    return false;
+    return ProdigyArtifactIO::Admission::submissionRejected;
+  }
+
+  bool submitLocalBrainMutation(
+      ProdigyPersistentLocalBrainState& durableCache,
+      std::function<bool(ProdigyPersistentLocalBrainState&, String&)> transform,
+      Completion completion)
+  {
+    return submitLocalBrainMutationWithAdmission(
+        durableCache, std::move(transform), std::move(completion)) == ProdigyArtifactIO::Admission::admitted;
   }
 
   bool hasPending(void) const { return pendingRequests != 0; }

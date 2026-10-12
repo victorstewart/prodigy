@@ -59,7 +59,6 @@ public:
   // Monotonically fences asynchronous local-digest checks for repeated
   // registration frames on one still-live transport generation.
   uint64_t artifactCapabilityValidationGeneration = 0;
-
   bool transportPeerProjectionCapable = false;
   bool transportCredentialLifecycleCapable = false;
   uint64_t transportPeerProjectionIOGeneration = 0;
@@ -403,6 +402,18 @@ public:
   uint8_t reportedDatacenterFragment = 0;
   uint32_t reportedFragment = 0;
   bool runtimeReady = false;
+  // Registration, fragment recovery, and persisted-inventory recovery can all
+  // discover the same missing receipt in one Ring turn.  Keep one request per
+  // control generation so replay cannot advance several container generations
+  // before Neuron has answered the first authoritative inventory request.
+  bool stateUploadRequestPending = false;
+  uint64_t stateUploadRequestIOGeneration = 0;
+  // A full Switchboard reset cannot overtake an outstanding route operation on
+  // the same ordered control stream. Retain the strongest deferred request so
+  // its exact acknowledgement can drive the reset instead of dropping it.
+  bool switchboardStateSyncPending = false;
+  bool switchboardStateSyncReplayContainerRoutes = false;
+  uint64_t switchboardStateSyncIOGeneration = 0;
   bytell_hash_set<uint32_t> usedContainerFragments;
 
   bool containerFragmentAvailable(uint8_t fragment) const

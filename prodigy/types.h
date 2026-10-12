@@ -8122,6 +8122,57 @@ static void serialize(S&& serializer, StatelessDeploymentAdmissionReceipt& recei
 }
 
 
+constexpr uint32_t ProdigyMachineFragmentAssignmentMaximumRecords = 65'535;
+
+class ProdigyMachineFragmentAssignment {
+public:
+
+  uint128_t machineUUID = 0;
+  uint32_t fragment = 0;
+
+  bool operator==(const ProdigyMachineFragmentAssignment& other) const
+  {
+    return machineUUID == other.machineUUID && fragment == other.fragment;
+  }
+
+  bool operator!=(const ProdigyMachineFragmentAssignment& other) const
+  {
+    return (*this == other) == false;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyMachineFragmentAssignment& assignment)
+{
+  serializer.value16b(assignment.machineUUID);
+  serializer.value4b(assignment.fragment);
+}
+
+static inline bool prodigyMachineFragmentAssignmentsValid(
+    const Vector<ProdigyMachineFragmentAssignment>& assignments)
+{
+  if (assignments.size() > ProdigyMachineFragmentAssignmentMaximumRecords)
+  {
+    return false;
+  }
+
+  bytell_hash_set<uint32_t> fragments;
+  fragments.reserve(assignments.size());
+  uint128_t previousUUID = 0;
+  for (uint32_t index = 0; index < assignments.size(); ++index)
+  {
+    const ProdigyMachineFragmentAssignment& assignment = assignments[index];
+    if (assignment.machineUUID == 0 || assignment.fragment == 0 || assignment.fragment > 0x00ffffffu ||
+        (index > 0 && assignment.machineUUID <= previousUUID) ||
+        fragments.insert(assignment.fragment).second == false)
+    {
+      return false;
+    }
+    previousUUID = assignment.machineUUID;
+  }
+  return true;
+}
+
 class ProdigyMasterAuthorityRuntimeState {
 public:
 
@@ -8166,6 +8217,9 @@ public:
   // Version-fifteen local deployment policy records.  They carry no pair
   // root, epoch, endpoint, or traffic key material.
   Vector<ProdigyLocalCousinServicePermission> localCousinServicePermissions;
+  // Durable container-network identity. Entries are canonical by machine UUID
+  // and retained after retirement so a 24-bit prefix is never reassigned.
+  Vector<ProdigyMachineFragmentAssignment> machineFragmentAssignments;
   // Public enrollment ledger; its one authority root is in the snapshot sidecar.
   Vector<ProdigyTransportCredentialEnrollment> transportCredentialEnrollments;
   Vector<ProdigyTransportCredentialEnrollmentOperation> transportCredentialEnrollmentOperations;
@@ -8181,6 +8235,7 @@ public:
         prodigyClusterPairEnrollmentsEqual(clusterPairEnrollments, other.clusterPairEnrollments) == false ||
         clusterPairEnrollmentOperations.size() != other.clusterPairEnrollmentOperations.size() ||
         prodigyLocalCousinServicePermissionsEqual(localCousinServicePermissions, other.localCousinServicePermissions) == false ||
+        machineFragmentAssignments != other.machineFragmentAssignments ||
         transportCredentialEnrollments != other.transportCredentialEnrollments ||
         transportCredentialEnrollmentOperations.size() != other.transportCredentialEnrollmentOperations.size() ||
         transportCredentialAuthorityRoot.authorityEpoch != other.transportCredentialAuthorityRoot.authorityEpoch ||
@@ -9283,9 +9338,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // revocation tail; version 14 adds explicitly agreed epoch rotation;
   // version 15 adds root-free, epoch-neutral local COUSIN deployment policy;
   // version 16 tags each transport operation row so lifecycle receipts cannot
-  // be misread as the legacy enrollment layout.
+  // be misread as the legacy enrollment layout; version 17 appends the
+  // canonical machine-to-container-network-fragment registry.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 16;
+  constexpr uint64_t explicitVersion = 17;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9305,6 +9361,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool permitsClusterPairEpochOperations = false;
   bool hasLocalCousinServicePermissions = false;
   bool permitsTransportCredentialLifecycleOperations = false;
+  bool hasMachineFragmentAssignments = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9338,9 +9395,12 @@ static void prodigySerializeMasterAuthorityRuntimeState(
     const bool hasTransportCredentialLifecycleOperations = std::any_of(
         state.transportCredentialEnrollmentOperations.begin(), state.transportCredentialEnrollmentOperations.end(),
         [](const auto& operation) { return operation.protocolVersion >= 2; });
-    permitsTransportCredentialLifecycleOperations = hasTransportCredentialLifecycleOperations;
-    // Version sixteen includes every earlier tail, even when empty.
-    hasLocalCousinServicePermissions = !state.localCousinServicePermissions.empty() || hasTransportCredentialLifecycleOperations;
+    hasMachineFragmentAssignments = state.machineFragmentAssignments.empty() == false;
+    permitsTransportCredentialLifecycleOperations =
+        hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments;
+    // Versions sixteen and seventeen include every earlier tail, even when empty.
+    hasLocalCousinServicePermissions = !state.localCousinServicePermissions.empty() ||
+                                       permitsTransportCredentialLifecycleOperations;
     // Version fifteen is cumulative through the v12 operation container.
     // Emit that bounded empty container when the new policy tail is present.
     if (hasLocalCousinServicePermissions) hasClusterPairEnrollmentOperations = true;
@@ -9376,10 +9436,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9424,6 +9484,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       permitsClusterPairEpochOperations = version >= 14;
       hasLocalCousinServicePermissions = version >= 15;
       permitsTransportCredentialLifecycleOperations = version >= 16;
+      hasMachineFragmentAssignments = version >= 17;
     }
   }
 
@@ -9618,6 +9679,23 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.localCousinServicePermissions.clear();
+  }
+  if (hasMachineFragmentAssignments)
+  {
+    serializer.container(state.machineFragmentAssignments,
+        ProdigyMachineFragmentAssignmentMaximumRecords,
+        [](auto& nested, ProdigyMachineFragmentAssignment& assignment) { nested.object(assignment); });
+    if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+    {
+      if (prodigyMachineFragmentAssignmentsValid(state.machineFragmentAssignments) == false)
+      {
+        serializer.adapter().error(bitsery::ReaderError::InvalidData);
+      }
+    }
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.machineFragmentAssignments.clear();
   }
 }
 

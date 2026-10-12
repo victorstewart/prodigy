@@ -961,22 +961,35 @@ public:
 
   bool usesAsyncMasterAuthorityPersistence() const override { return true; }
 
-  bool claimLocalClusterOwnershipAsync(uint128_t clusterUUID, PersistenceCompletion completion) override
+  UpdateSelfPersistenceAdmission claimLocalClusterOwnershipAsync(
+      uint128_t clusterUUID, PersistenceCompletion completion) override
   {
     ProdigyPersistentLocalBrainState candidate = persistentLocalBrainState;
     String failure;
     bool changed = false;
-    if (!prodigyEnsureLocalBrainOwnedByCluster(candidate, clusterUUID, &changed, &failure)) return false;
-    if (!changed) { if (completion) completion(true); return true; }
-    if (!ensurePersistentWriter()) return false;
+    if (!prodigyEnsureLocalBrainOwnedByCluster(candidate, clusterUUID, &changed, &failure))
+      return UpdateSelfPersistenceAdmission::rejected;
+    if (!changed)
+    {
+      if (completion) completion(true);
+      return UpdateSelfPersistenceAdmission::admitted;
+    }
+    if (!ensurePersistentWriter()) return UpdateSelfPersistenceAdmission::rejected;
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-    return persistentWriter->submitLocalBrainMutation(persistentLocalBrainState,
+    const ProdigyArtifactIO::Admission admission =
+        persistentWriter->submitLocalBrainMutationWithAdmission(persistentLocalBrainState,
         [clusterUUID](auto& latest, String& failure) {
           return prodigyEnsureLocalBrainOwnedByCluster(latest, clusterUUID, nullptr, &failure);
         },
         [lifetime, completion = std::move(completion)](auto&& result) mutable {
           if (!lifetime.expired() && completion) completion(result.durable);
         });
+    if (admission == ProdigyArtifactIO::Admission::admitted)
+      return UpdateSelfPersistenceAdmission::admitted;
+    if (admission == ProdigyArtifactIO::Admission::jobCapacity ||
+        admission == ProdigyArtifactIO::Admission::byteCapacity)
+      return UpdateSelfPersistenceAdmission::backpressured;
+    return UpdateSelfPersistenceAdmission::rejected;
   }
 
   bool applyPersistedTransportTLSAuthority(void)

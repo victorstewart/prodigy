@@ -13,6 +13,7 @@
 #include <vector>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 class TestSuite {
@@ -27,6 +28,24 @@ public:
     }
   }
 };
+
+// Frozen pre-G3B Brain/Neuron frame. This topic has no version negotiation;
+// current readers and writers must remain byte-compatible with this layout.
+struct LegacySwitchboardWormholeOperation {
+  uint32_t containerID = 0;
+  SwitchboardWormholeOperationStatus status = SwitchboardWormholeOperationStatus::request;
+  String revision;
+  String desired;
+};
+
+template <typename S>
+static void serialize(S&& serializer, LegacySwitchboardWormholeOperation& operation)
+{
+  serializer.value4b(operation.containerID);
+  serializer.value1b(operation.status);
+  serializer.text1b(operation.revision, 64);
+  serializer.text1b(operation.desired, SwitchboardWormholeOperation::maximumDesiredBytes);
+}
 
 class ScopedArtifactStore {
 public:
@@ -160,6 +179,8 @@ public:
   std::function<void(bool)> pendingRestoreCompletion = {};
   uint32_t restoreSubmissions = 0;
   uint32_t publishedContainers = 0;
+  uint32_t killAcknowledgements = 0;
+  uint128_t lastKillAcknowledgement = 0;
   std::vector<std::unique_ptr<Container>> publishedContainerOwners = {};
 
   ProdigyHostTask<bool> restoreStateUploadNetworkAsync(
@@ -199,6 +220,11 @@ public:
     return isPendingContainerLaunch(uuid);
   }
 
+  bool stateUploadRestoreOperationExistsForTest(uint128_t uuid) const
+  {
+    return pendingStateUploadRestores.contains(uuid);
+  }
+
   bool retainedCandidatePreservedForTest(uint128_t uuid, pid_t pid) const
   {
     auto found = pendingStateUploadRestores.find(uuid);
@@ -220,7 +246,18 @@ public:
     ++publishedContainers;
     publishedContainerOwners.emplace_back(container);
   }
-  void popContainer(Container *) override {}
+  void popContainer(Container *container) override
+  {
+    if (container == nullptr) return;
+    containers.erase(container->plan.uuid);
+    if (container->pid > 0) containerByPid.erase(container->pid);
+    RingDispatcher::eraseMultiplexee(container);
+  }
+  void queueContainerKillAck(uint128_t containerUUID) override
+  {
+    ++killAcknowledgements;
+    lastKillAcknowledgement = containerUUID;
+  }
   void downloadContainer(CoroutineStack *, uint64_t) override {}
   bool ensureHostNetworkingReady(String *failure = nullptr) override
   {
@@ -251,6 +288,11 @@ public:
 
   void replaceBrainWithoutClosing(void)
   {
+    if (brain != nullptr)
+    {
+      fenceStateUploadRestoresForControl(brain);
+      resetContainerLaunchControlForBrainReplacement();
+    }
     if (retained != nullptr) retired.push_back(retained);
     retained = brain;
     brain = new NeuronBrainControlStream();
@@ -625,6 +667,123 @@ int main()
                  "neuron_state_upload_restore_retired_control_identity_cannot_authorize_completion");
   }
   {
+    ArtifactRing restoreKillRing = {};
+    TestNeuron restoreKillNeuron = {};
+    restoreKillNeuron.replaceBrainWithoutClosing();
+    NeuronBase *previousNeuron = thisNeuron;
+    thisNeuron = &restoreKillNeuron;
+
+    const uint128_t containerUUID = uint128_t(0xA5510006);
+    pid_t child = fork();
+    if (child == 0)
+    {
+      for (;;) pause();
+    }
+
+    auto candidate = std::make_unique<Container>();
+    candidate->plan.uuid = containerUUID;
+    candidate->plan.fragment = 1;
+    candidate->plan.config.applicationID = 62'901;
+    candidate->plan.config.versionID = 1;
+    candidate->plan.config.cpuMode = ApplicationCPUMode::shared;
+    candidate->plan.config.nLogicalCores = 1;
+    candidate->plan.config.sharedCPUMillis = 1'000;
+    candidate->plan.restartOnFailure = true;
+    candidate->name.assignItoa(containerUUID);
+    candidate->pid = child;
+    candidate->pidfd = child > 0 ? int(syscall(SYS_pidfd_open, child, 0)) : -1;
+    ContainerPlan replay = candidate->plan;
+    ContainerRegistry::retain(candidate->plan.config.deploymentID());
+
+    suite.expect(child > 0 && candidate->pidfd >= 0 &&
+                     restoreKillNeuron.beginStateUploadRestoreForTest(std::move(candidate), 12),
+                 "neuron_state_upload_restore_kill_admits_live_retained_candidate");
+    auto obsoleteCompletion = std::exchange(restoreKillNeuron.pendingRestoreCompletion, {});
+    String killFrame = {};
+    Message::construct(killFrame, NeuronTopic::killContainer, containerUUID);
+    restoreKillNeuron.neuronHandler(reinterpret_cast<Message *>(killFrame.data()));
+    if (obsoleteCompletion) obsoleteCompletion(true);
+    runRingUntil(restoreKillRing, [&] { return restoreKillNeuron.killAcknowledgements == 1; });
+
+    errno = 0;
+    const bool childGone = child > 0 && kill(child, 0) != 0 && errno == ESRCH;
+    suite.expect(restoreKillRing.timedOut == false && childGone &&
+                     restoreKillNeuron.killAcknowledgements == 1 &&
+                     restoreKillNeuron.lastKillAcknowledgement == containerUUID,
+                 "neuron_state_upload_restore_kill_acks_only_after_exact_process_exit");
+    suite.expect(!restoreKillNeuron.pendingStateUploadRestoreForTest(containerUUID) &&
+                     !restoreKillNeuron.stateUploadRestoreOperationExistsForTest(containerUUID) &&
+                     !restoreKillNeuron.containers.contains(containerUUID) &&
+                     restoreKillNeuron.publishedContainers == 0,
+                 "neuron_state_upload_restore_kill_retires_unpublished_owner_without_publication");
+
+    restoreKillNeuron.replaceBrainWithoutClosing();
+    suite.expect(!restoreKillNeuron.pendingStateUploadRestoreForTest(replay.uuid) &&
+                     !restoreKillNeuron.stateUploadRestoreOperationExistsForTest(replay.uuid),
+                 "neuron_state_upload_restore_kill_cannot_reappear_after_control_replacement");
+    if (!childGone && child > 0)
+    {
+      kill(child, SIGKILL);
+      (void)waitpid(child, nullptr, 0);
+    }
+    thisNeuron = previousNeuron;
+  }
+  {
+    TestNeuron noPidfdRestoreKillNeuron = {};
+    noPidfdRestoreKillNeuron.replaceBrainWithoutClosing();
+
+    const uint128_t containerUUID = uint128_t(0xA5510007);
+    pid_t child = fork();
+    if (child == 0)
+    {
+      for (;;) pause();
+    }
+
+    auto candidate = std::make_unique<Container>();
+    candidate->plan.uuid = containerUUID;
+    candidate->plan.fragment = 1;
+    candidate->plan.config.applicationID = 62'902;
+    candidate->plan.config.versionID = 1;
+    candidate->plan.config.cpuMode = ApplicationCPUMode::shared;
+    candidate->plan.config.nLogicalCores = 1;
+    candidate->plan.config.sharedCPUMillis = 1'000;
+    candidate->plan.restartOnFailure = true;
+    candidate->name.assignItoa(containerUUID);
+    candidate->pid = child;
+    candidate->pidfd = -1;
+
+    suite.expect(child > 0 &&
+                     noPidfdRestoreKillNeuron.beginStateUploadRestoreForTest(std::move(candidate), 13),
+                 "neuron_state_upload_restore_no_pidfd_admits_live_retained_candidate");
+    auto obsoleteCompletion = std::exchange(noPidfdRestoreKillNeuron.pendingRestoreCompletion, {});
+    String killFrame = {};
+    Message::construct(killFrame, NeuronTopic::killContainer, containerUUID);
+    noPidfdRestoreKillNeuron.neuronHandler(reinterpret_cast<Message *>(killFrame.data()));
+    if (obsoleteCompletion) obsoleteCompletion(true);
+
+    const bool childStillAlive = child > 0 && kill(child, 0) == 0;
+    suite.expect(childStillAlive && noPidfdRestoreKillNeuron.killAcknowledgements == 0 &&
+                     noPidfdRestoreKillNeuron.stateUploadRestoreOperationExistsForTest(containerUUID) &&
+                     noPidfdRestoreKillNeuron.isContainerLaunchRetired(containerUUID) &&
+                     noPidfdRestoreKillNeuron.publishedContainers == 0,
+                 "neuron_state_upload_restore_no_pidfd_fails_closed_without_signalling_or_acknowledging");
+
+    noPidfdRestoreKillNeuron.replaceBrainWithoutClosing();
+    suite.expect(child > 0 && kill(child, 0) == 0 &&
+                     noPidfdRestoreKillNeuron.killAcknowledgements == 0 &&
+                     noPidfdRestoreKillNeuron.stateUploadRestoreOperationExistsForTest(containerUUID) &&
+                     noPidfdRestoreKillNeuron.isContainerLaunchRetired(containerUUID) &&
+                     !noPidfdRestoreKillNeuron.pendingStateUploadRestoreForTest(containerUUID) &&
+                     noPidfdRestoreKillNeuron.publishedContainers == 0,
+                 "neuron_state_upload_restore_no_pidfd_remains_fenced_across_control_replacement");
+
+    if (child > 0)
+    {
+      kill(child, SIGKILL);
+      (void)waitpid(child, nullptr, 0);
+    }
+  }
+  {
     std::function<void(bool)> lateCompletion = {};
     {
       TestNeuron shutdownNeuron = {};
@@ -648,6 +807,34 @@ int main()
   suite.expect(started, "neuron_artifact_starts_worker_and_control_stream");
   if (started)
   {
+    LegacySwitchboardWormholeOperation legacy = {};
+    legacy.containerID = 0x00a1b2c3;
+    legacy.status = SwitchboardWormholeOperationStatus::applied;
+    legacy.revision.assign("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"_ctv);
+    legacy.desired.assign("requested-wormhole-state"_ctv);
+    SwitchboardWormholeOperation current = {};
+    current.containerID = legacy.containerID;
+    current.status = legacy.status;
+    current.revision = legacy.revision;
+    current.desired = legacy.desired;
+    String legacyBytes = {}, currentBytes = {};
+    LegacySwitchboardWormholeOperation legacyFromCurrent = {};
+    SwitchboardWormholeOperation currentFromLegacy = {};
+    suite.expect(BitseryEngine::serialize(legacyBytes, legacy) &&
+                     BitseryEngine::serialize(currentBytes, current) &&
+                     legacyBytes.equals(currentBytes) &&
+                     BitseryEngine::deserializeSafe(currentBytes, legacyFromCurrent) &&
+                     BitseryEngine::deserializeSafe(legacyBytes, currentFromLegacy) &&
+                     legacyFromCurrent.containerID == legacy.containerID &&
+                     legacyFromCurrent.status == legacy.status &&
+                     legacyFromCurrent.revision.equals(legacy.revision) &&
+                     legacyFromCurrent.desired.equals(legacy.desired) &&
+                     currentFromLegacy.containerID == current.containerID &&
+                     currentFromLegacy.status == current.status &&
+                     currentFromLegacy.revision.equals(current.revision) &&
+                     currentFromLegacy.desired.equals(current.desired),
+                 "neuron_wormhole_operation_preserves_legacy_bidirectional_wire_layout");
+
     auto operation = [] {
       SwitchboardWormholeOperation value = {};
       value.containerID = 0x00a1b2c3;

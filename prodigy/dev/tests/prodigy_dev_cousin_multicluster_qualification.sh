@@ -12,6 +12,7 @@ GRAPH_ROOT=$ROOT
 PRODIGY_DEV_COUSIN_GRAPH=1
 [[ -x ${PRODIGY_DEV_COUSIN_PROBE_BIN:-} ]] || { echo 'FAIL: graph requires native probe' >&2; exit 1; }
 declare -A CLUSTERS WORKSPACES MANIFESTS CREATED OPERATIONS PAIR_ATTEMPTED PAIR_REMOVED ROUTE_IDS PREFIX_KEYS
+declare -a GRAPH_FAULT_PIDS=()
 CLUSTERS[a]=$FIRST; CLUSTERS[b]=$SECOND; CLUSTERS[c]="pair-enroll-third-$$-$RANDOM"
 WORKSPACES[a]=$FIRST_WORKSPACE; WORKSPACES[b]=$SECOND_WORKSPACE; WORKSPACES[c]="$ROOT/third-workspace"
 for label in a b c; do MANIFESTS[$label]="${WORKSPACES[$label]}/test-cluster-manifest.json"; CREATED[$label]=0; done
@@ -33,6 +34,9 @@ graph_cleanup() {
   COUSIN_OFFLINE=0
   trap - EXIT HUP INT TERM
   set +e
+  if (( PAIR_PARTITION_PID > 0 )); then wait "$PAIR_PARTITION_PID" || status=1; PAIR_PARTITION_PID=0; fi
+  for file in "${GRAPH_FAULT_PIDS[@]}"; do wait "$file" || status=1; done
+  GRAPH_FAULT_PIDS=()
   for label in a b c; do copy_cluster_logs "$label" "${MANIFESTS[$label]}" || status=1; done
   for pair in ab ac bc; do
     if (( PAIR_ATTEMPTED[$pair] )); then
@@ -72,8 +76,7 @@ prepare_pair() {
   mkdir -p "$ROOT/receipts"
   cp "$GRAPH_ROOT/$src-cluster-report.log" "$ROOT/first-cluster-report.log"
   cp "$GRAPH_ROOT/$dst-cluster-report.log" "$ROOT/second-cluster-report.log"
-  m enroll 45 "$ROOT/enroll.log" enrollClusterPair "$FIRST" "$SECOND" "$OPERATION"
-  enrollment_complete "$ROOT/enroll.log"
+  enroll_pair
   PAIR_ATTEMPTED[$pair]=1
   m prepare 45 "$ROOT/prepare.log" testClusterPairControl "$OPERATION" prepare
   ok "$ROOT/prepare.log" testClusterPairControl
@@ -112,7 +115,36 @@ PY_QUERY
 }
 
 observe_graph() {
-  local phase=$1; shift
+  local phase=$1 name side label app_name report deadline_ms; shift
+  deadline_ms=$(( $(date +%s%3N) + 240000 ))
+  for name in "$@"; do
+    for side in source destination; do
+      if [[ $side == source ]]; then label=${name:0:1}; else label=${name:1:1}; fi
+      app_name=$(jq -r ".${side}Name" "$ROOT/routes/$name/cousin-endpoints.json")
+      report="$ROOT/graph-$phase-$name-$side-app.log"
+      while true; do
+        if m "graph-$phase-$name-$side-report" 15 "$report" \
+             applicationReport "${CLUSTERS[$label]}" "$app_name" &&
+           python3 - "$report" <<'PY_APPLICATION_READY'
+import pathlib,re,sys
+data=pathlib.Path(sys.argv[1]).read_text()
+assert re.findall(r'\bstate:\s*DeploymentState::(\w+)\b',data)==['running']
+for field in ('nTarget','nDeployed','nHealthy'):
+    assert re.findall(r'\b'+field+r':\s*(\d+)\b',data)==['3']
+runtimes=re.findall(r'containerRuntime: cores=\d+ memMB=\d+ storMB=\d+ uuid=(\d+)',data)
+assert len(runtimes)==3 and len(set(runtimes))==3
+PY_APPLICATION_READY
+        then
+          break
+        fi
+        if (( $(date +%s%3N) >= deadline_ms )); then
+          echo "FAIL: graph $phase application $name $side did not recover before its bounded deadline" >&2
+          return 1
+        fi
+        sleep .2
+      done
+    done
+  done
   prodigy_dev_cousin_mark_time "$ROOT/graph-$phase"
   COUSIN_OFFLINE=1
   python3 - "$ROOT" "$phase" "$@" <<'PY_SPEC'
@@ -136,13 +168,21 @@ def candidates(label,deployment,role):
 routes=[]
 for name in names:
     transit=json.loads((root/'routes'/name/'cousin-service-transit.json').read_text())
+    current={}
+    for side in ('source','destination'):
+        report=(root/f'graph-{phase}-{name}-{side}-app.log').read_text()
+        for field in ('nHealthy','nDeployed'):
+            assert re.findall(r'\b'+field+r':\s*(\d+)\b',report)==['3'], (name,side,field)
+        current[side]={int(x) for x in re.findall(r'containerRuntime: cores=\d+ memMB=\d+ storMB=\d+ uuid=(\d+)',report)}
+        assert len(current[side])==3
     deadline=time.monotonic()+15
     while True:
-        sources=[x for x in candidates(name[0],transit['sourceDeploymentID'],'1') if any(
+        sources=[x for x in candidates(name[0],transit['sourceDeploymentID'],'1') if int(x[1]['uuid'],16) in current['source'] and any(
             r.get('source')==transit['sourceWhiteholeIPv6'] and r.get('sourcePort')==str(transit['sourceTCPPort']) for r in records(x[2],'request'))]
-        destinations=candidates(name[1],transit['destinationDeploymentID'],'0')
+        destinations=[x for x in candidates(name[1],transit['destinationDeploymentID'],'0') if int(x[1]['uuid'],16) in current['destination']]
         if len(sources)==1 and len(destinations)==3: break
-        if time.monotonic()>=deadline: raise SystemExit(f'no exact native identities for {name}: source={len(sources)} destination={len(destinations)}')
+        if time.monotonic()>=deadline:
+            raise SystemExit(f'no exact native identities for {name}: source={len(sources)} destination={len(destinations)}')
         time.sleep(.2)
     path,ready,_=sources[0]
     routes.append({'name':name,'sourceLog':str(path),'sourceUUID':ready['uuid'],
@@ -156,6 +196,8 @@ PY_SPEC
   python3 "$TEST_DIR/prodigy_dev_cousin_multicluster_observe.py" "$ROOT" "$ROOT/graph-$phase-spec.json"
   COUSIN_OFFLINE=0
 }
+
+if [[ ${PRODIGY_DEV_COUSIN_GRAPH_LIBRARY:-0} == 1 ]]; then return 0; fi
 
 sha256sum "$PRODIGY_BIN" "$MOTHERSHIP_BIN" "$BUNDLE" "$PRODIGY_DEV_COUSIN_PROBE_BIN" >"$ROOT/artifact-identities.sha256"
 create_graph_cluster a

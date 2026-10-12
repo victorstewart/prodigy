@@ -104,6 +104,9 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
     container.runtime_nLogicalCores = uint16_t(applicationSharedCPUCoreHint(base));
     container.runtime_memoryMB = base.totalMemoryMB();
     container.runtime_storageMB = base.totalStorageMB();
+    container.setMeshAddress(
+        container_network_subnet6, brain.brainConfig.datacenterFragment, machine.fragment, container.fragment);
+    container.addresses.emplace_back(container.meshAddress, uint8_t(128));
     container.explicitStatefulMeshRoles = StatefulMeshRoles::forShardGroup(deployment.plan.stateful,
                                                                              deployment.plan.config.applicationID, 0);
     container.explicitStatefulTopology.shardGroup = 0;
@@ -119,6 +122,20 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
     deployment.containers.insert(&container);
     deployment.containersByShardGroup.insert(0, &container);
   }
+
+  Whitehole verticalWhitehole = {};
+  verticalWhitehole.transport = ExternalAddressTransport::tcp;
+  verticalWhitehole.family = ExternalAddressFamily::ipv6;
+  verticalWhitehole.source = ExternalAddressSource::hostPublicAddress;
+  verticalWhitehole.hasAddress = true;
+  verticalWhitehole.address = IPAddress("2001:db8:7a51::1", true);
+  verticalWhitehole.sourcePort = 49'152;
+  verticalWhitehole.bindingNonce = 0x7a510001;
+  containers[0].whiteholes.push_back(verticalWhitehole);
+  suite.require(deployment.reserveWhiteholeAddressPortLease(
+                    verticalWhitehole, deployment.routableResourceLeaseOwner()),
+                "serving_resource_fixture_reserves_live_whitehole_binding");
+  brain.finishRuntimePersistence(true);
 
   ProdigyStatefulServingAuthority authority = {};
   authority.deploymentID = deployment.plan.config.deploymentID();
@@ -201,8 +218,17 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
                    machines[i].neuron.wBuffer.empty() &&
                    machines[i].memoryMB_available < availableBefore[i];
   }
+  const bool stagedWhiteholeRetained = brain.statefulServingRuntimeStates.size() == 3 &&
+                                      brain.statefulServingRuntimeStates[0].plan.whiteholes.size() == 1 &&
+                                      equalSerializedObjects(
+                                          brain.statefulServingRuntimeStates[0].plan.whiteholes[0], verticalWhitehole) &&
+                                      containers[0].whiteholes.size() == 1 &&
+                                      equalSerializedObjects(containers[0].whiteholes[0], verticalWhitehole) &&
+                                      brain.routableResourceLeaseRuntimeState.size() == 1;
   suite.expect(stagedExact,
                "serving_resource_preack_seals_all_member_digests_reserves_capacity_without_runtime_mutation");
+  suite.expect(stagedWhiteholeRetained,
+               "serving_resource_preack_seals_live_whitehole_binding_with_vertical_target");
 
   brain.finishRuntimePersistence(false);
   suite.expect(deployment.plan.config.memoryMB == base.memoryMB &&
@@ -227,6 +253,10 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
   machines[0].neuron.verifiedInstalledBundleIOGeneration = machines[0].neuron.ioGeneration;
   suite.expect(brain.restoreStatefulServingDecision(&deployment),
                "serving_resource_durable_receipt_restores_steady_target");
+  suite.expect(containers[0].whiteholes.size() == 1 &&
+                   equalSerializedObjects(containers[0].whiteholes[0], verticalWhitehole) &&
+                   brain.routableResourceLeaseRuntimeState.size() == 1,
+               "serving_resource_restore_preserves_live_whitehole_binding_after_vertical_target");
 
   auto countFrames = [&](NeuronTopic topic) -> uint32_t {
     uint32_t count = 0;
@@ -380,8 +410,15 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
                        machines[i].memoryMB_available == availableAfterDesiredReservation &&
                        machines[i].storageMB_available == storageAfterDesiredReservation;
   }
+  desiredObserved &= brain.statefulServingRuntimeStates.size() == 3 &&
+                     brain.statefulServingRuntimeStates[0].plan.whiteholes.size() == 1 &&
+                     equalSerializedObjects(
+                         brain.statefulServingRuntimeStates[0].plan.whiteholes[0], verticalWhitehole) &&
+                     containers[0].whiteholes.size() == 1 &&
+                     equalSerializedObjects(containers[0].whiteholes[0], verticalWhitehole) &&
+                     brain.routableResourceLeaseRuntimeState.size() == 1;
   suite.expect(desiredObserved,
-               "serving_resource_successful_upscale_reply_updates_observed_runtime_once");
+               "serving_resource_successful_upscale_reply_updates_observed_runtime_once_and_retains_live_whitehole_binding");
 
   // A failed observation may legitimately report no writable /storage volume.
   // It still records the filesystem allocation and retains the larger sealed
@@ -522,6 +559,53 @@ static void testStatefulServingResourceAdjustment(TestSuite& suite)
                    brain.prepareStatefulServingResourceAdjustment(&deployment, nonResource) == Admission::rejected &&
                    brain.masterAuthorityRuntimeState.generation == generation,
                "serving_resource_rejects_topology_and_nonresource_mutations_without_authority_change");
+
+  // Exercise the real uncovered loadStress branch.  It has no serving
+  // authority, so the already-applied scalar target must enter the ordinary
+  // DeploymentPlan map and persistent recovery snapshot.
+  brain.masterAuthorityRuntimeState.statefulServingAuthorities.clear();
+  brain.statefulServingRuntimeStates.clear();
+  deployment.plan.verticalScalers.clear();
+  VerticalScaler legacyMemory = {};
+  legacyMemory.name.assign(ProdigyMetrics::runtimeContainerMemoryUtilPctName);
+  legacyMemory.percentile = 95.0;
+  legacyMemory.lookbackSeconds = 60;
+  legacyMemory.threshold = 0.50;
+  legacyMemory.direction = Scaler::Direction::upscale;
+  legacyMemory.resource = ScalingDimension::memory;
+  legacyMemory.increment = 128;
+  legacyMemory.minValue = smaller.memoryMB;
+  legacyMemory.maxValue = desired.memoryMB;
+  deployment.plan.verticalScalers.push_back(legacyMemory);
+  brain.deploymentPlans.insert_or_assign(deployment.plan.config.deploymentID(), deployment.plan);
+  clearNeuronBuffers();
+  brain.holdRuntimePersistence = false;
+  const uint32_t persistenceBeforeLegacy = brain.persistCalls;
+  brain.metrics.record(deployment.plan.config.deploymentID(), containers[0].uuid,
+                       ProdigyMetrics::runtimeContainerMemoryUtilPctKey(),
+                       Time::now<TimeResolution::ms>(), 1.0);
+  TimeoutPacket legacyAutoscale = {};
+  legacyAutoscale.flags = uint64_t(DeploymentTimeoutFlags::autoscale);
+  deployment.dispatchTimeout(&legacyAutoscale);
+  const uint32_t legacyTargetMemory = smaller.memoryMB + legacyMemory.increment;
+  ProdigyPersistentMasterAuthorityPackage persistedLegacy = {};
+  brain.capturePersistentMasterAuthorityPackage(persistedLegacy);
+  StreamingTestBrain recoveredLegacy = {};
+  recoveredLegacy.iaas = &iaas;
+  const bool recoveredLegacyTarget =
+      recoveredLegacy.applyPersistentMasterAuthorityPackage(persistedLegacy) &&
+      recoveredLegacy.deploymentPlans.contains(deployment.plan.config.deploymentID()) &&
+      recoveredLegacy.deploymentPlans.at(deployment.plan.config.deploymentID()).config.memoryMB == legacyTargetMemory;
+  const auto publishedLegacy = brain.deploymentPlans.find(deployment.plan.config.deploymentID());
+  suite.expect(brain.persistCalls > persistenceBeforeLegacy &&
+                   publishedLegacy != brain.deploymentPlans.end() &&
+                   publishedLegacy->second.config.memoryMB == legacyTargetMemory &&
+                   persistedLegacy.deploymentPlans.at(deployment.plan.config.deploymentID()).config.memoryMB == legacyTargetMemory &&
+                   recoveredLegacyTarget &&
+                   deployment.statefulConstructionConfigForShardGroup(0).memoryMB == legacyTargetMemory &&
+                   countFrames(NeuronTopic::adjustContainerResources) == 3 &&
+                   brain.prepareStatefulServingResourceAdjustment(&deployment, deployment.plan.config) == Admission::ready,
+               "serving_resource_legacy_load_stress_publishes_persists_and_recovers_uncovered_target");
 
   for (uint32_t i = 0; i < 3; ++i)
   {

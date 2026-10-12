@@ -2388,6 +2388,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    )
    set_tests_properties(prodigy_predecessor_cgroup_drain_unit PROPERTIES TIMEOUT 10)
    add_test(
+      NAME prodigy_residual_netkit_classifier_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_RESIDUAL_NETKIT_CLASSIFIER_ONLY=1
+              $<TARGET_FILE:prodigy_deployments_unit>
+   )
+   set_tests_properties(prodigy_residual_netkit_classifier_unit PROPERTIES TIMEOUT 10)
+   add_test(
       NAME prodigy_durable_replacement_pairing_unit
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_INPLACE_PAIRING_ONLY=1
               $<TARGET_FILE:prodigy_deployments_unit>
@@ -2482,6 +2488,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_cousin_multicluster_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_multicluster_observe_unit.py)
    set_tests_properties(prodigy_cousin_multicluster_observe_unit PROPERTIES TIMEOUT 15)
+   add_test(NAME prodigy_cousin_fault_observe_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_fault_observe_unit.py)
+   set_tests_properties(prodigy_cousin_fault_observe_unit PROPERTIES TIMEOUT 15)
    add_test(NAME prodigy_cousin_lifecycle_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_lifecycle_observe_unit.py)
    set_tests_properties(prodigy_cousin_lifecycle_observe_unit PROPERTIES TIMEOUT 15)

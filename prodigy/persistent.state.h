@@ -822,6 +822,9 @@ static void serialize(S&& serializer, ProdigyPersistentLocalBrainState& state)
           !state.clusterPairControlProjection.epochStatuses.empty();
       uint64_t marker = emitsPairEpochLayout ? pairEpochMarker : pairMarker;
       serializer.value8b(marker);
+      if constexpr (requires { serializer.detachPersistentValue(state.clusterPairControlProjection.credentials.front()); })
+        for (auto& credential : state.clusterPairControlProjection.credentials)
+          serializer.detachPersistentValue(credential);
       auto projection = state.clusterPairControlProjection;
       for (auto& credential : projection.credentials) OPENSSL_cleanse(credential.psk, sizeof(credential.psk));
       serializer.object(projection);
@@ -3927,6 +3930,12 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
   // Deployment permissions are public runtime policy, but they still bind to
   // this snapshot's local authority generation and cluster identity.  Check
   // them before accepting a snapshot for either public or private storage.
+  if (!prodigyMachineFragmentAssignmentsValid(
+          snapshot.masterAuthority.runtimeState.machineFragmentAssignments))
+  {
+    if (failure) failure->assign("persistent brain snapshot machine fragment registry is malformed"_ctv);
+    return false;
+  }
   if (!snapshot.masterAuthority.runtimeState.localCousinServicePermissions.empty() &&
       !prodigyLocalCousinServicePermissionsValid(
           snapshot.masterAuthority.runtimeState.localCousinServicePermissions,
@@ -4222,6 +4231,12 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   const ProdigyTransportCredentialAuthorityRoot *transportAuthorityRoot =
       secrets.transportCredentialAuthorityRootSecrets.empty() ? nullptr :
       &secrets.transportCredentialAuthorityRootSecrets[0].root;
+  if (!prodigyMachineFragmentAssignmentsValid(
+          snapshot.masterAuthority.runtimeState.machineFragmentAssignments))
+  {
+    if (failure) failure->assign("persistent brain snapshot machine fragment registry is malformed"_ctv);
+    return false;
+  }
   if (!snapshot.masterAuthority.runtimeState.localCousinServicePermissions.empty() &&
       !prodigyLocalCousinServicePermissionsValid(
           snapshot.masterAuthority.runtimeState.localCousinServicePermissions,
@@ -5443,6 +5458,12 @@ public:
       {
         return false;
       }
+    }
+    else if (!prodigyMachineFragmentAssignmentsValid(
+                 snapshot.masterAuthority.runtimeState.machineFragmentAssignments))
+    {
+      if (failure) failure->assign("persistent brain snapshot machine fragment registry is malformed"_ctv);
+      return false;
     }
     else if (prodigyPersistentSnapshotRetirementDescriptorsNeedNoSecrets(snapshot, failure) == false ||
              prodigyPersistentSnapshotServingRuntimeDescriptorsNeedNoSecrets(snapshot, failure) == false ||

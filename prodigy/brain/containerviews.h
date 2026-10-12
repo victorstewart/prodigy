@@ -39,6 +39,11 @@ public:
   String wormholeRuntimeDesired;
   bytell_hash_set<uint32_t> wormholeRuntimePendingMachines;
   bytell_hash_set<uint32_t> wormholeRuntimeFailedMachines;
+  // Ephemeral per-machine acknowledgement fences. The operation wire format
+  // predates version negotiation, so the live control-stream incarnation is
+  // the request identity. Durable recovery restores only unresolved machine
+  // sets; the next registered stream assigns its current incarnation.
+  bytell_hash_map<uint32_t, uint64_t> wormholeRuntimePendingIOGenerations;
   // This is Brain-local delivery bookkeeping.  The durable route transaction
   // remains the revision plus desired bytes above; a recovered Brain may make
   // a fresh bounded delivery attempt for an unresolved machine.

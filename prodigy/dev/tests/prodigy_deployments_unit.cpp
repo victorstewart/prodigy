@@ -1479,6 +1479,72 @@ static __attribute__((noinline)) void testRecoveredStatefulSuccessorTarget(TestS
   delete brain;
 }
 
+static void testRecoveredStatefulHeadShardTarget(TestSuite& suite)
+{
+  TestBrain brain = {};
+  BrainBase *savedBrain = thisBrain;
+  thisBrain = &brain;
+
+  {
+    Machine machines[6] = {};
+    ContainerView containers[6] = {};
+    ApplicationDeployment recovered = {};
+    seedCommonPlan(recovered, true);
+    recovered.plan.config.type = ApplicationType::stateful;
+    recovered.plan.stateful.allMasters = true;
+    recovered.state = DeploymentState::running;
+    brain.deployments.insert_or_assign(recovered.plan.config.deploymentID(), &recovered);
+
+    for (uint32_t index = 0; index < 6; ++index)
+    {
+      Machine& machine = machines[index];
+      machine.uuid = uint128_t(0x1920a000 + index);
+      machine.state = MachineState::healthy;
+
+      ContainerView& container = containers[index];
+      container.uuid = uint128_t(0x1920b000 + index);
+      container.deploymentID = recovered.plan.config.deploymentID();
+      container.applicationID = recovered.plan.config.applicationID;
+      container.machine = &machine;
+      container.lifetime = ApplicationLifetime::base;
+      container.isStateful = true;
+      container.shardGroup = index / 3;
+      container.state = ContainerState::healthy;
+      container.runtimeReady = true;
+      recovered.containers.insert(&container);
+      recovered.containersByShardGroup.insert(container.shardGroup, &container);
+      brain.containers.insert_or_assign(container.uuid, &container);
+      machine.upsertContainerIndexEntry(container.deploymentID, &container);
+    }
+
+    recovered.recoverAfterReboot();
+    suite.expect(recovered.nShardGroups == 2 && recovered.nTargetBase == 6 &&
+                     recovered.nDeployed() == 6 && recovered.nHealthy() == 6,
+                 "recovered_stateful_head_restores_two_shard_target_from_authenticated_inventory");
+
+    ApplicationDeployment empty = {};
+    empty.plan = recovered.plan;
+    empty.plan.config.versionID += 1;
+    empty.state = DeploymentState::running;
+    brain.deployments.insert_or_assign(empty.plan.config.deploymentID(), &empty);
+    empty.recoverAfterReboot();
+    suite.expect(empty.nShardGroups == 1 && empty.nTargetBase == 3 && empty.containers.empty(),
+                 "fresh_stateful_head_without_inventory_defaults_to_one_shard");
+
+    brain.deployments.erase(empty.plan.config.deploymentID());
+    for (uint32_t index = 0; index < 6; ++index)
+    {
+      recovered.containers.erase(&containers[index]);
+      while (recovered.containersByShardGroup.eraseEntry(containers[index].shardGroup, &containers[index])) {}
+      machines[index].removeContainerIndexEntry(containers[index].deploymentID, &containers[index]);
+      brain.containers.erase(containers[index].uuid);
+    }
+    brain.deployments.erase(recovered.plan.config.deploymentID());
+  }
+
+  thisBrain = savedBrain;
+}
+
 static void testRecoveredStatefulQuorumDataStrategy(TestSuite& suite)
 {
   ApplicationDeployment deployment = {};
@@ -2595,9 +2661,139 @@ static void testStatefulHorizontalAutoscaleDispatch(TestSuite& suite)
     thisBrain = savedBrain;
 }
 
+static void testPendingCreateMarkerGenerationOwnership(TestSuite& suite)
+{
+  TemporaryDirectory containersRoot;
+  suite.expect(containersRoot.create(), "rejected_artifact_janitor_generation_fixture_mkdtemp_created");
+  if (containersRoot.path.size() == 0)
+  {
+    return;
+  }
+
+  std::filesystem::path rootPath = filesystemPathFromString(containersRoot.path);
+  std::filesystem::path liveArtifactPath = rootPath / "1002";
+  suite.expect(createDirectoryFixture(liveArtifactPath / "rootfs"),
+               "rejected_artifact_janitor_live_fixture_rootfs_created");
+  suite.expect(createDirectoryFixture(liveArtifactPath / ".prodigy-private"),
+               "rejected_artifact_janitor_live_fixture_private_dir_created");
+  suite.expect(
+      writeFileFixture(liveArtifactPath / ".prodigy-private" / "launch.metadata", "{}\n"),
+      "rejected_artifact_janitor_live_fixture_metadata_written");
+
+  String failure = {};
+  String liveArtifact = stringFromFilesystemPath(liveArtifactPath);
+  suite.expect(
+      ContainerManager::debugWriteContainerCreatePendingMarker(liveArtifact, getpid(), &failure),
+      "rejected_artifact_janitor_live_fixture_marker_written");
+  suite.expect(failure.size() == 0, "rejected_artifact_janitor_live_marker_write_clears_failure");
+  suite.expect(
+      !ContainerManager::debugIsAbandonedContainerCreateArtifact(liveArtifact, &failure),
+      "rejected_artifact_janitor_recognizes_live_pending_artifact");
+  suite.expect(failure.size() == 0, "rejected_artifact_janitor_live_inspection_clears_failure");
+
+  std::filesystem::path recycledArtifactPath = rootPath / "1004";
+  suite.expect(createDirectoryFixture(recycledArtifactPath / "rootfs"),
+               "rejected_artifact_janitor_recycled_pid_fixture_rootfs_created");
+  suite.expect(createDirectoryFixture(recycledArtifactPath / ".prodigy-private"),
+               "rejected_artifact_janitor_recycled_pid_fixture_private_dir_created");
+  suite.expect(
+      writeFileFixture(recycledArtifactPath / ".prodigy-private" / "launch.metadata", "{}\n"),
+      "rejected_artifact_janitor_recycled_pid_fixture_metadata_written");
+  char recycledPIDMarker[96] = {0};
+  std::snprintf(recycledPIDMarker, sizeof(recycledPIDMarker), "%d 1\n", int(getpid()));
+  suite.expect(
+      writeFileFixture(
+          recycledArtifactPath / ".prodigy-private" / "create.pending", recycledPIDMarker),
+      "rejected_artifact_janitor_recycled_pid_fixture_marker_written");
+
+  String recycledArtifact = stringFromFilesystemPath(recycledArtifactPath);
+  suite.expect(
+      ContainerManager::debugIsAbandonedContainerCreateArtifact(recycledArtifact, &failure),
+      "rejected_artifact_janitor_rejects_recycled_pid_generation");
+  suite.expect(failure.size() == 0,
+               "rejected_artifact_janitor_recycled_pid_inspection_clears_failure");
+
+  bool cleaned =
+      ContainerManager::debugCleanupRejectedOrphanedContainerArtifacts(containersRoot.path, &failure);
+  std::error_code liveExistsError;
+  std::error_code recycledExistsError;
+  bool liveArtifactExists = std::filesystem::exists(liveArtifactPath, liveExistsError);
+  bool recycledArtifactExists = std::filesystem::exists(recycledArtifactPath, recycledExistsError);
+  suite.expect(cleaned, "rejected_artifact_janitor_cleans_generation_fixtures");
+  suite.expect(failure.size() == 0, "rejected_artifact_janitor_generation_cleanup_clears_failure");
+  suite.expect(liveExistsError.value() == 0 && liveArtifactExists,
+               "rejected_artifact_janitor_keeps_live_pending_artifact_tree");
+  suite.expect(recycledExistsError.value() == 0 && recycledArtifactExists == false,
+               "rejected_artifact_janitor_erases_recycled_pid_artifact_tree");
+}
+
 int main(void)
 {
   TestSuite suite;
+  if (std::getenv("PRODIGY_TEST_PENDING_CREATE_MARKER_ONLY") != nullptr)
+  {
+    testPendingCreateMarkerGenerationOwnership(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_RESIDUAL_NETKIT_CLASSIFIER_ONLY") != nullptr)
+  {
+    using Action = ProdigyResidualNetkitAction;
+    ProdigyResidualNetkitEvidence evidence = {};
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::absent,
+                 "residual_netkit_absent_is_safe");
+    evidence = {.ifindex = 7, .peerIfindex = 8, .exactName = true, .netkit = true, .l3 = true};
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::destroy,
+                 "residual_netkit_exact_l3_pair_is_owned");
+    evidence.exactName = false;
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::reject,
+                 "residual_netkit_name_mismatch_is_rejected");
+    evidence.exactName = true;
+    evidence.netkit = false;
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::reject,
+                 "residual_netkit_foreign_kind_is_rejected");
+    evidence.netkit = true;
+    evidence.l3 = false;
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::reject,
+                 "residual_netkit_wrong_mode_is_rejected");
+    evidence.l3 = true;
+    evidence.peerIfindex = 0;
+    suite.expect(prodigyResidualNetkitAction(true, evidence) == Action::reject,
+                 "residual_netkit_without_peer_is_rejected");
+    suite.expect(prodigyResidualNetkitAction(false, evidence) == Action::reject,
+                 "residual_netkit_incomplete_query_is_rejected");
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (std::getenv("PRODIGY_TEST_RESIDUAL_NETKIT_LIVE_ONLY") != nullptr)
+  {
+    constexpr uint8_t fragment = 251;
+    NetkitPair stale;
+    stale.setNames(String {fragment});
+    if (if_nametoindex(stale.host.name.c_str()) != 0)
+    {
+      suite.expect(false, "residual_netkit_live_fixture_name_is_available");
+      return EXIT_FAILURE;
+    }
+    suite.expect(true, "residual_netkit_live_fixture_name_is_available");
+    stale.createPair(-1, NETKIT_SCRUB_NONE, NETKIT_SCRUB_NONE);
+    stale.getInfo();
+    suite.expect(stale.host.ifidx != 0 && stale.peer.ifidx != 0,
+                 "residual_netkit_live_fixture_created_exact_l3_pair");
+
+    Container recovered;
+    recovered.plan.fragment = fragment;
+    String failure;
+    const bool removed = recovered.removeVerifiedResidualColdRestartNetkit(&failure);
+    suite.expect(removed,
+                 "residual_netkit_live_cleanup_accepts_and_removes_owned_pair");
+    suite.expect(if_nametoindex(stale.host.name.c_str()) == 0,
+                 "residual_netkit_live_cleanup_observes_absence");
+    if (removed)
+    {
+      stale.host.ifidx = 0;
+      stale.peer.ifidx = 0;
+    }
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (std::getenv("PRODIGY_TEST_STATEFUL_HORIZONTAL_DISPATCH_ONLY") != nullptr)
   {
     testStatefulHorizontalAutoscaleDispatch(suite);
@@ -2612,6 +2808,7 @@ int main(void)
   {
     testRecoveredStatefulSuccessorTarget(suite, true);
     testRecoveredStatefulSuccessorTarget(suite, false);
+    testRecoveredStatefulHeadShardTarget(suite);
     testRecoveredStatefulQuorumDataStrategy(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
@@ -2712,7 +2909,9 @@ int main(void)
     container->storagePayloadPath.assign(storage.c_str());
     container->cgroup = -1;
     ContainerRegistry::retain(container->plan.config.deploymentID());
-    ContainerManager::restartContainer(container);
+    const bool restarted = ContainerManager::restartContainer(container);
+    suite.expect(restarted == false,
+                 "cold_restart_missing_cgroup_failure_reports_no_live_restart_owner");
     suite.expect(std::filesystem::exists(artifact / "rootfs" / "keep") &&
                      std::filesystem::exists(sentinel),
                  "cold_restart_missing_cgroup_failure_retains_existing_rootfs_and_storage");
@@ -5441,6 +5640,11 @@ int main(void)
           "rejected_artifact_janitor_orphan_fixture_marker_written");
 
       String failure = {};
+      String artifactRoot = stringFromFilesystemPath(artifactRootPath);
+      suite.expect(
+          ContainerManager::debugIsAbandonedContainerCreateArtifact(artifactRoot, &failure),
+          "rejected_artifact_janitor_recognizes_orphaned_pending_artifact");
+      suite.expect(failure.size() == 0, "rejected_artifact_janitor_orphan_inspection_clears_failure");
       bool cleaned = ContainerManager::debugCleanupRejectedOrphanedContainerArtifacts(containersRoot.path, &failure);
 
       std::error_code existsError;
@@ -5452,35 +5656,7 @@ int main(void)
     }
   }
 
-  {
-    TemporaryDirectory containersRoot;
-    suite.expect(containersRoot.create(), "rejected_artifact_janitor_live_fixture_mkdtemp_created");
-
-    if (containersRoot.path.size() > 0)
-    {
-      std::filesystem::path artifactRootPath = filesystemPathFromString(containersRoot.path) / "1002";
-      suite.expect(createDirectoryFixture(artifactRootPath / "rootfs"), "rejected_artifact_janitor_live_fixture_rootfs_created");
-      suite.expect(createDirectoryFixture(artifactRootPath / ".prodigy-private"), "rejected_artifact_janitor_live_fixture_private_dir_created");
-      suite.expect(
-          writeFileFixture(artifactRootPath / ".prodigy-private" / "launch.metadata", "{}\n"),
-          "rejected_artifact_janitor_live_fixture_metadata_written");
-      char livePidText[64] = {0};
-      std::snprintf(livePidText, sizeof(livePidText), "%d\n", int(getpid()));
-      suite.expect(
-          writeFileFixture(artifactRootPath / ".prodigy-private" / "create.pending", livePidText),
-          "rejected_artifact_janitor_live_fixture_marker_written");
-
-      String failure = {};
-      bool cleaned = ContainerManager::debugCleanupRejectedOrphanedContainerArtifacts(containersRoot.path, &failure);
-
-      std::error_code existsError;
-      bool artifactExists = std::filesystem::exists(artifactRootPath, existsError);
-
-      suite.expect(cleaned, "rejected_artifact_janitor_preserves_live_pending_artifact");
-      suite.expect(failure.size() == 0, "rejected_artifact_janitor_live_success_clears_failure");
-      suite.expect(existsError.value() == 0 && artifactExists, "rejected_artifact_janitor_keeps_live_pending_artifact_tree");
-    }
-  }
+  testPendingCreateMarkerGenerationOwnership(suite);
 
   {
     TemporaryDirectory containersRoot;

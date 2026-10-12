@@ -58,7 +58,7 @@ cat > "$PWD/ip" <<'IP'
 set -euo pipefail
 mode="$(<"$PWD/mode")"
 args="$*"
-if [[ "$args" == *"-j link show pairSource0"* ]]; then
+if [[ "$args" == *"-j link show"* && "$args" == *"pairSource0"* ]]; then
   case "$mode" in
     vanished) echo 'Device "pairSource0" does not exist.' >&2; exit 1 ;;
     replacement) printf '[{"ifindex":9,"link_index":8,"address":"02:ff:ff:ff:ff:ff"}]\n'; exit 0 ;;
@@ -76,7 +76,7 @@ if [[ "$args" == *"-j link show"* ]]; then
     replacement|owned) printf '[{"ifname":"pairSource0"}]\n'; exit 0 ;;
   esac
 fi
-if [[ "$args" == *"link del pairSource0"* ]]; then
+if [[ "$args" == *"link del"* && "$args" == *"pairSource0"* ]]; then
   if [[ "$mode" == disappear_delete ]]; then
     echo 'Device "pairSource0" does not exist.' >&2; exit 1
   fi
@@ -622,11 +622,145 @@ kill "$fixture_pid"; wait "$fixture_pid" || true
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlFaultDirectionSelection(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_fault_direction_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_fault_direction_reads_provider"); return; }
+  std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_fault_selected_sides()\n{\n");
+  const size_t end = text.find("\npair_control_fault_inside()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_fault_direction_extracts_real_provider_selector");
+  if (begin == std::string::npos || end == std::string::npos) return;
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+pair_control_fault_direction=both
+[[ "$(pair_control_fault_selected_sides)" == $'first\nsecond' ]]
+pair_control_fault_direction=first-to-second
+[[ "$(pair_control_fault_selected_sides)" == first ]]
+pair_control_fault_direction=second-to-first
+[[ "$(pair_control_fault_selected_sides)" == second ]]
+pair_control_fault_direction=outside-boundary
+if pair_control_fault_selected_sides; then exit 1; fi
+[[ "$(pair_control_fault_rule_witness first 0)" == first0-to-second0-DROP ]]
+[[ "$(pair_control_fault_rule_witness first 1)" == first0-to-second0-ABSENT ]]
+[[ "$(pair_control_fault_rule_witness second 0)" == second0-to-first0-DROP ]]
+[[ "$(pair_control_fault_rule_witness second 1)" == second0-to-first0-ABSENT ]]
+if pair_control_fault_rule_witness first 2; then exit 1; fi
+pair_control_dir="$PWD/pair"; mkdir -p "$pair_control_dir"
+pair_control_fault_delay_ms=7; pair_control_fault_duration_ms=9
+pair_control_fault_direction=first-to-second; pair_control_fault_touched=1
+printf 'delayMs=7 durationMs=9 direction=first-to-second\n' > "$pair_control_dir/fault-active"
+printf '5000000\n' > "$pair_control_dir/fault-begin-ns"
+printf 'digest\n' > "$pair_control_dir/firewall-digest"
+pair_control_fault_remove_rule() { printf '%s\n' "$1" >> "$pair_control_dir/removed"; }
+pair_control_firewall_digest() { printf digest; }
+pair_control_fault_monotonic_ns() { printf 10000000; }
+pair_write() { printf '%s\n' "$2" > "$1"; }
+pair_control_fault_restore_inside
+[[ "$(<"$pair_control_dir/removed")" == first ]]
+[[ ! -e "$pair_control_dir/fault-active" ]]
+[[ "$(<"$pair_control_dir/fault-last")" == 'delayMs=7 durationMs=9 direction=first-to-second beginNs=5000000 endNs=10000000 rules=first' ]]
+# An interrupt after an installed drop but before the begin marker must restore
+# the selected rule without publishing a false completed interval.
+rm -f "$pair_control_dir/fault-begin-ns" "$pair_control_dir/fault-end-ns" "$pair_control_dir/fault-last" "$pair_control_dir/removed"
+printf 'delayMs=7 durationMs=9 direction=first-to-second\n' > "$pair_control_dir/fault-active"
+pair_control_fault_touched=1
+pair_control_fault_restore_inside
+[[ "$(<"$pair_control_dir/removed")" == first ]]
+[[ ! -e "$pair_control_dir/fault-active" && ! -e "$pair_control_dir/fault-end-ns" && ! -e "$pair_control_dir/fault-last" ]]
+rm -f "$pair_control_dir/removed"
+printf 'delayMs=7 durationMs=9 direction=both\n' > "$pair_control_dir/fault-active"
+pair_control_fault_touched=1
+if pair_control_fault_restore_inside; then exit 1; fi
+[[ -f "$pair_control_dir/fault-active" && ! -e "$pair_control_dir/removed" ]]
+)TEST";
+  char temporary[] = "./pair-fault-direction-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_fault_direction_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_fault_direction_admits_only_exact_boundary_directions");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
+static void testPairControlFaultEmitsOnlyFaultReceipt(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_fault_stdout_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_fault_stdout_reads_provider"); return; }
+  std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_fault_inside()\n{\n");
+  const size_t end = text.find("\npair_control_action()\n", begin);
+  suite.expect(begin != std::string::npos && end != std::string::npos,
+               "pair_fault_stdout_extracts_real_inside_owner");
+  if (begin == std::string::npos || end == std::string::npos) return;
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + R"TEST(
+pair_control_dir="$PWD/pair"; mkdir -p "$pair_control_dir"
+pair_control_id=0x0900; pair_control_fault_delay_ms=7; pair_control_fault_duration_ms=9
+pair_control_query_inside() { printf 'PAIR_CONTROL preflight should-not-leak\n'; }
+pair_write() { printf '%s\n' "$2" > "$1"; }
+pair_control_fault_sleep() { :; }
+pair_control_fault_rule_text() { printf 'owned-%s' "$1"; }
+pair_control_fault_rule_witness() {
+  case "$1:${2:-0}" in
+    first:0) printf first0-to-second0-DROP ;;
+    first:1) printf first0-to-second0-ABSENT ;;
+    second:0) printf second0-to-first0-DROP ;;
+    second:1) printf second0-to-first0-ABSENT ;;
+    *) return 2 ;;
+  esac
+}
+pair_control_fault_rule_present() { return 1; }
+pair_control_fault_add_rule() { :; }
+pair_control_fault_selected_sides() { case "$pair_control_fault_direction" in both) printf 'first\nsecond\n' ;; first-to-second) printf 'first\n' ;; second-to-first) printf 'second\n' ;; esac; }
+pair_control_fault_monotonic_ns() { if [[ -e "$pair_control_dir/clock" ]]; then printf 20000000; else : > "$pair_control_dir/clock"; printf 10000000; fi; }
+pair_control_fault_restore_inside() { printf 20000000 > "$pair_control_dir/fault-end-ns"; pair_control_fault_touched=0; }
+run_case() {
+  local direction="$1" expected="$2" output
+  rm -f "$pair_control_dir"/*
+  pair_control_fault_direction="$direction"
+  output="$(pair_control_fault_inside)"
+  [[ "$output" == "$expected" ]]
+}
+run_case both 'PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=7 durationMs=9 beginNs=10000000 endNs=20000000'
+run_case first-to-second 'PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=7 durationMs=9 direction=first-to-second installRule=first0-to-second0-DROP restoreRule=first0-to-second0-ABSENT beginNs=10000000 endNs=20000000'
+run_case second-to-first 'PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME delayMs=7 durationMs=9 direction=second-to-first installRule=second0-to-first0-DROP restoreRule=second0-to-first0-ABSENT beginNs=10000000 endNs=20000000'
+)TEST";
+  char temporary[] = "./pair-fault-stdout-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_fault_stdout_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_fault_stdout_contains_exactly_one_fault_receipt");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
 int main()
 {
   TestSuite suite;
   testPairOwnedLinkCleanupRace(suite);
   testPairControlServiceDescriptorStatusIsolation(suite);
+  testPairControlFaultDirectionSelection(suite);
+  testPairControlFaultEmitsOnlyFaultReceipt(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
   testPairGuestResetAbsenceProofFailsClosed(suite);

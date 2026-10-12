@@ -24,6 +24,7 @@ class ProdigyCousinSessionClient;
 class ProdigyCousinSessionStream : public ProdigyTransportTLSStream {
   friend class ProdigyCousinSessionClient;
   std::weak_ptr<ProdigyCousinSessionLease> lease;
+  uint128_t resolvedSessionUUID = 0;
   int64_t pendingDeadline = 0;
   bool resolving = false;
   bool authorized() const
@@ -52,9 +53,9 @@ public:
   uint64_t queuedSendOutstandingBytes() const override
   { return authorized() ? ProdigyTransportTLSStream::queuedSendOutstandingBytes() : 0; }
   uint128_t sessionUUID() const
-  { auto current = lease.lock(); return current ? current->command.session.sessionUUID : 0; }
-  // Ring owns a fixed descriptor. An application-owned outbound stream may
-  // abort its ordinary descriptor when its fixed source tuple must be reused.
+  { return resolvedSessionUUID; }
+  // Ring owns a fixed descriptor. Either application-owned endpoint may abort
+  // its ordinary descriptor when the retired session's fixed tuple is reused.
   bool abortOwnedSocket()
   {
     if (isFixedFile || fd < 0) return false;
@@ -184,7 +185,7 @@ public:
     if (stream.fd < 0 || !Ring::bindSourceAddressBeforeFixedFileInstall(&stream)) return false;
     lease->claimed = true; stream.lease = lease; stream.resolving = false;
     std::weak_ptr<ProdigyCousinSessionLease> weak = lease;
-    return stream.beginTransportAEGISWithPrelude(false, state->containerUUID,
+    const bool prepared = stream.beginTransportAEGISWithPrelude(false, state->containerUUID,
         prelude(sessionUUID, CousinRouteHalf::source),
         [weak](const String& peer, std::array<uint8_t, 32>& key, String& context, uint128_t& peerUUID) {
           auto lease = weak.lock();
@@ -193,6 +194,8 @@ public:
           key = lease->command.psk; context = lease->command.canonicalContext;
           peerUUID = lease->command.session.destination.containerUUID; return true;
         });
+    if (prepared) stream.resolvedSessionUUID = sessionUUID;
+    return prepared;
   }
 
   // observedPeer must be the accepted peer returned by the socket/Ring owner,
@@ -213,7 +216,8 @@ public:
             if (lease->command.session.sessionUUID != sessionUUID) continue;
             if (!lease->current() || lease->claimed || lease->command.localHalf != CousinRouteHalf::destination ||
                 !observedSourceMatches(observedPeer, length, lease->command.session)) return false;
-            lease->claimed = true; stream.lease = lease; stream.resolving = false;
+            lease->claimed = true; stream.lease = lease;
+            stream.resolvedSessionUUID = sessionUUID; stream.resolving = false;
             key = lease->command.psk; context = lease->command.canonicalContext;
             peerUUID = lease->command.session.sourceContainerUUID;
             local = prelude(sessionUUID, CousinRouteHalf::destination); return true;

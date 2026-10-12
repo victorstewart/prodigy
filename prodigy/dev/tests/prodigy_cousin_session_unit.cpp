@@ -235,9 +235,29 @@ int main()
   expect(!unowned.abortOwnedSocket() && !fixed.abortOwnedSocket() && fixed.fd == 42,
          "abortive_close_rejects_unowned_and_ring_fixed_descriptors");
   fixed.fd = -1;
+  bool inboundClosed = false;
+  serverOwner.onSessionClosed = [&](uint128_t sessionUUID) {
+    if (server.sessionUUID() == sessionUUID)
+      inboundClosed = server.abortOwnedSocket();
+  };
+  auto revokeDestination = destination;
+  revokeDestination.kind = ProdigyCousinSessionLocalKind::revoke;
+  revokeDestination.psk.fill(0); revokeDestination.canonicalContext.clear();
+  expect(serverOwner.applyCommand(revokeDestination) &&
+         server.sessionUUID() == destination.session.sessionUUID && inboundClosed && server.fd == -1,
+         "destination_revocation_identifies_and_aborts_the_exact_accepted_stream");
+  bool peerReset = false;
+  for (unsigned attempt = 0; client.fd >= 0 && attempt < 500; ++attempt) {
+    char byte = 0;
+    const ssize_t received = recv(client.fd, &byte, sizeof(byte), MSG_DONTWAIT);
+    if (received < 0 && errno == ECONNRESET) { peerReset = true; break; }
+    if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+    usleep(100);
+  }
+  expect(peerReset, "retired_inbound_socket_resets_peer_instead_of_leaving_a_fin_wait_tuple");
   expect(client.abortOwnedSocket() && client.fd == -1,
          "revoked_fixed_whitehole_outbound_uses_abortive_owner_close");
-  if (server.fd >= 0) { close(server.fd); server.fd = -1; }
+  if (server.fd >= 0) (void)server.abortOwnedSocket();
   auto reconnectSource = fixture(CousinRouteHalf::source, 0x7f11, 0x7f12);
   auto reconnectDestination = fixture(CousinRouteHalf::destination, 0x7f11, 0x7f12);
   ProdigyCousinSessionClient reconnectClientOwner(reconnectSource.session.sourceContainerUUID);

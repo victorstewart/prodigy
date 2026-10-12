@@ -19,8 +19,10 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 constexpr auto probeConfigPath = "/cousin-probe-config"_ctv;
@@ -31,6 +33,7 @@ constexpr uint32_t maximumRequests = 64;
 constexpr int64_t maximumDurationMs = 180000;
 constexpr uint32_t echoIntervalMs = 2000;
 constexpr int64_t maximumSessionDurationMs = 30000;
+constexpr size_t maximumInboundConnections = 64;
 
 bool parseHex128(const String& text, uint128_t& value)
 {
@@ -73,13 +76,13 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   uint128_t nextRequestUUID = 1;
   uint128_t activeRequestUUID = 0;
   uint128_t activeSessionUUID = 0;
-  uint128_t inboundSessionUUID = 0;
   bool applyingRevocation = false;
   uint64_t outboundLeaseGeneration = 0;
   bool outboundCloseNotified = false;
+  bool outboundConnectOutcomeLogged = false;
   int listener = -1;
   std::unique_ptr<ProdigyCousinSessionStream> outbound;
-  std::unique_ptr<ProdigyCousinSessionStream> inbound;
+  std::vector<std::unique_ptr<ProdigyCousinSessionStream>> inbound;
   bool payloadQueued = false;
   uint32_t echoRound = 0;
   uint32_t requestAttempts = 0;
@@ -88,6 +91,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   int64_t nextEchoAtMs = 0;
   int64_t outboundStartedAtMs = 0;
   bool lifecycleProfile = false;
+  bool lifecycleBothSides = false;
   bool graphProfile = false;
   int64_t firstPayloadAtMs = 0;
   int64_t nextScaleMetricAtMs = 0;
@@ -95,15 +99,18 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
   void closeStream(std::unique_ptr<ProdigyCousinSessionStream>& stream)
   {
     if (!stream) return;
-    if (stream->fd >= 0) ::close(stream->fd);
+    // Either retired endpoint can retain a kernel TCP socket after a graceful
+    // close. Release its fixed tuple before a fresh authorized session reuses it.
+    (void)stream->abortOwnedSocket();
     stream.reset();
-    payloadQueued = false;
   }
 
   void failClosed(const char *reason)
   {
     std::printf("cousin_session_probe.fail %s\n", reason);
-    closeStream(outbound); closeStream(inbound);
+    closeStream(outbound); payloadQueued = false;
+    for (auto& stream : inbound) closeStream(stream);
+    inbound.clear();
   }
 
   void armTick()
@@ -140,24 +147,75 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
 
   void acceptInbound()
   {
-    if (listener < 0 || inbound) return;
-    sockaddr_storage peer = {}; socklen_t peerLength = sizeof(peer);
-    int accepted = ::accept4(listener, reinterpret_cast<sockaddr *>(&peer), &peerLength, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (accepted < 0) return;
-    auto stream = std::make_unique<ProdigyCousinSessionStream>();
-    stream->fd = accepted; stream->isNonBlocking = true; stream->rBuffer.reserve(8192); stream->wBuffer.reserve(8192);
-    if (!sessions->prepareInbound(*stream, peer, peerLength)) { ::close(accepted); return; }
-    inbound = std::move(stream);
+    if (listener < 0) return;
+    while (inbound.size() < maximumInboundConnections) {
+      sockaddr_storage peer = {}; socklen_t peerLength = sizeof(peer);
+      int accepted = ::accept4(listener, reinterpret_cast<sockaddr *>(&peer), &peerLength,
+                               SOCK_NONBLOCK | SOCK_CLOEXEC);
+      if (accepted < 0) return;
+      auto stream = std::make_unique<ProdigyCousinSessionStream>();
+      stream->fd = accepted; stream->isNonBlocking = true;
+      stream->rBuffer.reserve(8192); stream->wBuffer.reserve(8192);
+      if (!sessions->prepareInbound(*stream, peer, peerLength)) {
+        (void)stream->abortOwnedSocket();
+        continue;
+      }
+      char peerAddress[INET6_ADDRSTRLEN] = {};
+      const auto& peer6 = reinterpret_cast<const sockaddr_in6&>(peer);
+      (void)::inet_ntop(AF_INET6, &peer6.sin6_addr, peerAddress, sizeof(peerAddress));
+      std::printf("cousin_session_probe.accept source=%s sourcePort=%u pending=%zu monotonicMs=%lld\n",
+                  peerAddress, unsigned(ntohs(peer6.sin6_port)), inbound.size() + 1,
+                  (long long)Time::msSinceBoot());
+      inbound.push_back(std::move(stream));
+    }
+  }
+
+  void observeOutboundConnectOutcome(bool closing = false)
+  {
+    if (!outbound || outboundConnectOutcomeLogged) return;
+    pollfd descriptor = {};
+    descriptor.fd = outbound->fd;
+    descriptor.events = POLLOUT | POLLERR | POLLHUP;
+    errno = 0;
+    int pollResult = ::poll(&descriptor, 1, 0);
+    while (pollResult < 0 && errno == EINTR) {
+      errno = 0;
+      pollResult = ::poll(&descriptor, 1, 0);
+    }
+    const int pollError = errno;
+    if (pollResult == 0 && !closing) return;
+
+    outboundConnectOutcomeLogged = true;
+    const int64_t now = Time::msSinceBoot();
+    int socketError = 0;
+    socklen_t socketErrorLength = sizeof(socketError);
+    int socketErrorResult = -1;
+    int socketErrorReadError = 0;
+    if (pollResult > 0) {
+      errno = 0;
+      socketErrorResult = ::getsockopt(outbound->fd, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength);
+      socketErrorReadError = errno;
+    }
+    const char *outcome = pollResult < 0 ? "poll_error" :
+        pollResult == 0 ? "pending" :
+        socketErrorResult != 0 ? "socket_error_read_failed" :
+        socketError == 0 ? "connected" : "failed";
+    std::printf("cousin_session_probe.connectOutcome session=%016llx%016llx generation=%llu outcome=%s pollResult=%d revents=%u socketError=%d errno=%d elapsedMs=%lld monotonicMs=%lld\n",
+                (unsigned long long)(activeSessionUUID >> 64), (unsigned long long)activeSessionUUID,
+                (unsigned long long)outboundLeaseGeneration, outcome, pollResult,
+                unsigned(descriptor.revents), socketError,
+                pollResult < 0 ? pollError : socketErrorReadError,
+                (long long)(now - outboundStartedAtMs), (long long)now);
   }
 
   void notifyOutboundFailure()
   {
+    observeOutboundConnectOutcome(true);
     if (outbound && !outboundCloseNotified && hub && activeSessionUUID != 0 && outboundLeaseGeneration != 0) {
       outboundCloseNotified = true;
       (void)hub->closeCousinSession(activeSessionUUID, outboundLeaseGeneration);
     }
-    if (outbound) (void)outbound->abortOwnedSocket();
-    closeStream(outbound); activeSessionUUID = 0;
+    closeStream(outbound); payloadQueued = false; activeSessionUUID = 0;
   }
 
   void requestIfNeeded()
@@ -165,7 +223,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
     const int64_t now = Time::msSinceBoot();
     if (!source || outbound || !sourceWhitehole || permissionUUID == 0 || now < nextRequestAtMs ||
         requestAttempts >= (graphProfile ? 512 : maximumRequests) ||
-        now - startedAtMs > (graphProfile ? 1800000 : (lifecycleProfile ? 360000 : maximumDurationMs))) return;
+        now - startedAtMs > (graphProfile ? 1800000 : (lifecycleProfile ? (lifecycleBothSides ? 600000 : 360000) : maximumDurationMs))) return;
     ProdigyCousinSessionRequest request = {};
     request.requestUUID = ++nextRequestUUID;
     request.permissionUUID = permissionUUID;
@@ -203,7 +261,7 @@ class CousinSessionProbeContainer final : public NeuronHubDispatch, public Timeo
     outbound = std::move(stream); payloadQueued = false;
     activeRequestUUID = command.requestUUID; activeSessionUUID = command.session.sessionUUID;
     outboundLeaseGeneration = command.leaseGeneration;
-    outboundCloseNotified = false; nextEchoAtMs = Time::msSinceBoot();
+    outboundCloseNotified = false; outboundConnectOutcomeLogged = false; nextEchoAtMs = Time::msSinceBoot();
     outboundStartedAtMs = nextEchoAtMs;
     std::printf("cousin_session_probe.activate request=%016llx%016llx session=%016llx%016llx generation=%llu monotonicMs=%lld\n",
                (unsigned long long)(command.requestUUID >> 64), (unsigned long long)command.requestUUID,
@@ -274,9 +332,16 @@ public:
     if (!sessions) return;
     sessions->expire();
     acceptInbound();
+    observeOutboundConnectOutcome();
     if (outbound && !drive(*outbound)) notifyOutboundFailure();
-    if (inbound && !drive(*inbound)) closeStream(inbound);
-    if (inbound) inboundSessionUUID = inbound->sessionUUID();
+    for (auto it = inbound.begin(); it != inbound.end();) {
+      auto& stream = **it;
+      if (drive(stream)) { ++it; continue; }
+      std::printf("cousin_session_probe.transportClose direction=inbound session=%016llx%016llx monotonicMs=%lld\n",
+                  (unsigned long long)(stream.sessionUUID() >> 64), (unsigned long long)stream.sessionUUID(),
+                  (long long)Time::msSinceBoot());
+      closeStream(*it); it = inbound.erase(it);
+    }
     const int64_t now = Time::msSinceBoot();
     // Keep each connection attempt bounded and exercise fresh requests after
     // setup completes, including when an earlier request raced the offline marker.
@@ -285,6 +350,7 @@ public:
       if (!payloadQueued && now >= nextEchoAtMs) { outbound->wBuffer.append(probePayload); payloadQueued = true; }
       if (payloadQueued && outbound->rBuffer.size() == probePayload.size() &&
           std::memcmp(outbound->rBuffer.data(), probePayload.data(), probePayload.size()) == 0) {
+        if (firstPayloadAtMs == 0) firstPayloadAtMs = now;
         outbound->rBuffer.clear(); payloadQueued = false; nextEchoAtMs = now + echoIntervalMs; ++echoRound;
         std::printf("cousin_session_probe.round request=%016llx%016llx peer=%016llx%016llx session=%016llx%016llx round=%u monotonicMs=%lld wallMs=%lld payload=exact\n",
                    (unsigned long long)(activeRequestUUID >> 64), (unsigned long long)activeRequestUUID,
@@ -293,15 +359,18 @@ public:
                    unsigned(echoRound), (long long)now, (long long)Time::now<TimeResolution::ms>());
       }
     }
-    if (inbound && inbound->isTransportNegotiated() && inbound->rBuffer.size() == probePayload.size() &&
-        std::memcmp(inbound->rBuffer.data(), probePayload.data(), probePayload.size()) == 0) {
-      inbound->rBuffer.clear(); inbound->wBuffer.append(probePayload);
+    for (auto& owned : inbound) {
+      auto& stream = *owned;
+      if (!stream.isTransportNegotiated() || stream.rBuffer.size() != probePayload.size() ||
+          std::memcmp(stream.rBuffer.data(), probePayload.data(), probePayload.size()) != 0) continue;
+      stream.rBuffer.clear(); stream.wBuffer.append(probePayload);
       if (firstPayloadAtMs == 0) firstPayloadAtMs = now;
-      std::printf("cousin_session_probe.echo peer=%016llx%016llx session=%016llx%016llx payload=exact\n",
-                 (unsigned long long)(inbound->tlsPeerUUID >> 64), (unsigned long long)inbound->tlsPeerUUID,
-                 (unsigned long long)(inbound->sessionUUID() >> 64), (unsigned long long)inbound->sessionUUID());
+      std::printf("cousin_session_probe.echo peer=%016llx%016llx session=%016llx%016llx monotonicMs=%lld payload=exact\n",
+                 (unsigned long long)(stream.tlsPeerUUID >> 64), (unsigned long long)stream.tlsPeerUUID,
+                 (unsigned long long)(stream.sessionUUID() >> 64), (unsigned long long)stream.sessionUUID(),
+                 (long long)now);
     }
-    if (lifecycleProfile && !source && firstPayloadAtMs != 0 &&
+    if (lifecycleProfile && (!source || lifecycleBothSides) && firstPayloadAtMs != 0 &&
         now >= firstPayloadAtMs + 60000 && now >= nextScaleMetricAtMs) {
       // An application metric exercises the installed ordinary local scaler,
       // including while the external pair boundary is partitioned.
@@ -322,7 +391,8 @@ public:
     if (matches > 1) { failClosed("ambiguous_source_whiteholes"); std::exit(EXIT_FAILURE); }
     source = matches == 1;
     const char *lifecycle = std::getenv("COUSIN_PROBE_LIFECYCLE");
-    lifecycleProfile = lifecycle && std::strcmp(lifecycle, "1") == 0;
+    lifecycleProfile = lifecycle && (std::strcmp(lifecycle, "1") == 0 || std::strcmp(lifecycle, "both") == 0);
+    lifecycleBothSides = lifecycle && std::strcmp(lifecycle, "both") == 0;
     const char *graph = std::getenv("COUSIN_PROBE_GRAPH");
     graphProfile = graph && std::strcmp(graph, "1") == 0;
     if (source && !readPermissionUUID(permissionUUID)) { failClosed("source_config"); std::exit(EXIT_FAILURE); }
@@ -335,11 +405,13 @@ public:
       if (outbound && activeSessionUUID == sessionUUID) {
         if (!applyingRevocation) notifyOutboundFailure();
         else {
-          (void)outbound->abortOwnedSocket();
-          closeStream(outbound); activeSessionUUID = 0;
+          closeStream(outbound); payloadQueued = false; activeSessionUUID = 0;
         }
       }
-      if (inbound && inboundSessionUUID == sessionUUID) closeStream(inbound);
+      for (auto it = inbound.begin(); it != inbound.end();) {
+        if ((*it)->sessionUUID() != sessionUUID) { ++it; continue; }
+        closeStream(*it); it = inbound.erase(it);
+      }
     };
     hub->signalReady(); hub->signalRuntimeReady(); armTick();
     std::printf("cousin_session_probe.ready uuid=%016llx%016llx deployment=%llu source=%u group=%u workers=%u cores=%u memoryMB=%u storageMB=%u monotonicMs=%lld\n",

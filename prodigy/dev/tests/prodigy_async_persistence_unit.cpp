@@ -456,16 +456,19 @@ static void testLocalBrainMutationWriter(TestSuite& suite)
                 });
             if (!nestedAdmitted) Ring::exit = true;
           });
-      const bool concurrentRejected = !writer.submitLocalBrainMutation(
+      const ProdigyArtifactIO::Admission concurrentAdmission =
+          writer.submitLocalBrainMutationWithAdmission(
           cache,
           [](ProdigyPersistentLocalBrainState& candidate, String&) {
             candidate.ownerClusterUUID = 0x7104;
             return true;
           },
           [&](auto&&) { rejectedCallback = true; });
+      const bool concurrentRejected = concurrentAdmission != ProdigyArtifactIO::Admission::admitted;
       ring.armDeadline(1000);
       Ring::start();
-      suite.expect(!ring.timedOut && firstAdmitted && concurrentRejected && !rejectedCallback &&
+      suite.expect(!ring.timedOut && firstAdmitted && concurrentRejected &&
+                       concurrentAdmission == ProdigyArtifactIO::Admission::jobCapacity && !rejectedCallback &&
                        firstCallback && nestedAdmitted && nestedCallback && secondSawFirstReceipt &&
                        cache.ownerClusterUUID == 0x7103 && cache.transportTLS.generation == 17 &&
                        writer.drainForExec(),

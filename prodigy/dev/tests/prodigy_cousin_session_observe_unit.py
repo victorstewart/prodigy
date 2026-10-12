@@ -34,4 +34,38 @@ for name,mode,log,wanted in cases:
    else: raise AssertionError('observer did not exit')
   assert actual==wanted,(name,actual,wanted)
   results.append({'case':name,'passed':True})
+# Exercise the actual lease selector, including a master that is not the first
+# report entry. Selection only chooses an existing Brain-issued address.
+shell=source.with_name('prodigy_dev_cousin_session_qualification.sh')
+selector=compile(shell.read_text().split("<<'PY_TRANSIT'\n",1)[1].split('\nPY_TRANSIT',1)[0],str(shell),'exec')
+for name in ('master','follower','default','missing-master','duplicate-master','missing-lease','duplicate-owner','overlapping-prefix','foreign-owner'):
+ with tempfile.TemporaryDirectory(prefix='cousin-source-selector-') as directory:
+  root=pathlib.Path(directory)
+  masters=set() if name=='missing-master' else {1,2} if name=='duplicate-master' else {2}
+  (root/'first-cluster-report.log').write_text(''.join(f'\tMachine: state=healthy\n\t\tidentity uuid=0x{i:x} source=owned\n\t\tlifecycle currentMaster={int(i in masters)}\n' for i in (1,2,3)))
+  owners=[1,2,3]
+  if name=='duplicate-owner': owners[2]=2
+  if name=='foreign-owner': owners[2]=4
+  prefixes=['fd00::/120','fd00::100/120','fd00::200/120']
+  if name=='overlapping-prefix': prefixes[2]='fd00::100/120'
+  (root/'cousin-source-prefixes.tsv').write_text(''.join(f'{i}\t0x{u:x}\t{p}\n' for i,(u,p) in enumerate(zip(owners,prefixes),1)))
+  addresses=['fd00::1','fd00::101','fd00::201']
+  if name=='missing-lease': addresses.remove('fd00::101')
+  (root/'cousin-source-leases.log').write_text(''.join(f'kind=whiteholeAddressPort app=11 address={a} sourcePort=49152\n' for a in addresses))
+  (root/'cousin-discovery.log').write_text('cousinCounterpart publicAddress=fd01::1 publicTCPPort=9443\n')
+  profile='' if name=='default' else 'source-horizontal-destination-vertical' if name=='follower' else 'source-vertical-destination-horizontal'
+  args=['-',str(root),'0x10','0x20','11','12','aa','bb','',profile]
+  rejected=False
+  with patch.object(sys,'argv',args):
+   try: exec(selector,{'__name__':'__main__'})
+   except AssertionError: rejected=True
+  assert rejected==(name not in ('master','follower','default')),name
+  if not rejected:
+   transit=json.loads((root/'cousin-service-transit.json').read_text())
+   assert transit['sourceWhiteholeIPv6']==('fd00::101' if name=='master' else 'fd00::1'),name
+   assert 'sourceRole' not in transit, 'local evidence must not extend the strict Mothership request'
+   if name!='default':
+    choice=json.loads((root/'cousin-source-role-selection.json').read_text())
+    assert choice['sourceRole']==name and int(choice['sourceMachineUUID'],16)==(2 if name=='master' else 1)
+  results.append({'case':'source_selector_'+name,'passed':True})
 print(json.dumps(results))

@@ -530,6 +530,11 @@ validate_machine_indices()
    done
 }
 
+fault_monotonic_ms()
+{
+   python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000)'
+}
+
 # A fault can outlive provider adoption. Resolve the published owner at each
 # link transition and bind it to the original retained namespace identity.
 fault_link_set()
@@ -550,8 +555,13 @@ fault_link_set()
    local current_runtime_identity=""
    current_runtime_identity="$(runtime_identity_for_workspace "${workspace}" "${current_provider_pid}")" || return 1
    [[ "${current_runtime_identity}" == "${expected_runtime_identity}" ]] || return 1
+   # A down witness starts only after its mutation succeeds; an up witness ends
+   # before its mutation so the recorded interval never includes resumed traffic.
+   local monotonic_ms=""
+   if [[ "${link_state}" == up ]]; then monotonic_ms="$(fault_monotonic_ms)" || return 1; fi
    nsenter -t "${current_provider_pid}" -m -- ip netns exec "pvd-p-${expected_runtime_identity}" ip link set "${link_name}" "${link_state}" || return 1
-   printf 'fault-link runtime=%s link=%s state=%s atMs=%s\n' "${expected_runtime_identity}" "${link_name}" "${link_state}" "$(date +%s%3N)" >> "${workspace}/fault-events.log"
+   if [[ "${link_state}" == down ]]; then monotonic_ms="$(fault_monotonic_ms)" || return 1; fi
+   printf 'fault-link runtime=%s link=%s state=%s atMs=%s monotonicMs=%s\n' "${expected_runtime_identity}" "${link_name}" "${link_state}" "$(date +%s%3N)" "${monotonic_ms}" >> "${workspace}/fault-events.log"
 }
 
 fault_datacenter()
@@ -633,7 +643,7 @@ fault_datacenter()
       mv -f "${marker}.$$.tmp" "${marker}"
       kill -KILL -- "-${fault_pid}" >/dev/null 2>&1 || true
       kill -KILL "${fault_pid}" >/dev/null 2>&1 || true
-      printf 'fault-crash runtime=%s machine=%s atMs=%s\n' "${runtime_identity}" "${index}" "$(date +%s%3N)" >> "${workspace}/fault-events.log"
+      printf 'fault-crash runtime=%s machine=%s atMs=%s monotonicMs=%s\n' "${runtime_identity}" "${index}" "$(date +%s%3N)" "$(fault_monotonic_ms)" >> "${workspace}/fault-events.log"
    done
    [[ "${duration_ms}" -ne 0 ]] || return 0
    sleep_milliseconds "${duration_ms}"
@@ -941,6 +951,20 @@ pair_receipt_exact()
 import pathlib,sys
 assert pathlib.Path(sys.argv[1]).read_bytes() == (sys.argv[2] + '\n').encode()
 PAIR_RECEIPT_EXACT
+}
+
+vdc_cleanup_receipt_text()
+{
+   [[ "$#" -eq 1 && "$1" =~ ^[0-9]+$ && "$1" -gt 1 ]] || return 2
+   printf 'version=1\nruntimeIdentity=%s\ncleanup=complete' "$1"
+}
+
+vdc_cleanup_receipt_exact()
+{
+   [[ "$#" -eq 2 ]] || return 2
+   local path="$1" runtime_identity="$2" expected=""
+   expected="$(vdc_cleanup_receipt_text "$runtime_identity")" || return 1
+   pair_receipt_exact "$path" "$expected"
 }
 
 pair_workspace_persisted_identity()
@@ -1753,12 +1777,15 @@ PAIR_PROBE
 # two currently-live VDC parent namespaces.
 pair_control_parse()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 15 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
    pair_control_args=("${@:1:12}")
    pair_control_service_args=()
-   pair_control_fault_delay_ms=""; pair_control_fault_duration_ms=""
+   pair_control_fault_delay_ms=""; pair_control_fault_duration_ms=""; pair_control_fault_direction=both
    if [[ "$#" -eq 25 ]]; then pair_control_service_args=("${@:13:13}"); fi
-   if [[ "$#" -eq 14 ]]; then pair_control_fault_delay_ms="${13}"; pair_control_fault_duration_ms="${14}"; fi
+   if [[ "$#" -eq 14 || "$#" -eq 15 ]]; then
+      pair_control_fault_delay_ms="${13}"; pair_control_fault_duration_ms="${14}"
+      [[ "$#" -eq 15 ]] && pair_control_fault_direction="${15}"
+   fi
    pair_control_id="$1"; pair_control_first_uuid="$2"; pair_control_second_uuid="$3"
    pair_control_first_workspace="$4"; pair_control_second_workspace="$5"
    pair_control_first_runtime="$6"; pair_control_second_runtime="$7"
@@ -1795,12 +1822,13 @@ PAIR_CONTROL_PARSE
    then
       return 2
    fi
-   if [[ "$#" -eq 14 ]]; then
-      if ! python3 - "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" <<'PAIR_CONTROL_FAULT_PARSE'
+   if [[ "$#" -eq 14 || "$#" -eq 15 ]]; then
+      if ! python3 - "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" "$pair_control_fault_direction" <<'PAIR_CONTROL_FAULT_PARSE'
 import sys
-delay,duration=sys.argv[1:]
+delay,duration,direction=sys.argv[1:]
 assert all(value.isdecimal() and str(int(value))==value for value in (delay,duration))
 assert 0<=int(delay)<=30000 and 1<=int(duration)<=60000
+assert direction in ('both','first-to-second','second-to-first')
 PAIR_CONTROL_FAULT_PARSE
       then
          return 2
@@ -2649,6 +2677,16 @@ time.sleep(int(sys.argv[1]) / 1000)
 PAIR_CONTROL_FAULT_SLEEP
 }
 
+pair_control_fault_selected_sides()
+{
+   case "$pair_control_fault_direction" in
+      both) printf '%s\n' first second ;;
+      first-to-second) printf '%s\n' first ;;
+      second-to-first) printf '%s\n' second ;;
+      *) return 2 ;;
+   esac
+}
+
 pair_control_fault_rule_text()
 {
    [[ "$1" == first || "$1" == second ]] || return 2
@@ -2656,127 +2694,119 @@ pair_control_fault_rule_text()
    else printf '%s\n' 'FORWARD -i second0 -o first0 -j DROP'; fi
 }
 
+pair_control_fault_rule_witness()
+{
+   local restored=${2:-0}
+   [[ "$restored" == 0 || "$restored" == 1 ]] || return 2
+   case "$1:$restored" in
+      first:0) printf '%s\n' first0-to-second0-DROP ;;
+      first:1) printf '%s\n' first0-to-second0-ABSENT ;;
+      second:0) printf '%s\n' second0-to-first0-DROP ;;
+      second:1) printf '%s\n' second0-to-first0-ABSENT ;;
+      *) return 2 ;;
+   esac
+}
+
 pair_control_fault_rule_present()
 {
    [[ "$1" == first || "$1" == second ]] || return 2
-   if [[ "$1" == first ]]; then
-      ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i first0 -o second0 -j DROP
-   else
-      ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i second0 -o first0 -j DROP
-   fi
+   if [[ "$1" == first ]]; then ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i first0 -o second0 -j DROP
+   else ip netns exec "$pair_control_router_ns" ip6tables -C FORWARD -i second0 -o first0 -j DROP; fi
 }
 
 pair_control_fault_add_rule()
 {
-   local side="$1" expected="$2" name="fault-$1-rule"
+   local side="$1" expected="$2" name="fault-$1-rule" present
    [[ "$expected" == "$(pair_control_fault_rule_text "$side")" ]] || return 1
-   pair_control_fault_rule_present "$side" && return 1
-   local present=$?
+   if pair_control_fault_rule_present "$side"; then return 1; else present=$?; fi
    [[ "$present" == 1 ]] || return 1
    pair_write "$pair_control_dir/$name-intent" "$expected" || return 1
-   if [[ "$side" == first ]]; then
-      ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i first0 -o second0 -j DROP || return 1
-   else
-      ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i second0 -o first0 -j DROP || return 1
-   fi
+   if [[ "$side" == first ]]; then ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i first0 -o second0 -j DROP || return 1
+   else ip netns exec "$pair_control_router_ns" ip6tables -I FORWARD 1 -i second0 -o first0 -j DROP || return 1; fi
    pair_control_fault_rule_present "$side" || return 1
    pair_write "$pair_control_dir/$name" "$expected"
 }
 
 pair_control_fault_remove_rule()
 {
-   local side="$1" expected="$2" name="fault-$1-rule" present status
+   local side="$1" expected="$2" name="fault-$1-rule" present
    [[ "$expected" == "$(pair_control_fault_rule_text "$side")" ]] || return 1
-   [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" ||
-      -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]] || return 0
-   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" &&
-      "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
-   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then
-      [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" &&
-         "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1
-   fi
+   [[ -e "$pair_control_dir/$name-intent" || -L "$pair_control_dir/$name-intent" || -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]] || return 0
+   [[ -f "$pair_control_dir/$name-intent" && ! -L "$pair_control_dir/$name-intent" && "$(<"$pair_control_dir/$name-intent")" == "$expected" ]] || return 1
+   if [[ -e "$pair_control_dir/$name" || -L "$pair_control_dir/$name" ]]; then [[ -f "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" && "$(<"$pair_control_dir/$name")" == "$expected" ]] || return 1; fi
    if pair_control_fault_rule_present "$side"; then
-      if [[ "$side" == first ]]; then
-         ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i first0 -o second0 -j DROP || return 1
-      else
-         ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i second0 -o first0 -j DROP || return 1
-      fi
+      if [[ "$side" == first ]]; then ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i first0 -o second0 -j DROP || return 1
+      else ip netns exec "$pair_control_router_ns" ip6tables -D FORWARD -i second0 -o first0 -j DROP || return 1; fi
+      if pair_control_fault_rule_present "$side"; then return 1; else present=$?; fi
+      [[ "$present" == 1 ]] || return 1
    else
       present=$?
-      # An interrupted add can leave only the intent; a recorded rule must
-      # still exist so this owner never accepts someone else's removal.
       [[ "$present" == 1 && ! -e "$pair_control_dir/$name" && ! -L "$pair_control_dir/$name" ]] || return 1
    fi
-   rm -f -- "$pair_control_dir/$name" "$pair_control_dir/$name-intent" || return 1
+   rm -f -- "$pair_control_dir/$name" "$pair_control_dir/$name-intent"
 }
 
 pair_control_fault_restore_inside()
 {
-   if [[ "${pair_control_fault_touched:-0}" != 1 ]]; then
-      [[ -f "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
-      rm -f -- "$pair_control_dir/fault-active"
-      return
-   fi
-   local first_rule second_rule status=0 end
-   first_rule="$(pair_control_fault_rule_text first)" || return 1
-   second_rule="$(pair_control_fault_rule_text second)" || return 1
-   pair_control_fault_remove_rule first "$first_rule" || status=1
-   pair_control_fault_remove_rule second "$second_rule" || status=1
-   [[ "$status" == 0 ]] || return 1
-   [[ -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
-      "$(<"$pair_control_dir/firewall-digest")" =~ ^[0-9a-f]{64}$ &&
-      "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || return 1
+   [[ -f "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" &&
+      "$(<"$pair_control_dir/fault-active")" == "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms direction=$pair_control_fault_direction" ]] || return 1
+   if [[ "${pair_control_fault_touched:-0}" != 1 ]]; then rm -f -- "$pair_control_dir/fault-active"; return; fi
+   # Capture the interval endpoint while every successfully-installed selected
+   # drop is still active.  A partial install has no begin receipt and is
+   # cleaned without publishing a completed fault interval.
+   local side rule status=0 end rules="" begin=""
    end="$(pair_control_fault_monotonic_ns)" || return 1
-   pair_write "$pair_control_dir/fault-end-ns" "$end" || return 1
-   if [[ -f "$pair_control_dir/fault-begin-ns" && ! -L "$pair_control_dir/fault-begin-ns" ]]; then
-      pair_write "$pair_control_dir/fault-last" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms beginNs=$(<"$pair_control_dir/fault-begin-ns") endNs=$end firstRule=$first_rule secondRule=$second_rule" || return 1
+   if [[ -f "$pair_control_dir/fault-begin-ns" && ! -L "$pair_control_dir/fault-begin-ns" &&
+         "$(<"$pair_control_dir/fault-begin-ns")" =~ ^[0-9]+$ ]]; then
+      begin="$(<"$pair_control_dir/fault-begin-ns")"
    fi
-   [[ -f "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
-   rm -f -- "$pair_control_dir/fault-active"
-   pair_control_fault_touched=0
+   while IFS= read -r side; do
+      rule="$(pair_control_fault_rule_text "$side")" || return 1
+      pair_control_fault_remove_rule "$side" "$rule" || status=1
+      rules+="${rules:+,}$side"
+   done < <(pair_control_fault_selected_sides)
+   [[ "$status" == 0 && -f "$pair_control_dir/firewall-digest" && ! -L "$pair_control_dir/firewall-digest" &&
+      "$(pair_control_firewall_digest)" == "$(<"$pair_control_dir/firewall-digest")" ]] || return 1
+   if [[ -z "$begin" ]]; then rm -f -- "$pair_control_dir/fault-active"; pair_control_fault_touched=0; return; fi
+   pair_write "$pair_control_dir/fault-end-ns" "$end" || return 1
+   if [[ "$pair_control_fault_direction" == both ]]; then
+      pair_write "$pair_control_dir/fault-last" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms beginNs=$begin endNs=$end firstRule=$(pair_control_fault_rule_text first) secondRule=$(pair_control_fault_rule_text second)" || return 1
+   else
+      pair_write "$pair_control_dir/fault-last" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms direction=$pair_control_fault_direction beginNs=$begin endNs=$end rules=$rules" || return 1
+   fi
+   rm -f -- "$pair_control_dir/fault-active"; pair_control_fault_touched=0
 }
 
 pair_control_fault_inside()
 {
-   # The caller keeps both lifecycle locks through this bounded operation.
-   # Refuse a stale or malformed active receipt rather than touching a second
-   # resource set after an interrupted provider invocation.
-   pair_control_query_inside || return 1
-   if [[ -e "$pair_control_dir/fault-active" || -L "$pair_control_dir/fault-active" ]]; then
-      return 1
-   fi
-   local journal
+   pair_control_query_inside >/dev/null || return 1
+   [[ ! -e "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
+   local journal side rule begin end install_witness restore_witness
    for journal in fault-begin-ns fault-end-ns fault-first-rule fault-first-rule-intent fault-second-rule fault-second-rule-intent; do
-      if [[ -e "$pair_control_dir/$journal" || -L "$pair_control_dir/$journal" ]]; then
-         [[ -f "$pair_control_dir/$journal" && ! -L "$pair_control_dir/$journal" ]] || return 1
-         rm -f -- "$pair_control_dir/$journal"
-      fi
+      if [[ -e "$pair_control_dir/$journal" || -L "$pair_control_dir/$journal" ]]; then [[ -f "$pair_control_dir/$journal" && ! -L "$pair_control_dir/$journal" ]] || return 1; rm -f -- "$pair_control_dir/$journal"; fi
    done
-   pair_write "$pair_control_dir/fault-active" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms" || return 1
-   pair_control_fault_touched=0
-   trap 'pair_control_fault_restore_inside' EXIT
-   trap 'exit 130' TERM INT HUP
+   pair_write "$pair_control_dir/fault-active" "delayMs=$pair_control_fault_delay_ms durationMs=$pair_control_fault_duration_ms direction=$pair_control_fault_direction" || return 1
+   pair_control_fault_touched=0; trap 'pair_control_fault_restore_inside' EXIT; trap 'exit 130' TERM INT HUP
    pair_control_fault_sleep "$pair_control_fault_delay_ms" || return 1
-   # Install direction-specific drops above the boundary's accepts. The existing
-   # router namespace and its saved policy digest prove both rules are ours.
    pair_control_fault_touched=1
-   local first_rule second_rule
-   first_rule="$(pair_control_fault_rule_text first)" || return 1
-   second_rule="$(pair_control_fault_rule_text second)" || return 1
-   pair_control_fault_rule_present first && return 1
-   [[ "$?" == 1 ]] || return 1
-   pair_control_fault_rule_present second && return 1
-   [[ "$?" == 1 ]] || return 1
-   pair_control_fault_add_rule first "$first_rule" || return 1
-   pair_control_fault_add_rule second "$second_rule" || return 1
-   local begin end
-   begin="$(pair_control_fault_monotonic_ns)" || return 1
-   pair_write "$pair_control_dir/fault-begin-ns" "$begin" || return 1
+   while IFS= read -r side; do
+      rule="$(pair_control_fault_rule_text "$side")" || return 1
+      if pair_control_fault_rule_present "$side"; then return 1; else [[ "$?" == 1 ]] || return 1; fi
+      pair_control_fault_add_rule "$side" "$rule" || return 1
+   done < <(pair_control_fault_selected_sides)
+   begin="$(pair_control_fault_monotonic_ns)" || return 1; pair_write "$pair_control_dir/fault-begin-ns" "$begin" || return 1
    pair_control_fault_sleep "$pair_control_fault_duration_ms" || return 1
-   pair_control_fault_restore_inside || return 1
-   end="$(<"$pair_control_dir/fault-end-ns")"
-   printf 'PAIR_CONTROL_FAULT operationID=%s clock=CLOCK_BOOTTIME delayMs=%s durationMs=%s beginNs=%s endNs=%s\n' \
-      "$pair_control_id" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" "$begin" "$end"
+   pair_control_fault_restore_inside || return 1; end="$(<"$pair_control_dir/fault-end-ns")"
+   if [[ "$pair_control_fault_direction" == both ]]; then
+      printf 'PAIR_CONTROL_FAULT operationID=%s clock=CLOCK_BOOTTIME delayMs=%s durationMs=%s beginNs=%s endNs=%s\n' "$pair_control_id" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" "$begin" "$end"
+   else
+      while IFS= read -r side; do
+         install_witness="$(pair_control_fault_rule_witness "$side" 0)" || return 1
+         restore_witness="$(pair_control_fault_rule_witness "$side" 1)" || return 1
+      done < <(pair_control_fault_selected_sides)
+      [[ -n "$install_witness" && -n "$restore_witness" ]] || return 1
+      printf 'PAIR_CONTROL_FAULT operationID=%s clock=CLOCK_BOOTTIME delayMs=%s durationMs=%s direction=%s installRule=%s restoreRule=%s beginNs=%s endNs=%s\n' "$pair_control_id" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" "$pair_control_fault_direction" "$install_witness" "$restore_witness" "$begin" "$end"
+   fi
    trap - EXIT TERM INT HUP
 }
 
@@ -2912,7 +2942,9 @@ stop_datacenter_locked()
       return
    fi
    local pid_path="${workspace}/virtual-datacenter.pid"
+   local cleanup_receipt_path="${workspace}/virtual-datacenter.cleanup"
    local provider_pid="" runtime_identity="" retained_cgroup_root="" retained_scope=""
+   local cleanup_receipt_ok=1
    [[ ! -r "${pid_path}" ]] || provider_pid="$(<"${pid_path}")"
    if [[ "${provider_pid}" =~ ^[0-9]+$ && "${provider_pid}" -gt 1 ]]
    then
@@ -2942,6 +2974,11 @@ stop_datacenter_locked()
       done
       provider_process "${provider_pid}" "${workspace}" && kill -KILL -- "-${provider_pid}"
    fi
+   if [[ -n "${runtime_identity}" ]] &&
+      ! vdc_cleanup_receipt_exact "${cleanup_receipt_path}" "${runtime_identity}"
+   then
+      cleanup_receipt_ok=0
+   fi
    if [[ "${provider_pid}" =~ ^[0-9]+$ && "${provider_pid}" -gt 1 ]]
    then
       local cgroup_root="${retained_cgroup_root}"
@@ -2952,13 +2989,20 @@ stop_datacenter_locked()
          [[ -d "${cgroup_root}" ]] || break
          sleep 0.02
       done
-      [[ ! -d "${cgroup_root}" ]]
+      [[ ! -d "${cgroup_root}" ]] || cleanup_receipt_ok=0
       ip link del "vdh${runtime_identity: -8}" >/dev/null 2>&1 || true
    fi
    [[ -z "${retained_scope}" ]] || restore_cgroup_scope_if_idle "${retained_scope}"
-   rm -f -- "${control_socket_path}"
-   rmdir -- "${control_socket_path%/*}" 2>/dev/null || true
-   rm -rf -- "${workspace}"
+   rm -f -- "${control_socket_path}" || cleanup_receipt_ok=0
+   if [[ -e "${control_socket_path%/*}" || -L "${control_socket_path%/*}" ]]
+   then
+      rmdir -- "${control_socket_path%/*}" 2>/dev/null || cleanup_receipt_ok=0
+   fi
+   rm -rf -- "${workspace}" || cleanup_receipt_ok=0
+   [[ ! -e "${control_socket_path}" && ! -L "${control_socket_path}" &&
+      ! -e "${control_socket_path%/*}" && ! -L "${control_socket_path%/*}" &&
+      ! -e "${workspace}" && ! -L "${workspace}" ]] || cleanup_receipt_ok=0
+   [[ "${cleanup_receipt_ok}" == 1 ]]
 }
 
 
@@ -2996,6 +3040,23 @@ launch_datacenter()
    mkdir -p "${workspace%/*}" "${workspace}" || { pair_unlock_workspace "$lifecycle_fd"; return 1; }
    pair_unlock_workspace "$lifecycle_fd" || return 1
    setsid nohup bash "$0" --serve "$@" > "${workspace}/virtual-datacenter.log" 2>&1 < /dev/null &
+}
+
+# Fresh VDC providers own their netns-handle mount.  Adoption enters the
+# existing provider mount namespace and must retain that mount unchanged.
+fresh_provider_netns_handles()
+{
+   [[ "${adopted_mode}" -eq 0 ]] || return 0
+   local self_mount init_mount
+   [[ "${PRODIGY_VDC_MOUNT_NAMESPACE_READY:-0}" == 1 ]] || return 1
+   self_mount="$(stat -Lc %i /proc/self/ns/mnt)" || return 1
+   init_mount="$(stat -Lc %i /proc/1/ns/mnt)" || return 1
+   [[ "$self_mount" =~ ^[1-9][0-9]*$ && "$init_mount" =~ ^[1-9][0-9]*$ && "$self_mount" != "$init_mount" ]] || return 1
+   [[ ! -e "${provider_netns_handle_root}" || ( -d "${provider_netns_handle_root}" && ! -L "${provider_netns_handle_root}" ) ]] || return 1
+   mkdir -p "${provider_netns_handle_root}" || return 1
+   [[ -d "${provider_netns_handle_root}" && ! -L "${provider_netns_handle_root}" ]] || return 1
+   mount -t tmpfs -o mode=0700,nosuid,nodev tmpfs "${provider_netns_handle_root}" || return 1
+   [[ "$(findmnt -n -o FSTYPE -T "${provider_netns_handle_root}")" == tmpfs ]]
 }
 
 adopted_mode=0
@@ -3139,6 +3200,11 @@ do
    }
 done
 
+# A fresh provider must not reuse the guest-visible netns handle directory:
+# netns names are kernel mounts and a reboot can leave stale pathname tombstones.
+provider_netns_handle_root=/run/netns
+fresh_provider_netns_handles || { echo "fresh provider netns handle mount is unsafe" >&2; exit 1; }
+
 if [[ "$(stat -Lc %i /proc/self/ns/net)" != "${host_netns_inode}" ]]
 then
    echo "virtual datacenter provider did not start in the declared host network namespace" >&2
@@ -3182,6 +3248,7 @@ runtime_path="${workspace}/virtual-datacenter.runtime"
 pid_path="${workspace}/virtual-datacenter.pid"
 failure_path="${workspace}/virtual-datacenter.failure"
 manifest_path="${workspace}/test-cluster-manifest.json"
+cleanup_receipt_path="${workspace}/virtual-datacenter.cleanup"
 boundary_lock="/run/prodigy-virtual-datacenter.boundary.lock"
 boundary_bpffs="${workspace}/boundary-bpffs"
 host_edge="vdh${runtime_identity: -8}"
@@ -3224,6 +3291,59 @@ valid_machine_bpffs()
    [[ "${path}" == "${machine_bpffs_root}/machine${index}" && -d "${path}" && ! -L "${path}" ]] || return 1
    mountpoint -q "${path}" || return 1
    [[ "$(findmnt -n -o FSTYPE -T "${path}")" == "bpf" ]]
+}
+
+vdc_owned_resources_absent()
+{
+   local child_ns="" storage_mount="" index="" machine_bpffs="" current=""
+   [[ ! -e "/run/netns/${parent_ns}" && ! -L "/run/netns/${parent_ns}" ]] || return 1
+   for child_ns in "${child_names[@]}"
+   do
+      [[ ! -e "/run/netns/${child_ns}" && ! -L "/run/netns/${child_ns}" ]] || return 1
+   done
+   for storage_mount in "${storage_mounts[@]}"
+   do
+      mountpoint -q "${storage_mount}" && return 1
+   done
+   for index in $(seq "${machine_count}" -1 1)
+   do
+      machine_bpffs="$(machine_bpffs_path "${index}")" || return 1
+      mountpoint -q "${machine_bpffs}" && return 1
+   done
+   mountpoint -q "${filesystem_root}" && return 1
+   [[ ! -e "${filesystem_root}" && ! -L "${filesystem_root}" &&
+      ! -e "${filesystem_image}" && ! -L "${filesystem_image}" ]] || return 1
+   compgen -G "${workspace}/machine*.storage*.ext4" >/dev/null && return 1
+   [[ ! -e "${control_socket_path}" && ! -L "${control_socket_path}" &&
+      ! -e "${control_socket_path%/*}" && ! -L "${control_socket_path%/*}" ]] || return 1
+
+   if [[ "${fake_boundary}" == 1 ]]
+   then
+      ip link show dev "${host_edge}" >/dev/null 2>&1 && return 1
+      mountpoint -q "${boundary_bpffs}" && return 1
+      [[ ! -e "${boundary_bpffs}" && ! -L "${boundary_bpffs}" &&
+         ! -e "${boundary_lock}" && ! -L "${boundary_lock}" ]] || return 1
+      iptables -C FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 && return 1
+      iptables -C FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 && return 1
+      iptables -t nat -C POSTROUTING ! -s 172.31.0.0/30 -d 198.18.0.0/16 -o "${host_edge}" -j SNAT --to-source 172.31.0.1 >/dev/null 2>&1 && return 1
+      iptables -t nat -C POSTROUTING -s 172.31.0.2/32 ! -o "${host_edge}" -j MASQUERADE >/dev/null 2>&1 && return 1
+      ip6tables -C FORWARD -i "${host_edge}" ! -o "${host_edge}" -j ACCEPT >/dev/null 2>&1 && return 1
+      ip6tables -C FORWARD ! -i "${host_edge}" -o "${host_edge}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT >/dev/null 2>&1 && return 1
+      ip6tables -t nat -C POSTROUTING -s 2602:fac0:0:12ab:34cd::/88 -j MASQUERADE >/dev/null 2>&1 && return 1
+      ip6tables -t nat -C POSTROUTING -s fd00:31::2/128 -j MASQUERADE >/dev/null 2>&1 && return 1
+      ip -o route show exact 198.18.0.0/16 2>/dev/null | grep -F "via 172.31.0.2 dev ${host_edge}" >/dev/null && return 1
+      ip -o route show exact "${private4_subnet}" 2>/dev/null | grep -F "via 172.31.0.2 dev ${host_edge}" >/dev/null && return 1
+      if [[ -n "${host_ipv4_forward}" ]]
+      then
+         current="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" || return 1
+         [[ "${current}" == "${host_ipv4_forward}" ]] || return 1
+      fi
+      if [[ -n "${host_ipv6_forward}" ]]
+      then
+         current="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" || return 1
+         [[ "${current}" == "${host_ipv6_forward}" ]] || return 1
+      fi
+   fi
 }
 
 cleanup()
@@ -3304,6 +3424,14 @@ cleanup()
    rm -f "${ready_path}" "${seed_runtime_path}" "${runtime_path}" >/dev/null 2>&1 || true
    rm -f -- "${control_socket_path}" >/dev/null 2>&1 || true
    rmdir -- "${control_socket_path%/*}" >/dev/null 2>&1 || true
+   if vdc_owned_resources_absent
+   then
+      atomic_write "${cleanup_receipt_path}" "$(vdc_cleanup_receipt_text "${runtime_identity}")\n" || exit 1
+   else
+      atomic_write "${cleanup_receipt_path}" \
+         "version=1\nruntimeIdentity=${runtime_identity}\ncleanup=failed\n" || true
+      exit 1
+   fi
    exit "${status}"
 }
 
@@ -3325,7 +3453,7 @@ if [[ "${adopted_mode}" -eq 0 ]]
 then
 mkdir -p "${workspace}/boot" "${workspace}/transport-tls" "${filesystem_root}"
 install -d -m 0700 "${control_socket_path%/*}"
-rm -f "${provisioned_path}" "${members_provisioned_path}" "${seed_runtime_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${control_socket_path}"
+rm -f "${provisioned_path}" "${members_provisioned_path}" "${seed_runtime_path}" "${ready_path}" "${runtime_path}" "${failure_path}" "${manifest_path}" "${cleanup_receipt_path}" "${control_socket_path}"
 if [[ "$spare_machine_count" == 1 ]]; then
    for _ in $(seq 1 100); do
       [[ ! -r "$workspace/spare-bootstrap/ready" ]] || break

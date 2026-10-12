@@ -1430,6 +1430,14 @@ private:
     uint64_t authorityEpoch = 0;
   };
   Vector<DeferredDurableContainerSpin> deferredDurableContainerSpins;
+  // A failed stateful owner can be replaced on its same machine without
+  // changing its externally authenticated source tuple.  The pending entry
+  // keeps the predecessor alive through its close notification; the retained
+  // entry tells the scheduler that the successor owns an already-resolved
+  // binding and must never reallocate that binding.
+  bytell_hash_map<ContainerView *, ContainerView *> pendingStatefulWhiteholeTransfers;
+  bytell_hash_set<ContainerView *> retainedStatefulWhiteholeTransfers;
+  bytell_hash_set<ContainerView *> rejectedStatefulWhiteholeTransfers;
   // Resolved from the durable master-authority placement registry at plan admission.
   // It is intentionally not part of DeploymentPlan wire/persistent bytes.
   Vector<uint128_t> committedEligibleMachineUUIDs;
@@ -3041,9 +3049,27 @@ private:
               Vector<AssignedGPUDevice> assignedGPUDevices = {};
               bool assignedGPUs = prodigyTakeAssignedGPUsForScheduling(machine, ticket, nullptr, schedulingConfig, assignedGPUMemoryMBs, assignedGPUDevices);
               assert(assignedGPUs && "replacement stateful placement must reserve GPUs");
-              toSchedule.push_back(planStatefulConstruction(machine, container->shardGroup, topologyEpoch, DataStrategy::seeding, std::move(assignedGPUMemoryMBs), std::move(assignedGPUDevices)));
+              DeploymentWork *replacementWork = planStatefulConstruction(
+                  machine,
+                  container->shardGroup,
+                  topologyEpoch,
+                  DataStrategy::seeding,
+                  std::move(assignedGPUMemoryMBs),
+                  std::move(assignedGPUDevices));
+              ContainerView *successor = replacementWork->getBase()->container;
+              if (prepareSameMachineStatefulWhiteholeTransfer(container, successor) == false)
+              {
+                // A resolved binding is admission material.  Do not silently
+                // turn a failed handoff into a different externally visible
+                // source tuple.
+                rejectedStatefulWhiteholeTransfers.insert(successor);
+              }
+              toSchedule.push_back(replacementWork);
               container->plannedWork = nullptr;
-              destructContainer(container);
+              // The dead owner's healthy waiter can resume this scheduler.
+              // Keep replacement work visible, but defer that wake until
+              // old close signaling and the binding handoff are complete.
+              destructContainer(container, true, /*deferWaitersUntilDestroyed=*/true);
               containerDestroyed(container);
             }
             else
@@ -3606,7 +3632,15 @@ private:
       }
       else
       {
-        nShardGroups = 1;
+        // A promoted head has no predecessor, but it can already own an
+        // authenticated horizontally scaled inventory.  Recover that topology
+        // before falling back to the one-shard target for a genuinely fresh
+        // deployment.
+        nShardGroups = recoveredStatefulShardGroupCount();
+        if (nShardGroups == 0)
+        {
+          nShardGroups = 1;
+        }
       }
 
       nTargetBase = 0;
@@ -6607,6 +6641,19 @@ private:
                         graceSeconds);
             }
 
+            // Preserve the existing ordinary DeploymentPlan publication owner
+            // for the legacy in-place path.  This only records the already
+            // applied scalar target; it does not add a second resource
+            // transition or change application/artifact identity.
+            if (thisBrain != nullptr)
+            {
+              thisBrain->deploymentPlans.insert_or_assign(plan.config.deploymentID(), plan);
+              String serializedPlan = {};
+              BitseryEngine::serialize(serializedPlan, plan);
+              thisBrain->queueBrainDeploymentReplication(serializedPlan, ""_ctv);
+              thisBrain->persistLocalRuntimeStateAsync();
+            }
+
             autoscaleTrace("autoscale verticalInPlace deploymentID=%llu cores=%u->%u memMB=%u->%u storMB=%u->%u containers=%u\n",
                            (unsigned long long)plan.config.deploymentID(),
                            unsigned(oldCores),
@@ -6890,6 +6937,8 @@ public:
     uint32_t actualHealthySurge = 0;
 
     discardRecoveredStatelessContainersOnUnavailableHosts("recoverAfterReboot");
+    countPerMachine.clear();
+    countPerRack.clear();
 
     for (ContainerView *container : containers)
     {
@@ -6898,6 +6947,14 @@ public:
       if (plan.isStateful == false && recoveredStatelessContainerHostIsLive(container) == false)
       {
         countsAsHealthy = false;
+      }
+      if (countsAsDeployed && container->machine != nullptr)
+      {
+        countPerMachine[container->machine] += 1;
+        if (container->machine->rack != nullptr)
+        {
+          countPerRack[container->machine->rack] += 1;
+        }
       }
 
       switch (container->lifetime)
@@ -7686,15 +7743,40 @@ public:
       Whitehole& whitehole,
       uint128_t *requiredMachineUUID = nullptr,
       const ContainerView *container = nullptr,
-      const RoutableResourceLeaseOwner *owner = nullptr)
+      const RoutableResourceLeaseOwner *owner = nullptr,
+      bool allowOwnedRecoveryBinding = false)
   {
-    (void)container;
     if (requiredMachineUUID)
     {
       *requiredMachineUUID = 0;
     }
 
-    if (machine == nullptr || machine->state != MachineState::healthy || machineHasWhiteholeInternetAccessForDeployment(machine, whitehole.family) == false)
+    // A returned stateful owner replays while its authenticated empty
+    // stateUpload can still hold the registered nonterminal machine below
+    // healthy. That is not a new placement decision: allow this resolver to
+    // bind only the exact scheduled container already indexed on that machine.
+    // All placement callers keep the healthy-only gate below.
+    bool ownedRecoveryBinding = false;
+    if (allowOwnedRecoveryBinding && machine != nullptr && container != nullptr && owner != nullptr &&
+        machine->state != MachineState::hardwareFailure && machine->state != MachineState::decommissioning &&
+        machine->neuron.machine == machine && machine->neuron.connected && container->uuid != 0 && container->machine == machine &&
+        container->state == ContainerState::scheduled && container->isStateful &&
+        container->applicationID == owner->applicationID && container->deploymentID == owner->deploymentID &&
+        owner->lineageID == container->applicationID && thisBrain != nullptr)
+    {
+      auto indexed = thisBrain->containers.find(container->uuid);
+      auto machineDeployment = machine->containersByDeploymentID.find(container->deploymentID);
+      if (thisBrain->machines.contains(machine) && indexed != thisBrain->containers.end() && indexed->second == container &&
+          machineDeployment != machine->containersByDeploymentID.end() &&
+          std::find(machineDeployment->second.begin(), machineDeployment->second.end(), container) != machineDeployment->second.end())
+      {
+        ownedRecoveryBinding = true;
+      }
+    }
+
+    if (machine == nullptr || (allowOwnedRecoveryBinding && ownedRecoveryBinding == false) ||
+        (machine->state != MachineState::healthy && ownedRecoveryBinding == false) ||
+        machineHasWhiteholeInternetAccessForDeployment(machine, whitehole.family) == false)
     {
       return false;
     }
@@ -7888,6 +7970,74 @@ public:
     return true;
   }
 
+  // Hydrate an unresolved Whitehole only when replaying the exact stateful
+  // owner retained for a returning host.  A complete binding is immutable on
+  // replay, so retries preserve its tuple and nonce.
+  bool hydrateOwnedRecoveryWhiteholeBindings(Machine *machine, ContainerView *container)
+  {
+    if (container == nullptr)
+    {
+      return false;
+    }
+    if (container->whiteholes.empty())
+    {
+      return true;
+    }
+
+    bool unresolved = false;
+    for (const Whitehole& whitehole : container->whiteholes)
+    {
+      unresolved = unresolved || whitehole.hasAddress == false || whitehole.address.isNull() ||
+          whitehole.sourcePort == 0 || whitehole.bindingNonce == 0;
+    }
+    if (unresolved == false)
+    {
+      return true;
+    }
+    if (machine == nullptr || machine->state == MachineState::hardwareFailure ||
+        machine->state == MachineState::decommissioning || thisBrain == nullptr ||
+        thisBrain->machines.contains(machine) == false || container->machine != machine ||
+        container->state != ContainerState::scheduled || container->isStateful == false)
+    {
+      return false;
+    }
+
+    const RoutableResourceLeaseOwner owner = routableResourceLeaseOwner();
+    Vector<Whitehole> original = container->whiteholes;
+    Vector<bool> newlyReserved(container->whiteholes.size(), false);
+    for (uint32_t index = 0; index < container->whiteholes.size(); ++index)
+    {
+      Whitehole& whitehole = container->whiteholes[index];
+      const bool complete = whitehole.hasAddress && whitehole.address.isNull() == false &&
+          whitehole.sourcePort != 0 && whitehole.bindingNonce != 0;
+      if (complete)
+      {
+        continue;
+      }
+
+      whitehole.hasAddress = false;
+      whitehole.address = {};
+      whitehole.sourcePort = 0;
+      whitehole.bindingNonce = 0;
+      if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &owner, true) == false ||
+          whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole) == false ||
+          reserveWhiteholeAddressPortLease(whitehole, owner) == false)
+      {
+        for (uint32_t rollback = 0; rollback < container->whiteholes.size(); ++rollback)
+        {
+          if (newlyReserved[rollback])
+          {
+            releaseWhiteholeAddressPortLease(container->whiteholes[rollback], owner);
+          }
+        }
+        container->whiteholes = std::move(original);
+        return false;
+      }
+      newlyReserved[index] = true;
+    }
+    return true;
+  }
+
   bool releaseWhiteholeAddressPortLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner)
   {
     if (whitehole.hasAddress == false || whitehole.address.isNull() || whitehole.sourcePort == 0)
@@ -7913,6 +8063,169 @@ public:
       thisBrain->noteRoutableResourceLeaseRuntimeStateChanged();
     }
     return released;
+  }
+
+  static bool whiteholeDeclarationMatches(const Whitehole& lhs, const Whitehole& rhs)
+  {
+    return lhs.transport == rhs.transport && lhs.family == rhs.family && lhs.source == rhs.source;
+  }
+
+  static bool whiteholeBindingResolved(const Whitehole& whitehole)
+  {
+    return whitehole.hasAddress && whitehole.address.isNull() == false &&
+           whitehole.sourcePort != 0 && whitehole.bindingNonce != 0;
+  }
+
+  bool whiteholeBindingHasExactLease(const Whitehole& whitehole, const RoutableResourceLeaseOwner& owner) const
+  {
+    if (whiteholeBindingResolved(whitehole) == false || thisBrain == nullptr)
+    {
+      return false;
+    }
+    return std::any_of(
+        thisBrain->routableResourceLeaseRuntimeState.begin(),
+        thisBrain->routableResourceLeaseRuntimeState.end(),
+        [&](const RoutableResourceLease& lease) {
+          return lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort &&
+                 lease.owner == owner && lease.address.equals(whitehole.address) &&
+                 lease.sourcePort == whitehole.sourcePort;
+        });
+  }
+
+  bool statefulWhiteholeTransferMatchesPlan(const ContainerView *container) const
+  {
+    if (container == nullptr || container->applicationID != plan.config.applicationID ||
+        container->deploymentID != plan.config.deploymentID() || container->isStateful == false ||
+        container->whiteholes.size() != plan.whiteholes.size())
+    {
+      return false;
+    }
+
+    const RoutableResourceLeaseOwner owner = routableResourceLeaseOwner();
+    bool hasTransferredBinding = false;
+    for (uint32_t index = 0; index < container->whiteholes.size(); ++index)
+    {
+      const Whitehole& binding = container->whiteholes[index];
+      if (whiteholeDeclarationMatches(binding, plan.whiteholes[index]) == false)
+      {
+        return false;
+      }
+      if (whiteholeBindingResolved(binding))
+      {
+        if (whiteholeBindingHasExactLease(binding, owner) == false)
+        {
+          return false;
+        }
+        hasTransferredBinding = true;
+      }
+      else if (binding.hasAddress || binding.address.isNull() == false ||
+               binding.sourcePort != 0 || binding.bindingNonce != 0)
+      {
+        return false;
+      }
+    }
+    return hasTransferredBinding;
+  }
+
+  bool prepareSameMachineStatefulWhiteholeTransfer(ContainerView *predecessor, ContainerView *successor)
+  {
+    if (predecessor == nullptr || successor == nullptr || predecessor->machine != successor->machine ||
+        predecessor->applicationID != successor->applicationID || predecessor->deploymentID != successor->deploymentID ||
+        predecessor->applicationID != plan.config.applicationID || predecessor->deploymentID != plan.config.deploymentID() ||
+        predecessor->isStateful == false || successor->isStateful == false ||
+        predecessor->shardGroup != successor->shardGroup || successor->whiteholes.empty() == false)
+    {
+      return false;
+    }
+
+    // There is no existing tuple to preserve.  Let an ordinary fresh binding
+    // be created only when the predecessor had none.
+    if (predecessor->whiteholes.empty())
+    {
+      return true;
+    }
+
+    Vector<Whitehole> transferred = plan.whiteholes;
+    Vector<bool> matched(plan.whiteholes.size(), false);
+    const RoutableResourceLeaseOwner owner = routableResourceLeaseOwner();
+    for (const Whitehole& binding : predecessor->whiteholes)
+    {
+      if (whiteholeBindingResolved(binding) == false || whiteholeBindingHasExactLease(binding, owner) == false)
+      {
+        return false;
+      }
+      bool found = false;
+      for (uint32_t index = 0; index < plan.whiteholes.size(); ++index)
+      {
+        if (matched[index] == false && whiteholeDeclarationMatches(binding, plan.whiteholes[index]))
+        {
+          transferred[index] = binding;
+          matched[index] = true;
+          found = true;
+          break;
+        }
+      }
+      if (found == false)
+      {
+        return false;
+      }
+    }
+
+    successor->whiteholes = std::move(transferred);
+    if (statefulWhiteholeTransferMatchesPlan(successor) == false) return false;
+
+    pendingStatefulWhiteholeTransfers.insert_or_assign(predecessor, successor);
+    retainedStatefulWhiteholeTransfers.insert(successor);
+    return true;
+  }
+
+  bool completeSameMachineStatefulWhiteholeTransfer(ContainerView *predecessor)
+  {
+    auto pending = pendingStatefulWhiteholeTransfers.find(predecessor);
+    if (pending == pendingStatefulWhiteholeTransfers.end())
+    {
+      return false;
+    }
+
+    ContainerView *successor = pending->second;
+    pendingStatefulWhiteholeTransfers.erase(pending);
+    bool successorRetainsEveryPredecessorBinding = successor != nullptr;
+    if (successorRetainsEveryPredecessorBinding)
+    {
+      for (const Whitehole& predecessorBinding : predecessor->whiteholes)
+      {
+        const bool retained = whiteholeBindingResolved(predecessorBinding) &&
+          std::any_of(successor->whiteholes.begin(), successor->whiteholes.end(), [&](const Whitehole& successorBinding) {
+            return whiteholeDeclarationMatches(predecessorBinding, successorBinding) &&
+                   successorBinding.address.equals(predecessorBinding.address) &&
+                   successorBinding.sourcePort == predecessorBinding.sourcePort &&
+                   successorBinding.bindingNonce == predecessorBinding.bindingNonce;
+          });
+        if (retained == false)
+        {
+          successorRetainsEveryPredecessorBinding = false;
+          break;
+        }
+      }
+    }
+    const bool valid = successor != nullptr && containers.contains(successor) &&
+                       retainedStatefulWhiteholeTransfers.contains(successor) &&
+                       successor->machine == predecessor->machine &&
+                       successor->shardGroup == predecessor->shardGroup &&
+                       successor->applicationID == predecessor->applicationID &&
+                       successor->deploymentID == predecessor->deploymentID &&
+                       successorRetainsEveryPredecessorBinding &&
+                       statefulWhiteholeTransferMatchesPlan(successor);
+    if (valid == false)
+    {
+      if (successor != nullptr)
+      {
+        retainedStatefulWhiteholeTransfers.erase(successor);
+        rejectedStatefulWhiteholeTransfers.insert(successor);
+      }
+      return false;
+    }
+    return true;
   }
 
   static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta {}, const ApplicationConfig *configOverride = nullptr)
@@ -8934,7 +9247,7 @@ public:
     return this;
   }
 
-  void destructContainer(ContainerView *container, bool cancelWork = true)
+  void destructContainer(ContainerView *container, bool cancelWork = true, bool deferWaitersUntilDestroyed = false)
   {
     if (cancelWork && container->plannedWork)
     {
@@ -8973,7 +9286,14 @@ public:
     }
 
     container->state = ContainerState::destroying;
-    handleContainerStateChange(container, false);
+    if (deferWaitersUntilDestroyed)
+    {
+      container->reconcileMeshAgainstState(false);
+    }
+    else
+    {
+      handleContainerStateChange(container, false);
+    }
 
     Machine *machine = container->machine;
     ApplicationConfig containerConfig = resourceConfigForContainer(container);
@@ -9016,13 +9336,23 @@ public:
   {
     // Prevent double-destroy; out-of-band confirmations after a forced local destroy should not re-enter.
     assert(container->state != ContainerState::destroyed && "containerDestroyed called on an already-destroyed container");
+    retainedStatefulWhiteholeTransfers.erase(container);
+    rejectedStatefulWhiteholeTransfers.erase(container);
     RoutableResourceLeaseOwner owner = {};
     owner.applicationID = container->applicationID;
     owner.deploymentID = container->deploymentID;
     owner.lineageID = container->applicationID;
-    for (const Whitehole& whitehole : container->whiteholes)
+    // destructContainer has already sent the old owner's close notification.
+    // Keep the exact lease alive only after the successor and its declaration
+    // identity have been revalidated; waiter release below can then launch it
+    // without a release/reallocate gap.
+    const bool transferredWhiteholes = completeSameMachineStatefulWhiteholeTransfer(container);
+    if (transferredWhiteholes == false)
     {
-      releaseWhiteholeAddressPortLease(whitehole, owner);
+      for (const Whitehole& whitehole : container->whiteholes)
+      {
+        releaseWhiteholeAddressPortLease(whitehole, owner);
+      }
     }
 
     thisBrain->containers.erase(container->uuid);
@@ -9031,6 +9361,16 @@ public:
     handleContainerStateChange(container, false);
     completeStatefulWorkerTopologyUpgradeIfReady();
 
+    // Recovery temporarily retains raw MeshNode pointers while it joins pairing
+    // halves from Neuron inventories. Every container lifetime owner must retire
+    // those references after its final state transition and before releasing the
+    // canonical view, including scheduler and failure paths that are not
+    // state-upload omissions.
+    if (thisBrain != nullptr && thisBrain->mesh != nullptr)
+    {
+      thisBrain->mesh->stopAllSubscriptions(container);
+      thisBrain->mesh->stopAllAdvertisments(container);
+    }
     delete container;
 
     if (state == DeploymentState::failed && containers.empty() && waitingOnContainers.empty())
@@ -9088,6 +9428,116 @@ public:
           break;
         }
     }
+  }
+
+  // A promoted Brain can inherit a canonical view which a later complete
+  // Neuron inventory proves no longer has a process.  Once every machine has
+  // attested, discard that view locally without sending lifecycle work to the
+  // Neuron and without releasing routable leases which a reported successor
+  // may already own.  The recovery owner prunes only truly orphaned leases
+  // after all such views have been removed.
+  bool discardConfirmedAbsentRecoveredContainer(ContainerView *container)
+  {
+    if (container == nullptr || thisBrain == nullptr ||
+        containers.contains(container) == false || container->machine == nullptr ||
+        container->plannedWork != nullptr ||
+        container->state == ContainerState::none ||
+        container->state == ContainerState::planned ||
+        container->state == ContainerState::scheduled ||
+        container->state == ContainerState::aboutToDestroy ||
+        container->state == ContainerState::destroying ||
+        container->state == ContainerState::destroyed)
+    {
+      return false;
+    }
+
+    Machine *machine = container->machine;
+    const ApplicationConfig reserved = resourceConfigForContainer(container);
+
+    waitingOnContainers.erase(container);
+    for (auto transfer = pendingStatefulWhiteholeTransfers.begin();
+         transfer != pendingStatefulWhiteholeTransfers.end();)
+    {
+      if (transfer->first == container || transfer->second == container)
+      {
+        transfer = pendingStatefulWhiteholeTransfers.erase(transfer);
+      }
+      else
+      {
+        ++transfer;
+      }
+    }
+    retainedStatefulWhiteholeTransfers.erase(container);
+    rejectedStatefulWhiteholeTransfers.erase(container);
+
+    if (container->state == ContainerState::healthy)
+    {
+      switch (container->lifetime)
+      {
+        case ApplicationLifetime::canary:
+          if (nHealthyCanary > 0) --nHealthyCanary;
+          break;
+        case ApplicationLifetime::base:
+          if (nHealthyBase > 0) --nHealthyBase;
+          break;
+        case ApplicationLifetime::surge:
+          if (nHealthySurge > 0) --nHealthySurge;
+          break;
+      }
+    }
+    releaseContainerPlacementCounts(container);
+
+    if (thisBrain->mesh != nullptr)
+    {
+      thisBrain->mesh->stopAllSubscriptions(container);
+      thisBrain->mesh->stopAllAdvertisments(container);
+    }
+    container->subscriptions.clear();
+    container->advertisements.clear();
+    container->advertisingOnPorts.clear();
+
+    if (container->fragment != 0)
+    {
+      machine->relinquishContainerFragment(container->fragment);
+    }
+    prodigyCreditMachineScalarResources(machine, reserved, 1);
+    prodigyReleaseContainerGPUs(container);
+
+    containers.erase(container);
+    if (plan.isStateful)
+    {
+      const uint32_t shardGroup = container->shardGroup;
+      while (containersByShardGroup.eraseEntry(shardGroup, container))
+      {
+      }
+
+      auto master = masterForShardGroup.find(shardGroup);
+      if (!plan.stateful.allMasters &&
+          master != masterForShardGroup.end() && master->second == container)
+      {
+        // This is the same client-owner transition as ordinary destruction,
+        // except the absent process has no lifecycle acknowledgement to wait
+        // for.  Select and publish a live replica before releasing the stale
+        // view; durable serving authority, when present, owns the async change.
+        changeShardGroupMaster(shardGroup);
+      }
+
+      master = masterForShardGroup.find(shardGroup);
+      if (master != masterForShardGroup.end() && master->second == container)
+      {
+        masterForShardGroup.erase(master);
+      }
+    }
+    machine->removeContainerIndexEntry(container->deploymentID, container);
+    auto canonical = thisBrain->containers.find(container->uuid);
+    if (canonical != thisBrain->containers.end() && canonical->second == container)
+    {
+      thisBrain->containers.erase(canonical);
+    }
+
+    container->state = ContainerState::destroyed;
+    delete container;
+    return true;
   }
 
   void taskAttemptContainerDone(ContainerView *container)
@@ -9518,6 +9968,24 @@ public:
               break;
             }
 
+            const bool retainsStatefulWhiteholeTransfer = retainedStatefulWhiteholeTransfers.contains(container);
+            if (rejectedStatefulWhiteholeTransfers.contains(container) ||
+                (retainsStatefulWhiteholeTransfer && statefulWhiteholeTransferMatchesPlan(container) == false))
+            {
+              retainedStatefulWhiteholeTransfers.erase(container);
+              rejectedStatefulWhiteholeTransfers.insert(container);
+              state = DeploymentState::failed;
+              thisBrain->deploymentFailed(
+                  this,
+                  plan.config.applicationID,
+                  plan.config.deploymentID(),
+                  "stateful recovery Whitehole binding transfer no longer matches its declared source identity"_ctv,
+                  generateReport());
+              cancelDeploymentWork(currentlyExecutingWork);
+              credentialLaunchFailed = true;
+              break;
+            }
+
             ContainerView *replacingContainer = nullptr;
 
             if (work.lifecycle == LifecycleOp::updateInPlace)
@@ -9538,18 +10006,29 @@ public:
             container->addresses.clear();
             container->addresses.emplace_back(container->meshAddress, uint8_t(128));
             container->wormholes = plan.wormholes;
-            container->whiteholes = plan.whiteholes;
             container->networkAccess = plan.networkAccess;
 
+            if (retainsStatefulWhiteholeTransfer == false)
+            {
+              container->whiteholes = plan.whiteholes;
+            }
             RoutableResourceLeaseOwner whiteholeLeaseOwner = routableResourceLeaseOwner();
+            // A failed cold replay can trigger a second empty inventory before
+            // the returning host is promoted. Its existing scheduled stateful
+            // owner still needs bindings on this direct construction path.
+            const bool bindOwnedRecovery = container->isStateful && machine->state != MachineState::healthy;
             for (Whitehole& whitehole : container->whiteholes)
             {
+              if (retainsStatefulWhiteholeTransfer && whiteholeBindingResolved(whitehole))
+              {
+                continue;
+              }
               whitehole.hasAddress = false;
               whitehole.address = {};
               whitehole.sourcePort = 0;
               whitehole.bindingNonce = 0;
 
-              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &whiteholeLeaseOwner) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole) == false || reserveWhiteholeAddressPortLease(whitehole, whiteholeLeaseOwner) == false)
+              if (resolveWhiteholeSourceAddressForScheduling(machine, whitehole, nullptr, container, &whiteholeLeaseOwner, bindOwnedRecovery) == false || whitehole.hasAddress == false || allocateWhiteholeSourcePort(whitehole) == false || reserveWhiteholeAddressPortLease(whitehole, whiteholeLeaseOwner) == false)
               {
                 whitehole.hasAddress = false;
                 whitehole.address = {};

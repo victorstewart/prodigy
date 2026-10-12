@@ -94,8 +94,11 @@ int ct_ingress(struct __sk_buff *skb)
   if (protocol == BE_ETH_P_IPV6)
   {
     struct ipv6hdr *ip6h = (struct ipv6hdr *)l3_data;
-    if ((void *)(ip6h + 1) > data_end ||
-        switchboardClassifyWormholeIngressIPv6(ip6h, data_end, publicWormholeIngress) == false)
+    if ((void *)(ip6h + 1) > data_end)
+    {
+      return NETKIT_DROP;
+    }
+    if (switchboardClassifyWormholeIngressIPv6(ip6h, data_end, publicWormholeIngress) == false)
     {
       return NETKIT_DROP;
     }
@@ -113,7 +116,6 @@ int ct_ingress(struct __sk_buff *skb)
   {
     return NETKIT_DROP;
   }
-
   __u8 networkMode = containerNetworkMode();
   if (networkMode == CONTAINER_NETWORK_DENY || networkMode > CONTAINER_NETWORK_DECLARED_ONLY)
   {

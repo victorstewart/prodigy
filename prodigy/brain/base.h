@@ -1555,13 +1555,15 @@ public:
   void sendNeuronSwitchboardHostedIngressPrefixes(Machine *machine);
   void sendNeuronSwitchboardOverlayRoutes(void);
   void sendNeuronSwitchboardOverlayRoutes(Machine *machine);
-  void sendNeuronSwitchboardStateSync(Machine *machine);
+  void sendNeuronSwitchboardStateSync(Machine *machine, bool replayContainerRoutes = true);
   void buildSwitchboardFleetRoutableSubnets(Vector<DistributableExternalSubnet>& subnets) const;
   void buildHostedSwitchboardIngressPrefixes(Machine *machine, Vector<IPPrefix>& prefixes) const;
   bool whiteholeTargetsNeuronMachine(ContainerView *container, Machine *targetMachine, const Whitehole& whitehole) const;
   void collectWhiteholesForNeuronMachine(ContainerView *container, Machine *targetMachine, const Vector<Whitehole>& sourceWhiteholes, Vector<Whitehole>& whiteholes) const;
   bool buildSwitchboardOverlayRoutingConfig(Machine *machine, SwitchboardOverlayRoutingConfig& config) const;
   bool environmentBGPEnabled(void) const;
+  bool neuronSwitchboardStateSyncBlocked(Machine *machine) const;
+  void driveDeferredNeuronSwitchboardStateSync(Machine *machine);
   void sendNeuronOpenSwitchboardWormholes(ContainerView *container, const Vector<Wormhole>& wormholes);
   void sendNeuronRefreshContainerWormholes(ContainerView *container, const Vector<Wormhole>& wormholes);
   void sendNeuronCloseSwitchboardWormholesToContainer(ContainerView *container);
