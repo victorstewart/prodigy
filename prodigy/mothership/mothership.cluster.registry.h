@@ -4186,6 +4186,55 @@ public:
     if (failure) failure->clear(); return true;
   }
 
+  // Refreshing a sealed launcher is not boundary re-registration.  The lock
+  // makes the read/compare/write replacement atomic, and the comparison pins
+  // every identity and provider-state proof while allowing only a new proven
+  // executor digest.
+  bool refreshLocalVMBoundaryExecutor(const MothershipLocalVMBoundaryDescriptor& expected,
+                                      const MothershipLocalVMBoundaryDescriptor& requested,
+                                      MothershipLocalVMBoundaryDescriptor& recorded,
+                                      bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalVMBoundaryDescriptorValid(expected, failure) || expected.retired ||
+        !mothershipLocalVMBoundaryDescriptorValid(requested, failure) || requested.retired ||
+        !mothershipLocalVMBoundaryDescriptorSameIdentityAndState(expected, requested) ||
+        expected.executorSHA256 == requested.executorSHA256)
+    {
+      if (failure && failure->empty())
+        failure->assign("local VM boundary refresh requires one exact executor-only compare-and-swap"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(requested.vmBoundaryUUID);
+    if (!db.read(localVMBoundariesColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipLocalVMBoundaryDescriptorValid(recorded) || recorded.retired)
+    {
+      recorded = {};
+      if (failure && failure->empty()) failure->assign("local VM boundary refresh requires one active durable boundary"_ctv);
+      return false;
+    }
+    if (mothershipLocalVMBoundaryDescriptorEqual(recorded, requested))
+    {
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!mothershipLocalVMBoundaryDescriptorEqual(recorded, expected))
+    {
+      recorded = {};
+      if (failure) failure->assign("local VM boundary changed since its executor refresh proof"_ctv);
+      return false;
+    }
+    recorded = requested;
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localVMBoundariesColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool admitPhysicalClusterNetworkFault(const MothershipPhysicalClusterNetworkFaultRequest& requested,
                                         const MothershipPhysicalFaultMachineObservation& sourceAdmission,
                                         const MothershipPhysicalFaultMachineObservation& targetAdmission,

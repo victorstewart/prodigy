@@ -422,6 +422,92 @@ def resume_cold_reboot(record: dict[str, object], state_path: Path, operation_id
     return receipt
 
 
+def validate_cold_reboot_state_for_executor_upgrade(record: dict[str, object],
+                                                    expected_operation_id: str | None = None,
+                                                    expected_cohort_id: str | None = None) -> None:
+    """Validate, but never advance, the operation which currently owns a live VM."""
+    require((expected_operation_id is None) == (expected_cohort_id is None),
+            "executor upgrade recovery ownership must be an exact pair")
+    current = record.get("lastColdReboot")
+    if current is None:
+        return
+    require(isinstance(current, dict), "persistent cold reboot state is malformed")
+    operation_id = canonical_cold_reboot_id(current.get("operationID"), "operation ID")
+    if current.get("completed") is True:
+        cohort = current.get("cohortID")
+        if cohort is not None: cohort = canonical_cold_reboot_id(cohort, "cohort ID")
+        require(completed_cold_reboot(current, operation_id, cohort) is not None,
+                "completed cold reboot state is malformed")
+        return
+    legacy_fields = {"operationID", "beforePID", "beforeStarttime", "startedAtMonotonicMs", "completed"}
+    cohort_fields = legacy_fields | {"cohortID", "armedAtUnixMs", "notBeforeUnixMs", "phase"}
+    if current.get("phase") == "released": cohort_fields |= {"releasedAtUnixMs"}
+    require(set(current) in (legacy_fields, cohort_fields) and current.get("completed") is False,
+            "incomplete cold reboot state is malformed")
+    require(expected_operation_id is not None and set(current) == cohort_fields and
+            current.get("operationID") == expected_operation_id and
+            current.get("cohortID") == expected_cohort_id,
+            "incomplete lifecycle operation is not owned by this recovery cohort")
+    require(current.get("beforePID") == record.get("qemuPID") and
+            current.get("beforeStarttime") == record.get("qemuStarttime") and
+            isinstance(current.get("startedAtMonotonicMs"), int) and current["startedAtMonotonicMs"] > 0,
+            "incomplete cold reboot does not bind the live process identity")
+    if set(current) == cohort_fields:
+        canonical_cold_reboot_id(current.get("cohortID"), "cohort ID")
+        require(current.get("phase") in ("armed", "released") and
+                isinstance(current.get("armedAtUnixMs"), int) and current["armedAtUnixMs"] > 0 and
+                isinstance(current.get("notBeforeUnixMs"), int) and
+                current["notBeforeUnixMs"] >= current["armedAtUnixMs"],
+                "incomplete cohort cold reboot state is malformed")
+        if current["phase"] == "released":
+            require(isinstance(current.get("releasedAtUnixMs"), int) and current["releasedAtUnixMs"] > 0 and
+                    current["notBeforeUnixMs"] >= current["releasedAtUnixMs"],
+                    "released cohort cold reboot state is malformed")
+
+
+def reconcile_executor_upgrade(record: dict[str, object], state_path: Path,
+                               expected_operation_id: str | None = None,
+                               expected_cohort_id: str | None = None) -> dict[str, object]:
+    """Prove the live boundary or adopt one exact legacy replacement already launched."""
+    pid = int(record["qemuPID"]); starttime = str(record["qemuStarttime"]); command = record["qemuCommand"]
+    if command_matches(pid, starttime, command):
+        validate_cold_reboot_state_for_executor_upgrade(
+            record, expected_operation_id, expected_cohort_id)
+        verify_persistent_guest(record, pid, starttime)
+        return record
+
+    prior = record.get("lastColdReboot")
+    legacy_fields = {"operationID", "beforePID", "beforeStarttime", "startedAtMonotonicMs", "completed"}
+    require(isinstance(prior, dict) and set(prior) == legacy_fields and prior.get("completed") is False,
+            "executor upgrade cannot reconcile a non-legacy lifecycle operation")
+    operation_id = canonical_cold_reboot_id(prior.get("operationID"), "legacy operation ID")
+    require(prior.get("beforePID") == pid and prior.get("beforeStarttime") == starttime and
+            isinstance(prior.get("startedAtMonotonicMs"), int) and prior["startedAtMonotonicMs"] > 0,
+            "legacy cold reboot does not bind the stale process identity")
+    require(proc_starttime(pid) is None, "recorded QEMU PID is still live with a different identity")
+    pidfile = qemu_pidfile(command)
+    require(pidfile.is_file(), "legacy cold reboot replacement pidfile is absent")
+    try: replacement_pid = int(pidfile.read_text().strip())
+    except ValueError as error: raise BoundaryError("legacy cold reboot replacement pidfile is invalid") from error
+    replacement_starttime = proc_starttime(replacement_pid)
+    require(replacement_pid > 0 and replacement_starttime is not None and
+            (replacement_pid != pid or replacement_starttime != starttime) and
+            command_matches(replacement_pid, replacement_starttime, command),
+            "legacy cold reboot replacement does not match the exact QEMU command")
+    verify_persistent_guest(record, replacement_pid, replacement_starttime)
+    completed_at = max(time.monotonic_ns() // 1_000_000, int(prior["startedAtMonotonicMs"]) + 1)
+    receipt = dict(prior)
+    receipt.update(operationID=operation_id,
+                   beforeIdentity={"pid": prior["beforePID"], "starttime": prior["beforeStarttime"]},
+                   afterIdentity={"pid": replacement_pid, "starttime": replacement_starttime},
+                   afterPID=replacement_pid, afterStarttime=replacement_starttime,
+                   completedAtMonotonicMs=completed_at, phase="completed", completed=True)
+    record["qemuPID"], record["qemuStarttime"], record["lastColdReboot"] = \
+        replacement_pid, replacement_starttime, receipt
+    write_persistent_state(state_path, record)
+    return record
+
+
 def released_cold_reboot_child(state_path: Path, task_id: str, operation_id: str, cohort_id: str) -> None:
     """Detached owner inherits lifecycle_main's flock and never touches a non-exact VM."""
     os.setsid()
@@ -508,10 +594,17 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
                 require(set(options) == {"--operation-id", "--cohort-id"},
                         "release-cold-reboot requires operation ID and cohort ID")
         preserve_cold_reboot_after_session_loss()
-    elif operation == "query":
-        require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
-                "query accepts one exact operation ID and cohort ID pair")
-        if remainder:
+    elif operation in ("query", "reconcile-executor"):
+        if operation == "reconcile-executor":
+            require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
+                    "reconcile-executor accepts one exact operation ID and cohort ID pair")
+            if remainder:
+                operation_id = canonical_cold_reboot_id(remainder[1], "operation ID")
+                cohort_id = canonical_cold_reboot_id(remainder[3], "cohort ID")
+        else:
+            require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
+                    "query accepts one exact operation ID and cohort ID pair")
+        if operation == "query" and remainder:
             operation_id = canonical_cold_reboot_id(remainder[1], "operation ID")
             cohort_id = canonical_cold_reboot_id(remainder[3], "cohort ID")
     else:
@@ -519,6 +612,8 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
     if operation == "remove" and not state_path.exists():
         return 0
     record = load_persistent_state(state_path, task_id); pid = int(record["qemuPID"]); command = record["qemuCommand"]
+    if operation == "reconcile-executor":
+        print(json.dumps(reconcile_executor_upgrade(record, state_path, operation_id, cohort_id), sort_keys=True)); return 0
     if operation == "query":
         require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
         if operation_id is not None:
@@ -798,6 +893,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         operation = sys.argv[1] if len(sys.argv) > 1 else ""
-        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "cold-reboot", "arm-cold-reboot", "release-cold-reboot", "remove") else main())
+        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "reconcile-executor", "cold-reboot", "arm-cold-reboot", "release-cold-reboot", "remove") else main())
     except (BoundaryError, subprocess.CalledProcessError, OSError, json.JSONDecodeError) as error:
         print(f"FAIL: {error}", file=sys.stderr); raise SystemExit(1)

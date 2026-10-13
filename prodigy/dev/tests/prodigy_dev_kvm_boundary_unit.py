@@ -436,6 +436,92 @@ class KvmBoundaryUnit(unittest.TestCase):
             self.assertEqual(written[0]["lastColdReboot"]["beforePID"], 42)
             self.assertEqual(written[0]["lastColdReboot"]["afterPID"], 55)
 
+    def test_executor_upgrade_adopts_only_an_exact_already_live_legacy_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state_path = root / "boundary.json"; pidfile = root / "qemu.pid"
+            pidfile.write_text("55\n")
+            operation = "1" * 32
+            record = {"qemuPID": 42, "qemuStarttime": "old",
+                      "qemuCommand": ["qemu", "-pidfile", str(pidfile)],
+                      "lastColdReboot": {"operationID": operation, "beforePID": 42,
+                                         "beforeStarttime": "old", "startedAtMonotonicMs": 10,
+                                         "completed": False}}
+            written = []
+            def matches(pid, starttime, _command):
+                return pid == 55 and starttime == "new"
+            with mock.patch.object(KVM, "command_matches", side_effect=matches), \
+                 mock.patch.object(KVM, "proc_starttime", side_effect=lambda pid: "new" if pid == 55 else None), \
+                 mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+                 mock.patch.object(KVM, "write_persistent_state", side_effect=lambda _path, value: written.append(value.copy())), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn, \
+                 mock.patch.object(KVM.time, "monotonic_ns", return_value=20_000_000):
+                reconciled = KVM.reconcile_executor_upgrade(record, state_path)
+            stop.assert_not_called(); spawn.assert_not_called()
+            verify.assert_called_once_with(record, 55, "new")
+            self.assertEqual((reconciled["qemuPID"], reconciled["qemuStarttime"]), (55, "new"))
+            self.assertTrue(reconciled["lastColdReboot"]["completed"])
+            self.assertEqual(len(written), 1)
+
+    def test_executor_upgrade_is_read_only_when_the_recorded_vm_is_live(self):
+        record = {"qemuPID": 42, "qemuStarttime": "live", "qemuCommand": ["qemu"]}
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+             mock.patch.object(KVM, "write_persistent_state") as write, \
+             mock.patch.object(KVM.subprocess, "Popen") as spawn:
+            self.assertIs(KVM.reconcile_executor_upgrade(record, Path("/private/state")), record)
+        verify.assert_called_once_with(record, 42, "live")
+        write.assert_not_called(); spawn.assert_not_called()
+
+    def test_executor_upgrade_proves_but_does_not_advance_a_live_armed_cohort(self):
+        operation, cohort = "1" * 32, "2" * 32
+        armed = {"operationID": operation, "cohortID": cohort, "beforePID": 42,
+                 "beforeStarttime": "live", "startedAtMonotonicMs": 10,
+                 "armedAtUnixMs": 20, "notBeforeUnixMs": 30,
+                 "phase": "armed", "completed": False}
+        record = {"qemuPID": 42, "qemuStarttime": "live", "qemuCommand": ["qemu"],
+                  "lastColdReboot": armed}
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+             mock.patch.object(KVM, "write_persistent_state") as write:
+            self.assertIs(KVM.reconcile_executor_upgrade(
+                record, Path("/private/state"), operation, cohort), record)
+        verify.assert_called_once_with(record, 42, "live")
+        write.assert_not_called()
+        self.assertEqual(record["lastColdReboot"], armed)
+
+    def test_executor_upgrade_refuses_an_incomplete_operation_for_a_new_or_different_cohort(self):
+        operation, cohort = "1" * 32, "2" * 32
+        record = {"qemuPID": 42, "qemuStarttime": "live", "qemuCommand": ["qemu"],
+                  "lastColdReboot": {"operationID": operation, "cohortID": cohort,
+                                     "beforePID": 42, "beforeStarttime": "live",
+                                     "startedAtMonotonicMs": 10, "armedAtUnixMs": 20,
+                                     "notBeforeUnixMs": 30, "phase": "armed", "completed": False}}
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+             mock.patch.object(KVM, "write_persistent_state") as write:
+            with self.assertRaisesRegex(KVM.BoundaryError, "not owned"):
+                KVM.reconcile_executor_upgrade(record, Path("/private/state"))
+            with self.assertRaisesRegex(KVM.BoundaryError, "not owned"):
+                KVM.reconcile_executor_upgrade(
+                    record, Path("/private/state"), "3" * 32, cohort)
+        verify.assert_not_called(); write.assert_not_called()
+
+    def test_executor_upgrade_refuses_cohort_state_and_never_starts_a_missing_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            operation, cohort = "1" * 32, "2" * 32
+            record = {"qemuPID": 42, "qemuStarttime": "old",
+                      "qemuCommand": ["qemu", "-pidfile", str(Path(directory) / "missing.pid")],
+                      "lastColdReboot": {"operationID": operation, "cohortID": cohort,
+                                         "beforePID": 42, "beforeStarttime": "old",
+                                         "startedAtMonotonicMs": 10, "phase": "released", "completed": False}}
+            with mock.patch.object(KVM, "command_matches", return_value=False), \
+                 mock.patch.object(KVM, "write_persistent_state") as write, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn, \
+                 self.assertRaisesRegex(KVM.BoundaryError, "non-legacy"):
+                KVM.reconcile_executor_upgrade(record, Path(directory) / "state")
+        write.assert_not_called(); spawn.assert_not_called()
+
     def test_qemu_pidfile_is_part_of_persistent_command_identity(self):
         self.assertEqual(KVM.qemu_pidfile(["qemu", "-pidfile", "/run/g6.pid"]), Path("/run/g6.pid"))
         with self.assertRaises(KVM.BoundaryError): KVM.qemu_pidfile(["qemu"])

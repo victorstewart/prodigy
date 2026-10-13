@@ -22,7 +22,7 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertNotIn("executorSHA256", help_line)
 
     def test_hash_and_execution_share_one_opened_remote_descriptor(self):
-        begin = MOTHERSHIP.index("bool runLocalVMBoundarySealedLauncher")
+        begin = MOTHERSHIP.index("bool runCurrentLocalVMBoundarySealedLauncher")
         end = MOTHERSHIP.index("bool queryLocalVMBoundaryExecutor", begin)
         helper = MOTHERSHIP[begin:end]
         self.assertIn("mothershipLocalVMBoundarySource", helper)
@@ -33,6 +33,22 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         query_begin = MOTHERSHIP.index("bool queryLocalVMBoundaryExecutor")
         query_end = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction", query_begin)
         self.assertNotIn("sha256sum --", MOTHERSHIP[query_begin:query_end])
+
+    def test_executor_upgrade_is_separate_exact_and_rotates_only_after_immutable_proof(self):
+        pinned_begin = MOTHERSHIP.index("bool runLocalVMBoundarySealedLauncher")
+        pinned_end = MOTHERSHIP.index("bool inspectLocalVMBoundaryExecutor", pinned_begin)
+        pinned = MOTHERSHIP[pinned_begin:pinned_end]
+        self.assertIn("expectedSHA != descriptor.executorSHA256", pinned)
+        self.assertIn("runCurrentLocalVMBoundarySealedLauncher", pinned)
+        reconcile_begin = MOTHERSHIP.index("bool reconcileLocalVMBoundaryExecutorBinding")
+        reconcile_end = MOTHERSHIP.index("bool awaitLocalAuthorityRecoveryNonSeed", reconcile_begin)
+        reconcile = MOTHERSHIP[reconcile_begin:reconcile_end]
+        self.assertIn("reconcileLocalVMBoundaryExecutorForUpgrade", reconcile)
+        self.assertLess(reconcile.index("immutable != boundary.immutableStateSHA256"),
+                        reconcile.index("refreshLocalVMBoundaryExecutor"))
+        self.assertIn('set(prior) == legacy_fields', KVM_BOUNDARY)
+        self.assertIn('proc_starttime(pid) is None', KVM_BOUNDARY)
+        self.assertIn('"incomplete lifecycle operation is not owned by this recovery cohort"', KVM_BOUNDARY)
 
     def test_verified_vm_probe_does_not_reopen_the_live_brain_store(self):
         begin = MOTHERSHIP.index("bool buildLocalClusterMachineProbe")
@@ -66,6 +82,8 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("MothershipLocalAuthorityRecoveryPhase::armed", owner)
         self.assertIn("MothershipLocalAuthorityRecoveryPhase::released", owner)
         self.assertIn("awaitLocalAuthorityRecoveryClusterHealth", owner)
+        self.assertIn("existingCohort ? target.executor.executorOperationUUID", owner)
+        self.assertIn("existingCohort ? operationUUID", owner)
         self.assertIn("exit(75)", owner)
         self.assertIn("COLD_REBOOT_RELEASE_GRACE_MS", KVM_BOUNDARY)
         self.assertIn('current["notBeforeUnixMs"] = max', KVM_BOUNDARY)

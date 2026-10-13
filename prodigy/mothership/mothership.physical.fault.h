@@ -346,6 +346,23 @@ static inline bool mothershipLocalVMBoundaryDescriptorEqual(
   return leftBytes == rightBytes;
 }
 
+// A sealed launcher refresh is intentionally narrower than boundary
+// registration: all execution identity and immutable provider-state evidence
+// remains pinned, and only the proven launcher digest may rotate.
+static inline bool mothershipLocalVMBoundaryDescriptorSameIdentityAndState(
+    const MothershipLocalVMBoundaryDescriptor& left,
+    const MothershipLocalVMBoundaryDescriptor& right)
+{
+  return left.protocolVersion == right.protocolVersion &&
+      left.vmBoundaryUUID == right.vmBoundaryUUID && left.clusterUUID == right.clusterUUID &&
+      left.machineUUID == right.machineUUID && left.taskID == right.taskID &&
+      left.hostAddress == right.hostAddress && left.hostPort == right.hostPort &&
+      left.hostUser == right.hostUser && left.hostPrivateKeyPath == right.hostPrivateKeyPath &&
+      left.hostPublicKeyOpenSSH == right.hostPublicKeyOpenSSH && left.statePath == right.statePath &&
+      left.immutableStateSHA256 == right.immutableStateSHA256 &&
+      left.registeredAtMs == right.registeredAtMs && !left.retired && !right.retired;
+}
+
 static inline bool mothershipPhysicalFaultDirectionValid(MothershipPhysicalFaultDirection value)
 {
   return value == MothershipPhysicalFaultDirection::both ||

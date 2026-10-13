@@ -216,6 +216,38 @@ int main()
     MothershipLocalVMBoundaryDescriptor storedLocal = {};
     assert(registry.registerLocalVMBoundary(localBoundary, storedLocal, resumed, &failure) && !resumed);
     assert(registry.registerLocalVMBoundary(targetLocal, storedLocal, resumed, &failure) && !resumed);
+    auto refreshedLocal = localBoundary;
+    refreshedLocal.executorSHA256 = digest('6');
+    const auto rejectsBoundaryRefreshDrift = [&](auto mutate) {
+      auto drifted = refreshedLocal;
+      mutate(drifted);
+      assert(!registry.refreshLocalVMBoundaryExecutor(localBoundary, drifted, storedLocal, resumed, &failure));
+    };
+    rejectsBoundaryRefreshDrift([](auto& value) { value.vmBoundaryUUID++; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.clusterUUID++; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.machineUUID++; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.taskID = "g6-other-task"_ctv; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.hostAddress = "192.0.2.11"_ctv; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.hostPort++; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.hostUser = "admin"_ctv; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.hostPrivateKeyPath = "/tmp/g6-other-key"_ctv; });
+    rejectsBoundaryRefreshDrift([](auto& value) {
+      value.hostPublicKeyOpenSSH = "ssh-ed25519 BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB g6"_ctv;
+    });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.statePath = "/var/tmp/prodigy-g6/other.json"_ctv; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.immutableStateSHA256 = digest('0'); });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.registeredAtMs++; });
+    rejectsBoundaryRefreshDrift([](auto& value) { value.retired = true; });
+    auto staleExpectedLocal = localBoundary;
+    staleExpectedLocal.executorSHA256 = digest('5');
+    assert(!registry.refreshLocalVMBoundaryExecutor(staleExpectedLocal, refreshedLocal,
+                                                   storedLocal, resumed, &failure));
+    assert(registry.refreshLocalVMBoundaryExecutor(localBoundary, refreshedLocal,
+                                                   storedLocal, resumed, &failure) && !resumed);
+    assert(storedLocal.executorSHA256 == digest('6'));
+    assert(registry.refreshLocalVMBoundaryExecutor(localBoundary, refreshedLocal,
+                                                   storedLocal, resumed, &failure) && resumed);
+    localBoundary = refreshedLocal;
 
     MothershipPhysicalServiceTransitBoundary boundary = {};
     boundary.boundaryUUID = 0x501; boundary.pairOperationUUID = intent.operationUUID;
@@ -409,7 +441,8 @@ int main()
            pair.phase == MothershipProductionPairPhase::cleanupComplete);
     assert(reopened.loadPhysicalServiceTransitBoundary(0x501, boundary, &failure) && boundary.closed &&
            boundary.admissionReceiptSHA256 == digest('2') && boundary.cleanupReceiptSHA256 == digest('8'));
-    assert(reopened.loadLocalVMBoundary(0x801, localBoundary, &failure) && !localBoundary.retired);
+    assert(reopened.loadLocalVMBoundary(0x801, localBoundary, &failure) && !localBoundary.retired &&
+           localBoundary.executorSHA256 == digest('6'));
     MothershipLocalAuthorityRecoveryCohortRecord cohort = {};
     assert(reopened.loadLocalAuthorityRecoveryCohort(0xb01, cohort, &failure) &&
            cohort.phase == MothershipLocalAuthorityRecoveryPhase::recovered);

@@ -13311,21 +13311,19 @@ private:
     return matches == 1 && mothershipPhysicalFaultNumericAddressValid(address);
   }
 
-  // The registering caller never selects executable bytes.  For every query or
-  // action, stage the launcher compiled into Mothership, then make the remote
-  // Python process hash and execute the same opened descriptor.  In particular,
-  // do not split a pathname sha256sum from a later pathname python3 invocation.
-  bool runLocalVMBoundarySealedLauncher(const MothershipLocalVMBoundaryDescriptor& descriptor,
-                                        const Vector<String>& arguments, int timeoutMilliseconds,
-                                        String& output, String& failure)
+  // The registering caller never selects executable bytes.  This primitive
+  // always stages the launcher compiled into Mothership, then makes the remote
+  // Python process hash and execute the same opened descriptor.  Callers which
+  // perform ordinary actions must use the digest-pinned wrapper below.
+  bool runCurrentLocalVMBoundarySealedLauncher(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                               const Vector<String>& arguments, int timeoutMilliseconds,
+                                               String& output, String& failure)
   {
     output.clear();
     String expectedSHA = {}, sourceBytes = {};
     sourceBytes.append(reinterpret_cast<const char *>(mothershipLocalVMBoundarySource),
                        sizeof(mothershipLocalVMBoundarySource));
-    if (!prodigyComputeSHA256Hex(sourceBytes, expectedSHA, &failure) ||
-        expectedSHA != descriptor.executorSHA256)
-    { if (failure.empty()) failure.assign("local VM boundary launcher digest is not Mothership-owned"_ctv); return false; }
+    if (!prodigyComputeSHA256Hex(sourceBytes, expectedSHA, &failure)) return false;
 
     MothershipProdigyClusterMachine host = {};
     host.ssh.address = descriptor.hostAddress; host.ssh.port = descriptor.hostPort;
@@ -13396,17 +13394,47 @@ private:
     return valid;
   }
 
-  bool queryLocalVMBoundaryExecutor(const MothershipLocalVMBoundaryDescriptor& descriptor,
-                                    String& immutableStateSHA256, String& failure,
-                                    uint64_t *observedPID = nullptr,
-                                    String *observedStarttime = nullptr)
+  bool runLocalVMBoundarySealedLauncher(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                        const Vector<String>& arguments, int timeoutMilliseconds,
+                                        String& output, String& failure)
+  {
+    String expectedSHA = {}, sourceBytes = {};
+    sourceBytes.append(reinterpret_cast<const char *>(mothershipLocalVMBoundarySource),
+                       sizeof(mothershipLocalVMBoundarySource));
+    if (!prodigyComputeSHA256Hex(sourceBytes, expectedSHA, &failure) ||
+        expectedSHA != descriptor.executorSHA256)
+    { if (failure.empty()) failure.assign("local VM boundary launcher digest is not Mothership-owned"_ctv); return false; }
+    return runCurrentLocalVMBoundarySealedLauncher(
+        descriptor, arguments, timeoutMilliseconds, output, failure);
+  }
+
+  bool inspectLocalVMBoundaryExecutor(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                      const char *action, bool currentExecutorUpgrade,
+                                      String& immutableStateSHA256, String& failure,
+                                      uint64_t *observedPID = nullptr,
+                                      String *observedStarttime = nullptr,
+                                      uint128_t expectedOperationUUID = 0,
+                                      uint128_t expectedCohortUUID = 0)
   {
     immutableStateSHA256.clear();
+    if ((expectedOperationUUID == 0) != (expectedCohortUUID == 0))
+    { failure.assign("local VM executor reconciliation requires one exact ownership pair"_ctv); return false; }
     Vector<String> arguments = {};
-    arguments.emplace_back("query"_ctv); arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
+    arguments.emplace_back(action);
+    arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
     arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
+    if (expectedOperationUUID != 0)
+    {
+      String operation = {}, cohort = {};
+      mothershipAssignProviderHex128(expectedOperationUUID, operation);
+      mothershipAssignProviderHex128(expectedCohortUUID, cohort);
+      arguments.emplace_back("--operation-id"_ctv); arguments.push_back(std::move(operation));
+      arguments.emplace_back("--cohort-id"_ctv); arguments.push_back(std::move(cohort));
+    }
     String output = {};
-    bool valid = runLocalVMBoundarySealedLauncher(descriptor, arguments, 30'000, output, failure);
+    bool valid = currentExecutorUpgrade ?
+        runCurrentLocalVMBoundarySealedLauncher(descriptor, arguments, 30'000, output, failure) :
+        runLocalVMBoundarySealedLauncher(descriptor, arguments, 30'000, output, failure);
     if (!valid) return false;
 
     simdjson::dom::parser parser; simdjson::dom::element document;
@@ -13675,6 +13703,27 @@ private:
     { failure.assign("local VM executor state does not prove the exact KVM, disk, firmware, UUID, QMP, and userspace-network boundary"_ctv); return false; }
     String encoded = {}; BitseryEngine::serialize(encoded, identity);
     return prodigyComputeSHA256Hex(encoded, immutableStateSHA256, &failure);
+  }
+
+  bool queryLocalVMBoundaryExecutor(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                    String& immutableStateSHA256, String& failure,
+                                    uint64_t *observedPID = nullptr,
+                                    String *observedStarttime = nullptr)
+  {
+    return inspectLocalVMBoundaryExecutor(descriptor, "query", false,
+                                          immutableStateSHA256, failure,
+                                          observedPID, observedStarttime);
+  }
+
+  bool reconcileLocalVMBoundaryExecutorForUpgrade(
+      const MothershipLocalVMBoundaryDescriptor& descriptor,
+      String& immutableStateSHA256, String& failure,
+      uint128_t expectedOperationUUID = 0,
+      uint128_t expectedCohortUUID = 0)
+  {
+    return inspectLocalVMBoundaryExecutor(descriptor, "reconcile-executor", true,
+                                          immutableStateSHA256, failure, nullptr, nullptr,
+                                          expectedOperationUUID, expectedCohortUUID);
   }
 
   bool runLocalVMBoundaryExecutorAction(const MothershipLocalVMBoundaryDescriptor& descriptor,
@@ -13961,6 +14010,35 @@ private:
     return valid;
   }
 
+  bool reconcileLocalVMBoundaryExecutorBinding(
+      MothershipLocalVMBoundaryDescriptor& boundary, String& failure,
+      uint128_t expectedOperationUUID = 0,
+      uint128_t expectedCohortUUID = 0)
+  {
+    String sourceBytes = {}, currentExecutorSHA256 = {};
+    sourceBytes.append(reinterpret_cast<const char *>(mothershipLocalVMBoundarySource),
+                       sizeof(mothershipLocalVMBoundarySource));
+    if (!prodigyComputeSHA256Hex(sourceBytes, currentExecutorSHA256, &failure)) return false;
+    const bool refreshRequired = boundary.executorSHA256 != currentExecutorSHA256;
+    String immutable = {};
+    if (!reconcileLocalVMBoundaryExecutorForUpgrade(
+            boundary, immutable, failure, expectedOperationUUID, expectedCohortUUID) ||
+        immutable != boundary.immutableStateSHA256)
+    {
+      if (failure.empty())
+        failure.assign("local VM executor reconciliation changed immutable boundary identity"_ctv);
+      return false;
+    }
+    if (!refreshRequired) return true;
+    auto requested = boundary;
+    requested.executorSHA256 = currentExecutorSHA256;
+    MothershipLocalVMBoundaryDescriptor recorded = {}; bool resumed = false;
+    auto registry = openClusterRegistry();
+    if (!registry.refreshLocalVMBoundaryExecutor(boundary, requested, recorded, resumed, &failure)) return false;
+    boundary = std::move(recorded);
+    return true;
+  }
+
   bool awaitLocalAuthorityRecoveryNonSeed(
       const LocalAuthorityRecoveryTarget& target, uint128_t cohortOperationUUID,
       uint32_t timeoutMilliseconds, String& completedReceiptSHA256, String& failure)
@@ -14024,11 +14102,11 @@ private:
     { failure.assign("local authority recovery requires one exact three-Brain deploymentMode=local topology"_ctv); valid = false; }
 
     bool existingCohort = false;
+    MothershipLocalAuthorityRecoveryCohortRecord existingCohortRecord = {};
     if (valid)
     {
-      MothershipLocalAuthorityRecoveryCohortRecord existing = {};
       auto registry = openClusterRegistry(); String readFailure = {};
-      if (registry.loadLocalAuthorityRecoveryCohort(operationUUID, existing, &readFailure))
+      if (registry.loadLocalAuthorityRecoveryCohort(operationUUID, existingCohortRecord, &readFailure))
         existingCohort = true;
       else if (!readFailure.equal("record not found"_ctv))
       { failure = readFailure; valid = false; }
@@ -14050,12 +14128,7 @@ private:
           valid = registry.findActiveLocalVMBoundary(cluster.clusterUUID, machine.uuid,
                                                      target.boundary, &failure);
         }
-        String immutable = {};
-        if (valid && !existingCohort)
-          valid = queryLocalVMBoundaryExecutor(target.boundary, immutable, failure) &&
-              immutable == target.boundary.immutableStateSHA256;
-        if (!valid)
-        { if (failure.empty()) failure.assign("local authority recovery boundary identity changed"_ctv); break; }
+        if (!valid) break;
         target.executor.machineUUID = machine.uuid;
         target.executor.boundaryUUID = target.boundary.vmBoundaryUUID;
         target.executor.immutableBoundarySHA256 = target.boundary.immutableStateSHA256;
@@ -14086,6 +14159,21 @@ private:
       request.operationUUID = operationUUID; request.clusterUUID = cluster.clusterUUID;
       request.topologyVersion = cluster.topology.version; request.timeoutMilliseconds = uint32_t(timeout);
       for (const auto& target : targets) request.executors.push_back(target.executor);
+      if (existingCohort && !mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request))
+      { failure.assign("local authority recovery retry conflicts with its immutable cohort"_ctv); valid = false; }
+    }
+    for (auto& target : targets)
+    {
+      if (!valid) break;
+      valid = reconcileLocalVMBoundaryExecutorBinding(
+          target.boundary, failure,
+          existingCohort ? target.executor.executorOperationUUID : uint128_t(0),
+          existingCohort ? operationUUID : uint128_t(0));
+      if (!valid && failure.empty())
+        failure.assign("local authority recovery boundary identity changed"_ctv);
+    }
+    if (valid)
+    {
       auto registry = openClusterRegistry();
       valid = registry.admitLocalAuthorityRecoveryCohort(request, record, resumed, &failure);
     }
