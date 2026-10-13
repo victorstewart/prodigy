@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <openssl/rand.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1708,6 +1709,70 @@ public:
   Vector<ProdigyTransportCredentialEnrollment> ledger;
   uint64_t committedAuthorityGeneration = 0;
 };
+
+// Fresh cluster creation owns one initial AEGIS cohort. Every machine hosts a
+// Neuron identity, while Brain machines additionally receive a Brain identity.
+// Keep that role expansion identical for test and remote provisioning paths.
+static inline bool prodigyBuildInitialTransportCredentialProjection(
+    uint128_t clusterUUID, const ClusterTopology& topology,
+    ProdigyInitialTransportCredentialProjection& output, String *failure = nullptr)
+{
+  output = {};
+  ProdigyInitialTransportCredentialProjection candidate;
+  if (clusterUUID == 0 || topology.machines.empty() || topology.machines.size() > 2048)
+  {
+    if (failure) failure->assign("invalid initial transport cohort"_ctv);
+    return false;
+  }
+  candidate.authority.authorityEpoch = 1;
+  candidate.authority.keyEpoch = 1;
+  candidate.authority.authorityGeneration = 1;
+  candidate.committedAuthorityGeneration = 1;
+  if (RAND_priv_bytes(candidate.authority.root, sizeof(candidate.authority.root)) != 1 ||
+      !candidate.authority.valid())
+  {
+    if (failure) failure->assign("initial transport root randomness unavailable"_ctv);
+    return false;
+  }
+  for (const auto& machine : topology.machines)
+  {
+    if (machine.uuid == 0 || std::any_of(candidate.ledger.begin(), candidate.ledger.end(),
+        [&](const auto& prior) { return prior.nodeUUID == machine.uuid; }))
+    {
+      if (failure) failure->assign("initial transport cohort has ambiguous machine identity"_ctv);
+      return false;
+    }
+    for (auto role : {ProdigyTransportCredentialNodeRole::brain, ProdigyTransportCredentialNodeRole::neuron})
+    {
+      if (role == ProdigyTransportCredentialNodeRole::brain && !machine.isBrain) continue;
+      ProdigyTransportCredentialEnrollment enrollment;
+      if (RAND_priv_bytes(reinterpret_cast<unsigned char *>(&enrollment.operationUUID), sizeof(enrollment.operationUUID)) != 1 ||
+          enrollment.operationUUID == 0 || std::any_of(candidate.ledger.begin(), candidate.ledger.end(),
+              [&](const auto& prior) { return prior.operationUUID == enrollment.operationUUID; }))
+      {
+        if (failure) failure->assign("initial transport enrollment randomness unavailable"_ctv);
+        return false;
+      }
+      enrollment.nodeUUID = machine.uuid;
+      enrollment.clusterUUID = clusterUUID;
+      enrollment.authorityEpoch = 1;
+      enrollment.keyEpoch = 1;
+      enrollment.authorityGeneration = 1;
+      enrollment.role = role;
+      enrollment.state = ProdigyTransportCredentialEnrollmentState::active;
+      candidate.ledger.push_back(enrollment);
+    }
+  }
+  if (std::none_of(candidate.ledger.begin(), candidate.ledger.end(),
+      [](const auto& member) { return member.role == ProdigyTransportCredentialNodeRole::brain; }))
+  {
+    if (failure) failure->assign("initial transport cohort requires a Brain"_ctv);
+    return false;
+  }
+  output = std::move(candidate);
+  if (failure) failure->clear();
+  return true;
+}
 
 static inline bool prodigyBuildRemoteBootstrapBootMaterial(
     const ClusterMachine& clusterMachine,

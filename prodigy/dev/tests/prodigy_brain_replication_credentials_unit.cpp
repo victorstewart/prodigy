@@ -35033,17 +35033,19 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     configureAuthority(pairBrain, 100, 191);
     pairBrain.nBrains = 3;
 
-    auto pairTopologyMachine = [&](uint128_t uuid, const char *address) {
+    pairBrain.brainConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::dev;
+    auto pairTopologyMachine = [&](uint128_t uuid, const char *privateAddress, const char *publicAddress) {
       ClusterMachine value = {};
       value.uuid = uuid;
       value.isBrain = true;
-      prodigyAppendUniqueClusterMachineAddress(value.addresses.privateAddresses, address, 64, String());
+      prodigyAppendUniqueClusterMachineAddress(value.addresses.privateAddresses, privateAddress, 64, String());
+      prodigyAppendUniqueClusterMachineAddress(value.addresses.publicAddresses, publicAddress, 64, String());
       return value;
     };
     pairBrain.authoritativeTopology.machines = {
-        pairTopologyMachine(selfUUID, "fd00:9a::1"),
-        pairTopologyMachine(peerAUUID, "fd00:9a::2"),
-        pairTopologyMachine(peerBUUID, "fd00:9a::3")};
+        pairTopologyMachine(selfUUID, "fd00:9a::1", "2001:db8:9a::1"),
+        pairTopologyMachine(peerAUUID, "fd00:9a::2", "2001:db8:9a::2"),
+        pairTopologyMachine(peerBUUID, "fd00:9a::3", "2001:db8:9a::3")};
     pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
         enrollment(0x9a71, selfUUID, ProdigyTransportCredentialNodeRole::neuron,
                    ProdigyTransportCredentialEnrollmentState::active, 100));
@@ -35053,6 +35055,44 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     pairBrain.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
         enrollment(0x9a73, peerBUUID, ProdigyTransportCredentialNodeRole::neuron,
                    ProdigyTransportCredentialEnrollmentState::active, 100));
+
+    Vector<ClusterPairControlEndpoint> preferredEndpoints = {};
+    auto endpointRosterMatches = [&](std::initializer_list<const char *> expected) {
+      if (preferredEndpoints.size() != expected.size()) return false;
+      uint32_t index = 0;
+      for (const char *address : expected)
+      {
+        IPAddress parsed = {};
+        if (!ClusterMachine::parseIPAddressLiteral(address, parsed) ||
+            !preferredEndpoints[index++].address.equals(parsed)) return false;
+      }
+      return true;
+    };
+    suite.require(pairBrain.buildApprovedClusterPairEndpoints(preferredEndpoints) &&
+                      endpointRosterMatches({"fd00:9a::1", "fd00:9a::2", "fd00:9a::3"}),
+                  "cluster_pair_dev_endpoint_prefers_private_ipv6");
+    bool everyCloudKindPreferredPublic = true;
+    for (ProdigyEnvironmentKind kind : {ProdigyEnvironmentKind::gcp, ProdigyEnvironmentKind::aws,
+                                        ProdigyEnvironmentKind::azure, ProdigyEnvironmentKind::vultr})
+    {
+      pairBrain.brainConfig.runtimeEnvironment.kind = kind;
+      everyCloudKindPreferredPublic = everyCloudKindPreferredPublic &&
+          pairBrain.buildApprovedClusterPairEndpoints(preferredEndpoints) &&
+          endpointRosterMatches({"2001:db8:9a::1", "2001:db8:9a::2", "2001:db8:9a::3"});
+    }
+    suite.require(everyCloudKindPreferredPublic, "cluster_pair_cloud_endpoint_prefers_public_ipv6");
+    for (uint32_t index = 0; index < pairBrain.authoritativeTopology.machines.size(); ++index)
+    {
+      auto& publicAddresses = pairBrain.authoritativeTopology.machines[index].addresses.publicAddresses;
+      publicAddresses.clear();
+      String mislabeledPrivate;
+      mislabeledPrivate.snprintf<"fd00:dead::{}"_ctv>(String(index + 1));
+      prodigyAppendUniqueClusterMachineAddress(publicAddresses, mislabeledPrivate, 64, String());
+    }
+    suite.require(pairBrain.buildApprovedClusterPairEndpoints(preferredEndpoints) &&
+                      endpointRosterMatches({"fd00:9a::1", "fd00:9a::2", "fd00:9a::3"}),
+                  "cluster_pair_cloud_endpoint_rejects_ula_in_public_roster");
+    pairBrain.brainConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::dev;
 
     BrainView pairPeerA = {}, pairPeerB = {};
     suite.require(authenticatePeer(pairBrain, pairPeerA, peerAUUID) &&

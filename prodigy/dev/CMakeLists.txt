@@ -2494,6 +2494,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_cousin_lifecycle_observe_unit
       COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_cousin_lifecycle_observe_unit.py)
    set_tests_properties(prodigy_cousin_lifecycle_observe_unit PROPERTIES TIMEOUT 15)
+   add_test(NAME prodigy_g6_preflight_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_preflight_unit.py)
+   set_tests_properties(prodigy_g6_preflight_unit PROPERTIES TIMEOUT 15)
    add_test(NAME prodigy_transport_aegis_unit COMMAND $<TARGET_FILE:prodigy_transport_aegis_unit>)
    set_tests_properties(prodigy_transport_aegis_unit PROPERTIES TIMEOUT 30)
    add_test(NAME prodigy_pair_control_ring_unit COMMAND $<TARGET_FILE:prodigy_pair_control_ring_unit>)

@@ -42,6 +42,11 @@ static inline bool clusterPairControlEndpointValid(const ClusterPairControlEndpo
   return !loopback && !mappedV4 && !linkLocal && address[0] != 0xff;
 }
 
+static inline bool clusterPairControlEndpointGlobalUnicastIPv6(const ClusterPairControlEndpoint& endpoint)
+{
+  return clusterPairControlEndpointValid(endpoint) && (endpoint.address.v6[0] & 0xe0u) == 0x20u;
+}
+
 static inline bool clusterPairControlEndpointEquals(const ClusterPairControlEndpoint& left,
                                                     const ClusterPairControlEndpoint& right)
 {

@@ -278,6 +278,7 @@ class FakeClusterCreateHooks final : public MothershipClusterCreateHooks {
 public:
 
   uint32_t prepareProviderBootstrapArtifactsCalls = 0;
+  uint32_t resolveLocalSeedCalls = 0;
   uint32_t localBootstrapCalls = 0;
   uint32_t createSeedCalls = 0;
   uint32_t remoteBootstrapCalls = 0;
@@ -293,6 +294,9 @@ public:
   uint32_t destroyCreatedSeedCalls = 0;
 
   ProdigyPersistentBootState lastLocalBootState = {};
+  ProdigyPersistentLocalBrainState lastInitialLocalState = {};
+  bool localBootstrapReceivedInitialLocalState = false;
+  ClusterMachine localSeedMachine = {};
   CreateMachinesInstruction lastCreateSeedInstruction = {};
   ClusterMachine createdSeedMachine = {};
   ClusterMachine lastDestroyedSeedMachine = {};
@@ -301,6 +305,8 @@ public:
   AddMachines lastRemoteBootstrapRequest = {};
   ClusterTopology lastRemoteBootstrapTopology = {};
   ProdigyRuntimeEnvironmentConfig lastRemoteRuntimeEnvironment = {};
+  ProdigyInitialTransportCredentialProjection lastRemoteInitialTransportProjection = {};
+  bool remoteBootstrapReceivedInitialTransportProjection = false;
   BrainConfig lastConfig = {};
   Vector<BrainConfig> configureConfigs;
   AddMachines lastAddMachinesRequest = {};
@@ -316,6 +322,7 @@ public:
   ProdigyTimingAttribution addMachinesTiming = {};
   ProdigyTimingAttribution upsertMachineSchemasTiming = {};
   bool failBootstrapRemoteSeed = false;
+  bool failResolveLocalSeed = false;
   bool failConfigureSeedCluster = false;
   bool failFetchSeedTopology = false;
   bool failApplyAddMachines = false;
@@ -349,10 +356,27 @@ public:
     return true;
   }
 
-  bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, String *failure = nullptr) override
+  bool resolveLocalSeedMachine(const MothershipProdigyCluster& cluster, ClusterMachine& seedMachine, String *failure = nullptr) override
+  {
+    (void)cluster;
+    resolveLocalSeedCalls += 1;
+    if (failResolveLocalSeed)
+    {
+      if (failure) failure->assign("resolve local seed failed"_ctv);
+      return false;
+    }
+    seedMachine = localSeedMachine;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, const ProdigyPersistentLocalBrainState *initialLocalState = nullptr, String *failure = nullptr) override
   {
     localBootstrapCalls += 1;
     lastLocalBootState = bootState;
+    localBootstrapReceivedInitialLocalState = initialLocalState != nullptr;
+    lastInitialLocalState = initialLocalState == nullptr ? ProdigyPersistentLocalBrainState {} : *initialLocalState;
+    if (initialLocalState != nullptr && fetchedTopology.machines.empty()) fetchedTopology = bootState.initialTopology;
     callSequence.push_back(ClusterCreateCall::localBootstrap);
     if (failure)
     {
@@ -402,7 +426,7 @@ public:
     return true;
   }
 
-  bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
+  bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, const ProdigyInitialTransportCredentialProjection *initialTransportProjection = nullptr, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
   {
     (void)timingAttribution;
     remoteBootstrapCalls += 1;
@@ -411,6 +435,8 @@ public:
     lastRemoteBootstrapRequest = request;
     lastRemoteBootstrapTopology = topology;
     lastRemoteRuntimeEnvironment = runtimeEnvironment;
+    remoteBootstrapReceivedInitialTransportProjection = initialTransportProjection != nullptr;
+    lastRemoteInitialTransportProjection = initialTransportProjection == nullptr ? ProdigyInitialTransportCredentialProjection {} : *initialTransportProjection;
     callSequence.push_back(ClusterCreateCall::remoteBootstrap);
     if (timingAttribution != nullptr)
     {
@@ -753,6 +779,73 @@ int main(void)
     fakePath += originalPath;
   }
   suite.expect(::setenv("PATH", fakePath.c_str(), 1) == 0, "set_fake_path");
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "local-aegis"_ctv;
+    cluster.clusterUUID = 0x1000;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    cluster.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
+    cluster.desiredEnvironment = ProdigyEnvironmentKind::dev;
+    cluster.controls.push_back(makeUnixControl("/run/prodigy/local-aegis.sock"_ctv));
+    FakeClusterCreateHooks hooks;
+    hooks.localSeedMachine = makeTopologyMachine(
+        "local-aegis"_ctv, "fd00:60::1"_ctv, true,
+        ClusterMachineSource::adopted, ClusterMachineBacking::owned);
+    String failure;
+    suite.expect(mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure) && failure.empty(),
+                 "create_local_aegis_bootstrap_succeeds");
+    suite.expect(hooks.resolveLocalSeedCalls == 1 && hooks.localBootstrapCalls == 1 &&
+                     hooks.remoteBootstrapCalls == 0 && hooks.localBootstrapReceivedInitialLocalState,
+                 "create_local_aegis_resolves_and_bootstraps_local_seed_once");
+    suite.expect(hooks.lastLocalBootState.initialTopology.machines.size() == 1 &&
+                     hooks.lastLocalBootState.initialTopology.machines[0].isBrain &&
+                     hooks.lastLocalBootState.initialTopology.machines[0].uuid != 0 &&
+                     hooks.lastLocalBootState.initialTopology.machines[0].uuid == hooks.lastInitialLocalState.uuid,
+                 "create_local_aegis_binds_boot_topology_to_private_identity");
+    suite.expect(hooks.lastInitialLocalState.ownerClusterUUID == cluster.clusterUUID &&
+                     hooks.lastInitialLocalState.transportCredentialAuthorityRoot.valid() &&
+                     hooks.lastInitialLocalState.transportCredentials.enabled &&
+                     hooks.lastInitialLocalState.transportCredentials.self.role == ProdigyTransportCredentialNodeRole::brain &&
+                     hooks.lastInitialLocalState.transportCredentials.authorizedPeers.size() == 1 &&
+                     hooks.lastInitialLocalState.transportCredentials.authorizedPeers[0].role == ProdigyTransportCredentialNodeRole::neuron &&
+                     hooks.lastInitialLocalState.transportCredentials.committedAuthorityGeneration == 1,
+                 "create_local_aegis_private_state_has_brain_and_hosted_neuron_cohort");
+    suite.expect(equalCallSequence(hooks.callSequence, {ClusterCreateCall::localBootstrap,
+                                                        ClusterCreateCall::configure,
+                                                        ClusterCreateCall::fetchTopology}),
+                 "create_local_aegis_call_sequence");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.name = "local-adopted-aegis-rejected"_ctv;
+    cluster.clusterUUID = 0x1001;
+    cluster.deploymentMode = MothershipClusterDeploymentMode::local;
+    cluster.includeLocalMachine = false;
+    cluster.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
+    cluster.machines.push_back(makeAdoptedMachine(
+        "local-adopted"_ctv, "fd00:61::1"_ctv, true,
+        ClusterMachineBacking::owned));
+    FakeClusterCreateHooks hooks;
+    String failure;
+    suite.expect(!mothershipStandUpCluster(cluster, nullptr, hooks, nullptr, &failure) &&
+                     failure == "local AEGIS creation requires the fresh local machine as seed"_ctv &&
+                     hooks.localBootstrapCalls == 0 && hooks.remoteBootstrapCalls == 0,
+                 "create_local_adopted_aegis_rejected_without_private_seed_path");
+  }
+
+  {
+    ClusterMachine worker = makeTopologyMachine("remote-worker"_ctv, "10.0.0.9"_ctv, false, ClusterMachineSource::adopted, ClusterMachineBacking::cloud);
+    ClusterTopology topology = {};
+    topology.machines.push_back(worker);
+    ProdigyInitialTransportCredentialProjection projection = {};
+    String failure;
+    suite.expect(mothershipBuildRemoteSeedInitialTransportCredentialProjection(0x1000, worker, topology, projection, &failure) == false &&
+                     failure.equals("AEGIS bootstrap requires exactly one Brain seed"_ctv) &&
+                     projection.ledger.empty(),
+                 "create_remote_aegis_rejects_non_brain_seed_projection");
+  }
 
   {
     MothershipProdigyCluster cluster = {};
@@ -1540,6 +1633,7 @@ int main(void)
     cluster.name = "remote-adopted"_ctv;
     cluster.clusterUUID = 0x1003;
     cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
     cluster.provider = MothershipClusterProvider::gcp;
     cluster.providerScope = "projects/example"_ctv;
     cluster.providerCredentialName = "gcp-prod"_ctv;
@@ -1571,6 +1665,16 @@ int main(void)
     suite.expect(hooks.localBootstrapCalls == 0, "create_remote_adopted_no_local_bootstrap");
     suite.expect(hooks.createSeedCalls == 0, "create_remote_adopted_no_provider_seed");
     suite.expect(hooks.remoteBootstrapCalls == 1, "create_remote_adopted_bootstraps_seed_brain");
+    suite.expect(hooks.remoteBootstrapReceivedInitialTransportProjection, "create_remote_adopted_aegis_bootstrap_receives_projection");
+    suite.expect(hooks.lastRemoteInitialTransportProjection.authority.valid() &&
+                     hooks.lastRemoteInitialTransportProjection.committedAuthorityGeneration == 1 &&
+                     hooks.lastRemoteInitialTransportProjection.ledger.size() == 2 &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].clusterUUID == cluster.clusterUUID &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].nodeUUID != 0 &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].role == ProdigyTransportCredentialNodeRole::brain &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[1].nodeUUID == hooks.lastRemoteInitialTransportProjection.ledger[0].nodeUUID &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[1].role == ProdigyTransportCredentialNodeRole::neuron,
+                 "create_remote_adopted_aegis_projection_has_resolved_brain_and_hosted_neuron");
     suite.expect(hooks.lastRemoteSeedClusterUUID == cluster.clusterUUID, "create_remote_adopted_bootstrap_cluster_uuid");
     suite.expect(hooks.lastRemoteSeedMachine.addresses.privateAddresses.size() == 1 && hooks.lastRemoteSeedMachine.addresses.privateAddresses[0].address == "10.1.0.10"_ctv, "create_remote_adopted_uses_first_brain_seed");
     suite.expect(hooks.lastRemoteBootstrapRequest.controlSocketPath == "/run/prodigy/control.sock"_ctv, "create_remote_adopted_bootstrap_request_control_socket");
@@ -1694,6 +1798,7 @@ int main(void)
     cluster.name = "remote-created"_ctv;
     cluster.clusterUUID = 0x1004;
     cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.internalTransportProfile = MothershipInternalTransportProfile::aegisX25519V1;
     cluster.provider = MothershipClusterProvider::aws;
     cluster.providerScope = "acct/us-east-1"_ctv;
     cluster.providerCredentialName = "aws-prod"_ctv;
@@ -1737,6 +1842,15 @@ int main(void)
     suite.expect(hooks.lastCreateSeedInstruction.count == 1, "create_remote_managed_seed_count");
     suite.expect(hooks.lastCreateSeedInstruction.isBrain, "create_remote_managed_seed_is_brain");
     suite.expect(hooks.remoteBootstrapCalls == 1, "create_remote_managed_bootstraps_created_seed");
+    suite.expect(hooks.remoteBootstrapReceivedInitialTransportProjection, "create_remote_managed_aegis_bootstrap_receives_projection");
+    suite.expect(hooks.lastRemoteInitialTransportProjection.authority.valid() &&
+                     hooks.lastRemoteInitialTransportProjection.ledger.size() == 2 &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].clusterUUID == cluster.clusterUUID &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].nodeUUID != 0 &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[0].role == ProdigyTransportCredentialNodeRole::brain &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[1].nodeUUID == hooks.lastRemoteInitialTransportProjection.ledger[0].nodeUUID &&
+                     hooks.lastRemoteInitialTransportProjection.ledger[1].role == ProdigyTransportCredentialNodeRole::neuron,
+                 "create_remote_managed_aegis_projection_has_resolved_brain_and_hosted_neuron");
     suite.expect(hooks.lastRemoteSeedClusterUUID == cluster.clusterUUID, "create_remote_managed_bootstrap_cluster_uuid");
     suite.expect(hooks.lastRemoteBootstrapRequest.clusterUUID == cluster.clusterUUID, "create_remote_managed_bootstrap_request_cluster_uuid");
     suite.expect(hooks.lastRemoteBootstrapTopology.machines.size() == 1, "create_remote_managed_seed_topology_size");

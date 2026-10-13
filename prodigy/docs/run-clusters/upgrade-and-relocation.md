@@ -474,3 +474,56 @@ performance or soak, live Nametag, or a general cross-cluster control plane.
 Clusters retain separate Brain authority; foreign traffic enters the
 destination through Switchboard, and Mothership remains the only migration and
 test-lifecycle coordinator.
+
+### G6 physical-boundary preparation — 2026-10-12 (not qualified)
+
+G6 remains a physical-evidence gate. A local virtual-datacenter result, schema
+validation, or provider API submission cannot qualify the VM-isolated
+LAN-to-Vultr and cloud-to-cloud rows.
+
+The candidate closes bootstrap and endpoint prerequisites without claiming that
+result. Fresh local and remote `aegis-x25519-v1` creation resolve the seed's
+durable machine UUID and use the same initial-cohort builder as the test
+provider, producing independent Brain and hosted-Neuron credentials under one
+new cluster authority. The local path carries the private projection through a
+mode-0600 ephemeral file into Prodigy's existing durable private-state owner,
+removes that file before service start, and rejects adopted local seeds that
+cannot use that path. Subsequent membership still uses the ordinary Brain
+lifecycle. Cloud Brains now prefer a valid global-unicast IPv6 pair-control
+endpoint from the public roster and fall back to private IPv6; `dev` and unknown
+environments preserve private-first selection.
+
+Mothership also exposes one bounded provider fault operation:
+`faultRemoteCloudMachine CLUSTER MACHINE_UUID hard-reboot`. It refreshes the
+cluster's authoritative topology, accepts only an exact Mothership-created cloud
+machine UUID in a remote Vultr cluster, and requires the refreshed cluster view
+to preserve the complete durable machine roster and every source, backing and
+cloud-identity authorization. It then uses the cluster's stored provider
+credential and submits exactly one provider hard reboot. The command does not
+accept a caller-supplied cloud ID or secret, cannot authorize a changed target or
+non-target from the cluster report, and does not claim recovery; subsequent
+`clusterReport` evidence must prove it.
+
+`prodigy_g6_preflight.py` is an offline, fail-closed evidence-contract check.
+`result: planned` validates only a proposed run. `result: pass` additionally
+requires exact candidate, binary, bundle and Discombobulator contract/build
+identities; both physical rows; actual spend within the total cap; Mothership
+command and fault receipts inside the execution window; all four G5 lifecycle
+cases; the full routing, NAT, IPv4/IPv6, MTU/PMTU, DNS, TLS/client-identity,
+service-discovery and full/asymmetric-partition boundary matrix; monotonic active,
+drain, retirement, withdrawal and stale-replay evidence; and verified zero
+residual instances, VPCs, blocks and IPs after cleanup. Its versioned schema
+rejects unknown fields and embedded secret material rather than treating names or
+provider submissions as proof.
+
+No physical G6 run was performed at this checkpoint. The available Vultr
+credential returned HTTP 401, so authenticated inventory and prior-spend
+reconciliation could not be established; no provider resource was created and no
+new spend was incurred. Independently, production-equivalent remote service
+transit, a Mothership-owned physical network-partition operation, and a typed
+local-machine fault operation do not yet exist outside the test provider, while
+the G5 migration coordinator remains test-cluster-specific. The preflight names
+those missing owners and cannot accept a passing manifest without their receipts.
+Those are implementation blockers, not evidence that may be waived by a local
+topology. Stateful/application data semantics, G4, and live Nametag qualification
+remain deferred application stages.

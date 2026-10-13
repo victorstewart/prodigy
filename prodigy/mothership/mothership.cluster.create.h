@@ -11,6 +11,7 @@
 #include <prodigy/mothership/mothership.provider.credentials.h>
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/persistent.state.h>
+#include <prodigy/remote.bootstrap.h>
 
 enum class MothershipClusterSeedMode : uint8_t {
   local = 0,
@@ -933,10 +934,11 @@ public:
 
   virtual ~MothershipClusterCreateHooks() = default;
   virtual bool prepareProviderBootstrapArtifacts(const MothershipProdigyCluster& cluster, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
-  virtual bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, String *failure = nullptr) = 0;
+  virtual bool resolveLocalSeedMachine(const MothershipProdigyCluster& cluster, ClusterMachine& seedMachine, String *failure = nullptr) = 0;
+  virtual bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, const ProdigyPersistentLocalBrainState *initialLocalState = nullptr, String *failure = nullptr) = 0;
   virtual bool createSeedMachine(const MothershipProdigyCluster& cluster, const CreateMachinesInstruction& instruction, ClusterMachine& seedMachine, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool destroyCreatedSeedMachine(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, String *failure = nullptr) = 0;
-  virtual bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
+  virtual bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, const ProdigyInitialTransportCredentialProjection *initialTransportProjection = nullptr, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
   virtual bool configureSeedCluster(const MothershipProdigyCluster& cluster, const BrainConfig& config, String *failure = nullptr) = 0;
   // Test providers receive canonical follower bootstrap material only after
   // the seed has accepted this configuration. They then use ordinary
@@ -947,6 +949,53 @@ public:
   virtual bool upsertMachineSchemas(const MothershipProdigyCluster& cluster, const Vector<ProdigyManagedMachineSchemaPatch>& patches, ClusterTopology& topology, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) = 0;
 };
 
+// AEGIS starts with exactly one Brain.  Resolve that Brain's stable
+// bootstrap identity before minting its one-time credential projection; later
+// members are admitted by the configured Brain through the ordinary lifecycle.
+static inline bool mothershipBuildSeedInitialTransportCredentialMaterial(
+    uint128_t clusterUUID, const ClusterMachine& seedMachine, const ClusterTopology& seedTopology,
+    ProdigyPersistentLocalBrainState& localState, ClusterTopology& resolvedTopology,
+    ProdigyInitialTransportCredentialProjection& output, String *failure = nullptr)
+{
+  localState = {};
+  resolvedTopology = {};
+  output = {};
+  if (clusterUUID == 0 || seedTopology.machines.size() != 1 || seedMachine.isBrain == false)
+  {
+    if (failure) failure->assign("AEGIS bootstrap requires exactly one Brain seed"_ctv);
+    return false;
+  }
+
+  localState.ownerClusterUUID = clusterUUID;
+  if (prodigyBuildRemoteBootstrapTransportTLSState(seedMachine, seedTopology, localState, resolvedTopology, failure) == false ||
+      resolvedTopology.machines.size() != 1 || resolvedTopology.machines[0].isBrain == false ||
+      resolvedTopology.machines[0].uuid == 0 || resolvedTopology.machines[0].sameIdentityAs(seedMachine) == false ||
+      localState.uuid != resolvedTopology.machines[0].uuid)
+  {
+    if (failure && failure->empty()) failure->assign("AEGIS bootstrap seed identity is missing or ambiguous"_ctv);
+    return false;
+  }
+
+  if (!prodigyBuildInitialTransportCredentialProjection(clusterUUID, resolvedTopology, output, failure) ||
+      !prodigyBuildLocalTransportCredentialState(output.authority, output.ledger, localState.uuid,
+          ProdigyTransportCredentialNodeRole::brain, localState, output.committedAuthorityGeneration))
+  {
+    if (failure && failure->empty()) failure->assign("AEGIS bootstrap local credential projection is invalid"_ctv);
+    return false;
+  }
+  return true;
+}
+
+static inline bool mothershipBuildRemoteSeedInitialTransportCredentialProjection(
+    uint128_t clusterUUID, const ClusterMachine& seedMachine, const ClusterTopology& seedTopology,
+    ProdigyInitialTransportCredentialProjection& output, String *failure = nullptr)
+{
+  ProdigyPersistentLocalBrainState localState = {};
+  ClusterTopology resolvedTopology = {};
+  return mothershipBuildSeedInitialTransportCredentialMaterial(
+      clusterUUID, seedMachine, seedTopology, localState, resolvedTopology, output, failure);
+}
+
 static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, const MothershipProviderCredential *credential, MothershipClusterCreateHooks& hooks, MothershipClusterCreateTimingSummary *timingSummary = nullptr, String *failure = nullptr, const MothershipProviderCredential *dnsCredential = nullptr)
 {
   if (failure)
@@ -955,9 +1004,10 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
   }
 
   if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1 &&
-      cluster.deploymentMode != MothershipClusterDeploymentMode::test)
+      cluster.deploymentMode == MothershipClusterDeploymentMode::local &&
+      !mothershipClusterIncludesLocalMachine(cluster))
   {
-    if (failure) failure->assign("AEGIS transport creation currently requires fresh test-cluster provisioning"_ctv);
+    if (failure) failure->assign("local AEGIS creation requires the fresh local machine as seed"_ctv);
     return false;
   }
 
@@ -1052,7 +1102,33 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     bootState.bootstrapSshPrivateKeyPath = bootstrapRequest.bootstrapSshPrivateKeyPath;
     prodigyOwnRuntimeEnvironmentConfig(config.runtimeEnvironment, bootState.runtimeEnvironment);
 
-    if (hooks.bootstrapLocalSeed(bootState, failure) == false)
+    ProdigyPersistentLocalBrainState initialLocalState = {};
+    const ProdigyPersistentLocalBrainState *initialLocalStatePtr = nullptr;
+    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1)
+    {
+      ClusterMachine localSeed = {};
+      ClusterTopology seedTopology = {}, resolvedTopology = {};
+      ProdigyInitialTransportCredentialProjection initialTransportProjection = {};
+      String localFailure = {};
+      if (!hooks.resolveLocalSeedMachine(cluster, localSeed, &localFailure))
+      {
+        if (failure) failure->assign(localFailure);
+        return false;
+      }
+      seedTopology.machines.push_back(localSeed);
+      if (!mothershipBuildSeedInitialTransportCredentialMaterial(
+              cluster.clusterUUID, localSeed, seedTopology, initialLocalState,
+              resolvedTopology, initialTransportProjection, &localFailure))
+      {
+        if (failure) failure->assign(localFailure);
+        return false;
+      }
+      bootState.initialTopology = resolvedTopology;
+      cluster.topology = resolvedTopology;
+      initialLocalStatePtr = &initialLocalState;
+    }
+
+    if (hooks.bootstrapLocalSeed(bootState, initialLocalStatePtr, failure) == false)
     {
       return false;
     }
@@ -1076,12 +1152,25 @@ static inline bool mothershipStandUpCluster(MothershipProdigyCluster& cluster, c
     mothershipBuildSeedTopology(seedPlan.seedMachine, seedTopology);
     cluster.topology = seedTopology;
 
+    String localFailure;
+    ProdigyInitialTransportCredentialProjection initialTransportProjection = {};
+    const ProdigyInitialTransportCredentialProjection *initialTransportProjectionPtr = nullptr;
+    if (cluster.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1)
+    {
+      if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+          mothershipBuildRemoteSeedInitialTransportCredentialProjection(
+              cluster.clusterUUID, seedPlan.seedMachine, seedTopology, initialTransportProjection, &localFailure) == false)
+      {
+        return failWithCleanup(localFailure.empty() ? "remote AEGIS bootstrap projection unavailable"_ctv : localFailure);
+      }
+      initialTransportProjectionPtr = &initialTransportProjection;
+    }
+
     ProdigyRuntimeEnvironmentConfig bootstrapRuntimeEnvironment = {};
     mothershipBuildSeedBootstrapRuntimeEnvironment(config.runtimeEnvironment, bootstrapRuntimeEnvironment);
 
-    String localFailure;
     ProdigyTimingAttribution stageTiming = {};
-    if (hooks.bootstrapRemoteSeed(cluster, seedPlan.seedMachine, bootstrapRequest, seedTopology, bootstrapRuntimeEnvironment, &stageTiming, &localFailure) == false)
+    if (hooks.bootstrapRemoteSeed(cluster, seedPlan.seedMachine, bootstrapRequest, seedTopology, bootstrapRuntimeEnvironment, initialTransportProjectionPtr, &stageTiming, &localFailure) == false)
     {
       return failWithCleanup(localFailure);
     }

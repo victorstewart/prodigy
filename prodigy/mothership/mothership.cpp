@@ -5182,7 +5182,54 @@ static bool mothershipSnapshotLocalTestClusterFailureWorkspace(const MothershipP
   return true;
 }
 
-static bool bootstrapLocalProdigy(const ProdigyPersistentBootState& bootState, String *failure = nullptr)
+static bool mothershipWritePrivateBootstrapTemporary(
+    const String& contents, String& path, String *failure = nullptr)
+{
+  path.clear();
+  char temporary[] = "/var/lib/prodigy/transport.tls.XXXXXX";
+  int fd = ::mkstemp(temporary);
+  if (fd < 0)
+  {
+    if (failure) failure->snprintf<"failed to create private local bootstrap state: {}"_ctv>(String(std::strerror(errno)));
+    return false;
+  }
+  auto reject = [&](const char *operation, int error) -> bool {
+    ::close(fd);
+    ::unlink(temporary);
+    if (failure) failure->snprintf<"failed to {} private local bootstrap state: {}"_ctv>(String(operation), String(std::strerror(error)));
+    return false;
+  };
+  if (::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 || ::fchmod(fd, 0600) != 0)
+  {
+    return reject("secure", errno);
+  }
+  uint64_t offset = 0;
+  while (offset < contents.size())
+  {
+    const ssize_t written = ::write(fd, contents.data() + offset, size_t(contents.size() - offset));
+    if (written < 0 && errno == EINTR) continue;
+    if (written <= 0) return reject("write", errno);
+    offset += uint64_t(written);
+  }
+  if (::fsync(fd) != 0) return reject("sync", errno);
+  if (::close(fd) != 0)
+  {
+    const int saved = errno;
+    fd = -1;
+    ::unlink(temporary);
+    if (failure) failure->snprintf<"failed to close private local bootstrap state: {}"_ctv>(String(std::strerror(saved)));
+    return false;
+  }
+  fd = -1;
+  path.assign(temporary);
+  if (failure) failure->clear();
+  return true;
+}
+
+static bool bootstrapLocalProdigy(
+    const ProdigyPersistentBootState& bootState,
+    const ProdigyPersistentLocalBrainState *initialLocalState = nullptr,
+    String *failure = nullptr)
 {
   if (failure)
   {
@@ -5258,6 +5305,34 @@ static bool bootstrapLocalProdigy(const ProdigyPersistentBootState& bootState, S
   String bootJSON;
   renderProdigyPersistentBootStateJSON(bootState, bootJSON);
 
+  String transportTLSJSON = {}, transportTLSPath = {};
+  if (initialLocalState != nullptr)
+  {
+    if (!prodigyLocalTransportCredentialStateValid(*initialLocalState) ||
+        initialLocalState->transportCredentials.self.role != ProdigyTransportCredentialNodeRole::brain ||
+        initialLocalState->uuid == 0 || initialLocalState->ownerClusterUUID == 0)
+    {
+      if (failure) failure->assign("invalid private local AEGIS bootstrap state"_ctv);
+      return false;
+    }
+    renderProdigyPersistentLocalBrainStateJSON(*initialLocalState, transportTLSJSON);
+    if (!mothershipWritePrivateBootstrapTemporary(transportTLSJSON, transportTLSPath, failure))
+    {
+      Vault::secureClearString(transportTLSJSON);
+      return false;
+    }
+  }
+  struct PrivateBootstrapFileScope final
+  {
+    String& path;
+    String& contents;
+    ~PrivateBootstrapFileScope()
+    {
+      if (!path.empty()) ::unlink(path.c_str());
+      Vault::secureClearString(contents);
+    }
+  } privateBootstrapFileScope {transportTLSPath, transportTLSJSON};
+
   String persistCommand;
   persistCommand.assign("LD_LIBRARY_PATH="_ctv);
   prodigyAppendShellSingleQuoted(persistCommand, installPaths.libraryDirectory);
@@ -5265,9 +5340,25 @@ static bool bootstrapLocalProdigy(const ProdigyPersistentBootState& bootState, S
   prodigyAppendShellSingleQuoted(persistCommand, installPaths.binaryPath);
   persistCommand.append(" --persist-only --reset-brain-snapshot --boot-json="_ctv);
   prodigyAppendShellSingleQuoted(persistCommand, bootJSON);
+  if (!transportTLSPath.empty())
+  {
+    persistCommand.append(" --transport-tls-json-path="_ctv);
+    prodigyAppendShellSingleQuoted(persistCommand, transportTLSPath);
+  }
   if (prodigyRunLocalShellCommand(persistCommand, failure) == false)
   {
     return false;
+  }
+
+  if (!transportTLSPath.empty())
+  {
+    if (::unlink(transportTLSPath.c_str()) != 0 && errno != ENOENT)
+    {
+      if (failure) failure->snprintf<"failed to remove private local bootstrap state: {}"_ctv>(String(std::strerror(errno)));
+      return false;
+    }
+    transportTLSPath.clear();
+    Vault::secureClearString(transportTLSJSON);
   }
 
   if (prodigyRunLocalShellCommand("systemctl daemon-reload && systemctl enable prodigy && systemctl restart prodigy"_ctv, failure) == false)
@@ -8618,7 +8709,7 @@ private:
       return false;
     }
 
-    return bootstrapLocalProdigy(bootState, &failure);
+    return bootstrapLocalProdigy(bootState, nullptr, &failure);
   }
 
   bool stopLocalProdigyInstance(String& failure)
@@ -9574,9 +9665,14 @@ private:
       return true;
     }
 
-    bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, String *failure = nullptr) override
+    bool resolveLocalSeedMachine(const MothershipProdigyCluster& cluster, ClusterMachine& seedMachine, String *failure = nullptr) override
     {
-      return bootstrapLocalProdigy(bootState, failure);
+      return owner->buildLocalClusterMachineProbe(cluster, seedMachine, failure);
+    }
+
+    bool bootstrapLocalSeed(const ProdigyPersistentBootState& bootState, const ProdigyPersistentLocalBrainState *initialLocalState = nullptr, String *failure = nullptr) override
+    {
+      return bootstrapLocalProdigy(bootState, initialLocalState, failure);
     }
 
     bool createSeedMachine(const MothershipProdigyCluster& cluster, const CreateMachinesInstruction& instruction, ClusterMachine& seedMachine, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
@@ -9966,7 +10062,7 @@ private:
       return true;
     }
 
-    bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
+    bool bootstrapRemoteSeed(const MothershipProdigyCluster& cluster, const ClusterMachine& seedMachine, const AddMachines& request, const ClusterTopology& topology, const ProdigyRuntimeEnvironmentConfig& runtimeEnvironment, const ProdigyInitialTransportCredentialProjection *seedTransportProjection = nullptr, ProdigyTimingAttribution *timingAttribution = nullptr, String *failure = nullptr) override
     {
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
       uint64_t stageStartNs = Time::now<TimeResolution::ns>();
@@ -10158,7 +10254,7 @@ private:
       }
 
       ProdigyRemoteBootstrapPlan plan = {};
-      if (prodigyBuildRemoteBootstrapPlan(seedMachine, request, topology, runtimeEnvironment, plan, failure) == false)
+      if (prodigyBuildRemoteBootstrapPlan(seedMachine, request, topology, runtimeEnvironment, plan, failure, seedTransportProjection) == false)
       {
         finalizeTiming();
         return false;
@@ -11354,6 +11450,99 @@ private:
     basics_log("adoptTestClusterSpare submitted=%u target=%s failure=%s\n",
         unsigned(sent), spare.ssh.address.c_str(), failure.c_str());
     if (!sent) exit(EXIT_FAILURE);
+  }
+
+  void runFaultRemoteCloudMachine(int argc, char *argv[])
+  {
+    String identity = argc > 0 ? String(argv[0]) : String();
+    String action = argc > 2 ? String(argv[2]) : String();
+    String failure = {};
+    uint128_t machineUUID = 0;
+    MothershipProdigyCluster cluster = {};
+    bool valid = argc == 3 && action == "hard-reboot"_ctv &&
+        prodigyParseCanonicalHex128(String(argv[1]), machineUUID) && machineUUID != 0 &&
+        loadClusterForScopedMutation("faultRemoteCloudMachine", identity, cluster, failure);
+    if (valid == false && failure.empty())
+    {
+      failure.assign("usage: faultRemoteCloudMachine CLUSTER MACHINE_UUID hard-reboot"_ctv);
+    }
+    if (valid && (cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+                  cluster.provider != MothershipClusterProvider::vultr))
+    {
+      failure.assign("faultRemoteCloudMachine requires a remote Vultr cluster"_ctv);
+      valid = false;
+    }
+
+    ClusterTopology currentTopology = {};
+    if (valid)
+    {
+      ClusterCreateHooks hooks(this);
+      valid = hooks.fetchSeedTopology(cluster, currentTopology, &failure);
+      if (valid == false)
+      {
+        persistClusterRefreshFailure(cluster, failure);
+      }
+    }
+
+    String cloudID = {};
+    if (valid)
+    {
+      valid = mothershipResolveVerifiedCreatedCloudMachineID(
+          cluster.topology, currentTopology, machineUUID, cloudID, &failure);
+      if (valid)
+      {
+        persistClusterTopology(cluster, currentTopology);
+      }
+      else
+      {
+        persistClusterRefreshFailure(cluster, failure);
+      }
+    }
+
+    MothershipProviderCredential credential = {};
+    ProdigyRuntimeEnvironmentConfig runtimeEnvironment = {};
+    if (valid)
+    {
+      valid = validateClusterProviderCredentialReference(cluster, failure, &credential) &&
+          mothershipBuildClusterProvisioningRuntimeEnvironment(cluster, &credential, runtimeEnvironment, &failure) &&
+          runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr;
+      if (valid == false && failure.empty())
+      {
+        failure.assign("faultRemoteCloudMachine could not construct the Vultr provider environment"_ctv);
+      }
+    }
+
+    bool submitted = false;
+    if (valid)
+    {
+      submitted = mothershipRunProviderHostJob(
+          hostRuntime,
+          runtimeEnvironment,
+          MultiCurlClient::Clock::now() + std::chrono::minutes(5),
+          "hard reboot",
+          failure,
+          [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+            if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                  mothershipHardRebootProviderMachine(coro, provider, cloudID, completed, &jobFailure);
+                }))
+            {
+              co_await coro->suspendAtIndex(suspendIndex);
+            }
+          });
+    }
+
+    basics_log("faultRemoteCloudMachine submitted=%u action=hard-reboot clusterUUID=%016llx%016llx machineUUID=%016llx%016llx topologyVersion=%llu failure=%s\n",
+               unsigned(submitted),
+               (unsigned long long)(cluster.clusterUUID >> 64),
+               (unsigned long long)cluster.clusterUUID,
+               (unsigned long long)(machineUUID >> 64),
+               (unsigned long long)machineUUID,
+               (unsigned long long)currentTopology.version,
+               failure.c_str());
+    if (submitted == false)
+    {
+      exit(EXIT_FAILURE);
+    }
   }
 
   void runFaultTestCluster(int argc, char *argv[])
@@ -23490,6 +23679,7 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
+        {"faultRemoteCloudMachine",         &Mothership::runFaultRemoteCloudMachine        },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
@@ -23584,7 +23774,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultTestCluster, faultTestClusters, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -23634,6 +23824,8 @@ int main(int argc, char *argv[])
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
     message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
+    message.append("faultRemoteCloudMachine [clusterName|clusterUUID] [machineUUID canonical hex] hard-reboot\n");
+    message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
     message.append("\trequests a bounded virtual-datacenter machine fault through the Mothership-owned test provider\n");
     message.append("faultTestClusters [first name|clusterUUID] [first machineIndex] [second name|clusterUUID] [second machineIndex] [durationMs]\n");

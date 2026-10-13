@@ -33547,10 +33547,29 @@ public:
       endpoint.nodeUUID = machine.uuid;
       endpoint.port = uint16_t(ReservedPorts::clusterPairControl);
       bool found = false;
-      for (const auto *addresses : {&machine.addresses.privateAddresses, &machine.addresses.publicAddresses})
+      const auto *preferredAddresses = &machine.addresses.privateAddresses;
+      const auto *fallbackAddresses = &machine.addresses.publicAddresses;
+      bool publicGlobalUnicastRequired = false;
+      switch (brainConfig.runtimeEnvironment.kind)
+      {
+        case ProdigyEnvironmentKind::gcp:
+        case ProdigyEnvironmentKind::aws:
+        case ProdigyEnvironmentKind::azure:
+        case ProdigyEnvironmentKind::vultr:
+          std::swap(preferredAddresses, fallbackAddresses);
+          publicGlobalUnicastRequired = true;
+          break;
+        case ProdigyEnvironmentKind::unknown:
+        case ProdigyEnvironmentKind::dev:
+          break;
+      }
+      for (const auto *addresses : {preferredAddresses, fallbackAddresses})
       {
         for (const auto& candidate : *addresses)
-          if (ClusterMachine::parseIPAddressLiteral(candidate.address, endpoint.address) && clusterPairControlEndpointValid(endpoint))
+          if (ClusterMachine::parseIPAddressLiteral(candidate.address, endpoint.address) &&
+              clusterPairControlEndpointValid(endpoint) &&
+              (!publicGlobalUnicastRequired || addresses != preferredAddresses ||
+               clusterPairControlEndpointGlobalUnicastIPv6(endpoint)))
           { found = true; break; }
         if (found) break;
       }
