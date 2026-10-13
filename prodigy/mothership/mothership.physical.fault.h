@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <arpa/inet.h>
 
 #include <prodigy/mothership/mothership.cluster.types.h>
@@ -54,6 +55,26 @@ static inline bool mothershipParseVerifiedLocalVMIdentity(const String& marker,
   if (digits != 32 || parsed == 0) return false;
   machineUUID = parsed;
   return true;
+}
+
+static inline bool mothershipLocalVMGuestUUIDMatches(uint128_t machineUUID,
+                                                     std::string_view guestUUID)
+{
+  if (machineUUID == 0) return false;
+  uint128_t parsed = 0;
+  uint32_t digits = 0;
+  for (char byte : guestUUID)
+  {
+    if (byte == '-') continue;
+    uint8_t nibble = 0;
+    if (byte >= '0' && byte <= '9') nibble = uint8_t(byte - '0');
+    else if (byte >= 'a' && byte <= 'f') nibble = uint8_t(byte - 'a' + 10);
+    else if (byte >= 'A' && byte <= 'F') nibble = uint8_t(byte - 'A' + 10);
+    else return false;
+    if (++digits > 32) return false;
+    parsed = (parsed << 4) | nibble;
+  }
+  return digits == 32 && parsed == machineUUID;
 }
 
 enum class MothershipPhysicalFaultDirection : uint8_t {

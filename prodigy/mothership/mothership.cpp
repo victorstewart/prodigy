@@ -13263,20 +13263,6 @@ private:
     return matches == 1 && mothershipPhysicalFaultNumericAddressValid(address);
   }
 
-  static bool localVMBoundaryGuestUUIDMatches(uint128_t machineUUID, std::string_view guestUUID)
-  {
-    String expected = {}; expected.assignItoh(machineUUID);
-    String normalized = {};
-    for (char byte : guestUUID)
-    {
-      if (byte == '-') continue;
-      if (byte >= 'A' && byte <= 'F') byte = char(byte - 'A' + 'a');
-      if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) return false;
-      normalized.append(byte);
-    }
-    return normalized == expected;
-  }
-
   // The registering caller never selects executable bytes.  For every query or
   // action, stage the launcher compiled into Mothership, then make the remote
   // Python process hash and execute the same opened descriptor.  In particular,
@@ -13394,7 +13380,7 @@ private:
         object["ovmfVars"].get(ovmfVars) || object["qmpSocket"].get(qmpSocket) ||
         object["qemuStarttime"].get(starttime) || object["qemuPID"].get(pid) ||
         object["qemuCommand"].get(qemuCommand) || !stringViewMatches(taskID, descriptor.taskID) || pid == 0 ||
-        !localVMBoundaryGuestUUIDMatches(descriptor.machineUUID, guestUUID))
+        !mothershipLocalVMGuestUUIDMatches(descriptor.machineUUID, guestUUID))
     { failure.assign("local VM executor state conflicts with its registered task or guest identity"_ctv); return false; }
     auto safeText = [](std::string_view value) {
       if (value.empty() || value.size() > 4096) return false;

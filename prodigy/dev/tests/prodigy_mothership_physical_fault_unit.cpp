@@ -65,6 +65,19 @@ int main(void)
                    "unverified\n"_ctv,
                    "12345678-1234-4234-9234-123456789abc\n"_ctv, verifiedVMUUID),
                "local_vm_marker_rejects_unverified_boundary");
+  const uint128_t boundaryMachineUUID =
+      String::numberFromHexString<uint128_t>("c776150f4271478e84caada31f261c77"_ctv);
+  suite.expect(mothershipLocalVMGuestUUIDMatches(
+                   boundaryMachineUUID, "c776150f-4271-478e-84ca-ada31f261c77"),
+               "local_vm_boundary_matches_hyphenated_dmi_uuid_without_formatter_prefix");
+  suite.expect(mothershipLocalVMGuestUUIDMatches(
+                   boundaryMachineUUID, "C776150F-4271-478E-84CA-ADA31F261C77"),
+               "local_vm_boundary_matches_uppercase_dmi_uuid");
+  suite.expect(!mothershipLocalVMGuestUUIDMatches(
+                   boundaryMachineUUID, "0xc776150f4271478e84caada31f261c77") &&
+                   !mothershipLocalVMGuestUUIDMatches(
+                       boundaryMachineUUID, "c776150f-4271-478e-84ca-ada31f261c78"),
+               "local_vm_boundary_rejects_non_dmi_or_different_uuid");
 
   MothershipPhysicalServiceTransitBoundary boundary = {};
   boundary.boundaryUUID = 0x10; boundary.pairOperationUUID = 0x11;
