@@ -699,6 +699,54 @@ int main(void)
     }
     suite.expect(listedSeeded, "list_seeded_clusters");
     suite.expect(seededClusters.size() == 2, "list_seeded_clusters_count");
+
+    // A seed-only local cluster must not retain unused bootstrap credentials,
+    // but the membership transition that first adopts a remote machine must be
+    // able to provide its bootstrap descriptor again.
+    suite.expect(storedLocal.bootstrapSshUser.size() == 0, "seed_only_local_cluster_scrubs_bootstrap_ssh_user");
+    suite.expect(storedLocal.bootstrapSshPrivateKeyPath.size() == 0, "seed_only_local_cluster_scrubs_bootstrap_ssh_key_path");
+
+    Vault::SSHKeyPackage adoptedBootstrapPackage = {};
+    bool generatedAdoptedBootstrapPackage = Vault::generateSSHKeyPackageEd25519(
+        adoptedBootstrapPackage, "restart-local-bootstrap"_ctv, &failure);
+    suite.expect(generatedAdoptedBootstrapPackage, "seed_only_local_cluster_generate_adopted_bootstrap_ssh");
+    String adoptedBootstrapPrivateKeyPath = {};
+    adoptedBootstrapPrivateKeyPath.assign(dbRoot);
+    adoptedBootstrapPrivateKeyPath.append("/restart-local-key"_ctv);
+    String adoptedBootstrapPublicKeyPath = {};
+    adoptedBootstrapPublicKeyPath.assign(adoptedBootstrapPrivateKeyPath);
+    adoptedBootstrapPublicKeyPath.append(".pub"_ctv);
+    suite.expect(writeFileText(adoptedBootstrapPrivateKeyPath, adoptedBootstrapPackage.privateKeyOpenSSH),
+                 "seed_only_local_cluster_write_adopted_bootstrap_private_key");
+    suite.expect(writeFileText(adoptedBootstrapPublicKeyPath, adoptedBootstrapPackage.publicKeyOpenSSH),
+                 "seed_only_local_cluster_write_adopted_bootstrap_public_key");
+
+    MothershipProdigyCluster adoptedMembership = storedLocal;
+    adoptedMembership.bootstrapSshUser = "root"_ctv;
+    adoptedMembership.bootstrapSshPrivateKeyPath = adoptedBootstrapPrivateKeyPath;
+    MothershipProdigyClusterMachine adoptedMachine = {};
+    adoptedMachine.source = MothershipClusterMachineSource::adopted;
+    adoptedMachine.backing = ClusterMachineBacking::owned;
+    adoptedMachine.lifetime = MachineLifetime::owned;
+    adoptedMachine.kind = MachineConfig::MachineKind::bareMetal;
+    adoptedMachine.isBrain = true;
+    adoptedMachine.ssh.address = "fd00::10"_ctv;
+    adoptedMachine.ssh.user = "root"_ctv;
+    adoptedMachine.ssh.privateKeyPath = adoptedMembership.bootstrapSshPrivateKeyPath;
+    adoptedMachine.ssh.hostPublicKeyOpenSSH = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeBootstrapHostKey"_ctv;
+    adoptedMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
+    adoptedMembership.machines.push_back(adoptedMachine);
+
+    MothershipProdigyCluster normalizedAdoptedMembership = {};
+    bool validatedAdoptedMembership = MothershipClusterRegistry::validateClusterForStorage(
+        adoptedMembership, normalizedAdoptedMembership, &failure);
+    suite.expect(validatedAdoptedMembership, "seed_only_local_cluster_adopted_membership_accepts_bootstrap_ssh");
+    suite.expect(failure.size() == 0, "seed_only_local_cluster_adopted_membership_bootstrap_ssh_no_failure");
+    suite.expect(normalizedAdoptedMembership.bootstrapSshUser.equals("root"_ctv), "seed_only_local_cluster_adopted_membership_keeps_bootstrap_ssh_user");
+    suite.expect(normalizedAdoptedMembership.bootstrapSshPrivateKeyPath == adoptedBootstrapPrivateKeyPath,
+                 "seed_only_local_cluster_adopted_membership_keeps_bootstrap_ssh_key_path");
+    suite.expect(normalizedAdoptedMembership.bootstrapSshKeyPackage == adoptedBootstrapPackage,
+                 "seed_only_local_cluster_adopted_membership_resolves_bootstrap_ssh_package");
   }
 
   String mothershipBinary = PRODIGY_TEST_BINARY_DIR "/mothership";
@@ -892,6 +940,18 @@ int main(void)
   suite.expect(ranMissingMachines, "run_set_local_cluster_membership_missing_machines");
   suite.expect(missingMachinesExitCode == EXIT_FAILURE, "set_local_cluster_membership_missing_machines_exit_failure");
   suite.expect(stringContains(missingMachinesOutput, "setLocalClusterMembership.machines required"), "set_local_cluster_membership_missing_machines_reason");
+
+  String bootstrapFieldsWithoutMachinesOutput = {};
+  int bootstrapFieldsWithoutMachinesExitCode = -1;
+  bool ranBootstrapFieldsWithoutMachines = runMothershipCommand(
+      mothershipBinary,
+      dbRoot,
+      {"setLocalClusterMembership", "restart-local", "{\"includeLocalMachine\":true,\"bootstrapSshUser\":\"root\",\"bootstrapSshPrivateKeyPath\":\"/tmp/restart-local-key\"}"},
+      bootstrapFieldsWithoutMachinesOutput,
+      bootstrapFieldsWithoutMachinesExitCode);
+  suite.expect(ranBootstrapFieldsWithoutMachines, "run_set_local_cluster_membership_bootstrap_fields");
+  suite.expect(bootstrapFieldsWithoutMachinesExitCode == EXIT_FAILURE, "set_local_cluster_membership_bootstrap_fields_exit_failure");
+  suite.expect(stringContains(bootstrapFieldsWithoutMachinesOutput, "setLocalClusterMembership.machines required"), "set_local_cluster_membership_bootstrap_fields_accepted_before_membership_validation");
 
   String wrongModeTestOutput = {};
   int wrongModeTestExitCode = -1;

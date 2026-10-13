@@ -1,0 +1,301 @@
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <unistd.h>
+
+#include <prodigy/mothership/mothership.cluster.registry.h>
+
+static String digest(char value)
+{
+  String result = {};
+  for (uint32_t index = 0; index < 64; ++index) result.append(value);
+  return result;
+}
+
+static CousinRouteRecord makeRoute()
+{
+  CousinRouteRecord value = {};
+  value.routeUUID = 0x101; value.operationUUID = 0x102; value.pairUUID = 0x103;
+  value.logicalWorkloadUUID = 0x104; value.logicalServiceUUID = 0x105;
+  value.sourceClusterUUID = 0x201; value.destinationClusterUUID = 0x202;
+  value.sourceApplicationID = 7; value.destinationApplicationID = 19;
+  value.sourceCousinServicePrefix = MeshServices::generateStatefulService(7, 3);
+  value.destinationCousinServicePrefix = MeshServices::generateStatefulService(19, 3);
+  value.slots.insert(3); value.destinationRoutablePrefixUUID = 0x106;
+  value.destinationPublicAddress = IPAddress("2001:db8::1", true); value.destinationTCPPort = 443;
+  value.sourcePermissionUUID = 0x301; value.destinationPermissionUUID = 0x302;
+  value.transportProtocol = IPPROTO_TCP; value.destinationCIDR = 64; value.pathMTU = 1500;
+  value.generation = 1; value.issuedAtMs = 100; value.expiresAtMs = 200;
+  value.keyEpoch = 1; value.rootGeneration = 1;
+  return value;
+}
+
+static ProdigyLocalCousinServicePermission makePermission(const CousinRouteRecord& route, bool source)
+{
+  ProdigyLocalCousinServicePermission value = {};
+  value.protocolVersion = ProdigyLocalCousinServicePermission::baselineVersion;
+  value.permissionUUID = source ? route.sourcePermissionUUID : route.destinationPermissionUUID;
+  value.pairUUID = route.pairUUID; value.logicalWorkloadUUID = route.logicalWorkloadUUID;
+  value.logicalServiceUUID = route.logicalServiceUUID;
+  value.localClusterUUID = source ? route.sourceClusterUUID : route.destinationClusterUUID;
+  value.peerClusterUUID = source ? route.destinationClusterUUID : route.sourceClusterUUID;
+  value.localHalf = source ? CousinRouteHalf::source : CousinRouteHalf::destination;
+  value.localApplicationID = source ? route.sourceApplicationID : route.destinationApplicationID;
+  value.peerApplicationID = source ? route.destinationApplicationID : route.sourceApplicationID;
+  value.localCousinServicePrefix = source ? route.sourceCousinServicePrefix : route.destinationCousinServicePrefix;
+  value.peerCousinServicePrefix = source ? route.destinationCousinServicePrefix : route.sourceCousinServicePrefix;
+  value.slots = route.slots;
+  value.localDeploymentID = (uint64_t(value.localApplicationID) << 48) | (source ? 1 : 2);
+  value.canonicalPlanSHA256 = digest(source ? 'a' : 'b'); value.artifactSHA256 = digest(source ? 'c' : 'd');
+  value.artifactBytes = 8192; value.generation = 1; value.acceptedAuthorityGeneration = 7;
+  value.baselineLogicalCores = 2; value.baselineMemoryMB = 1024; value.baselineStorageMB = 1024;
+  return value;
+}
+
+static CousinRouteApplyReceipt makeRouteReceipt(const CousinRouteRecord& route, CousinRouteHalf half)
+{
+  CousinRouteApplyReceipt value = {};
+  value.routeUUID = route.routeUUID; value.generation = route.generation;
+  assert(cousinRouteAuthorizationDigest(route, value.authorizationSHA256));
+  value.localClusterUUID = half == CousinRouteHalf::source ? route.sourceClusterUUID : route.destinationClusterUUID;
+  value.localHalf = half; value.keyEpoch = route.keyEpoch;
+  value.localRuntimeRevision = half == CousinRouteHalf::source ? 7 : 8;
+  value.installedState = route.state;
+  return value;
+}
+
+static MothershipPhysicalFaultMachineObservation observation(uint128_t cluster, uint128_t machine,
+                                                             uint64_t topology, char state)
+{
+  MothershipPhysicalFaultMachineObservation value = {};
+  value.clusterUUID = cluster; value.machineUUID = machine; value.topologyVersion = topology;
+  value.stateSHA256 = digest(state);
+  return value;
+}
+
+int main()
+{
+  char directoryTemplate[] = "/tmp/prodigy-g6-registry-XXXXXX";
+  char *directory = ::mkdtemp(directoryTemplate);
+  assert(directory != nullptr);
+  struct ScopedDirectory {
+    std::filesystem::path path;
+    ~ScopedDirectory() { std::filesystem::remove_all(path); }
+  } cleanup {directory};
+
+  String path(directory), failure = {};
+  MothershipProductionPairIntent intent = {};
+  intent.operationUUID = 0x401; intent.route = makeRoute();
+  intent.sourcePermission = makePermission(intent.route, true);
+  intent.destinationPermission = makePermission(intent.route, false);
+  intent.sourceRouteReceipt = makeRouteReceipt(intent.route, CousinRouteHalf::source);
+  intent.destinationRouteReceipt = makeRouteReceipt(intent.route, CousinRouteHalf::destination);
+  intent.sourceWorkload.clusterUUID = intent.route.sourceClusterUUID;
+  intent.sourceWorkload.applicationID = 31;
+  intent.sourceWorkload.deploymentID = (uint64_t(31) << 48) | 11;
+  intent.sourceWorkload.canonicalPlanSHA256 = digest('e');
+  intent.sourceWorkload.artifactSHA256 = digest('f'); intent.sourceWorkload.artifactBytes = 4096;
+  intent.sourceWorkload.replicas = 1; intent.sourceWorkload.endpointMachineUUID = 0x601;
+  intent.sourceWorkload.endpointIPv4 = "192.0.2.1"_ctv; intent.sourceWorkload.endpointTCPPort = 8080;
+  intent.targetWorkload.clusterUUID = intent.route.destinationClusterUUID;
+  intent.targetWorkload.applicationID = 31;
+  intent.targetWorkload.deploymentID = (uint64_t(31) << 48) | 12;
+  intent.targetWorkload.canonicalPlanSHA256 = intent.sourceWorkload.canonicalPlanSHA256;
+  intent.targetWorkload.artifactSHA256 = digest('f'); intent.targetWorkload.artifactBytes = 4096;
+  intent.targetWorkload.replicas = 1; intent.targetWorkload.endpointMachineUUID = 0x602;
+  intent.targetWorkload.endpointIPv4 = "198.51.100.2"_ctv; intent.targetWorkload.endpointTCPPort = 8080;
+  intent.physicalBoundaryUUID = 0x501;
+  intent.selectorMachineUUID = intent.sourceWorkload.endpointMachineUUID;
+  intent.selectorExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
+  intent.selectorLocalVMBoundaryUUID = 0x801;
+  intent.selectorAddress = "192.0.2.3"_ctv;
+  intent.selectorTCPPort = 18080;
+  intent.ingressWitnessMachineUUID = 0x603;
+  intent.ingressWitnessExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
+  intent.ingressWitnessLocalVMBoundaryUUID = 0x803;
+
+  {
+    MothershipClusterRegistry registry(path);
+    CousinRouteRecord storedRoute = {}; CousinRouteApplyReceipt storedReceipt = {};
+    bool resumed = false;
+    assert(registry.recordCousinRoute(intent.route, storedRoute, resumed, &failure) && !resumed);
+    assert(registry.recordCousinRouteApplyReceipt(intent.sourceRouteReceipt, storedReceipt, resumed, &failure));
+    assert(registry.recordCousinRouteApplyReceipt(intent.destinationRouteReceipt, storedReceipt, resumed, &failure));
+
+    MothershipProductionPairRecord pair = {};
+    assert(registry.admitProductionPair(intent, 1000, pair, resumed, &failure) && !resumed);
+    assert(registry.admitProductionPair(intent, 1001, pair, resumed, &failure) && resumed);
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                          digest('1'), 1001, pair, resumed, &failure) && !resumed);
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                          digest('1'), 1001, pair, resumed, &failure) && resumed);
+    assert(!registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                           digest('2'), 1001, pair, resumed, &failure));
+
+    MothershipLocalVMBoundaryDescriptor localBoundary = {};
+    localBoundary.vmBoundaryUUID = 0x801; localBoundary.clusterUUID = intent.route.sourceClusterUUID;
+    localBoundary.machineUUID = intent.sourceWorkload.endpointMachineUUID; localBoundary.taskID = "g6-local-1"_ctv;
+    localBoundary.hostAddress = "192.0.2.10"_ctv;
+    localBoundary.hostUser = "root"_ctv; localBoundary.hostPrivateKeyPath = "/tmp/g6-key"_ctv;
+    localBoundary.hostPublicKeyOpenSSH = "ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA g6"_ctv;
+    localBoundary.statePath = "/var/tmp/prodigy-g6/machine-1.json"_ctv;
+    localBoundary.executorSHA256 = digest('7'); localBoundary.immutableStateSHA256 = digest('8');
+    localBoundary.registeredAtMs = 1003;
+    assert(mothershipPhysicalFaultProviderStateRootValid(
+        "/var/lib/prodigy/mothership-physical-faults"_ctv));
+    assert(!mothershipPhysicalFaultProviderStateRootValid("/tmp/physical-faults"_ctv));
+    MothershipLocalVMBoundaryDescriptor targetLocal = localBoundary;
+    targetLocal.vmBoundaryUUID = 0x802; targetLocal.clusterUUID = intent.route.destinationClusterUUID;
+    targetLocal.machineUUID = intent.targetWorkload.endpointMachineUUID;
+    targetLocal.taskID = "g6-local-2"_ctv; targetLocal.statePath = "/var/tmp/prodigy-g6/machine-2.json"_ctv;
+    MothershipLocalVMBoundaryDescriptor storedLocal = {};
+    assert(registry.registerLocalVMBoundary(localBoundary, storedLocal, resumed, &failure) && !resumed);
+    assert(registry.registerLocalVMBoundary(targetLocal, storedLocal, resumed, &failure) && !resumed);
+
+    MothershipPhysicalServiceTransitBoundary boundary = {};
+    boundary.boundaryUUID = 0x501; boundary.pairOperationUUID = intent.operationUUID;
+    boundary.routeUUID = intent.route.routeUUID; boundary.routeGeneration = intent.route.generation;
+    boundary.sourceClusterUUID = intent.route.sourceClusterUUID;
+    boundary.targetClusterUUID = intent.route.destinationClusterUUID;
+    boundary.sourceMachineUUID = 0x601; boundary.targetMachineUUID = 0x602;
+    boundary.sourceExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
+    boundary.targetExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
+    boundary.sourceLocalVMBoundaryUUID = localBoundary.vmBoundaryUUID;
+    boundary.targetLocalVMBoundaryUUID = targetLocal.vmBoundaryUUID;
+    boundary.sourceAddress = intent.sourceWorkload.endpointIPv4;
+    boundary.targetAddress = intent.targetWorkload.endpointIPv4;
+    boundary.sourceTCPPort = intent.sourceWorkload.endpointTCPPort;
+    boundary.targetTCPPort = intent.targetWorkload.endpointTCPPort; boundary.pathMTU = intent.route.pathMTU;
+    assert(cousinRouteAuthorizationDigest(intent.route, boundary.routeAuthorizationSHA256));
+    boundary.admissionReceiptSHA256 = digest('2'); boundary.admittedAtMs = 1002;
+    MothershipPhysicalServiceTransitBoundary storedBoundary = {};
+    assert(registry.admitPhysicalServiceTransitBoundary(boundary, storedBoundary, resumed, &failure) && !resumed);
+    assert(registry.admitPhysicalServiceTransitBoundary(boundary, storedBoundary, resumed, &failure) && resumed);
+    auto changedSourcePort = boundary; changedSourcePort.sourceTCPPort++;
+    assert(!registry.admitPhysicalServiceTransitBoundary(changedSourcePort, storedBoundary, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::transitApplied,
+                                          boundary.admissionReceiptSHA256, 1002, pair, resumed, &failure));
+
+    MothershipPhysicalClusterNetworkFaultRequest network = {};
+    network.operationUUID = 0x701; network.boundaryUUID = boundary.boundaryUUID;
+    network.sourceClusterUUID = boundary.sourceClusterUUID; network.targetClusterUUID = boundary.targetClusterUUID;
+    network.sourceMachineUUID = boundary.sourceMachineUUID; network.targetMachineUUID = boundary.targetMachineUUID;
+    network.direction = MothershipPhysicalFaultDirection::sourceToTarget; network.durationMilliseconds = 1000;
+    network.routeUUID = boundary.routeUUID; network.routeGeneration = boundary.routeGeneration;
+    network.routeAuthorizationSHA256 = boundary.routeAuthorizationSHA256;
+    network.sourceAddress = boundary.sourceAddress; network.targetAddress = boundary.targetAddress;
+    network.sourceTopologyVersion = 7; network.targetTopologyVersion = 8;
+    MothershipPhysicalClusterNetworkFaultRecord networkRecord = {};
+    const auto sourceAdmission = observation(network.sourceClusterUUID, network.sourceMachineUUID, 7, 'e');
+    const auto targetAdmission = observation(network.targetClusterUUID, network.targetMachineUUID, 8, 'f');
+    assert(registry.admitPhysicalClusterNetworkFault(network, sourceAdmission, targetAdmission,
+                                                     networkRecord, resumed, &failure) && !resumed);
+    assert(networkRecord.sourceAdmission.stateSHA256 == sourceAdmission.stateSHA256);
+    assert(networkRecord.targetAdmission.stateSHA256 == targetAdmission.stateSHA256);
+    assert(registry.admitPhysicalClusterNetworkFault(network, sourceAdmission, targetAdmission,
+                                                     networkRecord, resumed, &failure) && resumed);
+    auto staleSourceAdmission = sourceAdmission; staleSourceAdmission.stateSHA256 = digest('0');
+    assert(!registry.admitPhysicalClusterNetworkFault(network, staleSourceAdmission, targetAdmission,
+                                                      networkRecord, resumed, &failure));
+    auto retargeted = network; retargeted.targetMachineUUID++;
+    assert(!registry.admitPhysicalClusterNetworkFault(retargeted, sourceAdmission, targetAdmission,
+                                                      networkRecord, resumed, &failure));
+    auto reassigned = network; reassigned.targetAddress = "2001:db8::2"_ctv;
+    assert(!registry.admitPhysicalClusterNetworkFault(reassigned, sourceAdmission, targetAdmission,
+                                                      networkRecord, resumed, &failure));
+    MothershipPhysicalClusterNetworkFaultReceipt networkReceipt = {};
+    networkReceipt.operationUUID = network.operationUUID; networkReceipt.boundaryUUID = network.boundaryUUID;
+    networkReceipt.admission = network;
+    networkReceipt.sourceBefore = sourceAdmission;
+    networkReceipt.targetBefore = targetAdmission;
+    networkReceipt.sourceAfter = networkReceipt.sourceBefore; networkReceipt.targetAfter = networkReceipt.targetBefore;
+    networkReceipt.sourceInstalledAtMonotonicMilliseconds = 100;
+    networkReceipt.sourceRestoredAtMonotonicMilliseconds = 1100;
+    networkReceipt.sourceRestored = true; networkReceipt.restored = true;
+    auto mismatchedNetworkReceipt = networkReceipt;
+    mismatchedNetworkReceipt.sourceBefore.stateSHA256 = digest('a');
+    mismatchedNetworkReceipt.sourceAfter = mismatchedNetworkReceipt.sourceBefore;
+    assert(!registry.recordPhysicalClusterNetworkFaultReceipt(network, mismatchedNetworkReceipt,
+                                                               networkRecord, resumed, &failure));
+    assert(registry.recordPhysicalClusterNetworkFaultReceipt(network, networkReceipt, networkRecord, resumed, &failure) && !resumed);
+    assert(registry.recordPhysicalClusterNetworkFaultReceipt(network, networkReceipt, networkRecord, resumed, &failure) && resumed);
+
+    auto bidirectional = network; bidirectional.operationUUID++;
+    bidirectional.direction = MothershipPhysicalFaultDirection::both;
+    MothershipPhysicalClusterNetworkFaultReceipt bidirectionalReceipt = networkReceipt;
+    bidirectionalReceipt.operationUUID = bidirectional.operationUUID;
+    bidirectionalReceipt.admission = bidirectional;
+    assert(!mothershipPhysicalClusterNetworkFaultReceiptValid(bidirectional, bidirectionalReceipt, &failure));
+    bidirectionalReceipt.targetInstalledAtMonotonicMilliseconds = 200;
+    bidirectionalReceipt.targetRestoredAtMonotonicMilliseconds = 1200;
+    bidirectionalReceipt.targetRestored = true;
+    assert(mothershipPhysicalClusterNetworkFaultReceiptValid(bidirectional, bidirectionalReceipt, &failure));
+
+    assert(registry.registerLocalVMBoundary(localBoundary, storedLocal, resumed, &failure) && resumed);
+    MothershipLocalVMBoundaryDescriptor foundLocal = {};
+    assert(registry.findActiveLocalVMBoundary(localBoundary.clusterUUID, localBoundary.machineUUID,
+                                              foundLocal, &failure));
+    assert(foundLocal.vmBoundaryUUID == localBoundary.vmBoundaryUUID);
+    auto duplicateMachine = localBoundary; duplicateMachine.vmBoundaryUUID++;
+    assert(!registry.registerLocalVMBoundary(duplicateMachine, storedLocal, resumed, &failure));
+
+    MothershipLocalVMMachineFaultRequest local = {};
+    local.operationUUID = 0x901; local.vmBoundaryUUID = localBoundary.vmBoundaryUUID;
+    local.clusterUUID = localBoundary.clusterUUID; local.machineUUID = localBoundary.machineUUID;
+    local.action = MothershipLocalVMMachineFaultAction::coldReboot;
+    local.durationMilliseconds = 1000; local.expectedBootSHA256 = digest('9');
+    MothershipLocalVMMachineFaultRecord localRecord = {};
+    const auto localAdmission = observation(local.clusterUUID, local.machineUUID, 9, '9');
+    assert(registry.admitLocalVMMachineFault(local, localAdmission, localRecord, resumed, &failure) && !resumed);
+    assert(localRecord.admission.stateSHA256 == local.expectedBootSHA256);
+    assert(registry.admitLocalVMMachineFault(local, localAdmission, localRecord, resumed, &failure) && resumed);
+    auto staleLocalAdmission = localAdmission; staleLocalAdmission.topologyVersion++;
+    assert(!registry.admitLocalVMMachineFault(local, staleLocalAdmission, localRecord, resumed, &failure));
+    MothershipLocalVMMachineFaultReceipt localReceipt = {};
+    localReceipt.operationUUID = local.operationUUID; localReceipt.vmBoundaryUUID = local.vmBoundaryUUID;
+    localReceipt.before = observation(local.clusterUUID, local.machineUUID, 9, '9');
+    localReceipt.after = observation(local.clusterUUID, local.machineUUID, 10, '0');
+    localReceipt.restoredBootSHA256 = digest('0'); localReceipt.faultedAtMonotonicMilliseconds = 1000;
+    localReceipt.restoredAtMonotonicMilliseconds = 2000; localReceipt.restored = true;
+    auto mismatchedLocalReceipt = localReceipt;
+    mismatchedLocalReceipt.before.topologyVersion++;
+    assert(!registry.recordLocalVMMachineFaultReceipt(local, mismatchedLocalReceipt,
+                                                       localRecord, resumed, &failure));
+    assert(registry.recordLocalVMMachineFaultReceipt(local, localReceipt, localRecord, resumed, &failure) && !resumed);
+    assert(registry.recordLocalVMMachineFaultReceipt(local, localReceipt, localRecord, resumed, &failure) && resumed);
+
+    MothershipPhysicalServiceTransitBoundary closed = {};
+    assert(!registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('8'), closed, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::sourceIngressWitnessed,
+                                          digest('3'), 1003, pair, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetSelected,
+                                          digest('4'), 1004, pair, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetIngressWitnessed,
+                                          digest('5'), 1005, pair, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::sourceDrained,
+                                          digest('6'), 1006, pair, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::sourceRetired,
+                                          digest('7'), 1007, pair, resumed, &failure));
+    assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::cleanupComplete,
+                                          digest('8'), 1008, pair, resumed, &failure));
+    assert(registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('8'), closed, resumed, &failure) && !resumed);
+    assert(closed.admissionReceiptSHA256 == digest('2') && closed.cleanupReceiptSHA256 == digest('8'));
+    assert(registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('8'), closed, resumed, &failure) && resumed);
+    assert(!registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('9'), closed, resumed, &failure));
+  }
+
+  {
+    MothershipClusterRegistry reopened(path);
+    MothershipProductionPairRecord pair = {}; MothershipPhysicalServiceTransitBoundary boundary = {};
+    MothershipLocalVMBoundaryDescriptor localBoundary = {};
+    assert(reopened.loadProductionPair(intent.operationUUID, pair, &failure) &&
+           pair.phase == MothershipProductionPairPhase::cleanupComplete);
+    assert(reopened.loadPhysicalServiceTransitBoundary(0x501, boundary, &failure) && boundary.closed &&
+           boundary.admissionReceiptSHA256 == digest('2') && boundary.cleanupReceiptSHA256 == digest('8'));
+    assert(reopened.loadLocalVMBoundary(0x801, localBoundary, &failure) && !localBoundary.retired);
+  }
+
+  std::puts("PASS: G6 registry persists exact production-pair, transit, and fault owners");
+  return 0;
+}

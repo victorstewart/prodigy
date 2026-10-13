@@ -499,6 +499,12 @@ set(PRODIGY_IAAS_PRICING_PROVIDER_SOURCES ${PRODIGY_IAAS_AWS_SOURCE} ${PRODIGY_I
 
 set(PRODIGY_VIRTUAL_DATACENTER_PROVIDER_SOURCE "${PRODIGY_ROOT}/prodigy/mothership/mothership.virtual.datacenter.provider.sh")
 set(PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER "${CMAKE_BINARY_DIR}/generated/mothership.virtual.datacenter.provider.inc")
+set(PRODIGY_PRODUCTION_PAIR_PROVIDER_SOURCE "${PRODIGY_ROOT}/prodigy/mothership/mothership.production.pair.provider.py")
+set(PRODIGY_PRODUCTION_PAIR_PROVIDER_HEADER "${CMAKE_BINARY_DIR}/generated/mothership.production.pair.provider.inc")
+set(PRODIGY_PHYSICAL_FAULT_PROVIDER_SOURCE "${PRODIGY_ROOT}/prodigy/mothership/mothership.physical.fault.provider.py")
+set(PRODIGY_PHYSICAL_FAULT_PROVIDER_HEADER "${CMAKE_BINARY_DIR}/generated/mothership.physical.fault.provider.inc")
+set(PRODIGY_LOCAL_VM_BOUNDARY_SOURCE "${PRODIGY_ROOT}/prodigy/dev/tests/prodigy_dev_kvm_boundary.py")
+set(PRODIGY_LOCAL_VM_BOUNDARY_HEADER "${CMAKE_BINARY_DIR}/generated/mothership.local.vm.boundary.inc")
 set(PRODIGY_EMBED_FILE_BYTES_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/embed_file_bytes.cmake")
 add_custom_command(
    OUTPUT "${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER}"
@@ -511,9 +517,52 @@ add_custom_command(
    VERBATIM
 )
 set_source_files_properties("${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER}" PROPERTIES GENERATED TRUE)
+add_custom_command(
+   OUTPUT "${PRODIGY_PRODUCTION_PAIR_PROVIDER_HEADER}"
+   COMMAND "${CMAKE_COMMAND}"
+      -DINPUT=${PRODIGY_PRODUCTION_PAIR_PROVIDER_SOURCE}
+      -DOUTPUT=${PRODIGY_PRODUCTION_PAIR_PROVIDER_HEADER}
+      -DSYMBOL=mothershipProductionPairProviderSource
+      -P "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   DEPENDS "${PRODIGY_PRODUCTION_PAIR_PROVIDER_SOURCE}" "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   VERBATIM
+)
+add_custom_command(
+   OUTPUT "${PRODIGY_PHYSICAL_FAULT_PROVIDER_HEADER}"
+   COMMAND "${CMAKE_COMMAND}"
+      -DINPUT=${PRODIGY_PHYSICAL_FAULT_PROVIDER_SOURCE}
+      -DOUTPUT=${PRODIGY_PHYSICAL_FAULT_PROVIDER_HEADER}
+      -DSYMBOL=mothershipPhysicalFaultProviderSource
+      -P "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   DEPENDS "${PRODIGY_PHYSICAL_FAULT_PROVIDER_SOURCE}" "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   VERBATIM
+)
+add_custom_command(
+   OUTPUT "${PRODIGY_LOCAL_VM_BOUNDARY_HEADER}"
+   COMMAND "${CMAKE_COMMAND}"
+      -DINPUT=${PRODIGY_LOCAL_VM_BOUNDARY_SOURCE}
+      -DOUTPUT=${PRODIGY_LOCAL_VM_BOUNDARY_HEADER}
+      -DSYMBOL=mothershipLocalVMBoundarySource
+      -P "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   DEPENDS "${PRODIGY_LOCAL_VM_BOUNDARY_SOURCE}" "${PRODIGY_EMBED_FILE_BYTES_SCRIPT}"
+   VERBATIM
+)
+set_source_files_properties(
+   "${PRODIGY_PRODUCTION_PAIR_PROVIDER_HEADER}"
+   "${PRODIGY_PHYSICAL_FAULT_PROVIDER_HEADER}"
+   "${PRODIGY_LOCAL_VM_BOUNDARY_HEADER}"
+   PROPERTIES GENERATED TRUE
+)
 
 add_executable(prodigy ${PRODIGY_ROOT}/prodigy/prodigy.cpp ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
-add_executable(mothership ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
+add_executable(mothership
+   ${PRODIGY_ROOT}/prodigy/mothership/mothership.cpp
+   ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER}
+   ${PRODIGY_PRODUCTION_PAIR_PROVIDER_HEADER}
+   ${PRODIGY_PHYSICAL_FAULT_PROVIDER_HEADER}
+   ${PRODIGY_LOCAL_VM_BOUNDARY_HEADER}
+   ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES}
+)
 target_include_directories(mothership PRIVATE "${CMAKE_BINARY_DIR}/generated")
 add_executable(prodigy_dns_resolver ${PRODIGY_ROOT}/prodigy/dns/resolver.cpp)
 add_executable(prodigy_tidesdb9_export ${CMAKE_CURRENT_SOURCE_DIR}/tidesdb9_export.c)
@@ -668,6 +717,9 @@ add_dependencies(prodigy_mothership_tidesdb_migration_command_unit prodigy_tides
 add_executable(prodigy_mothership_cluster_reconcile_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_reconcile_unit.cpp)
 add_executable(prodigy_mothership_cluster_remove_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_remove_unit.cpp)
 add_executable(prodigy_mothership_cluster_create_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_cluster_create_unit.cpp)
+add_executable(prodigy_mothership_production_pair_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_production_pair_unit.cpp)
+add_executable(prodigy_mothership_physical_fault_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_physical_fault_unit.cpp)
+add_executable(prodigy_mothership_g6_registry_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_g6_registry_unit.cpp)
 add_executable(prodigy_mothership_addmachines_progress_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_addmachines_progress_unit.cpp)
 add_executable(prodigy_mothership_unix_connect_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_unix_connect_unit.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_MOTHERSHIP_TUNNEL_GATEWAY_SOURCE} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
 add_executable(prodigy_mothership_provider_capture_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_provider_capture_unit.cpp ${PRODIGY_VIRTUAL_DATACENTER_PROVIDER_HEADER} ${PRODIGY_IAAS_RUNTIME_PROVIDER_SOURCES})
@@ -781,6 +833,9 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_mothership_cluster_reconcile_unit
    prodigy_mothership_cluster_remove_unit
    prodigy_mothership_cluster_create_unit
+   prodigy_mothership_production_pair_unit
+   prodigy_mothership_physical_fault_unit
+   prodigy_mothership_g6_registry_unit
    prodigy_mothership_addmachines_progress_unit
    prodigy_mothership_unix_connect_unit
    prodigy_mothership_provider_capture_unit
@@ -1076,6 +1131,9 @@ target_compile_options(prodigy_mothership_tidesdb_migration_unit PRIVATE -UNDEBU
 target_compile_options(prodigy_mothership_cluster_reconcile_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_remove_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_cluster_create_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_production_pair_unit PRIVATE -O2 -UNDEBUG)
+target_compile_options(prodigy_mothership_physical_fault_unit PUBLIC -O2)
+target_compile_options(prodigy_mothership_g6_registry_unit PRIVATE -O2 -UNDEBUG)
 target_compile_options(prodigy_mothership_addmachines_progress_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_unix_connect_unit PUBLIC -O2)
 target_compile_options(prodigy_mothership_virtual_datacenter_unit PUBLIC -O2)
@@ -1510,6 +1568,24 @@ if (PROJECT_ENABLE_TESTS)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_kvm_boundary_unit.py
    )
    set_tests_properties(prodigy_dev_kvm_boundary_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_mothership_local_vm_boundary_contract
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_local_vm_boundary_contract.py
+   )
+   set_tests_properties(prodigy_mothership_local_vm_boundary_contract PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_mothership_production_pair_provider_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_production_pair_provider_unit.py
+   )
+   set_tests_properties(prodigy_mothership_production_pair_provider_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_mothership_physical_fault_provider_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mothership_physical_fault_provider_unit.py
+   )
+   set_tests_properties(prodigy_mothership_physical_fault_provider_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_dev_serial_upgrade_runtime_qualification_unit
@@ -2527,6 +2603,21 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(
       NAME prodigy_mothership_cluster_create_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_cluster_create_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_production_pair_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_production_pair_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_physical_fault_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_physical_fault_unit
+   )
+
+   add_test(
+      NAME prodigy_mothership_g6_registry_unit
+      COMMAND ${CMAKE_BINARY_DIR}/prodigy_mothership_g6_registry_unit
    )
 
    add_test(

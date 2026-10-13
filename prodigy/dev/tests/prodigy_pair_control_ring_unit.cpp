@@ -99,6 +99,27 @@ static bool buildComplementaryProjections(PairProjections& output, uint64_t comm
       prodigyLocalClusterPairControlProjectionValid(output.second, true);
 }
 
+static void pairControlNATObservedPeerValidation(TestSuite& suite)
+{
+  const auto privateInitiator = endpoint(firstClusterUUID, firstNodeUUID, "fd00:ffff:1234::1");
+  const auto globalResponder = endpoint(secondClusterUUID, secondNodeUUID, "2001:db8:1234::2");
+  sockaddr_storage observed = {};
+  auto& observed6 = reinterpret_cast<sockaddr_in6&>(observed);
+  observed6.sin6_family = AF_INET6;
+  std::memcpy(observed6.sin6_addr.s6_addr, globalResponder.address.v6, sizeof(globalResponder.address.v6));
+  const bool globalSafe = switchboardPairControlSafeObservedIPv6Peer(observed, sizeof(observed6));
+  std::memset(observed6.sin6_addr.s6_addr, 0, sizeof(observed6.sin6_addr.s6_addr));
+  observed6.sin6_addr.s6_addr[15] = 1;
+  const bool loopbackRejected = !switchboardPairControlSafeObservedIPv6Peer(observed, sizeof(observed6));
+  observed6.sin6_addr.s6_addr[0] = 0xff;
+  observed6.sin6_addr.s6_addr[15] = 1;
+  const bool multicastRejected = !switchboardPairControlSafeObservedIPv6Peer(observed, sizeof(observed6));
+  suite.expect(clusterPairControlEndpointNATCompatibleOutbound(privateInitiator, globalResponder) &&
+                   !clusterPairControlEndpointNATCompatibleOutbound(globalResponder, privateInitiator) &&
+                   globalSafe && loopbackRejected && multicastRejected,
+               "pair_control_nat_accepts_only_safe_observed_ipv6_for_non_global_to_global_credential");
+}
+
 static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nodeUUID,
                                                                   uint128_t sourceClusterUUID,
                                                                   uint128_t peerClusterUUID,
@@ -665,6 +686,7 @@ int main()
     return suite.failed == 0 ? 0 : 1;
   }
   pairControlCarrierReadyAndGenerationAdvance(suite);
+  pairControlNATObservedPeerValidation(suite);
   pairControlCarrierRevocationDropsReadinessAndDrains(suite);
   pairControlCarrierRejectsWrongPSK(suite);
   pairControlCarrierTransfersExactEpochStatus(suite);

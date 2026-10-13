@@ -16,6 +16,18 @@
 // Neuron owns this Switchboard control component. Its input is an already
 // durable, node-scoped credential projection; it never possesses a pair root
 // or carries application traffic. The first control record is a fixed hello.
+static inline bool switchboardPairControlSafeObservedIPv6Peer(const sockaddr_storage& peer, socklen_t length)
+{
+  if (peer.ss_family != AF_INET6 || length != sizeof(sockaddr_in6)) return false;
+  const uint8_t *address = reinterpret_cast<const sockaddr_in6&>(peer).sin6_addr.s6_addr;
+  const bool unspecified = std::all_of(address, address + 16, [](uint8_t byte) { return byte == 0; });
+  const bool loopback = std::all_of(address, address + 15, [](uint8_t byte) { return byte == 0; }) && address[15] == 1;
+  const bool mappedV4 = std::all_of(address, address + 10, [](uint8_t byte) { return byte == 0; }) &&
+                        address[10] == 0xff && address[11] == 0xff;
+  const bool linkLocal = address[0] == 0xfe && (address[1] & 0xc0u) == 0x80u;
+  return !unspecified && !loopback && !mappedV4 && !linkLocal && address[0] != 0xff;
+}
+
 class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
   static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
@@ -261,8 +273,9 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   }
   static bool adoptProcessSocket(SocketBase& socket)
   {
-    // The generic pointer installer tolerates source-bind failure. This
-    // carrier must prove its approved source binding before fixed-file adoption.
+    // The generic pointer installer tolerates source-bind failure. Callers
+    // prove the approved source binding first, except for the derived
+    // non-global-to-global outbound NAT credential.
     if (socket.fd < 0) return false;
     const int slot = Ring::adoptProcessFDIntoFixedFileSlot(socket.fd);
     if (slot < 0) { ::close(socket.fd); socket.fd = -1; return false; }
@@ -283,14 +296,14 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   bool selectIncoming(Connection& connection, const String& remoteClaim, String& localClaim,
                       std::array<uint8_t, 32>& key, String& context, uint128_t& peerUUID)
   {
-    if (stopping || connection.closing || connection.observedPeer.ss_family != AF_INET6 ||
-        connection.observedPeerLength != sizeof(sockaddr_in6)) return false;
+    if (stopping || connection.closing || !switchboardPairControlSafeObservedIPv6Peer(connection.observedPeer, connection.observedPeerLength)) return false;
     const ProdigyLocalClusterPairControlCredential *selected = nullptr;
     for (const auto& candidate : projection.credentials)
       if (candidate.remoteClaim == remoteClaim && candidate.responder == connection.local && isLocal(candidate.responder))
       { if (selected) return false; selected = &candidate; }
-    if (!selected || std::memcmp(selected->initiator.address.v6,
-        &reinterpret_cast<const sockaddr_in6&>(connection.observedPeer).sin6_addr, 16) != 0) return false;
+    const bool natCompatible = selected && clusterPairControlEndpointNATCompatibleOutbound(selected->initiator, selected->responder);
+    if (!selected || (!natCompatible && std::memcmp(selected->initiator.address.v6,
+        &reinterpret_cast<const sockaddr_in6&>(connection.observedPeer).sin6_addr, 16) != 0)) return false;
     connection.credential = *selected; connection.remote = selected->initiator; connection.selected = true;
     if (duplicate(connection)) return false;
     localClaim = selected->localClaim; context = selected->canonicalContext;
@@ -418,8 +431,10 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (nextConnectionID == 0 || nextConnectionID == UINT64_MAX) return;
     connection->selected = true; connection->connectionID = nextConnectionID++; connection->createdAt = Time::msSinceBoot();
     connection->setIPVersion(AF_INET6); connection->setNonBlocking();
-    connection->setSaddr(connection->local.address, 0); connection->setDaddr(connection->remote.address, connection->remote.port);
-    if (connection->fd < 0 || !Ring::bindSourceAddressBeforeFixedFileInstall(connection.get()))
+    const bool natCompatible = clusterPairControlEndpointNATCompatibleOutbound(credential.initiator, credential.responder);
+    if (!natCompatible) connection->setSaddr(connection->local.address, 0);
+    connection->setDaddr(connection->remote.address, connection->remote.port);
+    if (connection->fd < 0 || (!natCompatible && !Ring::bindSourceAddressBeforeFixedFileInstall(connection.get())))
     { if (connection->fd >= 0) ::close(connection->fd); connection->fd = -1; return; }
     if (!adoptProcessSocket(*connection)) return;
     connection->rBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128); connection->wBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128);

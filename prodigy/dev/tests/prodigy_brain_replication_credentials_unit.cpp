@@ -35092,7 +35092,15 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     suite.require(pairBrain.buildApprovedClusterPairEndpoints(preferredEndpoints) &&
                       endpointRosterMatches({"fd00:9a::1", "fd00:9a::2", "fd00:9a::3"}),
                   "cluster_pair_cloud_endpoint_rejects_ula_in_public_roster");
-    pairBrain.brainConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::dev;
+    for (uint32_t index = 0; index < pairBrain.authoritativeTopology.machines.size(); ++index)
+    {
+      auto& publicAddresses = pairBrain.authoritativeTopology.machines[index].addresses.publicAddresses;
+      publicAddresses.clear();
+      String globalAddress;
+      globalAddress.snprintf<"2001:db8:9a::{}"_ctv>(String(index + 1));
+      prodigyAppendUniqueClusterMachineAddress(publicAddresses, globalAddress, 64, String());
+    }
+    pairBrain.brainConfig.runtimeEnvironment.kind = ProdigyEnvironmentKind::vultr;
 
     BrainView pairPeerA = {}, pairPeerB = {};
     suite.require(authenticatePeer(pairBrain, pairPeerA, peerAUUID) &&
@@ -35240,6 +35248,14 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                       projection.credentials.size() == remoteRoster.size(),
                   "cluster_pair_owner_builds_derived_projection_only_after_active_exact_majority");
     auto& operation = pairBrain.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.front();
+    // The local cluster UUID sorts first, so this verifies that the admitted
+    // private-to-public endpoint rule—not UUID ordering—makes every private
+    // remote endpoint the initiator without mutating a sealed operation.
+    suite.expect(std::all_of(projection.credentials.begin(), projection.credentials.end(), [&](const auto& credential) {
+                   return credential.initiator.clusterUUID == uint128_t(0x9b99) &&
+                          clusterPairControlEndpointNATCompatibleOutbound(credential.initiator, credential.responder);
+                 }),
+                 "cluster_pair_owner_orients_private_to_global_endpoint_before_uuid_ordering");
     suite.expect(!operation.initialProjectionDelivered && selfMachine.neuron.clusterPairProjectionNonce != 0 &&
                      peerAMachine.neuron.clusterPairProjectionNonce != 0 && peerBMachine.neuron.clusterPairProjectionNonce != 0,
                  "cluster_pair_owner_does_not_mark_initial_delivery_before_neuron_durable_receipts");

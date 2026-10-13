@@ -11,6 +11,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <filesystem>
+#include <future>
 #include <fcntl.h>
 #include <libssh2/libssh2.h>
 #include <linux/capability.h>
@@ -70,6 +71,9 @@
 #include <switchboard/host.tcx.retention.h>
 
 #include "mothership.virtual.datacenter.provider.inc"
+#include "mothership.production.pair.provider.inc"
+#include "mothership.physical.fault.provider.inc"
+#include "mothership.local.vm.boundary.inc"
 #include <prodigy/mothership/mothership.tidesdb.migration.command.h>
 #include <prodigy/mothership/mothership.retained.recovery.command.h>
 
@@ -3523,24 +3527,26 @@ static bool resolveLocalProdigyExecutablePath(String& localProdigyPath, String *
   return false;
 }
 
-static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String *failure = nullptr)
+static bool mothershipCreateSealedProviderFD(const char *name, const uint8_t *source,
+                                             uint64_t sourceBytes, int& providerFD,
+                                             String *failure = nullptr)
 {
-  providerFD = ::memfd_create("mothership-vdc-provider", MFD_ALLOW_SEALING);
+  providerFD = ::memfd_create(name, MFD_ALLOW_SEALING);
   if (providerFD < 0)
   {
     if (failure)
     {
-      failure->snprintf<"failed to create virtual datacenter provider image: {}"_ctv>(String(std::strerror(errno)));
+      failure->snprintf<"failed to create sealed provider image: {}"_ctv>(String(std::strerror(errno)));
     }
     return false;
   }
 
   uint64_t offset = 0;
-  while (offset < sizeof(mothershipVirtualDatacenterProviderSource))
+  while (offset < sourceBytes)
   {
     ssize_t written = ::write(providerFD,
-                              mothershipVirtualDatacenterProviderSource + offset,
-                              sizeof(mothershipVirtualDatacenterProviderSource) - offset);
+                              source + offset,
+                              sourceBytes - offset);
     if (written < 0 && errno == EINTR)
     {
       continue;
@@ -3552,7 +3558,7 @@ static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String 
       providerFD = -1;
       if (failure)
       {
-        failure->snprintf<"failed to write virtual datacenter provider image: {}"_ctv>(String(std::strerror(saved)));
+        failure->snprintf<"failed to write sealed provider image: {}"_ctv>(String(std::strerror(saved)));
       }
       return false;
     }
@@ -3567,7 +3573,7 @@ static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String 
     providerFD = -1;
     if (failure)
     {
-      failure->snprintf<"failed to seal virtual datacenter provider image: {}"_ctv>(String(std::strerror(saved)));
+      failure->snprintf<"failed to seal provider image: {}"_ctv>(String(std::strerror(saved)));
     }
     return false;
   }
@@ -3576,6 +3582,13 @@ static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String 
     failure->clear();
   }
   return true;
+}
+
+static bool mothershipCreateVirtualDatacenterProviderFD(int& providerFD, String *failure = nullptr)
+{
+  return mothershipCreateSealedProviderFD("mothership-vdc-provider",
+      mothershipVirtualDatacenterProviderSource,
+      sizeof(mothershipVirtualDatacenterProviderSource), providerFD, failure);
 }
 
 static bool mothershipAppendVirtualDatacenterProviderOutput(
@@ -3741,6 +3754,62 @@ static bool mothershipRunVirtualDatacenterProvider(Vector<String> arguments, Str
     return false;
   }
   if (failure) failure->clear();
+  return true;
+}
+
+static bool mothershipRunSealedPythonProvider(const char *imageName,
+                                              const uint8_t *source, uint64_t sourceBytes,
+                                              Vector<String> arguments, String& output,
+                                              String& failure,
+                                              uint64_t timeoutMilliseconds = 30'000)
+{
+  output.clear(); failure.clear();
+  int providerFD = -1;
+  if (!mothershipCreateSealedProviderFD(imageName, source, sourceBytes, providerFD, &failure)) return false;
+
+  String providerPath = {};
+  providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
+  Vector<char *> argv = {};
+  argv.reserve(arguments.size() + 3);
+  argv.push_back(const_cast<char *>("/usr/bin/python3"));
+  argv.push_back(const_cast<char *>(providerPath.c_str()));
+  for (String& argument : arguments) argv.push_back(const_cast<char *>(argument.c_str()));
+  argv.push_back(nullptr);
+
+  int outputPipe[2] = {-1, -1};
+  if (::pipe2(outputPipe, O_CLOEXEC) != 0)
+  {
+    ::close(providerFD);
+    failure.snprintf<"failed to create sealed provider output pipe: {}"_ctv>(String(std::strerror(errno)));
+    return false;
+  }
+  const pid_t pid = ::fork();
+  if (pid == 0)
+  {
+    if (::dup2(outputPipe[1], STDOUT_FILENO) < 0 || ::dup2(outputPipe[1], STDERR_FILENO) < 0) _exit(127);
+    ::close(outputPipe[0]); ::close(outputPipe[1]);
+    ::execv("/usr/bin/python3", argv.data());
+    _exit(127);
+  }
+  ::close(providerFD); ::close(outputPipe[1]);
+  if (pid < 0)
+  {
+    ::close(outputPipe[0]);
+    failure.snprintf<"failed to launch sealed provider: {}"_ctv>(String(std::strerror(errno)));
+    return false;
+  }
+  int status = 0;
+  if (!mothershipCaptureVirtualDatacenterProviderOutput(
+          outputPipe[0], pid, output, &failure, 64_KB, timeoutMilliseconds, false, status)) return false;
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+  {
+    if (failure.empty())
+    {
+      if (WIFSIGNALED(status)) failure.snprintf<"sealed provider terminated by signal={itoa}"_ctv>(uint64_t(WTERMSIG(status)));
+      else failure.snprintf<"sealed provider failed status={itoa} output={}"_ctv>(uint64_t(WEXITSTATUS(status)), output);
+    }
+    return false;
+  }
   return true;
 }
 
@@ -8599,6 +8668,64 @@ private:
     prodigyAssignClusterMachineAddressesFromPeerCandidates(machine.addresses, candidates);
   }
 
+  static bool resolveVerifiedDisposableLocalVMIdentity(bool& detected, uint128_t& machineUUID,
+                                                        String *failure = nullptr)
+  {
+    detected = false; machineUUID = 0;
+    auto readSmall = [&](const char *path, bool privateMarker, String& contents) {
+      contents.clear();
+      const int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      if (fd < 0)
+      {
+        if (failure) failure->snprintf<"failed to open verified local VM identity file {}: {}"_ctv>(
+            String(path), String(std::strerror(errno)));
+        return false;
+      }
+      struct stat state = {};
+      bool valid = ::fstat(fd, &state) == 0 && S_ISREG(state.st_mode) && state.st_size >= 0 &&
+          state.st_size <= (privateMarker ? 128 : 4096) && (!privateMarker || (state.st_uid == 0 && state.st_nlink == 1 &&
+          (state.st_mode & 0777) == 0600));
+      char buffer[129] = {};
+      size_t offset = 0;
+      while (valid && offset < sizeof(buffer))
+      {
+        const ssize_t count = ::read(fd, buffer + offset, sizeof(buffer) - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) { valid = false; break; }
+        if (count == 0) break;
+        offset += size_t(count);
+      }
+      const int saved = errno;
+      ::close(fd);
+      if (!valid || offset == 0 || offset > 128)
+      {
+        if (failure) failure->snprintf<"verified local VM identity file is unsafe or unreadable {}: {}"_ctv>(
+            String(path), String(std::strerror(saved)));
+        return false;
+      }
+      contents.append(buffer, offset);
+      return true;
+    };
+
+    if (::access(mothershipVerifiedLocalVMMarkerPath, F_OK) != 0)
+    {
+      if (errno == ENOENT) { if (failure) failure->clear(); return true; }
+      if (failure) failure->snprintf<"failed to inspect verified local VM marker: {}"_ctv>(String(std::strerror(errno)));
+      return false;
+    }
+    String marker = {}, productUUID = {};
+    if (!readSmall(mothershipVerifiedLocalVMMarkerPath, true, marker) ||
+        !readSmall("/sys/class/dmi/id/product_uuid", false, productUUID) ||
+        !mothershipParseVerifiedLocalVMIdentity(marker, productUUID, machineUUID))
+    {
+      if (failure && failure->empty()) failure->assign("verified local VM marker or DMI UUID is invalid"_ctv);
+      return false;
+    }
+    detected = true;
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool buildLocalClusterMachineProbe(const MothershipProdigyCluster& cluster, ClusterMachine& localMachine, String *failure = nullptr)
   {
     localMachine = {};
@@ -8620,7 +8747,10 @@ private:
 
     localMachine.source = ClusterMachineSource::adopted;
     localMachine.backing = ClusterMachineBacking::owned;
-    localMachine.kind = MachineConfig::MachineKind::bareMetal;
+    bool verifiedLocalVM = false;
+    uint128_t verifiedLocalVMUUID = 0;
+    if (!resolveVerifiedDisposableLocalVMIdentity(verifiedLocalVM, verifiedLocalVMUUID, failure)) return false;
+    localMachine.kind = verifiedLocalVM ? MachineConfig::MachineKind::vm : MachineConfig::MachineKind::bareMetal;
     localMachine.lifetime = MachineLifetime::owned;
     localMachine.isBrain = true;
     prodigyAssignClusterMachineAddressesFromPeerCandidates(localMachine.addresses, localCandidates);
@@ -8631,6 +8761,11 @@ private:
     String stateFailure = {};
     if (persistentStateStore.loadLocalBrainState(localState, &stateFailure))
     {
+      if (verifiedLocalVM && localState.uuid != verifiedLocalVMUUID)
+      {
+        if (failure) failure->assign("local Prodigy machine UUID conflicts with the verified KVM DMI UUID"_ctv);
+        return false;
+      }
       localMachine.uuid = localState.uuid;
     }
     else if (stateFailure.size() > 0 && stateFailure.equal("record not found"_ctv) == false)
@@ -8640,6 +8775,10 @@ private:
         *failure = stateFailure;
       }
       return false;
+    }
+    else if (verifiedLocalVM)
+    {
+      localMachine.uuid = verifiedLocalVMUUID;
     }
 
     ClusterTopology normalizedTopology = {};
@@ -11317,6 +11456,33 @@ private:
 
         sawMachines = true;
       }
+      else if (key.equal("bootstrapSshUser"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("setLocalClusterMembership.bootstrapSshUser requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        desiredCluster.bootstrapSshUser.assign(field.value.get_c_str());
+      }
+      else if (key.equal("bootstrapSshPrivateKeyPath"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::STRING)
+        {
+          basics_log("setLocalClusterMembership.bootstrapSshPrivateKeyPath requires string\n");
+          exit(EXIT_FAILURE);
+        }
+
+        desiredCluster.bootstrapSshPrivateKeyPath.assign(field.value.get_c_str());
+      }
+      else if (key.equal("bootstrapSshKeyPackage"_ctv))
+      {
+        if (parseSSHKeyPackageJSON(field.value, desiredCluster.bootstrapSshKeyPackage, "setLocalClusterMembership.bootstrapSshKeyPackage") == false)
+        {
+          exit(EXIT_FAILURE);
+        }
+      }
       else if (key.equal("nBrains"_ctv))
       {
         int64_t value = 0;
@@ -12194,7 +12360,680 @@ private:
     return true;
   }
 
-  bool readTestPairClusterStatus(const MothershipProdigyCluster& cluster,
+  bool productionWorkloadIdentity(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
+                                  MothershipProductionWorkloadIdentity& identity,
+                                  DeploymentIdentityReport& report, String& failure)
+  {
+    identity = {}; report = {};
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test || cluster.nBrains != 3 ||
+        cluster.topology.machines.size() != 3 || !readDeploymentIdentity(cluster, deploymentID, report, failure))
+    {
+      if (failure.empty()) failure.assign("production migration requires a non-test three-Brain cluster"_ctv);
+      return false;
+    }
+    uint32_t endpointMatches = 0;
+    for (const auto& machine : cluster.topology.machines)
+      if (machine.uuid == report.observedEndpointMachineUUID && machine.isBrain) ++endpointMatches;
+    struct in_addr endpoint = {};
+    String endpointText = report.observedEndpointIPv4;
+    if (!report.profileEligible || report.isStateful || report.useHostNetworkNamespace ||
+        report.state != DeploymentState::running || report.applicationID == 0 ||
+        report.applicationID != uint16_t(deploymentID >> 48) ||
+        report.nTarget != 1 || report.nDeployed != 1 || report.nHealthy != 1 ||
+        !prodigyIsSHA256HexDigest(report.canonicalPlanSHA256) ||
+        !prodigyIsSHA256HexDigest(report.containerBlobSHA256) || report.containerBlobBytes == 0 ||
+        report.authorityGeneration == 0 || report.masterUUID == 0 || report.masterBootNs <= 0 ||
+        report.observedEndpointMachineUUID == 0 || endpointMatches != 1 ||
+        report.observedEndpointPort == 0 ||
+        ::inet_pton(AF_INET, endpointText.c_str(), &endpoint) != 1 ||
+        (uint32_t(ntohl(endpoint.s_addr)) >> 24) == 127 || endpoint.s_addr == INADDR_ANY)
+    {
+      failure.assign("production migration endpoint is not an exact healthy single-machine stateless TCP deployment"_ctv);
+      return false;
+    }
+    identity.clusterUUID = cluster.clusterUUID;
+    identity.applicationID = report.applicationID;
+    identity.deploymentID = report.deploymentID;
+    identity.canonicalPlanSHA256 = report.canonicalPlanSHA256;
+    identity.artifactSHA256 = report.containerBlobSHA256;
+    identity.artifactBytes = report.containerBlobBytes;
+    identity.replicas = report.nTarget;
+    identity.endpointMachineUUID = report.observedEndpointMachineUUID;
+    identity.endpointIPv4 = report.observedEndpointIPv4;
+    identity.endpointTCPPort = report.observedEndpointPort;
+    return mothershipProductionWorkloadIdentityValid(identity);
+  }
+
+  bool productionClusterHealthy(const MothershipProdigyCluster& cluster,
+                                ClusterStatusReport& report, String& failure)
+  {
+    if (!readManagedClusterStatus(cluster, report, failure)) return false;
+    if (!report.hasTopology || report.topology.version == 0 || report.topology.machines.size() != 3 ||
+        report.machineReports.size() != 3)
+    {
+      failure.assign("production migration requires a fresh exact three-machine topology"_ctv);
+      return false;
+    }
+    uint32_t masters = 0;
+    for (const auto& machine : report.topology.machines)
+    {
+      String uuid = {}; uuid.assignItoh(machine.uuid);
+      uint32_t matches = 0;
+      const MachineStatusReport *status = nullptr;
+      for (const auto& candidate : report.machineReports)
+        if (candidate.machineUUID == uuid) { ++matches; status = &candidate; }
+      if (machine.uuid == 0 || !machine.isBrain || matches != 1 || status == nullptr ||
+          !status->isBrain || status->state != "healthy"_ctv || !status->controlPlaneReachable ||
+          !status->runtimeReady || status->bootTimeMs <= 0 || status->hardwareFailure ||
+          status->decommissioning || status->rebooting || status->updatingOS)
+      {
+        failure.assign("production migration cluster is not an exact healthy three-Brain topology"_ctv);
+        return false;
+      }
+      if (status->currentMaster) ++masters;
+    }
+    if (masters != 1)
+    {
+      failure.assign("production migration cluster does not have exactly one observed master"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  static bool productionWorkloadIdentityEqual(const MothershipProductionWorkloadIdentity& left,
+                                              const MothershipProductionWorkloadIdentity& right)
+  {
+    String leftBytes = {}, rightBytes = {};
+    auto leftCopy = left; auto rightCopy = right;
+    BitseryEngine::serialize(leftBytes, leftCopy); BitseryEngine::serialize(rightBytes, rightCopy);
+    return leftBytes == rightBytes;
+  }
+
+  bool productionPairTransportReady(const MothershipProductionPairRecord& record,
+                                    MothershipProdigyCluster& source,
+                                    MothershipProdigyCluster& target,
+                                    String& failure)
+  {
+    const auto& expected = record.intent;
+    CousinRouteRecord route = {};
+    CousinRouteApplyReceipt sourceReceipt = {}, targetReceipt = {};
+    auto receiptCurrent = [&](const CousinRouteApplyReceipt& observed,
+                              const CousinRouteApplyReceipt& original) {
+      return cousinRouteApplyReceiptMatchesCurrentRoute(observed, route) &&
+          observed.localHalf == original.localHalf &&
+          observed.authorizationSHA256 == original.authorizationSHA256 &&
+          observed.localClusterUUID == original.localClusterUUID &&
+          observed.localRuntimeRevision == original.localRuntimeRevision;
+    };
+    {
+      auto registry = openClusterRegistry();
+      String sourceIdentity = {}, targetIdentity = {};
+      sourceIdentity.assignItoh(expected.route.sourceClusterUUID);
+      targetIdentity.assignItoh(expected.route.destinationClusterUUID);
+      if (!registry.getClusterByIdentity(sourceIdentity, source, &failure) ||
+          !registry.getClusterByIdentity(targetIdentity, target, &failure) ||
+          !registry.loadUsableCousinRoute(expected.route.routeUUID, Time::now<TimeResolution::ms>(), route, &failure) ||
+          route.priorOperationUUIDs != expected.route.priorOperationUUIDs ||
+          !cousinRouteExactMatches(route, expected.route) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source,
+                                                       sourceReceipt, &failure) ||
+          !registry.loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination,
+                                                       targetReceipt, &failure) ||
+          !receiptCurrent(sourceReceipt, expected.sourceRouteReceipt) ||
+          !receiptCurrent(targetReceipt, expected.destinationRouteReceipt))
+      {
+        if (failure.empty()) failure.assign("production migration route or durable application receipt changed"_ctv);
+        return false;
+      }
+    }
+    if (source.deploymentMode == MothershipClusterDeploymentMode::test ||
+        target.deploymentMode == MothershipClusterDeploymentMode::test)
+    {
+      failure.assign("production migration cannot use deploymentMode=test"_ctv);
+      return false;
+    }
+    ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, targetPermission = {};
+    if (!readLocalCousinServicePermission(source, route.sourcePermissionUUID, sourcePermission, failure) ||
+        !readLocalCousinServicePermission(target, route.destinationPermissionUUID, targetPermission, failure) ||
+        !prodigyLocalCousinServicePermissionEqual(sourcePermission.permission, expected.sourcePermission) ||
+        !prodigyLocalCousinServicePermissionEqual(targetPermission.permission, expected.destinationPermission))
+    {
+      if (failure.empty()) failure.assign("production migration COUSIN permission changed or is no longer qualified"_ctv);
+      return false;
+    }
+    DeploymentIdentityReport sourceTransport = {}, targetTransport = {};
+    if (!testPairCousinTransportDeploymentReady(source, expected.sourcePermission, sourceTransport, failure) ||
+        !testPairCousinTransportDeploymentReady(target, expected.destinationPermission, targetTransport, failure)) return false;
+    ProdigyCousinRouteResponse sourceResponse = {}, targetResponse = {};
+    if (!observeCousinRouteSide(source, route, CousinRouteHalf::source, sourceResponse, failure) ||
+        !observeCousinRouteSide(target, route, CousinRouteHalf::destination, targetResponse, failure) ||
+        !sourceResponse.found || !sourceResponse.qualified || !targetResponse.found || !targetResponse.qualified ||
+        !cousinRouteExactMatches(sourceResponse.route, route) || !cousinRouteExactMatches(targetResponse.route, route) ||
+        !receiptCurrent(sourceResponse.applyReceipt, expected.sourceRouteReceipt) ||
+        !receiptCurrent(targetResponse.applyReceipt, expected.destinationRouteReceipt))
+    {
+      if (failure.empty()) failure.assign("production migration COUSIN route is not freshly qualified on both clusters"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool productionPairWorkloadsReady(const MothershipProductionPairRecord& record,
+                                    const MothershipProdigyCluster& source,
+                                    const MothershipProdigyCluster& target,
+                                    bool requireSource,
+                                    ClusterStatusReport& sourceStatus,
+                                    ClusterStatusReport& targetStatus,
+                                    String& failure)
+  {
+    sourceStatus = {}; targetStatus = {};
+    if (!productionClusterHealthy(source, sourceStatus, failure) ||
+        !productionClusterHealthy(target, targetStatus, failure)) return false;
+    DeploymentIdentityReport report = {};
+    MothershipProductionWorkloadIdentity observed = {};
+    if (requireSource &&
+        (!productionWorkloadIdentity(source, record.intent.sourceWorkload.deploymentID, observed, report, failure) ||
+         !productionWorkloadIdentityEqual(observed, record.intent.sourceWorkload)))
+    {
+      if (failure.empty()) failure.assign("production migration source workload identity changed"_ctv);
+      return false;
+    }
+    observed = {}; report = {};
+    if (!productionWorkloadIdentity(target, record.intent.targetWorkload.deploymentID, observed, report, failure) ||
+        !productionWorkloadIdentityEqual(observed, record.intent.targetWorkload))
+    {
+      if (failure.empty()) failure.assign("production migration target workload identity changed"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  struct ProductionPairProviderState {
+    bool selectedTarget = false;
+    bool sourceReachable = false;
+    bool targetReachable = false;
+    uint64_t sourceFlows = 0;
+    uint64_t targetFlows = 0;
+    uint64_t sourceConnections = 0;
+    uint64_t targetConnections = 0;
+    uint64_t sourceRequestBytes = 0;
+    uint64_t sourceResponseBytes = 0;
+    uint64_t targetRequestBytes = 0;
+    uint64_t targetResponseBytes = 0;
+    uint64_t generation = 0;
+    uint64_t pid = 0;
+    String starttime = {};
+  };
+
+  void productionPairProviderArguments(const MothershipProductionPairRecord& record,
+                                       const char *action, Vector<String>& arguments)
+  {
+    arguments.clear();
+    String operation = {}, executorCluster = {}, executorMachine = {}, witnessMachine = {};
+    String sourcePort = {}, targetPort = {}, listenerPort = {};
+    operation.assignItoh(record.intent.operationUUID);
+    executorCluster.assignItoh(record.intent.sourceWorkload.clusterUUID);
+    executorMachine.assignItoh(record.intent.selectorMachineUUID);
+    witnessMachine.assignItoh(record.intent.ingressWitnessMachineUUID);
+    sourcePort.assignItoa(record.intent.sourceWorkload.endpointTCPPort);
+    targetPort.assignItoa(record.intent.targetWorkload.endpointTCPPort);
+    listenerPort.assignItoa(record.intent.selectorTCPPort);
+    arguments.emplace_back(action);
+    arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);
+    arguments.emplace_back("--executor-cluster-id"_ctv); arguments.push_back(executorCluster);
+    arguments.emplace_back("--executor-machine-id"_ctv); arguments.push_back(executorMachine);
+    arguments.emplace_back("--witness-machine-id"_ctv); arguments.push_back(witnessMachine);
+    arguments.emplace_back("--state-dir"_ctv);
+    arguments.emplace_back("/var/lib/prodigy/mothership-production-pairs"_ctv);
+    arguments.emplace_back("--listen-address"_ctv); arguments.push_back(record.intent.selectorAddress);
+    arguments.emplace_back("--listen-port"_ctv); arguments.push_back(listenerPort);
+    arguments.emplace_back("--source-address"_ctv); arguments.push_back(record.intent.sourceWorkload.endpointIPv4);
+    arguments.emplace_back("--source-port"_ctv); arguments.push_back(sourcePort);
+    arguments.emplace_back("--target-address"_ctv); arguments.push_back(record.intent.targetWorkload.endpointIPv4);
+    arguments.emplace_back("--target-port"_ctv); arguments.push_back(targetPort);
+  }
+
+  bool parseProductionPairProviderOutput(const MothershipProductionPairRecord& record,
+                                         const String& output, bool removal,
+                                         ProductionPairProviderState& state,
+                                         String& failure)
+  {
+    state = {};
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    if (output.size() > 64_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT)
+    { failure.assign("production pair provider returned malformed JSON"_ctv); return false; }
+    auto object = document.get_object(); bool success = false;
+    if (object["success"].get(success) || !success)
+    { failure.assign("production pair provider rejected the operation"_ctv); return false; }
+    if (removal) return object.size() == 1;
+    simdjson::dom::object encodedState;
+    if (object.size() != 2 || object["state"].get(encodedState))
+    { failure.assign("production pair provider omitted its exact state"_ctv); return false; }
+    std::string_view operation, executorCluster, executorMachine, status, starttime;
+    bool selected = false, sourceReachable = false, targetReachable = false;
+    uint64_t sourceFlows = 0, targetFlows = 0, sourceConnections = 0, targetConnections = 0;
+    uint64_t sourceRequestBytes = 0, sourceResponseBytes = 0;
+    uint64_t targetRequestBytes = 0, targetResponseBytes = 0;
+    uint64_t pid = 0, generation = 0, version = 0;
+    simdjson::dom::array listener, sourceEndpoint, targetEndpoint;
+    if (encodedState.size() != 22 || encodedState["version"].get(version) || version != 2 ||
+        encodedState["operationID"].get(operation) || encodedState["listener"].get(listener) ||
+        encodedState["executorClusterID"].get(executorCluster) ||
+        encodedState["executorMachineID"].get(executorMachine) ||
+        encodedState["source"].get(sourceEndpoint) || encodedState["target"].get(targetEndpoint) ||
+        encodedState["selectedTarget"].get(selected) || encodedState["sourceFlows"].get(sourceFlows) ||
+        encodedState["targetFlows"].get(targetFlows) ||
+        encodedState["sourceConnections"].get(sourceConnections) ||
+        encodedState["targetConnections"].get(targetConnections) ||
+        encodedState["sourceRequestBytes"].get(sourceRequestBytes) ||
+        encodedState["sourceResponseBytes"].get(sourceResponseBytes) ||
+        encodedState["targetRequestBytes"].get(targetRequestBytes) ||
+        encodedState["targetResponseBytes"].get(targetResponseBytes) ||
+        encodedState["sourceReachable"].get(sourceReachable) ||
+        encodedState["targetReachable"].get(targetReachable) || encodedState["pid"].get(pid) ||
+        encodedState["starttime"].get(starttime) || encodedState["generation"].get(generation) ||
+        encodedState["status"].get(status) || !sourceReachable || !targetReachable ||
+        pid == 0 || generation == 0 || starttime.empty() || status != "running")
+    { failure.assign("production pair provider state schema or process identity is invalid"_ctv); return false; }
+    auto endpointMatches = [&](simdjson::dom::array endpoint, const String& address, uint16_t port) {
+      if (endpoint.size() != 2) return false;
+      auto iterator = endpoint.begin(); std::string_view observedAddress; uint64_t observedPort = 0;
+      if ((*iterator).get(observedAddress)) return false; ++iterator;
+      if ((*iterator).get(observedPort)) return false;
+      return observedAddress.size() == address.size() &&
+          (!observedAddress.size() || std::memcmp(observedAddress.data(), address.data(), address.size()) == 0) &&
+          observedPort == port;
+    };
+    String expectedOperation = {}, expectedCluster = {}, expectedMachine = {};
+    expectedOperation.assignItoh(record.intent.operationUUID);
+    expectedCluster.assignItoh(record.intent.sourceWorkload.clusterUUID);
+    expectedMachine.assignItoh(record.intent.selectorMachineUUID);
+    auto textMatches = [](std::string_view observed, const String& expected) {
+      return observed.size() == expected.size() &&
+          (!observed.size() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
+    };
+    if (operation.size() != expectedOperation.size() ||
+        (operation.size() && std::memcmp(operation.data(), expectedOperation.data(), operation.size()) != 0) ||
+        !textMatches(executorCluster, expectedCluster) || !textMatches(executorMachine, expectedMachine) ||
+        !endpointMatches(listener, record.intent.selectorAddress, record.intent.selectorTCPPort) ||
+        !endpointMatches(sourceEndpoint, record.intent.sourceWorkload.endpointIPv4,
+                         record.intent.sourceWorkload.endpointTCPPort) ||
+        !endpointMatches(targetEndpoint, record.intent.targetWorkload.endpointIPv4,
+                         record.intent.targetWorkload.endpointTCPPort))
+    { failure.assign("production pair provider state conflicts with the immutable pair identity"_ctv); return false; }
+    state.selectedTarget = selected; state.sourceFlows = sourceFlows; state.targetFlows = targetFlows;
+    state.sourceConnections = sourceConnections; state.targetConnections = targetConnections;
+    state.sourceRequestBytes = sourceRequestBytes; state.sourceResponseBytes = sourceResponseBytes;
+    state.targetRequestBytes = targetRequestBytes; state.targetResponseBytes = targetResponseBytes;
+    state.sourceReachable = sourceReachable; state.targetReachable = targetReachable;
+    state.generation = generation; state.pid = pid;
+    state.starttime.setInvariant(starttime.data(), starttime.size());
+    return true;
+  }
+
+  bool mothershipRunRemoteSealedPythonProvider(
+      const MothershipProdigyCluster& cluster, const MothershipProdigyClusterMachine& executor,
+      const char *providerName, const uint8_t *providerSource, uint64_t providerSourceBytes,
+      const Vector<String>& arguments, int timeoutMilliseconds,
+      String& output, String& failure)
+  {
+    output.clear();
+    LIBSSH2_SESSION *session = nullptr; int fd = -1;
+    if (!mothershipConnectSSHSession(executor, session, fd, &failure,
+                                    &cluster.bootstrapSshKeyPackage,
+                                    &cluster.bootstrapSshPrivateKeyPath)) return false;
+    String stage = {};
+    bool valid = prodigyRunBlockingSSHCommand(session, fd,
+        "set -eu; d=$(mktemp -d /tmp/prodigy-g6-provider.XXXXXX); chmod 700 \"$d\"; printf '%s' \"$d\""_ctv,
+        &stage, &failure, 30'000);
+    constexpr const char *prefix = "/tmp/prodigy-g6-provider.";
+    const size_t prefixBytes = std::strlen(prefix);
+    if (valid && (stage.size() <= prefixBytes || std::memcmp(stage.data(), prefix, prefixBytes) != 0))
+    { failure.assign("remote sealed provider staging directory is invalid"_ctv); valid = false; }
+    for (size_t index = prefixBytes; valid && index < stage.size(); ++index)
+      if (!std::isalnum(static_cast<unsigned char>(stage[index])))
+      { failure.assign("remote sealed provider staging suffix is unsafe"_ctv); valid = false; }
+
+    String remoteProvider = stage; remoteProvider.append("/provider.py"_ctv);
+    int providerFD = -1;
+    if (valid) valid = mothershipCreateSealedProviderFD(providerName, providerSource,
+                                                        providerSourceBytes, providerFD, &failure);
+    String providerPath = {};
+    if (valid)
+    {
+      providerPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(providerFD));
+      valid = prodigyUploadLocalFileToSSHSession(session, fd, providerPath,
+                                                 remoteProvider, 0700, &failure, 30'000);
+    }
+    if (providerFD >= 0) ::close(providerFD);
+
+    String expectedSHA = {}, sourceBytes = {};
+    sourceBytes.append(reinterpret_cast<const char *>(providerSource), providerSourceBytes);
+    if (valid) valid = prodigyComputeSHA256Hex(sourceBytes, expectedSHA, &failure);
+    if (valid)
+    {
+      // Open, validate, hash, and execute one immutable descriptor in a single
+      // remote process.  A separate path-based sha256sum followed by python3
+      // would leave a replacement window for the SSH account between proof
+      // and execution.
+      constexpr auto remoteExec =
+          "import hashlib,os,stat,sys\n"
+          "expected,directory,name,*arguments=sys.argv[1:]\n"
+          "directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n"
+          "directory_state=os.fstat(directory_fd)\n"
+          "assert stat.S_ISDIR(directory_state.st_mode) and directory_state.st_uid==os.geteuid() and stat.S_IMODE(directory_state.st_mode)==0o700\n"
+          "provider_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory_fd)\n"
+          "provider_state=os.fstat(provider_fd)\n"
+          "assert stat.S_ISREG(provider_state.st_mode) and provider_state.st_uid==os.geteuid() and provider_state.st_nlink==1 and stat.S_IMODE(provider_state.st_mode)==0o700\n"
+          "digest=hashlib.sha256()\n"
+          "while True:\n"
+          " chunk=os.read(provider_fd,1048576)\n"
+          " if not chunk: break\n"
+          " digest.update(chunk)\n"
+          "assert digest.hexdigest()==expected\n"
+          "os.lseek(provider_fd,0,os.SEEK_SET)\n"
+          "os.set_inheritable(provider_fd,True)\n"
+          "os.close(directory_fd)\n"
+          "os.execve('/usr/bin/python3',['/usr/bin/python3','/proc/self/fd/%d'%provider_fd,*arguments],os.environ)\n";
+      String command = {}; command.assign("/usr/bin/python3 -c "_ctv);
+      prodigyAppendShellSingleQuoted(command, String(remoteExec));
+      command.append(' '); prodigyAppendShellSingleQuoted(command, expectedSHA);
+      command.append(' '); prodigyAppendShellSingleQuoted(command, stage);
+      command.append(" provider.py"_ctv);
+      for (const auto& argument : arguments)
+      { command.append(' '); prodigyAppendShellSingleQuoted(command, argument); }
+      valid = prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure,
+                                           timeoutMilliseconds);
+      if (!valid && failure.empty()) failure.assign("remote sealed provider validation or execution failed"_ctv);
+    }
+    if (!stage.empty())
+    {
+      String cleanup = {}; cleanup.assign("rm -rf -- "_ctv);
+      prodigyAppendShellSingleQuoted(cleanup, stage);
+      String ignored = {};
+      (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
+    }
+    mothershipCloseSSHSession(session, fd);
+    return valid;
+  }
+
+  bool runProductionPairProvider(const MothershipProductionPairRecord& record,
+                                 const MothershipProdigyCluster& source, const char *action,
+                                 ProductionPairProviderState& state, String& output,
+                                 String& providerEvidenceSHA256, String& failure)
+  {
+    MothershipProdigyClusterMachine executor = {};
+    if (!resolvePhysicalFaultExecutor(source, record.intent.selectorMachineUUID,
+                                      record.intent.selectorExecutorKind,
+                                      record.intent.selectorLocalVMBoundaryUUID,
+                                      record.intent.selectorCloudID,
+                                      executor, failure)) return false;
+    Vector<String> arguments = {};
+    productionPairProviderArguments(record, action, arguments);
+    const bool removal = std::strcmp(action, "remove") == 0;
+    if (!mothershipRunRemoteSealedPythonProvider(source, executor,
+          "mothership-production-pair-upload", mothershipProductionPairProviderSource,
+          sizeof(mothershipProductionPairProviderSource), arguments, 30'000, output, failure) ||
+        !parseProductionPairProviderOutput(record, output, removal, state, failure) ||
+        !prodigyComputeSHA256Hex(output, providerEvidenceSHA256, &failure)) return false;
+    return true;
+  }
+
+  bool parseProductionPairIngressWitness(const MothershipProductionPairRecord& record,
+                                         const char *side, const String& output, String& failure)
+  {
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    if (output.size() > 8_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT)
+    { failure.assign("production pair ingress witness returned malformed JSON"_ctv); return false; }
+    auto object = document.get_object(); bool success = false; simdjson::dom::object witness;
+    if (object.size() != 2 || object["success"].get(success) || !success || object["witness"].get(witness) ||
+        witness.size() != 5)
+    { failure.assign("production pair ingress witness rejected the observation"_ctv); return false; }
+    uint64_t version = 0, port = 0; std::string_view operation, machine, observedSide; simdjson::dom::array selector;
+    if (witness["version"].get(version) || version != 1 || witness["operationID"].get(operation) ||
+        witness["witnessMachineID"].get(machine) || witness["side"].get(observedSide) ||
+        witness["selector"].get(selector) || selector.size() != 2 || observedSide != side)
+    { failure.assign("production pair ingress witness schema conflicts with its request"_ctv); return false; }
+    auto it = selector.begin(); std::string_view address;
+    if ((*it).get(address))
+    { failure.assign("production pair ingress witness selector is malformed"_ctv); return false; }
+    ++it;
+    if ((*it).get(port))
+    { failure.assign("production pair ingress witness selector is malformed"_ctv); return false; }
+    String expectedOperation = {}, expectedMachine = {};
+    expectedOperation.assignItoh(record.intent.operationUUID);
+    expectedMachine.assignItoh(record.intent.ingressWitnessMachineUUID);
+    auto same = [](std::string_view observed, const String& expected) {
+      return observed.size() == expected.size() && (!observed.size() ||
+          std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
+    };
+    if (!same(operation, expectedOperation) || !same(machine, expectedMachine) ||
+        address.size() != record.intent.selectorAddress.size() ||
+        std::memcmp(address.data(), record.intent.selectorAddress.data(), address.size()) != 0 ||
+        port != record.intent.selectorTCPPort)
+    { failure.assign("production pair ingress witness does not bind the exact admitted selector"_ctv); return false; }
+    return true;
+  }
+
+  bool productionPairIngressWitness(const MothershipProductionPairRecord& record,
+                                    const MothershipProdigyCluster& source, const char *side,
+                                    String& receiptSHA256, String& failure)
+  {
+    receiptSHA256.clear();
+    if ((std::strcmp(side, "source") != 0 && std::strcmp(side, "target") != 0) ||
+        record.intent.ingressWitnessMachineUUID == record.intent.selectorMachineUUID)
+    { failure.assign("production pair ingress witness must be a distinct admitted topology machine"_ctv); return false; }
+    ProductionPairProviderState before = {}, after = {};
+    String beforeOutput = {}, afterOutput = {}, ignored = {}, output = {}, providerEvidence = {};
+    if (!runProductionPairProvider(record, source, "query", before, beforeOutput, ignored, failure)) return false;
+    const bool expectTarget = std::strcmp(side, "target") == 0;
+    if (before.selectedTarget != expectTarget)
+    { failure.assign("production pair ingress witness is on the wrong selector side"_ctv); return false; }
+    MothershipProdigyClusterMachine executor = {};
+    if (!resolvePhysicalFaultExecutor(source, record.intent.ingressWitnessMachineUUID,
+                                      record.intent.ingressWitnessExecutorKind,
+                                      record.intent.ingressWitnessLocalVMBoundaryUUID,
+                                      record.intent.ingressWitnessCloudID, executor, failure)) return false;
+    Vector<String> arguments = {};
+    productionPairProviderArguments(record, expectTarget ? "witness-target" : "witness-source", arguments);
+    if (!mothershipRunRemoteSealedPythonProvider(source, executor, "mothership-production-pair-ingress-witness",
+          mothershipProductionPairProviderSource, sizeof(mothershipProductionPairProviderSource), arguments,
+          30'000, output, failure) || !parseProductionPairIngressWitness(record, side, output, failure) ||
+        !prodigyComputeSHA256Hex(output, providerEvidence, &failure) ||
+        !runProductionPairProvider(record, source, "query", after, afterOutput, ignored, failure)) return false;
+    const bool progressed = expectTarget ?
+        (after.selectedTarget && after.targetConnections > before.targetConnections &&
+         after.targetRequestBytes > before.targetRequestBytes && after.targetResponseBytes > before.targetResponseBytes) :
+        (!after.selectedTarget && after.sourceConnections > before.sourceConnections &&
+         after.sourceRequestBytes > before.sourceRequestBytes && after.sourceResponseBytes > before.sourceResponseBytes);
+    if (!progressed)
+    { failure.assign("distinct ingress witness did not traverse the expected selector side"_ctv); return false; }
+    Vector<String> evidence = {};
+    evidence.emplace_back("mothership-production-pair-ingress-witness-receipt-v1"_ctv);
+    if (expectTarget) evidence.emplace_back("target-after-selection"_ctv);
+    else evidence.emplace_back("source-before-selection"_ctv);
+    evidence.push_back(providerEvidence);
+    String encoded = {}; auto immutableIntent = record.intent;
+    BitseryEngine::serialize(encoded, immutableIntent); evidence.push_back(encoded);
+    String beforeCounters = {}, afterCounters = {};
+    beforeCounters.snprintf<"{}:{}:{}:{}:{}"_ctv>(before.sourceConnections, before.targetConnections,
+        before.sourceRequestBytes, before.targetRequestBytes, before.generation);
+    afterCounters.snprintf<"{}:{}:{}:{}:{}"_ctv>(after.sourceConnections, after.targetConnections,
+        after.sourceRequestBytes, after.targetRequestBytes, after.generation);
+    evidence.push_back(beforeCounters); evidence.push_back(afterCounters);
+    encoded.clear(); BitseryEngine::serialize(encoded, evidence);
+    return prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+  }
+
+  bool productionPairSelectorPhaseReceipt(const MothershipProductionPairRecord& record,
+                                          MothershipProductionPairPhase phase,
+                                          const ProductionPairProviderState& state,
+                                          String& receiptSHA256, String& failure)
+  {
+    receiptSHA256.clear();
+    if ((phase != MothershipProductionPairPhase::transitApplied &&
+         phase != MothershipProductionPairPhase::targetSelected &&
+         phase != MothershipProductionPairPhase::sourceDrained) ||
+        state.pid == 0 || state.starttime.empty() || !state.sourceReachable || !state.targetReachable ||
+        (phase == MothershipProductionPairPhase::transitApplied &&
+         (state.selectedTarget || state.targetFlows != 0 || state.targetConnections != 0)) ||
+        (phase == MothershipProductionPairPhase::targetSelected &&
+         (!mothershipProductionPairReceiptValid(record.sourceIngressWitnessReceiptSHA256) ||
+          !state.selectedTarget || state.sourceFlows == 0 || state.sourceConnections == 0 ||
+          state.sourceRequestBytes == 0 || state.sourceResponseBytes == 0)) ||
+        (phase == MothershipProductionPairPhase::sourceDrained &&
+         (!mothershipProductionPairReceiptValid(record.sourceIngressWitnessReceiptSHA256) ||
+          !mothershipProductionPairReceiptValid(record.targetIngressWitnessReceiptSHA256) ||
+          !state.selectedTarget || state.sourceFlows != 0 || state.sourceConnections == 0 ||
+          state.targetConnections == 0 || state.sourceRequestBytes == 0 ||
+          state.sourceResponseBytes == 0 || state.targetRequestBytes == 0 ||
+          state.targetResponseBytes == 0)))
+    {
+      failure.assign("selector state does not prove the requested Mothership production-pair phase"_ctv);
+      return false;
+    }
+    String intentBytes = {}, intentSHA256 = {}, pid = {}, phaseText = {};
+    auto intent = record.intent; BitseryEngine::serialize(intentBytes, intent);
+    if (!prodigyComputeSHA256Hex(intentBytes, intentSHA256, &failure)) return false;
+    pid.assignItoa(state.pid); phaseText.assignItoa(uint8_t(phase));
+    Vector<String> evidence = {};
+    evidence.emplace_back("mothership-production-pair-selector-receipt-v2"_ctv);
+    evidence.push_back(phaseText); evidence.push_back(intentSHA256);
+    evidence.push_back(record.targetAdmissionReceiptSHA256);
+    evidence.emplace_back(phase >= MothershipProductionPairPhase::targetSelected ?
+                          record.sourceIngressWitnessReceiptSHA256 : String());
+    evidence.emplace_back(phase >= MothershipProductionPairPhase::targetSelected ?
+                          record.transitApplyReceiptSHA256 : String());
+    evidence.emplace_back(phase >= MothershipProductionPairPhase::sourceDrained ?
+                          record.targetIngressWitnessReceiptSHA256 : String());
+    evidence.emplace_back(phase >= MothershipProductionPairPhase::sourceDrained ?
+                          record.targetSelectionReceiptSHA256 : String());
+    evidence.push_back(pid); evidence.push_back(state.starttime);
+    if (state.selectedTarget) evidence.emplace_back("target"_ctv);
+    else evidence.emplace_back("source"_ctv);
+    if (phase == MothershipProductionPairPhase::targetSelected)
+    { evidence.emplace_back("source-witnessed"_ctv); evidence.emplace_back("source-active"_ctv); }
+    else if (phase == MothershipProductionPairPhase::sourceDrained)
+    { evidence.emplace_back("source-witnessed"_ctv); evidence.emplace_back("target-witnessed"_ctv);
+      evidence.emplace_back("source-zero"_ctv); }
+    else evidence.emplace_back("transit-ready"_ctv);
+    evidence.emplace_back("source-reachable"_ctv); evidence.emplace_back("target-reachable"_ctv);
+    String encoded = {}; BitseryEngine::serialize(encoded, evidence);
+    return prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+  }
+
+  bool productionPairSelectorPhaseMatches(const MothershipProductionPairRecord& record,
+                                          MothershipProductionPairPhase phase,
+                                          const ProductionPairProviderState& state,
+                                          String& failure)
+  {
+    String observed = {};
+    if (!productionPairSelectorPhaseReceipt(record, phase, state, observed, failure)) return false;
+    const String *expected = phase == MothershipProductionPairPhase::transitApplied ?
+        &record.transitApplyReceiptSHA256 :
+        (phase == MothershipProductionPairPhase::targetSelected ?
+         &record.targetSelectionReceiptSHA256 : &record.sourceDrainReceiptSHA256);
+    if (observed != *expected)
+    {
+      failure.assign("selector process identity or Mothership phase evidence changed"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool productionPhysicalBoundaryAdmissionReceipt(
+      const MothershipProductionPairRecord& record,
+      const MothershipPhysicalServiceTransitBoundary& boundary,
+      const ClusterStatusReport& sourceStatus, const ClusterStatusReport& targetStatus,
+      const String& selectorTransitReceiptSHA256,
+      String& receiptSHA256, String& failure)
+  {
+    MothershipPhysicalFaultMachineObservation sourceObservation = {}, targetObservation = {};
+    if (!physicalFaultMachineObservation(sourceStatus, boundary.sourceClusterUUID,
+                                         boundary.sourceMachineUUID, sourceObservation, failure) ||
+        !physicalFaultMachineObservation(targetStatus, boundary.targetClusterUUID,
+                                         boundary.targetMachineUUID, targetObservation, failure)) return false;
+    String sourceObservationBytes = {}, targetObservationBytes = {};
+    BitseryEngine::serialize(sourceObservationBytes, sourceObservation);
+    BitseryEngine::serialize(targetObservationBytes, targetObservation);
+    String operation = {}, route = {}, sourceMachine = {}, targetMachine = {};
+    String sourceBoundary = {}, targetBoundary = {}, mtu = {};
+    operation.assignItoh(record.intent.operationUUID); route.assignItoh(boundary.routeUUID);
+    sourceMachine.assignItoh(boundary.sourceMachineUUID); targetMachine.assignItoh(boundary.targetMachineUUID);
+    sourceBoundary.assignItoh(boundary.sourceLocalVMBoundaryUUID);
+    targetBoundary.assignItoh(boundary.targetLocalVMBoundaryUUID); mtu.assignItoa(boundary.pathMTU);
+    Vector<String> evidence = {};
+    evidence.emplace_back("mothership-physical-service-transit-admission-v3"_ctv);
+    evidence.push_back(operation); evidence.push_back(route);
+    evidence.push_back(sourceMachine); evidence.push_back(targetMachine);
+    evidence.emplace_back(); evidence.back().assignItoa(uint8_t(boundary.sourceExecutorKind));
+    evidence.emplace_back(); evidence.back().assignItoa(uint8_t(boundary.targetExecutorKind));
+    evidence.push_back(sourceBoundary); evidence.push_back(targetBoundary);
+    evidence.push_back(boundary.sourceCloudID); evidence.push_back(boundary.targetCloudID);
+    evidence.push_back(boundary.sourceAddress); evidence.push_back(boundary.targetAddress);
+    evidence.push_back(mtu); evidence.push_back(boundary.routeAuthorizationSHA256);
+    evidence.push_back(sourceObservationBytes); evidence.push_back(targetObservationBytes);
+    evidence.push_back(selectorTransitReceiptSHA256);
+    String encoded = {}; BitseryEngine::serialize(encoded, evidence);
+    return prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+  }
+
+  bool productionPairPhysicalBoundaryReady(
+      const MothershipProductionPairRecord& record,
+      const MothershipProdigyCluster& source, const MothershipProdigyCluster& target,
+      const MothershipPhysicalServiceTransitBoundary& boundary,
+      String& failure)
+  {
+    String authorization = {};
+    if (!mothershipPhysicalServiceTransitBoundaryValid(boundary, &failure) || boundary.closed ||
+        boundary.boundaryUUID != record.intent.physicalBoundaryUUID ||
+        boundary.pairOperationUUID != record.intent.operationUUID ||
+        boundary.routeUUID != record.intent.route.routeUUID ||
+        boundary.routeGeneration != record.intent.route.generation ||
+        boundary.sourceClusterUUID != record.intent.route.sourceClusterUUID ||
+        boundary.targetClusterUUID != record.intent.route.destinationClusterUUID ||
+        boundary.sourceMachineUUID != record.intent.sourceWorkload.endpointMachineUUID ||
+        boundary.sourceMachineUUID != record.intent.selectorMachineUUID ||
+        boundary.targetMachineUUID != record.intent.targetWorkload.endpointMachineUUID ||
+        boundary.sourceExecutorKind != record.intent.selectorExecutorKind ||
+        boundary.sourceLocalVMBoundaryUUID != record.intent.selectorLocalVMBoundaryUUID ||
+        boundary.sourceCloudID != record.intent.selectorCloudID ||
+        boundary.sourceAddress != record.intent.sourceWorkload.endpointIPv4 ||
+        boundary.targetAddress != record.intent.targetWorkload.endpointIPv4 ||
+        boundary.sourceTCPPort != record.intent.sourceWorkload.endpointTCPPort ||
+        boundary.targetTCPPort != record.intent.targetWorkload.endpointTCPPort ||
+        boundary.pathMTU != record.intent.route.pathMTU ||
+        !cousinRouteAuthorizationDigest(record.intent.route, authorization) ||
+        authorization != boundary.routeAuthorizationSHA256)
+    {
+      if (failure.empty())
+        failure.assign("production pair physical boundary conflicts with its immutable route or selector owner"_ctv);
+      return false;
+    }
+
+    MothershipPhysicalFaultExecutorKind sourceKind = MothershipPhysicalFaultExecutorKind::localVM;
+    MothershipPhysicalFaultExecutorKind targetKind = MothershipPhysicalFaultExecutorKind::localVM;
+    uint128_t sourceVMBoundary = 0, targetVMBoundary = 0;
+    String sourceCloudID = {}, targetCloudID = {};
+    if (!describePhysicalFaultExecutorBoundary(source, boundary.sourceMachineUUID, sourceKind,
+                                               sourceVMBoundary, sourceCloudID, failure) ||
+        !describePhysicalFaultExecutorBoundary(target, boundary.targetMachineUUID, targetKind,
+                                               targetVMBoundary, targetCloudID, failure) ||
+        sourceKind != boundary.sourceExecutorKind || targetKind != boundary.targetExecutorKind ||
+        sourceVMBoundary != boundary.sourceLocalVMBoundaryUUID ||
+        targetVMBoundary != boundary.targetLocalVMBoundaryUUID ||
+        sourceCloudID != boundary.sourceCloudID || targetCloudID != boundary.targetCloudID)
+    {
+      if (failure.empty())
+        failure.assign("production pair physical executors no longer match the admitted boundary"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool readManagedClusterStatus(const MothershipProdigyCluster& cluster,
                                 ClusterStatusReport& report, String& failure)
   {
     report = {};
@@ -12215,6 +13054,1244 @@ private:
     socket.close();
     if (!valid) failure.assign("current whole destination cluster observation is unavailable"_ctv);
     return valid;
+  }
+
+  bool physicalFaultMachineObservation(const ClusterStatusReport& report, uint128_t clusterUUID,
+                                       uint128_t machineUUID,
+                                       MothershipPhysicalFaultMachineObservation& observation,
+                                       String& failure)
+  {
+    observation = {};
+    if (!report.hasTopology || report.topology.version == 0 || machineUUID == 0)
+    {
+      failure.assign("physical fault requires a current versioned cluster topology"_ctv);
+      return false;
+    }
+    String machineIdentity = {}; machineIdentity.assignItoh(machineUUID);
+    uint32_t topologyMatches = 0, reportMatches = 0;
+    const MachineStatusReport *status = nullptr;
+    for (const auto& machine : report.topology.machines)
+      if (machine.uuid == machineUUID) ++topologyMatches;
+    for (const auto& candidate : report.machineReports)
+      if (candidate.machineUUID == machineIdentity) { ++reportMatches; status = &candidate; }
+    if (topologyMatches != 1 || reportMatches != 1 || status == nullptr ||
+        status->state != "healthy"_ctv || !status->isBrain || !status->controlPlaneReachable ||
+        !status->runtimeReady || status->bootTimeMs <= 0 || status->hardwareFailure ||
+        status->decommissioning || status->rebooting || status->updatingOS)
+    {
+      failure.assign("physical fault machine is not one exact healthy commissioned Brain"_ctv);
+      return false;
+    }
+    Vector<String> identity = {};
+    identity.emplace_back(); identity.back().assignItoh(clusterUUID);
+    identity.push_back(machineIdentity);
+    identity.emplace_back(); identity.back().assignItoa(report.topology.version);
+    identity.emplace_back(); identity.back().assignItoa(status->bootTimeMs);
+    identity.push_back(status->state); identity.push_back(status->runningProdigyVersion);
+    if (status->currentMaster) identity.emplace_back("master"_ctv);
+    else identity.emplace_back("follower"_ctv);
+    String encoded = {}; BitseryEngine::serialize(encoded, identity);
+    observation.clusterUUID = clusterUUID; observation.machineUUID = machineUUID;
+    observation.topologyVersion = report.topology.version;
+    if (!prodigyComputeSHA256Hex(encoded, observation.stateSHA256, &failure)) return false;
+    return mothershipPhysicalFaultMachineObservationValid(observation);
+  }
+
+  static bool topologyMachineOwnsAddress(const ClusterStatusReport& report, uint128_t machineUUID,
+                                         const String& address)
+  {
+    uint32_t matches = 0;
+    for (const auto& machine : report.topology.machines)
+    {
+      if (machine.uuid != machineUUID) continue;
+      for (const auto& candidate : machine.addresses.privateAddresses)
+        if (candidate.address == address) ++matches;
+      for (const auto& candidate : machine.addresses.publicAddresses)
+        if (candidate.address == address) ++matches;
+    }
+    return matches == 1 && mothershipPhysicalFaultNumericAddressValid(address);
+  }
+
+  static bool localVMBoundaryGuestUUIDMatches(uint128_t machineUUID, std::string_view guestUUID)
+  {
+    String expected = {}; expected.assignItoh(machineUUID);
+    String normalized = {};
+    for (char byte : guestUUID)
+    {
+      if (byte == '-') continue;
+      if (byte >= 'A' && byte <= 'F') byte = char(byte - 'A' + 'a');
+      if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) return false;
+      normalized.append(byte);
+    }
+    return normalized == expected;
+  }
+
+  // The registering caller never selects executable bytes.  For every query or
+  // action, stage the launcher compiled into Mothership, then make the remote
+  // Python process hash and execute the same opened descriptor.  In particular,
+  // do not split a pathname sha256sum from a later pathname python3 invocation.
+  bool runLocalVMBoundarySealedLauncher(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                        const Vector<String>& arguments, int timeoutMilliseconds,
+                                        String& output, String& failure)
+  {
+    output.clear();
+    String expectedSHA = {}, sourceBytes = {};
+    sourceBytes.append(reinterpret_cast<const char *>(mothershipLocalVMBoundarySource),
+                       sizeof(mothershipLocalVMBoundarySource));
+    if (!prodigyComputeSHA256Hex(sourceBytes, expectedSHA, &failure) ||
+        expectedSHA != descriptor.executorSHA256)
+    { if (failure.empty()) failure.assign("local VM boundary launcher digest is not Mothership-owned"_ctv); return false; }
+
+    MothershipProdigyClusterMachine host = {};
+    host.ssh.address = descriptor.hostAddress; host.ssh.port = descriptor.hostPort;
+    host.ssh.user = descriptor.hostUser; host.ssh.privateKeyPath = descriptor.hostPrivateKeyPath;
+    host.ssh.hostPublicKeyOpenSSH = descriptor.hostPublicKeyOpenSSH;
+    LIBSSH2_SESSION *session = nullptr; int fd = -1;
+    if (!mothershipConnectSSHSession(host, session, fd, &failure)) return false;
+    String stage = {};
+    bool valid = prodigyRunBlockingSSHCommand(session, fd,
+        "set -eu; d=$(mktemp -d /tmp/prodigy-g6-local-vm.XXXXXX); chmod 700 \"$d\"; printf '%s' \"$d\""_ctv,
+        &stage, &failure, 30'000);
+    constexpr const char *prefix = "/tmp/prodigy-g6-local-vm.";
+    const size_t prefixBytes = std::strlen(prefix);
+    if (valid && (stage.size() <= prefixBytes || std::memcmp(stage.data(), prefix, prefixBytes) != 0))
+    { failure.assign("local VM sealed launcher staging directory is invalid"_ctv); valid = false; }
+    for (size_t index = prefixBytes; valid && index < stage.size(); ++index)
+      if (!std::isalnum(static_cast<unsigned char>(stage[index])))
+      { failure.assign("local VM sealed launcher staging suffix is unsafe"_ctv); valid = false; }
+
+    String launcher = stage; launcher.append("/launcher.py"_ctv);
+    int launcherFD = -1;
+    if (valid) valid = mothershipCreateSealedProviderFD("mothership-local-vm-boundary",
+        mothershipLocalVMBoundarySource, sizeof(mothershipLocalVMBoundarySource), launcherFD, &failure);
+    String launcherPath = {};
+    if (valid)
+    {
+      launcherPath.snprintf<"/proc/self/fd/{itoa}"_ctv>(uint64_t(launcherFD));
+      valid = prodigyUploadLocalFileToSSHSession(session, fd, launcherPath, launcher, 0700, &failure, 30'000);
+    }
+    if (launcherFD >= 0) ::close(launcherFD);
+    if (valid)
+    {
+      constexpr auto remoteExec =
+          "import hashlib,os,stat,sys\n"
+          "expected,directory,name,*arguments=sys.argv[1:]\n"
+          "directory_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n"
+          "directory_state=os.fstat(directory_fd)\n"
+          "assert stat.S_ISDIR(directory_state.st_mode) and directory_state.st_uid==os.geteuid() and stat.S_IMODE(directory_state.st_mode)==0o700\n"
+          "launcher_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory_fd)\n"
+          "launcher_state=os.fstat(launcher_fd)\n"
+          "assert stat.S_ISREG(launcher_state.st_mode) and launcher_state.st_uid==os.geteuid() and launcher_state.st_nlink==1 and stat.S_IMODE(launcher_state.st_mode)==0o700\n"
+          "digest=hashlib.sha256()\n"
+          "while True:\n"
+          " chunk=os.read(launcher_fd,1048576)\n"
+          " if not chunk: break\n"
+          " digest.update(chunk)\n"
+          "assert digest.hexdigest()==expected\n"
+          "os.lseek(launcher_fd,0,os.SEEK_SET)\n"
+          "os.set_inheritable(launcher_fd,True)\n"
+          "os.close(directory_fd)\n"
+          "os.execve('/usr/bin/python3',['/usr/bin/python3','/proc/self/fd/%d'%launcher_fd,*arguments],os.environ)\n";
+      String command = {}; command.assign("/usr/bin/python3 -c "_ctv);
+      prodigyAppendShellSingleQuoted(command, String(remoteExec));
+      command.append(' '); prodigyAppendShellSingleQuoted(command, expectedSHA);
+      command.append(' '); prodigyAppendShellSingleQuoted(command, stage);
+      command.append(" launcher.py"_ctv);
+      for (const auto& argument : arguments)
+      { command.append(' '); prodigyAppendShellSingleQuoted(command, argument); }
+      valid = prodigyRunBlockingSSHCommand(session, fd, command, &output, &failure, timeoutMilliseconds);
+      if (!valid && failure.empty()) failure.assign("local VM sealed launcher validation or execution failed"_ctv);
+    }
+    if (!stage.empty())
+    {
+      String cleanup = {}; cleanup.assign("rm -rf -- "_ctv); prodigyAppendShellSingleQuoted(cleanup, stage);
+      String ignored = {}; (void)prodigyRunBlockingSSHCommand(session, fd, cleanup, nullptr, &ignored, 30'000);
+    }
+    mothershipCloseSSHSession(session, fd);
+    return valid;
+  }
+
+  bool queryLocalVMBoundaryExecutor(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                    String& immutableStateSHA256, String& failure,
+                                    uint64_t *observedPID = nullptr,
+                                    String *observedStarttime = nullptr)
+  {
+    immutableStateSHA256.clear();
+    Vector<String> arguments = {};
+    arguments.emplace_back("query"_ctv); arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
+    arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
+    String output = {};
+    bool valid = runLocalVMBoundarySealedLauncher(descriptor, arguments, 30'000, output, failure);
+    if (!valid) return false;
+
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    if (output.size() > 64_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT)
+    { failure.assign("local VM executor query returned malformed state"_ctv); return false; }
+    auto object = document.get_object();
+    if (object.size() != 10 && object.size() != 11)
+    { failure.assign("local VM executor query returned an unsupported state schema"_ctv); return false; }
+    std::string_view taskID, guestUUID, machineID, overlay, ovmfVars, qmpSocket, starttime;
+    uint64_t pid = 0;
+    simdjson::dom::array qemuCommand;
+    const auto stringViewMatches = [](std::string_view left, const String& right) {
+      return left.size() == right.size() &&
+          (left.empty() || std::memcmp(left.data(), right.data(), left.size()) == 0);
+    };
+    if (object["taskID"].get(taskID) || object["guestUUID"].get(guestUUID) ||
+        object["machineID"].get(machineID) || object["overlay"].get(overlay) ||
+        object["ovmfVars"].get(ovmfVars) || object["qmpSocket"].get(qmpSocket) ||
+        object["qemuStarttime"].get(starttime) || object["qemuPID"].get(pid) ||
+        object["qemuCommand"].get(qemuCommand) || !stringViewMatches(taskID, descriptor.taskID) || pid == 0 ||
+        !localVMBoundaryGuestUUIDMatches(descriptor.machineUUID, guestUUID))
+    { failure.assign("local VM executor state conflicts with its registered task or guest identity"_ctv); return false; }
+    auto safeText = [](std::string_view value) {
+      if (value.empty() || value.size() > 4096) return false;
+      for (char byte : value) if (byte == '\0' || byte == '\n' || byte == '\r') return false;
+      return true;
+    };
+    if (machineID.size() != 32 || !safeText(overlay) || !safeText(ovmfVars) || !safeText(qmpSocket) ||
+        starttime.empty() || !std::all_of(starttime.begin(), starttime.end(), [](char value) { return value >= '0' && value <= '9'; }))
+    { failure.assign("local VM executor state contains an invalid machine, path, or process identity"_ctv); return false; }
+    if (observedPID != nullptr) *observedPID = pid;
+    if (observedStarttime != nullptr) observedStarttime->setInvariant(starttime.data(), starttime.size());
+    Vector<String> identity = {};
+    auto add = [&](std::string_view value) { identity.emplace_back(); identity.back().setInvariant(value.data(), value.size()); };
+    add(taskID); add(guestUUID); add(machineID); add(overlay); add(ovmfVars); add(qmpSocket);
+    bool hasKVM = false, hasUUID = false, hasOverlay = false, hasVars = false, hasQMP = false;
+    bool hasNoDefaults = false, forbiddenNetworkOption = false;
+    Vector<String> netdevs = {}, devices = {};
+    uint32_t argumentCount = 0;
+    for (auto argumentElement : qemuCommand)
+    {
+      std::string_view argument;
+      if (argumentElement.get(argument) || !safeText(argument) || ++argumentCount > 128)
+      { failure.assign("local VM executor QEMU command is malformed"_ctv); return false; }
+      add(argument);
+    }
+    for (uint32_t index = 0; index < argumentCount; ++index)
+    {
+      const String& argument = identity[6 + index];
+      if (argument == "kvm"_ctv && index > 0 && identity[6 + index - 1] == "-accel"_ctv) hasKVM = true;
+      if (argument == "-nodefaults"_ctv) hasNoDefaults = true;
+      const bool netEquals = argument.size() >= 5 && std::memcmp(argument.data(), "-net=", 5) == 0;
+      const bool nicEquals = argument.size() >= 5 && std::memcmp(argument.data(), "-nic=", 5) == 0;
+      if (argument == "-net"_ctv || argument == "-nic"_ctv || netEquals || nicEquals)
+        forbiddenNetworkOption = true;
+      if (stringViewMatches(guestUUID, argument) && index > 0 && identity[6 + index - 1] == "-uuid"_ctv) hasUUID = true;
+      if (argument.size() >= overlay.size() && std::search(argument.begin(), argument.end(), overlay.begin(), overlay.end()) != argument.end()) hasOverlay = true;
+      if (argument.size() >= ovmfVars.size() && std::search(argument.begin(), argument.end(), ovmfVars.begin(), ovmfVars.end()) != argument.end()) hasVars = true;
+      if (argument.size() >= qmpSocket.size() && std::search(argument.begin(), argument.end(), qmpSocket.begin(), qmpSocket.end()) != argument.end()) hasQMP = true;
+      if (index > 0 && identity[6 + index - 1] == "-netdev"_ctv) netdevs.push_back(argument);
+      if (index > 0 && identity[6 + index - 1] == "-device"_ctv) devices.push_back(argument);
+    }
+    auto starts = [](const String& value, const char *prefix) {
+      const size_t count = std::strlen(prefix);
+      return value.size() >= count && std::memcmp(value.data(), prefix, count) == 0;
+    };
+    auto exactDecimalPort = [&](const String& value, const char *prefix, const char *suffix) {
+      const size_t prefixBytes = std::strlen(prefix), suffixBytes = std::strlen(suffix);
+      if (!starts(value, prefix) || value.size() <= prefixBytes + suffixBytes ||
+          std::memcmp(value.data() + value.size() - suffixBytes, suffix, suffixBytes) != 0) return false;
+      uint64_t parsed = 0;
+      for (size_t index = prefixBytes; index < value.size() - suffixBytes; ++index)
+      {
+        const char byte = value[index];
+        if (byte < '0' || byte > '9') return false;
+        parsed = parsed * 10 + uint64_t(byte - '0');
+        if (parsed > 65535) return false;
+      }
+      return parsed >= 1024;
+    };
+    auto exactMulticastNetdev = [&](const String& value) {
+      constexpr const char *prefix = "socket,id=clusterlan,mcast=";
+      constexpr const char *separator = ",localaddr=";
+      if (!starts(value, prefix)) return false;
+      const auto separatorAt = std::search(value.begin() + std::strlen(prefix), value.end(),
+                                           separator, separator + std::strlen(separator));
+      if (separatorAt == value.end()) return false;
+      String multicast = {}, local = {};
+      multicast.append(value.data() + std::strlen(prefix),
+                       size_t(separatorAt - value.begin() - std::strlen(prefix)));
+      local.append(separatorAt + std::strlen(separator),
+                   size_t(value.end() - separatorAt - std::strlen(separator)));
+      const auto colon = std::find(multicast.begin(), multicast.end(), ':');
+      if (colon == multicast.end() || std::find(colon + 1, multicast.end(), ':') != multicast.end()) return false;
+      String multicastAddress = {}, multicastPort = {};
+      multicastAddress.append(multicast.data(), size_t(colon - multicast.begin()));
+      multicastPort.append(colon + 1, size_t(multicast.end() - colon - 1));
+      struct in_addr multicastParsed = {}, localParsed = {};
+      if (::inet_pton(AF_INET, multicastAddress.c_str(), &multicastParsed) != 1 ||
+          ::inet_pton(AF_INET, local.c_str(), &localParsed) != 1) return false;
+      const uint8_t multicastFirst = uint8_t(ntohl(multicastParsed.s_addr) >> 24);
+      const uint32_t localHost = ntohl(localParsed.s_addr);
+      const uint8_t localFirst = uint8_t(localHost >> 24);
+      uint64_t port = 0;
+      if (multicastPort.empty()) return false;
+      for (char byte : multicastPort)
+      {
+        if (byte < '0' || byte > '9') return false;
+        port = port * 10 + uint64_t(byte - '0');
+        if (port > 65535) return false;
+      }
+      return multicastFirst >= 224 && multicastFirst <= 239 && port >= 1024 &&
+          localHost != INADDR_ANY && localHost != 0xffffffffu && localFirst != 127 && localFirst != 0 &&
+          !(localFirst == 169 && uint8_t(localHost >> 16) == 254) &&
+          !(localFirst >= 224 && localFirst <= 239);
+    };
+    auto exactSafeUnicastEndpoint = [&](const String& value) {
+      const auto colon = std::find(value.begin(), value.end(), ':');
+      if (colon == value.end() || std::find(colon + 1, value.end(), ':') != value.end()) return false;
+      String address = {}, portText = {};
+      address.append(value.data(), size_t(colon - value.begin()));
+      portText.append(colon + 1, size_t(value.end() - colon - 1));
+      struct in_addr parsed = {};
+      if (::inet_pton(AF_INET, address.c_str(), &parsed) != 1) return false;
+      char canonical[INET_ADDRSTRLEN] = {};
+      if (::inet_ntop(AF_INET, &parsed, canonical, sizeof(canonical)) == nullptr || address != String(canonical)) return false;
+      uint64_t port = 0;
+      if (portText.empty()) return false;
+      for (char byte : portText)
+      {
+        if (byte < '0' || byte > '9') return false;
+        port = port * 10 + uint64_t(byte - '0');
+        if (port > 65535) return false;
+      }
+      const uint32_t host = ntohl(parsed.s_addr);
+      const uint8_t first = uint8_t(host >> 24);
+      return port >= 1024 && host != INADDR_ANY && host != 0xffffffffu && first != 0 && first != 127 &&
+          !(first == 169 && uint8_t(host >> 16) == 254) && first < 224;
+    };
+    auto parseBoundedIndex = [](const String& value, size_t begin, size_t end, uint32_t& index) {
+      if (begin >= end || end > value.size()) return false;
+      uint64_t parsed = 0;
+      for (size_t offset = begin; offset < end; ++offset)
+      {
+        const char byte = value[offset];
+        if (byte < '0' || byte > '9') return false;
+        parsed = parsed * 10 + uint64_t(byte - '0');
+        if (parsed >= 4) return false;
+      }
+      index = uint32_t(parsed);
+      return true;
+    };
+    auto exactUDPLinkNetdev = [&](const String& value, uint32_t& index, String& local, String& remote) {
+      constexpr const char *prefix = "socket,id=clusterlink";
+      constexpr const char *udp = ",udp=";
+      constexpr const char *localAddress = ",localaddr=";
+      if (!starts(value, prefix)) return false;
+      const auto udpAt = std::search(value.begin() + std::strlen(prefix), value.end(), udp, udp + std::strlen(udp));
+      if (udpAt == value.end() || !parseBoundedIndex(value, std::strlen(prefix), size_t(udpAt - value.begin()), index)) return false;
+      const auto localAt = std::search(udpAt + std::strlen(udp), value.end(), localAddress, localAddress + std::strlen(localAddress));
+      if (localAt == value.end()) return false;
+      remote.clear(); local.clear();
+      remote.append(udpAt + std::strlen(udp), size_t(localAt - udpAt - std::strlen(udp)));
+      local.append(localAt + std::strlen(localAddress), size_t(value.end() - localAt - std::strlen(localAddress)));
+      return local != remote && exactSafeUnicastEndpoint(local) && exactSafeUnicastEndpoint(remote);
+    };
+    auto exactUDPHubport = [&](const String& value, uint32_t& index) {
+      constexpr const char *prefix = "hubport,id=clusterhub";
+      constexpr const char *middle = ",hubid=0,netdev=clusterlink";
+      if (!starts(value, prefix)) return false;
+      const auto middleAt = std::search(value.begin() + std::strlen(prefix), value.end(), middle, middle + std::strlen(middle));
+      if (middleAt == value.end() ||
+          !parseBoundedIndex(value, std::strlen(prefix), size_t(middleAt - value.begin()), index)) return false;
+      uint32_t linked = 0;
+      return parseBoundedIndex(value, size_t(middleAt - value.begin()) + std::strlen(middle), value.size(), linked) && linked == index;
+    };
+    auto exactClusterDevice = [&](const String& value) {
+      constexpr const char *prefix = "virtio-net-pci,netdev=clusterlan,mac=";
+      if (!starts(value, prefix) || value.size() != std::strlen(prefix) + 17) return false;
+      const uint8_t *mac = value.data() + std::strlen(prefix);
+      if (mac[0] != '0' || mac[1] != '2') return false;
+      for (size_t index = 2; index < 17; ++index)
+      {
+        if (index % 3 == 2) { if (mac[index] != ':') return false; }
+        else if (!((mac[index] >= '0' && mac[index] <= '9') ||
+                   (mac[index] >= 'a' && mac[index] <= 'f'))) return false;
+      }
+      return true;
+    };
+    auto exactUserDevice = [&](const String& value) {
+      constexpr const char *prefix = "virtio-net-pci,netdev=guestnet,mac=";
+      if (!starts(value, prefix) || value.size() != std::strlen(prefix) + 17) return false;
+      const uint8_t *mac = value.data() + std::strlen(prefix);
+      if (mac[0] != '0' || mac[1] != '2') return false;
+      for (size_t index = 2; index < 17; ++index)
+      {
+        if (index % 3 == 2) { if (mac[index] != ':') return false; }
+        else if (!((mac[index] >= '0' && mac[index] <= '9') ||
+                   (mac[index] >= 'a' && mac[index] <= 'f'))) return false;
+      }
+      return true;
+    };
+    uint32_t userNet = 0, multicastNet = 0, userDevice = 0, clusterDevice = 0, terminalHubport = 0;
+    bool udpLinks[4] = {}, udpHubports[4] = {};
+    Vector<String> udpLocals = {}, udpRemotes = {};
+    for (const auto& netdev : netdevs)
+    {
+      if (exactDecimalPort(netdev, "user,id=guestnet,hostfwd=tcp:127.0.0.1:", "-:22") ||
+          exactDecimalPort(netdev, "user,restrict=on,id=guestnet,hostfwd=tcp:127.0.0.1:", "-:22"))
+        ++userNet;
+      else if (exactMulticastNetdev(netdev)) ++multicastNet;
+      else if (netdev == "hubport,id=clusterlan,hubid=0"_ctv) ++terminalHubport;
+      else
+      {
+        uint32_t index = 0; String local = {}, remote = {};
+        if (exactUDPLinkNetdev(netdev, index, local, remote))
+        {
+          if (udpLinks[index]) { failure.assign("local VM executor repeats a UDP cluster link"_ctv); return false; }
+          for (const auto& prior : udpLocals) if (prior == local) { failure.assign("local VM executor repeats a UDP cluster local endpoint"_ctv); return false; }
+          for (const auto& prior : udpRemotes) if (prior == remote) { failure.assign("local VM executor repeats a UDP cluster remote endpoint"_ctv); return false; }
+          udpLinks[index] = true; udpLocals.push_back(local); udpRemotes.push_back(remote);
+        }
+        else if (exactUDPHubport(netdev, index))
+        {
+          if (udpHubports[index]) { failure.assign("local VM executor repeats a UDP cluster hubport"_ctv); return false; }
+          udpHubports[index] = true;
+        }
+        else
+        { failure.assign("local VM executor uses an unapproved host-network QEMU backend"_ctv); return false; }
+      }
+    }
+    for (const auto& device : devices)
+    {
+      if (exactUserDevice(device)) ++userDevice;
+      else if (exactClusterDevice(device)) ++clusterDevice;
+      else { failure.assign("local VM executor uses an unapproved QEMU network device"_ctv); return false; }
+    }
+    uint32_t udpCount = 0;
+    for (uint32_t index = 0; index < 4; ++index)
+    {
+      if (udpLinks[index]) ++udpCount;
+      if (udpLinks[index] != udpHubports[index]) { failure.assign("local VM executor UDP cluster link lacks its exact hubport"_ctv); return false; }
+    }
+    for (uint32_t index = 0; index < udpCount; ++index)
+      if (!udpLinks[index]) { failure.assign("local VM executor UDP cluster links are not contiguous"_ctv); return false; }
+    const bool legacyMulticast = multicastNet == 1 && udpCount == 0 && terminalHubport == 0 && clusterDevice == 1 &&
+        netdevs.size() == 2 && devices.size() == 2;
+    const bool udpStar = multicastNet == 0 && udpCount >= 1 && udpCount <= 4 && terminalHubport == 1 && clusterDevice == 1 &&
+        netdevs.size() == 2 * udpCount + 2 && devices.size() == 2;
+    const bool noClusterLAN = multicastNet == 0 && udpCount == 0 && terminalHubport == 0 && clusterDevice == 0 &&
+        netdevs.size() == 1 && devices.size() == 1;
+    const bool networkSafe = !forbiddenNetworkOption && hasNoDefaults && userNet == 1 && userDevice == 1 &&
+        (legacyMulticast || udpStar || noClusterLAN);
+    if (argumentCount == 0 || !hasKVM || !hasUUID || !hasOverlay || !hasVars || !hasQMP || !networkSafe)
+    { failure.assign("local VM executor state does not prove the exact KVM, disk, firmware, UUID, QMP, and userspace-network boundary"_ctv); return false; }
+    String encoded = {}; BitseryEngine::serialize(encoded, identity);
+    return prodigyComputeSHA256Hex(encoded, immutableStateSHA256, &failure);
+  }
+
+  bool runLocalVMBoundaryExecutorAction(const MothershipLocalVMBoundaryDescriptor& descriptor,
+                                        uint128_t operationUUID, const char *action,
+                                        uint32_t timeoutMilliseconds, uint64_t& startedAtMonotonicMs,
+                                        uint64_t& completedAtMonotonicMs,
+                                        String& failure)
+  {
+    startedAtMonotonicMs = 0; completedAtMonotonicMs = 0;
+    if (std::strcmp(action, "cold-reboot") != 0) { failure.assign("unsupported local VM executor action"_ctv); return false; }
+    String observed = {}, beforeStarttime = {};
+    uint64_t beforePID = 0;
+    if (!queryLocalVMBoundaryExecutor(descriptor, observed, failure, &beforePID, &beforeStarttime) ||
+        observed != descriptor.immutableStateSHA256)
+    { if (failure.empty()) failure.assign("local VM boundary immutable state changed"_ctv); return false; }
+    Vector<String> arguments = {};
+    arguments.emplace_back("cold-reboot"_ctv); arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
+    arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
+    String operation = {}; operation.assignItoh(operationUUID);
+    arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);
+    String output = {};
+    bool valid = runLocalVMBoundarySealedLauncher(descriptor, arguments,
+                                                   int(timeoutMilliseconds + 30'000), output, failure);
+    if (!valid) return false;
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    std::string_view observedOperation, beforeStarttimeReceipt, afterStarttimeReceipt;
+    std::string_view beforeIdentityStarttime, afterIdentityStarttime;
+    bool completed = false;
+    uint64_t beforePIDReceipt = 0, afterPIDReceipt = 0;
+    uint64_t beforeIdentityPID = 0, afterIdentityPID = 0;
+    simdjson::dom::object beforeIdentity, afterIdentity;
+    const auto sameProcessIdentity = [](uint64_t leftPID, std::string_view leftStarttime,
+                                        uint64_t rightPID, const String& rightStarttime) {
+      return leftPID == rightPID && leftStarttime.size() == rightStarttime.size() &&
+          (leftStarttime.empty() ||
+           std::memcmp(leftStarttime.data(), rightStarttime.data(), leftStarttime.size()) == 0);
+    };
+    if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT ||
+        document.get_object().size() != 10 ||
+        document["operationID"].get(observedOperation) || document["completed"].get(completed) ||
+        document["beforePID"].get(beforePIDReceipt) || document["beforeStarttime"].get(beforeStarttimeReceipt) ||
+        document["afterPID"].get(afterPIDReceipt) || document["afterStarttime"].get(afterStarttimeReceipt) ||
+        document["beforeIdentity"].get(beforeIdentity) || document["afterIdentity"].get(afterIdentity) ||
+        document["startedAtMonotonicMs"].get(startedAtMonotonicMs) ||
+        document["completedAtMonotonicMs"].get(completedAtMonotonicMs) || !completed ||
+        beforeIdentity.size() != 2 || afterIdentity.size() != 2 ||
+        beforeIdentity["pid"].get(beforeIdentityPID) || beforeIdentity["starttime"].get(beforeIdentityStarttime) ||
+        afterIdentity["pid"].get(afterIdentityPID) || afterIdentity["starttime"].get(afterIdentityStarttime) ||
+        observedOperation.size() != operation.size() ||
+        (observedOperation.size() && std::memcmp(observedOperation.data(), operation.data(), operation.size()) != 0) ||
+        beforeIdentityPID != beforePIDReceipt || afterIdentityPID != afterPIDReceipt ||
+        beforeIdentityStarttime != beforeStarttimeReceipt || afterIdentityStarttime != afterStarttimeReceipt ||
+        (!sameProcessIdentity(beforePIDReceipt, beforeStarttimeReceipt, beforePID, beforeStarttime) &&
+         !sameProcessIdentity(afterPIDReceipt, afterStarttimeReceipt, beforePID, beforeStarttime)) ||
+        afterPIDReceipt == 0 || afterStarttimeReceipt.empty() ||
+        (beforePIDReceipt == afterPIDReceipt && beforeStarttimeReceipt == afterStarttimeReceipt) ||
+        startedAtMonotonicMs == 0 ||
+        completedAtMonotonicMs <= startedAtMonotonicMs ||
+        completedAtMonotonicMs - startedAtMonotonicMs > timeoutMilliseconds)
+    { failure.assign("local VM executor returned an invalid or unbounded cold reboot receipt"_ctv); return false; }
+    uint64_t queriedAfterPID = 0; String queriedAfterStarttime = {}, afterImmutable = {};
+    valid = queryLocalVMBoundaryExecutor(descriptor, afterImmutable, failure,
+                                         &queriedAfterPID, &queriedAfterStarttime) &&
+        afterImmutable == descriptor.immutableStateSHA256 && queriedAfterPID == afterPIDReceipt &&
+        queriedAfterStarttime.size() == afterStarttimeReceipt.size() &&
+        std::memcmp(queriedAfterStarttime.data(), afterStarttimeReceipt.data(), queriedAfterStarttime.size()) == 0 &&
+        (afterPIDReceipt != beforePIDReceipt || afterStarttimeReceipt != beforeStarttimeReceipt);
+    if (!valid && failure.empty())
+      failure.assign("local VM executor did not prove a distinct verified post-reboot guest identity"_ctv);
+    return valid;
+  }
+
+  void runPrepareProductionPair(int argc, char *argv[])
+  {
+    String failure = {};
+    String listenerAddress = argc > 5 ? String(argv[5]) : String();
+    uint128_t operationUUID = 0, routeUUID = 0, boundaryUUID = 0;
+    uint64_t sourceDeploymentID = 0, targetDeploymentID = 0, listenerPort = 0;
+    bool valid = argc == 7 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[1]), routeUUID) && routeUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[2]), boundaryUUID) && boundaryUUID != 0 &&
+        mothershipParseUnsignedArgument(argv[3], UINT64_MAX, sourceDeploymentID) && sourceDeploymentID != 0 &&
+        mothershipParseUnsignedArgument(argv[4], UINT64_MAX, targetDeploymentID) && targetDeploymentID != 0 &&
+        mothershipProductionPairIngressAddressValid(listenerAddress) &&
+        mothershipParseUnsignedArgument(argv[6], UINT16_MAX, listenerPort) && listenerPort != 0;
+    if (!valid) failure.assign("usage: prepareProductionPair OPERATION_UUID ROUTE_UUID BOUNDARY_UUID SOURCE_DEPLOYMENT_ID TARGET_DEPLOYMENT_ID INGRESS_ADDRESS INGRESS_PORT"_ctv);
+
+    MothershipProductionPairRecord record = {};
+    bool existing = false, resumed = false;
+    if (valid)
+    {
+      auto registry = openClusterRegistry(); String readFailure = {};
+      if (registry.loadProductionPair(operationUUID, record, &readFailure))
+      {
+        existing = true;
+        valid = record.intent.route.routeUUID == routeUUID &&
+            record.intent.physicalBoundaryUUID == boundaryUUID &&
+            record.intent.sourceWorkload.deploymentID == sourceDeploymentID &&
+            record.intent.targetWorkload.deploymentID == targetDeploymentID &&
+            record.intent.selectorAddress == listenerAddress &&
+            record.intent.selectorTCPPort == listenerPort;
+        if (!valid) failure.assign("production pair retry conflicts with its immutable operation identity"_ctv);
+      }
+      else if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+    }
+
+    MothershipProdigyCluster source = {}, target = {};
+    if (valid && !existing)
+    {
+      MothershipProductionPairIntent intent = {};
+      intent.operationUUID = operationUUID; intent.physicalBoundaryUUID = boundaryUUID;
+      intent.selectorAddress = listenerAddress; intent.selectorTCPPort = uint16_t(listenerPort);
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.loadUsableCousinRoute(routeUUID, Time::now<TimeResolution::ms>(), intent.route, &failure) &&
+            registry.loadCurrentCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::source,
+                                                        intent.sourceRouteReceipt, &failure) &&
+            registry.loadCurrentCousinRouteApplyReceipt(routeUUID, CousinRouteHalf::destination,
+                                                        intent.destinationRouteReceipt, &failure);
+        String sourceIdentity = {}, targetIdentity = {};
+        sourceIdentity.assignItoh(intent.route.sourceClusterUUID);
+        targetIdentity.assignItoh(intent.route.destinationClusterUUID);
+        valid = valid && registry.getClusterByIdentity(sourceIdentity, source, &failure) &&
+            registry.getClusterByIdentity(targetIdentity, target, &failure);
+      }
+      if (valid && (source.deploymentMode == MothershipClusterDeploymentMode::test ||
+                    target.deploymentMode == MothershipClusterDeploymentMode::test ||
+                    source.nBrains != 3 || target.nBrains != 3))
+      { failure.assign("production pair requires two distinct non-test three-Brain clusters"_ctv); valid = false; }
+      ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, targetPermission = {};
+      DeploymentIdentityReport sourceTransport = {}, targetTransport = {}, sourceWorkload = {}, targetWorkload = {};
+      if (valid) valid = readLocalCousinServicePermission(source, intent.route.sourcePermissionUUID,
+                                                          sourcePermission, failure) &&
+          readLocalCousinServicePermission(target, intent.route.destinationPermissionUUID,
+                                            targetPermission, failure);
+      if (valid)
+      {
+        intent.sourcePermission = sourcePermission.permission;
+        intent.destinationPermission = targetPermission.permission;
+        valid = testPairCousinTransportDeploymentReady(source, intent.sourcePermission, sourceTransport, failure) &&
+            testPairCousinTransportDeploymentReady(target, intent.destinationPermission, targetTransport, failure) &&
+            productionWorkloadIdentity(source, sourceDeploymentID, intent.sourceWorkload, sourceWorkload, failure) &&
+            productionWorkloadIdentity(target, targetDeploymentID, intent.targetWorkload, targetWorkload, failure);
+        if (valid)
+        {
+          intent.selectorMachineUUID = intent.sourceWorkload.endpointMachineUUID;
+          valid = describePhysicalFaultExecutorBoundary(
+              source, intent.selectorMachineUUID, intent.selectorExecutorKind,
+              intent.selectorLocalVMBoundaryUUID, intent.selectorCloudID, failure);
+          // The ingress proof must originate outside the relay owner.  Pick
+          // one other currently admitted source topology member and bind its
+          // execution boundary into the immutable operation identity.
+          for (const auto& machine : source.topology.machines)
+            if (valid && machine.uuid != intent.selectorMachineUUID && intent.ingressWitnessMachineUUID == 0)
+            {
+              MothershipPhysicalFaultExecutorKind kind = MothershipPhysicalFaultExecutorKind::localVM;
+              uint128_t boundary = 0; String cloudID = {}, candidateFailure = {};
+              if (describePhysicalFaultExecutorBoundary(source, machine.uuid, kind, boundary, cloudID, candidateFailure))
+              {
+                intent.ingressWitnessMachineUUID = machine.uuid;
+                intent.ingressWitnessExecutorKind = kind;
+                intent.ingressWitnessLocalVMBoundaryUUID = boundary;
+                intent.ingressWitnessCloudID = cloudID;
+              }
+            }
+          if (valid && intent.ingressWitnessMachineUUID == 0)
+          { failure.assign("production pair requires a distinct admitted topology machine for ingress witnessing"_ctv); valid = false; }
+          if (valid) valid = mothershipProductionPairIntentValid(intent, &failure);
+        }
+      }
+      ClusterStatusReport admissionSourceStatus = {}, admissionTargetStatus = {};
+      if (valid)
+      {
+        valid = productionClusterHealthy(source, admissionSourceStatus, failure) &&
+            productionClusterHealthy(target, admissionTargetStatus, failure) &&
+            topologyMachineOwnsAddress(admissionSourceStatus, intent.selectorMachineUUID,
+                                       intent.selectorAddress);
+        if (!valid && failure.empty())
+          failure.assign("production ingress address is not owned by the exact admitted source machine"_ctv);
+      }
+      if (valid)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.admitProductionPair(intent, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+      }
+    }
+
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      String sourceIdentity = {}, targetIdentity = {};
+      sourceIdentity.assignItoh(record.intent.route.sourceClusterUUID);
+      targetIdentity.assignItoh(record.intent.route.destinationClusterUUID);
+      valid = registry.getClusterByIdentity(sourceIdentity, source, &failure) &&
+          registry.getClusterByIdentity(targetIdentity, target, &failure);
+    }
+    ClusterStatusReport sourceStatus = {}, targetStatus = {};
+    if (valid) valid = productionPairTransportReady(record, source, target, failure) &&
+        productionPairWorkloadsReady(record, source, target, true, sourceStatus, targetStatus, failure);
+    if (valid && !topologyMachineOwnsAddress(sourceStatus, record.intent.selectorMachineUUID,
+                                             record.intent.selectorAddress))
+    {
+      failure.assign("production ingress address is not owned by the exact live source machine"_ctv);
+      valid = false;
+    }
+
+    if (valid && record.phase == MothershipProductionPairPhase::prepared)
+    {
+      String evidence = {}, receipt = {};
+      BitseryEngine::serialize(evidence, targetStatus);
+      valid = prodigyComputeSHA256Hex(evidence, receipt, &failure);
+      if (valid)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                               receipt, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+      }
+    }
+
+    MothershipPhysicalServiceTransitBoundary boundary = {};
+    bool selectorLaunchAttemptedDuringPrepare = false;
+    if (valid && record.phase == MothershipProductionPairPhase::targetAdmitted)
+    {
+      auto registry = openClusterRegistry(); String readFailure = {};
+      bool boundaryExists = registry.loadPhysicalServiceTransitBoundary(boundaryUUID, boundary, &readFailure);
+      if (!boundaryExists)
+      {
+        if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+        else
+        {
+          boundary.boundaryUUID = boundaryUUID; boundary.pairOperationUUID = operationUUID;
+          boundary.routeUUID = record.intent.route.routeUUID;
+          boundary.routeGeneration = record.intent.route.generation;
+          boundary.sourceClusterUUID = record.intent.route.sourceClusterUUID;
+          boundary.targetClusterUUID = record.intent.route.destinationClusterUUID;
+          boundary.sourceMachineUUID = record.intent.sourceWorkload.endpointMachineUUID;
+          boundary.targetMachineUUID = record.intent.targetWorkload.endpointMachineUUID;
+          boundary.sourceExecutorKind = record.intent.selectorExecutorKind;
+          boundary.sourceLocalVMBoundaryUUID = record.intent.selectorLocalVMBoundaryUUID;
+          boundary.sourceCloudID = record.intent.selectorCloudID;
+          MothershipPhysicalFaultExecutorKind sourceKind = MothershipPhysicalFaultExecutorKind::localVM;
+          uint128_t sourceVMBoundary = 0; String sourceCloudID = {};
+          valid = describePhysicalFaultExecutorBoundary(
+              source, boundary.sourceMachineUUID, sourceKind,
+              sourceVMBoundary, sourceCloudID, failure) &&
+              sourceKind == record.intent.selectorExecutorKind &&
+              sourceVMBoundary == record.intent.selectorLocalVMBoundaryUUID &&
+              sourceCloudID == record.intent.selectorCloudID &&
+              describePhysicalFaultExecutorBoundary(
+                  target, boundary.targetMachineUUID, boundary.targetExecutorKind,
+                  boundary.targetLocalVMBoundaryUUID, boundary.targetCloudID, failure);
+          boundary.sourceAddress = record.intent.sourceWorkload.endpointIPv4;
+          boundary.targetAddress = record.intent.targetWorkload.endpointIPv4;
+          boundary.sourceTCPPort = record.intent.sourceWorkload.endpointTCPPort;
+          boundary.targetTCPPort = record.intent.targetWorkload.endpointTCPPort;
+          boundary.pathMTU = record.intent.route.pathMTU;
+          boundary.admittedAtMs = record.transitionedAtMs;
+          valid = valid && cousinRouteAuthorizationDigest(record.intent.route, boundary.routeAuthorizationSHA256);
+          if (!valid && failure.empty())
+            failure.assign("production pair source ingress no longer has its admitted physical executor"_ctv);
+        }
+      }
+      else
+      {
+        valid = productionPairPhysicalBoundaryReady(record, source, target, boundary, failure);
+      }
+      if (valid)
+      {
+        ProductionPairProviderState state = {}; String output = {}, providerEvidence = {}, transitReceipt = {};
+        selectorLaunchAttemptedDuringPrepare = true;
+        const bool launched = runProductionPairProvider(record, source, "launch", state, output, providerEvidence, failure);
+        valid = launched && productionPairSelectorPhaseReceipt(record, MothershipProductionPairPhase::transitApplied,
+                                                                state, transitReceipt, failure);
+        if (!valid && failure.empty()) failure.assign("production pair provider did not launch in source-selected state"_ctv);
+        if (valid && !boundaryExists)
+        {
+          valid = productionPhysicalBoundaryAdmissionReceipt(record, boundary, sourceStatus, targetStatus,
+                                                             transitReceipt,
+                                                             boundary.admissionReceiptSHA256, failure) &&
+              mothershipPhysicalServiceTransitBoundaryValid(boundary, &failure);
+          if (valid)
+          {
+            MothershipPhysicalServiceTransitBoundary recordedBoundary = {};
+            valid = registry.admitPhysicalServiceTransitBoundary(boundary, recordedBoundary, resumed, &failure);
+            if (valid) boundary = std::move(recordedBoundary);
+          }
+        }
+        else if (valid)
+        {
+          String expectedAdmissionReceipt = {};
+          valid = productionPhysicalBoundaryAdmissionReceipt(record, boundary, sourceStatus, targetStatus,
+                                                             transitReceipt, expectedAdmissionReceipt, failure) &&
+              expectedAdmissionReceipt == boundary.admissionReceiptSHA256;
+          if (!valid && failure.empty())
+            failure.assign("production pair physical boundary admission evidence changed before transit became durable"_ctv);
+        }
+        if (valid)
+        {
+          auto phaseRegistry = openClusterRegistry();
+          valid = phaseRegistry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::transitApplied,
+                                                      transitReceipt, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+        }
+      }
+    }
+    else if (valid && record.phase >= MothershipProductionPairPhase::transitApplied &&
+             record.phase < MothershipProductionPairPhase::cleanupComplete)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadPhysicalServiceTransitBoundary(boundaryUUID, boundary, &failure) &&
+          productionPairPhysicalBoundaryReady(record, source, target, boundary, failure);
+      if (valid)
+      {
+        ProductionPairProviderState state = {}; String output = {}, providerEvidence = {};
+        valid = runProductionPairProvider(record, source, "query", state, output, providerEvidence, failure);
+        MothershipProductionPairPhase selectorPhase = record.phase >= MothershipProductionPairPhase::sourceDrained ?
+            MothershipProductionPairPhase::sourceDrained :
+            (record.phase >= MothershipProductionPairPhase::targetSelected ?
+             MothershipProductionPairPhase::targetSelected : MothershipProductionPairPhase::transitApplied);
+        if (valid) valid = productionPairSelectorPhaseMatches(record, selectorPhase, state, failure);
+      }
+    }
+
+    // Launch is intentionally provisional until both the physical boundary and
+    // durable transit phase commit.  Compensate every later prepare failure;
+    // remove is idempotent and leaves only a retry-safe tombstone, never a
+    // live relay or a permanently locked selector scope.
+    if (!valid && selectorLaunchAttemptedDuringPrepare && record.phase < MothershipProductionPairPhase::transitApplied)
+    {
+      ProductionPairProviderState aborted = {}; String abortOutput = {}, abortEvidence = {}, abortFailure = {};
+      if (!runProductionPairProvider(record, source, "remove", aborted, abortOutput, abortEvidence, abortFailure))
+        failure.snprintf<"{}; selector abort failed: {}"_ctv>(failure, abortFailure);
+    }
+
+    String operation = {}, boundaryText = {}; operation.assignItoh(operationUUID); boundaryText.assignItoh(boundaryUUID);
+    basics_log("prepareProductionPair success=%u resumed=%u operationUUID=%s boundaryUUID=%s phase=%u ingress=%s:%u failure=%s\n",
+        unsigned(valid), unsigned(existing || resumed), operation.c_str(), boundaryText.c_str(),
+        unsigned(valid ? record.phase : MothershipProductionPairPhase::prepared), listenerAddress.c_str(),
+        unsigned(listenerPort), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runRegisterLocalVMBoundary(int argc, char *argv[])
+  {
+    String failure = {};
+    MothershipLocalVMBoundaryDescriptor requested = {}, recorded = {};
+    MothershipProdigyCluster cluster = {};
+    uint64_t port = 0;
+    bool resumed = false;
+    bool valid = argc == 10 && prodigyParseCanonicalHex128(String(argv[1]), requested.machineUUID) &&
+        requested.machineUUID != 0 && prodigyParseCanonicalHex128(String(argv[2]), requested.vmBoundaryUUID) &&
+        requested.vmBoundaryUUID != 0 && mothershipParseUnsignedArgument(argv[5], UINT16_MAX, port) && port != 0;
+    if (valid)
+    {
+      requested.taskID.assign(argv[3]); requested.hostAddress.assign(argv[4]); requested.hostPort = uint16_t(port);
+      requested.hostUser.assign(argv[6]); requested.hostPrivateKeyPath.assign(argv[7]);
+      requested.hostPublicKeyOpenSSH.assign(argv[8]); requested.statePath.assign(argv[9]);
+      String launcherBytes = {};
+      launcherBytes.append(reinterpret_cast<const char *>(mothershipLocalVMBoundarySource),
+                           sizeof(mothershipLocalVMBoundarySource));
+      valid = prodigyComputeSHA256Hex(launcherBytes, requested.executorSHA256, &failure);
+      for (uint32_t index = 0; index < 64; ++index) requested.immutableStateSHA256.append('0');
+      // A positive placeholder permits structural validation before the
+      // registry supplies either the original timestamp or the one new
+      // registration timestamp below.
+      requested.registeredAtMs = 1;
+      if (valid) { auto registry = openClusterRegistry(); valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure); }
+    }
+    uint32_t selected = 0;
+    if (valid)
+    {
+      requested.clusterUUID = cluster.clusterUUID;
+      for (const auto& machine : cluster.topology.machines)
+        if (machine.uuid == requested.machineUUID && machine.kind == MachineConfig::MachineKind::vm && machine.isBrain) ++selected;
+      valid = cluster.deploymentMode == MothershipClusterDeploymentMode::local && cluster.nBrains == 3 &&
+          cluster.topology.machines.size() == 3 && selected == 1 &&
+          mothershipLocalVMBoundaryDescriptorValid(requested, &failure);
+      if (!valid && failure.empty())
+        failure.assign("local VM boundary registration requires one exact VM in a three-Brain deploymentMode=local cluster"_ctv);
+    }
+    if (valid)
+    {
+      MothershipLocalVMBoundaryDescriptor prior = {};
+      auto registry = openClusterRegistry(); String readFailure = {};
+      if (registry.loadLocalVMBoundary(requested.vmBoundaryUUID, prior, &readFailure))
+        requested.registeredAtMs = prior.registeredAtMs;
+      else if (readFailure.equal("record not found"_ctv))
+        requested.registeredAtMs = Time::now<TimeResolution::ms>();
+      else
+      { failure = readFailure; valid = false; }
+    }
+    String immutable = {};
+    if (valid) valid = queryLocalVMBoundaryExecutor(requested, immutable, failure);
+    if (valid)
+    {
+      requested.immutableStateSHA256 = immutable;
+      auto registry = openClusterRegistry();
+      valid = registry.registerLocalVMBoundary(requested, recorded, resumed, &failure);
+    }
+    basics_log("registerLocalVMBoundary success=%u resumed=%u clusterUUID=%016llx%016llx machineUUID=%016llx%016llx boundaryUUID=%016llx%016llx failure=%s\n",
+        unsigned(valid), unsigned(resumed),
+        (unsigned long long)(requested.clusterUUID >> 64), (unsigned long long)requested.clusterUUID,
+        (unsigned long long)(requested.machineUUID >> 64), (unsigned long long)requested.machineUUID,
+        (unsigned long long)(requested.vmBoundaryUUID >> 64), (unsigned long long)requested.vmBoundaryUUID,
+        failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runFaultLocalClusterMachine(int argc, char *argv[])
+  {
+    String failure = {};
+    uint128_t operationUUID = 0, boundaryUUID = 0;
+    uint64_t timeout = 0;
+    bool valid = argc == 4 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[1]), boundaryUUID) && boundaryUUID != 0 &&
+        std::strcmp(argv[2], "cold-reboot") == 0 &&
+        mothershipParseUnsignedArgument(argv[3], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) && timeout > 0;
+    MothershipLocalVMBoundaryDescriptor boundary = {};
+    MothershipProdigyCluster cluster = {};
+    MothershipLocalVMMachineFaultRecord record = {};
+    bool resumed = false;
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      String clusterIdentity = {};
+      valid = registry.loadLocalVMBoundary(boundaryUUID, boundary, &failure);
+      if (valid)
+      {
+        clusterIdentity.assignItoh(boundary.clusterUUID);
+        valid = registry.getClusterByIdentity(clusterIdentity, cluster, &failure);
+      }
+    }
+    if (valid && (boundary.retired || cluster.deploymentMode != MothershipClusterDeploymentMode::local ||
+                  cluster.nBrains != 3 || cluster.topology.machines.size() != 3))
+    { failure.assign("local VM fault requires an active three-Brain deploymentMode=local boundary"_ctv); valid = false; }
+
+    ClusterStatusReport beforeReport = {};
+    MothershipPhysicalFaultMachineObservation before = {}, after = {};
+    if (valid) valid = readManagedClusterStatus(cluster, beforeReport, failure) &&
+        physicalFaultMachineObservation(beforeReport, cluster.clusterUUID, boundary.machineUUID, before, failure);
+
+    MothershipLocalVMMachineFaultRequest request = {};
+    bool alreadyAdmitted = false;
+    if (valid)
+    {
+      auto registry = openClusterRegistry(); String readFailure = {};
+      if (registry.loadLocalVMMachineFault(operationUUID, record, &readFailure))
+      {
+        alreadyAdmitted = true; request = record.request;
+        valid = request.vmBoundaryUUID == boundaryUUID && request.clusterUUID == cluster.clusterUUID &&
+            request.machineUUID == boundary.machineUUID && request.action == MothershipLocalVMMachineFaultAction::coldReboot &&
+            request.durationMilliseconds == timeout;
+        if (!valid) failure.assign("local VM fault retry conflicts with its durable request"_ctv);
+      }
+      else if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+    }
+    if (valid && alreadyAdmitted && record.hasReceipt)
+    {
+      basics_log("faultLocalClusterMachine success=1 resumed=1 restored=1 operationUUID=%016llx%016llx boundaryUUID=%016llx%016llx failure=\n",
+          (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(boundaryUUID >> 64), (unsigned long long)boundaryUUID);
+      return;
+    }
+    if (valid && !alreadyAdmitted)
+    {
+      request.operationUUID = operationUUID; request.vmBoundaryUUID = boundaryUUID;
+      request.clusterUUID = cluster.clusterUUID; request.machineUUID = boundary.machineUUID;
+      request.action = MothershipLocalVMMachineFaultAction::coldReboot;
+      request.durationMilliseconds = uint32_t(timeout); request.expectedBootSHA256 = before.stateSHA256;
+      auto registry = openClusterRegistry();
+      valid = registry.admitLocalVMMachineFault(request, before, record, resumed, &failure);
+    }
+    else if (valid && before.stateSHA256 != request.expectedBootSHA256)
+    {
+      // The exact executor operation is idempotent, so asking it again only
+      // returns the original durable reboot receipt.
+      resumed = true;
+    }
+
+    uint64_t faultedAt = 0, executorRestoredAt = 0;
+    if (valid) valid = runLocalVMBoundaryExecutorAction(boundary, operationUUID, "cold-reboot",
+                                                        uint32_t(timeout), faultedAt, executorRestoredAt, failure);
+    const int64_t deadline = Time::now<TimeResolution::ms>() + int64_t(timeout);
+    while (valid && Time::now<TimeResolution::ms>() <= deadline)
+    {
+      ClusterStatusReport afterReport = {}; String observationFailure = {};
+      if (readManagedClusterStatus(cluster, afterReport, observationFailure) &&
+          physicalFaultMachineObservation(afterReport, cluster.clusterUUID, boundary.machineUUID, after, observationFailure) &&
+          after.stateSHA256 != request.expectedBootSHA256) break;
+      after = {}; ::usleep(500'000);
+    }
+    if (valid && !mothershipPhysicalFaultMachineObservationValid(after))
+    { failure.assign("local VM fault did not recover as a new healthy boot before its deadline"_ctv); valid = false; }
+    String immutable = {};
+    if (valid) valid = queryLocalVMBoundaryExecutor(boundary, immutable, failure) &&
+        immutable == boundary.immutableStateSHA256;
+    if (valid && immutable != boundary.immutableStateSHA256)
+    { failure.assign("local VM boundary immutable identity changed across cold reboot"_ctv); valid = false; }
+    MothershipLocalVMMachineFaultReceipt receipt = {};
+    if (valid)
+    {
+      receipt.operationUUID = operationUUID; receipt.vmBoundaryUUID = boundaryUUID;
+      receipt.before = record.admission;
+      receipt.after = after; receipt.restoredBootSHA256 = after.stateSHA256;
+      receipt.faultedAtMonotonicMilliseconds = faultedAt;
+      receipt.restoredAtMonotonicMilliseconds = executorRestoredAt;
+      receipt.restored = true;
+      auto registry = openClusterRegistry(); valid = registry.recordLocalVMMachineFaultReceipt(
+          request, receipt, record, resumed, &failure);
+    }
+    basics_log("faultLocalClusterMachine success=%u resumed=%u restored=%u operationUUID=%016llx%016llx boundaryUUID=%016llx%016llx failure=%s\n",
+        unsigned(valid), unsigned(resumed), unsigned(valid && record.hasReceipt),
+        (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        (unsigned long long)(boundaryUUID >> 64), (unsigned long long)boundaryUUID, failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
+  struct PhysicalFaultProviderReceipt {
+    uint64_t installedAtMonotonicMs = 0;
+    uint64_t restoredAtMonotonicMs = 0;
+  };
+
+  bool parsePhysicalFaultProviderReceipt(const String& output, uint128_t operationUUID,
+                                         const char *role, uint128_t guestUUID,
+                                         const String& peerAddress, uint32_t durationMilliseconds,
+                                         PhysicalFaultProviderReceipt& receipt, String& failure)
+  {
+    receipt = {};
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT)
+    { failure.assign("physical fault provider returned malformed JSON"_ctv); return false; }
+    auto object = document.get_object();
+    std::string_view operation, observedRole, guest, peer, boot;
+    uint64_t duration = 0, installed = 0, restored = 0; bool didRestore = false;
+    if (object.size() != 9 || object["operationID"].get(operation) || object["role"].get(observedRole) ||
+        object["guestID"].get(guest) || object["peerAddress"].get(peer) ||
+        object["durationMilliseconds"].get(duration) || object["bootID"].get(boot) ||
+        object["installedAtMonotonicMs"].get(installed) ||
+        object["restoredAtMonotonicMs"].get(restored) || object["restored"].get(didRestore) ||
+        !didRestore || installed == 0 || restored < installed ||
+        restored - installed < durationMilliseconds ||
+        restored - installed > uint64_t(durationMilliseconds) + mothershipPhysicalFaultRestorationSlackMilliseconds)
+    { failure.assign("physical fault provider receipt does not prove bounded restoration"_ctv); return false; }
+    String expectedOperation = {}, expectedGuest = {};
+    expectedOperation.assignItoh(operationUUID); expectedGuest.assignItoh(guestUUID);
+    auto equal = [](std::string_view observed, const String& expected) {
+      return observed.size() == expected.size() &&
+          (!observed.size() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
+    };
+    if (!equal(operation, expectedOperation) || observedRole != role || !equal(guest, expectedGuest) ||
+        !equal(peer, peerAddress) || duration != durationMilliseconds || boot.empty())
+    { failure.assign("physical fault provider receipt conflicts with its exact request"_ctv); return false; }
+    receipt.installedAtMonotonicMs = installed; receipt.restoredAtMonotonicMs = restored;
+    return true;
+  }
+
+  bool describePhysicalFaultExecutorBoundary(
+      const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+      MothershipPhysicalFaultExecutorKind& kind, uint128_t& localVMBoundaryUUID,
+      String& cloudID, String& failure)
+  {
+    localVMBoundaryUUID = 0; cloudID.clear();
+    uint32_t topologyMatches = 0;
+    const ClusterMachine *topologyMachine = nullptr;
+    for (const auto& machine : cluster.topology.machines)
+      if (machine.uuid == machineUUID) { ++topologyMatches; topologyMachine = &machine; }
+    if (topologyMatches != 1)
+    { failure.assign("physical fault target is absent or ambiguous in durable topology"_ctv); return false; }
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::local)
+    {
+      MothershipLocalVMBoundaryDescriptor boundary = {};
+      auto registry = openClusterRegistry();
+      if (!registry.findActiveLocalVMBoundary(cluster.clusterUUID, machineUUID, boundary, &failure)) return false;
+      String immutable = {};
+      if (!queryLocalVMBoundaryExecutor(boundary, immutable, failure) ||
+          immutable != boundary.immutableStateSHA256)
+      { if (failure.empty()) failure.assign("local fault endpoint no longer has its exact verified VM boundary"_ctv); return false; }
+      kind = MothershipPhysicalFaultExecutorKind::localVM;
+      localVMBoundaryUUID = boundary.vmBoundaryUUID;
+      return true;
+    }
+    if (cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+        !mothershipClusterProviderIsIaaS(cluster.provider) || topologyMachine == nullptr ||
+        topologyMachine->kind != MachineConfig::MachineKind::vm ||
+        topologyMachine->backing != ClusterMachineBacking::cloud ||
+        topologyMachine->cloud.cloudID.empty() || topologyMachine->ssh.address.empty() ||
+        topologyMachine->ssh.port == 0 || topologyMachine->ssh.user.empty() ||
+        topologyMachine->ssh.hostPublicKeyOpenSSH.empty())
+    { failure.assign("physical fault target is neither a registered local VM nor a provider cloud VM"_ctv); return false; }
+    kind = MothershipPhysicalFaultExecutorKind::providerCloudVM;
+    cloudID = topologyMachine->cloud.cloudID;
+    return true;
+  }
+
+  bool resolvePhysicalFaultExecutor(
+      const MothershipProdigyCluster& cluster, uint128_t machineUUID,
+      MothershipPhysicalFaultExecutorKind expectedKind, uint128_t expectedLocalVMBoundaryUUID,
+      const String& expectedCloudID, MothershipProdigyClusterMachine& executor,
+      String& failure)
+  {
+    executor = {};
+    MothershipPhysicalFaultExecutorKind observedKind = MothershipPhysicalFaultExecutorKind::localVM;
+    uint128_t observedBoundaryUUID = 0; String observedCloudID = {};
+    if (!describePhysicalFaultExecutorBoundary(cluster, machineUUID, observedKind,
+                                               observedBoundaryUUID, observedCloudID, failure) ||
+        observedKind != expectedKind || observedBoundaryUUID != expectedLocalVMBoundaryUUID ||
+        observedCloudID != expectedCloudID)
+    {
+      if (failure.empty()) failure.assign("physical fault executor no longer matches its admitted isolation boundary"_ctv);
+      return false;
+    }
+    uint32_t matches = 0;
+    for (const auto& machine : cluster.topology.machines)
+      if (machine.uuid == machineUUID)
+      {
+        executor.ssh = machine.ssh;
+        ++matches;
+      }
+    if (matches != 1 || executor.ssh.address.empty() || executor.ssh.port == 0 ||
+        executor.ssh.user.empty() || executor.ssh.hostPublicKeyOpenSSH.empty())
+    { failure.assign("physical fault target has no exact pinned guest SSH execution boundary"_ctv); return false; }
+    return true;
+  }
+
+  void physicalFaultProviderArguments(uint128_t operationUUID, const char *role,
+                                      uint128_t guestUUID, const String& peerAddress,
+                                      uint32_t durationMilliseconds, Vector<String>& arguments)
+  {
+    String operation = {}, guest = {}, duration = {};
+    operation.assignItoh(operationUUID); guest.assignItoh(guestUUID); duration.assignItoa(durationMilliseconds);
+    arguments.clear(); arguments.emplace_back("execute"_ctv);
+    arguments.emplace_back("--state-root"_ctv); arguments.emplace_back("/var/lib/prodigy/mothership-physical-faults"_ctv);
+    arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);
+    arguments.emplace_back("--role"_ctv); arguments.emplace_back(role);
+    arguments.emplace_back("--guest-id"_ctv); arguments.push_back(guest);
+    arguments.emplace_back("--peer-address"_ctv); arguments.push_back(peerAddress);
+    arguments.emplace_back("--duration-ms"_ctv); arguments.push_back(duration);
+  }
+
+  bool runPhysicalFaultProvider(const MothershipProdigyCluster& cluster, uint128_t operationUUID,
+                                const char *role, uint128_t guestUUID, const String& peerAddress,
+                                uint32_t durationMilliseconds,
+                                MothershipPhysicalFaultExecutorKind executorKind,
+                                uint128_t localVMBoundaryUUID, const String& cloudID,
+                                PhysicalFaultProviderReceipt& receipt, String& failure)
+  {
+    MothershipProdigyClusterMachine executor = {};
+    if (!resolvePhysicalFaultExecutor(cluster, guestUUID, executorKind, localVMBoundaryUUID,
+                                      cloudID, executor, failure)) return false;
+    Vector<String> arguments = {};
+    physicalFaultProviderArguments(operationUUID, role, guestUUID, peerAddress, durationMilliseconds, arguments);
+    String output = {};
+    if (!mothershipRunRemoteSealedPythonProvider(
+          cluster, executor, "mothership-physical-fault-upload",
+          mothershipPhysicalFaultProviderSource, sizeof(mothershipPhysicalFaultProviderSource),
+          arguments, int(durationMilliseconds + 30'000), output, failure)) return false;
+    return parsePhysicalFaultProviderReceipt(output, operationUUID, role, guestUUID,
+                                             peerAddress, durationMilliseconds, receipt, failure);
+  }
+
+  void runFaultClusterNetwork(int argc, char *argv[])
+  {
+    String failure = {}, directionText = argc > 2 ? String(argv[2]) : String();
+    uint128_t operationUUID = 0, boundaryUUID = 0; uint64_t duration = 0;
+    MothershipPhysicalFaultDirection direction = MothershipPhysicalFaultDirection::both;
+    bool validDirection = directionText == "both"_ctv || directionText == "source-to-target"_ctv ||
+        directionText == "target-to-source"_ctv;
+    if (directionText == "source-to-target"_ctv) direction = MothershipPhysicalFaultDirection::sourceToTarget;
+    else if (directionText == "target-to-source"_ctv) direction = MothershipPhysicalFaultDirection::targetToSource;
+    bool valid = argc == 4 && validDirection &&
+        prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        prodigyParseCanonicalHex128(String(argv[1]), boundaryUUID) && boundaryUUID != 0 &&
+        mothershipParseUnsignedArgument(argv[3], mothershipPhysicalFaultMaximumDurationMilliseconds, duration) && duration != 0;
+    if (!valid) failure.assign("usage: faultClusterNetwork OPERATION_UUID BOUNDARY_UUID both|source-to-target|target-to-source DURATION_MS"_ctv);
+    MothershipPhysicalServiceTransitBoundary boundary = {};
+    MothershipProductionPairRecord pair = {};
+    MothershipProdigyCluster source = {}, target = {};
+    MothershipPhysicalClusterNetworkFaultRecord record = {};
+    bool resumed = false, existingFault = false;
+    if (valid)
+    {
+      auto registry = openClusterRegistry(); String readFailure = {};
+      String sourceIdentity = {}, targetIdentity = {};
+      valid = registry.loadPhysicalServiceTransitBoundary(boundaryUUID, boundary, &failure) && !boundary.closed &&
+          registry.loadProductionPair(boundary.pairOperationUUID, pair, &failure) &&
+          pair.phase >= MothershipProductionPairPhase::transitApplied &&
+          pair.phase < MothershipProductionPairPhase::cleanupComplete;
+      sourceIdentity.assignItoh(boundary.sourceClusterUUID);
+      targetIdentity.assignItoh(boundary.targetClusterUUID);
+      valid = valid && registry.getClusterByIdentity(sourceIdentity, source, &failure) &&
+          registry.getClusterByIdentity(targetIdentity, target, &failure);
+      if (valid && registry.loadPhysicalClusterNetworkFault(operationUUID, record, &readFailure))
+      {
+        existingFault = true;
+      }
+      else if (valid && !readFailure.empty() && !readFailure.equal("record not found"_ctv))
+      { failure = readFailure; valid = false; }
+    }
+
+    ClusterStatusReport sourceReport = {}, targetReport = {};
+    MothershipPhysicalFaultMachineObservation sourceBefore = {}, targetBefore = {}, sourceAfter = {}, targetAfter = {};
+    if (valid) valid = productionPairTransportReady(pair, source, target, failure) &&
+        readManagedClusterStatus(source, sourceReport, failure) &&
+        topologyMachineOwnsAddress(sourceReport, boundary.sourceMachineUUID, boundary.sourceAddress) &&
+        physicalFaultMachineObservation(sourceReport, source.clusterUUID, boundary.sourceMachineUUID, sourceBefore, failure) &&
+        readManagedClusterStatus(target, targetReport, failure) &&
+        topologyMachineOwnsAddress(targetReport, boundary.targetMachineUUID, boundary.targetAddress) &&
+        physicalFaultMachineObservation(targetReport, target.clusterUUID, boundary.targetMachineUUID, targetBefore, failure);
+    if (!valid && failure.empty()) failure.assign("physical fault endpoints no longer own their admitted addresses"_ctv);
+    MothershipPhysicalClusterNetworkFaultRequest request = {};
+    if (valid)
+    {
+      request.operationUUID = operationUUID; request.boundaryUUID = boundaryUUID;
+      request.sourceClusterUUID = boundary.sourceClusterUUID; request.targetClusterUUID = boundary.targetClusterUUID;
+      request.sourceMachineUUID = boundary.sourceMachineUUID; request.targetMachineUUID = boundary.targetMachineUUID;
+      request.direction = direction; request.durationMilliseconds = uint32_t(duration);
+      request.routeUUID = boundary.routeUUID; request.routeGeneration = boundary.routeGeneration;
+      request.routeAuthorizationSHA256 = boundary.routeAuthorizationSHA256;
+      request.sourceAddress = boundary.sourceAddress; request.targetAddress = boundary.targetAddress;
+      request.sourceTopologyVersion = sourceBefore.topologyVersion;
+      request.targetTopologyVersion = targetBefore.topologyVersion;
+      if (existingFault)
+      {
+        valid = mothershipPhysicalClusterNetworkFaultRequestEqual(record.request, request) &&
+            mothershipPhysicalFaultMachineObservationEqual(record.sourceAdmission, sourceBefore) &&
+            mothershipPhysicalFaultMachineObservationEqual(record.targetAdmission, targetBefore);
+        resumed = valid;
+        if (!valid) failure.assign("physical network fault retry no longer matches its freshly qualified route or endpoint proof"_ctv);
+      }
+      if (valid && existingFault && record.hasReceipt)
+      {
+        String encoded = {}; auto receipt = record.receipt; BitseryEngine::serialize(encoded, receipt);
+        String digest = {}; valid = prodigyComputeSHA256Hex(encoded, digest, &failure);
+        basics_log("faultClusterNetwork success=%u resumed=1 restored=1 operationUUID=%s boundaryUUID=%s receiptSHA256=%s failure=%s\n",
+            unsigned(valid), argv[0], argv[1], digest.c_str(), failure.c_str());
+        if (!valid) exit(EXIT_FAILURE);
+        return;
+      }
+      if (!existingFault)
+      {
+        auto registry = openClusterRegistry();
+        valid = registry.admitPhysicalClusterNetworkFault(request, sourceBefore, targetBefore,
+                                                          record, resumed, &failure);
+      }
+    }
+
+    PhysicalFaultProviderReceipt sourceProvider = {}, targetProvider = {};
+    String sourceFailure = {}, targetFailure = {};
+    if (valid)
+    {
+      const bool runSource = direction == MothershipPhysicalFaultDirection::both ||
+          direction == MothershipPhysicalFaultDirection::sourceToTarget;
+      const bool runTarget = direction == MothershipPhysicalFaultDirection::both ||
+          direction == MothershipPhysicalFaultDirection::targetToSource;
+      std::future<bool> sourceFuture, targetFuture;
+      if (runSource) sourceFuture = std::async(std::launch::async, [&]() {
+        return runPhysicalFaultProvider(source, operationUUID, "source", boundary.sourceMachineUUID,
+                                        boundary.targetAddress, uint32_t(duration), boundary.sourceExecutorKind,
+                                        boundary.sourceLocalVMBoundaryUUID, boundary.sourceCloudID,
+                                        sourceProvider, sourceFailure);
+      });
+      if (runTarget) targetFuture = std::async(std::launch::async, [&]() {
+        return runPhysicalFaultProvider(target, operationUUID, "target", boundary.targetMachineUUID,
+                                        boundary.sourceAddress, uint32_t(duration), boundary.targetExecutorKind,
+                                        boundary.targetLocalVMBoundaryUUID, boundary.targetCloudID,
+                                        targetProvider, targetFailure);
+      });
+      const bool sourceOK = !runSource || sourceFuture.get();
+      const bool targetOK = !runTarget || targetFuture.get();
+      valid = sourceOK && targetOK;
+      if (!valid) failure = !sourceOK ? sourceFailure : targetFailure;
+    }
+    if (valid) valid = readManagedClusterStatus(source, sourceReport, failure) &&
+        physicalFaultMachineObservation(sourceReport, source.clusterUUID, boundary.sourceMachineUUID, sourceAfter, failure) &&
+        readManagedClusterStatus(target, targetReport, failure) &&
+        physicalFaultMachineObservation(targetReport, target.clusterUUID, boundary.targetMachineUUID, targetAfter, failure);
+    MothershipPhysicalClusterNetworkFaultReceipt receipt = {};
+    if (valid)
+    {
+      receipt.operationUUID = operationUUID; receipt.boundaryUUID = boundaryUUID;
+      receipt.admission = request;
+      receipt.sourceBefore = record.sourceAdmission; receipt.targetBefore = record.targetAdmission;
+      receipt.sourceAfter = sourceAfter; receipt.targetAfter = targetAfter;
+      if (direction == MothershipPhysicalFaultDirection::both ||
+          direction == MothershipPhysicalFaultDirection::sourceToTarget)
+      {
+        receipt.sourceInstalledAtMonotonicMilliseconds = sourceProvider.installedAtMonotonicMs;
+        receipt.sourceRestoredAtMonotonicMilliseconds = sourceProvider.restoredAtMonotonicMs;
+        receipt.sourceRestored = true;
+      }
+      if (direction == MothershipPhysicalFaultDirection::both ||
+          direction == MothershipPhysicalFaultDirection::targetToSource)
+      {
+        receipt.targetInstalledAtMonotonicMilliseconds = targetProvider.installedAtMonotonicMs;
+        receipt.targetRestoredAtMonotonicMilliseconds = targetProvider.restoredAtMonotonicMs;
+        receipt.targetRestored = true;
+      }
+      receipt.restored = true;
+      auto registry = openClusterRegistry();
+      valid = registry.recordPhysicalClusterNetworkFaultReceipt(request, receipt, record, resumed, &failure);
+    }
+    String digest = {};
+    if (valid)
+    {
+      String encoded = {}; auto copy = record.receipt; BitseryEngine::serialize(encoded, copy);
+      valid = prodigyComputeSHA256Hex(encoded, digest, &failure);
+    }
+    basics_log("faultClusterNetwork success=%u resumed=%u restored=%u operationUUID=%s boundaryUUID=%s receiptSHA256=%s failure=%s\n",
+        unsigned(valid), unsigned(resumed), unsigned(valid && record.hasReceipt), argc > 0 ? argv[0] : "",
+        argc > 1 ? argv[1] : "", digest.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
   }
 
   bool testPairWholeDestinationReady(const MothershipTestPairBoundaryRecord& record,
@@ -12238,7 +14315,7 @@ private:
           !readDeploymentIdentity(target, record.cousinTransport.destinationPermission.localDeploymentID,
                                   cousinTransportReport, failure)) return false;
     }
-    return readTestPairClusterStatus(target, clusterReport, failure) &&
+    return readManagedClusterStatus(target, clusterReport, failure) &&
            readDeploymentIdentity(target, record.targetDeploymentID, deploymentReport, failure) &&
            MothershipClusterRegistry::testPairWholeDestinationReady(
                record, clusterReport, deploymentReport, &failure,
@@ -12524,7 +14601,8 @@ private:
     const int64_t deadlineMs = Time::now<TimeResolution::ms>() + 30'000;
     auto connectSource = [&]() {
       socket.close();
-      return configureControlTarget(source.name.c_str(), &failure) && socket.ensureConnected();
+      String sourceName = source.name;
+      return configureControlTarget(sourceName.c_str(), &failure) && socket.ensureConnected();
     };
     auto query = [&]() {
       Message::construct(socket.wBuffer, MothershipTopic::pullPairedSourceRetirement, uint8_t(1), operationID);
@@ -12620,6 +14698,341 @@ private:
     if (!valid) exit(EXIT_FAILURE);
   }
 
+  bool retireProductionPairSource(const MothershipProductionPairRecord& record,
+                                  const MothershipProdigyCluster& source,
+                                  const MothershipProdigyCluster& target,
+                                  String& receiptSHA256, String& failure)
+  {
+    receiptSHA256.clear();
+    const uint128_t operationID = record.intent.operationUUID;
+    PairedSourceRetirementReceipt receipt = {};
+    auto connectSource = [&]() {
+      socket.close();
+      String sourceName = source.name;
+      return configureControlTarget(sourceName.c_str(), &failure) && socket.ensureConnected();
+    };
+    auto query = [&]() {
+      Message::construct(socket.wBuffer, MothershipTopic::pullPairedSourceRetirement, uint8_t(1), operationID);
+      if (!socket.send()) { failure = socket.ioFailureDetail(); return false; }
+      receipt = {};
+      return readPairedSourceRetirementReceipt(socket.recvExpectedTopic(MothershipTopic::pullPairedSourceRetirement),
+                                               MothershipTopic::pullPairedSourceRetirement, receipt, failure);
+    };
+    bool valid = connectSource() && query();
+    const int64_t capabilityDeadline = Time::now<TimeResolution::ms>() + 30'000;
+    for (uint32_t polls = 0; valid && receipt.supported && !receipt.peersCapable && polls < 300 &&
+         Time::now<TimeResolution::ms>() < capabilityDeadline; ++polls)
+    { ::usleep(100'000); valid = query(); }
+    if (valid && (!receipt.supported || !receipt.peersCapable || receipt.currentAuthorityGeneration == 0 ||
+                  receipt.currentMasterUUID == 0 || receipt.currentMasterBootNs <= 0))
+    { failure.assign("current production source authority has not acknowledged paired retirement capability"_ctv); valid = false; }
+    auto matchesFence = [&]() {
+      ProdigyPairedSourceRetirementFence fence = {};
+      if (!BitseryEngine::deserializeSafe(receipt.sealedFence, fence) ||
+          !prodigyPairedSourceRetirementFenceValid(fence) || fence.operationID != operationID ||
+          fence.sourceClusterUUID != source.clusterUUID || fence.targetClusterUUID != target.clusterUUID ||
+          fence.sourceDeploymentID != record.intent.sourceWorkload.deploymentID ||
+          fence.targetDeploymentID != record.intent.targetWorkload.deploymentID ||
+          fence.sourceNormalizedPlanSHA256 != record.intent.sourceWorkload.canonicalPlanSHA256 ||
+          fence.sourceBlobSHA256 != record.intent.sourceWorkload.artifactSHA256)
+      { failure.assign("production source retirement fence conflicts with the durable pair"_ctv); return false; }
+      return true;
+    };
+    if (valid && !receipt.sealedFence.empty()) valid = matchesFence();
+    if (valid && receipt.sealedFence.empty())
+    {
+      DeploymentIdentityReport sourceReport = {};
+      MothershipProductionWorkloadIdentity sourceIdentity = {};
+      valid = productionWorkloadIdentity(source, record.intent.sourceWorkload.deploymentID,
+                                         sourceIdentity, sourceReport, failure) &&
+          productionWorkloadIdentityEqual(sourceIdentity, record.intent.sourceWorkload);
+      if (!valid && failure.empty()) failure.assign("live source differs from the production pair"_ctv);
+      ProductionPairProviderState drainState = {}; String drainOutput = {}, providerEvidence = {};
+      valid = valid && runProductionPairProvider(record, source, "drain", drainState, drainOutput,
+                                                 providerEvidence, failure) &&
+          productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::sourceDrained,
+                                             drainState, failure);
+      valid = valid && connectSource() && query();
+      if (valid && !receipt.sealedFence.empty()) valid = matchesFence();
+      if (valid && receipt.sealedFence.empty() &&
+          (!receipt.supported || !receipt.peersCapable || receipt.currentAuthorityGeneration == 0 ||
+           receipt.currentMasterUUID == 0 || receipt.currentMasterBootNs <= 0))
+      { failure.assign("source authority changed before production retirement preparation"_ctv); valid = false; }
+      if (valid && receipt.sealedFence.empty())
+      {
+        ProdigyPairedSourceRetirementRequest request = {};
+        request.operationID = operationID;
+        request.sourceClusterUUID = source.clusterUUID; request.targetClusterUUID = target.clusterUUID;
+        request.sourceDeploymentID = record.intent.sourceWorkload.deploymentID;
+        request.targetDeploymentID = record.intent.targetWorkload.deploymentID;
+        request.expectedAuthorityGeneration = receipt.currentAuthorityGeneration;
+        request.expectedMasterUUID = receipt.currentMasterUUID;
+        request.expectedMasterBootNs = receipt.currentMasterBootNs;
+        request.sourceNormalizedPlanSHA256 = record.intent.sourceWorkload.canonicalPlanSHA256;
+        request.sourceBlobSHA256 = record.intent.sourceWorkload.artifactSHA256;
+        request.sourceBlobBytes = record.intent.sourceWorkload.artifactBytes;
+        String encoded = {}; BitseryEngine::serialize(encoded, request);
+        Message::construct(socket.wBuffer, MothershipTopic::preparePairedSourceRetirement, encoded);
+        valid = socket.send() && readPairedSourceRetirementReceipt(
+            socket.recvExpectedTopic(MothershipTopic::preparePairedSourceRetirement),
+            MothershipTopic::preparePairedSourceRetirement, receipt, failure);
+      }
+    }
+    const int64_t terminalDeadline = Time::now<TimeResolution::ms>() + 150'000;
+    bool reportedSealed = false;
+    for (uint32_t polls = 0; valid && !receipt.terminal && polls < 1500 &&
+         Time::now<TimeResolution::ms>() < terminalDeadline; ++polls)
+    {
+      if (!receipt.sealedFence.empty() && !matchesFence()) { valid = false; break; }
+      if (receipt.sealed && !reportedSealed)
+      {
+        basics_log("productionPair progress=sealed terminal=0\n"); std::fflush(stdout); reportedSealed = true;
+      }
+      ::usleep(100'000); valid = query();
+    }
+    if (valid) valid = receipt.sealed && receipt.terminal && matchesFence() &&
+        prodigyComputeSHA256Hex(receipt.sealedFence, receiptSHA256, &failure);
+    socket.close();
+    if (!valid && failure.empty()) failure.assign("production source retirement is pending; resume the exact operation"_ctv);
+    return valid;
+  }
+
+  void runProductionPair(int argc, char *argv[])
+  {
+    String failure = {}, action = argc > 1 ? String(argv[1]) : String(), receiptSHA256 = {};
+    uint128_t operationUUID = 0;
+    bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        (action == "query"_ctv || action == "selectTarget"_ctv || action == "drain"_ctv ||
+         action == "retireSource"_ctv || action == "cleanup"_ctv);
+    if (!valid) failure.assign("usage: productionPair OPERATION_UUID query|selectTarget|drain|retireSource|cleanup"_ctv);
+    MothershipProductionPairRecord record = {};
+    MothershipProdigyCluster source = {}, target = {};
+    MothershipPhysicalServiceTransitBoundary physicalBoundary = {};
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadProductionPair(operationUUID, record, &failure);
+      String sourceIdentity = {}, targetIdentity = {};
+      sourceIdentity.assignItoh(record.intent.route.sourceClusterUUID);
+      targetIdentity.assignItoh(record.intent.route.destinationClusterUUID);
+      valid = valid && registry.getClusterByIdentity(sourceIdentity, source, &failure) &&
+          registry.getClusterByIdentity(targetIdentity, target, &failure);
+    }
+    if (valid && record.phase >= MothershipProductionPairPhase::transitApplied &&
+        record.phase < MothershipProductionPairPhase::cleanupComplete)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.loadPhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
+                                                           physicalBoundary, &failure) &&
+          productionPairPhysicalBoundaryReady(record, source, target, physicalBoundary, failure);
+    }
+
+    bool resumed = false;
+    if (valid && action == "cleanup"_ctv)
+    {
+      if (record.phase < MothershipProductionPairPhase::sourceRetired)
+      { failure.assign("production pair cleanup requires durable source retirement"_ctv); valid = false; }
+      if (valid && record.phase == MothershipProductionPairPhase::cleanupComplete)
+      {
+        MothershipPhysicalServiceTransitBoundary boundary = {};
+        auto registry = openClusterRegistry();
+        bool closeResumed = false;
+        valid = registry.closePhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
+                                                              record.cleanupReceiptSHA256,
+                                                              boundary, closeResumed, &failure);
+        receiptSHA256 = record.cleanupReceiptSHA256; resumed = valid && closeResumed;
+      }
+      else if (valid)
+      {
+        CousinRouteRecord terminalRoute = {};
+        CousinRouteApplyReceipt sourceReceipt = {}, targetReceipt = {};
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.loadCousinRoute(record.intent.route.routeUUID, terminalRoute, &failure) &&
+              cousinRouteTerminal(terminalRoute) && terminalRoute.generation > record.intent.route.generation &&
+              cousinRouteScopeMatches(record.intent.route, terminalRoute) &&
+              registry.loadCurrentCousinRouteApplyReceipt(terminalRoute.routeUUID, CousinRouteHalf::source,
+                                                          sourceReceipt, &failure) &&
+              registry.loadCurrentCousinRouteApplyReceipt(terminalRoute.routeUUID, CousinRouteHalf::destination,
+                                                          targetReceipt, &failure) &&
+              cousinRouteApplyReceiptMatchesCurrentRoute(sourceReceipt, terminalRoute) &&
+              cousinRouteApplyReceiptMatchesCurrentRoute(targetReceipt, terminalRoute);
+        }
+        ProductionPairProviderState state = {}; String output = {}, providerEvidence = {};
+        if (valid) valid = runProductionPairProvider(record, source, "remove", state, output, providerEvidence, failure);
+        if (valid)
+        {
+          String evidence = {}, encoded = {};
+          Vector<String> ownerEvidence = {};
+          ownerEvidence.emplace_back("mothership-production-pair-cleanup-receipt-v1"_ctv);
+          ownerEvidence.push_back(record.sourceRetirementReceiptSHA256);
+          ownerEvidence.push_back(providerEvidence);
+          BitseryEngine::serialize(evidence, ownerEvidence);
+          BitseryEngine::serialize(encoded, terminalRoute); evidence.append(encoded);
+          encoded.clear(); BitseryEngine::serialize(encoded, sourceReceipt); evidence.append(encoded);
+          encoded.clear(); BitseryEngine::serialize(encoded, targetReceipt); evidence.append(encoded);
+          valid = prodigyComputeSHA256Hex(evidence, receiptSHA256, &failure);
+        }
+        if (valid)
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::cleanupComplete,
+                                                 receiptSHA256, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+        }
+        if (valid)
+        {
+          MothershipPhysicalServiceTransitBoundary boundary = {};
+          auto registry = openClusterRegistry();
+          bool closeResumed = false;
+          valid = registry.closePhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
+                                                                receiptSHA256, boundary, closeResumed, &failure);
+          resumed = resumed || closeResumed;
+        }
+      }
+    }
+    else if (valid)
+    {
+      if (record.phase < MothershipProductionPairPhase::transitApplied ||
+          record.phase >= MothershipProductionPairPhase::cleanupComplete)
+      { failure.assign("production pair action requires an active applied transit"_ctv); valid = false; }
+      if (valid) valid = productionPairTransportReady(record, source, target, failure);
+
+      ClusterStatusReport sourceStatus = {}, targetStatus = {};
+      if (valid && action != "retireSource"_ctv)
+        valid = productionPairWorkloadsReady(record, source, target,
+            record.phase < MothershipProductionPairPhase::sourceRetired,
+            sourceStatus, targetStatus, failure);
+      if (valid && action == "retireSource"_ctv)
+      {
+        valid = productionClusterHealthy(source, sourceStatus, failure) &&
+            productionClusterHealthy(target, targetStatus, failure);
+        DeploymentIdentityReport targetReport = {};
+        MothershipProductionWorkloadIdentity targetIdentity = {};
+        valid = valid && productionWorkloadIdentity(target, record.intent.targetWorkload.deploymentID,
+                                                    targetIdentity, targetReport, failure) &&
+            productionWorkloadIdentityEqual(targetIdentity, record.intent.targetWorkload);
+      }
+      if (valid && !topologyMachineOwnsAddress(sourceStatus, record.intent.selectorMachineUUID,
+                                               record.intent.selectorAddress))
+      {
+        failure.assign("production ingress address is not owned by the exact live source machine"_ctv);
+        valid = false;
+      }
+
+      ProductionPairProviderState state = {}; String output = {}, providerEvidence = {};
+      if (valid && action == "query"_ctv)
+      {
+        valid = runProductionPairProvider(record, source, "query", state, output, providerEvidence, failure);
+        MothershipProductionPairPhase selectorPhase = record.phase >= MothershipProductionPairPhase::sourceDrained ?
+            MothershipProductionPairPhase::sourceDrained :
+            (record.phase >= MothershipProductionPairPhase::targetSelected ?
+             MothershipProductionPairPhase::targetSelected : MothershipProductionPairPhase::transitApplied);
+        if (valid) valid = productionPairSelectorPhaseMatches(record, selectorPhase, state, failure);
+        if (valid) receiptSHA256 = selectorPhase == MothershipProductionPairPhase::sourceDrained ?
+            record.sourceDrainReceiptSHA256 :
+            (selectorPhase == MothershipProductionPairPhase::targetSelected ?
+             record.targetSelectionReceiptSHA256 : record.transitApplyReceiptSHA256);
+      }
+      else if (valid && action == "selectTarget"_ctv)
+      {
+        if (record.phase < MothershipProductionPairPhase::targetSelected)
+        {
+          if (record.phase == MothershipProductionPairPhase::transitApplied)
+          {
+            valid = productionPairIngressWitness(record, source, "source", receiptSHA256, failure);
+            if (valid) { auto registry = openClusterRegistry(); valid = registry.advanceProductionPair(
+                operationUUID, MothershipProductionPairPhase::sourceIngressWitnessed, receiptSHA256,
+                Time::now<TimeResolution::ms>(), record, resumed, &failure); }
+          }
+          if (valid && record.phase != MothershipProductionPairPhase::sourceIngressWitnessed)
+          { failure.assign("target selection requires a durable distinct-machine source ingress witness"_ctv); valid = false; }
+          if (valid) valid = runProductionPairProvider(record, source, "select-target", state, output,
+                                                       providerEvidence, failure) &&
+              productionPairSelectorPhaseReceipt(record, MothershipProductionPairPhase::targetSelected,
+                                                 state, receiptSHA256, failure);
+          if (valid)
+          {
+            auto registry = openClusterRegistry();
+            valid = registry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::targetSelected,
+                                                   receiptSHA256, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+          }
+        }
+        else
+        {
+          valid = runProductionPairProvider(record, source, "query", state, output, providerEvidence, failure) &&
+              productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::targetSelected,
+                                                 state, failure);
+          resumed = valid;
+        }
+        receiptSHA256 = record.targetSelectionReceiptSHA256;
+      }
+      else if (valid && action == "drain"_ctv)
+      {
+        if (record.phase < MothershipProductionPairPhase::sourceDrained)
+        {
+          if (record.phase == MothershipProductionPairPhase::targetSelected)
+          {
+            valid = productionPairIngressWitness(record, source, "target", receiptSHA256, failure);
+            if (valid) { auto registry = openClusterRegistry(); valid = registry.advanceProductionPair(
+                operationUUID, MothershipProductionPairPhase::targetIngressWitnessed, receiptSHA256,
+                Time::now<TimeResolution::ms>(), record, resumed, &failure); }
+          }
+          if (valid && record.phase != MothershipProductionPairPhase::targetIngressWitnessed)
+          { failure.assign("source drain requires a durable distinct-machine target ingress witness"_ctv); valid = false; }
+          if (valid) valid = runProductionPairProvider(record, source, "drain", state, output,
+                                                       providerEvidence, failure) &&
+              productionPairSelectorPhaseReceipt(record, MothershipProductionPairPhase::sourceDrained,
+                                                 state, receiptSHA256, failure);
+          if (valid)
+          {
+            auto registry = openClusterRegistry();
+            valid = registry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::sourceDrained,
+                                                   receiptSHA256, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+          }
+        }
+        else
+        {
+          valid = runProductionPairProvider(record, source, "query", state, output, providerEvidence, failure) &&
+              productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::sourceDrained,
+                                                 state, failure);
+          resumed = valid;
+        }
+        receiptSHA256 = record.sourceDrainReceiptSHA256;
+      }
+      else if (valid && action == "retireSource"_ctv)
+      {
+        if (record.phase < MothershipProductionPairPhase::sourceRetired)
+        {
+          if (record.phase != MothershipProductionPairPhase::sourceDrained)
+          { failure.assign("source retirement requires the zero-source-flow drain phase"_ctv); valid = false; }
+          if (valid) valid = runProductionPairProvider(record, source, "drain", state, output,
+                                                       providerEvidence, failure) &&
+              productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::sourceDrained,
+                                                 state, failure);
+          if (valid) valid = retireProductionPairSource(record, source, target, receiptSHA256, failure);
+          if (valid)
+          {
+            auto registry = openClusterRegistry();
+            valid = registry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::sourceRetired,
+                                                   receiptSHA256, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+          }
+        }
+        else
+        {
+          valid = retireProductionPairSource(record, source, target, receiptSHA256, failure) &&
+              receiptSHA256 == record.sourceRetirementReceiptSHA256; resumed = valid;
+        }
+        receiptSHA256 = record.sourceRetirementReceiptSHA256;
+      }
+    }
+
+    String operation = {}; operation.assignItoh(operationUUID);
+    basics_log("productionPair success=%u resumed=%u operationUUID=%s action=%s phase=%u receiptSHA256=%s failure=%s\n",
+        unsigned(valid), unsigned(resumed), operation.c_str(), action.c_str(),
+        unsigned(valid ? record.phase : MothershipProductionPairPhase::prepared), receiptSHA256.c_str(), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runPrepareTestPairMigration(int argc, char *argv[])
   {
     String failure = {}; TestPairLifecycleLock lock;
@@ -12680,7 +15093,7 @@ private:
     {
       ClusterStatusReport targetReport = {};
       auto& intent = requested.targetReadinessIntent;
-      valid = readTestPairClusterStatus(target, targetReport, failure) && targetReport.hasTopology &&
+      valid = readManagedClusterStatus(target, targetReport, failure) && targetReport.hasTopology &&
               mothershipBuildTestPairTargetReadinessIntent(
                   targetReport.topology, d.targetMachinePrivate4, intent,
                   requested.version >= 5 ? requested.cousinTransport.destinationPermission.localDeploymentID : 0,
@@ -23709,6 +26122,8 @@ public:
         {"destroyProviderMachines",         &Mothership::runDestroyProviderMachines        },
         {"enrollClusterPair",               &Mothership::runEnrollClusterPair              },
         {"estimateClusterHourlyCost",       &Mothership::runEstimateClusterHourlyCost      },
+        {"faultClusterNetwork",            &Mothership::runFaultClusterNetwork           },
+        {"faultLocalClusterMachine",       &Mothership::runFaultLocalClusterMachine      },
         {"faultRemoteCloudMachine",         &Mothership::runFaultRemoteCloudMachine        },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
@@ -23719,6 +26134,7 @@ public:
         {"pairBoundary",                    &Mothership::runPairBoundary                   },
         {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
         {"planUpgrade",                     &Mothership::runPlanUpgrade                     },
+        {"prepareProductionPair",           &Mothership::runPrepareProductionPair          },
         {"prepareRetainedRecoveryArtifactLocal", &Mothership::runPrepareRetainedRecoveryArtifactLocal},
         {"prepareRetainedRecoveryLocal", &Mothership::runPrepareRetainedRecoveryLocal},
         {"prepareTestPairBoundary",         &Mothership::runPrepareTestPairBoundary        },
@@ -23727,6 +26143,7 @@ public:
         {"probePairBoundary",               &Mothership::runProbePairBoundary              },
         {"probeTestCluster",                &Mothership::runProbeTestCluster               },
         {"probeTestClusterTraffic",         &Mothership::runProbeTestClusterTraffic        },
+        {"productionPair",                  &Mothership::runProductionPair                 },
         {"pullDNSBindings",                 &Mothership::runPullDNSBindings                },
         {"pullProviderCredential",          &Mothership::runPullProviderCredential         },
         {"pullProviderCredentials",         &Mothership::runPullProviderCredentials        },
@@ -23737,6 +26154,7 @@ public:
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
         {"recoverTestClusterFollowerBrain", &Mothership::runRecoverTestClusterFollowerBrain},
+        {"registerLocalVMBoundary",         &Mothership::runRegisterLocalVMBoundary        },
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
@@ -23804,7 +26222,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -23845,7 +26263,7 @@ int main(int argc, char *argv[])
     message.append("printClusters\n");
     message.append("\tlists all managed Prodigy cluster records with their clusterUUIDs\n");
     message.append("setLocalClusterMembership [name|clusterUUID] [json]\n");
-    message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with exact json fields includeLocalMachine and machines before reconciling and persisting on live success\n");
+    message.append("\trequires deploymentMode=local and atomically replaces the stored local membership spec with includeLocalMachine, machines, optional nBrains, and bootstrapSshUser/bootstrapSshPrivateKeyPath/bootstrapSshKeyPackage for adopted-machine bootstrap before reconciling and persisting on live success\n");
     message.append("setTestClusterMachineCount [name|clusterUUID] [json]\n");
     message.append("\trequires deploymentMode=test and updates only test.machineCount through exact json field machineCount before restarting/reconciling and persisting on live success\n");
     message.append("adoptTestClusterSpare [name|clusterUUID]\n\tsubmits the configured SSH spare to ordinary Brain AddMachines and exits; observe native durable acceptance and cluster readiness separately\n");
@@ -23854,6 +26272,10 @@ int main(int argc, char *argv[])
     message.append("\tadopts an exact retained test-provider owner and replaces one worker while preserving descendant cgroups; application health must be observed separately\n");
     message.append("recoverTestClusterFollowerBrain [name|clusterUUID] [approved target bundle] [machineIndex] [expected installed source bundle SHA256] [optional test fault phase]\n");
     message.append("\ttest-only exact-runtime19b three-Brain follower replacement; optional frozen|rootInstalled|workerReplaced exits 86 after its durable transition, and the retry omits it\n");
+    message.append("faultClusterNetwork [operationUUID] [physicalBoundaryUUID] [both|source-to-target|target-to-source] [durationMs]\n");
+    message.append("\trequests one bounded guest-owned peer-host partition through the sealed Mothership physical-fault owner\n");
+    message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] cold-reboot [timeoutMs]\n");
+    message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity\n");
     message.append("faultRemoteCloudMachine [clusterName|clusterUUID] [machineUUID canonical hex] hard-reboot\n");
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");
@@ -23864,6 +26286,12 @@ int main(int argc, char *argv[])
     message.append("\truns a bounded application traffic probe through the Mothership-owned test provider\n");
     message.append("probeTestClusterTraffic [name|clusterUUID] [address] [port] [payload] [expected] [requestTimeoutMs] [sourceMachineIndex] [clients] [requestsPerClient] [intervalMs]\n");
     message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
+    message.append("prepareProductionPair [operationUUID] [activeRouteUUID] [physicalBoundaryUUID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIngressAddress] [ingressPort]\n");
+    message.append("\tadmits two exact non-test stateless workloads, their production COUSIN transport, and one durable source-machine ingress relay\n");
+    message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup]\n");
+    message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, and post-withdrawal cleanup\n");
+    message.append("registerLocalVMBoundary [cluster] [machineUUID] [boundaryUUID] [taskID] [hostAddress] [hostPort] [hostUser] [hostPrivateKey] [hostPublicKey] [statePath]\n");
+    message.append("\tregisters the exact pinned external KVM owner for one VM member of a three-Brain deploymentMode=local cluster; Mothership owns and seals the launcher bytes\n");
     message.append("retireTestPairSource [operationID] (test migration; fresh whole destination readiness and source drain required)\n");
     message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] [optional activeCousinRouteUUID] (test clusters only; final-transport route qualifies G5)\n");
     message.append("admitTestPairTarget [operationID] [containerBlob] (resume the same durable target admission)\n");

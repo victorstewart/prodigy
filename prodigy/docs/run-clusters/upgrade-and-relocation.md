@@ -513,6 +513,10 @@ cases; the full routing, NAT, IPv4/IPv6, MTU/PMTU, DNS, TLS/client-identity,
 service-discovery and full/asymmetric-partition boundary matrix; monotonic active,
 drain, retirement, withdrawal and stale-replay evidence; and verified zero
 G6/task-owned residual instances, VPCs, blocks and IPs after cleanup. For each
+boundary claim, the manifest binds both its Mothership topology or fault receipt
+and a distinct method-specific SHA-256 receipt from a read-only physical probe;
+one `clusterReport` receipt cannot be relabeled as DNS, TLS, PMTU, discovery, or
+service-path evidence. For each
 resource class, the manifest binds a non-secret exact pre-existing account
 identity-set hash, a separate task-owned identity-set hash, and distinct account
 and task-owned inventory queries. A passing result requires the post-cleanup

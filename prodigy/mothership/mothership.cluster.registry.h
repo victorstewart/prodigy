@@ -20,6 +20,8 @@
 #include <prodigy/mothership/mothership.tunnel.policy.h>
 #include <prodigy/mothership/mothership.virtual.datacenter.h>
 #include <prodigy/mothership/mothership.pair.control.boundary.h>
+#include <prodigy/mothership/mothership.production.pair.h>
+#include <prodigy/mothership/mothership.physical.fault.h>
 
 // Local endpoint qualification is an operation of the test provider, not a
 // migration receipt. In particular, selecting the target does not authorize
@@ -473,6 +475,11 @@ private:
   constexpr static auto cousinRoutesColumnFamily = "cousin_routes"_ctv;
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
   constexpr static auto clusterPairEnrollmentsColumnFamily = "cluster_pair_enrollments"_ctv;
+  constexpr static auto productionPairsColumnFamily = "production_pairs"_ctv;
+  constexpr static auto physicalTransitBoundariesColumnFamily = "physical_transit_boundaries"_ctv;
+  constexpr static auto physicalNetworkFaultsColumnFamily = "physical_network_faults"_ctv;
+  constexpr static auto localVMBoundariesColumnFamily = "local_vm_boundaries"_ctv;
+  constexpr static auto localVMFaultsColumnFamily = "local_vm_faults"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -506,6 +513,11 @@ private:
     ~CousinRouteLock() { if (fd >= 0) ::close(fd); }
   };
 
+  struct G6OperationLock {
+    int fd = -1;
+    ~G6OperationLock() { if (fd >= 0) ::close(fd); }
+  };
+
   bool lockClusterPairEnrollment(ClusterPairEnrollmentLock& lock, String *failure) const
   {
     String path = db.path();
@@ -527,6 +539,19 @@ private:
     if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
     {
       if (failure) failure->assign("cousin route registry lock unavailable"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  bool lockG6Operations(G6OperationLock& lock, String *failure) const
+  {
+    String path = db.path();
+    path.append(".g6-operation.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
+    {
+      if (failure) failure->assign("G6 operation registry lock unavailable"_ctv);
       return false;
     }
     return true;
@@ -2377,6 +2402,15 @@ private:
           return false;
         }
 
+        // Seed-only local clusters intentionally scrub unused bootstrap
+        // credentials.  When adopted machines are added later, restore the
+        // typed package from the explicitly supplied path before reconciliation
+        // so SSH never falls back to an unvalidated path-only identity.
+        if (resolveBootstrapSSHKeyPackage(cluster, false, failure) == false)
+        {
+          return false;
+        }
+
         if (cluster.remoteProdigyPath.size() == 0)
         {
           cluster.remoteProdigyPath.assign(defaultMothershipRemoteProdigyPath());
@@ -3600,6 +3634,525 @@ public:
     }
     if (failure) failure->clear();
     return true;
+  }
+
+  bool loadProductionPair(uint128_t operationUUID, MothershipProductionPairRecord& record,
+                          String *failure = nullptr)
+  {
+    record = {};
+    if (operationUUID == 0)
+    {
+      if (failure) failure->assign("production pair operation UUID is required"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {};
+    key.assignItoh(operationUUID);
+    if (!db.read(productionPairsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) ||
+        !mothershipProductionPairRecordValid(record) || record.intent.operationUUID != operationUUID)
+    {
+      record = {};
+      if (failure) failure->assign("production pair record is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitProductionPair(const MothershipProductionPairIntent& intent, int64_t nowMs,
+                           MothershipProductionPairRecord& recorded, bool& resumed,
+                           String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipProductionPairIntentValid(intent, failure) || nowMs <= 0) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+
+    CousinRouteRecord route = {};
+    CousinRouteApplyReceipt sourceReceipt = {}, destinationReceipt = {};
+    if (!loadCousinRoute(intent.route.routeUUID, route, failure) ||
+        route.priorOperationUUIDs != intent.route.priorOperationUUIDs ||
+        !cousinRouteExactMatches(route, intent.route) ||
+        !loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::source, sourceReceipt, failure) ||
+        !loadCurrentCousinRouteApplyReceipt(route.routeUUID, CousinRouteHalf::destination, destinationReceipt, failure) ||
+        !cousinRouteApplyReceiptExactMatches(sourceReceipt, intent.sourceRouteReceipt) ||
+        !cousinRouteApplyReceiptExactMatches(destinationReceipt, intent.destinationRouteReceipt))
+    {
+      if (failure && failure->empty()) failure->assign("production pair requires the exact durable active route and receipts"_ctv);
+      return false;
+    }
+
+    String key = {}, encoded = {}, readFailure = {};
+    key.assignItoh(intent.operationUUID);
+    if (db.read(productionPairsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipProductionPairRecordMatchesIntent(recorded, intent))
+      {
+        recorded = {};
+        if (failure) failure->assign("production pair operation conflicts with its immutable intent"_ctv);
+        return false;
+      }
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv))
+    {
+      if (failure) *failure = readFailure;
+      return false;
+    }
+
+    Vector<String> values = {};
+    if (!db.listValues(productionPairsColumnFamily, values, failure)) return false;
+    for (const auto& value : values)
+    {
+      MothershipProductionPairRecord prior = {};
+      if (!BitseryEngine::deserializeSafe(value, prior) || !mothershipProductionPairRecordValid(prior))
+      {
+        if (failure) failure->assign("production pair registry contains a corrupt record"_ctv);
+        return false;
+      }
+      if (prior.phase != MothershipProductionPairPhase::cleanupComplete &&
+          (prior.intent.route.routeUUID == intent.route.routeUUID ||
+           (prior.intent.route.sourceClusterUUID == intent.route.sourceClusterUUID &&
+            prior.intent.route.destinationClusterUUID == intent.route.destinationClusterUUID &&
+            prior.intent.route.logicalWorkloadUUID == intent.route.logicalWorkloadUUID)))
+      {
+        if (failure) failure->assign("production pair route or workload scope already has an open coordinator"_ctv);
+        return false;
+      }
+    }
+
+    if (!mothershipProductionPairBegin(intent, nowMs, recorded, failure)) return false;
+    MothershipProductionPairRecord copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(productionPairsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool advanceProductionPair(uint128_t operationUUID, MothershipProductionPairPhase phase,
+                             const String& receiptSHA256, int64_t nowMs,
+                             MothershipProductionPairRecord& recorded, bool& resumed,
+                             String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (operationUUID == 0 || !mothershipProductionPairPhaseValid(phase) ||
+        phase == MothershipProductionPairPhase::prepared)
+    {
+      if (failure) failure->assign("production pair advance requires a receipt-bearing phase"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord updated = recorded;
+    const bool wasSamePhase = updated.phase == phase;
+    const bool advanced = phase == MothershipProductionPairPhase::transitApplied ?
+        mothershipProductionPairMarkTransitApplied(updated, receiptSHA256, nowMs, failure) :
+        mothershipProductionPairAdvance(updated, phase, receiptSHA256, nowMs, failure);
+    if (!advanced) return false;
+    resumed = wasSamePhase;
+    if (resumed)
+    {
+      if (failure) failure->clear();
+      return true;
+    }
+    String key = {}, encoded = {};
+    key.assignItoh(operationUUID);
+    BitseryEngine::serialize(encoded, updated);
+    if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(updated);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool loadPhysicalServiceTransitBoundary(uint128_t boundaryUUID,
+                                          MothershipPhysicalServiceTransitBoundary& boundary,
+                                          String *failure = nullptr)
+  {
+    boundary = {};
+    if (boundaryUUID == 0)
+    {
+      if (failure) failure->assign("physical service transit boundary UUID is required"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {}; key.assignItoh(boundaryUUID);
+    if (!db.read(physicalTransitBoundariesColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, boundary) ||
+        !mothershipPhysicalServiceTransitBoundaryValid(boundary) || boundary.boundaryUUID != boundaryUUID)
+    {
+      boundary = {};
+      if (failure) failure->assign("physical service transit boundary is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitPhysicalServiceTransitBoundary(const MothershipPhysicalServiceTransitBoundary& requested,
+                                            MothershipPhysicalServiceTransitBoundary& recorded,
+                                            bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipPhysicalServiceTransitBoundaryValid(requested, failure) || requested.closed) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    MothershipProductionPairRecord pair = {};
+    if (!loadProductionPair(requested.pairOperationUUID, pair, failure) ||
+        pair.phase < MothershipProductionPairPhase::targetAdmitted ||
+        pair.phase >= MothershipProductionPairPhase::cleanupComplete ||
+        pair.intent.physicalBoundaryUUID != requested.boundaryUUID ||
+        pair.intent.route.routeUUID != requested.routeUUID || pair.intent.route.generation != requested.routeGeneration ||
+        pair.intent.route.sourceClusterUUID != requested.sourceClusterUUID ||
+        pair.intent.route.destinationClusterUUID != requested.targetClusterUUID ||
+        pair.intent.sourceWorkload.endpointMachineUUID != requested.sourceMachineUUID ||
+        pair.intent.targetWorkload.endpointMachineUUID != requested.targetMachineUUID ||
+        pair.intent.sourceWorkload.endpointIPv4 != requested.sourceAddress ||
+        pair.intent.targetWorkload.endpointIPv4 != requested.targetAddress ||
+        pair.intent.sourceWorkload.endpointTCPPort != requested.sourceTCPPort ||
+        pair.intent.targetWorkload.endpointTCPPort != requested.targetTCPPort)
+    {
+      if (failure && failure->empty()) failure->assign("physical service transit requires the exact target-admitted production pair"_ctv);
+      return false;
+    }
+    String authorization = {};
+    if (!cousinRouteAuthorizationDigest(pair.intent.route, authorization) ||
+        authorization != requested.routeAuthorizationSHA256)
+    {
+      if (failure) failure->assign("physical service transit route authorization digest conflicts"_ctv);
+      return false;
+    }
+    const auto executorBoundaryMatches = [&](uint128_t clusterUUID, uint128_t machineUUID,
+                                             MothershipPhysicalFaultExecutorKind kind,
+                                             uint128_t localVMBoundaryUUID,
+                                             const String& cloudID) {
+      if (kind == MothershipPhysicalFaultExecutorKind::localVM)
+      {
+        MothershipLocalVMBoundaryDescriptor boundary = {};
+        return loadLocalVMBoundary(localVMBoundaryUUID, boundary, failure) && !boundary.retired &&
+            boundary.clusterUUID == clusterUUID && boundary.machineUUID == machineUUID;
+      }
+      String identity = {}; identity.assignItoh(clusterUUID);
+      MothershipProdigyCluster cluster = {};
+      if (kind != MothershipPhysicalFaultExecutorKind::providerCloudVM ||
+          !getClusterByIdentity(identity, cluster, failure) ||
+          cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
+          !mothershipClusterProviderIsIaaS(cluster.provider)) return false;
+      uint32_t matches = 0;
+      for (const auto& machine : cluster.topology.machines)
+        if (machine.uuid == machineUUID && machine.kind == MachineConfig::MachineKind::vm &&
+            machine.backing == ClusterMachineBacking::cloud && machine.cloud.cloudID == cloudID)
+          ++matches;
+      return matches == 1;
+    };
+    if (!executorBoundaryMatches(requested.sourceClusterUUID, requested.sourceMachineUUID,
+                                 requested.sourceExecutorKind, requested.sourceLocalVMBoundaryUUID,
+                                 requested.sourceCloudID) ||
+        !executorBoundaryMatches(requested.targetClusterUUID, requested.targetMachineUUID,
+                                 requested.targetExecutorKind, requested.targetLocalVMBoundaryUUID,
+                                 requested.targetCloudID))
+    {
+      if (failure && failure->empty())
+        failure->assign("physical service transit endpoints lack exact registered VM isolation boundaries"_ctv);
+      return false;
+    }
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.boundaryUUID);
+    if (db.read(physicalTransitBoundariesColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipPhysicalServiceTransitBoundaryValid(recorded) ||
+          !mothershipPhysicalServiceTransitBoundaryEqual(recorded, requested))
+      {
+        recorded = {};
+        if (failure) failure->assign("physical service transit boundary UUID conflicts with its immutable record"_ctv);
+        return false;
+      }
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    Vector<String> values = {};
+    if (!db.listValues(physicalTransitBoundariesColumnFamily, values, failure)) return false;
+    for (const auto& value : values)
+    {
+      MothershipPhysicalServiceTransitBoundary prior = {};
+      if (!BitseryEngine::deserializeSafe(value, prior) || !mothershipPhysicalServiceTransitBoundaryValid(prior))
+      { if (failure) failure->assign("physical service transit registry contains a corrupt record"_ctv); return false; }
+      if (!prior.closed && (prior.pairOperationUUID == requested.pairOperationUUID ||
+          prior.routeUUID == requested.routeUUID))
+      { if (failure) failure->assign("production pair already owns an open physical service transit"_ctv); return false; }
+    }
+    if (pair.phase != MothershipProductionPairPhase::targetAdmitted)
+    {
+      if (failure) failure->assign("new physical service transit admission requires the target-admitted production phase"_ctv);
+      return false;
+    }
+    recorded = requested;
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(physicalTransitBoundariesColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool closePhysicalServiceTransitBoundary(uint128_t boundaryUUID, const String& cleanupReceiptSHA256,
+                                           MothershipPhysicalServiceTransitBoundary& recorded,
+                                           bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipPhysicalFaultDigestValid(cleanupReceiptSHA256))
+    { if (failure) failure->assign("physical service transit cleanup receipt is invalid"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadPhysicalServiceTransitBoundary(boundaryUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord pair = {};
+    if (!loadProductionPair(recorded.pairOperationUUID, pair, failure) ||
+        pair.phase != MothershipProductionPairPhase::cleanupComplete ||
+        pair.cleanupReceiptSHA256 != cleanupReceiptSHA256)
+    {
+      if (failure && failure->empty()) failure->assign("physical transit cleanup requires the exact completed production pair receipt"_ctv);
+      return false;
+    }
+    if (recorded.closed)
+    {
+      resumed = recorded.cleanupReceiptSHA256 == cleanupReceiptSHA256;
+      if (!resumed && failure) failure->assign("physical transit cleanup receipt conflicts with the durable receipt"_ctv);
+      return resumed;
+    }
+    recorded.closed = true; recorded.cleanupReceiptSHA256 = cleanupReceiptSHA256;
+    String key = {}, encoded = {}; key.assignItoh(boundaryUUID); auto copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    return db.write(physicalTransitBoundariesColumnFamily, key, encoded, failure);
+  }
+
+  bool loadLocalVMBoundary(uint128_t vmBoundaryUUID, MothershipLocalVMBoundaryDescriptor& descriptor,
+                           String *failure = nullptr)
+  {
+    descriptor = {};
+    if (vmBoundaryUUID == 0) { if (failure) failure->assign("local VM boundary UUID is required"_ctv); return false; }
+    String key = {}, encoded = {}; key.assignItoh(vmBoundaryUUID);
+    if (!db.read(localVMBoundariesColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, descriptor) ||
+        !mothershipLocalVMBoundaryDescriptorValid(descriptor) || descriptor.vmBoundaryUUID != vmBoundaryUUID)
+    { descriptor = {}; if (failure) failure->assign("local VM boundary is corrupt or unsupported"_ctv); return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool findActiveLocalVMBoundary(uint128_t clusterUUID, uint128_t machineUUID,
+                                 MothershipLocalVMBoundaryDescriptor& descriptor,
+                                 String *failure = nullptr)
+  {
+    descriptor = {};
+    if (clusterUUID == 0 || machineUUID == 0)
+    { if (failure) failure->assign("local VM boundary lookup requires exact cluster and machine identities"_ctv); return false; }
+    Vector<String> values = {};
+    if (!db.listValues(localVMBoundariesColumnFamily, values, failure)) return false;
+    uint32_t matches = 0;
+    for (const auto& value : values)
+    {
+      MothershipLocalVMBoundaryDescriptor candidate = {};
+      if (!BitseryEngine::deserializeSafe(value, candidate) ||
+          !mothershipLocalVMBoundaryDescriptorValid(candidate))
+      { if (failure) failure->assign("local VM boundary registry contains a corrupt record"_ctv); return false; }
+      if (!candidate.retired && candidate.clusterUUID == clusterUUID && candidate.machineUUID == machineUUID)
+      { descriptor = std::move(candidate); ++matches; }
+    }
+    if (matches != 1)
+    {
+      descriptor = {};
+      if (failure) failure->assign("cluster machine does not have one exact active local VM boundary"_ctv);
+      return false;
+    }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool registerLocalVMBoundary(const MothershipLocalVMBoundaryDescriptor& requested,
+                               MothershipLocalVMBoundaryDescriptor& recorded, bool& resumed,
+                               String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalVMBoundaryDescriptorValid(requested, failure) || requested.retired) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.vmBoundaryUUID);
+    if (db.read(localVMBoundariesColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipLocalVMBoundaryDescriptorValid(recorded) ||
+          !mothershipLocalVMBoundaryDescriptorEqual(recorded, requested))
+      { recorded = {}; if (failure) failure->assign("local VM boundary UUID conflicts with its immutable record"_ctv); return false; }
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    Vector<String> values = {};
+    if (!db.listValues(localVMBoundariesColumnFamily, values, failure)) return false;
+    for (const auto& value : values)
+    {
+      MothershipLocalVMBoundaryDescriptor prior = {};
+      if (!BitseryEngine::deserializeSafe(value, prior) || !mothershipLocalVMBoundaryDescriptorValid(prior))
+      { if (failure) failure->assign("local VM boundary registry contains a corrupt record"_ctv); return false; }
+      if (!prior.retired && prior.clusterUUID == requested.clusterUUID && prior.machineUUID == requested.machineUUID)
+      { if (failure) failure->assign("local cluster machine already has an active VM boundary"_ctv); return false; }
+    }
+    recorded = requested; auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localVMBoundariesColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool admitPhysicalClusterNetworkFault(const MothershipPhysicalClusterNetworkFaultRequest& requested,
+                                        const MothershipPhysicalFaultMachineObservation& sourceAdmission,
+                                        const MothershipPhysicalFaultMachineObservation& targetAdmission,
+                                        MothershipPhysicalClusterNetworkFaultRecord& recorded,
+                                        bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipPhysicalClusterNetworkFaultRequestValid(requested, failure)) return false;
+    if (!mothershipPhysicalFaultMachineObservationValid(sourceAdmission) ||
+        !mothershipPhysicalFaultMachineObservationValid(targetAdmission) ||
+        sourceAdmission.clusterUUID != requested.sourceClusterUUID ||
+        sourceAdmission.machineUUID != requested.sourceMachineUUID ||
+        targetAdmission.clusterUUID != requested.targetClusterUUID ||
+        targetAdmission.machineUUID != requested.targetMachineUUID)
+    { if (failure) failure->assign("network fault admission observations do not bind the exact request"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    MothershipPhysicalServiceTransitBoundary boundary = {};
+    if (!loadPhysicalServiceTransitBoundary(requested.boundaryUUID, boundary, failure) || boundary.closed ||
+        boundary.sourceClusterUUID != requested.sourceClusterUUID || boundary.targetClusterUUID != requested.targetClusterUUID ||
+        boundary.sourceMachineUUID != requested.sourceMachineUUID || boundary.targetMachineUUID != requested.targetMachineUUID)
+    { if (failure && failure->empty()) failure->assign("network fault does not bind an open exact physical transit boundary"_ctv); return false; }
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.operationUUID);
+    if (db.read(physicalNetworkFaultsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipPhysicalClusterNetworkFaultRecordValid(recorded) ||
+          !mothershipPhysicalClusterNetworkFaultReplayAdmissible(recorded.request, requested) ||
+          !mothershipPhysicalFaultMachineObservationEqual(recorded.sourceAdmission, sourceAdmission) ||
+          !mothershipPhysicalFaultMachineObservationEqual(recorded.targetAdmission, targetAdmission))
+      { recorded = {}; if (failure) failure->assign("network fault operation conflicts with its immutable request"_ctv); return false; }
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded.request = requested; recorded.sourceAdmission = sourceAdmission;
+    recorded.targetAdmission = targetAdmission; auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(physicalNetworkFaultsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool loadPhysicalClusterNetworkFault(uint128_t operationUUID,
+                                       MothershipPhysicalClusterNetworkFaultRecord& recorded,
+                                       String *failure = nullptr)
+  {
+    recorded = {};
+    if (operationUUID == 0) { if (failure) failure->assign("network fault operation UUID is required"_ctv); return false; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(physicalNetworkFaultsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipPhysicalClusterNetworkFaultRecordValid(recorded) || recorded.request.operationUUID != operationUUID)
+    { recorded = {}; if (failure) failure->assign("network fault record is corrupt or unsupported"_ctv); return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool recordPhysicalClusterNetworkFaultReceipt(const MothershipPhysicalClusterNetworkFaultRequest& request,
+                                                const MothershipPhysicalClusterNetworkFaultReceipt& receipt,
+                                                MothershipPhysicalClusterNetworkFaultRecord& recorded,
+                                                bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipPhysicalClusterNetworkFaultReceiptValid(request, receipt, failure)) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(request.operationUUID);
+    if (!db.read(physicalNetworkFaultsColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipPhysicalClusterNetworkFaultRecordValid(recorded) ||
+        !mothershipPhysicalClusterNetworkFaultRequestEqual(recorded.request, request) ||
+        !mothershipPhysicalFaultMachineObservationEqual(recorded.sourceAdmission, receipt.sourceBefore) ||
+        !mothershipPhysicalFaultMachineObservationEqual(recorded.targetAdmission, receipt.targetBefore))
+    { if (failure && failure->empty()) failure->assign("network fault receipt has no exact durable request"_ctv); return false; }
+    if (recorded.hasReceipt)
+    {
+      resumed = mothershipPhysicalFaultExactSerializedEqual(recorded.receipt, receipt);
+      if (!resumed && failure) failure->assign("network fault receipt conflicts with the durable receipt"_ctv);
+      return resumed;
+    }
+    recorded.hasReceipt = true; recorded.receipt = receipt; auto copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    return db.write(physicalNetworkFaultsColumnFamily, key, encoded, failure);
+  }
+
+  bool admitLocalVMMachineFault(const MothershipLocalVMMachineFaultRequest& requested,
+                                const MothershipPhysicalFaultMachineObservation& admission,
+                                MothershipLocalVMMachineFaultRecord& recorded,
+                                bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalVMMachineFaultRequestValid(requested, failure)) return false;
+    if (!mothershipPhysicalFaultMachineObservationValid(admission) ||
+        admission.clusterUUID != requested.clusterUUID || admission.machineUUID != requested.machineUUID ||
+        admission.stateSHA256 != requested.expectedBootSHA256)
+    { if (failure) failure->assign("local VM fault admission observation does not bind the exact request"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    MothershipLocalVMBoundaryDescriptor boundary = {};
+    if (!loadLocalVMBoundary(requested.vmBoundaryUUID, boundary, failure) || boundary.retired ||
+        boundary.clusterUUID != requested.clusterUUID || boundary.machineUUID != requested.machineUUID)
+    { if (failure && failure->empty()) failure->assign("local VM fault does not bind an active exact VM boundary"_ctv); return false; }
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.operationUUID);
+    if (db.read(localVMFaultsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipLocalVMMachineFaultRecordValid(recorded) ||
+          !mothershipLocalVMMachineFaultReplayAdmissible(recorded.request, requested) ||
+          !mothershipPhysicalFaultMachineObservationEqual(recorded.admission, admission))
+      { recorded = {}; if (failure) failure->assign("local VM fault operation conflicts with its immutable request"_ctv); return false; }
+      resumed = true; if (failure) failure->clear(); return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded.request = requested; recorded.admission = admission;
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localVMFaultsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool loadLocalVMMachineFault(uint128_t operationUUID, MothershipLocalVMMachineFaultRecord& recorded,
+                               String *failure = nullptr)
+  {
+    recorded = {};
+    if (operationUUID == 0) { if (failure) failure->assign("local VM fault operation UUID is required"_ctv); return false; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(localVMFaultsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipLocalVMMachineFaultRecordValid(recorded) || recorded.request.operationUUID != operationUUID)
+    { recorded = {}; if (failure) failure->assign("local VM fault record is corrupt or unsupported"_ctv); return false; }
+    if (failure) failure->clear(); return true;
+  }
+
+  bool recordLocalVMMachineFaultReceipt(const MothershipLocalVMMachineFaultRequest& request,
+                                        const MothershipLocalVMMachineFaultReceipt& receipt,
+                                        MothershipLocalVMMachineFaultRecord& recorded,
+                                        bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalVMMachineFaultReceiptValid(request, receipt, failure)) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(request.operationUUID);
+    if (!db.read(localVMFaultsColumnFamily, key, encoded, failure) ||
+        !BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipLocalVMMachineFaultRecordValid(recorded) ||
+        !mothershipLocalVMMachineFaultRequestEqual(recorded.request, request) ||
+        !mothershipPhysicalFaultMachineObservationEqual(recorded.admission, receipt.before))
+    { if (failure && failure->empty()) failure->assign("local VM fault receipt has no exact durable request"_ctv); return false; }
+    if (recorded.hasReceipt)
+    {
+      resumed = mothershipPhysicalFaultExactSerializedEqual(recorded.receipt, receipt);
+      if (!resumed && failure) failure->assign("local VM fault receipt conflicts with the durable receipt"_ctv);
+      return resumed;
+    }
+    recorded.hasReceipt = true; recorded.receipt = receipt; auto copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    return db.write(localVMFaultsColumnFamily, key, encoded, failure);
   }
 
   bool recordCousinRoute(const CousinRouteRecord& requested,

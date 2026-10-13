@@ -395,6 +395,14 @@ int main()
   invalidEndpoint.address = IPAddress("::1", true);
   ok &= expect(!clusterPairControlEndpointValid(invalidEndpoint),
                "pair_control_endpoint_rejects_loopback_or_nat_guessing_tuple");
+  const auto privateInitiator = endpoint(0x200, 0x703, "fd00:10::1", 4446);
+  const auto privateResponder = endpoint(0x300, 0x704, "fd00:20::1", 4447);
+  const auto globalResponder = endpoint(0x300, 0x704, "2001:db8:30::1", 4447);
+  ok &= expect(clusterPairControlEndpointNATCompatibleOutbound(privateInitiator, globalResponder) &&
+                   !clusterPairControlEndpointNATCompatibleOutbound(globalResponder, privateInitiator) &&
+                   !clusterPairControlEndpointNATCompatibleOutbound(privateInitiator, privateResponder) &&
+                   !clusterPairControlEndpointNATCompatibleOutbound(initiator, globalResponder),
+               "pair_control_nat_exception_requires_exact_non_global_to_global_endpoint_direction");
 
   ClusterPairRoot generated = {};
   generated.pairUUID = 0x100;

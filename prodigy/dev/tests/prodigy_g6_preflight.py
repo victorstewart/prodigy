@@ -6,6 +6,7 @@ connection nor invokes Mothership, a provider, or a runtime harness.
 """
 import argparse
 import datetime
+import ipaddress
 import json
 import re
 import sys
@@ -13,6 +14,7 @@ import sys
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+MACHINE_UUID = re.compile(r"^[0-9a-f]{32}$")
 SECRET_VALUE = re.compile(
     r"(?is)(-----BEGIN[^\n]*PRIVATE KEY|\bBearer\s+|\bAKIA[0-9A-Z]{16}\b|\bsk-[A-Za-z0-9_-]+|(?:api[_-]?key|access[_-]?token|token)\s*=)"
 )
@@ -20,13 +22,30 @@ SECRET_FIELD = re.compile(r"(?i)(api[_-]?key|access[_-]?token|private[_-]?key|se
 REQUIRED_LIFECYCLE = {"createCluster", "clusterReport", "removeCluster"}
 REQUIRED_RESIDUALS = {"instances", "vpcs", "blocks", "ips"}
 REQUIRED_FAULT_CASES = {"nominal", "target-master-crash", "target-cold-restart", "source-master-interruption-after-retirement-seal"}
-REQUIRED_ROW_OPERATIONS = {"createCluster", "clusterReport", "cousinRoute", "removeCluster"}
+REQUIRED_ROW_OPERATIONS = {
+    "createCluster", "clusterReport", "cousinRoute", "prepareProductionPair",
+    "productionPair", "removeCluster",
+}
+REQUIRED_TRANSIT_OPERATIONS = {"prepareProductionPair", "productionPair", "registerLocalVMBoundary"}
 REQUIRED_FAULT_OPERATIONS = {"faultRemoteCloudMachine", "faultLocalClusterMachine", "faultClusterNetwork"}
 REQUIRED_BOUNDARY_CHECKS = {
     "bidirectional-endpoint-reachability", "asymmetric-partition", "full-partition",
     "nat-directionality", "ipv4-route", "ipv6-route", "mtu-pmtu",
     "dns-ttl-cache", "tls-sni-client-identity", "service-discovery",
     "no-host-network-mutation",
+}
+BOUNDARY_OBSERVATION_METHODS = {
+    "bidirectional-endpoint-reachability": "tcp-connect-bidirectional",
+    "asymmetric-partition": "mothership-fault-and-tcp-observation",
+    "full-partition": "mothership-fault-and-tcp-observation",
+    "nat-directionality": "ingress-relay-reverse-connect",
+    "ipv4-route": "tcp-ipv4",
+    "ipv6-route": "cousin-ipv6-session",
+    "mtu-pmtu": "tcp-payload-path-mtu",
+    "dns-ttl-cache": "dns-ttl-cache-expiry",
+    "tls-sni-client-identity": "tls13-sni-mutual-identity",
+    "service-discovery": "prodigy-service-lookup",
+    "no-host-network-mutation": "host-network-before-after",
 }
 REQUIRED_PROTOCOLS = {"aegis-x25519-v1"}
 SUPPORTED_ARCHITECTURES = {"x86_64", "aarch64", "riscv64"}
@@ -84,6 +103,30 @@ def text(value, path):
 def exact_hash(value, path):
     if not isinstance(value, str) or not SHA256.fullmatch(value):
         fail(f"{path} must be a lower-case SHA-256")
+    return value
+
+
+def machine_uuid(value, path):
+    if not isinstance(value, str) or not MACHINE_UUID.fullmatch(value):
+        fail(f"{path} must be the canonical 32-character lower-case Mothership machine UUID")
+    return value
+
+
+def nonloopback_ip(value, path):
+    value = text(value, path)
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        fail(f"{path} must be a literal IP address")
+    if (address.version != 4 or address.is_unspecified or address.is_loopback or
+            address.is_multicast or address.is_link_local or value == "255.255.255.255"):
+        fail(f"{path} must be an exact non-loopback unicast IPv4 address")
+    return value
+
+
+def tcp_port(value, path):
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65_535:
+        fail(f"{path} must be an integer TCP/UDP port between 1 and 65535")
     return value
 
 
@@ -260,7 +303,7 @@ def validate(plan):
 
     operations = object_with_keys(
         plan.get("mothershipOperations"), "mothershipOperations",
-        {"owner", "lifecycle", "faults", "cleanup"},
+        {"owner", "lifecycle", "faults", "transit", "cleanup"},
     )
     if operations.get("owner") != "Mothership":
         fail("Mothership must own all lifecycle, fault, and cleanup operations")
@@ -268,9 +311,12 @@ def validate(plan):
     if lifecycle != REQUIRED_LIFECYCLE:
         fail("Mothership lifecycle operations must be exactly createCluster, clusterReport, and removeCluster")
     faults = string_set(operations.get("faults"), "mothershipOperations.faults")
+    transit = string_set(operations.get("transit"), "mothershipOperations.transit")
     cleanup_operations = string_set(operations.get("cleanup"), "mothershipOperations.cleanup")
     if faults != REQUIRED_FAULT_OPERATIONS:
         fail("Mothership faults must be exactly the remote machine, local machine, and network-boundary owners")
+    if transit != REQUIRED_TRANSIT_OPERATIONS:
+        fail("Mothership transit operations must be exactly the production-pair and local-VM boundary owners")
     if cleanup_operations != {"cousinRoute", "removeCluster"}:
         fail("Mothership cleanup must be exactly cousinRoute and removeCluster")
 
@@ -324,19 +370,21 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
     if len(row_evidence) != len(declared_kinds):
         fail("passing evidence requires one execution record for every physical row")
     observed_kinds = set()
+    observed_source_machines = set()
     expected_identities = {"commit": candidate["commit"], "prodigySHA256": candidate["binaries"]["prodigy"],
                            "mothershipSHA256": candidate["binaries"]["mothership"], "bundleSHA256": candidate["bundleSHA256"],
                            "applicationSHA256": candidate["applicationArtifact"]["sha256"],
                            "contractHeaderSHA256": candidate["applicationArtifact"]["discombobulator"]["contractHeaderSHA256"],
                            "buildReceiptSHA256": candidate["applicationArtifact"]["discombobulator"]["buildReceiptSHA256"]}
     declared_fault_operations = set(mothership_operations["faults"])
-    declared_operations = declared_fault_operations | set(mothership_operations["lifecycle"]) | set(mothership_operations["cleanup"])
+    declared_operations = (declared_fault_operations | set(mothership_operations["lifecycle"]) |
+                           set(mothership_operations["transit"]) | set(mothership_operations["cleanup"]))
     for index, row in enumerate(row_evidence):
         row = object_with_keys(
             row, f"execution.rows[{index}]",
             {"kind", "sourceCluster", "targetCluster", "startedAt", "completedAt",
-             "evidenceIdentities", "mothershipCommandReceipts", "faultCases",
-             "boundaryChecks", "routeObservation", "trafficObservation"},
+             "sourceMachineUUID", "evidenceIdentities", "mothershipCommandReceipts", "faultCases",
+             "boundaryChecks", "routeObservation", "trafficObservation", "ingressObservation"},
         )
         kind = text(row.get("kind"), f"execution.rows[{index}].kind")
         if kind not in declared_kinds or kind in observed_kinds:
@@ -348,6 +396,11 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
         row_started, row_completed = timestamp(row.get("startedAt"), f"execution.rows[{index}].startedAt"), timestamp(row.get("completedAt"), f"execution.rows[{index}].completedAt")
         if row_completed <= row_started or row_started < started or row_completed > completed:
             fail("execution row timestamps must be bounded by the execution interval")
+        source_machine = machine_uuid(
+            row.get("sourceMachineUUID"), f"execution.rows[{index}].sourceMachineUUID")
+        if source_machine in observed_source_machines:
+            fail("execution rows must bind distinct source machine UUIDs")
+        observed_source_machines.add(source_machine)
         identities = object_with_keys(
             row.get("evidenceIdentities"), f"execution.rows[{index}].evidenceIdentities",
             set(expected_identities),
@@ -356,18 +409,25 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
             fail("execution evidence identities must exactly bind the candidate")
         receipts = list_of(row.get("mothershipCommandReceipts"), f"execution.rows[{index}].mothershipCommandReceipts")
         operations = set()
+        receipt_hashes = {}
         for receipt_index, receipt in enumerate(receipts):
             receipt = object_with_keys(
                 receipt, f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}]",
                 {"operation", "sha256", "timestamp"},
             )
-            operations.add(text(receipt.get("operation"), f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}].operation"))
-            exact_hash(receipt.get("sha256"), f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}].sha256")
+            operation = text(receipt.get("operation"), f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}].operation")
+            if operation in operations:
+                fail("Mothership command receipts must not duplicate an operation within a row")
+            operations.add(operation)
+            receipt_hashes[operation] = exact_hash(
+                receipt.get("sha256"), f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}].sha256")
             observed_at = timestamp(receipt.get("timestamp"), f"execution.rows[{index}].mothershipCommandReceipts[{receipt_index}].timestamp")
             if observed_at < row_started or observed_at > row_completed:
                 fail("Mothership command receipt timestamp falls outside its row execution interval")
         if not REQUIRED_ROW_OPERATIONS.issubset(operations):
-            fail("each passing row requires Mothership create/report/route/remove receipts")
+            fail("each passing row requires Mothership create/report/route/production-pair/remove receipts")
+        if kind == "vm-isolated-lan-to-vultr" and "registerLocalVMBoundary" not in operations:
+            fail("the LAN row requires a Mothership local-VM boundary registration receipt")
         faults = list_of(row.get("faultCases"), f"execution.rows[{index}].faultCases")
         names = set()
         for fault_index, fault in enumerate(faults):
@@ -400,10 +460,12 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
 
         boundary_checks = list_of(row.get("boundaryChecks"), f"execution.rows[{index}].boundaryChecks")
         boundary_names = set()
+        boundary_observations = set()
         for check_index, check in enumerate(boundary_checks):
             check = object_with_keys(
                 check, f"execution.rows[{index}].boundaryChecks[{check_index}]",
-                {"name", "operation", "receiptSHA256", "timestamp"},
+                {"name", "operation", "receiptSHA256", "method", "observer",
+                 "observationSHA256", "passed", "timestamp"},
             )
             name = text(check.get("name"), f"execution.rows[{index}].boundaryChecks[{check_index}].name")
             if name in boundary_names:
@@ -413,7 +475,22 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
             expected_operation = "faultClusterNetwork" if name in {"asymmetric-partition", "full-partition"} else "clusterReport"
             if operation != expected_operation or operation not in declared_operations:
                 fail("physical boundary evidence must use its exact Mothership operation owner")
-            exact_hash(check.get("receiptSHA256"), f"execution.rows[{index}].boundaryChecks[{check_index}].receiptSHA256")
+            receipt_hash = exact_hash(
+                check.get("receiptSHA256"),
+                f"execution.rows[{index}].boundaryChecks[{check_index}].receiptSHA256")
+            expected_method = BOUNDARY_OBSERVATION_METHODS.get(name)
+            if check.get("method") != expected_method:
+                fail("physical boundary evidence must use its exact observation method")
+            if check.get("observer") != "read-only-physical-probe":
+                fail("physical boundary evidence must name the read-only physical observer")
+            observation_hash = exact_hash(
+                check.get("observationSHA256"),
+                f"execution.rows[{index}].boundaryChecks[{check_index}].observationSHA256")
+            if observation_hash == receipt_hash or observation_hash in boundary_observations:
+                fail("every physical boundary check requires a distinct observation, not a reused owner receipt")
+            boundary_observations.add(observation_hash)
+            if check.get("passed") is not True:
+                fail("physical boundary observation must explicitly pass")
             observed_at = timestamp(check.get("timestamp"), f"execution.rows[{index}].boundaryChecks[{check_index}].timestamp")
             if observed_at < row_started or observed_at > row_completed:
                 fail("physical boundary check timestamp falls outside its row execution interval")
@@ -449,6 +526,78 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
         if not (route_times["activeAt"] < zero_flows_at <= retired_at <= route_times["withdrawnAt"] <
                 route_times["staleReplayRejectedAt"] <= traffic_at):
             fail("route, drain, retirement, withdrawal, stale replay, and traffic evidence must be monotonic")
+
+        ingress = object_with_keys(
+            row.get("ingressObservation"), f"execution.rows[{index}].ingressObservation",
+            {"sourceMachineUUID", "ingressAddress", "ingressPort", "providerRelayReceiptSHA256",
+             "productionPairReceiptSHA256", "receivedAt", "requestHistorySHA256",
+             "clientDestinationObservations"},
+        )
+        if machine_uuid(ingress.get("sourceMachineUUID"), f"execution.rows[{index}].ingressObservation.sourceMachineUUID") != source_machine:
+            fail("ingress observation must bind the row's exact source machine UUID")
+        ingress_address = nonloopback_ip(
+            ingress.get("ingressAddress"), f"execution.rows[{index}].ingressObservation.ingressAddress")
+        ingress_port = tcp_port(
+            ingress.get("ingressPort"), f"execution.rows[{index}].ingressObservation.ingressPort")
+        relay_receipt = exact_hash(
+            ingress.get("providerRelayReceiptSHA256"),
+            f"execution.rows[{index}].ingressObservation.providerRelayReceiptSHA256")
+        if exact_hash(
+                ingress.get("productionPairReceiptSHA256"),
+                f"execution.rows[{index}].ingressObservation.productionPairReceiptSHA256") != receipt_hashes["productionPair"]:
+            fail("ingress observation must link to the row's admitted production-pair receipt")
+        ingress_history = exact_hash(
+            ingress.get("requestHistorySHA256"),
+            f"execution.rows[{index}].ingressObservation.requestHistorySHA256")
+        if ingress_history != traffic["requestHistorySHA256"]:
+            fail("ingress observation must bind the row traffic request-history hash")
+        ingress_at = timestamp(
+            ingress.get("receivedAt"), f"execution.rows[{index}].ingressObservation.receivedAt")
+        if not (route_times["activeAt"] <= ingress_at <= zero_flows_at):
+            fail("ingress receipt must be observed while the admitted route is active and before source drain")
+        destinations = list_of(
+            ingress.get("clientDestinationObservations"),
+            f"execution.rows[{index}].ingressObservation.clientDestinationObservations")
+        if not destinations:
+            fail("ingress observation requires at least one client destination observation")
+        client_machines = set()
+        for destination_index, destination in enumerate(destinations):
+            destination = object_with_keys(
+                destination,
+                f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}]",
+                {"clientMachineUUID", "destinationAddress", "destinationPort", "ingressReceiptSHA256",
+                 "requestHistorySHA256", "destinationObservationSHA256", "observedAt"},
+            )
+            client_machine = machine_uuid(
+                destination.get("clientMachineUUID"),
+                f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].clientMachineUUID")
+            if client_machine == source_machine or client_machine in client_machines:
+                fail("client destination observations must use distinct non-source machine UUIDs")
+            client_machines.add(client_machine)
+            if nonloopback_ip(
+                    destination.get("destinationAddress"),
+                    f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].destinationAddress") != ingress_address:
+                fail("client destination observation must target the admitted ingress address")
+            if tcp_port(
+                    destination.get("destinationPort"),
+                    f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].destinationPort") != ingress_port:
+                fail("client destination observation must target the admitted ingress port")
+            if exact_hash(
+                    destination.get("ingressReceiptSHA256"),
+                    f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].ingressReceiptSHA256") != relay_receipt:
+                fail("client destination observation must link to the provider/relay ingress receipt")
+            if exact_hash(
+                    destination.get("requestHistorySHA256"),
+                    f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].requestHistorySHA256") != ingress_history:
+                fail("client destination observation must link to the ingress request-history hash")
+            exact_hash(
+                destination.get("destinationObservationSHA256"),
+                f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].destinationObservationSHA256")
+            destination_at = timestamp(
+                destination.get("observedAt"),
+                f"execution.rows[{index}].ingressObservation.clientDestinationObservations[{destination_index}].observedAt")
+            if not (ingress_at <= destination_at <= zero_flows_at <= traffic_at):
+                fail("client destination observation must follow ingress receipt and precede drain completion")
     verified = timestamp(cleanup.get("verifiedAt"), "postCleanup.verifiedAt")
     if verified < completed:
         fail("post-cleanup verification must occur after execution")

@@ -1,0 +1,195 @@
+#include <prodigy/mothership/mothership.physical.fault.h>
+#include <services/debug.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
+class TestSuite {
+public:
+  int failed = 0;
+  void expect(bool condition, const char *name)
+  {
+    std::printf("%s: %s\n", condition ? "PASS" : "FAIL", name);
+    if (!condition) ++failed;
+  }
+};
+
+static String digest(char byte)
+{
+  String result = {};
+  for (uint32_t index = 0; index != 64; ++index) result.append(byte);
+  return result;
+}
+
+static MothershipPhysicalFaultMachineObservation observation(uint128_t cluster, uint128_t machine,
+                                                             uint64_t topology, char state)
+{
+  MothershipPhysicalFaultMachineObservation value = {};
+  value.clusterUUID = cluster; value.machineUUID = machine; value.topologyVersion = topology;
+  value.stateSHA256 = digest(state);
+  return value;
+}
+
+int main(void)
+{
+  TestSuite suite;
+  String failure = {};
+
+  auto sourceRoot = std::filesystem::path(__FILE__).parent_path().parent_path();
+  if (!std::filesystem::exists(sourceRoot / "mothership")) sourceRoot = sourceRoot.parent_path();
+  const auto mothershipSource = sourceRoot / "mothership" / "mothership.cpp";
+  std::ifstream sourceFile(mothershipSource);
+  const std::string source((std::istreambuf_iterator<char>(sourceFile)), std::istreambuf_iterator<char>());
+  suite.expect(source.find("exactUDPLinkNetdev") != std::string::npos &&
+                   source.find("exactUDPHubport") != std::string::npos &&
+                   source.find("hubport,id=clusterlan,hubid=0") != std::string::npos &&
+                   source.find("UDP cluster links are not contiguous") != std::string::npos,
+               "local_vm_boundary_contract_accepts_only_bounded_udp_hub_lan");
+  suite.expect(source.find("exactMulticastNetdev") != std::string::npos &&
+                   source.find("unapproved host-network QEMU backend") != std::string::npos,
+               "local_vm_boundary_contract_retains_legacy_lan_and_host_backend_rejection");
+
+  uint128_t verifiedVMUUID = 0;
+  suite.expect(mothershipParseVerifiedLocalVMIdentity(
+                   "prodigy-disposable-linux-v1\n"_ctv,
+                   "12345678-1234-4234-9234-123456789abc\n"_ctv, verifiedVMUUID) &&
+                   verifiedVMUUID == String::numberFromHexString<uint128_t>("12345678123442349234123456789abc"_ctv),
+               "local_vm_marker_binds_exact_qemu_dmi_uuid");
+  suite.expect(!mothershipParseVerifiedLocalVMIdentity(
+                   "prodigy-disposable-linux-v1\n"_ctv,
+                   "00000000-0000-0000-0000-000000000000\n"_ctv, verifiedVMUUID) && verifiedVMUUID == 0,
+               "local_vm_marker_rejects_zero_dmi_uuid");
+  suite.expect(!mothershipParseVerifiedLocalVMIdentity(
+                   "unverified\n"_ctv,
+                   "12345678-1234-4234-9234-123456789abc\n"_ctv, verifiedVMUUID),
+               "local_vm_marker_rejects_unverified_boundary");
+
+  MothershipPhysicalServiceTransitBoundary boundary = {};
+  boundary.boundaryUUID = 0x10; boundary.pairOperationUUID = 0x11;
+  boundary.routeUUID = 0x12; boundary.routeGeneration = 1;
+  boundary.sourceClusterUUID = 0x13; boundary.targetClusterUUID = 0x14;
+  boundary.sourceMachineUUID = 0x15; boundary.targetMachineUUID = 0x16;
+  boundary.sourceExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
+  boundary.sourceLocalVMBoundaryUUID = 0x17;
+  boundary.targetExecutorKind = MothershipPhysicalFaultExecutorKind::providerCloudVM;
+  boundary.targetCloudID = "cloud-instance-18"_ctv;
+  boundary.sourceAddress = "192.0.2.10"_ctv; boundary.targetAddress = "198.51.100.10"_ctv;
+  boundary.sourceTCPPort = 8080; boundary.targetTCPPort = 8080; boundary.pathMTU = 1500;
+  boundary.routeAuthorizationSHA256 = digest('1'); boundary.admissionReceiptSHA256 = digest('2');
+  boundary.admittedAtMs = 100;
+  suite.expect(mothershipPhysicalServiceTransitBoundaryValid(boundary, &failure) && failure.empty(),
+               "physical_boundary_requires_typed_local_or_cloud_vm_executors");
+  auto unsafeBoundary = boundary; unsafeBoundary.sourceLocalVMBoundaryUUID = 0;
+  suite.expect(!mothershipPhysicalServiceTransitBoundaryValid(unsafeBoundary, &failure),
+               "physical_boundary_rejects_unproven_local_execution");
+  unsafeBoundary = boundary; unsafeBoundary.targetCloudID.clear();
+  suite.expect(!mothershipPhysicalServiceTransitBoundaryValid(unsafeBoundary, &failure),
+               "physical_boundary_rejects_unproven_cloud_execution");
+
+  MothershipPhysicalClusterNetworkFaultRequest network = {};
+  network.operationUUID = 0x1001; network.boundaryUUID = 0x2001;
+  network.sourceClusterUUID = 0x3001; network.targetClusterUUID = 0x3002;
+  network.sourceMachineUUID = 0x4001; network.targetMachineUUID = 0x4002;
+  network.direction = MothershipPhysicalFaultDirection::sourceToTarget;
+  network.durationMilliseconds = 1000;
+  network.routeUUID = 0x5001; network.routeGeneration = 3;
+  network.routeAuthorizationSHA256 = digest('a');
+  network.sourceAddress = "192.0.2.40"_ctv; network.targetAddress = "198.51.100.40"_ctv;
+  network.sourceTopologyVersion = 7; network.targetTopologyVersion = 9;
+  suite.expect(mothershipPhysicalClusterNetworkFaultRequestValid(network, &failure) && failure.empty(),
+               "network_request_accepts_exact_bounded_authority");
+
+  MothershipPhysicalClusterNetworkFaultReceipt networkReceipt = {};
+  networkReceipt.operationUUID = network.operationUUID; networkReceipt.boundaryUUID = network.boundaryUUID;
+  networkReceipt.admission = network;
+  networkReceipt.sourceBefore = observation(network.sourceClusterUUID, network.sourceMachineUUID, 7, 'a');
+  networkReceipt.targetBefore = observation(network.targetClusterUUID, network.targetMachineUUID, 9, 'b');
+  networkReceipt.sourceAfter = networkReceipt.sourceBefore; networkReceipt.targetAfter = networkReceipt.targetBefore;
+  networkReceipt.sourceInstalledAtMonotonicMilliseconds = 100;
+  networkReceipt.sourceRestoredAtMonotonicMilliseconds = 1100;
+  networkReceipt.sourceRestored = true; networkReceipt.restored = true;
+  suite.expect(mothershipPhysicalClusterNetworkFaultReceiptValid(network, networkReceipt, &failure) && failure.empty(),
+               "network_receipt_requires_exact_pre_and_post_restoration");
+
+  MothershipPhysicalClusterNetworkFaultRequest retargeted = network;
+  retargeted.targetMachineUUID = 0x4003;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReplayAdmissible(network, retargeted),
+               "network_replay_rejects_retargeted_machine");
+  retargeted = network; retargeted.durationMilliseconds = 1001;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReplayAdmissible(network, retargeted),
+               "network_replay_rejects_duration_change");
+  retargeted = network; retargeted.targetAddress = "198.51.100.41"_ctv;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReplayAdmissible(network, retargeted),
+               "network_replay_rejects_reassigned_endpoint_address");
+  suite.expect(mothershipPhysicalClusterNetworkFaultReplayAdmissible(network, network),
+               "network_replay_allows_exact_retry_only");
+
+  MothershipPhysicalClusterNetworkFaultReceipt tamperedNetwork = networkReceipt;
+  tamperedNetwork.targetAfter.stateSHA256 = digest('c');
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReceiptValid(network, tamperedNetwork, &failure),
+               "network_receipt_rejects_unrestored_post_observation");
+  tamperedNetwork = networkReceipt; tamperedNetwork.boundaryUUID = 0x2002;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReceiptValid(network, tamperedNetwork, &failure),
+               "network_receipt_rejects_boundary_substitution");
+  tamperedNetwork = networkReceipt; tamperedNetwork.admission.targetTopologyVersion++;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReceiptValid(network, tamperedNetwork, &failure),
+               "network_receipt_rejects_changed_admission_proof");
+  tamperedNetwork = networkReceipt; tamperedNetwork.restored = false;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReceiptValid(network, tamperedNetwork, &failure),
+               "network_receipt_rejects_missing_cleanup_proof");
+  auto bidirectional = network; bidirectional.direction = MothershipPhysicalFaultDirection::both;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultReceiptValid(bidirectional, networkReceipt, &failure),
+               "bidirectional_network_receipt_requires_target_side_proof");
+  auto bidirectionalReceipt = networkReceipt;
+  bidirectionalReceipt.admission = bidirectional;
+  bidirectionalReceipt.targetInstalledAtMonotonicMilliseconds = 101;
+  bidirectionalReceipt.targetRestoredAtMonotonicMilliseconds = 1101;
+  bidirectionalReceipt.targetRestored = true;
+  suite.expect(mothershipPhysicalClusterNetworkFaultReceiptValid(bidirectional, bidirectionalReceipt, &failure),
+               "bidirectional_network_receipt_preserves_both_side_proofs");
+  retargeted = network; retargeted.sourceClusterUUID = retargeted.targetClusterUUID;
+  suite.expect(!mothershipPhysicalClusterNetworkFaultRequestValid(retargeted, &failure),
+               "network_request_rejects_same_cluster_boundary");
+
+  MothershipLocalVMMachineFaultRequest local = {};
+  local.operationUUID = 0x5001; local.vmBoundaryUUID = 0x6001;
+  local.clusterUUID = 0x7001; local.machineUUID = 0x8001;
+  local.action = MothershipLocalVMMachineFaultAction::coldReboot;
+  local.durationMilliseconds = 1000; local.expectedBootSHA256 = digest('d');
+  suite.expect(mothershipLocalVMMachineFaultRequestValid(local, &failure) && failure.empty(),
+               "local_vm_request_requires_typed_vm_boundary");
+
+  MothershipLocalVMMachineFaultReceipt localReceipt = {};
+  localReceipt.operationUUID = local.operationUUID; localReceipt.vmBoundaryUUID = local.vmBoundaryUUID;
+  localReceipt.before = observation(local.clusterUUID, local.machineUUID, 11, 'd');
+  localReceipt.after = observation(local.clusterUUID, local.machineUUID, 12, 'e');
+  localReceipt.restoredBootSHA256 = digest('e');
+  localReceipt.faultedAtMonotonicMilliseconds = 1000; localReceipt.restoredAtMonotonicMilliseconds = 2000;
+  localReceipt.restored = true;
+  suite.expect(mothershipLocalVMMachineFaultReceiptValid(local, localReceipt, &failure) && failure.empty(),
+               "local_vm_receipt_proves_new_boot_and_restoration");
+
+  MothershipLocalVMMachineFaultRequest localReplay = local;
+  localReplay.vmBoundaryUUID = 0x6002;
+  suite.expect(!mothershipLocalVMMachineFaultReplayAdmissible(local, localReplay),
+               "local_vm_replay_rejects_boundary_substitution");
+  suite.expect(mothershipLocalVMMachineFaultReplayAdmissible(local, local),
+               "local_vm_replay_allows_exact_retry_only");
+  MothershipLocalVMMachineFaultReceipt tamperedLocal = localReceipt;
+  tamperedLocal.restoredBootSHA256 = local.expectedBootSHA256;
+  suite.expect(!mothershipLocalVMMachineFaultReceiptValid(local, tamperedLocal, &failure),
+               "local_vm_receipt_rejects_unchanged_boot_identity");
+  tamperedLocal = localReceipt; tamperedLocal.after.machineUUID = 0x8002;
+  suite.expect(!mothershipLocalVMMachineFaultReceiptValid(local, tamperedLocal, &failure),
+               "local_vm_receipt_rejects_machine_substitution");
+  tamperedLocal = localReceipt; tamperedLocal.restoredAtMonotonicMilliseconds = 8000;
+  suite.expect(!mothershipLocalVMMachineFaultReceiptValid(local, tamperedLocal, &failure),
+               "local_vm_receipt_rejects_unbounded_recovery");
+  localReplay = local; localReplay.expectedBootSHA256 = "not-a-digest"_ctv;
+  suite.expect(!mothershipLocalVMMachineFaultRequestValid(localReplay, &failure),
+               "local_vm_request_rejects_untyped_boot_identity");
+
+  return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

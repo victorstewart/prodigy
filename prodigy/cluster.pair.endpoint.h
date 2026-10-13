@@ -47,6 +47,19 @@ static inline bool clusterPairControlEndpointGlobalUnicastIPv6(const ClusterPair
   return clusterPairControlEndpointValid(endpoint) && (endpoint.address.v6[0] & 0xe0u) == 0x20u;
 }
 
+// A non-global endpoint may be advertised as its durable roster identity while
+// reaching a globally-addressed peer through ordinary outbound NAT.  This is a
+// transport property derived from the exact, authenticated endpoint pair; it
+// is deliberately not mutable credential state or a relaxation of endpoint
+// identity.
+static inline bool clusterPairControlEndpointNATCompatibleOutbound(const ClusterPairControlEndpoint& initiator,
+                                                                    const ClusterPairControlEndpoint& responder)
+{
+  return clusterPairControlEndpointValid(initiator) && clusterPairControlEndpointValid(responder) &&
+      initiator.clusterUUID != responder.clusterUUID && !clusterPairControlEndpointGlobalUnicastIPv6(initiator) &&
+      clusterPairControlEndpointGlobalUnicastIPv6(responder);
+}
+
 static inline bool clusterPairControlEndpointEquals(const ClusterPairControlEndpoint& left,
                                                     const ClusterPairControlEndpoint& right)
 {

@@ -33944,8 +33944,18 @@ public:
       {
         ProdigyLocalClusterPairControlCredential credential;
         credential.pairUUID = row->pairUUID; credential.rootGeneration = row->rootGeneration; credential.keyEpoch = credentialEpoch;
-        credential.initiator = local->clusterUUID < remote.clusterUUID ? *local : remote;
-        credential.responder = local->clusterUUID < remote.clusterUUID ? remote : *local;
+        // A public responder is reachable by a private/behind-NAT initiator
+        // through ordinary outbound routing.  For every other topology retain
+        // the stable UUID ordering.  Both sides derive this from the immutable
+        // endpoint tuples, so the orientation remains claim- and key-bound.
+        if (clusterPairControlEndpointNATCompatibleOutbound(*local, remote)) {
+          credential.initiator = *local; credential.responder = remote;
+        } else if (clusterPairControlEndpointNATCompatibleOutbound(remote, *local)) {
+          credential.initiator = remote; credential.responder = *local;
+        } else {
+          credential.initiator = local->clusterUUID < remote.clusterUUID ? *local : remote;
+          credential.responder = local->clusterUUID < remote.clusterUUID ? remote : *local;
+        }
         ClusterPairControlResolver resolver;
         if (!clusterPairPrepareControlResolver(root, credential.initiator, credential.responder, *local, remote,
             credentialEpoch, "switchboard-pair-control-v1"_ctv, resolver)) return false;
