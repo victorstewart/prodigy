@@ -240,6 +240,34 @@ def qmp_quit(socket_path: str) -> None:
         client.sendall(b'{"execute":"quit"}' + bytes((13, 10)))
 
 
+def stop_persistent_qemu(record: dict[str, object], purpose: str) -> None:
+    """Stop only the exact sealed QEMU process, with bounded signal fallback."""
+    pid = int(record["qemuPID"])
+    starttime = str(record["qemuStarttime"])
+    command = record["qemuCommand"]
+    require(command_matches(pid, starttime, command), "exact QEMU process identity mismatch")
+    qmp_quit(str(record["qmpSocket"]))
+    for _ in range(100):
+        if proc_starttime(pid) is None:
+            return
+        time.sleep(.1)
+    require(command_matches(pid, starttime, command),
+            f"exact QEMU process identity changed during {purpose}")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(100):
+        if proc_starttime(pid) is None:
+            return
+        time.sleep(.1)
+    require(command_matches(pid, starttime, command),
+            f"exact QEMU process identity changed during {purpose}")
+    os.kill(pid, signal.SIGKILL)
+    for _ in range(100):
+        if proc_starttime(pid) is None:
+            return
+        time.sleep(.1)
+    require(proc_starttime(pid) is None, f"QEMU did not exit during {purpose}")
+
+
 def qemu_pidfile(command: list[str]) -> Path:
     require("-pidfile" in command, "persistent QEMU command has no pidfile")
     index = command.index("-pidfile")
@@ -350,11 +378,7 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
                      "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000, "completed": False}
             record["lastColdReboot"] = prior; write_persistent_state(state_path, record)
         if command_matches(pid, record["qemuStarttime"], command):
-            qmp_quit(record["qmpSocket"])
-        for _ in range(100):
-            if proc_starttime(pid) is None: break
-            time.sleep(.1)
-        require(proc_starttime(pid) is None, "QEMU did not exit for cold reboot")
+            stop_persistent_qemu(record, "cold reboot")
         replacement_pid = None
         pidfile = qemu_pidfile(command)
         if pidfile.is_file():
@@ -379,11 +403,7 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
         write_persistent_state(state_path, record); print(json.dumps(receipt, sort_keys=True)); return 0
     if operation == "remove":
         if command_matches(pid, record["qemuStarttime"], command):
-            qmp_quit(record["qmpSocket"])
-            for _ in range(100):
-                if proc_starttime(pid) is None: break
-                time.sleep(.1)
-            require(proc_starttime(pid) is None, "QEMU did not exit during exact cleanup")
+            stop_persistent_qemu(record, "exact cleanup")
         elif proc_starttime(pid) is not None: raise BoundaryError("exact QEMU process identity mismatch")
         for owned in (Path(record["overlay"]), Path(record["ovmfVars"]), Path(record["qmpSocket"])): owned.unlink(missing_ok=True)
         state_path.unlink(missing_ok=True); return 0

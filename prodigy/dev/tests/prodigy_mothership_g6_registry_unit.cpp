@@ -119,6 +119,70 @@ int main()
     MothershipClusterRegistry registry(path);
     CousinRouteRecord storedRoute = {}; CousinRouteApplyReceipt storedReceipt = {};
     bool resumed = false;
+
+    MothershipLocalMembershipCleanupRecord cleanupIntent = {};
+    cleanupIntent.clusterUUID = 0xa01;
+    cleanupIntent.desiredSpecSHA256 = digest('a');
+    MothershipLocalMembershipCleanupMachine cleanupMachine = {};
+    cleanupMachine.machine.source = MothershipClusterMachineSource::adopted;
+    cleanupMachine.machine.backing = ClusterMachineBacking::owned;
+    cleanupMachine.machine.kind = MachineConfig::MachineKind::vm;
+    cleanupMachine.machine.lifetime = MachineLifetime::owned;
+    cleanupMachine.machine.isBrain = true;
+    cleanupMachine.machine.ssh.address = "10.66.6.2"_ctv;
+    cleanupMachine.machine.ssh.user = "root"_ctv;
+    cleanupMachine.machine.ssh.port = 22;
+    cleanupMachine.machine.uuid = 0xa02;
+    cleanupMachine.machine.rackUUID = 17;
+    cleanupIntent.machines.push_back(cleanupMachine);
+    cleanupMachine.machine.ssh.address = "10.66.6.3"_ctv;
+    cleanupMachine.machine.uuid = 0xa03;
+    cleanupMachine.machine.rackUUID = 19;
+    cleanupIntent.machines.push_back(cleanupMachine);
+    MothershipLocalMembershipCleanupRecord storedCleanup = {};
+    assert(registry.admitLocalMembershipCleanup(
+        cleanupIntent, storedCleanup, resumed, &failure) && !resumed);
+    assert(storedCleanup.machines.size() == 2 &&
+           storedCleanup.machines[0].machine.uuid == 0xa02 &&
+           storedCleanup.machines[0].machine.rackUUID == 17 &&
+           storedCleanup.machines[1].machine.uuid == 0xa03 &&
+           storedCleanup.machines[1].machine.rackUUID == 19);
+    assert(registry.admitLocalMembershipCleanup(
+        cleanupIntent, storedCleanup, resumed, &failure) && resumed);
+    auto conflictingCleanup = cleanupIntent;
+    conflictingCleanup.desiredSpecSHA256 = digest('b');
+    assert(!registry.admitLocalMembershipCleanup(
+        conflictingCleanup, storedCleanup, resumed, &failure));
+    conflictingCleanup = cleanupIntent;
+    conflictingCleanup.machines[1].machine.uuid++;
+    assert(!registry.admitLocalMembershipCleanup(
+        conflictingCleanup, storedCleanup, resumed, &failure));
+    assert(registry.commitLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256,
+        storedCleanup, resumed, &failure) && !resumed);
+    assert(registry.commitLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256,
+        storedCleanup, resumed, &failure) && resumed);
+    assert(!registry.clearCompletedLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, &failure));
+    assert(registry.completeLocalMembershipCleanupMachine(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, 0,
+        storedCleanup, resumed, &failure) && !resumed);
+    assert(storedCleanup.machines[0].cleaned && !storedCleanup.machines[1].cleaned);
+    assert(registry.completeLocalMembershipCleanupMachine(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, 0,
+        storedCleanup, resumed, &failure) && resumed);
+    assert(!registry.clearCompletedLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, &failure));
+    assert(registry.completeLocalMembershipCleanupMachine(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, 1,
+        storedCleanup, resumed, &failure) && !resumed);
+    assert(registry.clearCompletedLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, cleanupIntent.desiredSpecSHA256, &failure));
+    assert(!registry.loadLocalMembershipCleanup(
+        cleanupIntent.clusterUUID, storedCleanup, &failure) &&
+        failure.equal("record not found"_ctv));
+
     assert(registry.recordCousinRoute(intent.route, storedRoute, resumed, &failure) && !resumed);
     assert(registry.recordCousinRouteApplyReceipt(intent.sourceRouteReceipt, storedReceipt, resumed, &failure));
     assert(registry.recordCousinRouteApplyReceipt(intent.destinationRouteReceipt, storedReceipt, resumed, &failure));

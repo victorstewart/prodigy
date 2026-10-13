@@ -463,6 +463,76 @@ static void serialize(S&& serializer, MothershipClusterPairEnrollmentIntent& int
   }
 }
 
+class MothershipLocalMembershipCleanupMachine {
+public:
+  MothershipProdigyClusterMachine machine = {};
+  bool cleaned = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalMembershipCleanupMachine& entry)
+{
+  // MothershipProdigyClusterMachine deliberately omits the adopted UUID and
+  // rack from its ordinary wire shape.  A cleanup journal must retain both:
+  // they are part of the exact machine identity that crossed the Brain
+  // membership boundary.
+  serializer.object(entry.machine);
+  serializer.value16b(entry.machine.uuid);
+  serializer.value4b(entry.machine.rackUUID);
+  serializer.value1b(entry.cleaned);
+}
+
+class MothershipLocalMembershipCleanupRecord {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t clusterUUID = 0;
+  String desiredSpecSHA256 = {};
+  bool membershipCommitted = false;
+  Vector<MothershipLocalMembershipCleanupMachine> machines = {};
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalMembershipCleanupRecord& record)
+{
+  serializer.value4b(record.protocolVersion); serializer.value16b(record.clusterUUID);
+  serializer.text1b(record.desiredSpecSHA256, 64); serializer.value1b(record.membershipCommitted);
+  serializer.object(record.machines);
+}
+
+static inline bool mothershipLocalMembershipCleanupRecordValid(
+    const MothershipLocalMembershipCleanupRecord& record)
+{
+  if (record.protocolVersion != MothershipLocalMembershipCleanupRecord::version ||
+      record.clusterUUID == 0 || !prodigyIsSHA256HexDigest(record.desiredSpecSHA256) ||
+      record.machines.empty()) return false;
+  for (uint32_t index = 0; index < record.machines.size(); ++index)
+  {
+    const auto& entry = record.machines[index];
+    if (entry.machine.source != MothershipClusterMachineSource::adopted ||
+        entry.machine.backing != ClusterMachineBacking::owned || entry.machine.uuid == 0 ||
+        entry.machine.ssh.address.empty() || entry.machine.ssh.user.empty()) return false;
+    for (uint32_t other = index + 1; other < record.machines.size(); ++other)
+      if (entry.machine.uuid == record.machines[other].machine.uuid) return false;
+  }
+  return true;
+}
+
+static inline bool mothershipLocalMembershipCleanupIntentEqual(
+    MothershipLocalMembershipCleanupRecord left,
+    MothershipLocalMembershipCleanupRecord right)
+{
+  if (!mothershipLocalMembershipCleanupRecordValid(left) ||
+      !mothershipLocalMembershipCleanupRecordValid(right) ||
+      left.clusterUUID != right.clusterUUID || left.desiredSpecSHA256 != right.desiredSpecSHA256 ||
+      left.machines.size() != right.machines.size()) return false;
+  left.membershipCommitted = right.membershipCommitted = false;
+  for (auto& entry : left.machines) entry.cleaned = false;
+  for (auto& entry : right.machines) entry.cleaned = false;
+  String leftBytes = {}, rightBytes = {};
+  BitseryEngine::serialize(leftBytes, left); BitseryEngine::serialize(rightBytes, right);
+  return leftBytes == rightBytes;
+}
+
 class MothershipClusterRegistry {
 private:
 
@@ -480,6 +550,7 @@ private:
   constexpr static auto physicalNetworkFaultsColumnFamily = "physical_network_faults"_ctv;
   constexpr static auto localVMBoundariesColumnFamily = "local_vm_boundaries"_ctv;
   constexpr static auto localVMFaultsColumnFamily = "local_vm_faults"_ctv;
+  constexpr static auto localMembershipCleanupColumnFamily = "local_membership_cleanup"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
@@ -2696,6 +2767,121 @@ public:
   const String& path(void)
   {
     return db.path();
+  }
+
+  bool loadLocalMembershipCleanup(uint128_t clusterUUID, MothershipLocalMembershipCleanupRecord& record, String *failure = nullptr)
+  {
+    record = {}; String key = {}, encoded = {}; key.assignItoh(clusterUUID);
+    if (!db.read(localMembershipCleanupColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, record) ||
+        !mothershipLocalMembershipCleanupRecordValid(record) || record.clusterUUID != clusterUUID)
+    {
+      record = {};
+      if (failure) failure->assign("local membership cleanup record is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitLocalMembershipCleanup(const MothershipLocalMembershipCleanupRecord& requested,
+                                   MothershipLocalMembershipCleanupRecord& recorded,
+                                   bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalMembershipCleanupRecordValid(requested) || requested.membershipCommitted)
+    {
+      if (failure) failure->assign("local membership cleanup admission is invalid"_ctv);
+      return false;
+    }
+    for (const auto& entry : requested.machines) if (entry.cleaned)
+    {
+      if (failure) failure->assign("local membership cleanup admission cannot start completed"_ctv);
+      return false;
+    }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.clusterUUID);
+    if (db.read(localMembershipCleanupColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipLocalMembershipCleanupRecordValid(recorded) ||
+          !mothershipLocalMembershipCleanupIntentEqual(recorded, requested))
+      {
+        recorded = {};
+        if (failure) failure->assign("local membership cleanup conflicts with the open operation"_ctv);
+        return false;
+      }
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv))
+    { if (failure) *failure = readFailure; return false; }
+    recorded = requested;
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localMembershipCleanupColumnFamily, key, encoded, failure))
+    { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool commitLocalMembershipCleanup(uint128_t clusterUUID, const String& desiredSpecSHA256,
+                                    MothershipLocalMembershipCleanupRecord& recorded,
+                                    bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) ||
+        !loadLocalMembershipCleanup(clusterUUID, recorded, failure)) return false;
+    if (recorded.desiredSpecSHA256 != desiredSpecSHA256)
+    { if (failure) failure->assign("local membership cleanup desired specification conflicts"_ctv); return false; }
+    if (recorded.membershipCommitted)
+    { resumed = true; if (failure) failure->clear(); return true; }
+    recorded.membershipCommitted = true;
+    String key = {}, encoded = {}; key.assignItoh(clusterUUID);
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localMembershipCleanupColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool completeLocalMembershipCleanupMachine(uint128_t clusterUUID, const String& desiredSpecSHA256,
+                                             uint32_t machineIndex,
+                                             MothershipLocalMembershipCleanupRecord& recorded,
+                                             bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) ||
+        !loadLocalMembershipCleanup(clusterUUID, recorded, failure)) return false;
+    if (recorded.desiredSpecSHA256 != desiredSpecSHA256 || !recorded.membershipCommitted ||
+        machineIndex >= recorded.machines.size())
+    { if (failure) failure->assign("local membership cleanup progress conflicts"_ctv); return false; }
+    if (recorded.machines[machineIndex].cleaned)
+    { resumed = true; if (failure) failure->clear(); return true; }
+    recorded.machines[machineIndex].cleaned = true;
+    String key = {}, encoded = {}; key.assignItoh(clusterUUID);
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localMembershipCleanupColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool clearCompletedLocalMembershipCleanup(uint128_t clusterUUID,
+                                            const String& desiredSpecSHA256,
+                                            String *failure = nullptr)
+  {
+    G6OperationLock lock;
+    MothershipLocalMembershipCleanupRecord record = {};
+    if (!lockG6Operations(lock, failure) ||
+        !loadLocalMembershipCleanup(clusterUUID, record, failure)) return false;
+    if (record.desiredSpecSHA256 != desiredSpecSHA256 || !record.membershipCommitted)
+    { if (failure) failure->assign("local membership cleanup completion conflicts"_ctv); return false; }
+    for (const auto& entry : record.machines) if (!entry.cleaned)
+    { if (failure) failure->assign("local membership cleanup is incomplete"_ctv); return false; }
+    String key = {}; key.assignItoh(clusterUUID);
+    return db.remove(localMembershipCleanupColumnFamily, key, failure);
   }
 
   static bool testPairBoundaryIdentityMatches(MothershipTestPairBoundaryRecord lhs,

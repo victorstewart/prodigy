@@ -8888,6 +8888,78 @@ private:
     return prodigyRunLocalShellCommand("systemctl stop prodigy || true"_ctv, &failure);
   }
 
+  bool localMembershipDesiredSpecDigest(const MothershipProdigyCluster& desiredCluster,
+                                        String& digest, String& failure)
+  {
+    // The ordinary machine serializer intentionally omits adopted UUID/rack
+    // fields, while topology and refresh data are observations rather than
+    // desired state.  Hash the storage record shape with those identities
+    // restored and observations removed so an exact retry remains stable
+    // across the Brain commit and registry persistence boundary.
+    MothershipProdigyClusterRecordV5 record = {};
+    record.cluster = desiredCluster;
+    record.cluster.topology = {};
+    record.cluster.lastRefreshMs = 0;
+    record.cluster.lastRefreshFailure.clear();
+    record.internalTransportProfile = desiredCluster.internalTransportProfile;
+    for (const auto& machine : desiredCluster.machines)
+    {
+      record.adoptedMachineUUIDs.push_back(machine.uuid);
+      record.adoptedMachineRackUUIDs.push_back(machine.rackUUID);
+    }
+    String encoded = {};
+    BitseryEngine::serialize(encoded, record);
+    return prodigyComputeSHA256Hex(encoded, digest, &failure);
+  }
+
+  bool drainCommittedLocalMembershipCleanup(
+      const MothershipProdigyCluster& cluster,
+      MothershipLocalMembershipCleanupRecord pending,
+      String& failure)
+  {
+    if (!pending.membershipCommitted)
+    {
+      failure.assign("local membership cleanup is not committed"_ctv);
+      return false;
+    }
+    for (uint32_t index = 0; index < pending.machines.size(); ++index)
+    {
+      if (pending.machines[index].cleaned) continue;
+      if (!stopAndWipeRemoteProdigyInstance(cluster, pending.machines[index].machine, failure))
+        return false;
+      bool resumed = false;
+      auto registry = openClusterRegistry();
+      if (!registry.completeLocalMembershipCleanupMachine(
+              cluster.clusterUUID, pending.desiredSpecSHA256, index,
+              pending, resumed, &failure)) return false;
+    }
+    auto registry = openClusterRegistry();
+    return registry.clearCompletedLocalMembershipCleanup(
+        cluster.clusterUUID, pending.desiredSpecSHA256, &failure);
+  }
+
+  bool finishLocalMembershipCleanupAfterClusterRemoval(
+      const MothershipProdigyCluster& cluster, String& failure)
+  {
+    MothershipLocalMembershipCleanupRecord pending = {};
+    String pendingFailure = {};
+    auto registry = openClusterRegistry();
+    if (!registry.loadLocalMembershipCleanup(cluster.clusterUUID, pending, &pendingFailure))
+    {
+      if (pendingFailure.equal("record not found"_ctv)) return true;
+      failure = pendingFailure;
+      return false;
+    }
+    if (!pending.membershipCommitted)
+    {
+      bool resumed = false;
+      if (!registry.commitLocalMembershipCleanup(
+              cluster.clusterUUID, pending.desiredSpecSHA256,
+              pending, resumed, &failure)) return false;
+    }
+    return drainCommittedLocalMembershipCleanup(cluster, pending, failure);
+  }
+
   bool reconcileClusterToDesiredSpec(
       const MothershipProdigyCluster& controlCluster,
       MothershipProdigyCluster& desiredCluster,
@@ -8916,6 +8988,29 @@ private:
     {
       failure.assign("cluster did not return topology"_ctv);
       return false;
+    }
+
+    // A membership removal crosses the Brain and remote-host boundaries.  Its
+    // exact adopted-machine inventory is admitted before the Brain mutation,
+    // committed after Brain success, and retained until the desired cluster
+    // record is durable and each remote wipe is checkpointed.
+    String desiredDigest = {};
+    bool hasPendingLocalCleanup = false;
+    MothershipLocalMembershipCleanupRecord pendingLocalCleanup = {};
+    if (desiredCluster.deploymentMode == MothershipClusterDeploymentMode::local)
+    {
+      if (!localMembershipDesiredSpecDigest(desiredCluster, desiredDigest, failure)) return false;
+      String pendingFailure = {};
+      auto registry = openClusterRegistry();
+      hasPendingLocalCleanup = registry.loadLocalMembershipCleanup(
+          controlCluster.clusterUUID, pendingLocalCleanup, &pendingFailure);
+      if (hasPendingLocalCleanup && pendingLocalCleanup.desiredSpecSHA256 != desiredDigest)
+      {
+        failure.assign("local membership cleanup conflicts with the requested desired specification"_ctv);
+        return false;
+      }
+      if (!hasPendingLocalCleanup && !pendingFailure.equal("record not found"_ctv))
+      { failure = pendingFailure; return false; }
     }
 
     if (desiredCluster.deploymentMode == MothershipClusterDeploymentMode::test)
@@ -8986,6 +9081,14 @@ private:
     finalState = currentState;
     if (changed == false)
     {
+      if (hasPendingLocalCleanup && !pendingLocalCleanup.membershipCommitted)
+      {
+        bool resumed = false;
+        auto registry = openClusterRegistry();
+        if (!registry.commitLocalMembershipCleanup(
+                controlCluster.clusterUUID, desiredDigest,
+                pendingLocalCleanup, resumed, &failure)) return false;
+      }
       desiredCluster.topology = currentState.topology;
       return true;
     }
@@ -9001,6 +9104,30 @@ private:
 
       request.readyMachines[0] = localReadyMachine;
       bootstrappedLocalMachine = true;
+    }
+
+    if (desiredCluster.deploymentMode == MothershipClusterDeploymentMode::local && !request.removedMachines.empty())
+    {
+      MothershipLocalMembershipCleanupRecord admitted = {};
+      admitted.clusterUUID = controlCluster.clusterUUID; admitted.desiredSpecSHA256 = desiredDigest;
+      for (const ClusterMachine& removed : request.removedMachines)
+        if (removed.source == ClusterMachineSource::adopted && removed.backing == ClusterMachineBacking::owned &&
+            (!localMachineKnown || !removed.sameIdentityAs(localMachine)))
+        {
+          MothershipLocalMembershipCleanupMachine entry = {};
+          mothershipPopulateRemoveMachineFromTopology(removed, entry.machine);
+          entry.machine.uuid = removed.uuid;
+          entry.machine.rackUUID = removed.rackUUID;
+          admitted.machines.push_back(std::move(entry));
+        }
+      if (!admitted.machines.empty())
+      {
+        bool resumed = false;
+        auto registry = openClusterRegistry();
+        if (!registry.admitLocalMembershipCleanup(
+                admitted, pendingLocalCleanup, resumed, &failure)) return false;
+        hasPendingLocalCleanup = true;
+      }
     }
 
     if (requestAddMachines(request, finalState, failure) == false)
@@ -9041,6 +9168,15 @@ private:
       {
         basics_log("cluster mutation local stop warning=%s\n", stopFailure.c_str());
       }
+    }
+
+    if (hasPendingLocalCleanup)
+    {
+      bool resumed = false;
+      auto registry = openClusterRegistry();
+      if (!registry.commitLocalMembershipCleanup(
+              controlCluster.clusterUUID, desiredDigest,
+              pendingLocalCleanup, resumed, &failure)) return false;
     }
 
     desiredCluster.topology = finalState.topology;
@@ -11373,6 +11509,20 @@ private:
       {
         return false;
       }
+    }
+
+    if (normalizedDesiredCluster.deploymentMode == MothershipClusterDeploymentMode::local)
+    {
+      MothershipLocalMembershipCleanupRecord pending = {};
+      String pendingFailure = {};
+      auto registry = openClusterRegistry();
+      if (registry.loadLocalMembershipCleanup(controlCluster.clusterUUID, pending, &pendingFailure))
+      {
+        if (!drainCommittedLocalMembershipCleanup(
+                normalizedDesiredCluster, pending, failure)) return false;
+      }
+      else if (!pendingFailure.equal("record not found"_ctv))
+      { failure = pendingFailure; return false; }
     }
 
     desiredCluster = normalizedDesiredCluster;
@@ -23577,6 +23727,12 @@ private:
         basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 dnsTeardownCompleted=%u wipedAdoptedMachines=%u failure=%s\n", name.c_str(), unsigned(summary.dnsTeardownCompleted), unsigned(summary.wipedAdoptedMachines), failure.c_str());
         exit(EXIT_FAILURE);
       }
+      if (!finishLocalMembershipCleanupAfterClusterRemoval(cluster, failure))
+      {
+        basics_log("removeCluster success=0 removed=0 identity=%s offlineDNSRecovery=1 failure=%s\n",
+                   name.c_str(), failure.c_str());
+        exit(EXIT_FAILURE);
+      }
       MothershipClusterRegistry clusterRegistry = openClusterRegistry();
       if (clusterRegistry.removeClusterByIdentity(name, &failure) == false)
       {
@@ -23593,6 +23749,13 @@ private:
     {
       basics_log("removeCluster success=0 removed=0 identity=%s dnsTeardownCompleted=%u resumedAfterDNS=%u failure=%s\n",
                  name.c_str(), unsigned(summary.dnsTeardownCompleted), unsigned(resumeAfterDNS), (failure.size() ? failure.c_str() : ""));
+      exit(EXIT_FAILURE);
+    }
+
+    if (!finishLocalMembershipCleanupAfterClusterRemoval(cluster, failure))
+    {
+      basics_log("removeCluster success=0 removed=0 identity=%s failure=%s\n",
+                 name.c_str(), failure.c_str());
       exit(EXIT_FAILURE);
     }
 

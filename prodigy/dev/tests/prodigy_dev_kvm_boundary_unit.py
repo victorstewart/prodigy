@@ -269,6 +269,33 @@ class KvmBoundaryUnit(unittest.TestCase):
             root = Path(directory); root.chmod(0o700)
             self.assertEqual(KVM.lifecycle_main(["remove", "--state", str(root / "absent"), "--task-id", "g6-local"]), 0)
 
+    def test_persistent_stop_falls_back_to_exact_identity_checked_signals(self):
+        record = {"qemuPID": 42, "qemuStarttime": "99", "qemuCommand": ["qemu", "-accel", "kvm"],
+                  "qmpSocket": "/private/qmp"}
+        observations = iter(["99"] * 101 + ["99"] * 101 + [None])
+        with mock.patch.object(KVM, "command_matches", return_value=True) as identity, \
+             mock.patch.object(KVM, "qmp_quit") as qmp, \
+             mock.patch.object(KVM, "proc_starttime", side_effect=lambda _pid: next(observations)), \
+             mock.patch.object(KVM.time, "sleep"), \
+             mock.patch.object(KVM.os, "kill") as kill:
+            KVM.stop_persistent_qemu(record, "exact cleanup")
+        qmp.assert_called_once_with("/private/qmp")
+        self.assertEqual([call.args for call in kill.call_args_list],
+                         [(42, KVM.signal.SIGTERM), (42, KVM.signal.SIGKILL)])
+        self.assertEqual(identity.call_count, 3)
+
+    def test_persistent_stop_never_signals_after_identity_change(self):
+        record = {"qemuPID": 42, "qemuStarttime": "99", "qemuCommand": ["qemu", "-accel", "kvm"],
+                  "qmpSocket": "/private/qmp"}
+        with mock.patch.object(KVM, "command_matches", side_effect=[True, False]), \
+             mock.patch.object(KVM, "qmp_quit"), \
+             mock.patch.object(KVM, "proc_starttime", return_value="99"), \
+             mock.patch.object(KVM.time, "sleep"), \
+             mock.patch.object(KVM.os, "kill") as kill, \
+             self.assertRaisesRegex(KVM.BoundaryError, "identity changed"):
+            KVM.stop_persistent_qemu(record, "exact cleanup")
+        kill.assert_not_called()
+
     def test_cold_reboot_receipt_is_exact_retry_identity(self):
         record = {"lastColdReboot": {"operationID": "1" * 32, "beforePID": 4, "beforeStarttime": "8",
                   "afterPID": 5, "afterStarttime": "9", "startedAtMonotonicMs": 10,

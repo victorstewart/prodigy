@@ -595,6 +595,7 @@ add_executable(prodigy_quic_wormhole_probe_container ${CMAKE_CURRENT_SOURCE_DIR}
 add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/wormhole_matrix_probe_container.cpp)
 add_executable(prodigy_resumption_readiness_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/resumption_readiness_probe_container.cpp)
 add_executable(prodigy_public_tls_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/public_tls_probe_container.cpp)
+add_executable(prodigy_g6_physical_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
    prodigy_task_probe_container
@@ -611,6 +612,7 @@ set(
    prodigy_wormhole_matrix_probe_container
    prodigy_resumption_readiness_probe_container
    prodigy_public_tls_probe_container
+   prodigy_g6_physical_probe_container
 )
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
@@ -982,6 +984,8 @@ target_link_libraries(prodigy_sdk_c_selftest PRIVATE Prodigy::SdkC)
 target_link_libraries(prodigy_sdk_cpp_unit PRIVATE Prodigy::SdkCppOpinionated)
 target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoquic::picoquic)
 target_link_libraries(prodigy_public_tls_probe_container PRIVATE openssl::ssl openssl::crypto)
+target_link_libraries(prodigy_g6_physical_probe_container PRIVATE openssl::ssl openssl::crypto)
+target_compile_options(prodigy_g6_physical_probe_container PRIVATE -O2)
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
 list(REMOVE_ITEM PRODIGY_PTHREAD_TARGETS prodigy mothership prodigy_sdk_cpp_unit)
@@ -1568,6 +1572,12 @@ if (PROJECT_ENABLE_TESTS)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_kvm_boundary_unit.py
    )
    set_tests_properties(prodigy_dev_kvm_boundary_unit PROPERTIES TIMEOUT 30)
+
+   add_test(
+      NAME prodigy_g6_physical_observe_unit
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_observe_unit.py
+   )
+   set_tests_properties(prodigy_g6_physical_observe_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_mothership_local_vm_boundary_contract
