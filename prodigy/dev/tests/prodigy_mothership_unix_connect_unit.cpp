@@ -1414,6 +1414,60 @@ int main(void)
           suite.expect(echoed && echoFailure.size() == 0, "remote_ssh_unix_streamlocal_round_trip_after_fallback");
         }
 
+        // Local clusters keep the local Unix socket as their preferred control
+        // path, but must reach an adopted remote Brain after local mastership
+        // moves. The fixture shares one filesystem with sshd, so use the
+        // test-only local-connect failure hook to model that remote boundary.
+        MothershipProdigyCluster localMasterMovedCluster = {};
+        localMasterMovedCluster.name.assign("local-unix-then-remote-ssh-fallback"_ctv);
+        localMasterMovedCluster.deploymentMode = MothershipClusterDeploymentMode::local;
+        localMasterMovedCluster.includeLocalMachine = true;
+        localMasterMovedCluster.bootstrapSshUser.assign("root"_ctv);
+        localMasterMovedCluster.bootstrapSshPrivateKeyPath = prodigyTestClientSSHPrivateKeyPath();
+        localMasterMovedCluster.controls.push_back(makeUnixControl(remoteListener.path));
+        localMasterMovedCluster.topology.machines.push_back(makeRemoteBrain(sshd.port));
+
+        MothershipSocket localMasterMovedSocket = {};
+        suite.expect(localMasterMovedSocket.configureCluster(localMasterMovedCluster, &failure), "local_unix_then_remote_ssh_fallback_configures");
+        suite.expect(localMasterMovedSocket.unitTestRemoteMachines().size() == 1, "local_unix_then_remote_ssh_fallback_retains_remote_brain");
+        localMasterMovedSocket.unitTestForceLocalUnixConnectionFailure(true);
+        localMasterMovedSocket.setRemoteIOTimeoutMs(2'000);
+
+        auto roundTripAfterLocalMasterMoved = [&](const char *name) {
+          bool connectedAfterFallback = localMasterMovedSocket.connect() == 0;
+          suite.expect(connectedAfterFallback, name);
+          if (connectedAfterFallback == false)
+          {
+            return;
+          }
+
+          ControlServerState state = {};
+          String echoFailure = {};
+          std::thread echo([&]() {
+            int peer = -1;
+            if (acceptNextClient(remoteListener.fd, state, peer))
+            {
+              String frame = {};
+              if (recvOneMessageFrame(peer, frame, echoFailure))
+                (void)sendAll(peer, frame, echoFailure);
+              ::close(peer);
+            }
+          });
+          Message::construct(localMasterMovedSocket.wBuffer, MothershipTopic::pullClusterReport);
+          bool echoed = localMasterMovedSocket.send() && localMasterMovedSocket.recvExpectedTopic(MothershipTopic::pullClusterReport) != nullptr;
+          localMasterMovedSocket.close();
+          state.stopRequested = true;
+          echo.join();
+          suite.expect(echoed && echoFailure.size() == 0, "local_unix_then_remote_ssh_fallback_round_trip");
+        };
+
+        roundTripAfterLocalMasterMoved("local_unix_then_remote_ssh_fallback_connects_remote_master");
+        uint32_t firstLocalAttemptCount = localMasterMovedSocket.unitTestLocalUnixConnectionAttempts();
+        suite.expect(firstLocalAttemptCount == 1, "local_unix_then_remote_ssh_fallback_attempts_local_first");
+        roundTripAfterLocalMasterMoved("local_unix_then_remote_ssh_fallback_reconnects_remote_master");
+        suite.expect(localMasterMovedSocket.unitTestLocalUnixConnectionAttempts() == firstLocalAttemptCount + 1,
+                     "local_unix_then_remote_ssh_fallback_retries_local_before_reconnect");
+
         MothershipProdigyCluster missingSocketCluster = fallbackCluster;
         missingSocketCluster.name.assign("remote-ssh-unix-missing-socket"_ctv);
         missingSocketCluster.topology.machines.clear();

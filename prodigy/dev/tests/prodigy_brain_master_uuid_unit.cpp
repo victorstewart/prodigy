@@ -8015,6 +8015,47 @@ int main(void)
     delete peer;
   });
 
+  withUniqueMothershipSocket("registration_degraded_rejoin_single_self_claim_socket_dir_created", [&] {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    brain.brainConfig.clusterUUID = uint128_t(0x7364);
+
+    brain.testSelfElectAsMaster("unit-test");
+    brain.masterQuorumDegraded = true;
+
+    // A cold-rebooted follower can reconnect before it has learned the
+    // incumbent's identity and temporarily advertise itself.  Its one vote is
+    // not a quorum to displace the still-live master.
+    BrainView *peer = makePeer(uint128_t(0), 0, IPAddress("10.0.0.12", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 49;
+    brain.brains.insert(peer);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(
+        buffer,
+        BrainTopic::registration,
+        uint128_t(0x200),
+        int64_t(20),
+        uint64_t(12),
+        uint128_t(0x200));
+    brain.testBrainHandler(peer, message);
+
+    suite.expect(brain.weAreMaster,
+                 "registration_degraded_rejoin_single_self_claim_keeps_incumbent_master");
+    suite.expect(brain.testMothershipUnixListenerActive(),
+                 "registration_degraded_rejoin_single_self_claim_keeps_control_listener_active");
+    suite.expect(peer->isMasterBrain == false,
+                 "registration_degraded_rejoin_single_self_claim_does_not_elect_rejoining_follower");
+    suite.expect(brain.noMasterYet == false,
+                 "registration_degraded_rejoin_single_self_claim_keeps_cluster_mastered");
+
+    brain.brains.erase(peer);
+    delete peer;
+  });
+
   withUniqueMothershipSocket("registration_majority_override_socket_dir_created", [&] {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();

@@ -5472,7 +5472,15 @@ private:
   String matchedFrameBuffer;
   uint128_t expectedClusterUUID = 0;
   String localClusterUUIDResolutionFailure;
+  // A local cluster can retain the local machine while its active master moves
+  // to an adopted remote Brain. Prefer the local control socket, but retain
+  // authenticated SSH candidates for that master handoff.
+  bool localUnixFirstWithRemoteSshFallback = false;
   bool credentialExpirySubscriptionAttempted = false;
+#ifdef PRODIGY_MOTHERSHIP_TEST_ACCESS
+  bool unitTestForceLocalUnixConnectFailure = false;
+  uint32_t unitTestLocalUnixConnectAttempts = 0;
+#endif
   int transportFD = -1;
   std::unique_ptr<SSL, decltype(&SSL_free)> tunnelGatewayTLS {nullptr, SSL_free};
   LIBSSH2_SESSION *sshSession = nullptr;
@@ -5518,6 +5526,7 @@ private:
     matchedFrameBuffer.clear();
     expectedClusterUUID = 0;
     localClusterUUIDResolutionFailure.clear();
+    localUnixFirstWithRemoteSshFallback = false;
     credentialExpirySubscriptionAttempted = false;
   }
 
@@ -5676,6 +5685,14 @@ private:
 
   bool connectLocalUnixSocket(const String& path)
   {
+#ifdef PRODIGY_MOTHERSHIP_TEST_ACCESS
+    ++unitTestLocalUnixConnectAttempts;
+    if (unitTestForceLocalUnixConnectFailure)
+    {
+      lastConnectFailure.assign("local unix connection forced to fail by unit test"_ctv);
+      return false;
+    }
+#endif
     String socketPath = path;
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
@@ -5800,7 +5817,13 @@ private:
       }
 
       basics_log("failed to connect to local cluster %s via unix socket\n", targetLabel.c_str());
-      return false;
+      if (localUnixFirstWithRemoteSshFallback == false)
+      {
+        return false;
+      }
+
+      basics_log("mothership control connect-fallback mode=localUnix target=%s next=remoteSshUnix\n", targetLabel.c_str());
+      transportMode = TransportMode::remoteSshUnix;
     }
 
     if (remoteMachines.size() == 0)
@@ -6350,6 +6373,16 @@ public:
     expectedClusterUUID = clusterUUID;
   }
 
+  void unitTestForceLocalUnixConnectionFailure(bool enabled)
+  {
+    unitTestForceLocalUnixConnectFailure = enabled;
+  }
+
+  uint32_t unitTestLocalUnixConnectionAttempts(void) const
+  {
+    return unitTestLocalUnixConnectAttempts;
+  }
+
   bool unitTestAdoptRemoteSshUnixTransportFD(int fd)
   {
     disconnect();
@@ -6456,7 +6489,7 @@ public:
       return false;
     }
 
-    if (mothershipClusterIncludesLocalMachine(cluster) || cluster.deploymentMode == MothershipClusterDeploymentMode::test)
+    if (cluster.deploymentMode == MothershipClusterDeploymentMode::test)
     {
       transportMode = TransportMode::localUnix;
       if (failure)
@@ -6465,8 +6498,6 @@ public:
       }
       return true;
     }
-
-    transportMode = TransportMode::remoteSshUnix;
 
     auto appendCandidate = [&](const MothershipProdigyClusterMachine& machine) -> void {
       if (machine.ssh.address.size() == 0 || machine.ssh.privateKeyPath.size() == 0)
@@ -6524,6 +6555,16 @@ public:
       {
         appendCandidate(machine);
       }
+    }
+
+    if (mothershipClusterIncludesLocalMachine(cluster))
+    {
+      transportMode = TransportMode::localUnix;
+      localUnixFirstWithRemoteSshFallback = remoteMachines.empty() == false;
+    }
+    else
+    {
+      transportMode = TransportMode::remoteSshUnix;
     }
 
     if (failure)
@@ -6602,6 +6643,13 @@ public:
     wBuffer.clear();
     matchedFrameBuffer.clear();
     credentialExpirySubscriptionAttempted = false;
+
+    // After a successful SSH fallback, reconnects must retry the local socket
+    // first so control returns locally when this Brain regains mastership.
+    if (localUnixFirstWithRemoteSshFallback)
+    {
+      transportMode = TransportMode::localUnix;
+    }
 
     switch (transportMode)
     {

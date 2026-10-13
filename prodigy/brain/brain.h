@@ -37709,13 +37709,7 @@ public:
                                        candidateVotes >= majority &&
                                        candidateMasterActive &&
                                        connectedMajority);
-            bool overrideByDegradedRejoin = (candidateMasterUUID > 0 &&
-                                             candidateVotes > 0 &&
-                                             candidateMasterActive &&
-                                             connectedMajority &&
-                                             masterQuorumDegraded);
-
-            if (overrideByMajority || overrideByDegradedRejoin)
+            if (overrideByMajority)
             {
               String oldMasterUUIDText = {};
               String newMasterUUIDText = {};
@@ -37727,7 +37721,7 @@ public:
                          candidateVotes,
                          majority,
                          int(masterQuorumDegraded),
-                         overrideByMajority ? "majority" : "degraded-rejoin");
+                         "majority");
 
               forfeitMasterStatus();
               resetMasterBrainAssignment();
