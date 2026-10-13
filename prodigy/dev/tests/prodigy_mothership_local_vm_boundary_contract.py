@@ -7,6 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 MOTHERSHIP = (ROOT / "prodigy/mothership/mothership.cpp").read_text()
+KVM_BOUNDARY = (ROOT / "prodigy/dev/tests/prodigy_dev_kvm_boundary.py").read_text()
 CMAKE = (ROOT / "prodigy/dev/CMakeLists.txt").read_text()
 
 
@@ -42,6 +43,14 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertLess(verified, fallback)
         self.assertIn("localMachine.uuid = verifiedLocalVMUUID", helper[verified:fallback])
         self.assertIn("else\n    {\n      ProdigyPersistentStateStore", helper[verified:fallback + 80])
+
+    def test_cold_reboot_accepts_only_fixed_width_provider_operation_identity(self):
+        self.assertIn('re.fullmatch(r"[0-9a-f]{32}", remainder[1]) is not None', KVM_BOUNDARY)
+        begin = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction")
+        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        helper = MOTHERSHIP[begin:end]
+        self.assertIn("mothershipAssignProviderHex128(operationUUID, operation);", helper)
+        self.assertNotIn("operation.assignItoh", helper)
 
 
 if __name__ == "__main__":

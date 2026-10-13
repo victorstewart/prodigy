@@ -51,6 +51,58 @@ int main(void)
                    source.find("unapproved host-network QEMU backend") != std::string::npos,
                "local_vm_boundary_contract_retains_legacy_lan_and_host_backend_rejection");
 
+  String providerIdentity = {};
+  mothershipAssignProviderHex128(uint128_t(1), providerIdentity);
+  suite.expect(providerIdentity == "00000000000000000000000000000001"_ctv,
+               "provider_identity_is_fixed_width_lowercase_without_prefix");
+  mothershipAssignProviderHex128(
+      String::numberFromHexString<uint128_t>("c776150f4271478e84caada31f261c77"_ctv),
+      providerIdentity);
+  suite.expect(providerIdentity == "c776150f4271478e84caada31f261c77"_ctv,
+               "provider_identity_preserves_all_128_bits");
+
+  const auto providerSection = [&](const char *begin, const char *end) {
+    const size_t first = source.find(begin);
+    const size_t last = first == std::string::npos ? std::string::npos : source.find(end, first);
+    return first == std::string::npos || last == std::string::npos ? std::string() :
+        source.substr(first, last - first);
+  };
+  const std::string pairArguments = providerSection(
+      "void productionPairProviderArguments", "bool parseProductionPairProviderOutput");
+  const std::string pairOutput = providerSection(
+      "bool parseProductionPairProviderOutput", "bool mothershipRunRemoteSealedPythonProvider");
+  const std::string pairWitness = providerSection(
+      "bool parseProductionPairIngressWitness", "bool productionPairIngressWitness");
+  const std::string localAction = providerSection(
+      "bool runLocalVMBoundaryExecutorAction", "void runPrepareProductionPair");
+  const std::string physicalReceipt = providerSection(
+      "bool parsePhysicalFaultProviderReceipt", "bool describePhysicalFaultExecutorBoundary");
+  const std::string physicalArguments = providerSection(
+      "void physicalFaultProviderArguments", "bool runPhysicalFaultProvider");
+  suite.expect(!pairArguments.empty() && pairArguments.find("assignItoh") == std::string::npos &&
+                   pairArguments.find("mothershipAssignProviderHex128(record.intent.operationUUID, operation);") != std::string::npos &&
+                   pairArguments.find("mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, executorCluster);") != std::string::npos &&
+                   pairArguments.find("mothershipAssignProviderHex128(record.intent.selectorMachineUUID, executorMachine);") != std::string::npos &&
+                   pairArguments.find("mothershipAssignProviderHex128(record.intent.ingressWitnessMachineUUID, witnessMachine);") != std::string::npos &&
+                   !pairOutput.empty() && pairOutput.find("assignItoh") == std::string::npos &&
+                   pairOutput.find("mothershipAssignProviderHex128(record.intent.operationUUID, expectedOperation);") != std::string::npos &&
+                   pairOutput.find("mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, expectedCluster);") != std::string::npos &&
+                   pairOutput.find("mothershipAssignProviderHex128(record.intent.selectorMachineUUID, expectedMachine);") != std::string::npos &&
+                   !pairWitness.empty() && pairWitness.find("assignItoh") == std::string::npos &&
+                   pairWitness.find("mothershipAssignProviderHex128(record.intent.operationUUID, expectedOperation);") != std::string::npos &&
+                   pairWitness.find("mothershipAssignProviderHex128(record.intent.ingressWitnessMachineUUID, expectedMachine);") != std::string::npos,
+               "production_pair_provider_wire_identities_use_exact_provider_hex");
+  suite.expect(!localAction.empty() && localAction.find("assignItoh") == std::string::npos &&
+                   localAction.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos,
+               "local_vm_fault_operation_uses_exact_provider_hex");
+  suite.expect(!physicalReceipt.empty() && physicalReceipt.find("assignItoh") == std::string::npos &&
+                   physicalReceipt.find("mothershipAssignProviderHex128(operationUUID, expectedOperation);") != std::string::npos &&
+                   physicalReceipt.find("mothershipAssignProviderHex128(guestUUID, expectedGuest);") != std::string::npos &&
+                   !physicalArguments.empty() && physicalArguments.find("assignItoh") == std::string::npos &&
+                   physicalArguments.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos &&
+                   physicalArguments.find("mothershipAssignProviderHex128(guestUUID, guest);") != std::string::npos,
+               "physical_fault_provider_wire_identities_use_exact_provider_hex");
+
   uint128_t verifiedVMUUID = 0;
   suite.expect(mothershipParseVerifiedLocalVMIdentity(
                    "prodigy-disposable-linux-v1\n"_ctv,

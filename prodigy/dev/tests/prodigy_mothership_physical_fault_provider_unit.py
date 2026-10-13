@@ -13,6 +13,7 @@ from pathlib import Path
 
 
 PROVIDER = Path(__file__).parents[2] / "mothership" / "mothership.physical.fault.provider.py"
+GUEST = "abcdef0123456789abcdef0123456789"
 SPEC = importlib.util.spec_from_file_location("physical_fault_provider", PROVIDER)
 provider = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -55,7 +56,7 @@ raise SystemExit(8)
         self.environment = os.environ.copy(); self.environment["FAKE_IP_STATE"] = str(self.ip_state)
         self.old = os.environ.get("FAKE_IP_STATE"); os.environ["FAKE_IP_STATE"] = str(self.ip_state)
         self.clock = Clock()
-        self.request = provider.Request("0123456789abcdef0123456789abcdef", "source", "guest-a", "198.51.100.9", 10)
+        self.request = provider.Request("0123456789abcdef0123456789abcdef", "source", GUEST, "198.51.100.9", 10)
         self.boot = "01234567-89ab-cdef-0123-456789abcdef"
 
     def tearDown(self):
@@ -89,7 +90,7 @@ raise SystemExit(8)
     def test_exact_retry_is_idempotent_and_retarget_rejected(self):
         first = self.execute()
         self.assertEqual(self.execute(), first)
-        changed = provider.Request(self.request.operationID, "source", "guest-a", "198.51.100.10", 10)
+        changed = provider.Request(self.request.operationID, "source", GUEST, "198.51.100.10", 10)
         with self.assertRaisesRegex(provider.ProviderError, "does not exactly match"):
             provider.execute(changed, self.root, str(self.ip), require_root=False, boot_id=self.boot,
                              now=self.clock.now, sleep=self.clock.sleep)
@@ -128,9 +129,13 @@ raise SystemExit(8)
         self.assertEqual(json.loads(self.ip_state.read_text()), matching)
 
     def test_invalid_request_and_colliding_state_rejected(self):
-        invalid = provider.Request("not-an-operation", "source", "guest-a", "127.0.0.1", 0)
+        invalid = provider.Request("not-an-operation", "source", GUEST, "127.0.0.1", 0)
         with self.assertRaises(provider.ProviderError): provider.validate_request(invalid)
-        other = provider.Request("11111111111111111111111111111111", "source", "guest-a", "198.51.100.9", 10)
+        for invalid_guest in ("guest-a", "0x" + GUEST, GUEST.upper(), GUEST[:-1], GUEST + "2"):
+            invalid = provider.Request(self.request.operationID, "source", invalid_guest, "198.51.100.9", 10)
+            with self.assertRaisesRegex(provider.ProviderError, "guestID must be exactly 32"):
+                provider.validate_request(invalid)
+        other = provider.Request("11111111111111111111111111111111", "source", GUEST, "198.51.100.9", 10)
         state = {"schemaVersion":provider.SCHEMA_VERSION, "request":provider.asdict(other), "operationID":other.operationID,
                  "role":other.role, "guestID":other.guestID, "peerAddress":other.peerAddress,
                  "durationMilliseconds":other.durationMilliseconds, "bootID":self.boot,

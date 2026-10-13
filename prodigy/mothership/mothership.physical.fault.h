@@ -23,6 +23,19 @@ constexpr static auto mothershipPhysicalFaultProviderStateRoot =
 constexpr static const char *mothershipVerifiedLocalVMMarkerPath = "/run/prodigy-disposable-linux";
 constexpr static auto mothershipVerifiedLocalVMMarker = "prodigy-disposable-linux-v1"_ctv;
 
+// Sealed provider interfaces use one fixed-width wire identity rather than
+// the operator-facing canonical hexadecimal form (which carries a 0x prefix
+// and omits leading zeroes).  Keep this formatter beside the typed provider
+// contracts so local-VM, physical-fault, and production-pair owners cannot
+// silently diverge at their Python execution boundaries.
+static inline void mothershipAssignProviderHex128(uint128_t value, String& output)
+{
+  constexpr static char digits[] = "0123456789abcdef";
+  output.clear();
+  for (int32_t shift = 124; shift >= 0; shift -= 4)
+    output.append(digits[uint8_t((value >> shift) & 0xf)]);
+}
+
 // The disposable KVM owner writes the root-only marker only after proving KVM,
 // Linux machine identity, and the exact QEMU DMI UUID.  The local seed uses
 // that UUID as its Prodigy machine UUID so the later outer-owner registration

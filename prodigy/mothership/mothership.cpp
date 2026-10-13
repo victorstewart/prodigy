@@ -12722,10 +12722,10 @@ private:
     arguments.clear();
     String operation = {}, executorCluster = {}, executorMachine = {}, witnessMachine = {};
     String sourcePort = {}, targetPort = {}, listenerPort = {};
-    operation.assignItoh(record.intent.operationUUID);
-    executorCluster.assignItoh(record.intent.sourceWorkload.clusterUUID);
-    executorMachine.assignItoh(record.intent.selectorMachineUUID);
-    witnessMachine.assignItoh(record.intent.ingressWitnessMachineUUID);
+    mothershipAssignProviderHex128(record.intent.operationUUID, operation);
+    mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, executorCluster);
+    mothershipAssignProviderHex128(record.intent.selectorMachineUUID, executorMachine);
+    mothershipAssignProviderHex128(record.intent.ingressWitnessMachineUUID, witnessMachine);
     sourcePort.assignItoa(record.intent.sourceWorkload.endpointTCPPort);
     targetPort.assignItoa(record.intent.targetWorkload.endpointTCPPort);
     listenerPort.assignItoa(record.intent.selectorTCPPort);
@@ -12797,9 +12797,9 @@ private:
           observedPort == port;
     };
     String expectedOperation = {}, expectedCluster = {}, expectedMachine = {};
-    expectedOperation.assignItoh(record.intent.operationUUID);
-    expectedCluster.assignItoh(record.intent.sourceWorkload.clusterUUID);
-    expectedMachine.assignItoh(record.intent.selectorMachineUUID);
+    mothershipAssignProviderHex128(record.intent.operationUUID, expectedOperation);
+    mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, expectedCluster);
+    mothershipAssignProviderHex128(record.intent.selectorMachineUUID, expectedMachine);
     auto textMatches = [](std::string_view observed, const String& expected) {
       return observed.size() == expected.size() &&
           (!observed.size() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
@@ -12954,8 +12954,8 @@ private:
     if ((*it).get(port))
     { failure.assign("production pair ingress witness selector is malformed"_ctv); return false; }
     String expectedOperation = {}, expectedMachine = {};
-    expectedOperation.assignItoh(record.intent.operationUUID);
-    expectedMachine.assignItoh(record.intent.ingressWitnessMachineUUID);
+    mothershipAssignProviderHex128(record.intent.operationUUID, expectedOperation);
+    mothershipAssignProviderHex128(record.intent.ingressWitnessMachineUUID, expectedMachine);
     auto same = [](std::string_view observed, const String& expected) {
       return observed.size() == expected.size() && (!observed.size() ||
           std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
@@ -13635,7 +13635,7 @@ private:
     Vector<String> arguments = {};
     arguments.emplace_back("cold-reboot"_ctv); arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
     arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
-    String operation = {}; operation.assignItoh(operationUUID);
+    String operation = {}; mothershipAssignProviderHex128(operationUUID, operation);
     arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);
     String output = {};
     bool valid = runLocalVMBoundarySealedLauncher(descriptor, arguments,
@@ -14162,7 +14162,8 @@ private:
         restored - installed > uint64_t(durationMilliseconds) + mothershipPhysicalFaultRestorationSlackMilliseconds)
     { failure.assign("physical fault provider receipt does not prove bounded restoration"_ctv); return false; }
     String expectedOperation = {}, expectedGuest = {};
-    expectedOperation.assignItoh(operationUUID); expectedGuest.assignItoh(guestUUID);
+    mothershipAssignProviderHex128(operationUUID, expectedOperation);
+    mothershipAssignProviderHex128(guestUUID, expectedGuest);
     auto equal = [](std::string_view observed, const String& expected) {
       return observed.size() == expected.size() &&
           (!observed.size() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
@@ -14247,7 +14248,9 @@ private:
                                       uint32_t durationMilliseconds, Vector<String>& arguments)
   {
     String operation = {}, guest = {}, duration = {};
-    operation.assignItoh(operationUUID); guest.assignItoh(guestUUID); duration.assignItoa(durationMilliseconds);
+    mothershipAssignProviderHex128(operationUUID, operation);
+    mothershipAssignProviderHex128(guestUUID, guest);
+    duration.assignItoa(durationMilliseconds);
     arguments.clear(); arguments.emplace_back("execute"_ctv);
     arguments.emplace_back("--state-root"_ctv); arguments.emplace_back("/var/lib/prodigy/mothership-physical-faults"_ctv);
     arguments.emplace_back("--operation-id"_ctv); arguments.push_back(operation);

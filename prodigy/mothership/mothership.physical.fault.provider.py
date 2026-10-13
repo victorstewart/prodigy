@@ -31,7 +31,7 @@ FIXED_STATE_ROOT = Path("/var/lib/prodigy/mothership-physical-faults")
 FIXED_STATE_PARENT = FIXED_STATE_ROOT.parent
 FIXED_STATE_GRANDPARENT = FIXED_STATE_PARENT.parent
 OPERATION = re.compile(r"^[0-9a-f]{32}$")
-GUEST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+GUEST = re.compile(r"^[0-9a-f]{32}$")
 ROLES = {"source", "target"}
 
 
@@ -63,7 +63,7 @@ def validate_request(request: Request) -> None:
     if request.role not in ROLES:
         raise ProviderError("role must be source or target")
     if not GUEST.fullmatch(request.guestID):
-        raise ProviderError("guestID is not a safe opaque guest identity")
+        raise ProviderError("guestID must be exactly 32 lower-case hex characters")
     try:
         address = ipaddress.ip_address(request.peerAddress)
     except ValueError as error:

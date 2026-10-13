@@ -117,6 +117,16 @@ def main():
             time.sleep(0.03)
 
     try:
+        for flag in ("--operation-id", "--executor-cluster-id", "--executor-machine-id",
+                     "--witness-machine-id"):
+            for rejected_identity in ("0x" + OPERATION, OPERATION.upper(), OPERATION[:-1],
+                                      OPERATION + "0", OPERATION[:8] + "-" + OPERATION[8:]):
+                rejected_base = base[:]
+                rejected_base[rejected_base.index(flag) + 1] = rejected_identity
+                rejected = subprocess.run(rejected_base[:2] + ["query"] + rejected_base[2:],
+                                          check=False, text=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, timeout=10)
+                assert rejected.returncode == 2 and "32 lowercase hexadecimal characters" in rejected.stderr
         for rejected_address in ("127.0.0.1", "0.0.0.0"):
             rejected_base = base[:]
             rejected_base[rejected_base.index("--listen-address") + 1] = rejected_address
