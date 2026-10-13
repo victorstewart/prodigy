@@ -311,6 +311,44 @@ class KvmBoundaryUnit(unittest.TestCase):
             KVM.preserve_cold_reboot_after_session_loss()
         install.assert_called_once_with(KVM.signal.SIGHUP, KVM.signal.SIG_IGN)
 
+    def test_incomplete_cold_reboot_retry_adopts_exact_live_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "boundary.json"
+            pidfile = root / "qemu.pid"
+            pidfile.write_text("55\n")
+            operation = "1" * 32
+            record = {"qemuPID": 42, "qemuStarttime": "old",
+                      "qemuCommand": ["qemu", "-pidfile", str(pidfile)],
+                      "qmpSocket": str(root / "qmp.sock"),
+                      "lastColdReboot": {"operationID": operation, "beforePID": 42,
+                                         "beforeStarttime": "old", "startedAtMonotonicMs": 10,
+                                         "completed": False}}
+            written = []
+            def matches(pid, starttime, _command):
+                return pid == 55 and starttime == "new"
+            with mock.patch.object(KVM, "preserve_cold_reboot_after_session_loss"), \
+                 mock.patch.object(KVM, "load_persistent_state", return_value=record), \
+                 mock.patch.object(KVM, "write_persistent_state", side_effect=lambda _path, value: written.append(value.copy())), \
+                 mock.patch.object(KVM, "command_matches", side_effect=matches), \
+                 mock.patch.object(KVM, "proc_starttime", side_effect=lambda pid: "new" if pid == 55 else None), \
+                 mock.patch.object(KVM, "verify_persistent_guest") as verify, \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn, \
+                 mock.patch.object(KVM.time, "monotonic_ns", return_value=20_000_000):
+                self.assertEqual(KVM._lifecycle_main([
+                    "cold-reboot", "--state", str(state_path), "--task-id", "g6-task",
+                    "--operation-id", operation]), 0)
+            stop.assert_not_called()
+            spawn.assert_not_called()
+            verify.assert_called_once_with(record, 55, "new")
+            self.assertEqual(len(written), 1)
+            self.assertEqual(written[0]["qemuPID"], 55)
+            self.assertEqual(written[0]["qemuStarttime"], "new")
+            self.assertTrue(written[0]["lastColdReboot"]["completed"])
+            self.assertEqual(written[0]["lastColdReboot"]["beforePID"], 42)
+            self.assertEqual(written[0]["lastColdReboot"]["afterPID"], 55)
+
     def test_qemu_pidfile_is_part_of_persistent_command_identity(self):
         self.assertEqual(KVM.qemu_pidfile(["qemu", "-pidfile", "/run/g6.pid"]), Path("/run/g6.pid"))
         with self.assertRaises(KVM.BoundaryError): KVM.qemu_pidfile(["qemu"])
@@ -326,7 +364,35 @@ class KvmBoundaryUnit(unittest.TestCase):
              mock.patch.object(KVM, "verify_guest_boundary") as verify:
             KVM.verify_persistent_guest(record, 12, "99")
         self.assertEqual(wait.call_args.args[0].ssh_port, 2222)
+        self.assertEqual(wait.call_args.args[0].ssh, "ssh")
+        self.assertEqual(wait.call_args.args[0].evidence_dir, Path("."))
         self.assertEqual(verify.call_args.args[1], "f" * 32)
+
+    def test_reboot_verification_reuses_explicit_saved_executor_fields(self):
+        record = {"qemuCommand": ["qemu", "-accel", "kvm"],
+                  "boundaryVerification": {"knownHosts": "/private/known_hosts", "sshPrivateKey": "/private/key",
+                                           "sshUser": "root", "sshPort": 2222, "bootTimeout": 30,
+                                           "guestUUID": "12345678-1234-4234-9234-123456789abc",
+                                           "machineID": "0" * 32, "hostMachineID": "f" * 32,
+                                           "sshCommand": "/usr/bin/ssh", "evidenceDir": "/private/evidence"}}
+        completed = KVM.subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(KVM, "command_matches", return_value=True), \
+             mock.patch.object(KVM.subprocess, "run", return_value=completed) as run, \
+             mock.patch.object(KVM, "verify_guest_boundary"):
+            KVM.verify_persistent_guest(record, 12, "99")
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/ssh")
+        self.assertIn("UserKnownHostsFile=/private/known_hosts", run.call_args.args[0])
+
+    def test_reboot_verification_reports_saved_evidence_path_if_qemu_exits(self):
+        record = {"qemuCommand": ["qemu", "-accel", "kvm"],
+                  "boundaryVerification": {"knownHosts": "/private/known_hosts", "sshPrivateKey": "/private/key",
+                                           "sshUser": "root", "sshPort": 2222, "bootTimeout": 30,
+                                           "guestUUID": "12345678-1234-4234-9234-123456789abc",
+                                           "machineID": "0" * 32, "hostMachineID": "f" * 32,
+                                           "sshCommand": "/usr/bin/ssh", "evidenceDir": "/private/evidence"}}
+        with mock.patch.object(KVM, "command_matches", return_value=False), \
+             self.assertRaisesRegex(KVM.BoundaryError, "/private/evidence/qemu.log"):
+            KVM.verify_persistent_guest(record, 12, "99")
 
     def test_reboot_verification_rejects_incomplete_saved_verification_inputs(self):
         with self.assertRaisesRegex(KVM.BoundaryError, "incomplete"):

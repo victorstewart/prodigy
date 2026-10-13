@@ -284,10 +284,18 @@ def verify_persistent_guest(record: dict[str, object], pid: int, starttime: str)
             isinstance(verification["hostMachineID"], str) and
             all(isinstance(verification[key], str) for key in ("knownHosts", "sshPrivateKey", "sshUser")),
             "persistent guest verification state is malformed")
+    # Early persistent-boundary records predate these two presentation/executor
+    # fields.  Mothership's launch contract used argparse's SSH default; retain
+    # that replay while recording explicit values for every new boundary.
+    ssh = verification.get("sshCommand", "ssh")
+    evidence_dir = verification.get("evidenceDir", ".")
+    require(isinstance(ssh, str) and ssh and isinstance(evidence_dir, str) and evidence_dir,
+            "persistent guest verification executor state is malformed")
     args = argparse.Namespace(known_hosts=Path(verification["knownHosts"]), ssh_private_key=Path(verification["sshPrivateKey"]),
                               ssh_user=verification["sshUser"], ssh_port=verification["sshPort"],
                               boot_timeout=verification["bootTimeout"], guest_uuid=uuid.UUID(verification["guestUUID"]),
-                              expected_machine_id=verification["machineID"])
+                              expected_machine_id=verification["machineID"], ssh=ssh,
+                              evidence_dir=Path(evidence_dir))
     class PersistentProcess:
         returncode = 1
         def poll(self) -> int | None:
@@ -341,7 +349,7 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
         try:
             require(starttime is not None, "could not record QEMU PID start time"); wait_for_guest(args, process); verify_guest_boundary(args, host_machine_id)
             require(command_matches(process.pid, starttime, command), "QEMU command identity changed before state seal")
-            verification = {"knownHosts": str(args.known_hosts), "sshPrivateKey": str(args.ssh_private_key), "sshUser": args.ssh_user, "sshPort": args.ssh_port, "bootTimeout": args.boot_timeout, "guestUUID": str(args.guest_uuid), "machineID": args.expected_machine_id, "hostMachineID": host_machine_id}
+            verification = {"knownHosts": str(args.known_hosts), "sshPrivateKey": str(args.ssh_private_key), "sshUser": args.ssh_user, "sshPort": args.ssh_port, "bootTimeout": args.boot_timeout, "guestUUID": str(args.guest_uuid), "machineID": args.expected_machine_id, "hostMachineID": host_machine_id, "sshCommand": args.ssh, "evidenceDir": str(args.evidence_dir)}
             write_persistent_state(state_path, {"taskID": task_id, "qemuPID": process.pid, "qemuStarttime": starttime, "qemuCommand": command, "overlay": str(overlay), "ovmfVars": str(vars_copy), "guestUUID": str(args.guest_uuid), "machineID": args.expected_machine_id, "qmpSocket": str(qmp_socket), "network": network, "boundaryVerification": verification})
         except Exception:
             cleanup_qemu(process, starttime, overlay, vars_copy, {}); raise
