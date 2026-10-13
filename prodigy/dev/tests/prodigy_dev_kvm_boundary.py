@@ -26,6 +26,9 @@ from typing import Sequence
 
 MARKER = "/run/prodigy-disposable-linux"
 MARKER_CONTENT = "prodigy-disposable-linux-v1"
+COLD_REBOOT_HISTORY_LIMIT = 16
+COLD_REBOOT_MAX_DELAY_MS = 24 * 60 * 60 * 1000
+COLD_REBOOT_RELEASE_GRACE_MS = 30 * 1000
 
 
 class BoundaryError(RuntimeError):
@@ -304,9 +307,21 @@ def verify_persistent_guest(record: dict[str, object], pid: int, starttime: str)
     verify_guest_boundary(args, verification["hostMachineID"])
 
 
-def completed_cold_reboot(record: dict[str, object], operation_id: str) -> dict[str, object] | None:
-    receipt = record.get("lastColdReboot")
-    if not isinstance(receipt, dict) or receipt.get("operationID") != operation_id or receipt.get("completed") is not True:
+def canonical_cold_reboot_id(value: object, label: str) -> str:
+    require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None,
+            f"{label} must be canonical 32-hex")
+    return value
+
+
+def completed_cold_reboot(receipt: dict[str, object], operation_id: str,
+                          cohort_id: str | None = None) -> dict[str, object] | None:
+    # Keep the original tiny helper interface for existing callers while new
+    # callers pass one receipt directly.
+    if "operationID" not in receipt and isinstance(receipt.get("lastColdReboot"), dict):
+        receipt = receipt["lastColdReboot"]
+    if receipt.get("operationID") != operation_id or receipt.get("completed") is not True:
+        return None
+    if cohort_id is not None and receipt.get("cohortID") != cohort_id:
         return None
     required = {"operationID", "beforePID", "beforeStarttime", "afterPID", "afterStarttime",
                 "startedAtMonotonicMs", "completedAtMonotonicMs", "completed"}
@@ -315,6 +330,119 @@ def completed_cold_reboot(record: dict[str, object], operation_id: str) -> dict[
             receipt["completedAtMonotonicMs"] > receipt["startedAtMonotonicMs"],
             "persistent cold reboot receipt timestamps are not strictly ordered")
     return receipt
+
+
+def completed_cold_reboot_for(record: dict[str, object], operation_id: str,
+                              cohort_id: str | None = None) -> dict[str, object] | None:
+    """Find an exact completed retry, including sealed sequential history."""
+    current = record.get("lastColdReboot")
+    if isinstance(current, dict):
+        completed = completed_cold_reboot(current, operation_id, cohort_id)
+        if completed is not None:
+            return completed
+    history = record.get("completedColdReboots", [])
+    require(isinstance(history, list) and len(history) <= COLD_REBOOT_HISTORY_LIMIT,
+            "persistent cold reboot history is invalid")
+    matches: list[dict[str, object]] = []
+    for receipt in history:
+        require(isinstance(receipt, dict), "persistent cold reboot history receipt is malformed")
+        completed = completed_cold_reboot(receipt, operation_id, cohort_id)
+        if completed is not None:
+            matches.append(completed)
+    require(len(matches) <= 1, "persistent cold reboot history has duplicate operation ID")
+    return matches[0] if matches else None
+
+
+def archive_completed_cold_reboot(record: dict[str, object]) -> None:
+    """Move only a completed current receipt to bounded durable replay history."""
+    current = record.get("lastColdReboot")
+    if current is None:
+        return
+    require(isinstance(current, dict) and current.get("completed") is True,
+            "another cold reboot operation already owns this boundary")
+    require(completed_cold_reboot(current, str(current.get("operationID", "")),
+                                  current.get("cohortID") if isinstance(current.get("cohortID"), str) else None) is not None,
+            "persistent cold reboot receipt is malformed")
+    history = record.setdefault("completedColdReboots", [])
+    require(isinstance(history, list) and len(history) < COLD_REBOOT_HISTORY_LIMIT,
+            "completed cold reboot history is full")
+    history.append(current)
+    record.pop("lastColdReboot", None)
+
+
+def cold_reboot_status(record: dict[str, object], operation_id: str | None = None,
+                       cohort_id: str | None = None) -> dict[str, object]:
+    """Return one exact operation state without exposing a different operation as a retry."""
+    current = record.get("lastColdReboot")
+    if isinstance(current, dict) and (operation_id is None or current.get("operationID") == operation_id) and \
+            (cohort_id is None or current.get("cohortID") == cohort_id):
+        return current
+    if operation_id is not None:
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        require(completed is not None, "cold reboot operation is absent")
+        return completed
+    return {"phase": "idle", "completed": False}
+
+
+def resume_cold_reboot(record: dict[str, object], state_path: Path, operation_id: str,
+                       cohort_id: str | None = None) -> dict[str, object]:
+    """Resume one already durable operation; this is the only stop/start path."""
+    completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+    if completed is not None:
+        return completed
+    prior = record.get("lastColdReboot")
+    require(isinstance(prior, dict) and prior.get("operationID") == operation_id and
+            (cohort_id is None or prior.get("cohortID") == cohort_id) and prior.get("completed") is False,
+            "another cold reboot operation already owns this boundary")
+    pid = int(record["qemuPID"]); command = record["qemuCommand"]
+    if command_matches(pid, record["qemuStarttime"], command):
+        stop_persistent_qemu(record, "cold reboot")
+    replacement_pid = None
+    pidfile = qemu_pidfile(command)
+    if pidfile.is_file():
+        try: candidate = int(pidfile.read_text().strip())
+        except ValueError: candidate = 0
+        if candidate > 0 and command_matches(candidate, proc_starttime(candidate) or "", command): replacement_pid = candidate
+    if replacement_pid is None:
+        Path(record["qmpSocket"]).unlink(missing_ok=True)
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        replacement_pid = process.pid
+    starttime = proc_starttime(replacement_pid)
+    require(starttime is not None and command_matches(replacement_pid, starttime, command), "replacement QEMU identity mismatch")
+    verify_persistent_guest(record, replacement_pid, starttime)
+    completed_at = max(time.monotonic_ns() // 1_000_000, int(prior["startedAtMonotonicMs"]) + 1)
+    receipt = dict(prior); receipt.update(beforeIdentity={"pid": prior["beforePID"], "starttime": prior["beforeStarttime"]},
+                                          afterIdentity={"pid": replacement_pid, "starttime": starttime},
+                                          afterPID=replacement_pid, afterStarttime=starttime,
+                                          completedAtMonotonicMs=completed_at, phase="completed",
+                                          completed=True)
+    record["qemuPID"], record["qemuStarttime"], record["lastColdReboot"] = replacement_pid, starttime, receipt
+    write_persistent_state(state_path, record)
+    return receipt
+
+
+def released_cold_reboot_child(state_path: Path, task_id: str, operation_id: str, cohort_id: str) -> None:
+    """Detached owner inherits lifecycle_main's flock and never touches a non-exact VM."""
+    os.setsid()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    null = os.open(os.devnull, os.O_RDWR)
+    try:
+        for descriptor in (0, 1, 2):
+            os.dup2(null, descriptor)
+    finally:
+        if null > 2: os.close(null)
+    record = load_persistent_state(state_path, task_id)
+    current = cold_reboot_status(record, operation_id, cohort_id)
+    require(current.get("phase") == "released" and current.get("completed") is False,
+            "cold reboot release is no longer active")
+    not_before = current.get("notBeforeUnixMs")
+    require(isinstance(not_before, int), "cold reboot release lacks not-before time")
+    delay = not_before - time.time_ns() // 1_000_000
+    if delay > 0:
+        time.sleep(delay / 1000)
+    record = load_persistent_state(state_path, task_id)
+    resume_cold_reboot(record, state_path, operation_id, cohort_id)
 
 
 def preserve_cold_reboot_after_session_loss() -> None:
@@ -355,13 +483,37 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
             cleanup_qemu(process, starttime, overlay, vars_copy, {}); raise
         finally: qemu_log.close()
         return 0
-    operation_id = None
-    if operation == "cold-reboot":
-        require(len(remainder) == 2 and remainder[0] == "--operation-id" and
-                re.fullmatch(r"[0-9a-f]{32}", remainder[1]) is not None,
-                "cold-reboot requires one canonical operation ID")
-        operation_id = remainder[1]
+    operation_id = cohort_id = None
+    not_before_unix_ms: int | None = None
+    if operation in ("cold-reboot", "arm-cold-reboot", "release-cold-reboot"):
+        require(len(remainder) in (2, 4, 6) and len(remainder) % 2 == 0,
+                f"{operation} requires canonical operation arguments")
+        options = dict(zip(remainder[::2], remainder[1::2]))
+        require(len(options) * 2 == len(remainder), f"{operation} arguments are duplicated")
+        operation_id = canonical_cold_reboot_id(options.get("--operation-id"), "operation ID")
+        if operation == "cold-reboot":
+            require(set(options) == {"--operation-id"}, "cold-reboot requires one canonical operation ID")
+        else:
+            require("--cohort-id" in options, f"{operation} requires one canonical cohort ID")
+            cohort_id = canonical_cold_reboot_id(options["--cohort-id"], "cohort ID")
+            if operation == "arm-cold-reboot":
+                require(set(options) == {"--operation-id", "--cohort-id", "--not-before-unix-ms"},
+                        "arm-cold-reboot requires operation ID, cohort ID, and not-before Unix ms")
+                try: not_before_unix_ms = int(options["--not-before-unix-ms"])
+                except ValueError as error: raise BoundaryError("not-before Unix ms is invalid") from error
+                now = time.time_ns() // 1_000_000
+                require(now < not_before_unix_ms <= now + COLD_REBOOT_MAX_DELAY_MS,
+                        "not-before Unix ms must be bounded future time")
+            else:
+                require(set(options) == {"--operation-id", "--cohort-id"},
+                        "release-cold-reboot requires operation ID and cohort ID")
         preserve_cold_reboot_after_session_loss()
+    elif operation == "query":
+        require(not remainder or (len(remainder) == 4 and remainder[0::2] == ["--operation-id", "--cohort-id"]),
+                "query accepts one exact operation ID and cohort ID pair")
+        if remainder:
+            operation_id = canonical_cold_reboot_id(remainder[1], "operation ID")
+            cohort_id = canonical_cold_reboot_id(remainder[3], "cohort ID")
     else:
         require(not remainder, f"{operation} does not accept extra arguments")
     if operation == "remove" and not state_path.exists():
@@ -369,15 +521,19 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
     record = load_persistent_state(state_path, task_id); pid = int(record["qemuPID"]); command = record["qemuCommand"]
     if operation == "query":
         require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
+        if operation_id is not None:
+            print(json.dumps(cold_reboot_status(record, operation_id, cohort_id), sort_keys=True)); return 0
         print(json.dumps(record, sort_keys=True)); return 0
     if operation == "cold-reboot":
         assert operation_id is not None
-        completed = completed_cold_reboot(record, operation_id)
+        completed = completed_cold_reboot_for(record, operation_id)
         if completed is not None:
             require(command_matches(pid, record["qemuStarttime"], command), "completed cold reboot no longer owns its exact QEMU process")
             verify_persistent_guest(record, pid, record["qemuStarttime"])
             print(json.dumps(completed, sort_keys=True)); return 0
         prior = record.get("lastColdReboot")
+        if isinstance(prior, dict) and prior.get("completed") is True:
+            archive_completed_cold_reboot(record); prior = None
         require(prior is None or (isinstance(prior, dict) and prior.get("operationID") == operation_id and
                 prior.get("completed") is False), "another cold reboot operation already owns this boundary")
         if prior is None:
@@ -385,30 +541,54 @@ def _lifecycle_main(argv: Sequence[str]) -> int:
             prior = {"operationID": operation_id, "beforePID": pid, "beforeStarttime": record["qemuStarttime"],
                      "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000, "completed": False}
             record["lastColdReboot"] = prior; write_persistent_state(state_path, record)
-        if command_matches(pid, record["qemuStarttime"], command):
-            stop_persistent_qemu(record, "cold reboot")
-        replacement_pid = None
-        pidfile = qemu_pidfile(command)
-        if pidfile.is_file():
-            try: candidate = int(pidfile.read_text().strip())
-            except ValueError: candidate = 0
-            if candidate > 0 and command_matches(candidate, proc_starttime(candidate) or "", command): replacement_pid = candidate
-        if replacement_pid is None:
-            Path(record["qmpSocket"]).unlink(missing_ok=True)
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       start_new_session=True)
-            replacement_pid = process.pid
-        starttime = proc_starttime(replacement_pid)
-        require(starttime is not None and command_matches(replacement_pid, starttime, command), "replacement QEMU identity mismatch")
-        verify_persistent_guest(record, replacement_pid, starttime)
-        completed_at = max(time.monotonic_ns() // 1_000_000, prior["startedAtMonotonicMs"] + 1)
-        receipt = dict(prior); receipt.update(beforeIdentity={"pid": prior["beforePID"], "starttime": prior["beforeStarttime"]},
-                                              afterIdentity={"pid": replacement_pid, "starttime": starttime},
-                                              afterPID=replacement_pid, afterStarttime=starttime,
-                                              completedAtMonotonicMs=completed_at,
-                                              completed=True)
-        record["qemuPID"], record["qemuStarttime"], record["lastColdReboot"] = replacement_pid, starttime, receipt
-        write_persistent_state(state_path, record); print(json.dumps(receipt, sort_keys=True)); return 0
+        receipt = resume_cold_reboot(record, state_path, operation_id)
+        print(json.dumps(receipt, sort_keys=True)); return 0
+    if operation == "arm-cold-reboot":
+        assert operation_id is not None and cohort_id is not None and not_before_unix_ms is not None
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        if completed is not None:
+            print(json.dumps(completed, sort_keys=True)); return 0
+        prior = record.get("lastColdReboot")
+        if isinstance(prior, dict) and prior.get("completed") is True:
+            archive_completed_cold_reboot(record); prior = None
+        if isinstance(prior, dict) and prior.get("operationID") == operation_id and prior.get("cohortID") == cohort_id:
+            require(prior.get("phase") == "armed" and prior.get("completed") is False,
+                    "cold reboot operation state is malformed")
+            print(json.dumps(prior, sort_keys=True)); return 0
+        require(prior is None, "another cold reboot operation already owns this boundary")
+        require(command_matches(pid, record["qemuStarttime"], command), "exact QEMU process identity mismatch")
+        armed = {"operationID": operation_id, "cohortID": cohort_id, "beforePID": pid,
+                 "beforeStarttime": record["qemuStarttime"],
+                 "startedAtMonotonicMs": time.monotonic_ns() // 1_000_000,
+                 "armedAtUnixMs": time.time_ns() // 1_000_000,
+                 "notBeforeUnixMs": not_before_unix_ms, "phase": "armed", "completed": False}
+        record["lastColdReboot"] = armed; write_persistent_state(state_path, record)
+        print(json.dumps(armed, sort_keys=True)); return 0
+    if operation == "release-cold-reboot":
+        assert operation_id is not None and cohort_id is not None
+        completed = completed_cold_reboot_for(record, operation_id, cohort_id)
+        if completed is not None:
+            print(json.dumps(completed, sort_keys=True)); return 0
+        current = cold_reboot_status(record, operation_id, cohort_id)
+        require(current.get("completed") is False and current.get("phase") in ("armed", "released"),
+                "cold reboot operation is not armed")
+        released_at = time.time_ns() // 1_000_000
+        current["phase"] = "released"; current["releasedAtUnixMs"] = released_at
+        # The original arm deadline may have expired while Mothership was
+        # resuming a partially armed cohort.  Give every release attempt a
+        # fresh bounded interval to persist its receipt.  A second attempt can
+        # acquire this lock only after the prior detached child has exited, so
+        # refreshing these attempt clocks cannot race a live executor.
+        current["notBeforeUnixMs"] = max(int(current["notBeforeUnixMs"]),
+                                           released_at + COLD_REBOOT_RELEASE_GRACE_MS)
+        current["startedAtMonotonicMs"] = time.monotonic_ns() // 1_000_000
+        record["lastColdReboot"] = current; write_persistent_state(state_path, record)
+        child = os.fork()
+        if child == 0:
+            try: released_cold_reboot_child(state_path, task_id, operation_id, cohort_id)
+            except BaseException: os._exit(1)
+            os._exit(0)
+        print(json.dumps(current, sort_keys=True)); return 0
     if operation == "remove":
         if command_matches(pid, record["qemuStarttime"], command):
             stop_persistent_qemu(record, "exact cleanup")
@@ -618,6 +798,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         operation = sys.argv[1] if len(sys.argv) > 1 else ""
-        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "cold-reboot", "remove") else main())
+        raise SystemExit(lifecycle_main(sys.argv[1:]) if operation in ("launch", "query", "cold-reboot", "arm-cold-reboot", "release-cold-reboot", "remove") else main())
     except (BoundaryError, subprocess.CalledProcessError, OSError, json.JSONDecodeError) as error:
         print(f"FAIL: {error}", file=sys.stderr); raise SystemExit(1)

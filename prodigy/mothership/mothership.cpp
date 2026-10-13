@@ -13414,8 +13414,18 @@ private:
         document.type() != simdjson::dom::element_type::OBJECT)
     { failure.assign("local VM executor query returned malformed state"_ctv); return false; }
     auto object = document.get_object();
-    if (object.size() != 10 && object.size() != 11)
+    if (object.size() < 10 || object.size() > 13)
     { failure.assign("local VM executor query returned an unsupported state schema"_ctv); return false; }
+    for (auto field : object)
+    {
+      String key = {}; key.setInvariant(field.key.data(), field.key.size());
+      if (key != "taskID"_ctv && key != "guestUUID"_ctv && key != "machineID"_ctv &&
+          key != "overlay"_ctv && key != "ovmfVars"_ctv && key != "qmpSocket"_ctv &&
+          key != "qemuStarttime"_ctv && key != "qemuPID"_ctv && key != "qemuCommand"_ctv &&
+          key != "network"_ctv && key != "boundaryVerification"_ctv &&
+          key != "lastColdReboot"_ctv && key != "completedColdReboots"_ctv)
+      { failure.assign("local VM executor query contains an unknown state field"_ctv); return false; }
+    }
     std::string_view taskID, guestUUID, machineID, overlay, ovmfVars, qmpSocket, starttime;
     uint64_t pid = 0;
     simdjson::dom::array qemuCommand;
@@ -13736,6 +13746,507 @@ private:
     if (!valid && failure.empty())
       failure.assign("local VM executor did not prove a distinct verified post-reboot guest identity"_ctv);
     return valid;
+  }
+
+  enum class LocalAuthorityRecoveryExecutorPhase : uint8_t {
+    armed = 0,
+    released = 1,
+    completed = 2,
+  };
+
+  struct LocalAuthorityRecoveryExecutorReceipt {
+    LocalAuthorityRecoveryExecutorPhase phase = LocalAuthorityRecoveryExecutorPhase::armed;
+    uint64_t beforePID = 0;
+    String beforeStarttime;
+    uint64_t afterPID = 0;
+    String afterStarttime;
+    uint64_t startedAtMonotonicMs = 0;
+    uint64_t completedAtMonotonicMs = 0;
+    uint64_t armedAtUnixMs = 0;
+    uint64_t releasedAtUnixMs = 0;
+    uint64_t notBeforeUnixMs = 0;
+  };
+
+  struct LocalAuthorityRecoveryTarget {
+    MothershipLocalAuthorityRecoveryExecutor executor;
+    MothershipLocalVMBoundaryDescriptor boundary;
+    bool localSeed = false;
+  };
+
+  static bool localAuthorityRecoveryProcessStarttimeValid(std::string_view value)
+  {
+    return !value.empty() && value.size() <= 64 &&
+        std::all_of(value.begin(), value.end(), [](char byte) { return byte >= '0' && byte <= '9'; });
+  }
+
+  bool deriveLocalAuthorityRecoveryExecutorOperationUUID(
+      uint128_t operationUUID, uint128_t clusterUUID, uint128_t machineUUID,
+      uint128_t boundaryUUID, uint128_t& executorOperationUUID, String& failure)
+  {
+    String material = {}, identity = {}, digest = {};
+    material.assign("prodigy-local-authority-recovery-executor-v1|"_ctv);
+    mothershipAssignProviderHex128(operationUUID, identity); material.append(identity); material.append('|');
+    mothershipAssignProviderHex128(clusterUUID, identity); material.append(identity); material.append('|');
+    mothershipAssignProviderHex128(machineUUID, identity); material.append(identity); material.append('|');
+    mothershipAssignProviderHex128(boundaryUUID, identity); material.append(identity);
+    if (!prodigyComputeSHA256Hex(material, digest, &failure) || digest.size() != 64)
+      return false;
+    executorOperationUUID = String::numberFromHexString<uint128_t>(digest.substr(0, 32, Copy::no));
+    if (executorOperationUUID == 0)
+    { failure.assign("local authority recovery derived an invalid executor operation identity"_ctv); return false; }
+    return true;
+  }
+
+  bool parseLocalAuthorityRecoveryExecutorReceipt(
+      const String& output, uint128_t expectedOperationUUID, uint128_t expectedCohortUUID,
+      uint32_t timeoutMilliseconds, LocalAuthorityRecoveryExecutorReceipt& receipt,
+      String& failure)
+  {
+    receipt = {};
+    simdjson::dom::parser parser; simdjson::dom::element document;
+    if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
+        document.type() != simdjson::dom::element_type::OBJECT)
+    { failure.assign("local authority recovery executor returned malformed JSON"_ctv); return false; }
+    auto object = document.get_object();
+    std::string_view operation, cohort, phase, beforeStarttime;
+    bool completed = false;
+    if (object["operationID"].get(operation) || object["cohortID"].get(cohort) ||
+        object["phase"].get(phase) || object["completed"].get(completed) ||
+        object["beforePID"].get(receipt.beforePID) ||
+        object["beforeStarttime"].get(beforeStarttime) ||
+        object["startedAtMonotonicMs"].get(receipt.startedAtMonotonicMs) ||
+        object["armedAtUnixMs"].get(receipt.armedAtUnixMs) ||
+        object["notBeforeUnixMs"].get(receipt.notBeforeUnixMs))
+    { failure.assign("local authority recovery executor receipt is incomplete"_ctv); return false; }
+    String expectedOperation = {}, expectedCohort = {};
+    mothershipAssignProviderHex128(expectedOperationUUID, expectedOperation);
+    mothershipAssignProviderHex128(expectedCohortUUID, expectedCohort);
+    const auto equal = [](std::string_view observed, const String& expected) {
+      return observed.size() == expected.size() &&
+          (observed.empty() || std::memcmp(observed.data(), expected.data(), observed.size()) == 0);
+    };
+    if (!equal(operation, expectedOperation) || !equal(cohort, expectedCohort) ||
+        receipt.beforePID == 0 || !localAuthorityRecoveryProcessStarttimeValid(beforeStarttime) ||
+        receipt.startedAtMonotonicMs == 0 || receipt.armedAtUnixMs == 0 ||
+        receipt.notBeforeUnixMs < receipt.armedAtUnixMs)
+    { failure.assign("local authority recovery executor receipt conflicts with its exact cohort"_ctv); return false; }
+    receipt.beforeStarttime.setInvariant(beforeStarttime.data(), beforeStarttime.size());
+
+    if (phase == "armed" && !completed && object.size() == 9)
+    {
+      receipt.phase = LocalAuthorityRecoveryExecutorPhase::armed;
+      return true;
+    }
+    if (object["releasedAtUnixMs"].get(receipt.releasedAtUnixMs) || receipt.releasedAtUnixMs == 0 ||
+        receipt.releasedAtUnixMs > UINT64_MAX - mothershipLocalAuthorityRecoveryReleaseGraceMilliseconds ||
+        receipt.notBeforeUnixMs < receipt.releasedAtUnixMs + mothershipLocalAuthorityRecoveryReleaseGraceMilliseconds)
+    { failure.assign("local authority recovery executor release lacks its durable grace interval"_ctv); return false; }
+    if (phase == "released" && !completed && object.size() == 10)
+    {
+      receipt.phase = LocalAuthorityRecoveryExecutorPhase::released;
+      return true;
+    }
+    if (phase != "completed" || !completed || object.size() != 15)
+    { failure.assign("local authority recovery executor receipt has an unsupported phase"_ctv); return false; }
+
+    std::string_view afterStarttime, beforeIdentityStarttime, afterIdentityStarttime;
+    simdjson::dom::object beforeIdentity, afterIdentity;
+    uint64_t beforeIdentityPID = 0, afterIdentityPID = 0;
+    if (object["afterPID"].get(receipt.afterPID) ||
+        object["afterStarttime"].get(afterStarttime) ||
+        object["completedAtMonotonicMs"].get(receipt.completedAtMonotonicMs) ||
+        object["beforeIdentity"].get(beforeIdentity) || object["afterIdentity"].get(afterIdentity) ||
+        beforeIdentity.size() != 2 || afterIdentity.size() != 2 ||
+        beforeIdentity["pid"].get(beforeIdentityPID) ||
+        beforeIdentity["starttime"].get(beforeIdentityStarttime) ||
+        afterIdentity["pid"].get(afterIdentityPID) ||
+        afterIdentity["starttime"].get(afterIdentityStarttime) ||
+        receipt.afterPID == 0 || !localAuthorityRecoveryProcessStarttimeValid(afterStarttime) ||
+        beforeIdentityPID != receipt.beforePID || afterIdentityPID != receipt.afterPID ||
+        beforeIdentityStarttime != beforeStarttime || afterIdentityStarttime != afterStarttime ||
+        (receipt.beforePID == receipt.afterPID && beforeStarttime == afterStarttime) ||
+        receipt.completedAtMonotonicMs <= receipt.startedAtMonotonicMs ||
+        receipt.completedAtMonotonicMs - receipt.startedAtMonotonicMs > timeoutMilliseconds)
+    { failure.assign("local authority recovery executor did not prove one bounded distinct reboot"_ctv); return false; }
+    receipt.afterStarttime.setInvariant(afterStarttime.data(), afterStarttime.size());
+    receipt.phase = LocalAuthorityRecoveryExecutorPhase::completed;
+    return true;
+  }
+
+  bool runLocalAuthorityRecoveryExecutor(
+      const MothershipLocalVMBoundaryDescriptor& descriptor, uint128_t executorOperationUUID,
+      uint128_t cohortOperationUUID, const char *action, uint64_t notBeforeUnixMs,
+      uint32_t timeoutMilliseconds, LocalAuthorityRecoveryExecutorReceipt& receipt,
+      String& receiptSHA256, String& failure)
+  {
+    Vector<String> arguments = {};
+    arguments.emplace_back(action); arguments.emplace_back("--state"_ctv); arguments.push_back(descriptor.statePath);
+    arguments.emplace_back("--task-id"_ctv); arguments.push_back(descriptor.taskID);
+    String executorOperation = {}, cohortOperation = {};
+    mothershipAssignProviderHex128(executorOperationUUID, executorOperation);
+    mothershipAssignProviderHex128(cohortOperationUUID, cohortOperation);
+    arguments.emplace_back("--operation-id"_ctv); arguments.push_back(executorOperation);
+    arguments.emplace_back("--cohort-id"_ctv); arguments.push_back(cohortOperation);
+    if (std::strcmp(action, "arm-cold-reboot") == 0)
+    {
+      String deadline = {}; deadline.assignItoa(notBeforeUnixMs);
+      arguments.emplace_back("--not-before-unix-ms"_ctv); arguments.push_back(std::move(deadline));
+    }
+    else if (std::strcmp(action, "release-cold-reboot") != 0 && std::strcmp(action, "query") != 0)
+    { failure.assign("unsupported local authority recovery executor action"_ctv); return false; }
+    String output = {};
+    if (!runLocalVMBoundarySealedLauncher(descriptor, arguments, 45'000, output, failure) ||
+        !parseLocalAuthorityRecoveryExecutorReceipt(output, executorOperationUUID, cohortOperationUUID,
+                                                    timeoutMilliseconds, receipt, failure) ||
+        !prodigyComputeSHA256Hex(output, receiptSHA256, &failure)) return false;
+    return true;
+  }
+
+  bool localAuthorityRecoveryTopologyMatches(
+      const MothershipLocalAuthorityRecoveryCohortRecord& record,
+      const ClusterStatusReport& report, String& failure)
+  {
+    if (!report.hasTopology || report.topology.version != record.request.topologyVersion ||
+        report.topology.machines.size() != record.request.executors.size())
+    { failure.assign("local authority recovery observed a different topology generation"_ctv); return false; }
+    for (const auto& executor : record.request.executors)
+    {
+      uint32_t matches = 0;
+      for (const auto& machine : report.topology.machines)
+        if (machine.uuid == executor.machineUUID && machine.kind == MachineConfig::MachineKind::vm && machine.isBrain)
+          ++matches;
+      if (matches != 1)
+      { failure.assign("local authority recovery did not observe its exact three VM Brain identities"_ctv); return false; }
+    }
+    return true;
+  }
+
+  bool awaitLocalAuthorityRecoveryClusterHealth(
+      const MothershipProdigyCluster& cluster,
+      const MothershipLocalAuthorityRecoveryCohortRecord& record,
+      uint32_t timeoutMilliseconds, ClusterStatusReport& status, String& failure)
+  {
+    status = {}; failure.clear();
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMilliseconds);
+    String lastFailure = {};
+    while (std::chrono::steady_clock::now() <= deadline)
+    {
+      ClusterStatusReport candidate = {}; String attemptFailure = {};
+      if (productionClusterHealthy(cluster, candidate, attemptFailure) &&
+          localAuthorityRecoveryTopologyMatches(record, candidate, attemptFailure))
+      { status = std::move(candidate); return true; }
+      if (!attemptFailure.empty()) lastFailure = attemptFailure;
+      ::usleep(500'000);
+    }
+    if (lastFailure.empty())
+      failure.assign("local authority recovery cluster health remained unavailable before its deadline"_ctv);
+    else
+      failure = lastFailure;
+    return false;
+  }
+
+  bool localAuthorityRecoveryExecutorCompletionValid(
+      const LocalAuthorityRecoveryTarget& target,
+      const LocalAuthorityRecoveryExecutorReceipt& receipt, String& failure)
+  {
+    String immutable = {}, observedStarttime = {}; uint64_t observedPID = 0;
+    const bool valid = receipt.phase == LocalAuthorityRecoveryExecutorPhase::completed &&
+        queryLocalVMBoundaryExecutor(target.boundary, immutable, failure,
+                                     &observedPID, &observedStarttime) &&
+        immutable == target.executor.immutableBoundarySHA256 &&
+        observedPID == receipt.afterPID && observedStarttime == receipt.afterStarttime;
+    if (!valid && failure.empty())
+      failure.assign("local authority recovery completion does not own the current exact VM boundary"_ctv);
+    return valid;
+  }
+
+  bool awaitLocalAuthorityRecoveryNonSeed(
+      const LocalAuthorityRecoveryTarget& target, uint128_t cohortOperationUUID,
+      uint32_t timeoutMilliseconds, String& completedReceiptSHA256, String& failure)
+  {
+    completedReceiptSHA256.clear(); failure.clear();
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMilliseconds);
+    String lastFailure = {};
+    while (std::chrono::steady_clock::now() <= deadline)
+    {
+      LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {}, attemptFailure = {};
+      if (runLocalAuthorityRecoveryExecutor(
+              target.boundary, target.executor.executorOperationUUID, cohortOperationUUID,
+              "release-cold-reboot", 0, timeoutMilliseconds,
+              receipt, receiptSHA256, attemptFailure))
+      {
+        if (receipt.phase == LocalAuthorityRecoveryExecutorPhase::completed)
+        {
+          if (localAuthorityRecoveryExecutorCompletionValid(target, receipt, attemptFailure))
+          { completedReceiptSHA256 = std::move(receiptSHA256); return true; }
+        }
+        else if (receipt.phase == LocalAuthorityRecoveryExecutorPhase::released)
+        {
+          // Exact release has either started the original attempt or resumed
+          // a child which died after stopping QEMU.  Its inherited state lock
+          // prevents this polling loop from launching a concurrent attempt.
+          attemptFailure.assign("local authority recovery executor reboot remains in progress"_ctv);
+        }
+        else
+          attemptFailure.assign("local authority recovery executor regressed to armed after durable release"_ctv);
+      }
+      if (!attemptFailure.empty()) lastFailure = attemptFailure;
+      ::usleep(500'000);
+    }
+    if (lastFailure.empty())
+      failure.assign("local authority recovery non-seed reboot did not complete before its deadline"_ctv);
+    else
+      failure = lastFailure;
+    return false;
+  }
+
+  void runRecoverLocalClusterAuthority(int argc, char *argv[])
+  {
+    String failure = {};
+    uint128_t operationUUID = 0;
+    uint64_t timeout = 0;
+    bool valid = argc == 3 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
+        mothershipParseUnsignedArgument(argv[2], mothershipLocalVMFaultMaximumRecoveryMilliseconds, timeout) &&
+        timeout >= mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
+    if (!valid)
+      failure.assign("usage: recoverLocalClusterAuthority OPERATION_UUID CLUSTER TIMEOUT_MS (timeout must be 120000..300000)"_ctv);
+
+    MothershipProdigyCluster cluster = {};
+    if (valid)
+    {
+      auto registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[1]), cluster, &failure);
+    }
+    if (valid && (cluster.deploymentMode != MothershipClusterDeploymentMode::local || cluster.nBrains != 3 ||
+                  cluster.topology.version == 0 || cluster.topology.machines.size() != 3))
+    { failure.assign("local authority recovery requires one exact three-Brain deploymentMode=local topology"_ctv); valid = false; }
+
+    bool existingCohort = false;
+    if (valid)
+    {
+      MothershipLocalAuthorityRecoveryCohortRecord existing = {};
+      auto registry = openClusterRegistry(); String readFailure = {};
+      if (registry.loadLocalAuthorityRecoveryCohort(operationUUID, existing, &readFailure))
+        existingCohort = true;
+      else if (!readFailure.equal("record not found"_ctv))
+      { failure = readFailure; valid = false; }
+    }
+
+    ClusterMachine seedMachine = {};
+    if (valid) valid = buildLocalClusterMachineProbe(cluster, seedMachine, &failure) && seedMachine.uuid != 0;
+    Vector<LocalAuthorityRecoveryTarget> targets = {};
+    if (valid)
+    {
+      for (const auto& machine : cluster.topology.machines)
+      {
+        if (machine.uuid == 0 || machine.kind != MachineConfig::MachineKind::vm || !machine.isBrain ||
+            machine.backing != ClusterMachineBacking::owned || machine.lifetime != MachineLifetime::owned)
+        { failure.assign("local authority recovery topology is not three owned VM Brain boundaries"_ctv); valid = false; break; }
+        LocalAuthorityRecoveryTarget target = {};
+        {
+          auto registry = openClusterRegistry();
+          valid = registry.findActiveLocalVMBoundary(cluster.clusterUUID, machine.uuid,
+                                                     target.boundary, &failure);
+        }
+        String immutable = {};
+        if (valid && !existingCohort)
+          valid = queryLocalVMBoundaryExecutor(target.boundary, immutable, failure) &&
+              immutable == target.boundary.immutableStateSHA256;
+        if (!valid)
+        { if (failure.empty()) failure.assign("local authority recovery boundary identity changed"_ctv); break; }
+        target.executor.machineUUID = machine.uuid;
+        target.executor.boundaryUUID = target.boundary.vmBoundaryUUID;
+        target.executor.immutableBoundarySHA256 = target.boundary.immutableStateSHA256;
+        valid = deriveLocalAuthorityRecoveryExecutorOperationUUID(
+            operationUUID, cluster.clusterUUID, machine.uuid, target.boundary.vmBoundaryUUID,
+            target.executor.executorOperationUUID, failure);
+        if (!valid) break;
+        target.localSeed = machine.uuid == seedMachine.uuid;
+        targets.push_back(std::move(target));
+      }
+    }
+    if (valid)
+    {
+      std::sort(targets.begin(), targets.end(), [](const auto& left, const auto& right) {
+        return left.executor.machineUUID < right.executor.machineUUID;
+      });
+      uint32_t seeds = 0;
+      for (const auto& target : targets) if (target.localSeed) ++seeds;
+      if (targets.size() != 3 || seeds != 1)
+      { failure.assign("local authority recovery cannot identify exactly one local seed VM"_ctv); valid = false; }
+    }
+
+    MothershipLocalAuthorityRecoveryCohortRequest request = {};
+    MothershipLocalAuthorityRecoveryCohortRecord record = {};
+    bool resumed = false;
+    if (valid)
+    {
+      request.operationUUID = operationUUID; request.clusterUUID = cluster.clusterUUID;
+      request.topologyVersion = cluster.topology.version; request.timeoutMilliseconds = uint32_t(timeout);
+      for (const auto& target : targets) request.executors.push_back(target.executor);
+      auto registry = openClusterRegistry();
+      valid = registry.admitLocalAuthorityRecoveryCohort(request, record, resumed, &failure);
+    }
+    if (valid && record.phase == MothershipLocalAuthorityRecoveryPhase::recovered)
+    {
+      basics_log("recoverLocalClusterAuthority success=1 pending=0 resumed=1 phase=%u operationUUID=%016llx%016llx clusterUUID=%016llx%016llx failure=\n",
+          unsigned(record.phase), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID);
+      return;
+    }
+
+    const uint64_t nowUnixMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    const uint64_t notBeforeUnixMs = nowUnixMs + mothershipLocalAuthorityRecoveryArmDelayMilliseconds;
+    for (uint32_t index = 0; valid && index < targets.size(); ++index)
+    {
+      if (record.boundaries[index].phase != MothershipLocalAuthorityRecoveryPhase::admitted) continue;
+      LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
+      valid = runLocalAuthorityRecoveryExecutor(
+          targets[index].boundary, targets[index].executor.executorOperationUUID, operationUUID,
+          "arm-cold-reboot", notBeforeUnixMs, uint32_t(timeout), receipt, receiptSHA256, failure) &&
+          receipt.phase == LocalAuthorityRecoveryExecutorPhase::armed;
+      if (!valid)
+      { if (failure.empty()) failure.assign("local authority recovery executor did not remain durably armed"_ctv); break; }
+      auto registry = openClusterRegistry(); bool phaseResumed = false;
+      valid = registry.advanceLocalAuthorityRecoveryCohort(
+          operationUUID, targets[index].executor.boundaryUUID,
+          MothershipLocalAuthorityRecoveryPhase::armed, receiptSHA256,
+          record, phaseResumed, &failure);
+      resumed = resumed || phaseResumed;
+    }
+    if (valid && record.phase < MothershipLocalAuthorityRecoveryPhase::armed)
+    { failure.assign("local authority recovery has not durably armed every VM boundary"_ctv); valid = false; }
+
+    bool recoveryPending = false;
+    for (uint32_t index = 0; valid && index < targets.size(); ++index)
+    {
+      if (targets[index].localSeed ||
+          record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::recovered) continue;
+      if (record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::armed)
+      {
+        LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
+        valid = runLocalAuthorityRecoveryExecutor(
+            targets[index].boundary, targets[index].executor.executorOperationUUID, operationUUID,
+            "release-cold-reboot", 0, uint32_t(timeout), receipt, receiptSHA256, failure) &&
+            (receipt.phase == LocalAuthorityRecoveryExecutorPhase::released ||
+             receipt.phase == LocalAuthorityRecoveryExecutorPhase::completed);
+        if (!valid)
+        { if (failure.empty()) failure.assign("local authority recovery executor did not durably release"_ctv); break; }
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceLocalAuthorityRecoveryCohort(
+            operationUUID, targets[index].executor.boundaryUUID,
+            MothershipLocalAuthorityRecoveryPhase::released, receiptSHA256,
+            record, phaseResumed, &failure);
+        resumed = resumed || phaseResumed;
+      }
+      String completedReceiptSHA256 = {};
+      if (valid && record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::released &&
+          !awaitLocalAuthorityRecoveryNonSeed(
+              targets[index], operationUUID, uint32_t(timeout), completedReceiptSHA256, failure))
+      { valid = false; recoveryPending = true; }
+    }
+
+    uint32_t seedIndex = targets.size();
+    for (uint32_t index = 0; index < targets.size(); ++index)
+      if (targets[index].localSeed) seedIndex = index;
+    if (valid && seedIndex == targets.size())
+    { failure.assign("local authority recovery lost its exact seed VM identity"_ctv); valid = false; }
+    bool seedReleasedPending = false;
+    if (valid && record.boundaries[seedIndex].phase == MothershipLocalAuthorityRecoveryPhase::armed)
+    {
+      LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
+      valid = runLocalAuthorityRecoveryExecutor(
+          targets[seedIndex].boundary, targets[seedIndex].executor.executorOperationUUID, operationUUID,
+          "release-cold-reboot", 0, uint32_t(timeout), receipt, receiptSHA256, failure) &&
+          (receipt.phase == LocalAuthorityRecoveryExecutorPhase::released ||
+           receipt.phase == LocalAuthorityRecoveryExecutorPhase::completed);
+      if (valid)
+      {
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceLocalAuthorityRecoveryCohort(
+            operationUUID, targets[seedIndex].executor.boundaryUUID,
+            MothershipLocalAuthorityRecoveryPhase::released, receiptSHA256,
+            record, phaseResumed, &failure);
+        resumed = resumed || phaseResumed;
+      }
+      if (valid && receipt.phase == LocalAuthorityRecoveryExecutorPhase::released)
+        seedReleasedPending = true;
+    }
+    if (valid && record.phase < MothershipLocalAuthorityRecoveryPhase::released)
+    { failure.assign("local authority recovery has not durably released every VM boundary"_ctv); valid = false; }
+    if (seedReleasedPending)
+    {
+      basics_log("recoverLocalClusterAuthority success=0 pending=1 resumed=%u phase=released operationUUID=%016llx%016llx clusterUUID=%016llx%016llx failure=cohort released; retry after the seed VM returns\n",
+          unsigned(resumed), (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID);
+      exit(75);
+    }
+
+    Vector<String> completedReceiptSHA256s = {}; completedReceiptSHA256s.resize(targets.size());
+    for (uint32_t index = 0; valid && index < targets.size(); ++index)
+    {
+      if (record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::recovered) continue;
+      if (!targets[index].localSeed)
+      {
+        valid = awaitLocalAuthorityRecoveryNonSeed(
+            targets[index], operationUUID, uint32_t(timeout),
+            completedReceiptSHA256s[index], failure);
+        if (!valid) recoveryPending = true;
+        continue;
+      }
+      LocalAuthorityRecoveryExecutorReceipt receipt = {}; String receiptSHA256 = {};
+      valid = runLocalAuthorityRecoveryExecutor(
+          targets[index].boundary, targets[index].executor.executorOperationUUID, operationUUID,
+          "release-cold-reboot", 0, uint32_t(timeout), receipt, receiptSHA256, failure);
+      if (valid && receipt.phase == LocalAuthorityRecoveryExecutorPhase::released)
+      { recoveryPending = true; valid = false; }
+      if (valid) valid = localAuthorityRecoveryExecutorCompletionValid(targets[index], receipt, failure);
+      if (!valid)
+      {
+        recoveryPending = true;
+        if (failure.empty()) failure.assign("local authority recovery seed reboot is still pending exact boundary proof"_ctv);
+        break;
+      }
+      completedReceiptSHA256s[index] = std::move(receiptSHA256);
+    }
+
+    ClusterStatusReport status = {};
+    if (valid && !awaitLocalAuthorityRecoveryClusterHealth(
+                     cluster, record, uint32_t(timeout), status, failure))
+    { valid = false; recoveryPending = true; }
+    if (valid)
+    {
+      for (uint32_t index = 0; valid && index < targets.size(); ++index)
+      {
+        if (record.boundaries[index].phase == MothershipLocalAuthorityRecoveryPhase::recovered) continue;
+        auto registry = openClusterRegistry(); bool phaseResumed = false;
+        valid = registry.advanceLocalAuthorityRecoveryCohort(
+            operationUUID, targets[index].executor.boundaryUUID,
+            MothershipLocalAuthorityRecoveryPhase::recovered, completedReceiptSHA256s[index],
+            record, phaseResumed, &failure);
+        resumed = resumed || phaseResumed;
+      }
+    }
+
+    if (!valid && recoveryPending)
+    {
+      basics_log("recoverLocalClusterAuthority success=0 pending=1 resumed=%u phase=%u operationUUID=%016llx%016llx clusterUUID=%016llx%016llx failure=%s\n",
+          unsigned(resumed), unsigned(record.phase),
+          (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+          (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+          failure.c_str());
+      exit(75);
+    }
+    const bool recovered = valid && record.phase == MothershipLocalAuthorityRecoveryPhase::recovered;
+    basics_log("recoverLocalClusterAuthority success=%u pending=0 resumed=%u phase=%u operationUUID=%016llx%016llx clusterUUID=%016llx%016llx failure=%s\n",
+        unsigned(recovered), unsigned(resumed), unsigned(record.phase),
+        (unsigned long long)(operationUUID >> 64), (unsigned long long)operationUUID,
+        (unsigned long long)(cluster.clusterUUID >> 64), (unsigned long long)cluster.clusterUUID,
+        failure.c_str());
+    if (!recovered) exit(EXIT_FAILURE);
   }
 
   void runPrepareProductionPair(int argc, char *argv[])
@@ -26351,6 +26862,7 @@ public:
         {"pullRoutableResourceLeases",      &Mothership::runPullRoutableResourceLeases     },
         {"pullRoutableSubnets",             &Mothership::runPullRoutableSubnets            },
         {"recommendClusterForApplications", &Mothership::runRecommendClusterForApplications},
+        {"recoverLocalClusterAuthority",    &Mothership::runRecoverLocalClusterAuthority   },
         {"recoverMaterializedStatefulDeployment", &Mothership::runRecoverMaterializedStatefulDeployment },
         {"recoverRetainedFleet", &Mothership::runRecoverRetainedFleet},
         {"recoverTestClusterBundle",        &Mothership::runRecoverTestClusterBundle       },
@@ -26423,7 +26935,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -26477,6 +26989,8 @@ int main(int argc, char *argv[])
     message.append("\trequests one bounded guest-owned peer-host partition through the sealed Mothership physical-fault owner\n");
     message.append("faultLocalClusterMachine [operationUUID] [localVMBoundaryUUID] cold-reboot [timeoutMs]\n");
     message.append("\tcold-reboots one exact registered VM in a three-Brain deploymentMode=local cluster and proves its new healthy boot identity\n");
+    message.append("recoverLocalClusterAuthority [operationUUID] [cluster] [timeoutMs]\n");
+    message.append("\tdurably arms and releases one exact three-VM local recovery cohort, then seals it only after all distinct reboots and normal one-master health are observed\n");
     message.append("faultRemoteCloudMachine [clusterName|clusterUUID] [machineUUID canonical hex] hard-reboot\n");
     message.append("\trefreshes authoritative topology, resolves one exact Mothership-created Vultr machine, and submits one bounded provider hard reboot\n");
     message.append("faultTestCluster [name|clusterUUID] [link|crash|flap] [machine indices csv] [durationMs] [cycles] [downMs] [upMs]\n");

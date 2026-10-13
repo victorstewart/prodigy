@@ -550,6 +550,7 @@ private:
   constexpr static auto physicalNetworkFaultsColumnFamily = "physical_network_faults"_ctv;
   constexpr static auto localVMBoundariesColumnFamily = "local_vm_boundaries"_ctv;
   constexpr static auto localVMFaultsColumnFamily = "local_vm_faults"_ctv;
+  constexpr static auto localAuthorityRecoveryCohortsColumnFamily = "local_authority_recovery_cohorts"_ctv;
   constexpr static auto localMembershipCleanupColumnFamily = "local_membership_cleanup"_ctv;
   constexpr static auto clusterRecordV2Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=2\n\n"_ctv;
   constexpr static auto clusterRecordV3Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=3\n\n"_ctv;
@@ -4339,6 +4340,122 @@ public:
     recorded.hasReceipt = true; recorded.receipt = receipt; auto copy = recorded;
     BitseryEngine::serialize(encoded, copy);
     return db.write(localVMFaultsColumnFamily, key, encoded, failure);
+  }
+
+  bool loadLocalAuthorityRecoveryCohort(uint128_t operationUUID,
+                                         MothershipLocalAuthorityRecoveryCohortRecord& recorded,
+                                         String *failure = nullptr)
+  {
+    recorded = {};
+    if (operationUUID == 0)
+    { if (failure) failure->assign("local authority recovery operation UUID is required"_ctv); return false; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    if (!db.read(localAuthorityRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+        !mothershipLocalAuthorityRecoveryCohortRecordValid(recorded) ||
+        recorded.request.operationUUID != operationUUID)
+    {
+      recorded = {};
+      if (failure) failure->assign("local authority recovery cohort is corrupt or unsupported"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool admitLocalAuthorityRecoveryCohort(const MothershipLocalAuthorityRecoveryCohortRequest& requested,
+                                         MothershipLocalAuthorityRecoveryCohortRecord& recorded,
+                                         bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipLocalAuthorityRecoveryCohortRequestValid(requested, failure)) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.operationUUID);
+    if (db.read(localAuthorityRecoveryCohortsColumnFamily, key, encoded, &readFailure))
+    {
+      if (!BitseryEngine::deserializeSafe(encoded, recorded) ||
+          !mothershipLocalAuthorityRecoveryCohortRecordValid(recorded) ||
+          !mothershipPhysicalFaultExactSerializedEqual(recorded.request, requested))
+      {
+        recorded = {};
+        if (failure) failure->assign("local authority recovery operation UUID conflicts with immutable cohort"_ctv);
+        return false;
+      }
+      resumed = true;
+      if (failure) failure->clear();
+      return true;
+    }
+    if (!readFailure.equal("record not found"_ctv)) { if (failure) *failure = readFailure; return false; }
+    recorded.protocolVersion = MothershipLocalAuthorityRecoveryCohortRecord::version;
+    recorded.request = requested;
+    recorded.phase = MothershipLocalAuthorityRecoveryPhase::admitted;
+    for (const auto& executor : requested.executors)
+    {
+      MothershipLocalAuthorityRecoveryBoundaryProgress progress = {};
+      progress.boundaryUUID = executor.boundaryUUID;
+      recorded.boundaries.push_back(std::move(progress));
+    }
+    auto copy = recorded; BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localAuthorityRecoveryCohortsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // Each boundary advances independently.  The cohort phase is the minimum
+  // durable boundary phase, which makes a crash between executor receipts
+  // resumable without authorizing a skipped cohort transition.
+  bool advanceLocalAuthorityRecoveryCohort(uint128_t operationUUID, uint128_t boundaryUUID,
+                                           MothershipLocalAuthorityRecoveryPhase phase,
+                                           const String& receiptSHA256,
+                                           MothershipLocalAuthorityRecoveryCohortRecord& recorded,
+                                           bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (operationUUID == 0 || boundaryUUID == 0 ||
+        !mothershipLocalAuthorityRecoveryPhaseValid(phase) ||
+        phase == MothershipLocalAuthorityRecoveryPhase::admitted ||
+        !mothershipPhysicalFaultDigestValid(receiptSHA256))
+    { if (failure) failure->assign("local authority recovery advance requires one receipt-bearing boundary phase"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadLocalAuthorityRecoveryCohort(operationUUID, recorded, failure)) return false;
+    uint32_t index = recorded.boundaries.size();
+    for (uint32_t candidate = 0; candidate < recorded.boundaries.size(); ++candidate)
+      if (recorded.boundaries[candidate].boundaryUUID == boundaryUUID) { index = candidate; break; }
+    if (index == recorded.boundaries.size())
+    { if (failure) failure->assign("local authority recovery boundary is not in this cohort"_ctv); return false; }
+    auto& progress = recorded.boundaries[index];
+    if (recorded.phase == MothershipLocalAuthorityRecoveryPhase::recovered)
+    {
+      resumed = progress.phase == phase && progress.receiptSHA256 == receiptSHA256;
+      if (!resumed && failure) failure->assign("recovered local authority recovery cohort is immutable"_ctv);
+      return resumed;
+    }
+    if (progress.phase == phase)
+    {
+      resumed = progress.receiptSHA256 == receiptSHA256;
+      if (!resumed && failure) failure->assign("local authority recovery boundary receipt conflicts with durable progress"_ctv);
+      return resumed;
+    }
+    if (uint8_t(phase) != uint8_t(progress.phase) + 1)
+    { if (failure) failure->assign("local authority recovery boundary phase is stale or skips durable progress"_ctv); return false; }
+    if (phase > MothershipLocalAuthorityRecoveryPhase::armed &&
+        uint8_t(recorded.phase) + 1 != uint8_t(phase))
+    {
+      if (failure) failure->assign("local authority recovery cannot cross a cohort barrier before every boundary"_ctv);
+      return false;
+    }
+    progress.phase = phase; progress.receiptSHA256 = receiptSHA256;
+    MothershipLocalAuthorityRecoveryPhase common = MothershipLocalAuthorityRecoveryPhase::recovered;
+    for (const auto& candidate : recorded.boundaries)
+      if (uint8_t(candidate.phase) < uint8_t(common)) common = candidate.phase;
+    recorded.phase = common;
+    if (!mothershipLocalAuthorityRecoveryCohortRecordValid(recorded, failure)) return false;
+    String key = {}, encoded = {}; key.assignItoh(operationUUID); auto copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    if (!db.write(localAuthorityRecoveryCohortsColumnFamily, key, encoded, failure)) return false;
+    if (failure) failure->clear();
+    return true;
   }
 
   bool recordCousinRoute(const CousinRouteRecord& requested,

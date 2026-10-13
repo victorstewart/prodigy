@@ -45,12 +45,30 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("else\n    {\n      ProdigyPersistentStateStore", helper[verified:fallback + 80])
 
     def test_cold_reboot_accepts_only_fixed_width_provider_operation_identity(self):
-        self.assertIn('re.fullmatch(r"[0-9a-f]{32}", remainder[1]) is not None', KVM_BOUNDARY)
+        self.assertIn('re.fullmatch(r"[0-9a-f]{32}", value) is not None', KVM_BOUNDARY)
+        self.assertIn('canonical_cold_reboot_id(options.get("--operation-id"), "operation ID")', KVM_BOUNDARY)
         begin = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction")
         end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
         helper = MOTHERSHIP[begin:end]
         self.assertIn("mothershipAssignProviderHex128(operationUUID, operation);", helper)
         self.assertNotIn("operation.assignItoh", helper)
+
+    def test_authority_recovery_arms_all_boundaries_and_releases_the_seed_last(self):
+        begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
+        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        owner = MOTHERSHIP[begin:end]
+        self.assertIn('"arm-cold-reboot"', owner)
+        self.assertIn('"release-cold-reboot"', owner)
+        peer_completion = owner.index("!awaitLocalAuthorityRecoveryNonSeed")
+        seed_release = owner.index("targets[seedIndex].boundary")
+        self.assertLess(peer_completion, seed_release)
+        self.assertIn("if (targets[index].localSeed", owner)
+        self.assertIn("MothershipLocalAuthorityRecoveryPhase::armed", owner)
+        self.assertIn("MothershipLocalAuthorityRecoveryPhase::released", owner)
+        self.assertIn("awaitLocalAuthorityRecoveryClusterHealth", owner)
+        self.assertIn("exit(75)", owner)
+        self.assertIn("COLD_REBOOT_RELEASE_GRACE_MS", KVM_BOUNDARY)
+        self.assertIn('current["notBeforeUnixMs"] = max', KVM_BOUNDARY)
 
 
 if __name__ == "__main__":

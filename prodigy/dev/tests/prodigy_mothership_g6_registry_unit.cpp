@@ -329,6 +329,58 @@ int main()
     assert(registry.recordLocalVMMachineFaultReceipt(local, localReceipt, localRecord, resumed, &failure) && !resumed);
     assert(registry.recordLocalVMMachineFaultReceipt(local, localReceipt, localRecord, resumed, &failure) && resumed);
 
+    MothershipLocalAuthorityRecoveryCohortRequest cohort = {};
+    cohort.operationUUID = 0xb01; cohort.clusterUUID = localBoundary.clusterUUID;
+    cohort.topologyVersion = 17;
+    cohort.timeoutMilliseconds = mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
+    for (uint128_t machine : {uint128_t(0xb11), uint128_t(0xb12), uint128_t(0xb13)})
+    {
+      MothershipLocalAuthorityRecoveryExecutor executor = {};
+      executor.machineUUID = machine; executor.boundaryUUID = machine + 0x100;
+      executor.executorOperationUUID = machine + 0x200; executor.immutableBoundarySHA256 = digest('a');
+      cohort.executors.push_back(std::move(executor));
+    }
+    MothershipLocalAuthorityRecoveryCohortRecord cohortRecord = {};
+    assert(registry.admitLocalAuthorityRecoveryCohort(cohort, cohortRecord, resumed, &failure) && !resumed);
+    assert(registry.admitLocalAuthorityRecoveryCohort(cohort, cohortRecord, resumed, &failure) && resumed);
+    auto conflictingCohort = cohort; conflictingCohort.timeoutMilliseconds++;
+    assert(!registry.admitLocalAuthorityRecoveryCohort(conflictingCohort, cohortRecord, resumed, &failure));
+    assert(registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::armed,
+        digest('b'), cohortRecord, resumed, &failure) && !resumed);
+    assert(!registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::released,
+        digest('c'), cohortRecord, resumed, &failure));
+    for (uint32_t index = 1; index < cohort.executors.size(); ++index)
+    {
+      const auto& executor = cohort.executors[index];
+      assert(registry.advanceLocalAuthorityRecoveryCohort(
+          cohort.operationUUID, executor.boundaryUUID, MothershipLocalAuthorityRecoveryPhase::armed,
+          digest('b'), cohortRecord, resumed, &failure) && !resumed);
+    }
+    assert(cohortRecord.phase == MothershipLocalAuthorityRecoveryPhase::armed);
+    assert(registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::armed,
+        digest('b'), cohortRecord, resumed, &failure) && resumed);
+    assert(!registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::recovered,
+        digest('c'), cohortRecord, resumed, &failure));
+    for (const auto& executor : cohort.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(
+          cohort.operationUUID, executor.boundaryUUID, MothershipLocalAuthorityRecoveryPhase::released,
+          digest('c'), cohortRecord, resumed, &failure) && !resumed);
+    for (const auto& executor : cohort.executors)
+      assert(registry.advanceLocalAuthorityRecoveryCohort(
+          cohort.operationUUID, executor.boundaryUUID, MothershipLocalAuthorityRecoveryPhase::recovered,
+          digest('d'), cohortRecord, resumed, &failure) && !resumed);
+    assert(cohortRecord.phase == MothershipLocalAuthorityRecoveryPhase::recovered);
+    assert(registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::recovered,
+        digest('d'), cohortRecord, resumed, &failure) && resumed);
+    assert(!registry.advanceLocalAuthorityRecoveryCohort(
+        cohort.operationUUID, cohort.executors[0].boundaryUUID, MothershipLocalAuthorityRecoveryPhase::recovered,
+        digest('e'), cohortRecord, resumed, &failure));
+
     MothershipPhysicalServiceTransitBoundary closed = {};
     assert(!registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('8'), closed, resumed, &failure));
     assert(registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::sourceIngressWitnessed,
@@ -358,6 +410,9 @@ int main()
     assert(reopened.loadPhysicalServiceTransitBoundary(0x501, boundary, &failure) && boundary.closed &&
            boundary.admissionReceiptSHA256 == digest('2') && boundary.cleanupReceiptSHA256 == digest('8'));
     assert(reopened.loadLocalVMBoundary(0x801, localBoundary, &failure) && !localBoundary.retired);
+    MothershipLocalAuthorityRecoveryCohortRecord cohort = {};
+    assert(reopened.loadLocalAuthorityRecoveryCohort(0xb01, cohort, &failure) &&
+           cohort.phase == MothershipLocalAuthorityRecoveryPhase::recovered);
   }
 
   std::puts("PASS: G6 registry persists exact production-pair, transit, and fault owners");

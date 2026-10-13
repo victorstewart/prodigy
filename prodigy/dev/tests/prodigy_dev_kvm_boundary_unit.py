@@ -306,6 +306,93 @@ class KvmBoundaryUnit(unittest.TestCase):
         with self.assertRaisesRegex(KVM.BoundaryError, "strictly ordered"):
             KVM.completed_cold_reboot(record, "1" * 32)
 
+    def test_completed_reboot_history_replays_exactly_and_refuses_new_admission_at_bound(self):
+        receipt = {"operationID": "1" * 32, "cohortID": "a" * 32, "beforePID": 4,
+                   "beforeStarttime": "8", "afterPID": 5, "afterStarttime": "9",
+                   "startedAtMonotonicMs": 10, "completedAtMonotonicMs": 20,
+                   "completed": True, "phase": "completed"}
+        record = {"lastColdReboot": dict(receipt), "completedColdReboots": []}
+        KVM.archive_completed_cold_reboot(record)
+        self.assertIsNone(record.get("lastColdReboot"))
+        self.assertEqual(KVM.completed_cold_reboot_for(record, "1" * 32, "a" * 32)["afterPID"], 5)
+        self.assertIsNone(KVM.completed_cold_reboot_for(record, "1" * 32, "b" * 32))
+        record = {"lastColdReboot": dict(receipt), "completedColdReboots": [dict(receipt) for _ in range(KVM.COLD_REBOOT_HISTORY_LIMIT)]}
+        with self.assertRaisesRegex(KVM.BoundaryError, "history is full"):
+            KVM.archive_completed_cold_reboot(record)
+
+    def test_arm_cold_reboot_persists_exact_identity_before_any_qemu_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state = root / "state"; operation, cohort = "1" * 32, "2" * 32
+            record = {"qemuPID": 42, "qemuStarttime": "old", "qemuCommand": ["qemu"],
+                      "lastColdReboot": None}
+            written = []
+            with mock.patch.object(KVM, "load_persistent_state", return_value=record), \
+                 mock.patch.object(KVM, "command_matches", return_value=True), \
+                 mock.patch.object(KVM, "write_persistent_state", side_effect=lambda _p, value: written.append(dict(value))), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop, \
+                 mock.patch.object(KVM.subprocess, "Popen") as spawn, \
+                 mock.patch.object(KVM.time, "time_ns", return_value=1_000_000), \
+                 mock.patch.object(KVM.time, "monotonic_ns", return_value=2_000_000):
+                self.assertEqual(KVM._lifecycle_main(["arm-cold-reboot", "--state", str(state), "--task-id", "g6-task",
+                                                       "--operation-id", operation, "--cohort-id", cohort,
+                                                       "--not-before-unix-ms", "1001"]), 0)
+            stop.assert_not_called(); spawn.assert_not_called()
+            self.assertEqual(written[0]["lastColdReboot"]["phase"], "armed")
+            self.assertEqual(written[0]["lastColdReboot"]["beforeStarttime"], "old")
+
+    def test_release_cold_reboot_detaches_after_durable_release_and_parent_never_stops_qemu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); state = root / "state"; operation, cohort = "1" * 32, "2" * 32
+            armed = {"operationID": operation, "cohortID": cohort, "beforePID": 42, "beforeStarttime": "old",
+                     "startedAtMonotonicMs": 1, "armedAtUnixMs": 2, "notBeforeUnixMs": 9_999,
+                     "phase": "armed", "completed": False}
+            record = {"qemuPID": 42, "qemuStarttime": "old", "qemuCommand": ["qemu"], "lastColdReboot": armed}
+            written = []
+            with mock.patch.object(KVM, "load_persistent_state", return_value=record), \
+                 mock.patch.object(KVM, "write_persistent_state", side_effect=lambda _p, value: written.append(dict(value))), \
+                 mock.patch.object(KVM.os, "fork", return_value=123) as fork, \
+                 mock.patch.object(KVM.time, "time_ns", return_value=10_000_000_000), \
+                 mock.patch.object(KVM.time, "monotonic_ns", return_value=20_000_000_000), \
+                 mock.patch.object(KVM, "stop_persistent_qemu") as stop:
+                self.assertEqual(KVM._lifecycle_main(["release-cold-reboot", "--state", str(state), "--task-id", "g6-task",
+                                                       "--operation-id", operation, "--cohort-id", cohort]), 0)
+            fork.assert_called_once(); stop.assert_not_called()
+            self.assertEqual(written[0]["lastColdReboot"]["phase"], "released")
+            self.assertEqual(written[0]["lastColdReboot"]["notBeforeUnixMs"],
+                             10_000 + KVM.COLD_REBOOT_RELEASE_GRACE_MS)
+            self.assertEqual(written[0]["lastColdReboot"]["startedAtMonotonicMs"], 20_000)
+
+    def test_release_retry_refreshes_a_stranded_detached_attempt_before_refork(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"; operation, cohort = "1" * 32, "2" * 32
+            released = {"operationID": operation, "cohortID": cohort, "beforePID": 42,
+                        "beforeStarttime": "old", "startedAtMonotonicMs": 1,
+                        "armedAtUnixMs": 2, "releasedAtUnixMs": 3, "notBeforeUnixMs": 4,
+                        "phase": "released", "completed": False}
+            record = {"qemuPID": 42, "qemuStarttime": "old", "qemuCommand": ["qemu"],
+                      "lastColdReboot": released}
+            written = []
+            with mock.patch.object(KVM, "load_persistent_state", return_value=record), \
+                 mock.patch.object(KVM, "write_persistent_state", side_effect=lambda _p, value: written.append(dict(value))), \
+                 mock.patch.object(KVM.os, "fork", return_value=123), \
+                 mock.patch.object(KVM.time, "time_ns", return_value=50_000_000_000), \
+                 mock.patch.object(KVM.time, "monotonic_ns", return_value=60_000_000_000):
+                self.assertEqual(KVM._lifecycle_main(["release-cold-reboot", "--state", str(state),
+                                                       "--task-id", "g6-task", "--operation-id", operation,
+                                                       "--cohort-id", cohort]), 0)
+            self.assertEqual(written[0]["lastColdReboot"]["releasedAtUnixMs"], 50_000)
+            self.assertEqual(written[0]["lastColdReboot"]["startedAtMonotonicMs"], 60_000)
+            self.assertEqual(written[0]["lastColdReboot"]["notBeforeUnixMs"],
+                             50_000 + KVM.COLD_REBOOT_RELEASE_GRACE_MS)
+
+    def test_two_phase_reboot_source_contract_keeps_the_lock_in_a_detached_child(self):
+        source = SOURCE.read_text()
+        self.assertIn("def released_cold_reboot_child", source)
+        self.assertIn("os.setsid()", source)
+        self.assertIn("signal.signal(signal.SIGHUP, signal.SIG_IGN)", source)
+        self.assertIn("resume_cold_reboot(record, state_path, operation_id, cohort_id)", source)
+        self.assertIn('current["phase"] = "released"', source)
+
     def test_cold_reboot_survives_loss_of_the_rebooted_guests_ssh_session(self):
         with mock.patch.object(KVM.signal, "signal") as install:
             KVM.preserve_cold_reboot_after_session_loss()

@@ -256,5 +256,27 @@ int main(void)
   suite.expect(!mothershipLocalVMMachineFaultRequestValid(localReplay, &failure),
                "local_vm_request_rejects_untyped_boot_identity");
 
+  MothershipLocalAuthorityRecoveryCohortRequest cohort = {};
+  cohort.operationUUID = 0x9001; cohort.clusterUUID = 0x9002; cohort.topologyVersion = 17;
+  cohort.timeoutMilliseconds = mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds;
+  for (uint128_t machine : {uint128_t(0x11), uint128_t(0x22), uint128_t(0x33)})
+  {
+    MothershipLocalAuthorityRecoveryExecutor executor = {};
+    executor.machineUUID = machine; executor.boundaryUUID = machine + 0x100;
+    executor.executorOperationUUID = machine + 0x200; executor.immutableBoundarySHA256 = digest('f');
+    cohort.executors.push_back(std::move(executor));
+  }
+  suite.expect(mothershipLocalAuthorityRecoveryCohortRequestValid(cohort, &failure) && failure.empty(),
+               "authority_recovery_requires_canonical_three_boundary_cohort");
+  auto shortCohort = cohort; shortCohort.timeoutMilliseconds--;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(shortCohort, &failure),
+               "authority_recovery_rejects_timeout_below_supported_recovery_bound");
+  auto invalidCohort = cohort; invalidCohort.executors[1].machineUUID = invalidCohort.executors[0].machineUUID;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(invalidCohort, &failure),
+               "authority_recovery_rejects_noncanonical_or_duplicate_machine_cohort");
+  invalidCohort = cohort; invalidCohort.executors[2].boundaryUUID = invalidCohort.executors[1].boundaryUUID;
+  suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(invalidCohort, &failure),
+               "authority_recovery_rejects_duplicate_boundary_identity");
+
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

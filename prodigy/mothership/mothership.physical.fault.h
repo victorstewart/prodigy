@@ -15,6 +15,9 @@
 constexpr static uint32_t mothershipPhysicalFaultMaximumDurationMilliseconds = 60'000;
 constexpr static uint32_t mothershipPhysicalFaultRestorationSlackMilliseconds = 5'000;
 constexpr static uint32_t mothershipLocalVMFaultMaximumRecoveryMilliseconds = 300'000;
+constexpr static uint32_t mothershipLocalAuthorityRecoveryArmDelayMilliseconds = 60'000;
+constexpr static uint32_t mothershipLocalAuthorityRecoveryReleaseGraceMilliseconds = 30'000;
+constexpr static uint32_t mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds = 120'000;
 // This is a provider-owned task directory, not caller-controlled execution
 // data. The sealed guest executor creates it only beneath /var/lib/prodigy
 // after proving that parent is root-owned and not group/world writable.
@@ -139,7 +142,6 @@ public:
   int64_t admittedAtMs = 0;
   bool closed = false;
 };
-
 template <typename S>
 static void serialize(S&& serializer, MothershipPhysicalServiceTransitBoundary& value)
 {
@@ -712,6 +714,149 @@ static void serialize(S&& serializer, MothershipLocalVMMachineFaultRecord& value
   serializer.value4b(value.protocolVersion); serializer.object(value.request);
   serializer.object(value.admission);
   serializer.value1b(value.hasReceipt); serializer.object(value.receipt);
+}
+
+// A local authority recovery never delegates discovery or execution authority
+// to the caller.  It only durably names the three already-proven local VM
+// boundaries which must take part in one bounded recovery cohort.
+enum class MothershipLocalAuthorityRecoveryPhase : uint8_t {
+  admitted = 0,
+  armed = 1,
+  released = 2,
+  recovered = 3,
+};
+
+class MothershipLocalAuthorityRecoveryExecutor {
+public:
+  uint128_t machineUUID = 0;
+  uint128_t boundaryUUID = 0;
+  uint128_t executorOperationUUID = 0; // derived by the cohort owner
+  String immutableBoundarySHA256;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryExecutor& value)
+{
+  serializer.value16b(value.machineUUID); serializer.value16b(value.boundaryUUID);
+  serializer.value16b(value.executorOperationUUID); serializer.text1b(value.immutableBoundarySHA256, 64);
+}
+
+class MothershipLocalAuthorityRecoveryCohortRequest {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  uint128_t operationUUID = 0;
+  uint128_t clusterUUID = 0;
+  uint64_t topologyVersion = 0;
+  uint32_t timeoutMilliseconds = 0;
+  Vector<MothershipLocalAuthorityRecoveryExecutor> executors;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRequest& value)
+{
+  serializer.value4b(value.protocolVersion); serializer.value16b(value.operationUUID);
+  serializer.value16b(value.clusterUUID); serializer.value8b(value.topologyVersion);
+  serializer.value4b(value.timeoutMilliseconds); serializer.object(value.executors);
+}
+
+static inline bool mothershipLocalAuthorityRecoveryPhaseValid(MothershipLocalAuthorityRecoveryPhase value)
+{
+  return value == MothershipLocalAuthorityRecoveryPhase::admitted ||
+      value == MothershipLocalAuthorityRecoveryPhase::armed ||
+      value == MothershipLocalAuthorityRecoveryPhase::released ||
+      value == MothershipLocalAuthorityRecoveryPhase::recovered;
+}
+
+static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
+    const MothershipLocalAuthorityRecoveryCohortRequest& value, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  if (value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRequest::version ||
+      value.operationUUID == 0 || value.clusterUUID == 0 || value.topologyVersion == 0 ||
+      value.timeoutMilliseconds < mothershipLocalAuthorityRecoveryMinimumTimeoutMilliseconds ||
+      value.timeoutMilliseconds > mothershipLocalVMFaultMaximumRecoveryMilliseconds || value.executors.size() != 3)
+  {
+    if (failure) failure->assign("local authority recovery requires one bounded exact three-machine cohort"_ctv);
+    return false;
+  }
+  for (uint32_t index = 0; index < value.executors.size(); ++index)
+  {
+    const auto& executor = value.executors[index];
+    if (executor.machineUUID == 0 || executor.boundaryUUID == 0 || executor.executorOperationUUID == 0 ||
+        !mothershipPhysicalFaultDigestValid(executor.immutableBoundarySHA256) ||
+        (index != 0 && value.executors[index - 1].machineUUID >= executor.machineUUID))
+    {
+      if (failure) failure->assign("local authority recovery executors must be canonically sorted and fully bound"_ctv);
+      return false;
+    }
+    for (uint32_t other = 0; other < index; ++other)
+      if (value.executors[other].boundaryUUID == executor.boundaryUUID ||
+          value.executors[other].executorOperationUUID == executor.executorOperationUUID)
+      {
+        if (failure) failure->assign("local authority recovery requires distinct machine, boundary, and executor identities"_ctv);
+        return false;
+      }
+  }
+  return true;
+}
+
+class MothershipLocalAuthorityRecoveryBoundaryProgress {
+public:
+  uint128_t boundaryUUID = 0;
+  MothershipLocalAuthorityRecoveryPhase phase = MothershipLocalAuthorityRecoveryPhase::admitted;
+  String receiptSHA256;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryBoundaryProgress& value)
+{
+  serializer.value16b(value.boundaryUUID); serializer.value1b(value.phase); serializer.text1b(value.receiptSHA256, 64);
+}
+
+class MothershipLocalAuthorityRecoveryCohortRecord {
+public:
+  static constexpr uint32_t version = 1;
+  uint32_t protocolVersion = version;
+  MothershipLocalAuthorityRecoveryCohortRequest request;
+  MothershipLocalAuthorityRecoveryPhase phase = MothershipLocalAuthorityRecoveryPhase::admitted;
+  Vector<MothershipLocalAuthorityRecoveryBoundaryProgress> boundaries;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipLocalAuthorityRecoveryCohortRecord& value)
+{
+  serializer.value4b(value.protocolVersion); serializer.object(value.request); serializer.value1b(value.phase);
+  serializer.object(value.boundaries);
+}
+
+static inline bool mothershipLocalAuthorityRecoveryCohortRecordValid(
+    const MothershipLocalAuthorityRecoveryCohortRecord& value, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  if (value.protocolVersion != MothershipLocalAuthorityRecoveryCohortRecord::version ||
+      !mothershipLocalAuthorityRecoveryCohortRequestValid(value.request, failure) ||
+      !mothershipLocalAuthorityRecoveryPhaseValid(value.phase) || value.boundaries.size() != 3)
+  {
+    if (failure && failure->empty()) failure->assign("local authority recovery record is invalid"_ctv);
+    return false;
+  }
+  MothershipLocalAuthorityRecoveryPhase minimum = MothershipLocalAuthorityRecoveryPhase::recovered;
+  for (uint32_t index = 0; index < value.boundaries.size(); ++index)
+  {
+    const auto& progress = value.boundaries[index];
+    if (progress.boundaryUUID != value.request.executors[index].boundaryUUID ||
+        !mothershipLocalAuthorityRecoveryPhaseValid(progress.phase) ||
+        (progress.phase == MothershipLocalAuthorityRecoveryPhase::admitted ? !progress.receiptSHA256.empty() :
+         !mothershipPhysicalFaultDigestValid(progress.receiptSHA256)))
+    {
+      if (failure) failure->assign("local authority recovery progress is not bound to the immutable cohort"_ctv);
+      return false;
+    }
+    if (uint8_t(progress.phase) < uint8_t(minimum)) minimum = progress.phase;
+  }
+  if (value.phase != minimum)
+  {
+    if (failure) failure->assign("local authority recovery cohort phase is not the durable common progress"_ctv);
+    return false;
+  }
+  return true;
 }
 
 static inline bool mothershipLocalVMMachineFaultRecordValid(
