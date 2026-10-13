@@ -529,6 +529,15 @@ storage. Those resource identities must remain exactly represented by the
 preserved pre-existing identity-set receipts; no G6 provider resource was created
 and no new spend was incurred.
 
+An exact x86_64 preparation candidate was then built on `wizard` from commit
+`b1199ccc374cb662588d16e1a732b3488a879b75` with Clang 22.1.8. The Prodigy bundle
+SHA-256 is `68b55a301cac5b865b4e14c460b3aedc7c0abf5e994157ac8f2629cf5bfc72f7` and the
+Discombobulator `--kind app` ping-pong artifact SHA-256 is
+`295a0146a981b661fa28905e0de21acce09ef2d8aeba3360a646658afb801d39`.
+The focused provider/removal regressions and full Mothership, bundle and app-artifact
+builds passed there. This closes only the missing-candidate preparation item; it is
+not physical qualification and none of the binaries was launched.
+
 Production-equivalent remote service transit, a Mothership-owned physical
 network-partition operation, and a typed local-VM machine fault operation still do
 not exist outside the test provider, while the G5 migration coordinator remains
