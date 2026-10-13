@@ -13477,7 +13477,7 @@ private:
         starttime.empty() || !std::all_of(starttime.begin(), starttime.end(), [](char value) { return value >= '0' && value <= '9'; }))
     { failure.assign("local VM executor state contains an invalid machine, path, or process identity"_ctv); return false; }
     if (observedPID != nullptr) *observedPID = pid;
-    if (observedStarttime != nullptr) observedStarttime->setInvariant(starttime.data(), starttime.size());
+    if (observedStarttime != nullptr) observedStarttime->assign(starttime.data(), starttime.size());
     Vector<String> identity = {};
     auto add = [&](std::string_view value) { identity.emplace_back(); identity.back().setInvariant(value.data(), value.size()); };
     add(taskID); add(guestUUID); add(machineID); add(overlay); add(ovmfVars); add(qmpSocket);

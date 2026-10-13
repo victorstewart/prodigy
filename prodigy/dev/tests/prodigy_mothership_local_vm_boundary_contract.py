@@ -33,6 +33,11 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         query_begin = MOTHERSHIP.index("bool queryLocalVMBoundaryExecutor")
         query_end = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction", query_begin)
         self.assertNotIn("sha256sum --", MOTHERSHIP[query_begin:query_end])
+        inspect_begin = MOTHERSHIP.index("bool inspectLocalVMBoundaryExecutor")
+        inspect_end = MOTHERSHIP.index("bool queryLocalVMBoundaryExecutor", inspect_begin)
+        inspect = MOTHERSHIP[inspect_begin:inspect_end]
+        self.assertIn("observedStarttime->assign(starttime.data(), starttime.size())", inspect)
+        self.assertNotIn("observedStarttime->setInvariant", inspect)
 
     def test_executor_upgrade_is_separate_exact_and_rotates_only_after_immutable_proof(self):
         pinned_begin = MOTHERSHIP.index("bool runLocalVMBoundarySealedLauncher")
