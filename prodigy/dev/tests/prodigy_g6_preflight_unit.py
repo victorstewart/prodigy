@@ -35,10 +35,10 @@ def baseline():
                                   "cleanup": ["cousinRoute", "removeCluster"]},
         "deadlinesSeconds": {"preflight": 60, "operation": 1800, "faultRecovery": 900, "cleanup": 900},
         "postCleanup": {"residualInventories": [
-            {"resource": "instances", "queryReference": "vultr://instances/g6", "expectedAfterCount": 0},
-            {"resource": "vpcs", "queryReference": "vultr://vpcs/g6", "expectedAfterCount": 0},
-            {"resource": "blocks", "queryReference": "vultr://blocks/g6", "expectedAfterCount": 0},
-            {"resource": "ips", "queryReference": "vultr://ips/g6", "expectedAfterCount": 0}]}}
+            {"resource": "instances", "accountQueryReference": "vultr://instances/account", "taskOwnedQueryReference": "vultr://instances?tag=g6-run", "preExistingIdentitySHA256": "8" * 64, "taskOwnedBeforeCleanupSHA256": "9" * 64, "expectedTaskOwnedAfterCount": 0},
+            {"resource": "vpcs", "accountQueryReference": "vultr://vpcs/account", "taskOwnedQueryReference": "vultr://vpcs?tag=g6-run", "preExistingIdentitySHA256": "8" * 64, "taskOwnedBeforeCleanupSHA256": "9" * 64, "expectedTaskOwnedAfterCount": 0},
+            {"resource": "blocks", "accountQueryReference": "vultr://blocks/account", "taskOwnedQueryReference": "vultr://blocks?tag=g6-run", "preExistingIdentitySHA256": "8" * 64, "taskOwnedBeforeCleanupSHA256": "9" * 64, "expectedTaskOwnedAfterCount": 0},
+            {"resource": "ips", "accountQueryReference": "vultr://ips/account", "taskOwnedQueryReference": "vultr://ips?tag=g6-run", "preExistingIdentitySHA256": "8" * 64, "taskOwnedBeforeCleanupSHA256": "9" * 64, "expectedTaskOwnedAfterCount": 0}]}}
 
 
 def expect_reject(label, mutate):
@@ -96,7 +96,7 @@ def passing_plan():
     plan["execution"] = {"startedAt": start, "completedAt": end, "rows": [completed_row("vm-isolated-lan-to-vultr"), completed_row("cloud-to-cloud")]}
     plan["postCleanup"]["verifiedAt"] = after
     for inventory in plan["postCleanup"]["residualInventories"]:
-        inventory.update(beforeSHA256="8" * 64, afterSHA256="9" * 64, observedAfterCount=0)
+        inventory.update(afterPreExistingIdentitySHA256="8" * 64, afterTaskOwnedIdentitySHA256="0" * 64, observedTaskOwnedAfterCount=0)
     return plan
 
 
@@ -117,6 +117,8 @@ expect_reject("non-Mothership owner", lambda p: p["mothershipOperations"].update
 expect_reject("missing remote fault owner", lambda p: p["mothershipOperations"].update(faults=["harnessReboot"]))
 expect_reject("invented operation owner", lambda p: p["mothershipOperations"]["faults"].append("unimplementedOperation"))
 expect_reject("unbounded cleanup", lambda p: p["deadlinesSeconds"].update(cleanup=0))
+expect_reject("vague global cleanup count", lambda p: p["postCleanup"]["residualInventories"][0].update(expectedAfterCount=0))
+expect_reject("same account and task inventory query", lambda p: p["postCleanup"]["residualInventories"][0].update(taskOwnedQueryReference="vultr://instances/account"))
 expect_reject("plan-only pass", lambda p: p.update(result="pass"))
 passing = passing_plan(); passing["execution"]["rows"][0]["faultCases"].pop()
 try:
@@ -132,13 +134,20 @@ except MODULE.ContractError:
     pass
 else:
     raise AssertionError("accepted actual spend above the total cap")
-passing = passing_plan(); passing["postCleanup"]["residualInventories"][0]["observedAfterCount"] = 1
+passing = passing_plan(); passing["postCleanup"]["residualInventories"][0]["observedTaskOwnedAfterCount"] = 1
 try:
     MODULE.validate(passing)
 except MODULE.ContractError:
     pass
 else:
-    raise AssertionError("accepted nonzero post-cleanup inventory")
+    raise AssertionError("accepted nonzero task-owned post-cleanup inventory")
+passing = passing_plan(); passing["postCleanup"]["residualInventories"][0]["afterPreExistingIdentitySHA256"] = "0" * 64
+try:
+    MODULE.validate(passing)
+except MODULE.ContractError:
+    pass
+else:
+    raise AssertionError("accepted deletion or mutation of pre-existing inventory")
 passing = passing_plan(); passing["execution"]["rows"][0]["mothershipCommandReceipts"][0]["timestamp"] = "2026-10-11T23:59:59Z"
 try:
     MODULE.validate(passing)

@@ -288,13 +288,21 @@ def validate(plan):
     for index, inventory in enumerate(inventories):
         inventory = object_with_keys(
             inventory, f"postCleanup.residualInventories[{index}]",
-            {"resource", "queryReference", "expectedAfterCount"},
-            {"beforeSHA256", "afterSHA256", "observedAfterCount"},
+            {"resource", "accountQueryReference", "taskOwnedQueryReference",
+             "preExistingIdentitySHA256", "taskOwnedBeforeCleanupSHA256",
+             "expectedTaskOwnedAfterCount"},
+            {"afterPreExistingIdentitySHA256", "afterTaskOwnedIdentitySHA256",
+             "observedTaskOwnedAfterCount"},
         )
         resource = text(inventory.get("resource"), f"postCleanup.residualInventories[{index}].resource")
-        text(inventory.get("queryReference"), f"postCleanup.residualInventories[{index}].queryReference")
-        if inventory.get("expectedAfterCount") != 0:
-            fail(f"post-cleanup residual {resource} must require zero")
+        account_query = text(inventory.get("accountQueryReference"), f"postCleanup.residualInventories[{index}].accountQueryReference")
+        task_query = text(inventory.get("taskOwnedQueryReference"), f"postCleanup.residualInventories[{index}].taskOwnedQueryReference")
+        if account_query == task_query:
+            fail("account and task-owned inventory queries must be distinct")
+        exact_hash(inventory.get("preExistingIdentitySHA256"), f"postCleanup.residualInventories[{index}].preExistingIdentitySHA256")
+        exact_hash(inventory.get("taskOwnedBeforeCleanupSHA256"), f"postCleanup.residualInventories[{index}].taskOwnedBeforeCleanupSHA256")
+        if inventory.get("expectedTaskOwnedAfterCount") != 0:
+            fail(f"post-cleanup task-owned {resource} residual must require zero")
         if resource in found:
             fail("post-cleanup inventories must not duplicate resource classes")
         found.add(resource)
@@ -445,10 +453,14 @@ def validate_execution(plan, candidate, declared_rows, cleanup, mothership_opera
     if verified < completed:
         fail("post-cleanup verification must occur after execution")
     for index, inventory in enumerate(cleanup["residualInventories"]):
-        exact_hash(inventory.get("beforeSHA256"), f"postCleanup.residualInventories[{index}].beforeSHA256")
-        exact_hash(inventory.get("afterSHA256"), f"postCleanup.residualInventories[{index}].afterSHA256")
-        if inventory.get("observedAfterCount") != 0:
-            fail("passing cleanup evidence must observe zero residual resources")
+        before = inventory["preExistingIdentitySHA256"]
+        after = inventory.get("afterPreExistingIdentitySHA256")
+        exact_hash(after, f"postCleanup.residualInventories[{index}].afterPreExistingIdentitySHA256")
+        if after != before:
+            fail("post-cleanup evidence must preserve the exact pre-existing inventory identity set")
+        exact_hash(inventory.get("afterTaskOwnedIdentitySHA256"), f"postCleanup.residualInventories[{index}].afterTaskOwnedIdentitySHA256")
+        if inventory.get("observedTaskOwnedAfterCount") != 0:
+            fail("passing cleanup evidence must observe zero task-owned residual resources")
 
 
 def main():

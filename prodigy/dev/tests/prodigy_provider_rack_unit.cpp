@@ -79,7 +79,8 @@ public:
   }
 };
 
-static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVultrHttp& http)
+static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVultrHttp& http,
+                                          const String& scope = {})
 {
   ProdigyProviderServices services = {};
   services.http = http.submission();
@@ -88,6 +89,7 @@ static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVult
   ProdigyRuntimeEnvironmentConfig runtime = {};
   runtime.kind = ProdigyEnvironmentKind::vultr;
   runtime.providerCredentialMaterial.assign("unit-test-vultr-credential"_ctv);
+  runtime.providerScope = scope;
   provider.configureRuntimeEnvironment(runtime);
 }
 
@@ -577,6 +579,18 @@ int main(void)
     String description = {};
     vultrManagedVPCDescription("ewr"_ctv, description);
     suite.expect(description == "prodigy-managed-vpc-ewr"_ctv, "vultr_managed_vpc_description_matches_region");
+
+    String scopedDescription = {};
+    vultrManagedVPCDescription("ewr"_ctv, "0123456789abcdef0123456789abcdef"_ctv, scopedDescription);
+    suite.expect(scopedDescription == "prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef"_ctv,
+                 "vultr_managed_vpc_description_binds_provisioning_cluster_uuid");
+    suite.expect(scopedDescription != description,
+                 "vultr_managed_vpc_description_never_reuses_legacy_region_vpc");
+
+    String legacyDescription = {};
+    vultrManagedVPCDescription("ewr"_ctv, String(), legacyDescription);
+    suite.expect(legacyDescription == description,
+                 "vultr_managed_vpc_description_preserves_legacy_without_cluster_uuid");
   }
 
   {
@@ -697,6 +711,87 @@ int main(void)
     http.complete(MultiCurlClient::Status::success, 404);
     suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty(),
                  "vultr_delete_raced_verified_not_found_is_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    uint32_t destroyed = 99;
+    String clusterUUID = "0123456789abcdef0123456789abcdef"_ctv;
+    provider.destroyClusterMachines(&stack, clusterUUID, destroyed, failure);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 1,
+                 "vultr_cluster_cleanup_lists_tagged_vms_before_vpc_cleanup");
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instances":[]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 2,
+                 "vultr_cluster_cleanup_lists_tagged_bare_metal_before_vpc_cleanup");
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 3 &&
+                     http.requests[2].method == MultiCurlClient::Method::get,
+                 "vultr_cluster_cleanup_lists_scoped_vpc_after_machine_cleanup");
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"id":"legacy","region":"ewr","description":"prodigy-managed-vpc-ewr"},{"id":"scoped","region":"ewr","description":"prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef","v4_subnet":"10.214.32.0","v4_subnet_mask":20}]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 4 &&
+                     http.requests[3].method == MultiCurlClient::Method::delete_ &&
+                     stringContains(http.requests[3].url, "/vpcs/scoped"),
+                 "vultr_cluster_cleanup_deletes_only_exact_scoped_vpc");
+    http.complete(MultiCurlClient::Status::success, 404);
+    suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty() && destroyed == 0,
+                 "vultr_cluster_cleanup_scoped_vpc_not_found_delete_is_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    uint32_t destroyed = 0;
+    provider.destroyClusterMachines(&stack, "0123456789abcdef0123456789abcdef"_ctv, destroyed, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instances":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"id":"legacy","region":"ewr","description":"prodigy-managed-vpc-ewr"}]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty() && http.requests.size() == 3,
+                 "vultr_cluster_cleanup_never_deletes_legacy_region_vpc");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    uint32_t destroyed = 0;
+    provider.destroyClusterMachines(&stack, "0123456789abcdef0123456789abcdef"_ctv, destroyed, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instances":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"id":"one","region":"ewr","description":"prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef","v4_subnet":"10.214.32.0","v4_subnet_mask":20},{"id":"two","region":"ewr","description":"prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef","v4_subnet":"10.214.32.0","v4_subnet_mask":20}]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() == false &&
+                     failure == "vultr managed vpc cleanup 'prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef' is ambiguous"_ctv &&
+                     http.requests.size() == 3,
+                 "vultr_cluster_cleanup_rejects_ambiguous_scoped_vpc");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    uint32_t destroyed = 0;
+    provider.destroyClusterMachines(&stack, "0123456789abcdef0123456789abcdef"_ctv, destroyed, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instances":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"id":"collision","region":"ewr","description":"prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef","v4_subnet":"10.1.0.0","v4_subnet_mask":20}]})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() == false &&
+                     failure == "vultr managed vpc cleanup 'prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef' does not match its subnet identity"_ctv &&
+                     http.requests.size() == 3,
+                 "vultr_cluster_cleanup_rejects_description_collision_with_other_subnet");
   }
 
   basics_log("SUMMARY: failed=%d\n", suite.failed);

@@ -363,6 +363,22 @@ static inline void vultrManagedVPCDescription(const String& region, String& desc
   description.snprintf<"prodigy-managed-vpc-{}"_ctv>(region);
 }
 
+// Older clusters shared one managed VPC per region.  A provisioner with an
+// assigned cluster UUID must never join that legacy VPC: its VPC is an owned
+// cluster resource and can consequently be removed without affecting another
+// cluster in the same region.
+static inline void vultrManagedVPCDescription(const String& region,
+                                              const String& clusterUUID,
+                                              String& description)
+{
+  if (clusterUUID.empty())
+  {
+    vultrManagedVPCDescription(region, description);
+    return;
+  }
+  description.snprintf<"prodigy-managed-vpc-{}-{}"_ctv>(region, clusterUUID);
+}
+
 static inline uint32_t vultrManagedVPCPrefixLength(void)
 {
   // /20 yields 4096 private IPv4 addresses, which is ample headroom for
@@ -1263,7 +1279,7 @@ private:
     }
 
     String description = {};
-    vultrManagedVPCDescription(region, description);
+    vultrManagedVPCDescription(region, provisioningClusterUUIDTagValue, description);
     String wantedSubnet = {};
     uint32_t wantedPrefixLength = 0;
     vultrManagedVPCSubnet(region, wantedSubnet, wantedPrefixLength);
@@ -1289,6 +1305,7 @@ private:
         return false;
       }
 
+      uint32_t matches = 0;
       for (auto vpc : vpcs)
       {
         std::string_view vpcRegion = {};
@@ -1303,23 +1320,34 @@ private:
         {
           String existingSubnet = {};
           uint32_t existingPrefixLength = 0;
-          if (vultrExtractVPCSubnetPlan(vpc, existingSubnet, existingPrefixLength))
+          const bool hasSubnetPlan = vultrExtractVPCSubnetPlan(vpc, existingSubnet, existingPrefixLength);
+          if (provisioningClusterUUIDTagValue.empty() == false &&
+              (hasSubnetPlan == false || existingSubnet != wantedSubnet || existingPrefixLength != wantedPrefixLength))
           {
-            if (existingPrefixLength > wantedPrefixLength)
-            {
-              error.snprintf<"vultr managed vpc '{}' in region '{}' is too small: {}/{} requires at least /{itoa}"_ctv>(
-                  description,
-                  region,
-                  existingSubnet,
-                  existingPrefixLength,
-                  wantedPrefixLength);
-              return false;
-            }
+            error.snprintf<"vultr managed cluster vpc '{}' in region '{}' does not match its subnet identity"_ctv>(
+                description, region);
+            return false;
+          }
+          if (provisioningClusterUUIDTagValue.empty() && hasSubnetPlan && existingPrefixLength > wantedPrefixLength)
+          {
+            error.snprintf<"vultr managed vpc '{}' in region '{}' is too small: {}/{} requires at least /{itoa}"_ctv>(
+                description,
+                region,
+                existingSubnet,
+                existingPrefixLength,
+                wantedPrefixLength);
+            return false;
           }
 
+          matches += 1;
           vpcID.assign(id);
-          return true;
         }
+      }
+
+      if (matches > 1)
+      {
+        error.snprintf<"vultr managed vpc '{}' in region '{}' is ambiguous"_ctv>(description, region);
+        return false;
       }
 
       return true;
@@ -2761,66 +2789,152 @@ private:
     {
       co_return false;
     }
-    if (vmCloudIDs.empty() && bareMetalCloudIDs.empty())
+    if (vmCloudIDs.empty() == false || bareMetalCloudIDs.empty() == false)
     {
-      co_return true;
-    }
-
-    destroyed = uint32_t(vmCloudIDs.size() + bareMetalCloudIDs.size());
-    VultrHttpTransport client = transport();
-    Vector<MultiCurlClient::Request> deletes;
-    for (const auto& group : {std::pair {MachineConfig::MachineKind::vm, &vmCloudIDs},
-                              std::pair {MachineConfig::MachineKind::bareMetal, &bareMetalCloudIDs}})
-    {
-      for (const String& cloudID : *group.second)
+      destroyed = uint32_t(vmCloudIDs.size() + bareMetalCloudIDs.size());
+      VultrHttpTransport client = transport();
+      Vector<MultiCurlClient::Request> deletes;
+      for (const auto& group : {
+               std::pair {MachineConfig::MachineKind::vm,        &vmCloudIDs       },
+               std::pair {MachineConfig::MachineKind::bareMetal, &bareMetalCloudIDs}
+      })
       {
-        String url;
-        url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(
-            String(resourcePath(group.first)), cloudID);
-        deletes.push_back(client.request(MultiCurlClient::Method::delete_, url));
+        for (const String& cloudID : *group.second)
+        {
+          String url;
+          url.snprintf<"https://api.vultr.com/v2/{}/{}"_ctv>(
+              String(resourcePath(group.first)), cloudID);
+          deletes.push_back(client.request(MultiCurlClient::Method::delete_, url));
+        }
       }
-    }
-    Vector<MultiCurlClient::Result> deleteResults = co_await client.sendBatch(coro, std::move(deletes));
-    if (deleteResults.size() != destroyed)
-    {
-      error.assign("vultr delete machine submission failed"_ctv);
-      co_return false;
-    }
-    for (const MultiCurlClient::Result& result : deleteResults)
-    {
-      if (VultrHttpTransport::succeeded(result) == false)
+      Vector<MultiCurlClient::Result> deleteResults = co_await client.sendBatch(coro, std::move(deletes));
+      if (deleteResults.size() != destroyed)
       {
-        error.assign("vultr delete machine failed"_ctv);
+        error.assign("vultr delete machine submission failed"_ctv);
         co_return false;
       }
-    }
-
-    for (uint32_t attempt = 0; attempt < 30; ++attempt)
-    {
-      if (co_await collectClusterMachines(coro, MachineConfig::MachineKind::vm,
-                                          clusterTag, vmCloudIDs, nullptr, error) == false ||
-          co_await collectClusterMachines(coro, MachineConfig::MachineKind::bareMetal,
-                                          clusterTag, bareMetalCloudIDs, nullptr, error) == false)
+      for (const MultiCurlClient::Result& result : deleteResults)
       {
-        co_return false;
+        if (VultrHttpTransport::succeeded(result) == false)
+        {
+          error.assign("vultr delete machine failed"_ctv);
+          co_return false;
+        }
       }
-      if (vmCloudIDs.empty() && bareMetalCloudIDs.empty())
+
+      for (uint32_t attempt = 0; attempt < 30; ++attempt)
       {
-        if (vmLabels.empty() == false &&
-            co_await destroyBootBlocksForMachineLabels(coro, vmLabels, error) == false)
+        if (co_await collectClusterMachines(coro, MachineConfig::MachineKind::vm,
+                                            clusterTag, vmCloudIDs, nullptr, error) == false ||
+            co_await collectClusterMachines(coro, MachineConfig::MachineKind::bareMetal,
+                                            clusterTag, bareMetalCloudIDs, nullptr, error) == false)
         {
           co_return false;
         }
-        co_return true;
+        if (vmCloudIDs.empty() && bareMetalCloudIDs.empty())
+        {
+          break;
+        }
+        if (co_await client.wait(coro, std::chrono::seconds(2)) == false)
+        {
+          co_return false;
+        }
       }
-      if (co_await client.wait(coro, std::chrono::seconds(2)) == false)
+      if (vmCloudIDs.empty() == false || bareMetalCloudIDs.empty() == false)
       {
+        error.assign("timed out waiting for vultr cluster machines to terminate"_ctv);
         co_return false;
       }
     }
 
-    error.assign("timed out waiting for vultr cluster machines to terminate"_ctv);
-    co_return false;
+    if (vmLabels.empty() == false &&
+        co_await destroyBootBlocksForMachineLabels(coro, vmLabels, error) == false)
+    {
+      co_return false;
+    }
+
+    // A configured provisioning UUID creates a VPC that is owned by exactly
+    // this cluster.  Legacy region-global VPCs intentionally have no cleanup
+    // path here because their users cannot be proven from this cluster.
+    if (runtimeEnvironment.providerScope.size() == 0)
+    {
+      error.assign("vultr managed vpc cleanup requires provider region"_ctv);
+      co_return false;
+    }
+    String description = {};
+    vultrManagedVPCDescription(runtimeEnvironment.providerScope, clusterUUID, description);
+    String wantedSubnet = {};
+    uint32_t wantedPrefixLength = 0;
+    vultrManagedVPCSubnet(runtimeEnvironment.providerScope, wantedSubnet, wantedPrefixLength);
+    String targetVPCID = {};
+    {
+      VultrHttpTransport client = transport();
+      String listURL = "https://api.vultr.com/v2/vpcs?per_page=200"_ctv;
+      MultiCurlClient::Result listResult = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::get, listURL, nullptr,
+                               VultrHttpTransport::getTimeout));
+      if (VultrHttpTransport::succeeded(listResult) == false)
+      {
+        error.assign("vultr managed vpc cleanup list failed"_ctv);
+        co_return false;
+      }
+      simdjson::dom::parser parser;
+      simdjson::dom::element doc = {};
+      if (parser.parse(listResult.body.c_str(), listResult.body.size()).get(doc))
+      {
+        error.assign("vultr managed vpc cleanup list parse failed"_ctv);
+        co_return false;
+      }
+      simdjson::dom::array vpcs = {};
+      if (doc["vpcs"].get(vpcs) != simdjson::SUCCESS)
+      {
+        error.assign("vultr managed vpc cleanup list missing vpcs array"_ctv);
+        co_return false;
+      }
+      uint32_t matches = 0;
+      for (auto vpc : vpcs)
+      {
+        std::string_view region = {}, candidateDescription = {}, id = {};
+        if (vpc["region"].get(region) != simdjson::SUCCESS ||
+            vpc["description"].get(candidateDescription) != simdjson::SUCCESS ||
+            vpc["id"].get(id) != simdjson::SUCCESS || id.empty() ||
+            region != std::string_view(reinterpret_cast<const char *>(runtimeEnvironment.providerScope.data()), size_t(runtimeEnvironment.providerScope.size())) ||
+            candidateDescription != std::string_view(reinterpret_cast<const char *>(description.data()), size_t(description.size())))
+        {
+          continue;
+        }
+        String subnet = {};
+        uint32_t prefixLength = 0;
+        if (vultrExtractVPCSubnetPlan(vpc, subnet, prefixLength) == false ||
+            subnet != wantedSubnet || prefixLength != wantedPrefixLength)
+        {
+          error.snprintf<"vultr managed vpc cleanup '{}' does not match its subnet identity"_ctv>(description);
+          co_return false;
+        }
+        targetVPCID.assign(id);
+        matches += 1;
+      }
+      if (matches > 1)
+      {
+        error.snprintf<"vultr managed vpc cleanup '{}' is ambiguous"_ctv>(description);
+        co_return false;
+      }
+      if (matches == 0)
+      {
+        co_return true;
+      }
+      String deleteURL = {};
+      deleteURL.snprintf<"https://api.vultr.com/v2/vpcs/{}"_ctv>(targetVPCID);
+      MultiCurlClient::Result deleteResult = co_await client.send(
+          coro, client.request(MultiCurlClient::Method::delete_, deleteURL));
+      if (VultrHttpTransport::succeeded(deleteResult) == false &&
+          vultrVerifiedResourceNotFound(deleteResult.status, deleteResult.statusCode) == false)
+      {
+        error.assign("vultr managed vpc cleanup delete failed"_ctv);
+        co_return false;
+      }
+    }
+    co_return true;
   }
 
 public:

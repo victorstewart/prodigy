@@ -703,10 +703,17 @@ static inline bool mothershipRemoveClusterRuntime(const MothershipProdigyCluster
 
   Vector<ClusterMachine> createdCloudMachines = {};
   mothershipCollectCreatedCloudClusterRemoveMachines(cluster, createdCloudMachines);
-  if (createdCloudMachines.empty())
+  const bool canSweepVultrCluster =
+      cluster.provider == MothershipClusterProvider::vultr && adoptedMachines.empty();
+  if (createdCloudMachines.empty() && canSweepVultrCluster == false)
   {
     return true;
   }
 
+  // A fully Mothership-created Vultr cluster can own scoped resources that
+  // outlive every recorded machine (for example, a VPC created before a
+  // partial provisioning failure).  Invoke its cluster cleanup owner even for
+  // an empty durable machine set.  An adopted machine keeps removal on the
+  // exact-machine path so a shared cluster tag can never authorize deletion.
   return hooks.destroyCreatedCloudMachines(cluster, createdCloudMachines, summary.destroyedCreatedCloudMachines, failure);
 }

@@ -8108,7 +8108,37 @@ private:
     }
     else
     {
-      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
+      Vector<MothershipProdigyClusterMachine> adoptedMachines = {};
+      mothershipCollectAdoptedClusterRemoveMachines(cluster, adoptedMachines);
+      if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr && adoptedMachines.empty())
+      {
+        String clusterUUID = {};
+        clusterUUID.assignItoh(cluster.clusterUUID);
+        uint32_t providerDestroyedCloudMachines = 0;
+        destroyed = mothershipRunProviderHostJob(
+            hostRuntime,
+            runtimeEnvironment,
+            MultiCurlClient::Clock::now() + std::chrono::minutes(10),
+            "cluster destroy",
+            failure,
+            [&](CoroutineStack *coro, BrainIaaS& provider, bool& completed, String& jobFailure) -> void {
+              if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+                    mothershipDestroyProviderClusterMachines(
+                        coro,
+                        provider,
+                        clusterUUID,
+                        providerDestroyedCloudMachines,
+                        completed,
+                        &jobFailure);
+                  }))
+              {
+                co_await coro->suspendAtIndex(suspendIndex);
+              }
+            });
+        destroyedCloudMachines = destroyed ? providerDestroyedCloudMachines : 0;
+        return destroyed;
+      }
+      else if (runtimeEnvironment.kind == ProdigyEnvironmentKind::vultr)
       {
         destroyed = mothershipRunProviderHostJob(
             hostRuntime,

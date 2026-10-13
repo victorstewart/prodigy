@@ -512,18 +512,46 @@ command and fault receipts inside the execution window; all four G5 lifecycle
 cases; the full routing, NAT, IPv4/IPv6, MTU/PMTU, DNS, TLS/client-identity,
 service-discovery and full/asymmetric-partition boundary matrix; monotonic active,
 drain, retirement, withdrawal and stale-replay evidence; and verified zero
-residual instances, VPCs, blocks and IPs after cleanup. Its versioned schema
-rejects unknown fields and embedded secret material rather than treating names or
-provider submissions as proof.
+G6/task-owned residual instances, VPCs, blocks and IPs after cleanup. For each
+resource class, the manifest binds a non-secret exact pre-existing account
+identity-set hash, a separate task-owned identity-set hash, and distinct account
+and task-owned inventory queries. A passing result requires the post-cleanup
+pre-existing hash to match exactly and the task-owned observed count to be zero;
+it must preserve unrelated resources rather than treating a global account count
+of zero as cleanup proof. Its versioned schema rejects unknown fields and embedded
+secret material rather than treating names or provider submissions as proof.
 
-No physical G6 run was performed at this checkpoint. The available Vultr
-credential returned HTTP 401, so authenticated inventory and prior-spend
-reconciliation could not be established; no provider resource was created and no
-new spend was incurred. Independently, production-equivalent remote service
-transit, a Mothership-owned physical network-partition operation, and a typed
-local-machine fault operation do not yet exist outside the test provider, while
-the G5 migration coordinator remains test-cluster-specific. The preflight names
-those missing owners and cannot accept a passing manifest without their receipts.
-Those are implementation blockers, not evidence that may be waived by a local
-topology. Stateful/application data semantics, G4, and live Nametag qualification
-remain deferred application stages.
+No physical G6 run was performed at this checkpoint. On 2026-10-13 the replacement
+Vultr credential reference `codex` authenticated successfully and the read-only
+account, region, plan, OS and resource inventories were established. The baseline
+contains one pre-existing non-G6 instance, reserved IP and VPC and no block
+storage. Those resource identities must remain exactly represented by the
+preserved pre-existing identity-set receipts; no G6 provider resource was created
+and no new spend was incurred.
+
+Production-equivalent remote service transit, a Mothership-owned physical
+network-partition operation, and a typed local-VM machine fault operation still do
+not exist outside the test provider, while the G5 migration coordinator remains
+test-cluster-specific. The approved Apple Linux guest is available for isolated
+development but is not a registered three-machine `deploymentMode: local` fault
+boundary, and no verified external KVM guest creator is available for the LAN row.
+
+The same checkpoint removes the discovered Vultr cleanup hazard for future
+clusters. A nonzero provisioning cluster UUID now selects a deterministic
+cluster-scoped VPC identity rather than the legacy region-global identity.
+Teardown waits for tagged machines and their discovered boot blocks, then removes
+only one VPC whose region, cluster-scoped description, subnet and prefix all match;
+absence and a raced not-found response are idempotent, while legacy, colliding or
+ambiguous VPCs fail closed or remain untouched. `removeCluster` invokes that
+cluster-scoped provider sweep for a fully managed Vultr cluster even when a retry
+or partial create has left no durable machine records. Clusters containing adopted
+machines retain exact machine-ID deletion and never broaden their shared cluster
+tag into delete authority. The focused provider and removal regressions, plus the
+full Mothership build, passed in the pinned Apple Linux guest. No live VPC deletion
+was used as evidence.
+
+The preflight names the remaining owners and cannot accept a passing manifest
+without their receipts. Those are implementation or environment blockers, not
+evidence that may be waived by a local topology or an authenticated provider
+submission. Stateful/application data semantics, G4, and live Nametag
+qualification remain deferred application stages.

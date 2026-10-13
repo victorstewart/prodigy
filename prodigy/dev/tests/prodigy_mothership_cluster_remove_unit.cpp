@@ -810,6 +810,43 @@ int main(void)
   {
     MothershipProdigyCluster cluster = {};
     cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.provider = MothershipClusterProvider::vultr;
+
+    FakeRemoveHooks hooks = {};
+    MothershipClusterRemoveSummary summary = {};
+    String failure = {};
+    bool ok = mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure);
+    suite.expect(ok, "remove_vultr_cluster_without_recorded_machines_ok");
+    suite.expect(failure.empty(), "remove_vultr_cluster_without_recorded_machines_no_failure");
+    suite.expect(hooks.destroyCreatedCalls == 1,
+                 "remove_vultr_cluster_without_recorded_machines_runs_provider_sweep");
+    suite.expect(hooks.destroyedCreatedCloudIDs.empty(),
+                 "remove_vultr_cluster_without_recorded_machines_passes_empty_durable_set");
+    suite.expect(equalStrings(hooks.callOrder, {"dns", "destroy"}),
+                 "remove_vultr_cluster_without_recorded_machines_cleanup_order");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
+    cluster.provider = MothershipClusterProvider::vultr;
+    cluster.machines.push_back(makeAdoptedMachine("10.0.1.20"_ctv, true, ClusterMachineBacking::cloud));
+
+    FakeRemoveHooks hooks = {};
+    MothershipClusterRemoveSummary summary = {};
+    String failure = {};
+    bool ok = mothershipRemoveClusterRuntime(cluster, hooks, summary, &failure);
+    suite.expect(ok, "remove_adopted_only_vultr_cluster_ok");
+    suite.expect(hooks.stopAdoptedCalls == 1, "remove_adopted_only_vultr_cluster_wipes_adopted_machine");
+    suite.expect(hooks.destroyCreatedCalls == 0,
+                 "remove_adopted_only_vultr_cluster_never_runs_tagged_machine_sweep");
+    suite.expect(equalStrings(hooks.callOrder, {"dns", "adopted"}),
+                 "remove_adopted_only_vultr_cluster_cleanup_order");
+  }
+
+  {
+    MothershipProdigyCluster cluster = {};
+    cluster.deploymentMode = MothershipClusterDeploymentMode::remote;
     cluster.dnsProvider = MothershipClusterProvider::cloudflare;
 
     ClusterMachine createdMachine = makeTopologyMachine("i-created-skipped"_ctv, ClusterMachineSource::created, ClusterMachineBacking::cloud);
