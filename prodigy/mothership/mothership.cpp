@@ -8756,29 +8756,30 @@ private:
     prodigyAssignClusterMachineAddressesFromPeerCandidates(localMachine.addresses, localCandidates);
     localMachine.ownership.mode = ClusterMachineOwnershipMode::wholeMachine;
 
-    ProdigyPersistentStateStore persistentStateStore;
-    ProdigyPersistentLocalBrainState localState = {};
-    String stateFailure = {};
-    if (persistentStateStore.loadLocalBrainState(localState, &stateFailure))
+    if (verifiedLocalVM)
     {
-      if (verifiedLocalVM && localState.uuid != verifiedLocalVMUUID)
+      // The verified DMI identity is authoritative for the disposable KVM
+      // boundary.  Do not reopen Prodigy's live TidesDB merely to rediscover
+      // it: the running local Brain owns that store's exclusive lock.
+      localMachine.uuid = verifiedLocalVMUUID;
+    }
+    else
+    {
+      ProdigyPersistentStateStore persistentStateStore;
+      ProdigyPersistentLocalBrainState localState = {};
+      String stateFailure = {};
+      if (persistentStateStore.loadLocalBrainState(localState, &stateFailure))
       {
-        if (failure) failure->assign("local Prodigy machine UUID conflicts with the verified KVM DMI UUID"_ctv);
+        localMachine.uuid = localState.uuid;
+      }
+      else if (stateFailure.size() > 0 && stateFailure.equal("record not found"_ctv) == false)
+      {
+        if (failure)
+        {
+          *failure = stateFailure;
+        }
         return false;
       }
-      localMachine.uuid = localState.uuid;
-    }
-    else if (stateFailure.size() > 0 && stateFailure.equal("record not found"_ctv) == false)
-    {
-      if (failure)
-      {
-        *failure = stateFailure;
-      }
-      return false;
-    }
-    else if (verifiedLocalVM)
-    {
-      localMachine.uuid = verifiedLocalVMUUID;
     }
 
     ClusterTopology normalizedTopology = {};

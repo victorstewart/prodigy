@@ -33,6 +33,16 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         query_end = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction", query_begin)
         self.assertNotIn("sha256sum --", MOTHERSHIP[query_begin:query_end])
 
+    def test_verified_vm_probe_does_not_reopen_the_live_brain_store(self):
+        begin = MOTHERSHIP.index("bool buildLocalClusterMachineProbe")
+        end = MOTHERSHIP.index("bool findLocalClusterMachineInTopology", begin)
+        helper = MOTHERSHIP[begin:end]
+        verified = helper.index("if (verifiedLocalVM)")
+        fallback = helper.index("ProdigyPersistentStateStore persistentStateStore")
+        self.assertLess(verified, fallback)
+        self.assertIn("localMachine.uuid = verifiedLocalVMUUID", helper[verified:fallback])
+        self.assertIn("else\n    {\n      ProdigyPersistentStateStore", helper[verified:fallback + 80])
+
 
 if __name__ == "__main__":
     unittest.main()
