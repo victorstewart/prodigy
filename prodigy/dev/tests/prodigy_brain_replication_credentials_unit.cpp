@@ -109,6 +109,7 @@ public:
   bool holdClusterOwnership = false;
   uint32_t clusterOwnershipBackpressureResponses = 0;
   uint32_t clusterOwnershipAdmissionCalls = 0;
+  uint32_t mothershipTransportCloseRequests = 0;
   std::deque<std::function<void(bool)>> pendingClusterOwnership;
   BrainConfig lastPersistedBrainConfig = {};
   ProdigyMasterAuthorityRuntimeState lastPersistedMasterAuthorityState = {};
@@ -282,6 +283,12 @@ public:
     auto completion = std::move(pendingClusterOwnership.front());
     pendingClusterOwnership.pop_front();
     completion(owned);
+  }
+
+  void queueMothershipTransportClose(Mothership *stream) override
+  {
+    (void)stream;
+    mothershipTransportCloseRequests += 1;
   }
 
   bool storeSystemContainerArtifact(const String& sha256, uint64_t bytes, const String& blob, String *failure = nullptr) override
@@ -8363,6 +8370,8 @@ static void testMothershipConfigureRetriesPersistenceBackpressure(TestSuite& sui
                     brain.pendingConfigureOwnershipReceipt->ownershipDurable == false &&
                     brain.pendingConfigureOwnershipReceipt->configurationPersistencePending == false,
                 "mothership_configure_backpressure_retains_exact_request");
+  suite.expect(mothership.closeReason == nullptr,
+               "mothership_configure_backpressure_does_not_close_stream_while_ownership_is_deferred");
 
   brain.retryPendingMothershipConfiguration();
   suite.expect(brain.clusterOwnershipAdmissionCalls == 2 && brain.clusterOwnershipCalls == 1,
@@ -8374,6 +8383,8 @@ static void testMothershipConfigureRetriesPersistenceBackpressure(TestSuite& sui
                     brain.pendingConfigureOwnershipReceipt->ownershipDurable &&
                     brain.pendingConfigureOwnershipReceipt->configurationPersistencePending == false,
                 "mothership_configure_backpressure_retains_durable_owner_for_snapshot_retry");
+  suite.expect(mothership.closeReason == nullptr,
+               "mothership_configure_backpressure_does_not_close_stream_while_snapshot_is_deferred");
 
   brain.retryPendingMothershipConfiguration();
   suite.expect(brain.updateSelfPersistenceAdmissionCalls == 2 && brain.persistCalls == 1,
@@ -8394,6 +8405,131 @@ static void testMothershipConfigureRetriesPersistenceBackpressure(TestSuite& sui
                    brain.updateSelfPersistenceAdmissionCalls == 2 && brain.persistCalls == 1 &&
                    mothership.wBuffer.size() == responseBytes,
                "mothership_configure_backpressure_extra_retry_is_inert");
+}
+
+static void testMothershipConfigureCloseReasons(TestSuite& suite)
+{
+  {
+    TestBrain brain;
+    NoopBrainIaaS iaas;
+    Mothership mothership = {};
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    mothership.isFixedFile = true;
+    mothership.fslot = 1;
+    mothership.pendingSend = true;
+    if (suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                      "mothership_configure_persistence_unavailable_activates_stream") == false)
+    {
+      return;
+    }
+    brain.rejectUpdateSelfPersistenceAdmission = true;
+
+    BrainConfig incoming = {};
+    incoming.clusterUUID = 0x4404;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, incoming);
+    String messageBuffer = {};
+    brain.mothershipHandler(&mothership,
+                            buildMothershipMessage(messageBuffer, MothershipTopic::configure, serialized));
+
+    suite.expect(mothership.closeReason != nullptr &&
+                     strcmp(mothership.closeReason, "configure-persistence-unavailable") == 0,
+                 "mothership_configure_persistence_unavailable_records_close_reason");
+    suite.expect(brain.mothershipTransportCloseRequests == 1,
+                 "mothership_configure_persistence_unavailable_requests_one_transport_close");
+    suite.expect(mothership.wBuffer.empty(), "mothership_configure_persistence_unavailable_emits_no_ack");
+  }
+
+  {
+    TestBrain brain;
+    NoopBrainIaaS iaas;
+    Mothership first = {};
+    Mothership duplicate = {};
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    first.isFixedFile = duplicate.isFixedFile = true;
+    first.fslot = 1;
+    duplicate.fslot = 2;
+    first.pendingSend = duplicate.pendingSend = true;
+    if (suite.require(first.fslot >= 0 && brain.activateMothershipConnection(&first),
+                      "mothership_configure_duplicate_first_activates_stream") == false ||
+        suite.require(duplicate.fslot >= 0 && brain.activateMothershipConnection(&duplicate),
+                      "mothership_configure_duplicate_second_activates_stream") == false)
+    {
+      return;
+    }
+    brain.holdClusterOwnership = true;
+
+    BrainConfig incoming = {};
+    incoming.clusterUUID = 0x4405;
+    String serialized = {};
+    BitseryEngine::serialize(serialized, incoming);
+    String firstBuffer = {};
+    brain.mothershipHandler(&first,
+                            buildMothershipMessage(firstBuffer, MothershipTopic::configure, serialized));
+    String duplicateBuffer = {};
+    brain.mothershipHandler(&duplicate,
+                            buildMothershipMessage(duplicateBuffer, MothershipTopic::configure, serialized));
+
+    suite.expect(duplicate.closeReason != nullptr &&
+                     strcmp(duplicate.closeReason, "configure-ownership-pending") == 0,
+                 "mothership_configure_duplicate_records_close_reason");
+    suite.expect(first.closeReason == nullptr,
+                 "mothership_configure_duplicate_preserves_original_pending_stream");
+    suite.expect(brain.mothershipTransportCloseRequests == 1,
+                 "mothership_configure_duplicate_requests_one_transport_close");
+  }
+
+  {
+    TestBrain brain;
+    Mothership mothership = {};
+    brain.weAreMaster = false;
+    mothership.isFixedFile = true;
+    mothership.fslot = 1;
+    mothership.pendingSend = true;
+    if (suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                      "mothership_configure_not_master_activates_stream") == false)
+    {
+      return;
+    }
+
+    BrainConfig incoming = {};
+    String serialized = {};
+    BitseryEngine::serialize(serialized, incoming);
+    String messageBuffer = {};
+    brain.mothershipHandler(&mothership,
+                            buildMothershipMessage(messageBuffer, MothershipTopic::configure, serialized));
+
+    suite.expect(mothership.closeReason != nullptr && strcmp(mothership.closeReason, "configure-not-master") == 0,
+                 "mothership_configure_not_master_records_close_reason");
+    suite.expect(brain.mothershipTransportCloseRequests == 1,
+                 "mothership_configure_not_master_requests_one_transport_close");
+  }
+}
+
+static void testMothershipSendDrainCloseReason(TestSuite& suite)
+{
+  TestBrain brain;
+  Mothership mothership = {};
+  brain.weAreMaster = true;
+  mothership.isFixedFile = true;
+  mothership.fslot = 1;
+  if (suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                    "mothership_send_drain_activates_stream") == false)
+  {
+    return;
+  }
+
+  brain.queueCloseAfterSendDrain(&mothership);
+
+  suite.expect(mothership.closeReason != nullptr &&
+                   strcmp(mothership.closeReason, "send-drain-immediate") == 0,
+               "mothership_send_drain_records_close_reason");
+  suite.expect(brain.mothershipTransportCloseRequests == 1,
+               "mothership_send_drain_requests_one_transport_close");
 }
 
 static OperatingSystemUpdatePolicy makeOSUpdatePolicy(
@@ -8588,8 +8724,11 @@ static void testMothershipConfigureRejectsClusterTakeover(TestSuite& suite)
   mothership.isFixedFile = true;
   mothership.fslot = 1;
   mothership.pendingSend = true;
-  suite.require(brain.activateMothershipConnection(&mothership),
-                "mothership_configure_reject_takeover_activates_stream");
+  if (suite.require(mothership.fslot >= 0 && brain.activateMothershipConnection(&mothership),
+                    "mothership_configure_reject_takeover_activates_stream") == false)
+  {
+    return;
+  }
   brain.rejectClusterOwnership = true;
   brain.rejectClusterOwnershipFailure.assign("local machine already belongs to cluster a and refuses takeover by cluster b"_ctv);
 
@@ -8608,6 +8747,10 @@ static void testMothershipConfigureRejectsClusterTakeover(TestSuite& suite)
   suite.expect(brain.brainConfig.clusterUUID == 0, "mothership_configure_reject_takeover_preserves_cluster_uuid");
   suite.expect(brain.persistCalls == 0, "mothership_configure_reject_takeover_does_not_persist");
   suite.expect(mothership.wBuffer.size() == 0, "mothership_configure_reject_takeover_emits_no_ack");
+  suite.expect(mothership.closeReason != nullptr && strcmp(mothership.closeReason, "configure-owner-mismatch") == 0,
+               "mothership_configure_reject_takeover_records_close_reason");
+  suite.expect(brain.mothershipTransportCloseRequests == 1,
+               "mothership_configure_reject_takeover_requests_one_transport_close");
 }
 
 static void testReplicateMasterAuthorityRejectsClusterTakeover(TestSuite& suite)
@@ -37365,6 +37508,14 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "configure-backpressure") == 0)
   {
     testMothershipConfigureRetriesPersistenceBackpressure(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "configure-close-reasons") == 0)
+  {
+    testMothershipConfigureRetriesPersistenceBackpressure(suite);
+    testMothershipConfigureCloseReasons(suite);
+    testMothershipSendDrainCloseReason(suite);
+    testMothershipConfigureRejectsClusterTakeover(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-topology-overlap") == 0)

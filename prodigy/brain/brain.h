@@ -1115,6 +1115,9 @@ private:
 public:
 
   bool closeAfterSendDrain = false;
+  // The first terminal decision for this transport. It is deliberately
+  // non-persisted and is only ever a static branch label.
+  const char *closeReason = nullptr;
   uint64_t connectionIncarnation = 0;
   bool apiCredentialExpiryNoticesSubscribed = false;
   bytell_hash_set<uint64_t> queuedApiCredentialExpiryNoticeIDs;
@@ -18337,10 +18340,10 @@ public:
       {
         if (weAreMaster == false)
         {
-          PRODIGY_DEBUG_LOG( "prodigy mothership accept-close transport=unix reason=follower acceptedFslot=%d path=%s\n",
-                       fslot,
-                       mothershipUnixSocketPath.c_str());
-          PRODIGY_DEBUG_FLUSH();
+          basics_log("prodigy mothership accept-close transport=unix reason=follower acceptedFslot=%d path=%s authorityEpoch=%llu\n",
+                     fslot,
+                     mothershipUnixSocketPath.c_str(),
+                     (unsigned long long)masterAuthorityEpoch);
           Ring::queueCloseRaw(fslot);
         }
         else
@@ -18351,6 +18354,10 @@ public:
           mothership->isNonBlocking = true;
           if (activateMothershipConnection(mothership) == false)
           {
+            basics_log("prodigy mothership accept-close transport=unix reason=activation-failed acceptedFslot=%d path=%s authorityEpoch=%llu\n",
+                       fslot,
+                       mothershipUnixSocketPath.c_str(),
+                       (unsigned long long)masterAuthorityEpoch);
             delete mothership;
             mothership = nullptr;
             Ring::queueCloseRaw(fslot);
@@ -20367,7 +20374,11 @@ public:
     else if (activeMotherships.contains(static_cast<Mothership *>(socket)))
     {
       Mothership *activeMothership = static_cast<Mothership *>(socket);
-      basics_log("mothership stream closed weAreMaster=%d\n", int(weAreMaster));
+      basics_log("prodigy mothership stream-close reason=%s master=%d authorityEpoch=%llu streamIncarnation=%llu\n",
+                 (activeMothership->closeReason ? activeMothership->closeReason : "transport-closed"),
+                 int(weAreMaster),
+                 (unsigned long long)masterAuthorityEpoch,
+                 (unsigned long long)activeMothership->connectionIncarnation);
       clearSpinApplicationMothershipsForStream(activeMothership);
       clearContainerLogRequestsForStream(activeMothership);
       activeMotherships.erase(activeMothership);
@@ -20385,9 +20396,11 @@ public:
     else if (closingMotherships.contains(static_cast<Mothership *>(socket)))
     {
       Mothership *closingStream = static_cast<Mothership *>(socket);
-      basics_log("mothership retired stream closed weAreMaster=%d closingStreams=%zu\n",
-                 int(weAreMaster),
-                 size_t(closingMotherships.size()));
+      PRODIGY_DEBUG_LOG( "prodigy mothership retired-stream-closed reason=%s master=%d closingStreams=%zu\n",
+                   (closingStream->closeReason ? closingStream->closeReason : "unknown"),
+                   int(weAreMaster),
+                   size_t(closingMotherships.size()));
+      PRODIGY_DEBUG_FLUSH();
       clearSpinApplicationMothershipsForStream(closingStream);
       clearContainerLogRequestsForStream(closingStream);
       RingDispatcher::eraseMultiplexee(closingStream);
@@ -25453,7 +25466,9 @@ public:
 
     bool selfIsBrain = false;
     ClusterTopology topology = {};
-    if (loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false)
+    const bool haveAuthoritativeTopology =
+        loadAuthoritativeClusterTopology(topology) && topology.machines.empty() == false;
+    if (haveAuthoritativeTopology)
     {
       restoreBrainsFromClusterTopology(topology);
 
@@ -25514,6 +25529,13 @@ public:
         refreshLocalBrainPeerAddresses();
       }
     }
+
+    basics_log("brain bootstrap inventory source=%s selfIsBrain=%d brainCount=%u localUUID=%016llx%016llx\n",
+               haveAuthoritativeTopology ? "authoritative-topology" : "provider-inventory",
+               int(selfIsBrain),
+               unsigned(nBrains),
+               (unsigned long long)(thisNeuron->uuid >> 64),
+               (unsigned long long)thisNeuron->uuid);
 
     for (BrainView *brain : brains)
     {
@@ -26371,7 +26393,7 @@ public:
 
       for (Mothership *stream : activeStreams)
       {
-        queueCloseIfActive(stream);
+        queueCloseIfActive(stream, "master-forfeit");
       }
     }
 
@@ -26819,7 +26841,7 @@ public:
 
         for (Mothership *stream : activeStreams)
         {
-          queueCloseIfActive(stream);
+          queueCloseIfActive(stream, "peer-master-convergence");
         }
       }
 
@@ -30464,18 +30486,35 @@ public:
       return;
     }
 
+    if (stream->closeReason == nullptr && reason != nullptr)
+    {
+      stream->closeReason = reason;
+    }
+
     closingMotherships.insert(stream);
     activeMotherships.erase(stream);
     if (mothership == stream)
     {
       mothership = (activeMotherships.empty() ? nullptr : *activeMotherships.begin());
     }
-    PRODIGY_DEBUG_LOG( "prodigy mothership retire-closing reason=%s stream=%p closingStreams=%zu master=%d\n",
-                 (reason ? reason : "unknown"),
-                 static_cast<void *>(stream),
+    const char *closeReason = stream->closeReason ? stream->closeReason : reason;
+    if (closeReason)
+    {
+      basics_log("prodigy mothership stream-close reason=%s closingStreams=%zu master=%d authorityEpoch=%llu streamIncarnation=%llu\n",
+                 closeReason,
                  size_t(closingMotherships.size()),
-                 int(weAreMaster));
-    PRODIGY_DEBUG_FLUSH();
+                 int(weAreMaster),
+                 (unsigned long long)masterAuthorityEpoch,
+                 (unsigned long long)stream->connectionIncarnation);
+    }
+    else
+    {
+      PRODIGY_DEBUG_LOG( "prodigy mothership retire-closing reason=unknown stream=%p closingStreams=%zu master=%d\n",
+                   static_cast<void *>(stream),
+                   size_t(closingMotherships.size()),
+                   int(weAreMaster));
+      PRODIGY_DEBUG_FLUSH();
+    }
     if (weAreMaster)
     {
       queueMothershipUnixAcceptIfNeeded();
@@ -30498,6 +30537,10 @@ public:
     PRODIGY_DEBUG_FLUSH();
 
     stream->closeAfterSendDrain = false;
+    if (stream->closeReason == nullptr && reason != nullptr)
+    {
+      stream->closeReason = reason;
+    }
 
     if (RingDispatcher::dispatcher != nullptr && Ring::getRingFD() > 0 && rawStreamIsActive(stream))
     {
@@ -30555,12 +30598,21 @@ public:
       return;
     }
 
+    if (stream->closeReason == nullptr && reason != nullptr)
+    {
+      stream->closeReason = reason;
+    }
     stream->closeAfterSendDrain = false;
-    Ring::queueClose(stream);
+    queueMothershipTransportClose(stream);
     if (stream->pendingSend == false && stream->wBuffer.outstandingBytes() == 0)
     {
-      retireClosingMothershipStreamIfNeeded(stream, reason);
+      retireClosingMothershipStreamIfNeeded(stream, stream->closeReason ? stream->closeReason : reason);
     }
+  }
+
+  virtual void queueMothershipTransportClose(Mothership *stream)
+  {
+    Ring::queueClose(stream);
   }
 
   void closeMothershipAfterSendDrainIfNeeded(Mothership *stream, const char *reason = nullptr)
@@ -30576,9 +30628,13 @@ public:
     }
 
     stream->closeAfterSendDrain = false;
+    if (stream->closeReason == nullptr && reason != nullptr)
+    {
+      stream->closeReason = reason;
+    }
     if (streamIsActive(stream) && Ring::socketIsClosing(stream) == false)
     {
-      Ring::queueClose(stream);
+      queueMothershipTransportClose(stream);
     }
 
     retireClosingMothershipStreamIfNeeded(stream, reason);
@@ -42440,7 +42496,10 @@ public:
                    unsigned(message->topic),
                    static_cast<void *>(mothership));
       PRODIGY_DEBUG_FLUSH();
-      queueCloseIfActive(mothership);
+      queueCloseIfActive(mothership,
+                         MothershipTopic(message->topic) == MothershipTopic::configure
+                             ? "configure-not-master"
+                             : "control-request-not-master");
       return;
     }
 
