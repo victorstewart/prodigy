@@ -11472,6 +11472,8 @@ public:
       }
     }
     BrainConfig previousConfig = std::move(brainConfig);
+    const bool machineReservedResourcesChanged =
+        !(previousConfig.machineReservedResources == prepared.config.machineReservedResources);
     auto previousServing = std::move(statefulServingRuntimeStates);
     const auto previousPlans = deploymentPlans;
     // This transition was durably captured with these plans.  Project them
@@ -11486,7 +11488,7 @@ public:
       if (prepared.configChanged)
       {
         refreshMachineFragmentAssignmentsIfPossible();
-        loadBrainConfigIf();
+        loadBrainConfigIf(machineReservedResourcesChanged);
       }
       return true;
     }
@@ -21554,7 +21556,9 @@ public:
     ownRuntimeEnvironmentConfig(source.runtimeEnvironment, owned.runtimeEnvironment);
   }
 
-  bool applyConfiguredMachineCapacity(Machine *machine, const MachineConfig& machineConfig, bool overrideExistingTotals)
+  bool applyConfiguredMachineCapacity(
+      Machine *machine, const MachineConfig& machineConfig, bool overrideExistingTotals,
+      bool refreshOwnedResources = false)
   {
     if (machine == nullptr)
     {
@@ -21612,9 +21616,9 @@ public:
     ownership.nMemoryBasisPoints = machine->ownershipMemoryBasisPoints;
     ownership.nStorageBasisPoints = machine->ownershipStorageBasisPoints;
 
-    uint32_t resolvedOwnedLogicalCores = overrideExistingTotals ? 0 : machine->ownedLogicalCores;
-    uint32_t resolvedOwnedMemoryMB = overrideExistingTotals ? 0 : machine->ownedMemoryMB;
-    uint32_t resolvedOwnedStorageMB = overrideExistingTotals ? 0 : machine->ownedStorageMB;
+    uint32_t resolvedOwnedLogicalCores = (overrideExistingTotals || refreshOwnedResources) ? 0 : machine->ownedLogicalCores;
+    uint32_t resolvedOwnedMemoryMB = (overrideExistingTotals || refreshOwnedResources) ? 0 : machine->ownedMemoryMB;
+    uint32_t resolvedOwnedStorageMB = (overrideExistingTotals || refreshOwnedResources) ? 0 : machine->ownedStorageMB;
     if (resolvedOwnedLogicalCores == 0 || resolvedOwnedMemoryMB == 0 || resolvedOwnedStorageMB == 0)
     {
       (void)clusterMachineResolveOwnedResources(
@@ -21705,7 +21709,7 @@ public:
     return beforeTotalLogicalCores != machine->totalLogicalCores || beforeTotalMemoryMB != machine->totalMemoryMB || beforeTotalStorageMB != machine->totalStorageMB || beforeOwnedLogicalCores != machine->ownedLogicalCores || beforeOwnedMemoryMB != machine->ownedMemoryMB || beforeOwnedStorageMB != machine->ownedStorageMB || beforeAvailableLogicalCores != machine->nLogicalCores_available || beforeAvailableSharedCPUMillis != machine->sharedCPUMillis_available || beforeAvailableMemoryMB != machine->memoryMB_available || beforeAvailableStorageMB != machine->storageMB_available;
   }
 
-  void loadBrainConfigIf(void)
+  void loadBrainConfigIf(bool refreshOwnedResources = false)
   {
     if (iaas != nullptr)
     {
@@ -21725,13 +21729,15 @@ public:
     for (Machine *machine : machines) // accounts for us
     {
       auto it = brainConfig.configBySlug.find(machine->slug);
-      if (it == brainConfig.configBySlug.end())
+      if (it == brainConfig.configBySlug.end() && refreshOwnedResources == false)
       {
         continue;
       }
 
-      const MachineConfig& machineConfig = it->second;
-      (void)applyConfiguredMachineCapacity(machine, machineConfig, brainConfig.runtimeEnvironment.test.enabled);
+      const MachineConfig defaultMachineConfig = {};
+      const MachineConfig& machineConfig = it == brainConfig.configBySlug.end() ? defaultMachineConfig : it->second;
+      (void)applyConfiguredMachineCapacity(
+          machine, machineConfig, brainConfig.runtimeEnvironment.test.enabled, refreshOwnedResources);
 
       if (haveDatacenterFragment)
       {
@@ -25315,7 +25321,7 @@ public:
       }
     }
 
-    loadBrainConfigIf();
+    loadBrainConfigIf(true);
 
     // Wait one full initial control-plane reconnect window before declaring
     // startup ignited. Freshly created machines can continue bootstrapping
@@ -42521,6 +42527,8 @@ public:
           const bool previousMasterAuthorityDurable = masterAuthorityRuntimeStateDurable;
           const uint64_t previousDurableMasterAuthorityGeneration =
               durableMasterAuthorityRuntimeStateGeneration;
+          const bool machineReservedResourcesChanged =
+              !(brainConfig.machineReservedResources == incomingConfig.machineReservedResources);
           if (incomingConfig.clusterUUID != 0)
           {
             brainConfig.clusterUUID = incomingConfig.clusterUUID;
@@ -42654,6 +42662,7 @@ public:
                candidateConfig = std::move(serializedBrainConfig), previousConfig = std::move(previousConfig),
                previousMasterAuthorityState = std::move(previousMasterAuthorityState),
                previousMasterAuthorityDurable, previousDurableMasterAuthorityGeneration,
+               machineReservedResourcesChanged,
                previousSharedCPUOvercommitPermille](bool durable) mutable {
                 if (lifetime.expired()) return;
                 pendingConfigure->configurationPersistencePending = false;
@@ -42688,7 +42697,7 @@ public:
                 }
                 if (pendingConfigureOwnershipReceipt == pendingConfigure)
                   pendingConfigureOwnershipReceipt.reset();
-                loadBrainConfigIf(); refreshMachineFragmentAssignmentsIfPossible(); armMachineUpdateTimerIfNeeded();
+                loadBrainConfigIf(machineReservedResourcesChanged); refreshMachineFragmentAssignmentsIfPossible(); armMachineUpdateTimerIfNeeded();
                 if (noMasterYet) deriveMasterBrain();
                 if (activeMotherships.contains(mothership) == false || mothership->connectionIncarnation != streamIncarnation ||
                     streamIsActive(mothership) == false || Ring::socketIsClosing(mothership)) return;

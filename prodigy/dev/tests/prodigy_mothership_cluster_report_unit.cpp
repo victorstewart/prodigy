@@ -854,16 +854,17 @@ static bool executableOnPath(const char *name)
   return false;
 }
 
-static String buildDeployPlanJSON(uint16_t applicationID, MachineCpuArchitecture architecture)
+static String buildDeployPlanJSON(uint16_t applicationID, MachineCpuArchitecture architecture, uint32_t nBase = 1)
 {
   char buffer[2048] = {};
   int written = std::snprintf(
       buffer,
       sizeof(buffer),
-      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"apiCredentials\":{\"applicationID\":%u,\"requiredCredentialNames\":[]},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":1,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
+      "{\"config\":{\"type\":\"ApplicationType::stateless\",\"applicationID\":%u,\"versionID\":1,\"architecture\":\"%s\",\"filesystemMB\":64,\"storageMB\":64,\"memoryMB\":128,\"nLogicalCores\":1,\"msTilHealthy\":10000,\"sTilHealthcheck\":15,\"sTilKillable\":30},\"apiCredentials\":{\"applicationID\":%u,\"requiredCredentialNames\":[]},\"minimumSubscriberCapacity\":1024,\"isStateful\":false,\"stateless\":{\"nBase\":%u,\"maxPerRackRatio\":1.0,\"maxPerMachineRatio\":1.0,\"moveableDuringCompaction\":true},\"useHostNetworkNamespace\":false,\"subscriptions\":[],\"advertisements\":[],\"moveConstructively\":true,\"requiresDatacenterUniqueTag\":false}",
       unsigned(applicationID),
       machineCpuArchitectureName(architecture),
-      unsigned(applicationID));
+      unsigned(applicationID),
+      unsigned(nBase));
 
   String json = {};
   if (written > 0)
@@ -1051,6 +1052,9 @@ static bool handleDeployStep(
     const String& expectedBlobPath,
     uint16_t expectedApplicationID,
     MachineCpuArchitecture expectedArchitecture,
+    uint32_t measuredNBase,
+    uint32_t measuredNSurge,
+    uint32_t measuredNFit,
     bool closeAfterInitialOkay,
     String& failure)
 {
@@ -1098,10 +1102,15 @@ static bool handleDeployStep(
   }
 
   String response = {};
-  Message::construct(response, MothershipTopic::measureApplication, uint32_t(1), uint32_t(0), uint32_t(1));
+  Message::construct(response, MothershipTopic::measureApplication, measuredNBase, measuredNSurge, measuredNFit);
   if (sendAll(clientFD, response, failure) == false)
   {
     return false;
+  }
+
+  if (measuredNFit < measuredNBase + measuredNSurge)
+  {
+    return true;
   }
 
   frame.clear();
@@ -1591,6 +1600,9 @@ int main(void)
                            deployBlobPath,
                            deployApplicationID,
                            currentArchitecture,
+                           1,
+                           0,
+                           1,
                            false,
                            stepFailure) == false)
       {
@@ -1706,6 +1718,35 @@ int main(void)
                            deployBlobPath,
                            deployApplicationID,
                            currentArchitecture,
+                           1,
+                           0,
+                           1,
+                           true,
+                           stepFailure) == false)
+      {
+        testClusterServer.failure = stepFailure;
+        testClusterServer.stopRequested.store(true);
+        closeClient(clientFD);
+        return;
+      }
+
+      closeClient(clientFD);
+
+      clientFD = -1;
+      if (acceptNextClient(testClusterListener.fd, testClusterServer, clientFD) == false)
+      {
+        return;
+      }
+
+      if (handleDeployStep(clientFD,
+                           testClusterServer,
+                           createdTestDeployCluster.clusterUUID,
+                           deployBlobPath,
+                           deployApplicationID,
+                           currentArchitecture,
+                           3,
+                           0,
+                           2,
                            true,
                            stepFailure) == false)
       {
@@ -1728,20 +1769,37 @@ int main(void)
         testClusterDeployExitCode);
     suite.expect(ranTestClusterDeploy, "deploy_test_cluster_runs_mothership_deploy");
     suite.expect(testClusterDeployExitCode == EXIT_SUCCESS, "deploy_test_cluster_returns_after_initial_okay");
+
+    String insufficientCapacityDeployOutput = {};
+    int insufficientCapacityDeployExitCode = -1;
+    String insufficientCapacityDeployPlanJSON = buildDeployPlanJSON(deployApplicationID, currentArchitecture, 3);
+    bool ranInsufficientCapacityDeploy = runMothershipCommand(
+        binaryPath,
+        dbRoot,
+        {"deploy", "cluster-deploy-test", std::string(insufficientCapacityDeployPlanJSON.c_str()), std::string(deployBlobPath.c_str())},
+        insufficientCapacityDeployOutput,
+        insufficientCapacityDeployExitCode);
+    suite.expect(ranInsufficientCapacityDeploy, "deploy_insufficient_capacity_runs_mothership_deploy");
+    suite.expect(insufficientCapacityDeployExitCode == EXIT_FAILURE, "deploy_insufficient_capacity_exit_failure");
+    suite.expect(
+        stringContains(insufficientCapacityDeployOutput, "we would need to schedule 3 base instances and 0 surge instances, but the cluster can only fit 2 total instances"),
+        "deploy_insufficient_capacity_output_is_readable");
     testClusterServer.stopRequested.store(true);
     testClusterServerThread.join();
 
     if (ranTestClusterDeploy == false || testClusterDeployExitCode != EXIT_SUCCESS ||
-        testClusterServer.failure.size() > 0 || testClusterServer.acceptCount != 1 ||
+        ranInsufficientCapacityDeploy == false || insufficientCapacityDeployExitCode != EXIT_FAILURE ||
+        testClusterServer.failure.size() > 0 || testClusterServer.acceptCount != 2 ||
         testClusterServer.sawMeasureApplication == false || testClusterServer.sawSpinApplication == false ||
         testClusterServer.deployBlobMatched == false)
     {
       writeFailureDetail("detail deploy_test_cluster_output:", testClusterDeployOutput);
+      writeFailureDetail("detail deploy_insufficient_capacity_output:", insufficientCapacityDeployOutput);
       writeFailureDetail("detail deploy_test_cluster_server_failure:", testClusterServer.failure);
     }
 
     suite.expect(testClusterServer.failure.size() == 0, "deploy_test_cluster_server_no_failure");
-    suite.expect(testClusterServer.acceptCount == 1, "deploy_test_cluster_server_accept_count");
+    suite.expect(testClusterServer.acceptCount == 2, "deploy_test_cluster_server_accept_count");
     suite.expect(testClusterServer.sawMeasureApplication, "deploy_test_cluster_server_saw_measure_topic");
     suite.expect(testClusterServer.sawSpinApplication, "deploy_test_cluster_server_saw_spin_topic");
     suite.expect(testClusterServer.deployApplicationID == deployApplicationID, "deploy_test_cluster_application_id_matches");
@@ -1749,6 +1807,7 @@ int main(void)
     suite.expect(
         stringContains(testClusterDeployOutput, "SpinApplicationResponseCode::okay"),
         "deploy_test_cluster_output_reports_initial_okay");
+
     (void)::unlink(testControlPath.c_str());
     (void)::rmdir(std::filesystem::path(testControlPath.c_str()).parent_path().c_str());
   }

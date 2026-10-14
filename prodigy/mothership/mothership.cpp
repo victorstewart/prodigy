@@ -16661,8 +16661,8 @@ private:
     }
     if (result.nFit < result.nBase + result.nSurge)
     {
-      result.failure.snprintf<"we would need to schedule {} base instances and {} surge instances, but the cluster can only fit {} total instances"_ctv>(
-          result.nBase, result.nSurge, result.nFit);
+      result.failure.snprintf<"we would need to schedule {itoa} base instances and {itoa} surge instances, but the cluster can only fit {itoa} total instances"_ctv>(
+          uint64_t(result.nBase), uint64_t(result.nSurge), uint64_t(result.nFit));
       return false;
     }
     if (emitCLIOutput)

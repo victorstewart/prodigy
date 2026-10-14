@@ -8662,9 +8662,9 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   machine.rack = &rack;
   machine.state = MachineState::healthy;
   machine.lifetime = MachineLifetime::owned;
-  machine.ownedLogicalCores = 4;
-  machine.ownedMemoryMB = 8192;
-  machine.ownedStorageMB = 8192;
+  machine.ownedLogicalCores = 2;
+  machine.ownedMemoryMB = 4096;
+  machine.ownedStorageMB = 4096;
   machine.totalLogicalCores = 4;
   machine.totalMemoryMB = 8192;
   machine.totalStorageMB = 8192;
@@ -8672,6 +8672,7 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   Machine::Claim claim = {};
   claim.nFit = 1;
   claim.reservedSharedCPUMillisPerInstance = 6000;
+  claim.reservedMemoryMBPerInstance = 512;
   machine.claims.push_back(claim);
 
   rack.machines.insert(&machine);
@@ -8680,12 +8681,6 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   BrainConfig incoming = {};
   incoming.sharedCPUOvercommitPermille = 1000;
   incoming.machineReservedResources = prodigySmokeMachineReservedResources;
-  MachineConfig machineConfig = {};
-  machineConfig.slug = machine.slug;
-  machineConfig.nLogicalCores = 4;
-  machineConfig.nMemoryMB = 8192;
-  machineConfig.nStorageMB = 8192;
-  incoming.configBySlug.insert_or_assign(machineConfig.slug, machineConfig);
 
   String serialized;
   BitseryEngine::serialize(serialized, incoming);
@@ -8697,9 +8692,13 @@ static void testMothershipConfigureLowersSharedCPUOvercommitWithoutMovingClaims(
   suite.expect(brain.brainConfig.sharedCPUOvercommitPermille == 1000, "mothership_configure_applies_shared_cpu_overcommit");
   suite.expect(brain.brainConfig.machineReservedResources == prodigySmokeMachineReservedResources, "mothership_configure_applies_resource_reservation");
   suite.expect(machine.ownedLogicalCores == 4, "mothership_configure_resource_reservation_keeps_smoke_cores");
+  suite.expect(machine.ownedMemoryMB == 8192 && machine.ownedStorageMB == 8192,
+               "mothership_configure_resource_reservation_refreshes_unconfigured_local_seed");
   suite.expect(brain.persistCalls == 1, "mothership_configure_shared_cpu_overcommit_persists_runtime_state");
   suite.expect(machine.claims.size() == 1, "mothership_configure_shared_cpu_overcommit_keeps_existing_claims");
   suite.expect(machine.sharedCPUMillisCommitted == 6000, "mothership_configure_shared_cpu_overcommit_preserves_committed_shared_cpu");
+  suite.expect(machine.memoryMB_available == 7680,
+               "mothership_configure_resource_reservation_redebits_unconfigured_local_seed_claim");
   suite.expect(machine.sharedCPUMillis_available < 0, "mothership_configure_shared_cpu_overcommit_can_leave_negative_shared_headroom");
   suite.expect(machine.nLogicalCores_available < 0, "mothership_configure_shared_cpu_overcommit_can_leave_negative_isolated_headroom");
 
