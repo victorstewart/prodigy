@@ -74,6 +74,15 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("mothershipAssignProviderHex128(operationUUID, operation);", helper)
         self.assertNotIn("operation.assignItoh", helper)
 
+    def test_cold_reboot_parser_accepts_only_the_completed_executor_receipt(self):
+        begin = MOTHERSHIP.index("bool runLocalVMBoundaryExecutorAction")
+        end = MOTHERSHIP.index("enum class LocalAuthorityRecoveryExecutorPhase", begin)
+        helper = MOTHERSHIP[begin:end]
+        self.assertIn('document.get_object().size() != 11', helper)
+        self.assertIn('document["phase"].get(phase) || phase != "completed"', helper)
+        self.assertIn('completedAtMonotonicMs - startedAtMonotonicMs > timeoutMilliseconds', helper)
+        self.assertIn('completedAtMonotonicMs=completed_at, phase="completed"', KVM_BOUNDARY)
+
     def test_authority_recovery_receipt_owns_process_identity_strings(self):
         begin = MOTHERSHIP.index("bool parseLocalAuthorityRecoveryExecutorReceipt")
         end = MOTHERSHIP.index("bool runLocalAuthorityRecoveryExecutor", begin)

@@ -13783,7 +13783,7 @@ private:
                                                    int(timeoutMilliseconds + 30'000), output, failure);
     if (!valid) return false;
     simdjson::dom::parser parser; simdjson::dom::element document;
-    std::string_view observedOperation, beforeStarttimeReceipt, afterStarttimeReceipt;
+    std::string_view observedOperation, phase, beforeStarttimeReceipt, afterStarttimeReceipt;
     std::string_view beforeIdentityStarttime, afterIdentityStarttime;
     bool completed = false;
     uint64_t beforePIDReceipt = 0, afterPIDReceipt = 0;
@@ -13797,8 +13797,9 @@ private:
     };
     if (output.size() > 16_KB || parser.parse(output.data(), output.size()).get(document) != simdjson::SUCCESS ||
         document.type() != simdjson::dom::element_type::OBJECT ||
-        document.get_object().size() != 10 ||
+        document.get_object().size() != 11 ||
         document["operationID"].get(observedOperation) || document["completed"].get(completed) ||
+        document["phase"].get(phase) || phase != "completed" ||
         document["beforePID"].get(beforePIDReceipt) || document["beforeStarttime"].get(beforeStarttimeReceipt) ||
         document["afterPID"].get(afterPIDReceipt) || document["afterStarttime"].get(afterStarttimeReceipt) ||
         document["beforeIdentity"].get(beforeIdentity) || document["afterIdentity"].get(afterIdentity) ||
