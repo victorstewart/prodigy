@@ -18394,7 +18394,10 @@ public:
       // Once a peer is healthy again and no longer quarantined, any later
       // connect CQE on the opposite-direction connector is stale fallback
       // work and must not reinitialize the BrainView transport generation.
-      if (brain->weConnectToIt == false && brain->currentStreamAccepted == false && brain->quarantined == false)
+      // A master-owned fallback remains authoritative until the peer
+      // acknowledges the selected master, even though UUID order assigns the
+      // canonical connector to the peer.
+      if (peerReconnectOwned(brain) == false && brain->currentStreamAccepted == false && brain->quarantined == false)
       {
         basics_log("brain connect ignored non-connector completion private4=%u result=%d fd=%d fslot=%d\n",
                    brain->private4,

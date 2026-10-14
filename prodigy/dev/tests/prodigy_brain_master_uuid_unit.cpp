@@ -3790,8 +3790,54 @@ int main(void)
 
   };
 
+  auto runForcedNonConnectorFallbackFixture = [&] {
+    ScopedRing scopedRing = {};
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    BrainView *peer = makePeer(uint128_t(0x90224), 5, IPAddress("10.0.0.25", false).v4, "10.0.0.25");
+    peer->connected = false;
+    peer->quarantined = false;
+    peer->weConnectToIt = false;
+    peer->forceConnectorOwnershipUntilMasterAck = true;
+    peer->currentStreamAccepted = false;
+    brain.brains.insert(peer);
+
+    int fds[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) != 0)
+    {
+      suite.expect(false, "brain_connect_handler_forced_non_connector_fallback_creates_socketpair");
+    }
+    else
+    {
+      peer->fd = fds[0];
+      Ring::installFDIntoFixedFileSlot(peer);
+
+      brain.testConnectHandler(peer, 0);
+
+      suite.expect(peer->connected, "brain_connect_handler_forced_non_connector_fallback_marks_connected");
+      suite.expect(peer->pendingRecv, "brain_connect_handler_forced_non_connector_fallback_arms_recv");
+      suite.expect(peer->pendingSend, "brain_connect_handler_forced_non_connector_fallback_arms_send");
+      suite.expect(peer->wBuffer.outstandingBytes() > 0, "brain_connect_handler_forced_non_connector_fallback_queues_registration");
+      suite.expect(peer->forceConnectorOwnershipUntilMasterAck, "brain_connect_handler_forced_non_connector_fallback_preserves_ownership_until_ack");
+
+      Ring::uninstallFromFixedFileSlot(peer);
+      ::close(fds[1]);
+      peer->fd = -1;
+    }
+
+    brain.brains.erase(peer);
+    delete peer;
+  };
+
   if (const char *testOnly = ::getenv("PRODIGY_TEST_ONLY"); testOnly != nullptr)
   {
+    if (std::strcmp(testOnly, "forced-non-connector-fallback") == 0)
+    {
+      runForcedNonConnectorFallbackFixture();
+      return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (std::strcmp(testOnly, "machine-claim-resume-mutation") == 0)
     {
       runMachineClaimResumeMutationFixture(suite);
@@ -5513,6 +5559,8 @@ int main(void)
     brain.brains.erase(peer);
     delete peer;
   }
+
+  runForcedNonConnectorFallbackFixture();
 
   {
     ScopedRing scopedRing = {};
