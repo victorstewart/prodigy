@@ -1549,6 +1549,62 @@ static void testLargeMetricHistoryUsesImmutableAsyncCapture(TestSuite& suite)
   havePersistedBrainSnapshot = false;
 }
 
+static void testSnapshotReservationProfileNormalizesTopologyCapacity(TestSuite& suite)
+{
+  const ProdigyPersistentBrainSnapshot savedSnapshot = persistedBrainSnapshot;
+  const ProdigyPersistentBootState savedBootState = persistentBootState;
+  const bool savedHaveSnapshot = havePersistedBrainSnapshot;
+
+  persistedBrainSnapshot = {};
+  persistedBrainSnapshot.brainConfig.machineReservedResources = prodigyMachineReservedResources;
+  ClusterMachine staleMachine = {};
+  staleMachine.uuid = 0xCA9702;
+  staleMachine.isBrain = true;
+  staleMachine.totalLogicalCores = 4;
+  staleMachine.totalMemoryMB = 8192;
+  staleMachine.totalStorageMB = 32'768;
+  staleMachine.ownedLogicalCores = 2;
+  staleMachine.ownedMemoryMB = 4096;
+  staleMachine.ownedStorageMB = 28'672;
+  persistedBrainSnapshot.topology.machines.push_back(staleMachine);
+  havePersistedBrainSnapshot = true;
+  persistentBootState = {};
+
+  ProdigyHostControlNetwork network;
+  {
+    ProdigyBrain brain(network, {});
+    BrainConfig candidateConfig = brain.brainConfig;
+    candidateConfig.machineReservedResources = prodigySmokeMachineReservedResources;
+    ProdigyPersistentBrainSnapshot candidate =
+        brain.buildPersistentBrainSnapshot(nullptr, &candidateConfig);
+
+    suite.expect(
+        candidate.brainConfig.machineReservedResources == prodigySmokeMachineReservedResources,
+        "reservation_profile_snapshot_uses_candidate_config");
+    suite.expect(
+        candidate.topology.machines.size() == 1,
+        "reservation_profile_snapshot_preserves_topology");
+    if (candidate.topology.machines.size() == 1)
+    {
+      const ClusterMachine& normalized = candidate.topology.machines[0];
+      suite.expect(normalized.ownedLogicalCores == 4,
+                   "reservation_profile_snapshot_normalizes_owned_cores");
+      suite.expect(normalized.ownedMemoryMB == 8192,
+                   "reservation_profile_snapshot_normalizes_owned_memory");
+      suite.expect(normalized.ownedStorageMB == 32'768,
+                   "reservation_profile_snapshot_normalizes_owned_storage");
+    }
+    suite.expect(
+        brain.brainConfig.machineReservedResources == prodigyMachineReservedResources,
+        "reservation_profile_snapshot_does_not_mutate_live_config");
+  }
+  (void)network.shutdown();
+
+  persistedBrainSnapshot = savedSnapshot;
+  persistentBootState = savedBootState;
+  havePersistedBrainSnapshot = savedHaveSnapshot;
+}
+
 static void testDurableMaterializedRecoveryHistoricalCull(TestSuite& suite)
 {
   PersistenceRing ring = {};
@@ -2318,6 +2374,12 @@ static void testProductionPairProjectionWriterUsesColocatedNeuronAuthority(TestS
 int main(void)
 {
   TestSuite suite;
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "reservation-profile-snapshot") == 0)
+  {
+    testSnapshotReservationProfileNormalizesTopologyCapacity(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "machine-fragment-registry") == 0)
   {

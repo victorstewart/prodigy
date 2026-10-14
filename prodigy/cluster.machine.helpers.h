@@ -1247,7 +1247,10 @@ static inline void prodigyApplyHardwareProfileToClusterMachine(ClusterMachine& m
   (void)clusterMachineApplyOwnedResourcesFromTotals(machine, machine.totalLogicalCores, machine.totalMemoryMB, machine.totalStorageMB, reservedResources);
 }
 
-static inline void prodigyApplyHardwareProfileToMachine(Machine& machine, const MachineHardwareProfile& hardware)
+static inline void prodigyApplyHardwareProfileToMachine(
+    Machine& machine,
+    const MachineHardwareProfile& hardware,
+    const ProdigyMachineReservedResources& reservedResources = prodigyMachineReservedResources)
 {
   machine.hardware = hardware;
   machine.hasInternetAccess = prodigyMachineHardwareHasInternetAccess(hardware);
@@ -1289,7 +1292,8 @@ static inline void prodigyApplyHardwareProfileToMachine(Machine& machine, const 
       machine.totalStorageMB,
       machine.ownedLogicalCores,
       machine.ownedMemoryMB,
-      machine.ownedStorageMB);
+      machine.ownedStorageMB,
+      reservedResources);
 
   machine.isolatedLogicalCoresCommitted = 0;
   machine.sharedCPUMillisCommitted = 0;

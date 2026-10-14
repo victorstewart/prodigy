@@ -221,6 +221,26 @@ static void prodigyAppendClusterTopologyBrainPeers(Vector<ProdigyBootstrapConfig
   std::sort(peers.begin(), peers.end(), prodigyBootstrapPeerComesBefore);
 }
 
+static void prodigyNormalizeClusterTopologyOwnedResources(
+    ClusterTopology& topology,
+    const ProdigyMachineReservedResources& reservedResources)
+{
+  for (ClusterMachine& machine : topology.machines)
+  {
+    if (machine.totalLogicalCores == 0 || machine.totalMemoryMB == 0 || machine.totalStorageMB == 0)
+    {
+      continue;
+    }
+
+    (void)clusterMachineApplyOwnedResourcesFromTotals(
+        machine,
+        machine.totalLogicalCores,
+        machine.totalMemoryMB,
+        machine.totalStorageMB,
+        reservedResources);
+  }
+}
+
 static ClusterTopology prodigyCaptureClusterTopology(const Brain& brain, const ClusterTopology& authoritativeTopology)
 {
   ClusterTopology topology = {};
@@ -332,7 +352,12 @@ static ClusterTopology prodigyCaptureClusterTopology(const Brain& brain, const C
     }
     if ((clusterMachine.ownedLogicalCores == 0 || clusterMachine.ownedMemoryMB == 0 || clusterMachine.ownedStorageMB == 0) && clusterMachine.totalLogicalCores > 0 && clusterMachine.totalMemoryMB > 0 && clusterMachine.totalStorageMB > 0)
     {
-      (void)clusterMachineApplyOwnedResourcesFromTotals(clusterMachine, clusterMachine.totalLogicalCores, clusterMachine.totalMemoryMB, clusterMachine.totalStorageMB);
+      (void)clusterMachineApplyOwnedResourcesFromTotals(
+          clusterMachine,
+          clusterMachine.totalLogicalCores,
+          clusterMachine.totalMemoryMB,
+          clusterMachine.totalStorageMB,
+          brain.brainConfig.machineReservedResources);
     }
 
     captured.push_back(std::move(clusterMachine));
@@ -427,6 +452,8 @@ static ClusterTopology prodigyCaptureClusterTopology(const Brain& brain, const C
 
   if (topology.machines.empty() == false)
   {
+    prodigyNormalizeClusterTopologyOwnedResources(
+        topology, brain.brainConfig.machineReservedResources);
     prodigyNormalizeClusterTopologyPeerAddresses(topology);
     prodigyStripMachineHardwareCapturesFromClusterTopology(topology);
     topology.version = authoritativeTopology.version + 1;
@@ -1065,7 +1092,9 @@ public:
     if (!admitted && *callback) (*callback)(false);
   }
 
-  ProdigyPersistentBrainSnapshot buildPersistentBrainSnapshot(const ClusterTopology *topologyOverride = nullptr)
+  ProdigyPersistentBrainSnapshot buildPersistentBrainSnapshot(
+      const ClusterTopology *topologyOverride = nullptr,
+      const BrainConfig *brainConfigOverride = nullptr)
   {
     prodigyRuntimeTrace(
         "prodigy persist snapshot-build-begin topologyOverride=%d havePersistedBrainSnapshot=%d bootTopology=%zu machines=%zu brains=%zu\n",
@@ -1076,7 +1105,7 @@ public:
         size_t(brains.size()));
 
     ProdigyPersistentBrainSnapshot snapshot = {};
-    snapshot.brainConfig = brainConfig;
+    snapshot.brainConfig = brainConfigOverride != nullptr ? *brainConfigOverride : brainConfig;
     if (topologyOverride)
     {
       snapshot.topology = *topologyOverride;
@@ -1103,6 +1132,8 @@ public:
       }
     }
 
+    prodigyNormalizeClusterTopologyOwnedResources(
+        snapshot.topology, snapshot.brainConfig.machineReservedResources);
     prodigyStripMachineHardwareCapturesFromClusterTopology(snapshot.topology);
 
     capturePersistentMasterAuthorityPackage(snapshot.masterAuthority);
@@ -1244,8 +1275,7 @@ public:
   bool persistMasterAuthorityTransitionCandidate(
       const ProdigyMasterAuthorityStateTransition& candidate, PersistenceCompletion completion) override
   {
-    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot();
-    snapshot.brainConfig = candidate.brainConfig;
+    ProdigyPersistentBrainSnapshot snapshot = buildPersistentBrainSnapshot(nullptr, &candidate.brainConfig);
     snapshot.masterAuthority.runtimeState = candidate.runtimeState;
     snapshot.masterAuthority.servingRuntimeStates = candidate.servingRuntimeStates;
     // A v3 transition persists the admitted normalized plans in the same

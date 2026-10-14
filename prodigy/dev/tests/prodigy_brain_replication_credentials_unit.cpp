@@ -31677,6 +31677,96 @@ static void testBrainNeuronHandlerAppliesMachineHardwareProfile(TestSuite& suite
                "brain_neuron_hardware_persists_cluster_topology");
 }
 
+static void testBrainHardwareProfileAppliesMachineReservationProfile(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.brainConfig.machineReservedResources = prodigySmokeMachineReservedResources;
+
+  ClusterMachine clusterMachine = makeCreatedBrainClusterMachineForTest(
+      0x4205, "gcp-follower-5"_ctv, "10.128.15.217"_ctv, "34.10.44.22"_ctv);
+  brain.authoritativeTopology.machines.push_back(clusterMachine);
+
+  Machine machine = {};
+  machine.uuid = clusterMachine.uuid;
+  machine.isBrain = true;
+  machine.slug = clusterMachine.cloud.schema;
+  machine.type = clusterMachine.cloud.providerMachineType;
+  machine.cloudID = clusterMachine.cloud.cloudID;
+  machine.privateAddress = "10.128.15.217"_ctv;
+  machine.publicAddress = "34.10.44.22"_ctv;
+  machine.private4 = IPAddress("10.128.15.217", false).v4;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+
+  MachineHardwareProfile hardware = {};
+  hardware.inventoryComplete = true;
+  hardware.collectedAtMs = 111'222'335;
+  hardware.cpu.logicalCores = 2;
+  hardware.memory.totalMB = 4096;
+  MachineDiskHardwareProfile disk = {};
+  disk.sizeMB = 20'480;
+  hardware.disks.push_back(disk);
+
+  brain.applyMachineHardwareProfile(&machine, hardware);
+
+  suite.expect(machine.ownedLogicalCores == 2,
+               "brain_hardware_reservation_profile_refreshes_owned_cores");
+  suite.expect(machine.ownedMemoryMB == 4096,
+               "brain_hardware_reservation_profile_refreshes_owned_memory");
+  suite.expect(machine.ownedStorageMB == 20'480,
+               "brain_hardware_reservation_profile_refreshes_owned_storage");
+  suite.require(
+      brain.authoritativeTopology.machines.size() == 1,
+      "brain_hardware_reservation_profile_persists_topology");
+  if (brain.authoritativeTopology.machines.size() == 1)
+  {
+    const ClusterMachine& persistedMachine = brain.authoritativeTopology.machines[0];
+    suite.expect(persistedMachine.ownedLogicalCores == 2,
+                 "brain_hardware_reservation_profile_persists_owned_cores");
+    suite.expect(persistedMachine.ownedMemoryMB == 4096,
+                 "brain_hardware_reservation_profile_persists_owned_memory");
+    suite.expect(persistedMachine.ownedStorageMB == 20'480,
+                 "brain_hardware_reservation_profile_persists_owned_storage");
+  }
+}
+
+static void testTopologyRestoreAppliesMachineReservationProfile(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain = {};
+  NoopBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.brainConfig.machineReservedResources = prodigySmokeMachineReservedResources;
+
+  ClusterTopology topology = {};
+  ClusterMachine machine = makeCreatedBrainClusterMachineForTest(
+      0x4204, "gcp-follower-4"_ctv, "10.128.15.216"_ctv, "34.10.44.21"_ctv);
+  machine.totalLogicalCores = 2;
+  machine.totalMemoryMB = 4096;
+  machine.totalStorageMB = 20'480;
+  machine.ownedLogicalCores = 0;
+  machine.ownedMemoryMB = 0;
+  machine.ownedStorageMB = 16'384;
+  topology.machines.push_back(machine);
+
+  suite.require(
+      brain.restoreMachinesFromClusterTopology(topology),
+      "topology_restore_reservation_profile_restores_machine");
+  Machine *restored = brain.findMachineByUUIDForTest(machine.uuid);
+  suite.require(restored != nullptr, "topology_restore_reservation_profile_finds_machine");
+  if (restored != nullptr)
+  {
+    suite.expect(restored->ownedLogicalCores == 2,
+                 "topology_restore_reservation_profile_refreshes_owned_cores");
+    suite.expect(restored->ownedMemoryMB == 4096,
+                 "topology_restore_reservation_profile_refreshes_owned_memory");
+    suite.expect(restored->ownedStorageMB == 20'480,
+                 "topology_restore_reservation_profile_refreshes_owned_storage");
+  }
+}
+
 class DeferredTopologyInventoryBrain final : public ResumableAddMachinesBrain {
 public:
   class PendingTopologyPersistence {
@@ -37290,6 +37380,12 @@ int main(void)
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-admission-replay") == 0)
   {
     testBrainReplaysHardwareReceivedBeforeTopologyAdmission(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "hardware-reservation-profile") == 0)
+  {
+    testBrainHardwareProfileAppliesMachineReservationProfile(suite);
+    testTopologyRestoreAppliesMachineReservationProfile(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "credential-listener-contract") == 0)

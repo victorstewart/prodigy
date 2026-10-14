@@ -21969,7 +21969,7 @@ public:
     bool changed = (machine->hardware != hardware);
     if (changed)
     {
-      prodigyApplyHardwareProfileToMachine(*machine, hardware);
+      prodigyApplyHardwareProfileToMachine(*machine, hardware, brainConfig.machineReservedResources);
     }
     bool configuredCapacityChanged = false;
     if (brainConfig.runtimeEnvironment.test.enabled)
@@ -24016,6 +24016,17 @@ public:
     machine->isThisMachine = thisIsMachine;
     machine->neuron.machine = machine;
     prodigyConfigureMachineNeuronEndpoint(*machine, thisNeuron, &localBrainPeerAddresses);
+
+    const MachineConfig defaultMachineConfig = {};
+    auto configuredMachine = brainConfig.configBySlug.find(machine->slug);
+    const MachineConfig& machineConfig = configuredMachine == brainConfig.configBySlug.end()
+                                             ? defaultMachineConfig
+                                             : configuredMachine->second;
+    (void)applyConfiguredMachineCapacity(
+        machine,
+        machineConfig,
+        brainConfig.runtimeEnvironment.test.enabled,
+        true);
   }
 
   bool restoreBrainsFromClusterTopology(const ClusterTopology& topology)
