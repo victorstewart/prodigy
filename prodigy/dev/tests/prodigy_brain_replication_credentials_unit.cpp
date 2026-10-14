@@ -37215,6 +37215,12 @@ int main(void)
     testAsyncAddMachinesRecoveryPersistence(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only && strcmp(only, "machine-schema-persistence") == 0)
+  {
+    testAsyncTopologyCallers(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "async-recovery") == 0)
   {
     testAsyncMaterializedRecoveryAcceptance(suite);

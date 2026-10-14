@@ -2166,6 +2166,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    add_test(NAME prodigy_runtime_persistence_unit COMMAND ${CMAKE_BINARY_DIR}/prodigy_runtime_persistence_unit)
    add_test(NAME prodigy_async_persistence_callers
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=async-persistence-callers ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(NAME prodigy_machine_schema_persistence_backpressure
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-schema-persistence ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
    add_test(
       NAME prodigy_async_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit

@@ -41648,6 +41648,26 @@ public:
       Message::construct(stream->wBuffer, topic, payload);
       (void)flushActiveMothershipSendBuffer(stream, "machine-schema-durable");
     };
+
+    // Machine-schema requests are ordinary retryable control operations.  A
+    // full ArtifactIO queue is bounded contention, not a failed durable
+    // mutation: restore the pre-request view and close without a response so
+    // Mothership's existing transport retry can resubmit the unchanged
+    // request after the current writer receipts release their leases.
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      syncManagedMachineSchemaConfigs(masterAuthorityRuntimeState.machineSchemas, previousSchemas);
+      masterAuthorityRuntimeState.machineSchemas = std::move(previousSchemas);
+      if (admission == UpdateSelfPersistenceAdmission::backpressured)
+      {
+        queueCloseIfActive(stream, "machine-schema-persistence-backpressure");
+        return;
+      }
+      reply(false, "machine schema persistence unavailable"_ctv, {}, {});
+      return;
+    }
+
     commitMasterAuthorityStateChangeAsync([this, epoch, generation, previousSchemas = std::move(previousSchemas),
         reply = std::move(reply)](bool durable) mutable {
       if (masterAuthorityEpoch != epoch) return;

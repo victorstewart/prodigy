@@ -118,4 +118,56 @@ static void testAsyncTopologyCallers(TestSuite& suite)
     brain.closingMotherships.erase(&stream);
     if (stream.fd >= 0) { ::close(stream.fd); stream.fd = -1; }
   }
+
+  {
+    ScopedAsyncMothershipRing ring;
+    ScopedSocketPair sockets;
+    ResumableAddMachinesBrain brain;
+    NoopBrainIaaS iaas;
+    Mothership stream;
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    if (suite.require(sockets.create(suite, "schema_backpressure_socket_pair"),
+                      "schema_backpressure_socket_pair_required") == false) return;
+    stream.isFixedFile = false;
+    stream.fd = sockets.takeLeft();
+    if (suite.require(brain.activateMothershipConnection(&stream),
+                      "schema_backpressure_activates_mothership") == false) return;
+    RingDispatcher::installMultiplexee(&stream, &brain);
+
+    ProdigyManagedMachineSchemaPatch patch;
+    patch.schema = "backpressured-schema"_ctv;
+    patch.hasKind = true;
+    patch.kind = MachineConfig::MachineKind::vm;
+    patch.hasLifetime = true;
+    patch.lifetime = MachineLifetime::ondemand;
+    patch.hasProviderMachineType = true;
+    patch.providerMachineType = "vc2-4c-8gb"_ctv;
+    patch.hasBudget = true;
+    patch.budget = 3;
+    UpsertMachineSchemas request;
+    request.patches.push_back(std::move(patch));
+    String payload;
+    String frame;
+    BitseryEngine::serialize(payload, request);
+
+    const uint64_t generation = brain.masterAuthorityRuntimeState.generation;
+    brain.updateSelfPersistenceBackpressureResponses = 1;
+    brain.mothershipHandler(
+        &stream, buildMothershipMessage(frame, MothershipTopic::upsertMachineSchemas, payload));
+    suite.expect(brain.persistCalls == 0 &&
+                     brain.masterAuthorityRuntimeState.generation == generation &&
+                     brain.masterAuthorityRuntimeState.machineSchemas.empty(),
+                 "schema_backpressure_restores_uncommitted_mutation_without_persisting");
+    suite.expect(stream.wBuffer.empty() && Ring::socketIsClosing(&stream) &&
+                     brain.activeMotherships.contains(&stream) == false &&
+                     brain.closingMotherships.contains(&stream),
+                 "schema_backpressure_closes_without_terminal_response_for_mothership_retry");
+
+    RingDispatcher::eraseMultiplexee(&stream);
+    brain.activeMotherships.erase(&stream);
+    brain.closingMotherships.erase(&stream);
+    if (stream.fd >= 0) { ::close(stream.fd); stream.fd = -1; }
+  }
 }
