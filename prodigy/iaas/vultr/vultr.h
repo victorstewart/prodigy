@@ -434,6 +434,24 @@ static inline void vultrAppendPublicMachinePeerAddresses(
   }
 }
 
+static inline void vultrPreferPrivateMachinePeerAddress(
+    const String& privateAddress, Vector<ClusterMachinePeerAddress>& peerAddresses)
+{
+  if (privateAddress.size() == 0)
+  {
+    return;
+  }
+
+  Vector<ClusterMachinePeerAddress> preferred = {};
+  prodigyAppendUniqueClusterMachinePeerAddress(
+      preferred, ClusterMachinePeerAddress {privateAddress, 0, {}});
+  for (const ClusterMachinePeerAddress& peerAddress : peerAddresses)
+  {
+    prodigyAppendUniqueClusterMachinePeerAddress(preferred, peerAddress);
+  }
+  peerAddresses = std::move(preferred);
+}
+
 static inline bool vultrExtractAttachedVPCIPv4(simdjson::dom::element doc, String& privateAddress)
 {
   privateAddress.clear();
@@ -1277,6 +1295,7 @@ private:
     if (vultrExtractInternalIPv4(dev, privateAddress))
     {
       m->privateAddress = privateAddress;
+      vultrPreferPrivateMachinePeerAddress(m->privateAddress, m->peerAddresses);
     }
     else if (public6Address.size() == 0 && p4 == 0 && m->publicAddress.size() > 0)
     {
@@ -1727,7 +1746,7 @@ private:
     }
 
     machine.privateAddress = privateAddress;
-    prodigyAppendUniqueClusterMachinePeerAddress(machine.peerAddresses, ClusterMachinePeerAddress {privateAddress, 0, {}});
+    vultrPreferPrivateMachinePeerAddress(privateAddress, machine.peerAddresses);
     uint32_t parsedPrivate4 = 0;
     if (parse_ipv4(privateAddress, parsedPrivate4))
     {

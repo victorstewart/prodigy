@@ -303,6 +303,58 @@ int main(void)
   }
 
   {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    bytell_hash_set<Machine *> machines = {};
+    provider.getMachines(&stack, "ewr"_ctv, machines, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"instances":[{"id":"instance-with-vpc","main_ip":"45.76.166.5","v6_main_ip":"2001:19f0:6001:48e4:5400:06ff:fe05:9ea6","internal_ip":"10.1.96.3","region":"ewr","tags":["prodigy"]}]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 500);
+    bool privateFirst = false;
+    for (Machine *machine : machines)
+    {
+      privateFirst = machine->peerAddresses.size() == 2 &&
+          machine->peerAddresses[0].address == "10.1.96.3"_ctv &&
+          machine->peerAddresses[1].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv;
+      delete machine;
+    }
+    suite.expect(!stack.hasSuspendedCoroutines() && failure.empty() &&
+                     machines.size() == 1 && privateFirst,
+                 "vultr_machine_inventory_prefers_internal_ipv4_when_vpc_lookup_fails");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv);
+    CoroutineStack stack = {};
+    String failure = {};
+    bytell_hash_set<Machine *> machines = {};
+    provider.getMachines(&stack, "ewr"_ctv, machines, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"instances":[{"id":"instance-with-late-vpc","main_ip":"45.76.166.6","v6_main_ip":"2001:19f0:6001:48e4:5400:06ff:fe05:9ea7","region":"ewr","tags":["prodigy"]}]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"ip_address":"10.1.96.4"}]})json"_ctv);
+    bool privateFirst = false;
+    for (Machine *machine : machines)
+    {
+      privateFirst = machine->peerAddresses.size() == 3 &&
+          machine->peerAddresses[0].address == "10.1.96.4"_ctv &&
+          machine->peerAddresses[1].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea7"_ctv &&
+          machine->peerAddresses[2].address == "45.76.166.6"_ctv;
+      delete machine;
+    }
+    suite.expect(!stack.hasSuspendedCoroutines() && failure.empty() &&
+                     machines.size() == 1 && privateFirst,
+                 "vultr_machine_inventory_promotes_late_vpc_ipv4_before_public_ipv6");
+  }
+
+  {
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
     String json = "{\"id\":\"1234567890\",\"zone\":\"projects/test-project/zones/us-central1-a\",\"resourceStatus\":{\"physicalHost\":\"host-42\"}}"_ctv;
@@ -628,14 +680,25 @@ int main(void)
     if (parsed)
     {
       String publicIPv6 = {};
+      String internalIPv4 = {};
       suite.expect(vultrExtractPublicIPv6(doc, publicIPv6), "vultr_vpc_machine_extracts_public_ipv6");
+      suite.expect(vultrExtractInternalIPv4(doc, internalIPv4), "vultr_vpc_machine_extracts_internal_ipv4");
       Vector<ClusterMachinePeerAddress> peerAddresses = {};
       vultrAppendPublicMachinePeerAddresses(publicIPv6, "45.76.166.5"_ctv, true, peerAddresses);
-      ClusterMachineAddresses addresses = {};
-      prodigyAssignClusterMachineAddressesFromPeerCandidates(addresses, peerAddresses);
-      suite.expect(addresses.publicAddresses.size() == 1 &&
-          addresses.publicAddresses[0].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv,
-          "vultr_vpc_machine_retains_public_ipv6_peer_address");
+      vultrPreferPrivateMachinePeerAddress(internalIPv4, peerAddresses);
+      suite.expect(peerAddresses.size() == 2 &&
+          peerAddresses[0].address == "10.1.96.3"_ctv &&
+          peerAddresses[1].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv,
+          "vultr_vpc_machine_prefers_late_private_ipv4_before_public_ipv6");
+      ClusterTopology topology = {};
+      topology.machines.resize(1);
+      topology.machines[0].peerAddresses = std::move(peerAddresses);
+      prodigyNormalizeClusterTopologyPeerAddresses(topology);
+      const Vector<ClusterMachinePeerAddress>& normalized = topology.machines[0].peerAddresses;
+      suite.expect(normalized.size() == 2 &&
+          normalized[0].address == "10.1.96.3"_ctv &&
+          normalized[1].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv,
+          "vultr_vpc_machine_preserves_private_ipv4_and_public_ipv6_with_private_first");
     }
   }
 
