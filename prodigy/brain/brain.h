@@ -7850,37 +7850,9 @@ public:
         co_return;
       }
 
-      class ProvisioningStack final : public CoroutineStack
-      {
-        uint32_t consumers = 0;
-        bool retired = false;
-
-      public:
-
-        void co_consume(void) override
-        {
-          consumers += 1;
-          CoroutineStack::co_consume();
-          consumers -= 1;
-          if (retired && consumers == 0)
-          {
-            delete this;
-          }
-        }
-
-        void retire(void)
-        {
-          retired = true;
-          if (consumers == 0)
-          {
-            delete this;
-          }
-        }
-      };
-
       bytell_hash_set<Machine *> createdSnapshots = {};
       String providerFailure = {};
-      ProvisioningStack *coro = new ProvisioningStack();
+      BrainProviderCoroutineStack *coro = new BrainProviderCoroutineStack();
       iaas->configureBootstrapSSHAccess(persistedOperation->request.bootstrapSshUser,
                                         persistedOperation->request.bootstrapSshKeyPackage,
                                         persistedOperation->request.bootstrapSshHostKeyPackage,
@@ -27391,7 +27363,7 @@ public:
         machineConfig = &currentConfig->second;
       }
 
-      CoroutineStack *coro = new CoroutineStack();
+      BrainProviderCoroutineStack *coro = new BrainProviderCoroutineStack();
 
       String error;
 
@@ -27408,7 +27380,7 @@ public:
         co_await coro->suspendAtIndex(suspendIndex);
       }
 
-      delete coro;
+      coro->retire();
 
       if (iaas->provisioningOperationSettled() == false)
       {
@@ -40411,7 +40383,7 @@ public:
               incrementalCreatedBootstrapUsesBlocking,
               incrementalCreatedBootstrapUsesCoordinator);
 
-          CoroutineStack *coro = new CoroutineStack();
+          BrainProviderCoroutineStack *coro = new BrainProviderCoroutineStack();
           bytell_hash_set<Machine *> createdSnapshots;
           String providerError;
 
@@ -40435,6 +40407,9 @@ public:
           {
             co_await coro->suspendAtIndex(suspendIndex);
           }
+          // The provider wakes this frame from inside co_consume().  Retire the
+          // owned stack now, but let the active consumer return before deletion.
+          coro->retire();
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
           addMachinesProviderWaitNs += (Time::now<TimeResolution::ns>() - providerWaitStartNs);
 #endif
@@ -40445,13 +40420,11 @@ public:
           if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch)
           {
             for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
-            delete coro;
             co_return;
           }
           if (!progressDurable && response.failure.empty())
             response.failure.assign("failed to persist provisioned machine identity"_ctv);
           provisioningProgressSink.clearIncrementalCreatedBootstrap();
-          delete coro;
 
           if (createdSnapshots.size() != instruction.count)
           {

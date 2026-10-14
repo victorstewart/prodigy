@@ -5208,6 +5208,50 @@ static void testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(
   restored.mesh = nullptr;
 }
 
+static void testAutonomousProvisioningRetiresSuspendedProviderStack(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain;
+  AutoProvisionBrainIaaS iaas;
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.clusterUUID = 0x62004002;
+  iaas.observedBrain = &brain;
+  iaas.suspendSpinWithFailure = true;
+
+  MachineConfig machineConfig;
+  machineConfig.slug.assign("suspended-autonomous"_ctv);
+  machineConfig.nLogicalCores = 4;
+  machineConfig.nMemoryMB = 4096;
+  machineConfig.nStorageMB = 4096;
+  brain.brainConfig.configBySlug.insert_or_assign(machineConfig.slug, machineConfig);
+
+  ApplicationDeployment deployment;
+  seedDeployRequestPlan(deployment.plan, 62'005);
+  brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+  MachineTicket ticket;
+  brain.requestMachines(&ticket, &deployment, ApplicationLifetime::base, 8);
+
+  if (!suite.require(iaas.spinCalls == 1 && iaas.suspendedSpinStack != nullptr &&
+                         brain.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.size() == 1,
+                     "autonomous_provisioning_waits_for_suspended_provider_failure"))
+  {
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    delete brain.mesh;
+    brain.mesh = nullptr;
+    return;
+  }
+
+  iaas.finishSuspendedSpinFailure();
+  suite.expect(iaas.suspendedSpinStack == nullptr &&
+                   brain.masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.empty(),
+               "autonomous_provisioning_retires_provider_stack_after_resume");
+
+  brain.deployments.erase(deployment.plan.config.deploymentID());
+  delete brain.mesh;
+  brain.mesh = nullptr;
+}
+
 static void testSpinApplicationFailedFrameCarriesReason(TestSuite& suite)
 {
   StreamingTestBrain brain;
@@ -37628,6 +37672,7 @@ int main(void)
   if (std::getenv("PRODIGY_TEST_AUTONOMOUS_PROVISIONING_JOURNAL") != nullptr)
   {
     testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
+    testAutonomousProvisioningRetiresSuspendedProviderStack(suite);
     return suite.failed == 0 ? 0 : 1;
   }
   if (std::getenv("PRODIGY_TEST_FAILED_DEPLOYMENT_RESTART") != nullptr)
@@ -37921,6 +37966,7 @@ int main(void)
   testAcceptedBrainPeerSetsLargePayloadUserTimeout(suite);
   testStatefulRequestMachinesClaimsDeployingMachinesWithSpecializedTicket(suite);
   testAutonomousProvisioningJournalReplaysAmbiguousLaunchAfterRestart(suite);
+  testAutonomousProvisioningRetiresSuspendedProviderStack(suite);
   testSpinApplicationFailedFrameCarriesReason(suite);
   testMachineSchemaMutationsQueueRuntimeStateReplication(suite);
   testManagedMachineSchemaRequestCarriesClusterUUID(suite);

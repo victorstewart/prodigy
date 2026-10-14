@@ -34,6 +34,36 @@ class Mesh;
 class Wormhole;
 class TlsResumptionApplyAck;
 
+// Provider completions resume their caller from inside CoroutineStack::co_consume().
+// A caller that owns its stack can finish during that resume, but it must not
+// destroy the stack until the active consumer has returned to its outer frame.
+class BrainProviderCoroutineStack final : public CoroutineStack {
+  uint32_t activeConsumers = 0;
+  bool retirementRequested = false;
+
+public:
+
+  void co_consume(void) override
+  {
+    activeConsumers += 1;
+    CoroutineStack::co_consume();
+    activeConsumers -= 1;
+    if (retirementRequested && activeConsumers == 0)
+    {
+      delete this;
+    }
+  }
+
+  void retire(void)
+  {
+    retirementRequested = true;
+    if (activeConsumers == 0)
+    {
+      delete this;
+    }
+  }
+};
+
 constexpr inline int64_t prodigyOperatorCancellationTombstoneRetentionMs =
     24LL * 60LL * 60LL * 1000LL;
 
@@ -1181,11 +1211,12 @@ public:
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count)
   {
-    bool coroWasNull = !coro;
+    BrainProviderCoroutineStack *ownedCoro = nullptr;
 
-    if (coroWasNull)
+    if (coro == nullptr)
     {
-      coro = new CoroutineStack();
+      ownedCoro = new BrainProviderCoroutineStack();
+      coro = ownedCoro;
     }
 
     bytell_hash_set<Machine *> newMachines;
@@ -1215,9 +1246,9 @@ public:
                  reinterpret_cast<const char *>(config.slug.data()), error.c_str());
     }
 
-    if (coroWasNull)
+    if (ownedCoro != nullptr)
     {
-      delete coro;
+      ownedCoro->retire();
     }
   }
 

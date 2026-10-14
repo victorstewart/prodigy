@@ -231,6 +231,57 @@ static void testAsyncAddMachinesProviderJournalDurability(TestSuite& suite)
  }
 }
 
+static void testAsyncAddMachinesProviderStackRetiresAfterCallback(TestSuite& suite)
+{
+  AutoProvisionBrainIaaS iaas = {};
+  ResumableAddMachinesBrain brain = {};
+  configureAsyncAddMachinesBrain(brain, iaas, 0xaadd06, 0xaadd61);
+
+  MachineConfig workerConfig = {};
+  workerConfig.kind = MachineConfig::MachineKind::vm;
+  workerConfig.slug.assign("suspended-worker-vm"_ctv);
+  workerConfig.providerMachineType.assign("suspended-worker-vm"_ctv);
+  workerConfig.nLogicalCores = 2;
+  workerConfig.nMemoryMB = 4096;
+  workerConfig.nStorageMB = 32'768;
+  brain.brainConfig.configBySlug.insert_or_assign(workerConfig.slug, workerConfig);
+
+  AddMachines request = {};
+  request.clusterUUID = brain.brainConfig.clusterUUID;
+  request.bootstrapSshUser.assign("root"_ctv);
+  request.bootstrapSshPrivateKeyPath.assign("/tmp/test-key"_ctv);
+  request.controlSocketPath.assign("/run/prodigy/control.sock"_ctv);
+  Brain::ManagedAddMachinesWork work = {};
+  CreateMachinesInstruction instruction = {};
+  instruction.backing = ClusterMachineBacking::cloud;
+  instruction.kind = MachineConfig::MachineKind::vm;
+  instruction.lifetime = MachineLifetime::ondemand;
+  instruction.count = 1;
+  instruction.isBrain = false;
+  instruction.cloud.schema = workerConfig.slug;
+  work.createdMachines.push_back(instruction);
+
+  iaas.suspendSpinWithFailure = true;
+  bool completed = false;
+  AddMachines response = {};
+  brain.addMachines(nullptr, std::move(request), std::move(work), nullptr,
+                    [&](AddMachines value) { completed = true; response = std::move(value); });
+  if (!suite.require(!completed && iaas.suspendedSpinStack != nullptr,
+                     "async_addmachines_initial_waits_for_suspended_provider_failure"))
+  {
+    return;
+  }
+
+  // This callback resumes addMachines from inside the provider stack's
+  // co_consume().  Completion may retire that stack, but deletion must wait
+  // until the active consumer has returned.
+  iaas.finishSuspendedSpinFailure();
+  suite.expect(completed && !response.success && iaas.suspendedSpinStack == nullptr &&
+                   response.failure.equals("injected suspended provider failure"_ctv) &&
+                   brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty(),
+               "async_addmachines_initial_retires_provider_stack_after_resume");
+}
+
 static void testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(TestSuite& suite);
 
 static void runAsyncAddMachinesTests(TestSuite& suite)
@@ -239,6 +290,7 @@ static void runAsyncAddMachinesTests(TestSuite& suite)
   testAsyncAddMachinesAdoptedJournalDurability(suite);
   testAsyncAddMachinesFinalJournalDurability(suite);
   testAsyncAddMachinesProviderJournalDurability(suite);
+  testAsyncAddMachinesProviderStackRetiresAfterCallback(suite);
   testAsyncAddMachinesReconcilesStaleTopologyAfterBootstrap(suite);
 }
 
