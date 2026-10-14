@@ -119,6 +119,7 @@ private:
   AsyncBootStatePersistence asyncBootStatePersistence = {};
   BootstrapBrainIaaS bootstrapDelegate;
   std::unique_ptr<BrainIaaS> providerDelegate;
+  uint32_t activeDelegatedOperations = 0;
   bool providerReconfigurationPending = false;
   bool elasticAddressOperationBatchActive = false;
   bool elasticAddressReleaseFenceActive = false;
@@ -142,6 +143,7 @@ private:
   void applyPendingRuntimeEnvironment(BrainIaaS *completedDelegate)
   {
     if (completedDelegate != nullptr && providerReconfigurationPending &&
+        activeDelegatedOperations == 0 &&
         elasticAddressOperationBatchActive == false && elasticAddressReleaseFenceActive == false &&
         providerReconfigurationFenceActive == false &&
         completedDelegate == providerDelegate.get() &&
@@ -153,6 +155,57 @@ private:
       persistBootState();
     }
   }
+
+  void finishDelegatedOperation(BrainIaaS *completedDelegate, bool applyPending)
+  {
+    if (activeDelegatedOperations == 0)
+    {
+      std::abort();
+    }
+    --activeDelegatedOperations;
+    if (applyPending)
+    {
+      applyPendingRuntimeEnvironment(completedDelegate);
+    }
+  }
+
+  class DelegatedOperation final
+  {
+  private:
+
+    RuntimeAwareBrainIaaS *owner;
+    BrainIaaS *delegate;
+
+  public:
+
+    DelegatedOperation(RuntimeAwareBrainIaaS& requestedOwner, BrainIaaS *requestedDelegate)
+        : owner(&requestedOwner),
+          delegate(requestedDelegate)
+    {
+      ++owner->activeDelegatedOperations;
+    }
+
+    ~DelegatedOperation()
+    {
+      if (owner)
+      {
+        owner->finishDelegatedOperation(delegate, false);
+      }
+    }
+
+    void complete(void)
+    {
+      if (owner)
+      {
+        RuntimeAwareBrainIaaS *completedOwner = owner;
+        owner = nullptr;
+        completedOwner->finishDelegatedOperation(delegate, true);
+      }
+    }
+
+    DelegatedOperation(const DelegatedOperation&) = delete;
+    DelegatedOperation& operator=(const DelegatedOperation&) = delete;
+  };
 
   void persistBootState(void)
   {
@@ -183,6 +236,18 @@ public:
   {
     asyncBootStatePersistence = std::move(persistence);
   }
+
+#ifdef PRODIGY_RUNTIME_PERSISTENCE_UNIT
+  void installProviderDelegateForTest(std::unique_ptr<BrainIaaS> delegate)
+  {
+    providerDelegate = std::move(delegate);
+  }
+
+  bool providerReconfigurationPendingForTest(void) const
+  {
+    return providerReconfigurationPending;
+  }
+#endif
 
   RuntimeAwareBrainIaaS(ProdigyPersistentStateStore *store,
                         const ProdigyBootstrapConfig& bootstrap,
@@ -244,7 +309,8 @@ public:
     prodigyStripManagedCloudBootstrapCredentials(requestedEnvironment);
     prodigyApplyInternalRuntimeEnvironmentDefaults(requestedEnvironment);
     if (providerDelegate &&
-        (providerDelegate->hasActiveControlOperations() || elasticAddressOperationBatchActive))
+        (activeDelegatedOperations > 0 || providerDelegate->hasActiveControlOperations() ||
+         elasticAddressOperationBatchActive))
     {
       prodigyOwnRuntimeEnvironmentConfig(requestedEnvironment, pendingRuntimeEnvironment);
       providerReconfigurationPending = true;
@@ -281,12 +347,40 @@ public:
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    activeDelegate()->spinMachines(coro, lifetime, config, count, newMachines, error);
+    BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
+    if (coro == nullptr)
+    {
+      delegate->spinMachines(coro, lifetime, config, count, newMachines, error);
+      operation.complete();
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->spinMachines(coro, lifetime, config, count, newMachines, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    operation.complete();
   }
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bool isBrain, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    activeDelegate()->spinMachines(coro, lifetime, config, count, isBrain, newMachines, error);
+    BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
+    if (coro == nullptr)
+    {
+      delegate->spinMachines(coro, lifetime, config, count, isBrain, newMachines, error);
+      operation.complete();
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->spinMachines(coro, lifetime, config, count, isBrain, newMachines, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    operation.complete();
   }
 
   void configureBootstrapSSHAccess(const String& user, const Vault::SSHKeyPackage& keyPackage, const Vault::SSHKeyPackage& hostKeyPackage, const String& privateKeyPath) override
@@ -339,7 +433,21 @@ public:
 
   void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
   {
-    activeDelegate()->getMachines(coro, metro, machines, failure);
+    BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
+    if (coro == nullptr)
+    {
+      delegate->getMachines(coro, metro, machines, failure);
+      operation.complete();
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->getMachines(coro, metro, machines, failure);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    operation.complete();
   }
 
   void getBrains(CoroutineStack *coro, uint128_t selfUUID, bool& selfIsBrain, bytell_hash_set<BrainView *>& brains, String& failure) override
@@ -364,7 +472,21 @@ public:
 
   void inferMachineSchemaCpuCapability(CoroutineStack *coro, const MachineConfig& config, MachineSchemaCpuCapability& capability, String& error) override
   {
-    activeDelegate()->inferMachineSchemaCpuCapability(coro, config, capability, error);
+    BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
+    if (coro == nullptr)
+    {
+      delegate->inferMachineSchemaCpuCapability(coro, config, capability, error);
+      operation.complete();
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->inferMachineSchemaCpuCapability(coro, config, capability, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    operation.complete();
   }
 
   bool supportsAuthoritativeMachineSchemaCpuCapabilityInference(void) const override
@@ -374,7 +496,21 @@ public:
 
   void preflightClusterCreate(CoroutineStack *coro, const BrainIaaSClusterCreatePreflight& preflight, String& error) override
   {
-    activeDelegate()->preflightClusterCreate(coro, preflight, error);
+    BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
+    if (coro == nullptr)
+    {
+      delegate->preflightClusterCreate(coro, preflight, error);
+      operation.complete();
+      co_return;
+    }
+    if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
+          delegate->preflightClusterCreate(coro, preflight, error);
+        }))
+    {
+      co_await coro->suspendAtIndex(suspendIndex);
+    }
+    operation.complete();
   }
 
   void hardRebootMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
@@ -385,14 +521,14 @@ public:
       co_return;
     }
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->hardRebootMachine(coro, cloudID, failure);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void reportHardwareFailure(uint128_t uuid, const String& report) override
@@ -403,14 +539,14 @@ public:
   void checkForSpotTerminations(CoroutineStack *coro, Vector<String>& decommissionedIDs) override
   {
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->checkForSpotTerminations(coro, decommissionedIDs);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void destroyMachine(CoroutineStack *coro, const String& cloudID, String& failure) override
@@ -421,14 +557,14 @@ public:
       co_return;
     }
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->destroyMachine(coro, cloudID, failure);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void destroyClusterMachines(CoroutineStack *coro, const String& clusterUUID, uint32_t& destroyed, String& error) override
@@ -440,14 +576,14 @@ public:
       co_return;
     }
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->destroyClusterMachines(coro, clusterUUID, destroyed, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void ensureProdigyMachineTags(CoroutineStack *coro,
@@ -461,14 +597,14 @@ public:
       co_return;
     }
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->ensureProdigyMachineTags(coro, clusterUUID, cloudID, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void prepareProviderElasticAddress(CoroutineStack *coro,
@@ -485,14 +621,14 @@ public:
     }
 
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->prepareProviderElasticAddress(coro, request, transactionNonce, plan, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void applyProviderElasticAddress(CoroutineStack *coro,
@@ -508,14 +644,14 @@ public:
     }
 
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->applyProviderElasticAddress(coro, plan, assignment, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void compensateProviderElasticAddress(CoroutineStack *coro,
@@ -529,14 +665,14 @@ public:
     }
 
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->compensateProviderElasticAddress(coro, plan, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   void releaseProviderElasticAddress(CoroutineStack *coro,
@@ -550,14 +686,14 @@ public:
     }
 
     BrainIaaS *delegate = activeDelegate();
+    DelegatedOperation operation(*this, delegate);
     if (uint32_t suspendIndex = coro->nextSuspendIndex(); coro->didSuspend([&](void) -> void {
           delegate->releaseProviderElasticAddress(coro, release, error);
         }))
     {
       co_await coro->suspendAtIndex(suspendIndex);
     }
-
-    applyPendingRuntimeEnvironment(delegate);
+    operation.complete();
   }
 
   uint32_t supportedMachineKindsMask() const override

@@ -19,6 +19,41 @@ public:
   }
 };
 
+class SuspendedRuntimeBrainIaaS final : public DevBrainIaaS {
+private:
+
+  bool *destroyed;
+  bool *entered;
+  bool *resumed;
+
+public:
+
+  SuspendedRuntimeBrainIaaS(bool& requestedDestroyed,
+                            bool& requestedEntered,
+                            bool& requestedResumed)
+      : destroyed(&requestedDestroyed),
+        entered(&requestedEntered),
+        resumed(&requestedResumed)
+  {}
+
+  ~SuspendedRuntimeBrainIaaS() override
+  {
+    *destroyed = true;
+  }
+
+  void spinMachines(CoroutineStack *coro,
+                    MachineLifetime,
+                    const MachineConfig&,
+                    uint32_t,
+                    bytell_hash_set<Machine *>&,
+                    String&) override
+  {
+    *entered = true;
+    co_await coro->suspend();
+    *resumed = true;
+  }
+};
+
 class ReceiptTestNeuron final : public Neuron {
 public:
   RuntimeTestNeuronIaaS testIaaS;
@@ -724,6 +759,57 @@ static void testRuntimeAwareBrainActivatesOnlyTheAsyncPersistenceOwner(TestSuite
   suite.expect(retainedBytes > sizeof(ProdigyPersistentBootState) &&
                    retainedBytes < ProdigyPersistentStateWriter::maximumRetainedBytes,
                "runtime_persistence_brain_measures_schema_without_encoding");
+}
+
+static void testRuntimeAwareBrainDefersProviderReplacementAcrossSuspension(TestSuite& suite)
+{
+  const ProdigyPersistentBootState boot = runtimePersistenceBootState();
+  RuntimeAwareBrainIaaS iaas(nullptr, boot.bootstrapConfig, boot, {});
+  bool destroyed = false;
+  bool entered = false;
+  bool resumed = false;
+  iaas.installProviderDelegateForTest(
+      std::make_unique<SuspendedRuntimeBrainIaaS>(destroyed, entered, resumed));
+
+  CoroutineStack stack;
+  MachineConfig config = {};
+  bytell_hash_set<Machine *> machines;
+  String error = {};
+  iaas.spinMachines(&stack, MachineLifetime::ondemand, config, 1, machines, error);
+
+  ProdigyRuntimeEnvironmentConfig replacement = {};
+  replacement.kind = ProdigyEnvironmentKind::dev;
+  iaas.configureRuntimeEnvironment(replacement);
+  suite.expect(entered && stack.hasSuspendedCoroutines() && !destroyed &&
+                   iaas.providerReconfigurationPendingForTest(),
+               "runtime_provider_reconfiguration_retains_suspended_delegate");
+
+  stack.co_consume();
+  suite.expect(resumed && destroyed && !stack.hasSuspendedCoroutines() &&
+                   !iaas.providerReconfigurationPendingForTest(),
+               "runtime_provider_reconfiguration_applies_after_delegate_completion");
+
+  RuntimeAwareBrainIaaS canceledIaaS(nullptr, boot.bootstrapConfig, boot, {});
+  bool canceledDestroyed = false;
+  bool canceledEntered = false;
+  bool canceledResumed = false;
+  canceledIaaS.installProviderDelegateForTest(
+      std::make_unique<SuspendedRuntimeBrainIaaS>(
+          canceledDestroyed, canceledEntered, canceledResumed));
+  CoroutineStack canceledStack;
+  canceledIaaS.spinMachines(
+      &canceledStack, MachineLifetime::ondemand, config, 1, machines, error);
+  canceledIaaS.configureRuntimeEnvironment(replacement);
+  canceledStack.reset();
+  suite.expect(canceledEntered && !canceledResumed && !canceledDestroyed &&
+                   !canceledStack.hasSuspendedCoroutines() &&
+                   canceledIaaS.providerReconfigurationPendingForTest(),
+               "runtime_provider_cancellation_unwinds_before_pending_replacement");
+
+  canceledIaaS.configureRuntimeEnvironment(replacement);
+  suite.expect(canceledDestroyed &&
+                   !canceledIaaS.providerReconfigurationPendingForTest(),
+               "runtime_provider_reconfiguration_retry_applies_after_cancellation");
 }
 
 static void testRuntimeAwareNeuronActivatesOnlyTheAsyncPersistenceOwner(TestSuite& suite)
@@ -2279,6 +2365,7 @@ int main(void)
   testPersistentWriterRetainedAccountingChargesManyShortStrings(suite);
   testNeuronOSUpdateUsesOwnedReceiptDrivenRequest(suite);
   testRuntimeAwareBrainActivatesOnlyTheAsyncPersistenceOwner(suite);
+  testRuntimeAwareBrainDefersProviderReplacementAcrossSuspension(suite);
   testRuntimeAwareNeuronActivatesOnlyTheAsyncPersistenceOwner(suite);
   testBootPersistenceAdmissionRejectionHasNoReceipt(suite);
   testDurableMaterializedRecoveryHistoricalCull(suite);
