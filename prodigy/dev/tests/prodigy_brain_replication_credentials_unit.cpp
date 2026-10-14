@@ -1143,6 +1143,7 @@ public:
   uint32_t acceptedCallbacks = 0;
   uint32_t provisionedCallbacks = 0;
   Vector<Machine *> snapshotsToReturn;
+  std::deque<Vector<Machine *>> snapshotBatchesToReturn;
   Vector<Machine *> inventorySnapshots;
   Vector<String> destroyedCloudIDs;
   BrainIaaSMachineProvisioningProgressSink *progressSink = nullptr;
@@ -1153,6 +1154,7 @@ public:
   bool sawBootstrapDuringSpin = false;
   bool provisioningSettled = true;
   Vector<uint64_t> provisioningOperationIDs;
+  Vector<uint32_t> provisioningInstructionIndices;
 
   void boot(void) override {}
 
@@ -1170,7 +1172,18 @@ public:
       sawAutonomousOperationDuringSpin = true;
     }
     error.clear();
-    for (Machine *snapshot : snapshotsToReturn)
+    Vector<Machine *> snapshots = {};
+    if (snapshotBatchesToReturn.empty() == false)
+    {
+      snapshots = std::move(snapshotBatchesToReturn.front());
+      snapshotBatchesToReturn.pop_front();
+    }
+    else
+    {
+      snapshots = std::move(snapshotsToReturn);
+      snapshotsToReturn.clear();
+    }
+    for (Machine *snapshot : snapshots)
     {
       if (snapshot != nullptr && progressSink != nullptr)
       {
@@ -1191,8 +1204,6 @@ public:
 
       newMachines.insert(snapshot);
     }
-
-    snapshotsToReturn.clear();
   }
 
   void configureProvisioningProgressSink(BrainIaaSMachineProvisioningProgressSink *sink) override
@@ -1205,9 +1216,19 @@ public:
     provisioningOperationIDs.push_back(operationID);
   }
 
+  void configureProvisioningInstructionIndex(uint32_t instructionIndex) override
+  {
+    provisioningInstructionIndices.push_back(instructionIndex);
+  }
+
   bool provisioningOperationSettled(void) override
   {
     return provisioningSettled;
+  }
+
+  bool supportsDurableProvisioningRetryIdentity(void) const override
+  {
+    return true;
   }
 
   void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
@@ -14264,6 +14285,125 @@ static void testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(TestS
     }
   }
   suite.expect(foundRefreshedMachine, "resume_pending_addmachines_refresh_finds_persisted_cloud_machine");
+}
+
+static void testResumePendingAddMachinesReplaysDurableCreateIntent(TestSuite& suite)
+{
+  ResumableAddMachinesBrain brain;
+  AutoProvisionBrainIaaS iaas = {};
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.nBrains = 1;
+  brain.brainConfig.clusterUUID = 0x9902;
+
+  MachineConfig workerConfig = {};
+  workerConfig.slug = "recovery-worker-vm"_ctv;
+  workerConfig.kind = MachineConfig::MachineKind::vm;
+  workerConfig.providerMachineType = "c7i.large"_ctv;
+  workerConfig.nLogicalCores = 4;
+  workerConfig.nMemoryMB = 8192;
+  workerConfig.nStorageMB = 65'536;
+  brain.brainConfig.configBySlug.insert_or_assign(workerConfig.slug, workerConfig);
+
+  ClusterMachine seed = {};
+  seed.uuid = 0x9901;
+  seed.isBrain = true;
+  seed.ssh.address = "10.9.0.10"_ctv;
+  seed.ssh.user = "root"_ctv;
+  seed.ssh.privateKeyPath = "/tmp/test-key"_ctv;
+  prodigyAppendUniqueClusterMachineAddress(seed.addresses.privateAddresses, "10.9.0.10"_ctv, 24, "10.9.0.1"_ctv);
+  brain.authoritativeTopology.version = 40;
+  brain.authoritativeTopology.machines.push_back(seed);
+
+  ProdigyPendingAddMachinesOperation operation = {};
+  operation.operationID = 17;
+  operation.request.clusterUUID = brain.brainConfig.clusterUUID;
+  operation.request.architecture = MachineCpuArchitecture::x86_64;
+  operation.request.bootstrapSshUser = "root"_ctv;
+  operation.request.bootstrapSshPrivateKeyPath = "/tmp/test-key"_ctv;
+  operation.request.controlSocketPath = "/run/prodigy/control.sock"_ctv;
+  operation.request.remoteProdigyPath = "/root/prodigy"_ctv;
+  operation.plannedTopology = brain.authoritativeTopology;
+  brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(operation);
+
+  ProdigyPendingAddMachinesProvisioningIntent intent = {};
+  intent.operationID = operation.operationID;
+  CreateMachinesInstruction instruction = {};
+  instruction.kind = MachineConfig::MachineKind::vm;
+  instruction.lifetime = MachineLifetime::ondemand;
+  instruction.backing = ClusterMachineBacking::cloud;
+  instruction.cloud.schema = workerConfig.slug;
+  instruction.cloud.providerMachineType = workerConfig.providerMachineType;
+  instruction.count = 1;
+  instruction.isBrain = false;
+  intent.instructions.push_back(instruction);
+  intent.instructions.push_back(instruction);
+  brain.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.push_back(intent);
+
+  String serialized = {};
+  auto stateCopy = brain.masterAuthorityRuntimeState;
+  BitseryEngine::serialize(serialized, stateCopy);
+  ProdigyMasterAuthorityRuntimeState restored = {};
+  suite.expect(BitseryEngine::deserializeSafe(serialized, restored) &&
+                   restored.pendingAddMachinesProvisioningIntents.size() == 1 &&
+                   restored.pendingAddMachinesProvisioningIntents[0] == intent,
+               "pending_addmachines_create_intent_v19_round_trips");
+  brain.masterAuthorityRuntimeState = std::move(restored);
+
+  Vector<Machine *> firstRecoveredBatch = {};
+  firstRecoveredBatch.push_back(makeMachineSnapshot(workerConfig.slug, "10.9.0.20"_ctv,
+                                                      "recovered-worker-17-0"_ctv, 0x9903));
+  iaas.snapshotBatchesToReturn.push_back(std::move(firstRecoveredBatch));
+  Vector<Machine *> secondRecoveredBatch = {};
+  secondRecoveredBatch.push_back(makeMachineSnapshot(workerConfig.slug, "10.9.0.21"_ctv,
+                                                       "recovered-worker-17-1"_ctv, 0x9904));
+  iaas.snapshotBatchesToReturn.push_back(std::move(secondRecoveredBatch));
+  brain.resumePendingAddMachinesOperations();
+
+  suite.expect(iaas.spinCalls == 2 && iaas.provisioningOperationIDs.size() == 2 &&
+                   iaas.provisioningOperationIDs[0] == operation.operationID &&
+                   iaas.provisioningOperationIDs[1] == operation.operationID,
+               "resume_pending_addmachines_replays_create_with_original_operation_id");
+  suite.expect(iaas.provisioningInstructionIndices.size() == 2 &&
+                   iaas.provisioningInstructionIndices[0] == 0 &&
+                   iaas.provisioningInstructionIndices[1] == 1,
+               "resume_pending_addmachines_replays_stable_instruction_indexes_in_order");
+  suite.expect(brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty() &&
+                   brain.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.empty(),
+               "resume_pending_addmachines_replayed_create_settles_journals");
+  suite.expect(brain.authoritativeTopology.machines.size() == 3 &&
+                   brain.authoritativeTopology.machines[1].cloud.cloudID == "recovered-worker-17-0"_ctv &&
+                   brain.authoritativeTopology.machines[2].cloud.cloudID == "recovered-worker-17-1"_ctv,
+               "resume_pending_addmachines_replayed_create_persists_recovered_machine");
+
+  ResumableAddMachinesBrain legacy = {};
+  legacy.iaas = &iaas;
+  legacy.weAreMaster = true;
+  legacy.noMasterYet = false;
+  legacy.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(operation);
+  legacy.resumePendingAddMachinesOperations();
+  suite.expect(legacy.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1 &&
+                   legacy.masterAuthorityRuntimeState.pendingAddMachinesOperations[0].lastFailure.equals(
+                       "legacy pending addMachines provisioning intent cannot be resumed safely"_ctv),
+               "legacy_intentless_precreate_journal_remains_pending_and_fails_closed");
+
+  ResumableAddMachinesBrain settlement = {};
+  settlement.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(operation);
+  settlement.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.push_back(intent);
+  settlement.holdRuntimePersistence = true;
+  bool settlementDurable = true;
+  settlement.erasePendingAddMachinesOperationAsync(
+      operation.operationID, [&](bool durable) { settlementDurable = durable; });
+  suite.expect(settlement.masterAuthorityRuntimeState.pendingAddMachinesOperations.empty() &&
+                   settlement.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.empty(),
+               "pending_addmachines_settlement_removes_operation_and_create_intent_together");
+  settlement.finishRuntimePersistence(false);
+  suite.expect(!settlementDurable &&
+                   settlement.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1 &&
+                   settlement.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.size() == 1 &&
+                   settlement.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents[0] == intent,
+               "pending_addmachines_failed_settlement_restores_create_intent_with_operation");
 }
 
 static void testResumePendingAddMachinesOperationFailureRetainsJournal(TestSuite& suite)
@@ -37480,6 +37620,12 @@ int main(void)
     dprintf(STDERR_FILENO, "%s: prodigy_spin_application_duplicate_id failed=%d\n", suite.failed == 0 ? "PASS" : "FAIL", suite.failed);
     return suite.failed == 0 ? 0 : 1;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "pending-addmachines-provisioning-intent") == 0)
+  {
+    testResumePendingAddMachinesReplaysDurableCreateIntent(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   bool createdRing = false;
   if (Ring::getRingFD() <= 0)
   {
@@ -37812,6 +37958,7 @@ int main(void)
   testResumePendingAddMachinesOperations(suite);
   testAdoptedMachineUUIDJournalSurvivesInterruptedBootstrap(suite);
   testResumePendingAddMachinesRefreshesProvisionalCreatedMachine(suite);
+  testResumePendingAddMachinesReplaysDurableCreateIntent(suite);
   testResumePendingAddMachinesOperationFailureRetainsJournal(suite);
   testSuspendableAddMachinesStreamsCreatedBootstrapDuringSpin(suite);
   testSuspendableResumeQueuesAdoptedBootstrapOnOwner(suite);

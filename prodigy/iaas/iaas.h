@@ -14,6 +14,7 @@
 #include <openssl/evp.h>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
 
 class CoroutineStack;
 class Machine;
@@ -205,6 +206,11 @@ class BrainIaaSMachineProvisioningProgressReporter {
 private:
 
   BrainIaaSMachineProvisioningProgressSink *sink = nullptr;
+  // Sink owners lend stack-backed callbacks to a provider spin.  Registration
+  // and invocation share this lock so configureSink(nullptr) is a quiescence
+  // barrier: it cannot return while an in-flight provider callback still owns
+  // the borrowed sink.
+  std::mutex sinkMutex;
   Vector<MachineProvisioningProgress> progress;
   int64_t nextEmitAtMs = 0;
 
@@ -227,6 +233,7 @@ public:
 
   void configureSink(BrainIaaSMachineProvisioningProgressSink *progressSink)
   {
+    std::lock_guard<std::mutex> lock(sinkMutex);
     sink = progressSink;
   }
 
@@ -272,6 +279,7 @@ public:
 
   void emitMaybe(int64_t nowMs, int64_t intervalMs = 15'000)
   {
+    std::lock_guard<std::mutex> lock(sinkMutex);
     if (sink == nullptr || progress.empty())
     {
       return;
@@ -286,6 +294,7 @@ public:
 
   void emitNow(void)
   {
+    std::lock_guard<std::mutex> lock(sinkMutex);
     if (sink != nullptr && progress.empty() == false)
     {
       sink->reportMachineProvisioningProgress(progress);
@@ -294,6 +303,7 @@ public:
 
   void notifyMachineProvisioningAccepted(const String& cloudID)
   {
+    std::lock_guard<std::mutex> lock(sinkMutex);
     if (sink != nullptr && cloudID.size() > 0)
     {
       sink->reportMachineProvisioningAccepted(cloudID);
@@ -302,6 +312,7 @@ public:
 
   void notifyMachineProvisioned(const Machine& machine)
   {
+    std::lock_guard<std::mutex> lock(sinkMutex);
     if (sink != nullptr)
     {
 #if PRODIGY_DEBUG
@@ -345,6 +356,8 @@ public:
 
   virtual void configureProvisioningProgressSink(BrainIaaSMachineProvisioningProgressSink *sink)
   {
+    // Providers must route notifications through their progress reporter and
+    // must not retain or invoke this borrowed pointer themselves.
     (void)sink;
   }
   virtual void configureProvisioningClusterUUID(uint128_t clusterUUID)
@@ -355,9 +368,17 @@ public:
   {
     (void)operationID;
   }
+  virtual void configureProvisioningInstructionIndex(uint32_t instructionIndex)
+  {
+    (void)instructionIndex;
+  }
   virtual bool provisioningOperationSettled(void)
   {
     return true;
+  }
+  virtual bool supportsDurableProvisioningRetryIdentity(void) const
+  {
+    return false;
   }
   virtual bool resolveLocalBrainPeerAddress(IPAddress& address, String& addressText) const
   {

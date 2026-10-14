@@ -8961,6 +8961,7 @@ private:
   }
 
   bool drainCommittedLocalMembershipCleanup(
+      MothershipClusterRegistry& registry,
       const MothershipProdigyCluster& cluster,
       MothershipLocalMembershipCleanupRecord pending,
       String& failure)
@@ -8976,12 +8977,10 @@ private:
       if (!stopAndWipeRemoteProdigyInstance(cluster, pending.machines[index].machine, failure))
         return false;
       bool resumed = false;
-      auto registry = openClusterRegistry();
       if (!registry.completeLocalMembershipCleanupMachine(
               cluster.clusterUUID, pending.desiredSpecSHA256, index,
               pending, resumed, &failure)) return false;
     }
-    auto registry = openClusterRegistry();
     return registry.clearCompletedLocalMembershipCleanup(
         cluster.clusterUUID, pending.desiredSpecSHA256, &failure);
   }
@@ -9005,10 +9004,11 @@ private:
               cluster.clusterUUID, pending.desiredSpecSHA256,
               pending, resumed, &failure)) return false;
     }
-    return drainCommittedLocalMembershipCleanup(cluster, pending, failure);
+    return drainCommittedLocalMembershipCleanup(registry, cluster, pending, failure);
   }
 
   bool reconcileClusterToDesiredSpec(
+      MothershipClusterRegistry& registry,
       const MothershipProdigyCluster& controlCluster,
       MothershipProdigyCluster& desiredCluster,
       AddMachines& request,
@@ -9049,7 +9049,6 @@ private:
     {
       if (!localMembershipDesiredSpecDigest(desiredCluster, desiredDigest, failure)) return false;
       String pendingFailure = {};
-      auto registry = openClusterRegistry();
       hasPendingLocalCleanup = registry.loadLocalMembershipCleanup(
           controlCluster.clusterUUID, pendingLocalCleanup, &pendingFailure);
       if (hasPendingLocalCleanup && pendingLocalCleanup.desiredSpecSHA256 != desiredDigest)
@@ -9132,7 +9131,6 @@ private:
       if (hasPendingLocalCleanup && !pendingLocalCleanup.membershipCommitted)
       {
         bool resumed = false;
-        auto registry = openClusterRegistry();
         if (!registry.commitLocalMembershipCleanup(
                 controlCluster.clusterUUID, desiredDigest,
                 pendingLocalCleanup, resumed, &failure)) return false;
@@ -9171,7 +9169,6 @@ private:
       if (!admitted.machines.empty())
       {
         bool resumed = false;
-        auto registry = openClusterRegistry();
         if (!registry.admitLocalMembershipCleanup(
                 admitted, pendingLocalCleanup, resumed, &failure)) return false;
         hasPendingLocalCleanup = true;
@@ -9221,7 +9218,6 @@ private:
     if (hasPendingLocalCleanup)
     {
       bool resumed = false;
-      auto registry = openClusterRegistry();
       if (!registry.commitLocalMembershipCleanup(
               controlCluster.clusterUUID, desiredDigest,
               pendingLocalCleanup, resumed, &failure)) return false;
@@ -9515,11 +9511,18 @@ private:
 
   void persistClusterRefreshFailure(MothershipProdigyCluster& cluster, const String& failure)
   {
+    MothershipClusterRegistry clusterRegistry = openClusterRegistry();
+    persistClusterRefreshFailure(clusterRegistry, cluster, failure);
+  }
+
+  void persistClusterRefreshFailure(MothershipClusterRegistry& clusterRegistry,
+                                    MothershipProdigyCluster& cluster,
+                                    const String& failure)
+  {
     cluster.lastRefreshMs = Time::now<TimeResolution::ms>();
     cluster.lastRefreshFailure = failure;
 
     String persistFailure;
-    MothershipClusterRegistry clusterRegistry = openClusterRegistry();
     if (clusterRegistry.upsertCluster(cluster, nullptr, &persistFailure) == false)
     {
       basics_log("failed to persist cluster refresh failure for %s: %s\n", cluster.name.c_str(), persistFailure.c_str());
@@ -11565,43 +11568,37 @@ private:
       desiredCluster.controls.clear();
     }
 
+    MothershipClusterRegistry clusterRegistry = openClusterRegistry();
     MothershipProdigyCluster normalizedDesiredCluster = {};
+    if (clusterRegistry.validateClusterForUpsert(desiredCluster, normalizedDesiredCluster, &failure) == false)
     {
-      MothershipClusterRegistry clusterRegistry = openClusterRegistry();
-      if (clusterRegistry.validateClusterForUpsert(desiredCluster, normalizedDesiredCluster, &failure) == false)
-      {
-        return false;
-      }
+      return false;
     }
 
     AddMachines finalState = {};
-    if (reconcileClusterToDesiredSpec(controlCluster, normalizedDesiredCluster, request, finalState, changed, failure) == false)
+    if (reconcileClusterToDesiredSpec(clusterRegistry, controlCluster, normalizedDesiredCluster, request, finalState, changed, failure) == false)
     {
       MothershipProdigyCluster failedCluster = controlCluster;
-      persistClusterRefreshFailure(failedCluster, failure);
+      persistClusterRefreshFailure(clusterRegistry, failedCluster, failure);
       return false;
     }
 
     normalizedDesiredCluster.lastRefreshMs = Time::now<TimeResolution::ms>();
     normalizedDesiredCluster.lastRefreshFailure.clear();
 
+    if (clusterRegistry.upsertCluster(normalizedDesiredCluster, &normalizedDesiredCluster, &failure) == false)
     {
-      MothershipClusterRegistry clusterRegistry = openClusterRegistry();
-      if (clusterRegistry.upsertCluster(normalizedDesiredCluster, &normalizedDesiredCluster, &failure) == false)
-      {
-        return false;
-      }
+      return false;
     }
 
     if (normalizedDesiredCluster.deploymentMode == MothershipClusterDeploymentMode::local)
     {
       MothershipLocalMembershipCleanupRecord pending = {};
       String pendingFailure = {};
-      auto registry = openClusterRegistry();
-      if (registry.loadLocalMembershipCleanup(controlCluster.clusterUUID, pending, &pendingFailure))
+      if (clusterRegistry.loadLocalMembershipCleanup(controlCluster.clusterUUID, pending, &pendingFailure))
       {
         if (!drainCommittedLocalMembershipCleanup(
-                normalizedDesiredCluster, pending, failure)) return false;
+                clusterRegistry, normalizedDesiredCluster, pending, failure)) return false;
       }
       else if (!pendingFailure.equal("record not found"_ctv))
       { failure = pendingFailure; return false; }

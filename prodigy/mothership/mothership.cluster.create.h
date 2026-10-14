@@ -40,6 +40,17 @@ public:
   ProdigyTimingAttribution total;
 };
 
+static inline uint64_t mothershipClusterSeedProvisioningOperationID(uint128_t clusterUUID)
+{
+  // The cluster record is durable before seed provisioning starts. Derive a
+  // stable provider-operation namespace from that immutable identity so an
+  // ambiguous seed create is reconciled rather than issued under a timestamp.
+  if (clusterUUID == 0) return 0;
+  return (uint64_t(clusterUUID) ^ uint64_t(clusterUUID >> 64) ^
+          UINT64_C(0x4d53485053454544)) |
+      (UINT64_C(1) << 63);
+}
+
 static inline void mothershipAccumulateClusterCreateTimingStage(
     MothershipClusterCreateTimingSummary *summary,
     ProdigyTimingAttribution MothershipClusterCreateTimingSummary::*member,
@@ -776,6 +787,9 @@ static inline void mothershipProvisionCreatedSeedMachine(
   String providerError;
 
   iaas.configureProvisioningClusterUUID(cluster.clusterUUID);
+  iaas.configureProvisioningOperationID(
+      mothershipClusterSeedProvisioningOperationID(cluster.clusterUUID));
+  iaas.configureProvisioningInstructionIndex(0);
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
   uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
 #endif

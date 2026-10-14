@@ -2408,6 +2408,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
               $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
    )
    set_tests_properties(prodigy_addmachines_bootstrap_completion_unit PROPERTIES TIMEOUT 30)
+   add_test(
+      NAME prodigy_pending_addmachines_provisioning_intent_unit
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=pending-addmachines-provisioning-intent
+              $<TARGET_FILE:prodigy_brain_replication_credentials_unit>
+   )
+   set_tests_properties(prodigy_pending_addmachines_provisioning_intent_unit PROPERTIES TIMEOUT 30)
 
    add_test(
       NAME prodigy_update_self_concurrency_unit

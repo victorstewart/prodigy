@@ -7,10 +7,14 @@
 #include <prodigy/iaas/vultr/vultr.h>
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <simdjson.h>
 #include <sys/socket.h>
+#include <thread>
 
 class TestSuite {
 public:
@@ -79,11 +83,49 @@ public:
   }
 };
 
+class ScriptedVultrDelay
+{
+public:
+
+  TimeoutPacket *pending = nullptr;
+  Vector<uint64_t> delays;
+
+  static void queue(void *context, TimeoutPacket *packet)
+  {
+    auto& owner = *static_cast<ScriptedVultrDelay *>(context);
+    owner.pending = packet;
+    owner.delays.push_back(uint64_t(packet->timeout.tv_sec) * 1'000'000u +
+                           uint64_t(packet->timeout.tv_nsec) / 1'000u);
+  }
+
+  static void cancel(void *context, TimeoutPacket *packet)
+  {
+    auto& owner = *static_cast<ScriptedVultrDelay *>(context);
+    if (owner.pending == packet) owner.pending = nullptr;
+  }
+
+  ProdigyHostDelayOperation::Submission submission(void)
+  {
+    return {this, queue, cancel};
+  }
+
+  bool complete(void)
+  {
+    if (pending == nullptr) return false;
+    TimeoutPacket *packet = pending;
+    pending = nullptr;
+    packet->dispatcher->dispatchTimeout(packet);
+    return true;
+  }
+};
+
 static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVultrHttp& http,
-                                          const String& scope = {})
+                                          const String& scope = {},
+                                          ScriptedVultrDelay *delay = nullptr)
 {
   ProdigyProviderServices services = {};
   services.http = http.submission();
+  if (delay != nullptr) services.delay = delay->submission();
   services.operationDeadline = MultiCurlClient::Clock::now() + std::chrono::minutes(1);
   provider.configureProviderServices(services);
   ProdigyRuntimeEnvironmentConfig runtime = {};
@@ -92,6 +134,28 @@ static void configureVultrProviderForTest(VultrBrainIaaS& provider, ScriptedVult
   runtime.providerScope = scope;
   provider.configureRuntimeEnvironment(runtime);
 }
+
+class BlockingProvisioningProgressSink final : public BrainIaaSMachineProvisioningProgressSink {
+public:
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool entered = false;
+  bool release = false;
+  uint32_t acceptedCalls = 0;
+
+  void reportMachineProvisioningAccepted(const String&) override
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ++acceptedCalls;
+    entered = true;
+    changed.notify_all();
+    changed.wait(lock, [&] { return release; });
+  }
+
+  void reportMachineProvisioningProgress(const Vector<MachineProvisioningProgress>&) override
+  {}
+};
 
 int main(void)
 {
@@ -145,6 +209,42 @@ int main(void)
   };
 
   {
+    BrainIaaSMachineProvisioningProgressReporter reporter = {};
+    BlockingProvisioningProgressSink sink = {};
+    reporter.configureSink(&sink);
+    std::thread callback([&] {
+      reporter.notifyMachineProvisioningAccepted("machine-1"_ctv);
+    });
+    {
+      std::unique_lock<std::mutex> lock(sink.mutex);
+      sink.changed.wait(lock, [&] { return sink.entered; });
+    }
+
+    std::atomic<bool> unregisterStarted = false;
+    std::atomic<bool> unregisterCompleted = false;
+    std::thread unregister([&] {
+      unregisterStarted.store(true, std::memory_order_release);
+      reporter.configureSink(nullptr);
+      unregisterCompleted.store(true, std::memory_order_release);
+    });
+    while (!unregisterStarted.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    suite.expect(!unregisterCompleted.load(std::memory_order_acquire),
+                 "provisioning_progress_sink_unregister_waits_for_inflight_callback");
+
+    {
+      std::lock_guard<std::mutex> lock(sink.mutex);
+      sink.release = true;
+    }
+    sink.changed.notify_all();
+    callback.join();
+    unregister.join();
+    reporter.notifyMachineProvisioningAccepted("machine-2"_ctv);
+    suite.expect(unregisterCompleted.load(std::memory_order_acquire) && sink.acceptedCalls == 1,
+                 "provisioning_progress_sink_unregister_is_quiescent");
+  }
+
+  {
     String padded = {};
     Base64::encodePadded(reinterpret_cast<const uint8_t *>("A"), 1, padded);
     suite.expect(padded == "QQ=="_ctv, "base64_encode_padded_tail_one");
@@ -174,6 +274,14 @@ int main(void)
     suite.expect(azure.supportsIncrementalProvisioningCallbacks(), "azure_supports_incremental_provisioning_callbacks");
     suite.expect(gcp.supportsIncrementalProvisioningCallbacks(), "gcp_supports_incremental_provisioning_callbacks");
     suite.expect(vultr.supportsIncrementalProvisioningCallbacks(), "vultr_supports_incremental_provisioning_callbacks");
+    suite.expect(aws.supportsDurableProvisioningRetryIdentity(),
+                 "aws_supports_durable_provisioning_retry_identity");
+    suite.expect(vultr.supportsDurableProvisioningRetryIdentity(),
+                 "vultr_supports_durable_provisioning_retry_identity");
+    suite.expect(!gcp.supportsDurableProvisioningRetryIdentity(),
+                 "gcp_fails_closed_without_durable_provisioning_retry_identity");
+    suite.expect(!azure.supportsDurableProvisioningRetryIdentity(),
+                 "azure_fails_closed_without_durable_provisioning_retry_identity");
   }
 
   {
@@ -665,6 +773,78 @@ int main(void)
   }
 
   {
+    String clusterUUID = "0d05b0c6179e4d93e8bfbf02c3b4edd1"_ctv;
+    String firstLabel = {};
+    String firstHostname = {};
+    String repeatedLabel = {};
+    String repeatedHostname = {};
+    String changedOperationLabel = {};
+    String changedOperationHostname = {};
+    String changedRoleLabel = {};
+    String changedRoleHostname = {};
+    String changedInstructionLabel = {};
+    String changedInstructionHostname = {};
+    String changedSlotLabel = {};
+    String changedSlotHostname = {};
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 17, 0, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            true, 0, firstLabel, firstHostname),
+        "vultr_provisioning_identity_builds");
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 17, 0, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            true, 0, repeatedLabel, repeatedHostname) &&
+            repeatedLabel == firstLabel && repeatedHostname == firstHostname,
+        "vultr_provisioning_identity_is_stable_for_same_operation_slot");
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 18, 0, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            true, 0, changedOperationLabel, changedOperationHostname) &&
+            changedOperationLabel != firstLabel && changedOperationHostname != firstHostname,
+        "vultr_provisioning_identity_changes_with_operation");
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 17, 0, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            false, 0, changedRoleLabel, changedRoleHostname) &&
+            changedRoleLabel != firstLabel && changedRoleHostname != firstHostname,
+        "vultr_provisioning_identity_changes_with_role");
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 17, 1, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            true, 0, changedInstructionLabel, changedInstructionHostname) &&
+            changedInstructionLabel != firstLabel && changedInstructionHostname != firstHostname,
+        "vultr_provisioning_identity_changes_with_instruction");
+    suite.expect(
+        vultrBuildProvisioningMachineIdentity(
+            clusterUUID, 17, 0, "vc2-4c-8gb"_ctv, MachineConfig::MachineKind::vm,
+            true, 1, changedSlotLabel, changedSlotHostname) &&
+            changedSlotLabel != firstLabel && changedSlotHostname != firstHostname,
+        "vultr_provisioning_identity_changes_with_slot");
+    suite.expect(firstHostname.size() <= 63,
+                 "vultr_provisioning_hostname_fits_dns_label");
+  }
+
+  {
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc = {};
+    String json = "{\"instances\":[{\"id\":\"instance-a\",\"label\":\"stable-label\"},{\"id\":\"instance-b\",\"label\":\"stable-label\"}]}"_ctv;
+    bool parsed = parseJSON(json, parser, doc);
+    suite.expect(parsed, "vultr_duplicate_recovery_inventory_json_parses");
+    if (parsed)
+    {
+      String recoveredID = {};
+      uint32_t matchCount = 0;
+      suite.expect(
+          vultrFindMachineIDByLabel(
+              doc, MachineConfig::MachineKind::vm, "stable-label", recoveredID,
+              &matchCount) == false &&
+              recoveredID.empty() && matchCount == 2,
+          "vultr_duplicate_recovery_identity_fails_closed");
+    }
+  }
+
+  {
     VultrBrainIaaS::MachineProvisioningPollObservation initial = {};
     initial.phase = VultrBrainIaaS::MachineProvisioningPollPhase::waitingForPublicSSHAddress;
     initial.providerStatus.assign("active"_ctv);
@@ -761,6 +941,34 @@ int main(void)
     http.complete(MultiCurlClient::Status::success, 404);
     suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty() && destroyed == 0,
                  "vultr_cluster_cleanup_scoped_vpc_not_found_delete_is_idempotent");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    ScriptedVultrDelay delay = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http, "ewr"_ctv, &delay);
+    CoroutineStack stack = {};
+    String failure = {};
+    uint32_t destroyed = 0;
+    String clusterUUID = "0123456789abcdef0123456789abcdef"_ctv;
+    provider.destroyClusterMachines(&stack, clusterUUID, destroyed, failure);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"instances":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200, R"json({"bare_metals":[]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"vpcs":[{"id":"scoped","region":"ewr","description":"prodigy-managed-vpc-ewr-0123456789abcdef0123456789abcdef","v4_subnet":"10.214.32.0","v4_subnet_mask":20}]})json"_ctv);
+    http.complete(MultiCurlClient::Status::success, 400,
+                  R"json({"error":"The following servers are attached to this VPC network: 192.0.2.10","status":400})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && delay.pending != nullptr &&
+                     delay.delays.size() == 1 &&
+                     delay.delays[0] == uint64_t(vultrManagedVPCDeleteRetryMs) * 1'000u,
+                 "vultr_cluster_cleanup_waits_for_lingering_vpc_attachment");
+    suite.expect(delay.complete() && http.requests.size() == 5 &&
+                     http.requests[4].method == MultiCurlClient::Method::delete_,
+                 "vultr_cluster_cleanup_retries_exact_vpc_delete_after_attachment_delay");
+    http.complete(MultiCurlClient::Status::success, 204);
+    suite.expect(!stack.hasSuspendedCoroutines() && failure.empty() && destroyed == 0,
+                 "vultr_cluster_cleanup_lingering_attachment_retry_succeeds");
   }
 
   {

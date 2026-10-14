@@ -601,6 +601,7 @@ private:
   Vault::SSHKeyPackage bootstrapSSHHostKeyPackage;
   String provisioningClusterUUIDTagValue;
   uint64_t provisioningOperationID = 0;
+  uint32_t provisioningInstructionIndex = 0;
   BrainIaaSMachineProvisioningProgressReporter provisioningProgress;
   constexpr static const char *canonicalUbuntuSSMPrefix = "resolve:ssm:/aws/service/canonical/ubuntu/server/";
 
@@ -2622,6 +2623,7 @@ public:
     credentialLoaded = false;
     metadata.reset();
     provisioningOperationID = 0;
+    provisioningInstructionIndex = 0;
   }
 
   void preflightClusterCreate(CoroutineStack *coro, const BrainIaaSClusterCreatePreflight& preflight, String& error) override
@@ -2897,9 +2899,19 @@ public:
     provisioningOperationID = operationID;
   }
 
+  void configureProvisioningInstructionIndex(uint32_t instructionIndex) override
+  {
+    provisioningInstructionIndex = instructionIndex;
+  }
+
   bool provisioningOperationSettled(void) override
   {
     return provisioningOperationID == 0;
+  }
+
+  bool supportsDurableProvisioningRetryIdentity(void) const override
+  {
+    return true;
   }
 
   bool supportsIncrementalProvisioningCallbacks() const override
@@ -3000,6 +3012,8 @@ public:
       storageText.assignItoa(config.nStorageMB);
       String operationIDText;
       operationIDText.assignItoa(provisioningOperationID);
+      String instructionIndexText;
+      instructionIndexText.assignItoa(provisioningInstructionIndex);
       Vector<String> tokenComponents;
       tokenComponents.push_back(provisioningClusterUUIDTagValue);
       tokenComponents.push_back(config.slug);
@@ -3011,6 +3025,7 @@ public:
       tokenComponents.push_back(lifetimeText);
       tokenComponents.push_back(storageText);
       tokenComponents.push_back(operationIDText);
+      tokenComponents.push_back(instructionIndexText);
       if (!AwsHttpRequest::idempotencyToken(tokenComponents, launchToken))
       {
         error.assign("aws RunInstances ClientToken generation failed"_ctv);

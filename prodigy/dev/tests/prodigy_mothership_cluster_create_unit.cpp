@@ -610,6 +610,9 @@ public:
   Vector<String> ensuredClusterUUIDs;
   Vector<String> ensuredCloudIDs;
   BrainIaaSMachineProvisioningProgressSink *progressSink = nullptr;
+  uint128_t provisioningClusterUUID = 0;
+  uint64_t provisioningOperationID = 0;
+  uint32_t provisioningInstructionIndex = UINT32_MAX;
 
   void boot(void) override
   {
@@ -640,6 +643,21 @@ public:
   void configureProvisioningProgressSink(BrainIaaSMachineProvisioningProgressSink *sink) override
   {
     progressSink = sink;
+  }
+
+  void configureProvisioningClusterUUID(uint128_t clusterUUID) override
+  {
+    provisioningClusterUUID = clusterUUID;
+  }
+
+  void configureProvisioningOperationID(uint64_t operationID) override
+  {
+    provisioningOperationID = operationID;
+  }
+
+  void configureProvisioningInstructionIndex(uint32_t instructionIndex) override
+  {
+    provisioningInstructionIndex = instructionIndex;
   }
 
   void getMachines(CoroutineStack *coro, const String& metro, bytell_hash_set<Machine *>& machines, String& failure) override
@@ -933,6 +951,7 @@ int main(void)
   {
     MothershipProdigyCluster cluster = {};
     cluster.name = "seed-provision"_ctv;
+    cluster.clusterUUID = 0x1100;
     cluster.bootstrapSshUser = "root"_ctv;
     cluster.bootstrapSshPrivateKeyPath = prodigyTestBootstrapSeedSSHPrivateKeyPath();
     appendClusterMachineConfig(cluster, makeMachineConfig("aws-brain-vm"_ctv, MachineConfig::MachineKind::vm, 4, 16'384, 131'072));
@@ -970,6 +989,14 @@ int main(void)
     suite.expect(ok, "seed_provision_ok");
     suite.expect(failure.size() == 0, "seed_provision_no_failure");
     suite.expect(iaas.spinCalls == 1, "seed_provision_spin_called");
+    suite.expect(iaas.provisioningClusterUUID == cluster.clusterUUID,
+                 "seed_provision_configures_cluster_identity");
+    suite.expect(iaas.provisioningOperationID ==
+                     mothershipClusterSeedProvisioningOperationID(cluster.clusterUUID) &&
+                     iaas.provisioningOperationID != 0,
+                 "seed_provision_configures_stable_operation_identity");
+    suite.expect(iaas.provisioningInstructionIndex == 0,
+                 "seed_provision_configures_instruction_identity");
     suite.expect(iaas.destroyCalls == 0, "seed_provision_no_destroy");
     suite.expect(progressSink.calls == 1, "seed_provision_progress_called");
     suite.expect(progressSink.lastProgress.size() == 1, "seed_provision_progress_count");

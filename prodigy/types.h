@@ -7543,6 +7543,72 @@ static void serialize(S&& serializer, ProdigyPendingAddMachinesOperation& operat
   serializer.text1b(operation.lastFailure, UINT32_MAX);
 }
 
+// The add-machines journal is durable before a provider accepts a create.  The
+// immutable create work must therefore live outside its legacy positional
+// record: old snapshots cannot be taught an extra field in that record.
+class ProdigyPendingAddMachinesProvisioningIntent {
+public:
+
+  uint64_t operationID = 0;
+  uint32_t nextInstructionIndex = 0;
+  Vector<CreateMachinesInstruction> instructions;
+
+  bool operator==(const ProdigyPendingAddMachinesProvisioningIntent& other) const
+  {
+    return operationID == other.operationID &&
+        nextInstructionIndex == other.nextInstructionIndex &&
+        instructions == other.instructions;
+  }
+
+  bool operator!=(const ProdigyPendingAddMachinesProvisioningIntent& other) const
+  {
+    return (*this == other) == false;
+  }
+};
+
+template <typename S>
+static void serialize(S&& serializer, ProdigyPendingAddMachinesProvisioningIntent& intent)
+{
+  serializer.value8b(intent.operationID);
+  serializer.value4b(intent.nextInstructionIndex);
+  serializer.object(intent.instructions);
+}
+
+static inline bool prodigyPendingAddMachinesProvisioningIntentsValid(
+    const Vector<ProdigyPendingAddMachinesOperation>& operations,
+    const Vector<ProdigyPendingAddMachinesProvisioningIntent>& intents)
+{
+  for (uint32_t index = 0; index < intents.size(); ++index)
+  {
+    const auto& intent = intents[index];
+    if (intent.operationID == 0 || intent.instructions.empty() ||
+        uint64_t(intent.nextInstructionIndex) + intent.instructions.size() > UINT32_MAX)
+    {
+      return false;
+    }
+    if (std::any_of(intents.begin(), intents.begin() + index, [&](const auto& previous) {
+          return previous.operationID == intent.operationID;
+        }))
+    {
+      return false;
+    }
+    if (std::count_if(operations.begin(), operations.end(), [&](const auto& operation) {
+          return operation.operationID == intent.operationID;
+        }) != 1)
+    {
+      return false;
+    }
+    for (const auto& instruction : intent.instructions)
+      if (instruction.backing != ClusterMachineBacking::cloud ||
+          instruction.cloud.schema.empty() || instruction.count == 0 ||
+          instruction.lifetime == MachineLifetime::owned)
+      {
+        return false;
+      }
+  }
+  return true;
+}
+
 class ProdigyPendingAutonomousProvisioningOperation {
 public:
 
@@ -8244,6 +8310,7 @@ public:
   uint64_t nextDNSIntentRevision = 1;
   ProdigyResumptionRegistry::SnapshotMap tlsResumptionSnapshotsByWormhole;
   Vector<ProdigyPendingAddMachinesOperation> pendingAddMachinesOperations;
+  Vector<ProdigyPendingAddMachinesProvisioningIntent> pendingAddMachinesProvisioningIntents;
   Vector<ProdigyPendingAutonomousProvisioningOperation> pendingAutonomousProvisioningOperations;
   Vector<ProdigyPendingElasticAddressAssignment> pendingElasticAddressAssignments;
   Vector<ProdigyPendingElasticAddressRelease> pendingElasticAddressReleases;
@@ -8290,7 +8357,7 @@ public:
 
   bool operator==(const ProdigyMasterAuthorityRuntimeState& other) const
   {
-    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
+    if (generation != other.generation || hasCompletedInitialMasterElection != other.hasCompletedInitialMasterElection || transportTLSAuthority != other.transportTLSAuthority || nextMintedClientTlsGeneration != other.nextMintedClientTlsGeneration || nextTlsResumptionGeneration != other.nextTlsResumptionGeneration || nextPendingAddMachinesOperationID != other.nextPendingAddMachinesOperationID || nextPendingElasticAddressOperationID != other.nextPendingElasticAddressOperationID || nextDNSIntentRevision != other.nextDNSIntentRevision || tlsResumptionSnapshotsByWormhole.size() != other.tlsResumptionSnapshotsByWormhole.size() || pendingAddMachinesOperations.size() != other.pendingAddMachinesOperations.size() || pendingAddMachinesProvisioningIntents.size() != other.pendingAddMachinesProvisioningIntents.size() || pendingAutonomousProvisioningOperations.size() != other.pendingAutonomousProvisioningOperations.size() || pendingElasticAddressAssignments.size() != other.pendingElasticAddressAssignments.size() || pendingElasticAddressReleases.size() != other.pendingElasticAddressReleases.size() || statefulWorkerTopologyUpgradeOperations.size() != other.statefulWorkerTopologyUpgradeOperations.size() || statefulServingAuthorities.size() != other.statefulServingAuthorities.size() || deferredStatefulScaleIntents.size() != other.deferredStatefulScaleIntents.size() || materializedStatefulRecoveryOperations.size() != other.materializedStatefulRecoveryOperations.size() || materializedStatefulRecoveryRetries.size() != other.materializedStatefulRecoveryRetries.size() || apiCredentialExpiryNotices.size() != other.apiCredentialExpiryNotices.size() || machineSchemas.size() != other.machineSchemas.size() || routableResourceLeases.size() != other.routableResourceLeases.size() || publicTlsCertificates.size() != other.publicTlsCertificates.size() || privateTlsVaultLifecycles.size() != other.privateTlsVaultLifecycles.size() || taskExecutions.size() != other.taskExecutions.size() || mothershipTunnelProviderDesiredState != other.mothershipTunnelProviderDesiredState || updateSelf != other.updateSelf || updateSelfFollowerConcurrency != other.updateSelfFollowerConcurrency || updateSelfFollowerTransitionIssuedPeerKeys != other.updateSelfFollowerTransitionIssuedPeerKeys || updateSelfFollowerReadyPeerKeys != other.updateSelfFollowerReadyPeerKeys ||
         prodigyDeploymentPlacementPoliciesEqual(deploymentPlacementPolicies, other.deploymentPlacementPolicies) == false ||
         prodigyStatelessDeploymentAdmissionsEqual(statelessDeploymentAdmissions, other.statelessDeploymentAdmissions) == false ||
         prodigyClusterPairEnrollmentsEqual(clusterPairEnrollments, other.clusterPairEnrollments) == false ||
@@ -8334,6 +8401,14 @@ public:
     for (uint32_t index = 0; index < pendingAddMachinesOperations.size(); ++index)
     {
       if (pendingAddMachinesOperations[index] != other.pendingAddMachinesOperations[index])
+      {
+        return false;
+      }
+    }
+
+    for (uint32_t index = 0; index < pendingAddMachinesProvisioningIntents.size(); ++index)
+    {
+      if (pendingAddMachinesProvisioningIntents[index] != other.pendingAddMachinesProvisioningIntents[index])
       {
         return false;
       }
@@ -9402,9 +9477,11 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   // version 16 tags each transport operation row so lifecycle receipts cannot
   // be misread as the legacy enrollment layout; version 17 appends the
   // canonical machine-to-container-network-fragment registry; version 18
-  // appends canonical replicated COUSIN route authority records.
+  // appends canonical replicated COUSIN route authority records; version 19
+  // appends durable managed-machine create intent outside the legacy pending
+  // add-machines record.
   // Older readers reject before consuming either newer operation layout.
-  constexpr uint64_t explicitVersion = 18;
+  constexpr uint64_t explicitVersion = 19;
   using Serializer = std::remove_cv_t<std::remove_reference_t<S>>;
   if constexpr (!ProdigyPersistentSerializerIsWriter<Serializer>::value)
     state.transportCredentialAuthorityRoot = {};
@@ -9426,6 +9503,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   bool permitsTransportCredentialLifecycleOperations = false;
   bool hasMachineFragmentAssignments = false;
   bool hasCousinRoutes = false;
+  bool hasPendingAddMachinesProvisioningIntents = false;
 
   if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value)
   {
@@ -9461,15 +9539,20 @@ static void prodigySerializeMasterAuthorityRuntimeState(
         [](const auto& operation) { return operation.protocolVersion >= 2; });
     hasMachineFragmentAssignments = state.machineFragmentAssignments.empty() == false;
     hasCousinRoutes = state.cousinRoutes.empty() == false;
+    hasPendingAddMachinesProvisioningIntents = state.pendingAddMachinesProvisioningIntents.empty() == false;
+    // Version nineteen is cumulative through the v18 route container.
+    if (hasPendingAddMachinesProvisioningIntents) hasCousinRoutes = true;
     // Version eighteen is cumulative through the version-seventeen fragment
     // registry. Emit its bounded empty container when routes are present so
     // the reader cannot consume route bytes as fragment assignments.
     if (hasCousinRoutes) hasMachineFragmentAssignments = true;
     permitsTransportCredentialLifecycleOperations =
-        hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments || hasCousinRoutes;
+        hasTransportCredentialLifecycleOperations || hasMachineFragmentAssignments || hasCousinRoutes ||
+        hasPendingAddMachinesProvisioningIntents;
     // Versions sixteen and seventeen include every earlier tail, even when empty.
     hasLocalCousinServicePermissions = !state.localCousinServicePermissions.empty() ||
-                                       permitsTransportCredentialLifecycleOperations || hasCousinRoutes;
+                                       permitsTransportCredentialLifecycleOperations || hasCousinRoutes ||
+                                       hasPendingAddMachinesProvisioningIntents;
     // Version fifteen is cumulative through the v12 operation container.
     // Emit that bounded empty container when the new policy tail is present.
     if (hasLocalCousinServicePermissions) hasClusterPairEnrollmentOperations = true;
@@ -9496,7 +9579,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       hasAllMachineRecoveryWitnesses = true;
       hasMaterializedStatefulRecoveryRetries = true;
     }
-    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency)
+    if (hasMaterializedStatefulRecoveryOperations || hasApiCredentialExpiryNotices || hasAllMachineRecoveryWitnesses || hasMaterializedStatefulRecoveryRetries || hasContainerRuntimeStates || hasDeploymentPlacementPolicies || hasStatefulServingAuthorities || hasStatelessDeploymentAdmissions || hasExplicitUpdateSelfFollowerConcurrency || hasPendingAddMachinesProvisioningIntents)
     {
       uint64_t marker = versionMarker;
       serializer.value8b(marker);
@@ -9505,10 +9588,10 @@ static void prodigySerializeMasterAuthorityRuntimeState(
           [](const auto& operation) { return operation.protocolVersion >= 2; });
       const bool hasPairEpochOperations = std::any_of(state.clusterPairEnrollmentOperations.begin(), state.clusterPairEnrollmentOperations.end(),
           [](const auto& operation) { return operation.protocolVersion >= 3; });
-      uint64_t version = hasCousinRoutes ? 18 : (hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
+      uint64_t version = hasPendingAddMachinesProvisioningIntents ? 19 : (hasCousinRoutes ? 18 : (hasMachineFragmentAssignments ? 17 : (hasTransportCredentialLifecycleOperations ? 16 : (hasLocalCousinServicePermissions ? 15 : (hasClusterPairEnrollmentOperations ? (hasPairEpochOperations ? 14 : (hasPairRevocationOperations ? 13 : 12)) : (hasTransportCredentialEnrollments ? 11 : (hasClusterPairEnrollments ? 10 : (hasExplicitUpdateSelfFollowerConcurrency ? 9 : (hasStatelessDeploymentAdmissions ? 8 : (hasStatefulServingAuthorities ? 7 : (hasDeploymentPlacementPolicies ? 6 :
                          (hasContainerRuntimeStates ? 5 :
                          (hasMaterializedStatefulRecoveryRetries ? 4 :
-                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1))))))))))))));
+                          (hasAllMachineRecoveryWitnesses ? 3 : (hasApiCredentialExpiryNotices ? 2 : 1)))))))))))))));
       serializer.value8b(version);
     }
     serializer.value8b(state.generation);
@@ -9555,6 +9638,7 @@ static void prodigySerializeMasterAuthorityRuntimeState(
       permitsTransportCredentialLifecycleOperations = version >= 16;
       hasMachineFragmentAssignments = version >= 17;
       hasCousinRoutes = version >= 18;
+      hasPendingAddMachinesProvisioningIntents = version >= 19;
     }
   }
 
@@ -9778,6 +9862,23 @@ static void prodigySerializeMasterAuthorityRuntimeState(
   else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
   {
     state.cousinRoutes.clear();
+  }
+  if (hasPendingAddMachinesProvisioningIntents)
+  {
+    serializer.object(state.pendingAddMachinesProvisioningIntents);
+  }
+  else if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    state.pendingAddMachinesProvisioningIntents.clear();
+  }
+  if constexpr (ProdigyPersistentSerializerIsWriter<Serializer>::value == false)
+  {
+    if (!prodigyPendingAddMachinesProvisioningIntentsValid(
+            state.pendingAddMachinesOperations,
+            state.pendingAddMachinesProvisioningIntents))
+    {
+      serializer.adapter().error(bitsery::ReaderError::InvalidData);
+    }
   }
 }
 

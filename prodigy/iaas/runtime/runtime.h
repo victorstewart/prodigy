@@ -130,6 +130,11 @@ private:
     return providerDelegate ? providerDelegate.get() : static_cast<BrainIaaS *>(&bootstrapDelegate);
   }
 
+  const BrainIaaS *activeDelegate(void) const
+  {
+    return providerDelegate ? providerDelegate.get() : static_cast<const BrainIaaS *>(&bootstrapDelegate);
+  }
+
   void applyRuntimeEnvironment(void)
   {
     providerDelegate = prodigyCreateProviderBrainIaaS(runtimeEnvironment, providerServices);
@@ -408,9 +413,19 @@ public:
     activeDelegate()->configureProvisioningOperationID(operationID);
   }
 
+  void configureProvisioningInstructionIndex(uint32_t instructionIndex) override
+  {
+    activeDelegate()->configureProvisioningInstructionIndex(instructionIndex);
+  }
+
   bool provisioningOperationSettled(void) override
   {
     return activeDelegate()->provisioningOperationSettled();
+  }
+
+  bool supportsDurableProvisioningRetryIdentity(void) const override
+  {
+    return activeDelegate()->supportsDurableProvisioningRetryIdentity();
   }
 
   bool supportsIncrementalProvisioningCallbacks() const override

@@ -7122,7 +7122,34 @@ public:
       if (continuation) continuation(ready);
   }
 
-  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap, bool persist = true)
+  ProdigyPendingAddMachinesProvisioningIntent *findPendingAddMachinesProvisioningIntent(uint64_t operationID)
+  {
+    for (ProdigyPendingAddMachinesProvisioningIntent& intent : masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents)
+      if (intent.operationID == operationID) return &intent;
+    return nullptr;
+  }
+
+  const ProdigyPendingAddMachinesProvisioningIntent *findPendingAddMachinesProvisioningIntent(uint64_t operationID) const
+  {
+    for (const ProdigyPendingAddMachinesProvisioningIntent& intent : masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents)
+      if (intent.operationID == operationID) return &intent;
+    return nullptr;
+  }
+
+  bool erasePendingAddMachinesProvisioningIntent(uint64_t operationID)
+  {
+    auto& intents = masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents;
+    auto it = std::remove_if(intents.begin(), intents.end(), [=](const auto& intent) {
+      return intent.operationID == operationID;
+    });
+    if (it == intents.end()) return false;
+    intents.erase(it, intents.end());
+    return true;
+  }
+
+  uint64_t journalAddMachinesOperation(const AddMachines& request, ClusterTopology& plannedTopology, Vector<ClusterMachine>& machinesToBootstrap,
+                                       const Vector<CreateMachinesInstruction> *provisioningInstructions = nullptr,
+                                       bool persist = true)
   {
     if (!assignAdoptedBootstrapMachineUUIDs(plannedTopology, machinesToBootstrap)) return 0;
     refreshMasterAuthorityRuntimeStateFromLiveFields();
@@ -7140,6 +7167,13 @@ public:
     operation.machinesToBootstrap = machinesToBootstrap;
     operation.updatedAtMs = Time::now<TimeResolution::ms>();
     masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(operation));
+    if (provisioningInstructions != nullptr && provisioningInstructions->empty() == false)
+    {
+      ProdigyPendingAddMachinesProvisioningIntent intent = {};
+      intent.operationID = operationID;
+      intent.instructions = *provisioningInstructions;
+      masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.push_back(std::move(intent));
+    }
     if (persist) noteMasterAuthorityRuntimeStateChanged();
     return operationID;
   }
@@ -7194,6 +7228,7 @@ public:
     }
 
     operations.erase(it, operations.end());
+    (void)erasePendingAddMachinesProvisioningIntent(operationID);
     noteMasterAuthorityRuntimeStateChanged(replicate, persist);
     return true;
   }
@@ -7203,15 +7238,38 @@ public:
     auto *operation = findPendingAddMachinesOperation(operationID);
     if (!operation) { if (completion) completion(true); return; }
     auto previous = *operation;
+    Vector<ProdigyPendingAddMachinesProvisioningIntent> previousProvisioningIntents = {};
+    uint32_t provisioningIntentIndex = 0;
+    for (uint32_t index = 0;
+         index < masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.size(); ++index)
+      if (masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents[index].operationID == operationID)
+      {
+        if (previousProvisioningIntents.empty()) provisioningIntentIndex = index;
+        previousProvisioningIntents.push_back(
+            masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents[index]);
+      }
     const uint64_t epoch = masterAuthorityEpoch;
     erasePendingAddMachinesOperation(operationID, false, false);
     const uint64_t generation = masterAuthorityRuntimeState.generation;
     commitMasterAuthorityStateChangeAsync(
-        [this, epoch, generation, previous = std::move(previous), completion = std::move(completion)](bool durable) mutable {
+        [this, epoch, generation, previous = std::move(previous),
+         previousProvisioningIntents = std::move(previousProvisioningIntents),
+         provisioningIntentIndex,
+         completion = std::move(completion)](bool durable) mutable {
           if (!durable && masterAuthorityEpoch == epoch &&
               masterAuthorityRuntimeState.generation == generation &&
               !findPendingAddMachinesOperation(previous.operationID))
+          {
             masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(previous));
+            if (!previousProvisioningIntents.empty())
+            {
+              auto& intents = masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents;
+              intents.insert(
+                  intents.begin() + std::min<size_t>(provisioningIntentIndex, intents.size()),
+                  std::make_move_iterator(previousProvisioningIntents.begin()),
+                  std::make_move_iterator(previousProvisioningIntents.end()));
+            }
+          }
           if (completion) completion(durable);
         }, false);
   }
@@ -7737,6 +7795,145 @@ public:
       finish(true);
       co_return;
     }
+
+    // Before v19, a crash between provider acceptance and the first machine
+    // receipt leaves no durable evidence of what the empty journal intended
+    // to create.  Never reinterpret that old journal using today's schemas:
+    // it could issue a different request and duplicate an already accepted
+    // provider create.  Ordinary adopted/ready/removed journals remain
+    // resumable because their request itself carries all work.
+    const bool legacyIntentlessPreCreate =
+        findPendingAddMachinesProvisioningIntent(operationID) == nullptr &&
+        persistedOperation->request.adoptedMachines.empty() &&
+        persistedOperation->request.readyMachines.empty() &&
+        persistedOperation->request.removedMachines.empty() &&
+        persistedOperation->machinesToBootstrap.empty();
+    if (legacyIntentlessPreCreate)
+    {
+      failure.assign("legacy pending addMachines provisioning intent cannot be resumed safely"_ctv);
+      (void)co_await persistFailure(failure);
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      finish(false);
+      co_return;
+    }
+
+    // Each instruction stays durable until both its provider result and the
+    // resulting ClusterMachine identities commit together.  A crash in
+    // between therefore retries the exact instruction under this same durable
+    // operation ID; providers use that identity to recover rather than create
+    // another follower.
+    while (true)
+    {
+      const ProdigyPendingAddMachinesProvisioningIntent *recordedIntent =
+          findPendingAddMachinesProvisioningIntent(operationID);
+      if (recordedIntent == nullptr || recordedIntent->instructions.empty()) break;
+      const CreateMachinesInstruction instruction = recordedIntent->instructions.front();
+      const uint32_t instructionIndex = recordedIntent->nextInstructionIndex;
+      if (instruction.backing != ClusterMachineBacking::cloud || instruction.cloud.schema.empty() ||
+          instruction.count == 0 || instruction.lifetime == MachineLifetime::owned)
+      {
+        failure.assign("invalid durable addMachines provisioning instruction"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
+      }
+      auto configIt = brainConfig.configBySlug.find(instruction.cloud.schema);
+      if (configIt == brainConfig.configBySlug.end() || configIt->second.kind != instruction.kind ||
+          iaas->supports(instruction.kind) == false || iaas->supportsAutoProvision() == false ||
+          iaas->supportsDurableProvisioningRetryIdentity() == false)
+      {
+        failure.assign("durable addMachines provisioning instruction is no longer supported"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
+      }
+
+      bytell_hash_set<Machine *> createdSnapshots = {};
+      String providerFailure = {};
+      CoroutineStack *coro = new CoroutineStack();
+      iaas->configureBootstrapSSHAccess(persistedOperation->request.bootstrapSshUser,
+                                        persistedOperation->request.bootstrapSshKeyPackage,
+                                        persistedOperation->request.bootstrapSshHostKeyPackage,
+                                        persistedOperation->request.bootstrapSshPrivateKeyPath);
+      iaas->configureProvisioningClusterUUID(brainConfig.clusterUUID);
+      iaas->configureProvisioningOperationID(operationID);
+      iaas->configureProvisioningInstructionIndex(instructionIndex);
+      const uint32_t suspendIndex = coro->nextSuspendIndex();
+      iaas->spinMachines(coro, instruction.lifetime, configIt->second, instruction.count,
+                         instruction.isBrain, createdSnapshots, providerFailure);
+      if (suspendIndex < coro->nextSuspendIndex()) co_await coro->suspendAtIndex(suspendIndex);
+      delete coro;
+      if (lifetime.expired() || masterAuthorityEpoch != epoch)
+      {
+        for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
+        co_return;
+      }
+      if (providerFailure.empty() == false || createdSnapshots.size() != instruction.count)
+      {
+        for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
+        if (providerFailure.empty())
+          providerFailure.snprintf<"provider recovered {itoa} machines but {itoa} were requested"_ctv>(
+              createdSnapshots.size(), instruction.count);
+        (void)co_await persistFailure(providerFailure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
+      }
+
+      ProdigyPendingAddMachinesOperation *operation = findPendingAddMachinesOperation(operationID);
+      ProdigyPendingAddMachinesProvisioningIntent *intent = findPendingAddMachinesProvisioningIntent(operationID);
+      if (operation == nullptr || intent == nullptr || intent->instructions.empty())
+      {
+        for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
+        finish(false);
+        co_return;
+      }
+      for (Machine *snapshot : createdSnapshots)
+      {
+        ClusterMachine createdMachine = {};
+        prodigyPopulateCreatedClusterMachineFromSnapshot(
+            createdMachine, snapshot, instruction, configIt->second,
+            operation->request.bootstrapSshUser, operation->request.bootstrapSshPrivateKeyPath,
+            operation->request.bootstrapSshHostKeyPackage.publicKeyOpenSSH,
+            brainConfig.machineReservedResources);
+        (void)prodigyUpsertClusterMachineByIdentity(operation->plannedTopology.machines, createdMachine);
+        (void)prodigyUpsertClusterMachineByIdentity(operation->machinesToBootstrap, createdMachine);
+        prodigyDestroyMachineSnapshot(snapshot);
+      }
+      prodigyNormalizeClusterTopologyPeerAddresses(operation->plannedTopology);
+      operation->updatedAtMs = Time::now<TimeResolution::ms>();
+      if (intent->nextInstructionIndex == UINT32_MAX)
+      {
+        failure.assign("durable addMachines provisioning instruction index exhausted"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
+      }
+      ++intent->nextInstructionIndex;
+      intent->instructions.erase(intent->instructions.begin());
+      if (intent->instructions.empty())
+      {
+        (void)erasePendingAddMachinesProvisioningIntent(operationID);
+      }
+      const bool provisionedDurably = co_await ProdigyHostCompletion<bool>([this](auto receipt) {
+        commitMasterAuthorityStateChangeAsync(std::move(receipt));
+      });
+      if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+      if (!provisionedDurably)
+      {
+        failure.assign("failed to persist recovered addMachines provider identity"_ctv);
+        (void)co_await persistFailure(failure);
+        if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
+        finish(false);
+        co_return;
+      }
+      persistedOperation = findPendingAddMachinesOperation(operationID);
+      if (persistedOperation == nullptr) { finish(false); co_return; }
+    }
+
     if (refreshPendingAddMachinesOperationCreatedMachines(*persistedOperation, failure, false) == false)
     {
       (void)co_await persistFailure(failure);
@@ -10317,7 +10514,10 @@ public:
   bool applyPersistentMasterAuthorityPackage(const ProdigyPersistentMasterAuthorityPackage& package)
   {
     ProdigyMasterAuthorityRuntimeState restoredRuntimeState = package.runtimeState;
-    if (!masterAuthorityMachineFragmentAssignmentsPreserved(
+    if (!prodigyPendingAddMachinesProvisioningIntentsValid(
+            restoredRuntimeState.pendingAddMachinesOperations,
+            restoredRuntimeState.pendingAddMachinesProvisioningIntents) ||
+        !masterAuthorityMachineFragmentAssignmentsPreserved(
             restoredRuntimeState.machineFragmentAssignments) ||
         !machineFragmentAssignmentsMatchLiveContainers(
             restoredRuntimeState.machineFragmentAssignments,
@@ -10576,7 +10776,10 @@ public:
       const BrainConfig *validationConfig = nullptr)
   {
     const BrainConfig& credentialConfig = validationConfig != nullptr ? *validationConfig : brainConfig;
-    if (!masterAuthorityMachineFragmentAssignmentsPreserved(incoming.machineFragmentAssignments) ||
+    if (!prodigyPendingAddMachinesProvisioningIntentsValid(
+            incoming.pendingAddMachinesOperations,
+            incoming.pendingAddMachinesProvisioningIntents) ||
+        !masterAuthorityMachineFragmentAssignmentsPreserved(incoming.machineFragmentAssignments) ||
         !machineFragmentAssignmentsMatchLiveContainers(
             incoming.machineFragmentAssignments, credentialConfig.datacenterFragment) ||
         !prodigyValidatePersistentClusterPairEnrollmentDescriptors(
@@ -27052,6 +27255,16 @@ public:
 
     if (nMore > 0) // we still need more machines
     {
+      if (iaas->supportsDurableProvisioningRetryIdentity() == false)
+      {
+        basics_log("requestMachines failure reason=provider-lacks-durable-provisioning-retry-identity applicationID=%u deploymentID=%llu lifetime=%u requested=%u\n",
+                   unsigned(config.applicationID),
+                   (unsigned long long)config.deploymentID(),
+                   unsigned(lifetime),
+                   unsigned(nMore));
+        co_return;
+      }
+
       MachineLifetime machineLifetime;
 
       switch (lifetime)
@@ -27156,6 +27369,7 @@ public:
 
       iaas->configureProvisioningClusterUUID(brainConfig.clusterUUID);
       iaas->configureProvisioningOperationID(provisioningOperationID);
+      iaas->configureProvisioningInstructionIndex(0);
       iaas->spinMachines(coro, machineLifetime, *machineConfig, nMoreMachines, machines, error);
 
       if (suspendIndex < coro->nextSuspendIndex())
@@ -39515,6 +39729,11 @@ public:
         uint32_t pendingReceipts = 0;
         bool persistenceFailed = false;
         std::function<void(bool)> persistenceCompletion = {};
+        // Provider progress can outlive the surrounding addMachines frame
+        // while persistence is completing.  Completion callbacks hold only a
+        // weak receipt lifetime and must never dereference this stack sink
+        // after cancellation destroys it.
+        std::shared_ptr<uint8_t> receiptLifetime = std::make_shared<uint8_t>(0);
 
         void finishPersistenceReceipt(bool durable)
         {
@@ -39655,11 +39874,12 @@ public:
               *pendingOperationID, createdMachine, queueForBootstrap, false, false);
           const uint64_t authorityEpoch = owner->masterAuthorityEpoch;
           const std::weak_ptr<uint8_t> lifetime = owner->persistenceLifetime;
+          const std::weak_ptr<uint8_t> receipt = receiptLifetime;
           ++pendingReceipts;
           owner->commitMasterAuthorityStateChangeAsync(
-              [this, lifetime, authorityEpoch, createdMachine = std::move(createdMachine),
+              [this, lifetime, receipt, authorityEpoch, createdMachine = std::move(createdMachine),
                bootstrapAfterReceipt](bool durable) mutable {
-                if (lifetime.expired()) return;
+                if (receipt.expired() || lifetime.expired()) return;
                 if (!durable)
                 {
                   if (failure != nullptr && failure->size() == 0)
@@ -40058,8 +40278,10 @@ public:
 
       if (response.failure.size() == 0)
       {
-        for (const CreateMachinesInstruction& instruction : managedWork.createdMachines)
+        for (uint32_t instructionIndex = 0;
+             instructionIndex < managedWork.createdMachines.size(); ++instructionIndex)
         {
+          const CreateMachinesInstruction& instruction = managedWork.createdMachines[instructionIndex];
           if (instruction.backing != ClusterMachineBacking::cloud)
           {
             response.failure.assign("created machine instruction currently requires backing=cloud"_ctv);
@@ -40113,9 +40335,16 @@ public:
             break;
           }
 
+          if (iaas->supportsDurableProvisioningRetryIdentity() == false)
+          {
+            response.failure.assign("current runtime environment does not support durable machine provisioning retry identity"_ctv);
+            break;
+          }
+
           if (pendingAddMachinesOperationID == 0)
           {
-            pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap, false);
+            pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap,
+                                                                         &managedWork.createdMachines, false);
             if (pendingAddMachinesOperationID == 0)
             { response.failure.assign("failed to assign stable bootstrap machine identities"_ctv); goto addmachines_finalize; }
             *activeOperation = pendingAddMachinesOperationID;
@@ -40165,6 +40394,7 @@ public:
 
           iaas->configureProvisioningClusterUUID(brainConfig.clusterUUID);
           iaas->configureProvisioningOperationID(pendingAddMachinesOperationID);
+          iaas->configureProvisioningInstructionIndex(instructionIndex);
           uint32_t suspendIndex = coro->nextSuspendIndex();
 #if PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
           uint64_t providerWaitStartNs = Time::now<TimeResolution::ns>();
@@ -40342,7 +40572,8 @@ public:
         const bool journalWasNew = pendingAddMachinesOperationID == 0;
         if (response.failure.size() == 0 && pendingAddMachinesOperationID == 0)
         {
-          pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap, false);
+          pendingAddMachinesOperationID = journalAddMachinesOperation(request, targetTopology, machinesToBootstrap,
+                                                                       &managedWork.createdMachines, false);
             if (pendingAddMachinesOperationID == 0)
             { response.failure.assign("failed to assign stable bootstrap machine identities"_ctv); goto addmachines_finalize; }
           *activeOperation = pendingAddMachinesOperationID;
@@ -40357,6 +40588,10 @@ public:
           if (!pending) { response.failure.assign("missing machine bootstrap intent"_ctv); goto addmachines_finalize; }
           pending->plannedTopology = targetTopology;
           pending->machinesToBootstrap = machinesToBootstrap;
+          // The topology and all provider identities now commit in this same
+          // receipt.  Clear the durable create work only in that receipt so a
+          // crash before it retries the original provider operation instead.
+          (void)erasePendingAddMachinesProvisioningIntent(pendingAddMachinesOperationID);
           const bool journalDurable = co_await ProdigyHostCompletion<bool>([this](auto completion) {
             commitMasterAuthorityStateChangeAsync(std::move(completion));
           });

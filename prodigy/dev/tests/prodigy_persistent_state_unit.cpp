@@ -1275,6 +1275,88 @@ static void testMasterAuthorityRuntimeCousinRouteCodec(TestSuite& suite)
       "master_authority_runtime18_decodes_version17_machine_fragment_tail");
 }
 
+static ProdigyPendingAddMachinesProvisioningIntent persistentPendingAddMachinesProvisioningIntent(uint64_t operationID)
+{
+  ProdigyPendingAddMachinesProvisioningIntent intent = {};
+  intent.operationID = operationID;
+  CreateMachinesInstruction instruction = {};
+  instruction.kind = MachineConfig::MachineKind::vm;
+  instruction.lifetime = MachineLifetime::ondemand;
+  instruction.backing = ClusterMachineBacking::cloud;
+  instruction.cloud.schema.assign("persistent-codec-worker"_ctv);
+  instruction.cloud.providerMachineType.assign("n2-standard-4"_ctv);
+  instruction.count = 1;
+  intent.instructions.push_back(std::move(instruction));
+  return intent;
+}
+
+static void testMasterAuthorityRuntimePendingAddMachinesProvisioningIntentCodec(TestSuite& suite)
+{
+  ProdigyMasterAuthorityRuntimeState v18Runtime = {};
+  v18Runtime.generation = 18;
+  v18Runtime.cousinRoutes.push_back(persistentRuntimeCousinRoute(0x181, 0x281));
+  String v18Bytes = {};
+  BitseryEngine::serialize(v18Bytes, v18Runtime);
+  uint64_t v18Marker = 0, v18Version = 0;
+  if (v18Bytes.size() >= sizeof(v18Marker) + sizeof(v18Version))
+  {
+    memcpy(&v18Marker, v18Bytes.data(), sizeof(v18Marker));
+    memcpy(&v18Version, v18Bytes.data() + sizeof(v18Marker), sizeof(v18Version));
+  }
+  ProdigyMasterAuthorityRuntimeState restoredV18 = {};
+  suite.expect(
+      v18Marker == UINT64_MAX && v18Version == 18 &&
+          BitseryEngine::deserializeSafe(v18Bytes, restoredV18) &&
+          restoredV18 == v18Runtime &&
+          restoredV18.pendingAddMachinesProvisioningIntents.empty(),
+      "master_authority_runtime19_decodes_actual_v18_without_provisioning_intents");
+
+  ProdigyMasterAuthorityRuntimeState v19Runtime = {};
+  v19Runtime.generation = 19;
+  ProdigyPendingAddMachinesOperation operation = {};
+  operation.operationID = 0x1901;
+  v19Runtime.pendingAddMachinesOperations.push_back(operation);
+  const ProdigyPendingAddMachinesProvisioningIntent intent =
+      persistentPendingAddMachinesProvisioningIntent(operation.operationID);
+  v19Runtime.pendingAddMachinesProvisioningIntents.push_back(intent);
+  String v19Bytes = {};
+  BitseryEngine::serialize(v19Bytes, v19Runtime);
+  ProdigyMasterAuthorityRuntimeState restoredV19 = {};
+  suite.expect(
+      BitseryEngine::deserializeSafe(v19Bytes, restoredV19) && restoredV19 == v19Runtime &&
+          prodigyPendingAddMachinesProvisioningIntentsValid(
+              restoredV19.pendingAddMachinesOperations,
+              restoredV19.pendingAddMachinesProvisioningIntents),
+      "master_authority_runtime19_roundtrips_valid_provisioning_intent");
+
+  auto expectMalformedV19RejectedAtDecode = [&suite](
+                                                ProdigyMasterAuthorityRuntimeState malformed,
+                                                const char *name) {
+    String bytes = {};
+    BitseryEngine::serialize(bytes, malformed);
+    ProdigyMasterAuthorityRuntimeState decoded = {};
+    suite.expect(!BitseryEngine::deserializeSafe(bytes, decoded), name);
+  };
+
+  ProdigyMasterAuthorityRuntimeState duplicate = v19Runtime;
+  duplicate.pendingAddMachinesProvisioningIntents.push_back(intent);
+  expectMalformedV19RejectedAtDecode(
+      std::move(duplicate),
+      "master_authority_runtime19_decode_rejects_duplicate_provisioning_intent");
+
+  ProdigyMasterAuthorityRuntimeState orphan = v19Runtime;
+  orphan.pendingAddMachinesProvisioningIntents[0].operationID = operation.operationID + 1;
+  expectMalformedV19RejectedAtDecode(
+      std::move(orphan),
+      "master_authority_runtime19_decode_rejects_orphan_provisioning_intent");
+
+  ProdigyMasterAuthorityRuntimeState zeroID = v19Runtime;
+  zeroID.pendingAddMachinesProvisioningIntents[0].operationID = 0;
+  expectMalformedV19RejectedAtDecode(
+      std::move(zeroID),
+      "master_authority_runtime19_decode_rejects_zero_id_provisioning_intent");
+}
+
 static int runPersistentUpdateBundleSnapshotMeasurement(TestSuite& suite, const char *bundlePath)
 {
   if (bundlePath == nullptr || bundlePath[0] == '\0')
@@ -1362,6 +1444,7 @@ int main(void)
   }
   testMasterAuthorityRuntimeStateRecoveryCodec(suite);
   testMasterAuthorityRuntimeCousinRouteCodec(suite);
+  testMasterAuthorityRuntimePendingAddMachinesProvisioningIntentCodec(suite);
   testPersistentMapDirectionalSerialization(suite);
   testFailedDeploymentRecordCompatibilityAndRoundtrip(suite);
   testPersistentBrainSnapshotLargeMetricSampleRoundtrip(suite);
