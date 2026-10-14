@@ -513,6 +513,27 @@ int main(void)
   {
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
+    String json = "{\"id\":\"instance-with-vpc\",\"main_ip\":\"45.76.166.5\",\"v6_main_ip\":\"2001:19f0:6001:48e4:5400:06ff:fe05:9ea6\",\"internal_ip\":\"10.1.96.3\",\"plan\":\"vc2-4c-8gb\",\"region\":\"ewr\",\"tags\":[\"brain\"]}"_ctv;
+    bool parsed = parseJSON(json, parser, doc);
+    suite.expect(parsed, "vultr_vpc_public_ipv6_machine_json_parses");
+
+    if (parsed)
+    {
+      String publicIPv6 = {};
+      suite.expect(vultrExtractPublicIPv6(doc, publicIPv6), "vultr_vpc_machine_extracts_public_ipv6");
+      Vector<ClusterMachinePeerAddress> peerAddresses = {};
+      vultrAppendPublicMachinePeerAddresses(publicIPv6, "45.76.166.5"_ctv, true, peerAddresses);
+      ClusterMachineAddresses addresses = {};
+      prodigyAssignClusterMachineAddressesFromPeerCandidates(addresses, peerAddresses);
+      suite.expect(addresses.publicAddresses.size() == 1 &&
+          addresses.publicAddresses[0].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv,
+          "vultr_vpc_machine_retains_public_ipv6_peer_address");
+    }
+  }
+
+  {
+    simdjson::dom::parser parser;
+    simdjson::dom::element doc = {};
     String json = "{\"internal_ip\":\"10.1.96.3\"}"_ctv;
     bool parsed = parseJSON(json, parser, doc);
     suite.expect(parsed, "vultr_internal_ipv4_json_parses");

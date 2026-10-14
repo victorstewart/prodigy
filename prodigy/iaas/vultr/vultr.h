@@ -313,6 +313,22 @@ static inline bool vultrExtractInternalIPv4(simdjson::dom::element dev, String& 
   return false;
 }
 
+static inline void vultrAppendPublicMachinePeerAddresses(
+    const String& public6Address, const String& public4Address,
+    bool hasPrivateAddress, Vector<ClusterMachinePeerAddress>& peerAddresses)
+{
+  if (public6Address.size() > 0)
+  {
+    prodigyAppendUniqueClusterMachinePeerAddress(
+        peerAddresses, ClusterMachinePeerAddress {public6Address, 0, {}});
+  }
+  if (hasPrivateAddress == false && public4Address.size() > 0)
+  {
+    prodigyAppendUniqueClusterMachinePeerAddress(
+        peerAddresses, ClusterMachinePeerAddress {public4Address, 0, {}});
+  }
+}
+
 static inline bool vultrExtractAttachedVPCIPv4(simdjson::dom::element doc, String& privateAddress)
 {
   privateAddress.clear();
@@ -1160,14 +1176,9 @@ private:
       m->privateAddress = m->publicAddress;
     }
 
-    if (m->privateAddress.size() == 0 && public6Address.size() > 0)
-    {
-      prodigyAppendUniqueClusterMachinePeerAddress(m->peerAddresses, ClusterMachinePeerAddress {public6Address, 0, {}});
-      if (m->publicAddress.size() > 0)
-      {
-        prodigyAppendUniqueClusterMachinePeerAddress(m->peerAddresses, ClusterMachinePeerAddress {m->publicAddress, 0, {}});
-      }
-    }
+    vultrAppendPublicMachinePeerAddresses(
+        public6Address, m->publicAddress, m->privateAddress.size() > 0,
+        m->peerAddresses);
 
     if (p4 == 0 && public4 != 0)
     {
