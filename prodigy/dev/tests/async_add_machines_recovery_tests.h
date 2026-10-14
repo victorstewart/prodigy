@@ -25,9 +25,11 @@ static ProdigyPendingAddMachinesOperation makeAsyncRecoveryOperation(uint64_t op
   ProdigyPendingAddMachinesOperation operation = {};
   operation.operationID = operationID;
   operation.request.clusterUUID = 0xadd01;
+  operation.request.architecture = MachineCpuArchitecture::x86_64;
   operation.request.bootstrapSshUser.assign("root"_ctv);
   operation.request.bootstrapSshPrivateKeyPath.assign("/tmp/test-key"_ctv);
   operation.request.controlSocketPath.assign("/run/prodigy/control.sock"_ctv);
+  operation.request.remoteProdigyPath.assign("/root/prodigy"_ctv);
 
   ClusterMachine machine = {};
   machine.uuid = uint128_t(0xadd10) + operationID;
@@ -38,6 +40,7 @@ static ProdigyPendingAddMachinesOperation makeAsyncRecoveryOperation(uint64_t op
   machine.ssh.address.assign("10.22.0.10"_ctv);
   machine.ssh.user.assign("root"_ctv);
   machine.ssh.privateKeyPath.assign("/tmp/test-key"_ctv);
+  machine.ssh.hostPublicKeyOpenSSH.assign("ssh-ed25519 test-key"_ctv);
   prodigyAppendUniqueClusterMachineAddress(machine.addresses.privateAddresses,
                                            "10.22.0.10"_ctv, 24, "10.22.0.1"_ctv);
   operation.plannedTopology.version = 1;
@@ -158,5 +161,58 @@ static void testAsyncAddMachinesRecoveryPersistence(TestSuite& suite)
     brain.finishRuntimePersistence(true);
     suite.expect(completed && !success && brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.size() == 1,
                  "async_addmachines_recovery_topology_failure_retains_replay_journal");
+  }
+
+  {
+    ScopedRing ring;
+    AsyncAddMachinesRecoveryBrain brain;
+    AutoProvisionBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+    brain.weAreMaster = true;
+    brain.noMasterYet = false;
+    brain.nBrains = 1;
+    brain.brainConfig.clusterUUID = 0xadd50;
+
+    MachineConfig config = {};
+    config.slug.assign("suspended-provider-vm"_ctv);
+    config.kind = MachineConfig::MachineKind::vm;
+    config.providerMachineType.assign("test-vm"_ctv);
+    brain.brainConfig.configBySlug.insert_or_assign(config.slug, config);
+
+    ProdigyPendingAddMachinesOperation operation = makeAsyncRecoveryOperation(5);
+    operation.request.clusterUUID = brain.brainConfig.clusterUUID;
+    operation.machinesToBootstrap.clear();
+    brain.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(operation);
+
+    ProdigyPendingAddMachinesProvisioningIntent intent = {};
+    intent.operationID = operation.operationID;
+    CreateMachinesInstruction instruction = {};
+    instruction.kind = MachineConfig::MachineKind::vm;
+    instruction.lifetime = MachineLifetime::ondemand;
+    instruction.backing = ClusterMachineBacking::cloud;
+    instruction.cloud.schema = config.slug;
+    instruction.cloud.providerMachineType = config.providerMachineType;
+    instruction.count = 1;
+    instruction.isBrain = true;
+    intent.instructions.push_back(instruction);
+    brain.masterAuthorityRuntimeState.pendingAddMachinesProvisioningIntents.push_back(intent);
+
+    iaas.suspendSpinWithFailure = true;
+    bool completed = false;
+    bool success = true;
+    brain.resumePendingAddMachinesOperationAsync(5, [&](bool durable) {
+      completed = true;
+      success = durable;
+    });
+    suite.expect(!completed && iaas.suspendedSpinStack != nullptr &&
+                     brain.activeAddMachinesOperations.contains(5),
+                 "async_addmachines_recovery_waits_for_suspended_provider_failure");
+
+    iaas.finishSuspendedSpinFailure();
+    const ProdigyPendingAddMachinesOperation *retained = brain.findPendingAddMachinesOperation(5);
+    suite.expect(completed && !success && iaas.suspendedSpinStack == nullptr &&
+                     retained != nullptr && retained->lastFailure.equals(
+                         "injected suspended provider failure"_ctv),
+                 "async_addmachines_recovery_retires_provider_stack_after_resume");
   }
 }

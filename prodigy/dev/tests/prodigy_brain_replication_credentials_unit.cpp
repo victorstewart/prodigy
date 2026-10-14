@@ -778,6 +778,11 @@ public:
   ClusterTopology authoritativeTopology = {};
   bool failBootstrap = false;
 
+  bool canSuspendRemoteBootstrap(void) const override
+  {
+    return false;
+  }
+
   bool loadAuthoritativeClusterTopology(ClusterTopology& topology) const override
   {
     topology = authoritativeTopology;
@@ -1152,6 +1157,8 @@ public:
   bool sawPendingOperationDuringSpin = false;
   bool sawAutonomousOperationDuringSpin = false;
   bool sawBootstrapDuringSpin = false;
+  bool suspendSpinWithFailure = false;
+  CoroutineStack *suspendedSpinStack = nullptr;
   bool provisioningSettled = true;
   Vector<uint64_t> provisioningOperationIDs;
   Vector<uint32_t> provisioningInstructionIndices;
@@ -1160,12 +1167,19 @@ public:
 
   void spinMachines(CoroutineStack *coro, MachineLifetime lifetime, const MachineConfig& config, uint32_t count, bytell_hash_set<Machine *>& newMachines, String& error) override
   {
-    (void)coro;
     (void)lifetime;
     (void)config;
     (void)count;
 
     spinCalls += 1;
+    if (suspendSpinWithFailure)
+    {
+      suspendedSpinStack = coro;
+      co_await coro->suspend();
+      suspendedSpinStack = nullptr;
+      error.assign("injected suspended provider failure"_ctv);
+      co_return;
+    }
     if (observedBrain != nullptr &&
         observedBrain->masterAuthorityRuntimeState.pendingAutonomousProvisioningOperations.empty() == false)
     {
@@ -1203,6 +1217,15 @@ public:
       }
 
       newMachines.insert(snapshot);
+    }
+  }
+
+  void finishSuspendedSpinFailure(void)
+  {
+    CoroutineStack *stack = suspendedSpinStack;
+    if (stack != nullptr)
+    {
+      stack->co_consume();
     }
   }
 

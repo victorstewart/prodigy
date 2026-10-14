@@ -7850,9 +7850,37 @@ public:
         co_return;
       }
 
+      class ProvisioningStack final : public CoroutineStack
+      {
+        uint32_t consumers = 0;
+        bool retired = false;
+
+      public:
+
+        void co_consume(void) override
+        {
+          consumers += 1;
+          CoroutineStack::co_consume();
+          consumers -= 1;
+          if (retired && consumers == 0)
+          {
+            delete this;
+          }
+        }
+
+        void retire(void)
+        {
+          retired = true;
+          if (consumers == 0)
+          {
+            delete this;
+          }
+        }
+      };
+
       bytell_hash_set<Machine *> createdSnapshots = {};
       String providerFailure = {};
-      CoroutineStack *coro = new CoroutineStack();
+      ProvisioningStack *coro = new ProvisioningStack();
       iaas->configureBootstrapSSHAccess(persistedOperation->request.bootstrapSshUser,
                                         persistedOperation->request.bootstrapSshKeyPackage,
                                         persistedOperation->request.bootstrapSshHostKeyPackage,
@@ -7864,7 +7892,10 @@ public:
       iaas->spinMachines(coro, instruction.lifetime, configIt->second, instruction.count,
                          instruction.isBrain, createdSnapshots, providerFailure);
       if (suspendIndex < coro->nextSuspendIndex()) co_await coro->suspendAtIndex(suspendIndex);
-      delete coro;
+      // A provider callback resumes this continuation from inside co_consume().
+      // Defer destruction until that active consumer has returned; deleting the
+      // stack here makes runNextSuspended() continue on freed storage.
+      coro->retire();
       if (lifetime.expired() || masterAuthorityEpoch != epoch)
       {
         for (Machine *snapshot : createdSnapshots) prodigyDestroyMachineSnapshot(snapshot);
