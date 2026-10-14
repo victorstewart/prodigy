@@ -429,6 +429,7 @@ int main(void)
   localAdopted.machines[1].rackUUID = 202;
   localAdopted.machines[2].rackUUID = 303;
   localAdopted.machines[1].uuid = (uint128_t(0x5a02) << 64) | uint128_t(0x5a03);
+  assignFixtureBootstrapSSHKeyPackage(localAdopted);
 
   MothershipProdigyCluster storedLocalAdopted = localAdopted;
   storedLocalAdopted.architecture = nametagCurrentBuildMachineArchitecture();
