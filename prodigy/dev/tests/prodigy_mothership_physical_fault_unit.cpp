@@ -278,5 +278,30 @@ int main(void)
   suite.expect(!mothershipLocalAuthorityRecoveryCohortRequestValid(invalidCohort, &failure),
                "authority_recovery_rejects_duplicate_boundary_identity");
 
+  ClusterTopology recoveryTopology = {};
+  recoveryTopology.version = cohort.topologyVersion;
+  for (const auto& executor : cohort.executors)
+  {
+    ClusterMachine machine = {};
+    machine.uuid = executor.machineUUID;
+    machine.kind = MachineConfig::MachineKind::vm;
+    machine.backing = ClusterMachineBacking::owned;
+    machine.lifetime = MachineLifetime::owned;
+    machine.isBrain = true;
+    recoveryTopology.machines.push_back(std::move(machine));
+  }
+  suite.expect(mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
+               "authority_recovery_accepts_admitted_exact_topology");
+  recoveryTopology.version += 5;
+  suite.expect(mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
+               "authority_recovery_accepts_newer_generation_with_exact_owned_vm_identities");
+  recoveryTopology.version = cohort.topologyVersion - 1;
+  suite.expect(!mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
+               "authority_recovery_rejects_topology_older_than_admission");
+  recoveryTopology.version = cohort.topologyVersion + 5;
+  recoveryTopology.machines[1].lifetime = MachineLifetime::reserved;
+  suite.expect(!mothershipLocalAuthorityRecoveryTopologyMatches(cohort, recoveryTopology),
+               "authority_recovery_rejects_newer_topology_with_boundary_ownership_drift");
+
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

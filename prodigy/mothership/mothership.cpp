@@ -13955,18 +13955,9 @@ private:
       const MothershipLocalAuthorityRecoveryCohortRecord& record,
       const ClusterStatusReport& report, String& failure)
   {
-    if (!report.hasTopology || report.topology.version != record.request.topologyVersion ||
-        report.topology.machines.size() != record.request.executors.size())
-    { failure.assign("local authority recovery observed a different topology generation"_ctv); return false; }
-    for (const auto& executor : record.request.executors)
-    {
-      uint32_t matches = 0;
-      for (const auto& machine : report.topology.machines)
-        if (machine.uuid == executor.machineUUID && machine.kind == MachineConfig::MachineKind::vm && machine.isBrain)
-          ++matches;
-      if (matches != 1)
-      { failure.assign("local authority recovery did not observe its exact three VM Brain identities"_ctv); return false; }
-    }
+    if (!report.hasTopology ||
+        !mothershipLocalAuthorityRecoveryTopologyMatches(record.request, report.topology))
+    { failure.assign("local authority recovery did not observe its admitted or newer exact three owned VM Brain topology"_ctv); return false; }
     return true;
   }
 

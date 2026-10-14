@@ -816,6 +816,28 @@ static inline bool mothershipLocalAuthorityRecoveryCohortRequestValid(
   return true;
 }
 
+// A reboot may advance Brain's authoritative topology generation while
+// preserving the exact three VM identities admitted by the recovery cohort.
+// Reject an older generation or any identity/ownership substitution, but do
+// not require the live generation to remain frozen across the reboot itself.
+static inline bool mothershipLocalAuthorityRecoveryTopologyMatches(
+    const MothershipLocalAuthorityRecoveryCohortRequest& request,
+    const ClusterTopology& topology)
+{
+  if (topology.version < request.topologyVersion ||
+      topology.machines.size() != request.executors.size()) return false;
+  for (const auto& executor : request.executors)
+  {
+    uint32_t matches = 0;
+    for (const auto& machine : topology.machines)
+      if (machine.uuid == executor.machineUUID && machine.kind == MachineConfig::MachineKind::vm &&
+          machine.backing == ClusterMachineBacking::owned && machine.lifetime == MachineLifetime::owned &&
+          machine.isBrain) ++matches;
+    if (matches != 1) return false;
+  }
+  return true;
+}
+
 class MothershipLocalAuthorityRecoveryBoundaryProgress {
 public:
   uint128_t boundaryUUID = 0;
