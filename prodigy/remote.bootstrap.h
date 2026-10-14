@@ -1542,7 +1542,7 @@ static inline void prodigyAppendRemoteContainerRootCommand(String& command, bool
 {
   command.append("mkdir -p /var/lib/prodigy /containers; fs=$(stat -f -c "_ctv);
   command.append(systemdUnit ? "%%T" : "%T");
-  command.append(" /containers 2>/dev/null || true); if [ \"$fs\" != btrfs ]; then if mountpoint -q /containers; then echo '/containers must be btrfs' >&2; exit 1; fi; img=/var/lib/prodigy/containers.btrfs.loop; if [ ! -e \"$img\" ]; then truncate -s 16G \"$img\" && mkfs.btrfs -f \"$img\" >/dev/null; fi; mount -o loop,nosuid,nodev \"$img\" /containers; fi; mkdir -p /containers/store /containers/storage"_ctv);
+  command.append(" /containers 2>/dev/null || true); if [ \"$fs\" != btrfs ]; then if mountpoint -q /containers; then echo '/containers must be btrfs' >&2; exit 1; fi; if [ ! -e /sys/module/loop ]; then command -v modprobe >/dev/null 2>&1 || { echo 'loop module loader is unavailable' >&2; exit 1; }; modprobe loop || { echo 'could not load the loop device driver' >&2; exit 1; }; fi; if [ ! -e /sys/module/loop ] || [ ! -c /dev/loop-control ]; then echo 'loop device support is unavailable' >&2; exit 1; fi; img=/var/lib/prodigy/containers.btrfs.loop; if [ ! -e \"$img\" ]; then truncate -s 16G \"$img\" && mkfs.btrfs -f \"$img\" >/dev/null; fi; mount -o loop,nosuid,nodev \"$img\" /containers; fi; mkdir -p /containers/store /containers/storage"_ctv);
 }
 
 static inline void renderProdigySystemdUnit(const String& remoteBinaryPath, const String& remoteLibraryDirectory, const String& controlSocketDirectory, String& unit)
@@ -2016,7 +2016,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   String tempBundleSHA256Path = {};
   prodigyResolveBundleSHA256Path(tempBundlePath, tempBundleSHA256Path);
 
-  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1 || ! command -v btrfs >/dev/null 2>&1 || ! command -v mkfs.btrfs >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends zstd btrfs-progs; elif command -v pacman >/dev/null 2>&1; then pacman -Syu --noconfirm --needed zstd btrfs-progs; else echo 'missing zstd or btrfs-progs on remote host' >&2; exit 1; fi; fi; "_ctv);
+  plan.installCommand.assign("set -eu; systemctl stop prodigy || true; if ! command -v zstd >/dev/null 2>&1 || ! command -v btrfs >/dev/null 2>&1 || ! command -v mkfs.btrfs >/dev/null 2>&1 || ! command -v modprobe >/dev/null 2>&1; then if command -v apt-get >/dev/null 2>&1; then export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends zstd btrfs-progs kmod; elif command -v pacman >/dev/null 2>&1; then pacman -Syu --noconfirm --needed zstd btrfs-progs kmod; else echo 'missing zstd, btrfs-progs, or kmod on remote host' >&2; exit 1; fi; fi; "_ctv);
   plan.installCommand.append(plan.mkdirCommand);
   plan.installCommand.append("; "_ctv);
   prodigyAppendRemoteContainerRootCommand(plan.installCommand);

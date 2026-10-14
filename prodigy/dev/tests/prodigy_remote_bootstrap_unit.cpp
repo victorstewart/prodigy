@@ -1396,11 +1396,18 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "rm -f '/tmp/prodigy.remote-bootstrap.payload.tar'"), "plan_install_command_removes_stage_payload");
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v zstd"), "plan_install_command_zstd_preflight");
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v btrfs"), "plan_install_command_btrfs_preflight");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "command -v modprobe"), "plan_install_command_kmod_preflight");
   suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install -y --no-install-recommends zstd"), "plan_install_command_zstd_install_fallback");
   suite.expect(stringContains(singleSeedPlan.installCommand, "pacman -Syu --noconfirm --needed zstd btrfs-progs"), "plan_install_command_arch_zstd_btrfs_install_fallback");
   suite.expect(shellSyntaxValid(singleSeedPlan.installCommand), "plan_install_command_shell_syntax_valid");
   suite.expect(stringContains(singleSeedPlan.installCommand, "btrfs-progs"), "plan_install_command_btrfs_install_fallback");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "btrfs-progs kmod"), "plan_install_command_kmod_install_fallback");
   suite.expect(stringContains(singleSeedPlan.installCommand, "mkfs.btrfs -f"), "plan_install_command_container_root_mkfs");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "modprobe loop"), "plan_install_command_loads_loop_driver");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "/sys/module/loop") &&
+                   stringContains(singleSeedPlan.installCommand, "-c /dev/loop-control"),
+               "plan_install_command_proves_loop_support");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "loop device support is unavailable"), "plan_install_command_fails_without_loop_support");
   suite.expect(stringContains(singleSeedPlan.installCommand, "mount -o loop,nosuid,nodev"), "plan_install_command_container_root_mount");
   suite.expect(stringContains(singleSeedPlan.installCommand, "command -v certbot") == false, "plan_install_command_never_trusts_host_certbot");
   suite.expect(stringContains(singleSeedPlan.installCommand, "apt-get install") && stringContains(singleSeedPlan.installCommand, "certbot") == false, "plan_install_command_no_certbot_without_acme");
@@ -1457,6 +1464,10 @@ int main(void)
   suite.expect(stringContains(plan.systemdUnit, "stat -f -c %%T /containers"), "plan_systemd_escapes_stat_percent");
   suite.expect(stringContains(plan.systemdUnit, "stat -f -c /tmp /containers") == false, "plan_systemd_never_expands_stat_percent");
   suite.expect(stringContains(plan.systemdUnit, "mkfs.btrfs -f"), "plan_systemd_container_root_mkfs");
+  suite.expect(stringContains(plan.systemdUnit, "modprobe loop"), "plan_systemd_loads_loop_driver");
+  suite.expect(stringContains(plan.systemdUnit, "/sys/module/loop") && stringContains(plan.systemdUnit, "-c /dev/loop-control"),
+               "plan_systemd_proves_loop_support");
+  suite.expect(stringContains(plan.systemdUnit, "loop device support is unavailable"), "plan_systemd_fails_without_loop_support");
   suite.expect(stringContains(plan.systemdUnit, "mount -o loop,nosuid,nodev"), "plan_systemd_container_root_mount");
   suite.expect(stringContains(plan.systemdUnit, "ExecStartPre=/usr/bin/mkdir -p /run/prodigy /var/lib/prodigy /opt/prodigy-root/lib"), "plan_systemd_execstartpre");
   suite.expect(stringContains(plan.systemdUnit, "WantedBy=multi-user.target"), "plan_systemd_wanted_by");
