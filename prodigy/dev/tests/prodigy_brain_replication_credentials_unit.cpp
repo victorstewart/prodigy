@@ -36999,12 +36999,21 @@ int main(void)
   {
     TestSuite suite;
     testUpgradeAdmissionObservationFences(suite);
+    testUpgradeAdmissionMasterOwnsFollowerInventoryFreshness(suite);
     testAdmittedUpdateRejectsUnfencedRequests(suite);
     testAdmittedUpdateCanonicalOperationPassesFreshFence(suite);
     testGeneratedUpgradeBundlePolicyAndAsyncOwner(suite);
     testGeneratedUnsupportedBundleFailsAdmittedAsyncProofBeforePublication(suite);
     testUpgradeAdmissionObservedCapacityFacts(suite);
     testUpgradeAdmissionTargetBoundStagingCapacity(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only && strcmp(only, "upgrade-admission-inventory") == 0)
+  {
+    TestSuite suite;
+    testUpgradeAdmissionObservationFences(suite);
+    testUpgradeAdmissionMasterOwnsFollowerInventoryFreshness(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (getenv("PRODIGY_TEST_DEPLOYMENT_IDENTITY_ONLY") != nullptr)
@@ -37680,6 +37689,7 @@ int main(void)
   testContainerNeuronListenerContract(suite);
   testPlacementPolicyTests(suite);
   testUpgradeAdmissionObservationFences(suite);
+  testUpgradeAdmissionMasterOwnsFollowerInventoryFreshness(suite);
   testAdmittedUpdateRejectsUnfencedRequests(suite);
   testAdmittedUpdateCanonicalOperationPassesFreshFence(suite);
   testGeneratedUpgradeBundlePolicyAndAsyncOwner(suite);

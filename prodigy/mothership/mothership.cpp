@@ -11173,6 +11173,39 @@ private:
         }
   }
 
+  static void logUpgradeAdmissionReportFacts(const MothershipUpgradeAdmissionReport& report)
+  {
+    String clusterUUID = {}, masterUUID = {};
+    clusterUUID.assignItoh(report.clusterUUID);
+    masterUUID.assignItoh(report.masterUUID);
+    basics_log(
+        "upgrade admission facts clusterUUID=%s masterUUID=%s generation=%llu receipt=%llu peers=%llu "
+        "master=%u quorum=%u authority=%u recoveryWitness=%u transport=%u observation=%u "
+        "bundleDigests=%u inventories=%u stagingResponses=%u stagingCapacity=%u\n",
+        clusterUUID.c_str(), masterUUID.c_str(),
+        (unsigned long long)report.authorityGeneration,
+        (unsigned long long)report.observationReceiptVersion,
+        (unsigned long long)report.peers.size(), unsigned(report.master),
+        unsigned(report.authorityQuorumHealthy), unsigned(report.authorityAcknowledged),
+        unsigned(report.recoveryWitnessAcknowledged),
+        unsigned(report.commissionedPeerTransportVerified), unsigned(report.observationComplete),
+        unsigned(report.fleetBundleDigestsFresh), unsigned(report.fleetInventoriesFresh),
+        unsigned(report.stagingCapacityResponsesComplete), unsigned(report.stagingCapacityComplete));
+    for (const ProdigyUpgradeAdmissionPeerObservation& peer : report.peers)
+    {
+      String brainUUID = {}, machineUUID = {};
+      brainUUID.assignItoh(peer.brainUUID);
+      machineUUID.assignItoh(peer.machineUUID);
+      basics_log(
+          "upgrade admission peer brainUUID=%s machineUUID=%s serialFollowers=%u installedBundle=%u "
+          "stateUpload=%u authority=%u recoveryWitness=%u stagingProbe=%u stagingCapacity=%u\n",
+          brainUUID.c_str(), machineUUID.c_str(), unsigned(peer.codeSupportsSerialFollowers),
+          unsigned(peer.localInstalledBundleVerified), unsigned(peer.stateUploadFresh),
+          unsigned(peer.authorityAcknowledged), unsigned(peer.recoveryWitnessAcknowledged),
+          unsigned(peer.stagingCapacityProbeComplete), unsigned(peer.stagingCapacityVerified));
+    }
+  }
+
   bool requestUpgradeAdmissionReport(const ProdigyUpgradeAdmissionReportRequest& request,
                                      MothershipUpgradeAdmissionReport& report, String& failure)
   {
@@ -11291,6 +11324,7 @@ private:
       basics_log("planUpgrade success=0 failure=%s\n", failure.c_str());
       exit(EXIT_FAILURE);
     }
+    if (!report.observationComplete) logUpgradeAdmissionReportFacts(report);
     MothershipUpgradeIdentity sourceIdentity = {};
     sourceIdentity.releaseID = sourceBundle.contract.releaseID;
     sourceIdentity.contractSHA256 = sourceBundle.contract.contractSHA256;

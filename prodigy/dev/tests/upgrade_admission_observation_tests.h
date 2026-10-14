@@ -57,7 +57,154 @@ static void testUpgradeAdmissionObservationFences(TestSuite& suite)
   suite.expect(pending.received.empty(), "upgrade_observation_rejects_wrong_target_capacity_response");
   r = valid(); pending.requestedAtMs = Time::msSinceBoot() - 30'001; send(r);
   suite.expect(pending.received.empty(), "upgrade_observation_rejects_stale_local_receipt");
+  Machine peerMachine = {};
+  peerMachine.uuid = peer.uuid;
+  peerMachine.runtimeReady = true;
+  peer.machine = &peerMachine;
+  r = valid();
+  r.stateUploadFresh = false;
+  brain.persistedMachineInventoryUploaded.insert(peerMachine.uuid);
+  suite.expect(brain.bindMasterUpgradeAdmissionInventory(&peer, r) && r.stateUploadFresh,
+               "upgrade_observation_binds_follower_inventory_to_master_authenticated_upload");
+  brain.persistedMachineInventoryUploaded.erase(peerMachine.uuid);
+  r.stateUploadFresh = true;
+  suite.expect(brain.bindMasterUpgradeAdmissionInventory(&peer, r) && !r.stateUploadFresh,
+               "upgrade_observation_rejects_follower_inventory_without_master_authenticated_upload");
+  peer.machine = nullptr;
   brain.brains.erase(&peer);
+  thisNeuron = previousNeuron;
+}
+
+static void testUpgradeAdmissionMasterOwnsFollowerInventoryFreshness(TestSuite& suite)
+{
+  ScopedAsyncMothershipRing ring = {};
+  TestNeuron local = {};
+  local.uuid = uint128_t(0x560);
+  String sourceDigest = {};
+  for (uint32_t index = 0; index < 64; ++index) sourceDigest.append('a');
+  local.setInstalledBundleDigestForTest(sourceDigest);
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &local;
+
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.nBrains = 2;
+  brain.boottimens = 101;
+  brain.brainConfig.clusterUUID = uint128_t(0x562);
+  brain.masterAuthorityRuntimeState.generation = 51;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 51;
+
+  Machine localMachine = {};
+  localMachine.uuid = local.uuid;
+  localMachine.isThisMachine = true;
+  localMachine.isBrain = true;
+  localMachine.state = MachineState::healthy;
+  localMachine.runtimeReady = true;
+  Machine followerMachine = {};
+  followerMachine.uuid = uint128_t(0x561);
+  followerMachine.isBrain = true;
+  followerMachine.state = MachineState::healthy;
+  followerMachine.runtimeReady = true;
+  BrainView follower = {};
+  follower.uuid = followerMachine.uuid;
+  follower.machine = &followerMachine;
+  follower.boottimens = 102;
+  follower.ioGeneration = 7;
+  follower.version = ProdigyBinaryVersion;
+  follower.connected = true;
+  follower.isFixedFile = true;
+  follower.fslot = 19;
+  follower.registrationFresh = true;
+  brain.machines.insert(&localMachine);
+  brain.machines.insert(&followerMachine);
+  brain.machinesByUUID.insert_or_assign(localMachine.uuid, &localMachine);
+  brain.machinesByUUID.insert_or_assign(followerMachine.uuid, &followerMachine);
+  brain.brains.insert(&follower);
+  brain.persistedMachineInventoryUploaded.insert(localMachine.uuid);
+  brain.persistedMachineInventoryUploaded.insert(followerMachine.uuid);
+
+  auto& pending = brain.upgradeAdmissionObservation;
+  pending.receiptVersion = 11;
+  pending.authorityGeneration = brain.masterAuthorityRuntimeState.generation;
+  pending.nonce = 17;
+  pending.requestedAtMs = Time::msSinceBoot();
+  pending.capacityRequest.operationID.assignItoh(uint128_t(3));
+  pending.capacityRequest.targetBundleSHA256.assign(sourceDigest);
+  for (uint32_t index = 0; index < 64; ++index)
+    pending.capacityRequest.targetContractSHA256.append('b');
+  pending.capacityRequest.requiredStagingBytes = 4096;
+  pending.localCapacityMeasurementComplete = true;
+  pending.localCapacityVerified = true;
+  pending.localCapacityAvailableBytes = 8192;
+  pending.commissionedPeerUUIDs.insert(follower.uuid);
+  pending.expectedPeerGenerations.insert_or_assign(follower.uuid, follower.ioGeneration);
+  pending.requiredPeerCount = 1;
+
+  ProdigyUpgradeAdmissionPeerObservation response = {};
+  response.brainUUID = follower.uuid;
+  response.machineUUID = follower.uuid;
+  response.receiptVersion = pending.receiptVersion;
+  response.authorityGeneration = pending.authorityGeneration;
+  response.requesterTransportGeneration = follower.ioGeneration;
+  response.masterUUID = local.uuid;
+  response.masterBootNs = brain.boottimens;
+  response.nonce = pending.nonce;
+  response.observedAtMs = pending.requestedAtMs;
+  response.codeSupportsSerialFollowers = true;
+  response.localInstalledBundleVerified = true;
+  response.stateUploadFresh = false;
+  response.authorityAcknowledged = true;
+  response.recoveryWitnessAcknowledged = true;
+  response.operationID.assign(pending.capacityRequest.operationID);
+  response.targetBundleSHA256.assign(pending.capacityRequest.targetBundleSHA256);
+  response.targetContractSHA256.assign(pending.capacityRequest.targetContractSHA256);
+  response.requiredStagingBytes = pending.capacityRequest.requiredStagingBytes;
+  response.stagingAvailableBytes = 8192;
+  response.stagingCapacityProbeComplete = true;
+  response.stagingCapacityVerified = true;
+  response.installedBundleSHA256.assign(sourceDigest);
+  pending.received.insert_or_assign(follower.uuid, response);
+
+  String serializedAuthority = {}, authorityDigest = {};
+  suite.require(brain.serializeCurrentMasterAuthorityTransition(serializedAuthority, authorityDigest),
+                "upgrade_observation_master_inventory_serializes_current_authority");
+  Brain::MasterAuthorityReplicationPeerState tracking = {};
+  tracking.uuid = follower.uuid;
+  tracking.bootNs = follower.boottimens;
+  tracking.ioGeneration = follower.ioGeneration;
+  tracking.transportEpoch = follower.transportEpoch;
+  tracking.fileSlot = follower.fslot;
+  tracking.acknowledgedGeneration = brain.masterAuthorityRuntimeState.generation;
+  tracking.acknowledgedTransitionDigest.assign(authorityDigest);
+  brain.masterAuthorityReplicationByPeer.insert_or_assign(&follower, std::move(tracking));
+
+  MothershipUpgradeAdmissionReport report = {};
+  brain.collectUpgradeAdmissionReport(report);
+  suite.expect(report.observationComplete && report.fleetInventoriesFresh &&
+                   report.peers.size() == 2 && report.peers[1].brainUUID == follower.uuid &&
+                   report.peers[1].stateUploadFresh,
+               "upgrade_observation_uses_master_authenticated_inventory_for_rebooted_follower");
+
+  brain.persistedMachineInventoryUploaded.erase(followerMachine.uuid);
+  brain.collectUpgradeAdmissionReport(report);
+  suite.expect(!report.observationComplete && !report.fleetInventoriesFresh &&
+                   report.peers.size() == 2 && !report.peers[1].stateUploadFresh,
+               "upgrade_observation_fails_closed_without_master_authenticated_follower_inventory");
+
+  brain.persistedMachineInventoryUploaded.insert(followerMachine.uuid);
+  follower.ioGeneration += 1;
+  brain.collectUpgradeAdmissionReport(report);
+  suite.expect(!report.observationComplete && report.peers.size() == 1,
+               "upgrade_observation_does_not_stamp_stale_follower_transport_generation");
+
+  brain.masterAuthorityReplicationByPeer.erase(&follower);
+  brain.brains.erase(&follower);
+  brain.machinesByUUID.erase(followerMachine.uuid);
+  brain.machinesByUUID.erase(localMachine.uuid);
+  brain.machines.erase(&followerMachine);
+  brain.machines.erase(&localMachine);
   thisNeuron = previousNeuron;
 }
 

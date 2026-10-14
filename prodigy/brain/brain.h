@@ -41739,6 +41739,30 @@ public:
     if (pending) drivePendingBrainConfigurationOwnership(pending);
   }
 
+  bool upgradeAdmissionMachineInventoryFresh(const Machine *machine) const
+  {
+    return machine != nullptr && machine->runtimeReady &&
+           persistedMachineInventoryUploaded.contains(machine->uuid);
+  }
+
+  bool bindMasterUpgradeAdmissionInventory(
+      const BrainView *peer,
+      ProdigyUpgradeAdmissionPeerObservation& observation) const
+  {
+    if (peer == nullptr || peer->machine == nullptr || peer->machine->uuid == 0 ||
+        observation.machineUUID != peer->machine->uuid)
+    {
+      return false;
+    }
+    // Neurons have one controlling Brain stream. After a follower reboots its
+    // local Brain cannot receive that machine's stateUpload while the active
+    // master owns the stream, so bind fleet-inventory freshness to the
+    // master's authenticated stateUpload receipt instead of the follower's
+    // necessarily empty process-local cache.
+    observation.stateUploadFresh = upgradeAdmissionMachineInventoryFresh(peer->machine);
+    return true;
+  }
+
   bool collectLocalUpgradeAdmissionObservation(
       uint64_t receiptVersion,
       uint64_t authorityGeneration,
@@ -41764,8 +41788,7 @@ public:
       }
     }
     Machine *machine = observation.machineUUID == 0 ? nullptr : findMachineByUUID(observation.machineUUID);
-    observation.stateUploadFresh = machine != nullptr && machine->runtimeReady &&
-                                    persistedMachineInventoryUploaded.contains(machine->uuid);
+    observation.stateUploadFresh = upgradeAdmissionMachineInventoryFresh(machine);
     if (capacityRequest != nullptr)
     {
       observation.operationID.assign(capacityRequest->operationID);
@@ -42035,7 +42058,9 @@ public:
       {
         continue;
       }
-      report.peers.push_back(found->second);
+      ProdigyUpgradeAdmissionPeerObservation observation = found->second;
+      if (!bindMasterUpgradeAdmissionInventory(peer, observation)) continue;
+      report.peers.push_back(std::move(observation));
     }
     const bool observationFresh = upgradeAdmissionObservation.requestedAtMs > 0 &&
         report.observedAtMs >= upgradeAdmissionObservation.requestedAtMs &&
