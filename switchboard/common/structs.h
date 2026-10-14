@@ -376,6 +376,14 @@ static inline __u32 switchboardPacketBudgetRemoteInnerMTU(__u32 underlayMTU, boo
   return underlayMTU > overhead ? underlayMTU - overhead : 0u;
 }
 
+static inline __u32 switchboardPacketBudgetWormholeInnerMTU(__u32 underlayMTU)
+{
+  const __u32 underlaySafeMTU = switchboardPacketBudgetRemoteInnerMTU(underlayMTU, true);
+  return underlaySafeMTU < WORMHOLE_PUBLIC_INGRESS_L3_MTU
+             ? underlaySafeMTU
+             : WORMHOLE_PUBLIC_INGRESS_L3_MTU;
+}
+
 static inline __u32 switchboardPacketBudgetTransportHeaderBytes(__u8 protocol)
 {
   if (protocol == SWITCHBOARD_IP_PROTOCOL_TCP)

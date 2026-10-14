@@ -1456,10 +1456,16 @@ static void exerciseHostIngressRemotePortalRoute(TestSuite& suite, bool ipv6, ui
     char actionName[256] = {};
     std::snprintf(actionName, sizeof(actionName), "%s_action_matches", suffix);
     expectNamed(boundaryOpts.retval == expectedAction, actionName);
+    if (boundaryResult == 0 && expectedAction == TC_ACT_OK)
+    {
+      char budgetName[256] = {};
+      std::snprintf(budgetName, sizeof(budgetName), "%s_outer_l3_fits_standard_underlay", suffix);
+      expectNamed(boundaryOpts.data_size_out <= sizeof(struct ethhdr) + 1500u, budgetName);
+    }
   };
   runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU,
                     TC_ACT_OK,
-                    "accepts_exact_1500_byte_host_remote_encap_boundary");
+                    "accepts_exact_1448_byte_host_remote_encap_boundary");
   runRemoteBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU + 1u,
                     TC_ACT_SHOT,
                     "rejects_host_remote_encap_above_supported_boundary");
@@ -1677,8 +1683,14 @@ static void exerciseBalancerRemotePortalRoutesWithOverlay(TestSuite& suite)
     char actionName[256] = {};
     std::snprintf(actionName, sizeof(actionName), "%s_action_matches", suffix);
     expectNamed(boundaryOpts.retval == expectedAction, actionName);
+    if (boundaryResult == 0 && expectedAction == XDP_TX)
+    {
+      char budgetName[256] = {};
+      std::snprintf(budgetName, sizeof(budgetName), "%s_outer_l3_fits_standard_underlay", suffix);
+      expectNamed(boundaryOpts.data_size_out == sizeof(struct ethhdr) + 1500u, budgetName);
+    }
   };
-  runBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU, XDP_TX, "accepts_exact_1500_byte_public_l3_boundary");
+  runBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU, XDP_TX, "accepts_exact_1448_byte_public_l3_boundary");
   runBoundary(WORMHOLE_PUBLIC_INGRESS_L3_MTU + 1u, XDP_DROP, "rejects_public_l3_above_supported_boundary");
 
   balancerProgram.close();

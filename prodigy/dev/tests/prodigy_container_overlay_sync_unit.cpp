@@ -1053,7 +1053,7 @@ static void testSystemEgressPolicyConstrainsIPv4(TestSuite& suite)
   thisNeuron = previousNeuron;
 }
 
-static void testContainerNetworkPolicySeparatesPrivateAndWormholePacketBudgets(TestSuite& suite)
+static void testContainerNetworkPolicyReservesWormholeProvenanceBudget(TestSuite& suite)
 {
   OverlayTestNeuron neuron = {};
   NeuronBase *previousNeuron = thisNeuron;
@@ -1066,10 +1066,58 @@ static void testContainerNetworkPolicySeparatesPrivateAndWormholePacketBudgets(T
   container.plan.wormholes.push_back(Wormhole {});
 
   container_network_policy policy = {};
-  suite.expect(container.buildContainerNetworkPolicy(policy),
-               "container_network_policy_accepts_9000_private_mtu_on_9040_underlay_with_wormhole");
-  suite.expect(policy.interContainerMTU == 9000,
-               "container_network_policy_keeps_private_mtu_independent_of_wormhole_provenance_overhead");
+  String failure = {};
+  suite.expect(container.buildContainerNetworkPolicy(policy, &failure) == false,
+               "container_network_policy_rejects_private_mtu_that_exceeds_wormhole_provenance_budget");
+  suite.expect(failure.equals("inter-container mtu 9000 exceeds safe underlay budget 1448 for container 36864"_ctv),
+               "container_network_policy_reports_wormhole_provenance_budget_rejection");
+
+  neuron.configuredInterContainerMTU = 1448;
+  policy = {};
+  failure.clear();
+  suite.expect(container.buildContainerNetworkPolicy(policy, &failure),
+               "container_network_policy_accepts_exact_wormhole_provenance_budget");
+  suite.expect(policy.interContainerMTU == 1448,
+               "container_network_policy_keeps_jumbo_wormhole_private_traffic_within_public_ingress_budget");
+
+  thisNeuron = previousNeuron;
+}
+
+static void testContainerNetworkPolicyFitsWormholeInStandardUnderlay(TestSuite& suite)
+{
+  OverlayTestNeuron neuron = {};
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &neuron;
+  neuron.eth.mtu = 1500;
+
+  Container container = {};
+  container.plan.uuid = 0x1500;
+  container.plan.wormholes.push_back(Wormhole {});
+
+  container_network_policy policy = {};
+  String failure = {};
+  suite.expect(container.buildContainerNetworkPolicy(policy, &failure),
+               "container_network_policy_accepts_wormhole_on_standard_underlay");
+  suite.expect(policy.interContainerMTU == 1448u,
+               "container_network_policy_clamps_wormhole_to_standard_underlay_inner_budget");
+  suite.expect(failure.size() == 0,
+               "container_network_policy_standard_underlay_wormhole_keeps_failure_empty");
+
+  neuron.configuredInterContainerMTU = 1448;
+  policy = {};
+  failure.clear();
+  suite.expect(container.buildContainerNetworkPolicy(policy, &failure),
+               "container_network_policy_accepts_exact_wormhole_standard_underlay_budget");
+  suite.expect(policy.interContainerMTU == 1448u,
+               "container_network_policy_preserves_exact_wormhole_standard_underlay_budget");
+
+  neuron.configuredInterContainerMTU = 1449;
+  policy = {};
+  failure.clear();
+  suite.expect(container.buildContainerNetworkPolicy(policy, &failure) == false,
+               "container_network_policy_rejects_wormhole_budget_above_standard_underlay");
+  suite.expect(failure.equals("inter-container mtu 1449 exceeds safe underlay budget 1448 for container 5376"_ctv),
+               "container_network_policy_reports_wormhole_standard_underlay_budget_rejection");
 
   thisNeuron = previousNeuron;
 }
@@ -2397,7 +2445,8 @@ int main(void)
   testContainerPeerOverlayRoutingSyncPopulatesMapsAndRemovesStaleEntries(suite);
   testContainerPeerRuntimeSyncPopulatesAndClearsWormholeEgressBindings(suite);
   testSystemEgressPolicyConstrainsIPv4(suite);
-  testContainerNetworkPolicySeparatesPrivateAndWormholePacketBudgets(suite);
+  testContainerNetworkPolicyReservesWormholeProvenanceBudget(suite);
+  testContainerNetworkPolicyFitsWormholeInStandardUnderlay(suite);
   testContainerPeerEgressRouterLoadsAfterWormholeSourceRewrite(suite);
   testContainerPeerEgressRouterDropsPacketsOverConfiguredMTU(suite);
   testContainerPeerEgressRouterEnforcesSystemAllowlist(suite);

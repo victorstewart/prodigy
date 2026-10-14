@@ -1901,7 +1901,9 @@ public:
     const uint32_t configuredMTU = thisNeuron->configuredInterContainerMTU;
     const uint32_t hostMTU = thisNeuron->eth.mtu;
     const bool hasWormholes = plan.wormholes.empty() == false;
-    const uint32_t safeMTU = switchboardPacketBudgetRemoteInnerMTU(hostMTU, false);
+    const uint32_t safeMTU = hasWormholes
+                                 ? switchboardPacketBudgetWormholeInnerMTU(hostMTU)
+                                 : switchboardPacketBudgetRemoteInnerMTU(hostMTU, false);
     if (hasWormholes && switchboardPacketBudgetExternalIngressUnderlayMTUValid(hostMTU) == false)
     {
       basics_log("container wormhole mtu budget mismatch uuid=%llu hostMTU=%u required=%u hostIfidx=%u\n",

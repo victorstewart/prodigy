@@ -207,10 +207,13 @@ int main(void)
   suite.expect(switchboardPacketBudgetExternalIngressLocalDeliveryAddedBytes() == 0u, "switchboard_packet_budget_external_ingress_local_adds_no_bytes");
   suite.expect(switchboardPacketBudgetWormholeOverlayHeaderBytes() == 12u, "switchboard_wormhole_overlay_header_is_standard_keyed_sequenced_gre_size");
   suite.expect(switchboardPacketBudgetExternalIngressRemoteDeliveryAddedBytes() == switchboardPacketBudgetIPv6HeaderBytes() + switchboardPacketBudgetWormholeOverlayHeaderBytes(), "switchboard_packet_budget_external_ingress_remote_adds_outer_ipv6_and_provenance_headers");
-  suite.expect(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU() == 1552u, "switchboard_packet_budget_external_ingress_remote_requires_1552_underlay");
-  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1551u) == false, "switchboard_packet_budget_external_ingress_remote_rejects_underlay_below_boundary");
-  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1552u), "switchboard_packet_budget_external_ingress_remote_accepts_exact_underlay_boundary");
-  suite.expect(switchboardPacketBudgetRemoteInnerMTU(1552u, true) == 1500u, "switchboard_packet_budget_external_ingress_remote_derives_supported_inner_mtu");
+  suite.expect(WORMHOLE_PUBLIC_INGRESS_L3_MTU == 1448u, "switchboard_packet_budget_external_ingress_public_l3_budget_fits_standard_underlay");
+  suite.expect(switchboardPacketBudgetExternalIngressRequiredUnderlayMTU() == 1500u, "switchboard_packet_budget_external_ingress_remote_requires_standard_underlay");
+  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1499u) == false, "switchboard_packet_budget_external_ingress_remote_rejects_underlay_below_standard_boundary");
+  suite.expect(switchboardPacketBudgetExternalIngressUnderlayMTUValid(1500u), "switchboard_packet_budget_external_ingress_remote_accepts_exact_standard_underlay_boundary");
+  suite.expect(switchboardPacketBudgetRemoteInnerMTU(1500u, true) == 1448u, "switchboard_packet_budget_external_ingress_remote_derives_standard_underlay_inner_mtu");
+  suite.expect(switchboardPacketBudgetWormholeInnerMTU(1500u) == 1448u, "switchboard_packet_budget_wormhole_inner_mtu_matches_standard_underlay_budget");
+  suite.expect(switchboardPacketBudgetWormholeInnerMTU(9040u) == 1448u, "switchboard_packet_budget_wormhole_inner_mtu_preserves_static_public_ingress_cap_on_jumbo_underlay");
   suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_TCP) == WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_tcp_starts_with_short_embryonic_lifetime");
   suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) == WORMHOLE_FLOW_UDP_IDLE_NS, "switchboard_wormhole_flow_udp_starts_with_idle_lifetime");
   suite.expect(switchboardWormholeInitialFlowLifetimeNs(IPPROTO_UDP) > WORMHOLE_FLOW_EMBRYONIC_NS, "switchboard_wormhole_flow_udp_survives_embryonic_rollout_gap");

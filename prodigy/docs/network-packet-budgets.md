@@ -49,10 +49,10 @@ Provider networks can add their own encapsulation or MTU constraints. Those prov
 
 Worked examples:
 
-- `interContainerMTU = 9000` with IPv6 overlay requires at least `9040` bytes of underlay L3 MTU, or `9054` Ethernet-frame bytes before VLAN/FCS.
-- A public wormhole requires at least `1552` bytes of underlay L3 MTU. Admission rejects the wormhole on a smaller host, and the balancer enforces the paired `1500`-byte external L3 contract before remote encapsulation.
+- A non-wormhole `interContainerMTU = 9000` with IPv6 overlay requires at least `9040` bytes of underlay L3 MTU, or `9054` Ethernet-frame bytes before VLAN/FCS.
+- A public wormhole on a standard `1500`-byte underlay supports up to `1448` bytes of external L3 traffic when delivery crosses machines: Prodigy adds the `52`-byte IPv6 plus provenance header, producing an exact `1500`-byte outer L3 packet. Admission rejects a smaller underlay, and the balancer enforces the paired `1448`-byte external L3 contract before remote encapsulation.
 
-Current caveat: the `interContainerMTU` gate runs before route classification in the container egress program. Public internet egress still has to fit the configured L3 limit even though the public path itself adds `0` bytes.
+Current caveat: the `interContainerMTU` gate runs before route classification in the container egress program. A workload with a wormhole therefore uses the static `1448`-byte budget for both its public ingress contract and its private/container egress, even on a jumbo underlay, although public egress itself adds `0` bytes. Preserving a larger public ingress MTU on jumbo hosts requires a separately synchronized per-host BPF ingress budget and matching container MTU; it is not provided by this contract.
 
 ## Source paths
 
