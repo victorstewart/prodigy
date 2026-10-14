@@ -114,10 +114,34 @@ static void pairControlNATObservedPeerValidation(TestSuite& suite)
   observed6.sin6_addr.s6_addr[0] = 0xff;
   observed6.sin6_addr.s6_addr[15] = 1;
   const bool multicastRejected = !switchboardPairControlSafeObservedIPv6Peer(observed, sizeof(observed6));
+  ProdigyLocalClusterPairControlCredential natCredential = {};
+  natCredential.initiator = privateInitiator;
+  natCredential.responder = globalResponder;
+  TCPSocket bound = {};
+  bound.setIPVersion(AF_INET6);
+  bound.setDaddr(globalResponder.address, globalResponder.port);
+  const bool sourceBound = switchboardPairControlBindOutboundSource(bound, natCredential);
+  sockaddr_in6 local = {};
+  socklen_t localLength = sizeof(local);
+  const bool exactSource = sourceBound && getsockname(bound.fd, reinterpret_cast<sockaddr *>(&local), &localLength) == 0 &&
+      localLength == sizeof(local) && local.sin6_family == AF_INET6 && local.sin6_port != 0 &&
+      std::memcmp(local.sin6_addr.s6_addr, privateInitiator.address.v6, sizeof(privateInitiator.address.v6)) == 0;
+  if (bound.fd >= 0) { ::close(bound.fd); bound.fd = -1; }
+
+  auto unavailableInitiator = privateInitiator;
+  unavailableInitiator.address = IPAddress("fd00:ffff:1234::dead", true);
+  auto unavailableCredential = natCredential;
+  unavailableCredential.initiator = unavailableInitiator;
+  TCPSocket unavailable = {};
+  unavailable.setIPVersion(AF_INET6);
+  unavailable.setDaddr(globalResponder.address, globalResponder.port);
+  const bool unavailableRejected = !switchboardPairControlBindOutboundSource(unavailable, unavailableCredential);
+  if (unavailable.fd >= 0) { ::close(unavailable.fd); unavailable.fd = -1; }
   suite.expect(clusterPairControlEndpointNATCompatibleOutbound(privateInitiator, globalResponder) &&
                    !clusterPairControlEndpointNATCompatibleOutbound(globalResponder, privateInitiator) &&
-                   globalSafe && loopbackRejected && multicastRejected,
-               "pair_control_nat_accepts_only_safe_observed_ipv6_for_non_global_to_global_credential");
+                   switchboardPairControlOutboundSourceAddress(natCredential).equals(privateInitiator.address) &&
+                   exactSource && unavailableRejected && globalSafe && loopbackRejected && multicastRejected,
+               "pair_control_nat_binds_exact_initiator_fails_closed_and_accepts_only_safe_observed_ipv6");
 }
 
 static ProdigyCousinDiscoveryPublication buildDiscoveryPublication(uint128_t nodeUUID,
@@ -681,6 +705,10 @@ int main()
 
   TestSuite suite = {};
   const char *selection = std::getenv("PRODIGY_TEST_ONLY");
+  if (selection != nullptr && std::strcmp(selection, "nat-source") == 0) {
+    pairControlNATObservedPeerValidation(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
   if (selection != nullptr && std::strcmp(selection, "cousin-session") == 0) {
     pairControlCarrierTransfersSessionControl(suite);
     return suite.failed == 0 ? 0 : 1;

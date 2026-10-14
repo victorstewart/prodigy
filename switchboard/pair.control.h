@@ -28,6 +28,23 @@ static inline bool switchboardPairControlSafeObservedIPv6Peer(const sockaddr_sto
   return !unspecified && !loopback && !mappedV4 && !linkLocal && address[0] != 0xff;
 }
 
+static inline IPAddress switchboardPairControlOutboundSourceAddress(
+    const ProdigyLocalClusterPairControlCredential& credential)
+{
+  // NAT may translate the address observed by the responder, but the local
+  // socket still has to use the admitted initiator address.  In particular,
+  // do not let Linux choose an unrelated address on a multi-address VM.
+  return credential.initiator.address;
+}
+
+template <typename Socket>
+static inline bool switchboardPairControlBindOutboundSource(
+    Socket& socket, const ProdigyLocalClusterPairControlCredential& credential)
+{
+  socket.setSaddr(switchboardPairControlOutboundSourceAddress(credential), 0);
+  return socket.fd >= 0 && Ring::bindSourceAddressBeforeFixedFileInstall(&socket);
+}
+
 class SwitchboardPairControlRuntime final : public RingInterface {
   static constexpr uint32_t helloBytes = 68;
   static constexpr uint32_t epochRecordBytes = 4 + 8 + ProdigyClusterPairEpochStatusBytes;
@@ -274,8 +291,7 @@ class SwitchboardPairControlRuntime final : public RingInterface {
   static bool adoptProcessSocket(SocketBase& socket)
   {
     // The generic pointer installer tolerates source-bind failure. Callers
-    // prove the approved source binding first, except for the derived
-    // non-global-to-global outbound NAT credential.
+    // prove the approved source binding first.
     if (socket.fd < 0) return false;
     const int slot = Ring::adoptProcessFDIntoFixedFileSlot(socket.fd);
     if (slot < 0) { ::close(socket.fd); socket.fd = -1; return false; }
@@ -431,10 +447,8 @@ class SwitchboardPairControlRuntime final : public RingInterface {
     if (nextConnectionID == 0 || nextConnectionID == UINT64_MAX) return;
     connection->selected = true; connection->connectionID = nextConnectionID++; connection->createdAt = Time::msSinceBoot();
     connection->setIPVersion(AF_INET6); connection->setNonBlocking();
-    const bool natCompatible = clusterPairControlEndpointNATCompatibleOutbound(credential.initiator, credential.responder);
-    if (!natCompatible) connection->setSaddr(connection->local.address, 0);
     connection->setDaddr(connection->remote.address, connection->remote.port);
-    if (connection->fd < 0 || (!natCompatible && !Ring::bindSourceAddressBeforeFixedFileInstall(connection.get())))
+    if (!switchboardPairControlBindOutboundSource(*connection, credential))
     { if (connection->fd >= 0) ::close(connection->fd); connection->fd = -1; return; }
     if (!adoptProcessSocket(*connection)) return;
     connection->rBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128); connection->wBuffer.reserve(ProdigyCousinDiscoveryMaximumBytes + 128);
