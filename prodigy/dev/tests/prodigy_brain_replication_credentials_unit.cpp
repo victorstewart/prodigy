@@ -37320,6 +37320,82 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   suite.expect(workerReceiptDurable && workerDelivered == 1 && brainRolesStillActive == 2,
                "transport_credential_add_machines_durable_receipt_marks_only_bootstrapped_machine");
 
+  // The delivered pair transition keeps its own quorum fence, but a settled
+  // pair must not become pending again merely because the addMachines journal
+  // advances the enclosing authority generation.  The new credential cohort
+  // has its own exact-quorum activation and release fences.
+  TransportCredentialCohortTestBrain pairedCohort = {};
+  configureAuthority(pairedCohort, 65, 156);
+  pairedCohort.authoritativeTopology.machines = {
+      machine(selfUUID, true), machine(peerAUUID, true), machine(peerBUUID, true)};
+  ProdigyClusterPairEnrollment settledPair = {};
+  settledPair.pairUUID = 0x9a70;
+  settledPair.localClusterUUID = clusterUUID;
+  settledPair.peerClusterUUID = 0x9a71;
+  settledPair.operationUUID = 0x9a72;
+  settledPair.rootGeneration = 1;
+  settledPair.agreedKeyEpoch = 1;
+  settledPair.localAuthorityGeneration = 61;
+  settledPair.state = ProdigyClusterPairEnrollmentState::active;
+  for (uint32_t byte = 0; byte < sizeof(settledPair.root); ++byte)
+    settledPair.root[byte] = uint8_t(byte + 1);
+  ClusterPairControlEndpoint settledLocal = {}, settledPeer = {};
+  settledLocal.clusterUUID = clusterUUID;
+  settledLocal.nodeUUID = selfUUID;
+  settledLocal.port = uint16_t(ReservedPorts::clusterPairControl);
+  settledPeer.clusterUUID = settledPair.peerClusterUUID;
+  settledPeer.nodeUUID = 0x9a73;
+  settledPeer.port = uint16_t(ReservedPorts::clusterPairControl);
+  suite.require(ClusterMachine::parseIPAddressLiteral("fd00:9a::1", settledLocal.address) &&
+                    ClusterMachine::parseIPAddressLiteral("fd00:9a::2", settledPeer.address),
+                "transport_credential_add_machines_settled_pair_endpoint_fixture");
+  ProdigyClusterPairEnrollmentOperation settledPairOperation = {};
+  settledPairOperation.pairUUID = settledPair.pairUUID;
+  settledPairOperation.operationUUID = settledPair.operationUUID;
+  settledPairOperation.localAuthorityGeneration = settledPair.localAuthorityGeneration;
+  settledPairOperation.transitionGeneration = 65;
+  settledPairOperation.pinnedMasterAuthorityEpoch = pairedCohort.masterAuthorityEpoch;
+  settledPairOperation.initialProjectionDelivered = true;
+  settledPairOperation.frozenElectorate = voters;
+  settledPairOperation.localEndpoints = {settledLocal};
+  settledPairOperation.peerEndpoints = {settledPeer};
+  pairedCohort.masterAuthorityRuntimeState.clusterPairEnrollments.push_back(settledPair);
+  pairedCohort.masterAuthorityRuntimeState.clusterPairEnrollmentOperations.push_back(settledPairOperation);
+  suite.expect(pairedCohort.clusterPairInitialEnrollmentPending(),
+               "transport_credential_add_machines_pair_terminal_transition_requires_own_quorum");
+  BrainView pairedCohortPeer = {};
+  suite.require(authenticatePeer(pairedCohort, pairedCohortPeer, peerAUUID),
+                "transport_credential_add_machines_pair_terminal_transition_authenticates_peer");
+  pairedCohortPeer.version = ProdigyBinaryVersion;
+  String pairedCohortCapabilities = {};
+  pairedCohort.brainHandler(&pairedCohortPeer, buildBrainMessage(
+      pairedCohortCapabilities, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 32 | 64)));
+  suite.require(acknowledgeCurrent(pairedCohort, pairedCohortPeer),
+                "transport_credential_add_machines_pair_terminal_transition_records_exact_quorum");
+  suite.require(pairedCohort.clusterPairAuthorityQualified() &&
+                    !pairedCohort.clusterPairInitialEnrollmentPending(),
+                "transport_credential_add_machines_pair_terminal_transition_quorum_settles_fence");
+  const uint64_t pairedAddMachinesOperationID = addMachinesOperationID + 1;
+  ProdigyPendingAddMachinesOperation pairedPending = {};
+  pairedPending.operationID = pairedAddMachinesOperationID;
+  pairedPending.plannedTopology.machines = pairedCohort.authoritativeTopology.machines;
+  pairedPending.plannedTopology.machines.push_back(machine(newWorkerUUID, false));
+  pairedPending.machinesToBootstrap = {machine(newWorkerUUID, false)};
+  pairedCohort.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(pairedPending));
+  pairedCohort.masterAuthorityRuntimeState.generation = 66;
+  pairedCohort.durableMasterAuthorityRuntimeStateGeneration = 66;
+  suite.require(!pairedCohort.clusterPairAuthorityQualified() &&
+                    !pairedCohort.clusterPairInitialEnrollmentPending(),
+                "transport_credential_add_machines_settled_pair_ignores_unrelated_generation_quorum");
+  bool pairedCohortReady = false;
+  pairedCohort.holdRuntimePersistence = true;
+  suite.expect(pairedCohort.ensurePendingAddMachinesTransportCohort(
+                   pairedAddMachinesOperationID, [&](bool ready) { pairedCohortReady = ready; }) &&
+                   pairedCohort.masterAuthorityRuntimeState.transportCredentialEnrollmentOperations.size() == 1 &&
+                   !pairedCohortReady,
+               "transport_credential_add_machines_stages_worker_after_settled_pair_without_unrelated_generation_quorum");
+  pairedCohort.finishRuntimePersistence(false);
+
   TransportCredentialCohortTestBrain partial = {};
   configureAuthority(partial, 70, 161);
   partial.authoritativeTopology = cohort.authoritativeTopology;

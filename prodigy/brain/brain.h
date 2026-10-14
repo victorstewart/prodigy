@@ -33776,9 +33776,18 @@ public:
           if (enrollment.operationUUID == operation.operationUUID && enrollment.state != ProdigyClusterPairEnrollmentState::revoked)
             return true;
     }
-    // A delivered flag is itself a replicated transition. Do not admit a new
-    // credential electorate while that terminal transition is still unproven.
-    return !masterAuthorityRuntimeState.clusterPairEnrollmentOperations.empty() && !clusterPairAuthorityQualified();
+    // The delivered flag's own transition still needs qualified quorum.  A
+    // later authority generation carries that settled flag forward and must
+    // not turn the pair back into a pending-enrollment fence merely because
+    // the later, unrelated transition has not yet been acknowledged.
+    const bool terminalTransitionCurrent = std::any_of(
+        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.begin(),
+        masterAuthorityRuntimeState.clusterPairEnrollmentOperations.end(),
+        [&](const auto& operation) {
+          return operation.initialProjectionDelivered &&
+              operation.transitionGeneration == masterAuthorityRuntimeState.generation;
+        });
+    return terminalTransitionCurrent && !clusterPairAuthorityQualified();
   }
 
   bool clusterPairAuthorityQualified() const

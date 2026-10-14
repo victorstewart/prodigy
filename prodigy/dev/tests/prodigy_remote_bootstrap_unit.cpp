@@ -1434,6 +1434,7 @@ int main(void)
   suite.expect(stringContains(singleSeedPlan.installCommand, "ufw status"), "plan_install_command_ufw_detects_active_firewall");
   suite.expect(stringContains(singleSeedPlan.installCommand, "ufw allow 312/tcp"), "plan_install_command_ufw_allows_neuron_port");
   suite.expect(stringContains(singleSeedPlan.installCommand, "ufw allow 313/tcp"), "plan_install_command_ufw_allows_brain_port");
+  suite.expect(stringContains(singleSeedPlan.installCommand, "ufw allow 315/tcp"), "plan_install_command_ufw_allows_cluster_pair_control_port");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl daemon-reload"), "plan_install_command_daemon_reload");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl enable prodigy"), "plan_install_command_enable");
   suite.expect(stringContains(singleSeedPlan.installCommand, "systemctl restart prodigy"), "plan_install_command_restart");
