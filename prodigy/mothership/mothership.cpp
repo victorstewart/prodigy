@@ -13879,7 +13879,7 @@ private:
         receipt.startedAtMonotonicMs == 0 || receipt.armedAtUnixMs == 0 ||
         receipt.notBeforeUnixMs < receipt.armedAtUnixMs)
     { failure.assign("local authority recovery executor receipt conflicts with its exact cohort"_ctv); return false; }
-    receipt.beforeStarttime.setInvariant(beforeStarttime.data(), beforeStarttime.size());
+    receipt.beforeStarttime.assign(beforeStarttime.data(), beforeStarttime.size());
 
     if (phase == "armed" && !completed && object.size() == 9)
     {
@@ -13917,7 +13917,7 @@ private:
         receipt.completedAtMonotonicMs <= receipt.startedAtMonotonicMs ||
         receipt.completedAtMonotonicMs - receipt.startedAtMonotonicMs > timeoutMilliseconds)
     { failure.assign("local authority recovery executor did not prove one bounded distinct reboot"_ctv); return false; }
-    receipt.afterStarttime.setInvariant(afterStarttime.data(), afterStarttime.size());
+    receipt.afterStarttime.assign(afterStarttime.data(), afterStarttime.size());
     receipt.phase = LocalAuthorityRecoveryExecutorPhase::completed;
     return true;
   }

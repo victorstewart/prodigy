@@ -74,6 +74,15 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("mothershipAssignProviderHex128(operationUUID, operation);", helper)
         self.assertNotIn("operation.assignItoh", helper)
 
+    def test_authority_recovery_receipt_owns_process_identity_strings(self):
+        begin = MOTHERSHIP.index("bool parseLocalAuthorityRecoveryExecutorReceipt")
+        end = MOTHERSHIP.index("bool runLocalAuthorityRecoveryExecutor", begin)
+        parser = MOTHERSHIP[begin:end]
+        self.assertIn("receipt.beforeStarttime.assign(beforeStarttime.data(), beforeStarttime.size())", parser)
+        self.assertIn("receipt.afterStarttime.assign(afterStarttime.data(), afterStarttime.size())", parser)
+        self.assertNotIn("receipt.beforeStarttime.setInvariant", parser)
+        self.assertNotIn("receipt.afterStarttime.setInvariant", parser)
+
     def test_authority_recovery_arms_all_boundaries_and_releases_the_seed_last(self):
         begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
         end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
