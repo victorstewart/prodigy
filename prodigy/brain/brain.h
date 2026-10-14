@@ -33870,16 +33870,30 @@ public:
     return endpoints.size() == voters.size() && prodigyClusterPairEndpointsValid(endpoints, brainConfig.clusterUUID);
   }
 
-  bool clusterPairEnrollmentReady(Vector<ClusterPairControlEndpoint>& endpoints) const
+  bool clusterPairEnrollmentReady(Vector<ClusterPairControlEndpoint>& endpoints, String *failure = nullptr) const
   {
-    if (!clusterPairAuthorityQualified() || !commissionedRetirementPeersCurrent() ||
-        !buildApprovedClusterPairEndpoints(endpoints) || clusterPairInitialEnrollmentPending() ||
-        transportCredentialNewCohortIsFenced()) return false;
+    if (failure != nullptr) failure->clear();
+    auto reject = [&](const char *detail) {
+      if (failure != nullptr) failure->assign(detail);
+      return false;
+    };
+    if (!clusterPairAuthorityQualified())
+      return reject("pair enrollment authority is not currently qualified");
+    if (!commissionedRetirementPeersCurrent())
+      return reject("pair enrollment commissioned peer is not current");
+    if (!buildApprovedClusterPairEndpoints(endpoints))
+      return reject("pair enrollment approved endpoint roster is unavailable");
+    if (clusterPairInitialEnrollmentPending())
+      return reject("pair enrollment has a pending initial projection");
+    if (transportCredentialNewCohortIsFenced())
+      return reject("pair enrollment awaits addMachines transport credential cohort settlement");
     for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
-      if (transportCredentialOperationUnfinished(operation)) return false;
+      if (transportCredentialOperationUnfinished(operation))
+        return reject("pair enrollment awaits transport credential operation completion");
     for (const auto& endpoint : endpoints)
       if (endpoint.nodeUUID != selfBrainUUID() &&
-          !clusterPairEnrollmentPeerCapabilityCurrent(findBrainViewByUUID(endpoint.nodeUUID), true)) return false;
+          !clusterPairEnrollmentPeerCapabilityCurrent(findBrainViewByUUID(endpoint.nodeUUID), true))
+        return reject("pair enrollment peer capability is not current");
     return true;
   }
 
@@ -33909,8 +33923,9 @@ public:
         response.failure.assign("pair enrollment has no durable operation"_ctv); return response;
       }
     response.success = true;
-    response.qualified = clusterPairEnrollmentReady(response.localEndpoints);
-    if (!response.qualified) response.failure.assign("pair enrollment awaits current durable quorum, credentials, topology and capabilities"_ctv);
+    String readinessFailure = {};
+    response.qualified = clusterPairEnrollmentReady(response.localEndpoints, &readinessFailure);
+    if (!response.qualified) response.failure = std::move(readinessFailure);
     return response;
   }
 

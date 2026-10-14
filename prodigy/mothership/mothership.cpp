@@ -22294,6 +22294,21 @@ private:
       valid = queryClusterPairEnrollment(requestedFirst, resumed ? operationUUID : 0, firstProbe, failure);
       if (valid) valid = queryClusterPairEnrollment(requestedSecond, resumed ? operationUUID : 0, secondProbe, failure);
     }
+    if (valid && !resumed && (!firstProbe.qualified || !secondProbe.qualified))
+    {
+      const bool firstBlocked = !firstProbe.qualified;
+      const auto& blocked = firstBlocked ? firstProbe : secondProbe;
+      if (firstBlocked)
+        failure.assign("first cluster pair endpoint probe is incomplete"_ctv);
+      else
+        failure.assign("second cluster pair endpoint probe is incomplete"_ctv);
+      if (!blocked.failure.empty())
+      {
+        failure.append(": "_ctv);
+        failure.append(blocked.failure);
+      }
+      valid = false;
+    }
     if (valid && !resumed)
     {
       if (!makeClusterPairIntent(operationUUID, firstProbe, secondProbe, intent))

@@ -35605,12 +35605,20 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                   "cluster_pair_owner_authenticates_all_private_ipv6_roster_neurons");
 
     Vector<ClusterPairControlEndpoint> localRoster = {};
-    suite.require(!pairBrain.clusterPairEnrollmentReady(localRoster),
+    String enrollmentReadinessFailure = {};
+    suite.require(acknowledgeCurrent(pairBrain, pairPeerA) &&
+                      !pairBrain.clusterPairEnrollmentReady(localRoster, &enrollmentReadinessFailure) &&
+                      enrollmentReadinessFailure.equal("pair enrollment peer capability is not current"_ctv),
                   "cluster_pair_owner_rejects_new_operation_for_legacy_capability_only_peers");
+    const auto legacyCapabilityQuery = pairBrain.queryClusterPairEnrollment({1, 0});
+    suite.expect(!legacyCapabilityQuery.qualified &&
+                     legacyCapabilityQuery.failure.equal("pair enrollment peer capability is not current"_ctv),
+                 "cluster_pair_owner_query_reports_current_peer_capability_blocker");
     acknowledgePairCapabilities(pairPeerA, uint64_t(2 | 32 | 64));
     acknowledgePairCapabilities(pairPeerB, uint64_t(2 | 32 | 64));
     suite.require(acknowledgeCurrent(pairBrain, pairPeerA) &&
-                      pairBrain.clusterPairEnrollmentReady(localRoster) && localRoster.size() == 3,
+                      pairBrain.clusterPairEnrollmentReady(localRoster, &enrollmentReadinessFailure) &&
+                      enrollmentReadinessFailure.empty() && localRoster.size() == 3,
                   "cluster_pair_owner_requires_current_authenticated_operation_capabilities_and_quorum");
 
     auto remoteEndpoint = [&](uint128_t uuid, const char *address) {
