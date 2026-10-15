@@ -19,8 +19,31 @@ enum class NeuronTimeoutFlags : uint64_t {
   metricsTick,
   walSync,
   resourceDeltaGrace,
-  networkCleanup
+  networkCleanup,
+  bgpIPv6ReadinessRetry
 };
+
+// Cloud BGP cannot be configured until the kernel has installed a usable
+// global IPv6 address.  Keep this deliberately finite: six retries at
+// 1/2/4/8/16/32 seconds cover the first 63 seconds after runtime setup without
+// turning an unavailable provider account into an unbounded background poll.
+constexpr static uint32_t prodigyBGPIPv6ReadinessRetryMaximumAttempts = 6;
+constexpr static uint32_t prodigyBGPIPv6ReadinessRetryInitialDelayMs = 1'000;
+
+static inline bool prodigyBGPIPv6ReadinessRetryEligible(
+    bool providerReady, const NeuronBGPConfig& config,
+    const IPAddress& globalIPv6, uint32_t attempts)
+{
+  return providerReady && config.enabled == false &&
+         (globalIPv6.is6 == false || globalIPv6.isNull()) &&
+         attempts < prodigyBGPIPv6ReadinessRetryMaximumAttempts;
+}
+
+static inline uint32_t prodigyBGPIPv6ReadinessRetryDelayMs(uint32_t attempts)
+{
+  // The caller has already checked the cap: 1s through 32s, 63 seconds total.
+  return prodigyBGPIPv6ReadinessRetryInitialDelayMs << attempts;
+}
 
 class Container;
 class ContainerPlan;

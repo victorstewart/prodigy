@@ -239,6 +239,22 @@ int main(void)
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_requires_global_ipv6_source");
 
+  IPAddress noGlobalIPv6 = {};
+  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(true, rejectedVultr, noGlobalIPv6, 0),
+               "bgp_ipv6_readiness_retry_arms_only_for_ready_provider_missing_global_ipv6");
+  suite.expect(prodigyBGPIPv6ReadinessRetryDelayMs(0) == 1'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(1) == 2'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(2) == 4'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(3) == 8'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(4) == 16'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(5) == 32'000,
+               "bgp_ipv6_readiness_retry_backoff_covers_first_63_seconds");
+  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(true, rejectedVultr, noGlobalIPv6,
+                                                     prodigyBGPIPv6ReadinessRetryMaximumAttempts) == false &&
+                   prodigyBGPIPv6ReadinessRetryEligible(false, rejectedVultr, noGlobalIPv6, 0) == false &&
+                   prodigyBGPIPv6ReadinessRetryEligible(true, vultrCloud, noGlobalIPv6, 0) == false,
+               "bgp_ipv6_readiness_retry_rejects_exhausted_unready_and_enabled_configs");
+
   {
     FakeVultrBGPHttp http = {};
     VultrNeuronIaaS vultr = {};

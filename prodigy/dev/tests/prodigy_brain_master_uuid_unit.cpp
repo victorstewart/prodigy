@@ -231,6 +231,11 @@ public:
     electBrainToMaster(brain);
   }
 
+  bool testPeerMasterElectionPersistenceRetryPending(void) const
+  {
+    return pendingPeerMasterElectionPersistence.pending;
+  }
+
   void testDeriveMasterBrain(bool allowExistingMasterClaims = true)
   {
     deriveMasterBrain(allowExistingMasterClaims);
@@ -6437,6 +6442,108 @@ int main(void)
   {
     TestBrain brain = {};
     brain.iaas = new NoopBrainIaaS();
+    BrainView *peer = makePeer(uint128_t(0x305), 26, IPAddress("10.0.0.17", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 44;
+    brain.brains.insert(peer);
+
+    // Model the narrow reentrant interval after an admitted preflight but
+    // before its receipt: only a fresh capacity result may retain a retry.
+    brain.holdRuntimeStatePersist = true;
+    brain.testElectBrainToMaster(peer);
+    brain.updateSelfPersistenceBackpressureResponses = 1;
+    brain.finishRuntimeStatePersistence(false);
+    suite.expect(!brain.noMasterYet && peer->isMasterBrain &&
+                     brain.peerMasterIdentityPublicationPending &&
+                     brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_rejected_receipt_rearms_only_for_fresh_backpressure");
+
+    brain.holdRuntimeStatePersist = false;
+    brain.runBrainPeerHeartbeatTick();
+    suite.expect(!brain.noMasterYet && peer->isMasterBrain && brain.persistCalls == 1 &&
+                     !brain.peerMasterIdentityPublicationPending &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_rejected_receipt_heartbeat_retries_durable_adoption");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    BrainView *peer = makePeer(uint128_t(0x304), 25, IPAddress("10.0.0.16", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 43;
+    brain.brains.insert(peer);
+    brain.updateSelfPersistenceBackpressureResponses = 1;
+
+    brain.testElectBrainToMaster(peer);
+    peer->ioGeneration += 1;
+    brain.runBrainPeerHeartbeatTick();
+    suite.expect(brain.noMasterYet && !peer->isMasterBrain && brain.persistCalls == 0 &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_backpressure_discards_recycled_peer_generation");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    BrainView *peer = makePeer(uint128_t(0x306), 27, IPAddress("10.0.0.18", false).v4);
+    brain.brains.insert(peer);
+    brain.updateSelfPersistenceBackpressureResponses = 1;
+
+    brain.testElectBrainToMaster(peer);
+    brain.advanceMasterAuthorityEpoch();
+    suite.expect(brain.noMasterYet && !peer->isMasterBrain && brain.persistCalls == 0 &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_backpressure_clears_on_authority_epoch_change");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    BrainView *peer = makePeer(uint128_t(0x307), 28, IPAddress("10.0.0.19", false).v4);
+    brain.brains.insert(peer);
+    brain.failRuntimeStatePersist = true;
+
+    brain.testElectBrainToMaster(peer);
+    suite.expect(!brain.noMasterYet && peer->isMasterBrain && brain.persistCalls == 1 &&
+                     brain.peerMasterIdentityPublicationPending &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_commit_failure_keeps_publication_and_retry_fenced");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    BrainView *peer = makePeer(uint128_t(0x303), 24, IPAddress("10.0.0.15", false).v4);
+    brain.brains.insert(peer);
+    brain.rejectUpdateSelfPersistenceAdmission = true;
+
+    brain.testElectBrainToMaster(peer);
+    suite.expect(brain.noMasterYet && !peer->isMasterBrain && brain.persistCalls == 0 &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_permanent_persistence_rejection_stays_fenced");
+
+    brain.brains.erase(peer);
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
     const uint128_t savedNeuronUUID = neuron.uuid;
     neuron.uuid = 0;
     suite.expect(brain.shouldWeConnectToBrain(nullptr) == false, "connector_order_rejects_null_peer");
@@ -7278,6 +7385,44 @@ int main(void)
     suite.expect(brain.noMasterYet == false, "elect_brain_to_master_clears_no_master_flag");
     suite.expect(brain.persistCalls == 1, "elect_brain_to_master_persists");
 
+    delete peer;
+  }
+
+  {
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+    brain.nBrains = 3;
+    BrainView *peer = makePeer(uint128_t(0x302), 23, IPAddress("10.0.0.14", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 42;
+    brain.brains.insert(peer);
+
+    // A full writer must leave the follower's live ownership and control path
+    // untouched. Repeated registration observes the same immutable peer but
+    // must not create another pending election or consume another admission.
+    brain.updateSelfPersistenceBackpressureResponses = 2;
+    brain.testElectBrainToMaster(peer);
+    brain.testElectBrainToMaster(peer);
+    suite.expect(brain.noMasterYet && !peer->isMasterBrain && brain.persistCalls == 0 &&
+                     brain.testPeerMasterElectionPersistenceRetryPending() &&
+                     brain.updateSelfPersistenceBackpressureResponses == 1,
+                 "elect_peer_master_backpressure_coalesces_without_mutating_election");
+
+    // The existing heartbeat owns the retry. Its first turn remains
+    // backpressured; the next accepted turn persists and only then publishes
+    // the peer-master identity through the normal durable receipt path.
+    brain.runBrainPeerHeartbeatTick();
+    suite.expect(brain.noMasterYet && !peer->isMasterBrain && brain.persistCalls == 0 &&
+                     brain.testPeerMasterElectionPersistenceRetryPending(),
+                 "elect_peer_master_backpressure_heartbeat_retains_one_retry");
+    brain.runBrainPeerHeartbeatTick();
+    suite.expect(!brain.noMasterYet && peer->isMasterBrain && brain.persistCalls == 1 &&
+                     !brain.testPeerMasterElectionPersistenceRetryPending() &&
+                     !brain.peerMasterIdentityPublicationPending,
+                 "elect_peer_master_backpressure_heartbeat_persists_before_publication");
+
+    brain.brains.erase(peer);
     delete peer;
   }
 

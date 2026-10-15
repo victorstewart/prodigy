@@ -1644,6 +1644,18 @@ public:
   bool noMasterYet = true;
   bool weAreMaster = false;
   bool peerMasterIdentityPublicationPending = false;
+  // Peer-master adoption cannot publish its registration until its snapshot is
+  // durable.  Keep one heartbeat-owned retry while the shared writer is at
+  // capacity; retaining only immutable peer identity prevents a recycled
+  // stream from inheriting an old election.
+  struct PendingPeerMasterElectionPersistence
+  {
+    bool pending = false;
+    uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    uint64_t peerGeneration = 0;
+    uint64_t authorityEpoch = 0;
+  } pendingPeerMasterElectionPersistence = {};
   uint64_t masterAuthorityEpoch = 1;
   // Hardware inventory is an asynchronous read-modify-write of the durable
   // topology. Keep only the latest profile per immutable ClusterMachine
@@ -19668,6 +19680,7 @@ public:
     const bool localHeartbeatTickLagged = (tickLagMs >= int64_t(brainPeerHeartbeatTimeoutMs));
     // Retry before appending heartbeats, so an already queued control frame
     // suppresses duplicate authority work without starving it behind this tick.
+    retryPendingPeerMasterElectionPersistence();
     retryMasterAuthorityRuntimeStatePersistence();
     retryDeferredMachineFragmentAssignments();
     retryDeferredRecoveryPersistence();
@@ -19856,6 +19869,10 @@ public:
 
   void brainMissing(BrainView *brain)
   {
+    if (pendingPeerMasterElectionMatches(brain))
+    {
+      pendingPeerMasterElectionPersistence = {};
+    }
     const bool peerWasCurrentMaster = peerRepresentsCurrentMasterForLiveness(brain);
     const bool peerWasPendingDesignatedMaster = (noMasterYet &&
                                                  pendingDesignatedMasterPeerKey > 0 &&
@@ -25559,6 +25576,7 @@ public:
   {
     noMasterYet = true;
     peerMasterIdentityPublicationPending = false;
+    pendingPeerMasterElectionPersistence = {};
     isMasterMissing = false;
     pendingDesignatedMasterPeerKey = 0;
     cancelAllBrainLivenessWaiters("reset-master");
@@ -26338,6 +26356,7 @@ public:
     {
       masterAuthorityEpoch = 1;
     }
+    pendingPeerMasterElectionPersistence = {};
     // Detached fragment candidates belong to the exact authority epoch that
     // admitted them. Invalidate their singleton before a promotion refresh;
     // a late receipt keeps only its weak candidate and cannot clear or block
@@ -26810,6 +26829,76 @@ public:
     return true;
   }
 
+  bool pendingPeerMasterElectionMatches(const BrainView *brain) const
+  {
+    return pendingPeerMasterElectionPersistence.pending && brain != nullptr &&
+           pendingPeerMasterElectionPersistence.peerUUID == brain->uuid &&
+           pendingPeerMasterElectionPersistence.peerBootTime == brain->boottimens &&
+           pendingPeerMasterElectionPersistence.peerGeneration == brain->ioGeneration &&
+           pendingPeerMasterElectionPersistence.authorityEpoch == masterAuthorityEpoch;
+  }
+
+  void deferPeerMasterElectionPersistence(const BrainView *brain)
+  {
+    if (brain == nullptr) return;
+    pendingPeerMasterElectionPersistence.pending = true;
+    pendingPeerMasterElectionPersistence.peerUUID = brain->uuid;
+    pendingPeerMasterElectionPersistence.peerBootTime = brain->boottimens;
+    pendingPeerMasterElectionPersistence.peerGeneration = brain->ioGeneration;
+    pendingPeerMasterElectionPersistence.authorityEpoch = masterAuthorityEpoch;
+  }
+
+  void retryPendingPeerMasterElectionPersistence(void)
+  {
+    if (pendingPeerMasterElectionPersistence.pending == false) return;
+    if (pendingPeerMasterElectionPersistence.authorityEpoch != masterAuthorityEpoch)
+    {
+      pendingPeerMasterElectionPersistence = {};
+      return;
+    }
+
+    BrainView *brain = findBrainViewByUUID(pendingPeerMasterElectionPersistence.peerUUID);
+    if (brain == nullptr || brains.contains(brain) == false ||
+        brain->boottimens != pendingPeerMasterElectionPersistence.peerBootTime ||
+        brain->ioGeneration != pendingPeerMasterElectionPersistence.peerGeneration ||
+        peerEligibleForClusterQuorum(brain) == false)
+    {
+      pendingPeerMasterElectionPersistence = {};
+      return;
+    }
+
+    // electBrainToMaster performs the admission preflight before it mutates
+    // local ownership. Clear this marker only for the attempt itself, so a
+    // repeated capacity result re-arms exactly the same immutable request.
+    pendingPeerMasterElectionPersistence = {};
+    electBrainToMaster(brain);
+  }
+
+  void rearmPeerMasterElectionAfterRejectedReceipt(
+      uint128_t peerUUID, int64_t peerBootTime, uint64_t peerGeneration, uint64_t authorityEpoch)
+  {
+    if (authorityEpoch != masterAuthorityEpoch || pendingPeerMasterElectionPersistence.pending)
+    {
+      return;
+    }
+    BrainView *brain = findBrainViewByUUID(peerUUID);
+    if (brain == nullptr || brains.contains(brain) == false || brain->boottimens != peerBootTime ||
+        brain->ioGeneration != peerGeneration || brain->isMasterBrain == false ||
+        peerMasterIdentityPublicationPending == false || peerEligibleForClusterQuorum(brain) == false)
+    {
+      return;
+    }
+
+    // The original admitted preflight can lose its slot to a reentrant Ring
+    // callback before submitSnapshot runs. Recheck rather than treating every
+    // failed durable receipt as retryable: disk/commit and permanent writer
+    // failures remain fenced.
+    if (updateSelfPersistenceAdmission() == UpdateSelfPersistenceAdmission::backpressured)
+    {
+      deferPeerMasterElectionPersistence(brain);
+    }
+  }
+
   void electBrainToMaster(BrainView *brain)
   {
     if (authorityElectionRequired())
@@ -26822,6 +26911,29 @@ public:
     {
       return;
     }
+
+    // Repeated registrations can observe the same peer while its durable
+    // adoption is backpressured. One heartbeat retry owns that request; do
+    // not consume more writer slots or mutate election state again.
+    if (pendingPeerMasterElectionMatches(brain))
+    {
+      return;
+    }
+
+    // The follower must not close its local control path or advertise a peer
+    // master until the writer can accept the matching durability boundary.
+    // Capacity is retryable from the heartbeat; every other rejection stays
+    // fail-closed without changing local master ownership.
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission != UpdateSelfPersistenceAdmission::admitted)
+    {
+      if (admission == UpdateSelfPersistenceAdmission::backpressured)
+      {
+        deferPeerMasterElectionPersistence(brain);
+      }
+      return;
+    }
+    pendingPeerMasterElectionPersistence = {};
 
     if (weAreMaster)
     {
@@ -26870,14 +26982,27 @@ public:
     const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
     const uint64_t epoch = masterAuthorityEpoch;
     const uint64_t incarnation = brain->ioGeneration;
-    persistLocalRuntimeStateAsync([this, lifetime, epoch, brain, incarnation](bool durable) {
-      if (lifetime.expired() || !durable || masterAuthorityEpoch != epoch ||
-          std::find(brains.begin(), brains.end(), brain) == brains.end() ||
-          brain->ioGeneration != incarnation || !brain->isMasterBrain) return;
-      peerMasterIdentityPublicationPending = false;
-      publishLocalMasterIdentity();
-      refreshMasterPeerLivenessWaiter(brain, "elect-master");
-    });
+    const uint128_t peerUUID = brain->uuid;
+    const int64_t peerBootTime = brain->boottimens;
+    persistLocalRuntimeStateAsync(
+        [this, lifetime, epoch, brain, incarnation, peerUUID, peerBootTime](bool durable) {
+          if (lifetime.expired() || masterAuthorityEpoch != epoch ||
+              std::find(brains.begin(), brains.end(), brain) == brains.end() ||
+              brain->uuid != peerUUID || brain->boottimens != peerBootTime ||
+              brain->ioGeneration != incarnation || !brain->isMasterBrain)
+          {
+            return;
+          }
+          if (!durable)
+          {
+            rearmPeerMasterElectionAfterRejectedReceipt(
+                peerUUID, peerBootTime, incarnation, epoch);
+            return;
+          }
+          peerMasterIdentityPublicationPending = false;
+          publishLocalMasterIdentity();
+          refreshMasterPeerLivenessWaiter(brain, "elect-master");
+        });
   }
 
   void deriveMasterBrain(bool allowExistingMasterClaims = true)

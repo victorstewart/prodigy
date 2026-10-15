@@ -209,6 +209,10 @@ protected:
   };
   std::unique_ptr<BGPConfigurationRefreshOperation> bgpConfigurationRefresh;
   uint64_t runtimeEnvironmentGeneration = 0;
+  TimeoutPacket bgpIPv6ReadinessRetryTick;
+  bool bgpIPv6ReadinessRetryQueued = false;
+  uint32_t bgpIPv6ReadinessRetryAttempts = 0;
+  uint64_t bgpIPv6ReadinessRetryPendingGeneration = 0;
   bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
   constexpr static uint32_t maximumPendingStateUploadRestores = 64;
   uint64_t stateUploadRestoreEpoch = 0;
@@ -5748,6 +5752,41 @@ protected:
         bgp = std::make_unique<NeuronBGPRuntime>();
       }
       bgp->configure(bgpConfig);
+
+      IPAddress globalIPv6 = eth.getGlobal6();
+      if (bgpConfig.enabled)
+      {
+        bgpIPv6ReadinessRetryAttempts = 0;
+        bgpIPv6ReadinessRetryPendingGeneration = 0;
+        if (bgpIPv6ReadinessRetryQueued)
+        {
+          Ring::queueCancelTimeout(&bgpIPv6ReadinessRetryTick);
+        }
+      }
+      else if (prodigyBGPIPv6ReadinessRetryEligible(
+                   true, bgpConfig, globalIPv6, bgpIPv6ReadinessRetryAttempts))
+      {
+        bgpIPv6ReadinessRetryPendingGeneration = generation;
+        if (bgpIPv6ReadinessRetryQueued == false)
+        {
+          bgpIPv6ReadinessRetryTick.clear();
+          bgpIPv6ReadinessRetryTick.flags = uint64_t(NeuronTimeoutFlags::bgpIPv6ReadinessRetry);
+          bgpIPv6ReadinessRetryTick.identifier = generation;
+          bgpIPv6ReadinessRetryTick.originator = this;
+          const uint32_t delayMs = prodigyBGPIPv6ReadinessRetryDelayMs(bgpIPv6ReadinessRetryAttempts++);
+          bgpIPv6ReadinessRetryTick.setTimeoutMs(delayMs);
+          bgpIPv6ReadinessRetryQueued = true;
+          std::fprintf(stderr,
+                       "neuron BGP IPv6 readiness retry scheduled generation=%llu attempt=%u delayMs=%u\n",
+                       (unsigned long long)generation,
+                       unsigned(bgpIPv6ReadinessRetryAttempts), unsigned(delayMs));
+          Ring::queueTimeout(&bgpIPv6ReadinessRetryTick);
+        }
+      }
+      else
+      {
+        bgpIPv6ReadinessRetryPendingGeneration = 0;
+      }
     }
     else
     {
@@ -5766,6 +5805,12 @@ protected:
   {
     runtimeEnvironmentGeneration += 1;
     bgpConfigurationRefresh.reset();
+    bgpIPv6ReadinessRetryAttempts = 0;
+    bgpIPv6ReadinessRetryPendingGeneration = 0;
+    if (bgpIPv6ReadinessRetryQueued)
+    {
+      Ring::queueCancelTimeout(&bgpIPv6ReadinessRetryTick);
+    }
   }
 
   void scheduleRuntimeEnvironmentBGPRefresh(void)
@@ -8029,6 +8074,23 @@ public:
       if (result != -ECANCELED)
       {
         transitionToNewBundle();
+      }
+      return;
+    }
+
+    if (packet == &bgpIPv6ReadinessRetryTick)
+    {
+      bgpIPv6ReadinessRetryQueued = false;
+      // A cancellation can race the next runtime-environment refresh.  That
+      // refresh records its own generation only after it has independently
+      // re-observed missing IPv6; never let the old timer's identifier alone
+      // restart a superseded provider configuration.
+      if (bgpIPv6ReadinessRetryPendingGeneration == runtimeEnvironmentGeneration)
+      {
+        std::fprintf(stderr, "neuron BGP IPv6 readiness retry start generation=%llu attempt=%u\n",
+                     (unsigned long long)runtimeEnvironmentGeneration,
+                     unsigned(bgpIPv6ReadinessRetryAttempts));
+        scheduleRuntimeEnvironmentBGPRefresh();
       }
       return;
     }
