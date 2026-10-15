@@ -249,6 +249,31 @@ int main()
                                                    storedLocal, resumed, &failure) && resumed);
     localBoundary = refreshedLocal;
 
+    Vector<uint128_t> expectedBoundaryMachines = {0x601, 0x602, 0x603};
+    Vector<MothershipLocalVMBoundaryDescriptor> inspectedBoundaries = {localBoundary};
+    assert(!MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
+        localBoundary.clusterUUID, expectedBoundaryMachines, inspectedBoundaries, &failure));
+    auto secondBoundary = localBoundary;
+    secondBoundary.vmBoundaryUUID = 0x804; secondBoundary.machineUUID = 0x602;
+    auto thirdBoundary = localBoundary;
+    thirdBoundary.vmBoundaryUUID = 0x805; thirdBoundary.machineUUID = 0x603;
+    inspectedBoundaries.push_back(secondBoundary); inspectedBoundaries.push_back(thirdBoundary);
+    assert(MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
+        localBoundary.clusterUUID, expectedBoundaryMachines, inspectedBoundaries, &failure));
+    auto duplicateBoundary = secondBoundary;
+    duplicateBoundary.vmBoundaryUUID = 0x806;
+    inspectedBoundaries.push_back(duplicateBoundary);
+    assert(!MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
+        localBoundary.clusterUUID, expectedBoundaryMachines, inspectedBoundaries, &failure));
+    inspectedBoundaries.pop_back();
+    auto injectedNewlineKey = localBoundary;
+    String unsafePublicKey = {};
+    unsafePublicKey.append("ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA g6"_ctv);
+    unsafePublicKey.append('\n');
+    assert(unsafePublicKey[unsafePublicKey.size() - 1] == '\n');
+    injectedNewlineKey.hostPublicKeyOpenSSH = std::move(unsafePublicKey);
+    assert(!registry.registerLocalVMBoundary(injectedNewlineKey, storedLocal, resumed, &failure));
+
     MothershipPhysicalServiceTransitBoundary boundary = {};
     boundary.boundaryUUID = 0x501; boundary.pairOperationUUID = intent.operationUUID;
     boundary.routeUUID = intent.route.routeUUID; boundary.routeGeneration = intent.route.generation;
@@ -431,6 +456,32 @@ int main()
     assert(closed.admissionReceiptSHA256 == digest('2') && closed.cleanupReceiptSHA256 == digest('8'));
     assert(registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('8'), closed, resumed, &failure) && resumed);
     assert(!registry.closePhysicalServiceTransitBoundary(boundary.boundaryUUID, digest('9'), closed, resumed, &failure));
+
+    MothershipProductionPairIntent abortedIntent = intent;
+    abortedIntent.operationUUID = 0x402; abortedIntent.physicalBoundaryUUID = 0x502;
+    assert(registry.admitProductionPair(abortedIntent, 1010, pair, resumed, &failure) && !resumed);
+    assert(registry.advanceProductionPair(abortedIntent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                          digest('a'), 1011, pair, resumed, &failure));
+    MothershipPhysicalServiceTransitBoundary abortBoundary = boundary;
+    abortBoundary.boundaryUUID = abortedIntent.physicalBoundaryUUID;
+    abortBoundary.pairOperationUUID = abortedIntent.operationUUID;
+    abortBoundary.admissionReceiptSHA256 = digest('b'); abortBoundary.cleanupReceiptSHA256.clear(); abortBoundary.closed = false;
+    assert(registry.admitPhysicalServiceTransitBoundary(abortBoundary, storedBoundary, resumed, &failure) && !resumed);
+    const String abortReceipt = digest('c');
+    assert(registry.closePhysicalServiceTransitBoundaryBeforeTransit(abortBoundary.boundaryUUID, abortReceipt,
+                                                                      closed, resumed, &failure) && !resumed);
+    assert(registry.abortProductionPairBeforeTransit(abortedIntent.operationUUID, abortReceipt, 1012,
+                                                     pair, resumed, &failure) && !resumed);
+    assert(pair.phase == MothershipProductionPairPhase::abortedBeforeTransit);
+    assert(registry.abortProductionPairBeforeTransit(abortedIntent.operationUUID, abortReceipt, 1012,
+                                                     pair, resumed, &failure) && resumed);
+    assert(registry.closePhysicalServiceTransitBoundaryBeforeTransit(abortBoundary.boundaryUUID, abortReceipt,
+                                                                      closed, resumed, &failure) && resumed);
+    assert(!registry.abortProductionPairBeforeTransit(abortedIntent.operationUUID, digest('d'), 1012,
+                                                      pair, resumed, &failure));
+    MothershipProductionPairIntent nextIntent = abortedIntent;
+    nextIntent.operationUUID = 0x403; nextIntent.physicalBoundaryUUID = 0x503;
+    assert(registry.admitProductionPair(nextIntent, 1013, pair, resumed, &failure) && !resumed);
   }
 
   {

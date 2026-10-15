@@ -575,6 +575,14 @@ private:
     path.assign("/tmp/prodigy-mothership/clusters"_ctv);
   }
 
+  static bool localVMBoundaryPublicKeySafeForInspection(
+      const MothershipLocalVMBoundaryDescriptor& descriptor)
+  {
+    for (char byte : descriptor.hostPublicKeyOpenSSH)
+      if (static_cast<unsigned char>(byte) < 0x20 || static_cast<unsigned char>(byte) == 0x7f) return false;
+    return true;
+  }
+
   struct ClusterPairEnrollmentLock {
     int fd = -1;
     ~ClusterPairEnrollmentLock() { if (fd >= 0) ::close(fd); }
@@ -3900,7 +3908,7 @@ public:
         if (failure) failure->assign("production pair registry contains a corrupt record"_ctv);
         return false;
       }
-      if (prior.phase != MothershipProductionPairPhase::cleanupComplete &&
+      if (!mothershipProductionPairTerminal(prior.phase) &&
           (prior.intent.route.routeUUID == intent.route.routeUUID ||
            (prior.intent.route.sourceClusterUUID == intent.route.sourceClusterUUID &&
             prior.intent.route.destinationClusterUUID == intent.route.destinationClusterUUID &&
@@ -3947,6 +3955,28 @@ public:
     }
     String key = {}, encoded = {};
     key.assignItoh(operationUUID);
+    BitseryEngine::serialize(encoded, updated);
+    if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(updated);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool abortProductionPairBeforeTransit(uint128_t operationUUID, const String& receiptSHA256,
+                                        int64_t nowMs, MothershipProductionPairRecord& recorded,
+                                        bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (operationUUID == 0 || !mothershipProductionPairReceiptValid(receiptSHA256) || nowMs <= 0)
+    { if (failure) failure->assign("production pair abort requires an operation, receipt, and timestamp"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord updated = recorded;
+    const bool wasAborted = updated.phase == MothershipProductionPairPhase::abortedBeforeTransit;
+    if (!mothershipProductionPairAbortBeforeTransit(updated, receiptSHA256, nowMs, failure)) return false;
+    resumed = wasAborted;
+    if (resumed) { if (failure) failure->clear(); return true; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
     BitseryEngine::serialize(encoded, updated);
     if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
     recorded = std::move(updated);
@@ -4112,6 +4142,43 @@ public:
     return db.write(physicalTransitBoundariesColumnFamily, key, encoded, failure);
   }
 
+  // A boundary admitted while selector launch was still provisional must be
+  // closable before the pair abort becomes durable.  This avoids making an
+  // uncommitted transit permanently block the exact route after a crash.
+  bool closePhysicalServiceTransitBoundaryBeforeTransit(
+      uint128_t boundaryUUID, const String& abortReceiptSHA256,
+      MothershipPhysicalServiceTransitBoundary& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (!mothershipPhysicalFaultDigestValid(abortReceiptSHA256))
+    { if (failure) failure->assign("physical service transit abort receipt is invalid"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadPhysicalServiceTransitBoundary(boundaryUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord pair = {};
+    if (!loadProductionPair(recorded.pairOperationUUID, pair, failure) ||
+        (pair.phase != MothershipProductionPairPhase::targetAdmitted &&
+         pair.phase != MothershipProductionPairPhase::abortedBeforeTransit) ||
+        (pair.phase == MothershipProductionPairPhase::abortedBeforeTransit &&
+         pair.cleanupReceiptSHA256 != abortReceiptSHA256) ||
+        pair.intent.physicalBoundaryUUID != recorded.boundaryUUID ||
+        pair.intent.route.routeUUID != recorded.routeUUID ||
+        pair.intent.route.generation != recorded.routeGeneration)
+    {
+      if (failure && failure->empty()) failure->assign("physical transit abort requires the exact pre-transit production pair"_ctv);
+      return false;
+    }
+    if (recorded.closed)
+    {
+      resumed = recorded.cleanupReceiptSHA256 == abortReceiptSHA256;
+      if (!resumed && failure) failure->assign("physical transit abort receipt conflicts with the durable receipt"_ctv);
+      return resumed;
+    }
+    recorded.closed = true; recorded.cleanupReceiptSHA256 = abortReceiptSHA256;
+    String key = {}, encoded = {}; key.assignItoh(boundaryUUID); auto copy = recorded;
+    BitseryEngine::serialize(encoded, copy);
+    return db.write(physicalTransitBoundariesColumnFamily, key, encoded, failure);
+  }
+
   bool loadLocalVMBoundary(uint128_t vmBoundaryUUID, MothershipLocalVMBoundaryDescriptor& descriptor,
                            String *failure = nullptr)
   {
@@ -4123,6 +4190,75 @@ public:
         !mothershipLocalVMBoundaryDescriptorValid(descriptor) || descriptor.vmBoundaryUUID != vmBoundaryUUID)
     { descriptor = {}; if (failure) failure->assign("local VM boundary is corrupt or unsupported"_ctv); return false; }
     if (failure) failure->clear(); return true;
+  }
+
+  // This is deliberately a registry-only listing primitive.  Callers which
+  // need to prove that the external VM still matches the recorded descriptor
+  // must separately use the sealed executor query.
+  bool listLocalVMBoundaries(uint128_t clusterUUID,
+                             Vector<MothershipLocalVMBoundaryDescriptor>& descriptors,
+                             String *failure = nullptr)
+  {
+    descriptors.clear();
+    if (clusterUUID == 0)
+    { if (failure) failure->assign("local VM boundary listing requires a cluster UUID"_ctv); return false; }
+    Vector<String> values = {};
+    if (!db.listValues(localVMBoundariesColumnFamily, values, failure)) return false;
+    for (const auto& value : values)
+    {
+      MothershipLocalVMBoundaryDescriptor candidate = {};
+      if (!BitseryEngine::deserializeSafe(value, candidate) ||
+          !mothershipLocalVMBoundaryDescriptorValid(candidate) ||
+          !localVMBoundaryPublicKeySafeForInspection(candidate))
+      { if (failure) failure->assign("local VM boundary registry contains a corrupt record"_ctv); return false; }
+      if (candidate.clusterUUID == clusterUUID) descriptors.push_back(std::move(candidate));
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
+  // Inspection accepts only the exact active set for the current three-machine
+  // local topology.  Retired records remain useful audit history and are not
+  // part of that live set.
+  static bool activeLocalVMBoundariesExactForMachines(
+      uint128_t clusterUUID, const Vector<uint128_t>& expectedMachineUUIDs,
+      const Vector<MothershipLocalVMBoundaryDescriptor>& descriptors, String *failure = nullptr)
+  {
+    if (clusterUUID == 0 || expectedMachineUUIDs.size() != 3)
+    { if (failure) failure->assign("local VM boundary inspection requires exactly three machine identities"_ctv); return false; }
+    Vector<uint32_t> matches = {};
+    Vector<uint128_t> activeBoundaryUUIDs = {};
+    for (uint32_t index = 0; index < expectedMachineUUIDs.size(); ++index)
+    {
+      if (expectedMachineUUIDs[index] == 0)
+      { if (failure) failure->assign("local VM boundary inspection requires nonzero machine identities"_ctv); return false; }
+      for (uint32_t prior = 0; prior < index; ++prior)
+        if (expectedMachineUUIDs[prior] == expectedMachineUUIDs[index])
+        { if (failure) failure->assign("local VM boundary inspection topology contains duplicate machine identities"_ctv); return false; }
+      matches.push_back(0);
+    }
+    for (const auto& descriptor : descriptors)
+    {
+      if (descriptor.clusterUUID != clusterUUID)
+      { if (failure) failure->assign("local VM boundary inspection received a boundary from another cluster"_ctv); return false; }
+      if (descriptor.retired) continue;
+      for (uint128_t activeBoundaryUUID : activeBoundaryUUIDs)
+        if (activeBoundaryUUID == descriptor.vmBoundaryUUID)
+        { if (failure) failure->assign("local VM boundary inspection found duplicate active boundary identities"_ctv); return false; }
+      activeBoundaryUUIDs.push_back(descriptor.vmBoundaryUUID);
+      uint32_t index = 0;
+      for (; index < expectedMachineUUIDs.size(); ++index)
+        if (expectedMachineUUIDs[index] == descriptor.machineUUID) break;
+      if (index == expectedMachineUUIDs.size())
+      { if (failure) failure->assign("local VM boundary inspection found an active orphan boundary"_ctv); return false; }
+      if (++matches[index] != 1)
+      { if (failure) failure->assign("local VM boundary inspection found duplicate active boundaries"_ctv); return false; }
+    }
+    for (uint32_t count : matches)
+      if (count != 1)
+      { if (failure) failure->assign("local VM boundary inspection found a machine without one active boundary"_ctv); return false; }
+    if (failure) failure->clear();
+    return true;
   }
 
   bool findActiveLocalVMBoundary(uint128_t clusterUUID, uint128_t machineUUID,
@@ -4159,6 +4295,8 @@ public:
   {
     recorded = {}; resumed = false;
     if (!mothershipLocalVMBoundaryDescriptorValid(requested, failure) || requested.retired) return false;
+    if (!localVMBoundaryPublicKeySafeForInspection(requested))
+    { if (failure) failure->assign("local VM boundary host public key contains a control character"_ctv); return false; }
     G6OperationLock lock;
     if (!lockG6Operations(lock, failure)) return false;
     String key = {}, encoded = {}, readFailure = {}; key.assignItoh(requested.vmBoundaryUUID);

@@ -155,6 +155,25 @@ int main()
   assert(mothershipProductionPairBegin(request, 1000, skipped, &failure));
   assert(mothershipProductionPairRecordMatchesIntent(skipped, request));
   assert(!mothershipProductionPairAdvance(skipped, MothershipProductionPairPhase::sourceDrained, digest('7'), 1001, &failure));
+
+  MothershipProductionPairRecord aborted = {};
+  assert(mothershipProductionPairBegin(request, 1000, aborted, &failure));
+  assert(mothershipProductionPairAdvance(aborted, MothershipProductionPairPhase::targetAdmitted,
+                                         digest('a'), 1001, &failure));
+  assert(mothershipProductionPairAbortBeforeTransit(aborted, digest('b'), 1002, &failure));
+  assert(aborted.phase == MothershipProductionPairPhase::abortedBeforeTransit);
+  assert(mothershipProductionPairRecordValid(aborted, &failure));
+  assert(mothershipProductionPairAbortBeforeTransit(aborted, digest('b'), 1002, &failure));
+  assert(!mothershipProductionPairAbortBeforeTransit(aborted, digest('c'), 1002, &failure));
+  assert(!mothershipProductionPairAdvance(aborted, MothershipProductionPairPhase::targetSelected,
+                                          digest('c'), 1003, &failure));
+  assert(!mothershipProductionPairAbortBeforeTransit(skipped, digest('b'), 1002, &failure));
+  MothershipProductionPairRecord afterTransit = {};
+  assert(mothershipProductionPairBegin(request, 1000, afterTransit, &failure));
+  assert(mothershipProductionPairAdvance(afterTransit, MothershipProductionPairPhase::targetAdmitted,
+                                         digest('a'), 1001, &failure));
+  assert(mothershipProductionPairMarkTransitApplied(afterTransit, digest('b'), 1002, &failure));
+  assert(!mothershipProductionPairAbortBeforeTransit(afterTransit, digest('c'), 1003, &failure));
   std::puts("PASS: production paired-migration state validation and idempotency");
   return 0;
 }

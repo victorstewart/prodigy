@@ -14390,6 +14390,8 @@ private:
             record.intent.selectorAddress == listenerAddress &&
             record.intent.selectorTCPPort == listenerPort;
         if (!valid) failure.assign("production pair retry conflicts with its immutable operation identity"_ctv);
+        if (valid && record.phase == MothershipProductionPairPhase::abortedBeforeTransit)
+        { failure.assign("production pair was durably aborted before transit; use a new operation UUID"_ctv); valid = false; }
       }
       else if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
     }
@@ -14693,6 +14695,67 @@ private:
         (unsigned long long)(requested.vmBoundaryUUID >> 64), (unsigned long long)requested.vmBoundaryUUID,
         failure.c_str());
     if (!valid) exit(EXIT_FAILURE);
+  }
+
+  void runInspectLocalVMBoundaries(int argc, char *argv[])
+  {
+    String failure = {};
+    MothershipProdigyCluster cluster = {};
+    Vector<uint128_t> expectedMachineUUIDs = {};
+    Vector<MothershipLocalVMBoundaryDescriptor> boundaries = {};
+    bool valid = argc == 1;
+    if (!valid) failure.assign("usage: inspectLocalVMBoundaries CLUSTER"_ctv);
+    if (valid)
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      valid = registry.getClusterByIdentity(String(argv[0]), cluster, &failure);
+      if (valid && (cluster.deploymentMode != MothershipClusterDeploymentMode::local || cluster.nBrains != 3 ||
+                    cluster.topology.version == 0 || cluster.topology.machines.size() != 3))
+      { failure.assign("local VM boundary inspection requires one exact three-Brain deploymentMode=local topology"_ctv); valid = false; }
+      if (valid)
+      {
+        for (const auto& machine : cluster.topology.machines)
+        {
+          if (machine.uuid == 0 || machine.kind != MachineConfig::MachineKind::vm || !machine.isBrain)
+          { failure.assign("local VM boundary inspection requires three VM Brain machine identities"_ctv); valid = false; break; }
+          expectedMachineUUIDs.push_back(machine.uuid);
+        }
+      }
+      if (valid) valid = registry.listLocalVMBoundaries(cluster.clusterUUID, boundaries, &failure) &&
+          MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
+              cluster.clusterUUID, expectedMachineUUIDs, boundaries, &failure);
+    }
+    // The executor query can create bounded remote query-side effects, but
+    // inspection itself never writes the registry or invokes a VM lifecycle action.
+    const bool inspectable = valid;
+    for (auto& boundary : boundaries)
+    {
+      if (!inspectable || boundary.retired) continue;
+      String boundaryUUID = {}, machineUUID = {}, observedImmutable = {}, observedStarttime = {}, queryFailure = {};
+      boundaryUUID.assignItoh(boundary.vmBoundaryUUID);
+      machineUUID.assignItoh(boundary.machineUUID);
+      uint64_t observedPID = 0;
+      bool queried = queryLocalVMBoundaryExecutor(boundary, observedImmutable, queryFailure,
+                                                   &observedPID, &observedStarttime);
+      const bool boundaryValid = queried && observedImmutable == boundary.immutableStateSHA256;
+      valid = valid && boundaryValid;
+      if (!boundaryValid && failure.empty())
+        failure.assign(queried ? "local VM boundary immutable state changed" :
+                                "local VM boundary sealed query failed");
+      // Never print the public key: its optional OpenSSH comment is operator
+      // supplied and has no diagnostic value for a read-only inspection.
+      basics_log("localVMBoundary boundaryUUID=%s machineUUID=%s taskID=%s host=%s:%u hostUser=%s statePath=%s executorSHA256=%s registeredImmutableStateSHA256=%s querySuccess=%u observedImmutableStateSHA256=%s observedPID=%llu observedStarttime=%s\n",
+                 boundaryUUID.c_str(), machineUUID.c_str(), boundary.taskID.c_str(),
+                 boundary.hostAddress.c_str(), unsigned(boundary.hostPort), boundary.hostUser.c_str(),
+                 boundary.statePath.c_str(), boundary.executorSHA256.c_str(), boundary.immutableStateSHA256.c_str(),
+                 unsigned(queried), observedImmutable.c_str(), (unsigned long long)observedPID, observedStarttime.c_str());
+    }
+    String clusterUUID = {}; clusterUUID.assignItoh(cluster.clusterUUID);
+    basics_log("inspectLocalVMBoundaries success=%u clusterUUID=%s activeCount=%u result=%s failure=%s\n",
+               unsigned(valid), clusterUUID.c_str(), unsigned(expectedMachineUUIDs.size()),
+               valid ? "verified" : "failed", failure.c_str());
+    if (!valid)
+      exit(EXIT_FAILURE);
   }
 
   void runFaultLocalClusterMachine(int argc, char *argv[])
@@ -15613,8 +15676,8 @@ private:
     uint128_t operationUUID = 0;
     bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
         (action == "query"_ctv || action == "selectTarget"_ctv || action == "drain"_ctv ||
-         action == "retireSource"_ctv || action == "cleanup"_ctv);
-    if (!valid) failure.assign("usage: productionPair OPERATION_UUID query|selectTarget|drain|retireSource|cleanup"_ctv);
+         action == "retireSource"_ctv || action == "cleanup"_ctv || action == "abortBeforeTransit"_ctv);
+    if (!valid) failure.assign("usage: productionPair OPERATION_UUID query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit"_ctv);
     MothershipProductionPairRecord record = {};
     MothershipProdigyCluster source = {}, target = {};
     MothershipPhysicalServiceTransitBoundary physicalBoundary = {};
@@ -15638,7 +15701,48 @@ private:
     }
 
     bool resumed = false;
-    if (valid && action == "cleanup"_ctv)
+    if (valid && action == "abortBeforeTransit"_ctv)
+    {
+      if (record.phase != MothershipProductionPairPhase::targetAdmitted &&
+          record.phase != MothershipProductionPairPhase::abortedBeforeTransit)
+      { failure.assign("production pair pre-transit abort requires the target-admitted phase"_ctv); valid = false; }
+      ProductionPairProviderState state = {}; String output = {}, providerEvidence = {};
+      if (valid) valid = runProductionPairProvider(record, source, "remove", state, output, providerEvidence, failure);
+      MothershipPhysicalServiceTransitBoundary boundary = {}; bool boundaryExists = false;
+      if (valid)
+      {
+        auto registry = openClusterRegistry(); String readFailure = {};
+        boundaryExists = registry.loadPhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID, boundary, &readFailure);
+        if (!boundaryExists && !readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
+        if (boundaryExists && boundary.pairOperationUUID != operationUUID)
+        { failure.assign("production pair abort physical boundary conflicts with operation identity"_ctv); valid = false; }
+      }
+      if (valid)
+      {
+        Vector<String> evidence = {};
+        evidence.emplace_back("mothership-production-pair-pre-transit-abort-receipt-v1"_ctv);
+        evidence.push_back(record.targetAdmissionReceiptSHA256);
+        evidence.push_back(providerEvidence);
+        evidence.push_back(boundaryExists ? boundary.admissionReceiptSHA256 : String());
+        String encoded = {}; BitseryEngine::serialize(encoded, evidence);
+        valid = prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+      }
+      if (valid && boundaryExists)
+      {
+        auto registry = openClusterRegistry(); bool closeResumed = false;
+        valid = registry.closePhysicalServiceTransitBoundaryBeforeTransit(record.intent.physicalBoundaryUUID,
+            receiptSHA256, boundary, closeResumed, &failure);
+        resumed = closeResumed;
+      }
+      if (valid)
+      {
+        auto registry = openClusterRegistry(); bool abortResumed = false;
+        valid = registry.abortProductionPairBeforeTransit(operationUUID, receiptSHA256,
+            Time::now<TimeResolution::ms>(), record, abortResumed, &failure);
+        resumed = resumed || abortResumed;
+      }
+    }
+    else if (valid && action == "cleanup"_ctv)
     {
       if (record.phase < MothershipProductionPairPhase::sourceRetired)
       { failure.assign("production pair cleanup requires durable source retirement"_ctv); valid = false; }
@@ -26965,6 +27069,7 @@ public:
         {"faultRemoteCloudMachine",         &Mothership::runFaultRemoteCloudMachine        },
         {"faultTestCluster",                &Mothership::runFaultTestCluster               },
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
+        {"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries       },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
@@ -27061,7 +27166,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -27129,10 +27234,12 @@ int main(int argc, char *argv[])
     message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
     message.append("prepareProductionPair [operationUUID] [activeRouteUUID] [physicalBoundaryUUID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIngressAddress] [ingressPort]\n");
     message.append("\tadmits two exact non-test stateless workloads, their production COUSIN transport, and one durable source-machine ingress relay\n");
-    message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup]\n");
-    message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, and post-withdrawal cleanup\n");
+    message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit]\n");
+    message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, post-withdrawal cleanup, or pre-transit abort\n");
     message.append("registerLocalVMBoundary [cluster] [machineUUID] [boundaryUUID] [taskID] [hostAddress] [hostPort] [hostUser] [hostPrivateKey] [hostPublicKey] [statePath]\n");
     message.append("\tregisters the exact pinned external KVM owner for one VM member of a three-Brain deploymentMode=local cluster; Mothership owns and seals the launcher bytes\n");
+    message.append("inspectLocalVMBoundaries [cluster]\n");
+    message.append("\tverifies the exact three active local-VM owners and their sealed immutable executor state without lifecycle mutation\n");
     message.append("retireTestPairSource [operationID] (test migration; fresh whole destination readiness and source drain required)\n");
     message.append("prepareTestPairMigration [sourceCluster] [targetCluster] [operationID] [sourceDeploymentID] [sourceMachineIndex] [targetMachineIndex] [IPv4] [TCPport] [targetJSON] [containerBlob] [optional activeCousinRouteUUID] (test clusters only; final-transport route qualifies G5)\n");
     message.append("admitTestPairTarget [operationID] [containerBlob] (resume the same durable target admission)\n");

@@ -21,12 +21,22 @@ enum class MothershipProductionPairPhase : uint8_t {
   sourceDrained = 7,
   sourceRetired = 8,
   cleanupComplete = 9,
+  // No traffic selection became durable.  The admitted target remains intact,
+  // but the provisional selector and any physical-boundary admission were
+  // removed under one exact abort receipt.
+  abortedBeforeTransit = 10,
 };
 
 static inline bool mothershipProductionPairPhaseValid(MothershipProductionPairPhase phase)
 {
   return phase >= MothershipProductionPairPhase::prepared &&
-         phase <= MothershipProductionPairPhase::cleanupComplete;
+         phase <= MothershipProductionPairPhase::abortedBeforeTransit;
+}
+
+static inline bool mothershipProductionPairTerminal(MothershipProductionPairPhase phase)
+{
+  return phase == MothershipProductionPairPhase::cleanupComplete ||
+         phase == MothershipProductionPairPhase::abortedBeforeTransit;
 }
 
 // An opaque owner-issued receipt is recorded only by its exact SHA-256 digest.
@@ -274,6 +284,16 @@ static inline bool mothershipProductionPairRecordValid(const MothershipProductio
       !mothershipProductionPairIntentValid(record.intent) || !mothershipProductionPairPhaseValid(record.phase) ||
       record.transitionGeneration == 0 || record.transitionedAtMs <= 0)
     return reject("production pair record has an invalid immutable intent or transition identity");
+  if (record.phase == MothershipProductionPairPhase::abortedBeforeTransit)
+  {
+    if (!mothershipProductionPairReceiptValid(record.targetAdmissionReceiptSHA256) ||
+        !record.transitApplyReceiptSHA256.empty() || !record.sourceIngressWitnessReceiptSHA256.empty() ||
+        !record.targetSelectionReceiptSHA256.empty() || !record.targetIngressWitnessReceiptSHA256.empty() ||
+        !record.sourceDrainReceiptSHA256.empty() || !record.sourceRetirementReceiptSHA256.empty() ||
+        !mothershipProductionPairReceiptValid(record.cleanupReceiptSHA256))
+      return reject("production pair pre-transit abort has invalid receipts");
+    return true;
+  }
   const auto require = [&](const String& receipt, MothershipProductionPairPhase atLeast) {
     return record.phase < atLeast ? receipt.empty() : mothershipProductionPairReceiptValid(receipt);
   };
@@ -321,6 +341,7 @@ static inline String *mothershipProductionPairReceiptSlot(MothershipProductionPa
     case MothershipProductionPairPhase::sourceDrained: return &record.sourceDrainReceiptSHA256;
     case MothershipProductionPairPhase::sourceRetired: return &record.sourceRetirementReceiptSHA256;
     case MothershipProductionPairPhase::cleanupComplete: return &record.cleanupReceiptSHA256;
+    case MothershipProductionPairPhase::abortedBeforeTransit: return &record.cleanupReceiptSHA256;
     default: return nullptr;
   }
 }
@@ -339,7 +360,8 @@ static inline bool mothershipProductionPairAdvance(MothershipProductionPairRecor
     return false;
   }
   const uint8_t current = uint8_t(record.phase), requested = uint8_t(next);
-  if (next == MothershipProductionPairPhase::transitApplied || requested < current || requested > current + 1) {
+  if (next == MothershipProductionPairPhase::transitApplied ||
+      next == MothershipProductionPairPhase::abortedBeforeTransit || requested < current || requested > current + 1) {
     if (failure) failure->assign("production pair advance must move exactly one receipt-bearing phase");
     return false;
   }
@@ -351,6 +373,33 @@ static inline bool mothershipProductionPairAdvance(MothershipProductionPairRecor
   }
   *slot = receiptSHA256;
   record.phase = next;
+  ++record.transitionGeneration;
+  record.transitionedAtMs = nowMs;
+  return mothershipProductionPairRecordValid(record, failure);
+}
+
+// Abort is intentionally not an ordinary ordinal transition: it is the one
+// safe terminal branch before traffic selection.  The caller first removes the
+// exact provider selector and closes any provisional boundary, then persists
+// this receipt.  Repeating the exact receipt is a successful retry.
+static inline bool mothershipProductionPairAbortBeforeTransit(MothershipProductionPairRecord& record,
+                                                               const String& receiptSHA256, int64_t nowMs,
+                                                               String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  if (!mothershipProductionPairRecordValid(record) || nowMs < record.transitionedAtMs ||
+      !mothershipProductionPairReceiptValid(receiptSHA256))
+  { if (failure) failure->assign("production pair abort has invalid record, receipt, or timestamp"); return false; }
+  if (record.phase == MothershipProductionPairPhase::abortedBeforeTransit)
+  {
+    if (record.cleanupReceiptSHA256 == receiptSHA256) return true;
+    if (failure) failure->assign("production pair abort retry receipt conflicts with durable receipt");
+    return false;
+  }
+  if (record.phase != MothershipProductionPairPhase::targetAdmitted)
+  { if (failure) failure->assign("production pair abort requires the target-admitted pre-transit phase"); return false; }
+  record.cleanupReceiptSHA256 = receiptSHA256;
+  record.phase = MothershipProductionPairPhase::abortedBeforeTransit;
   ++record.transitionGeneration;
   record.transitionedAtMs = nowMs;
   return mothershipProductionPairRecordValid(record, failure);

@@ -39,6 +39,32 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("observedStarttime->assign(starttime.data(), starttime.size())", inspect)
         self.assertNotIn("observedStarttime->setInvariant", inspect)
 
+    def test_boundary_inspection_does_not_mutate_registry_or_lifecycle_and_suppresses_key_comments(self):
+        registry = (ROOT / "prodigy/mothership/mothership.cluster.registry.h").read_text()
+        registry_begin = registry.index("bool listLocalVMBoundaries")
+        registry_end = registry.index("bool findActiveLocalVMBoundary", registry_begin)
+        registry_helper = registry[registry_begin:registry_end]
+        self.assertIn("db.listValues(localVMBoundariesColumnFamily", registry_helper)
+        self.assertNotIn("db.write", registry_helper)
+        begin = MOTHERSHIP.index("void runInspectLocalVMBoundaries")
+        end = MOTHERSHIP.index("void runFaultLocalClusterMachine", begin)
+        command = MOTHERSHIP[begin:end]
+        self.assertIn('{"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries', MOTHERSHIP)
+        self.assertIn("registry.listLocalVMBoundaries", command)
+        self.assertIn("activeLocalVMBoundariesExactForMachines", command)
+        self.assertIn("queryLocalVMBoundaryExecutor", command)
+        self.assertIn("statePath", command)
+        self.assertNotIn("boundary.hostPrivateKeyPath", command)
+        self.assertNotIn("boundary.hostPublicKeyOpenSSH", command)
+        self.assertNotIn("db.write", command)
+        self.assertNotIn("runLocalVMBoundaryExecutorAction", command)
+        self.assertIn("never writes the registry or invokes a VM lifecycle action", command)
+        self.assertIn("const bool boundaryValid = queried &&", command)
+        self.assertIn("valid = valid && boundaryValid", command)
+        self.assertNotIn("valid = queried &&", command)
+        self.assertIn('"inspectLocalVMBoundaries success=%u', command)
+        self.assertNotIn('"inspectLocalVMBoundaries success=1', command)
+
     def test_executor_upgrade_is_separate_exact_and_rotates_only_after_immutable_proof(self):
         pinned_begin = MOTHERSHIP.index("bool runLocalVMBoundarySealedLauncher")
         pinned_end = MOTHERSHIP.index("bool inspectLocalVMBoundaryExecutor", pinned_begin)

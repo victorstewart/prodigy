@@ -73,6 +73,8 @@ int main(void)
       "bool parseProductionPairProviderOutput", "bool mothershipRunRemoteSealedPythonProvider");
   const std::string pairWitness = providerSection(
       "bool parseProductionPairIngressWitness", "bool productionPairIngressWitness");
+  const std::string productionPairCommand = providerSection(
+      "void runProductionPair", "void runPrepareTestPairMigration");
   const std::string localAction = providerSection(
       "bool runLocalVMBoundaryExecutorAction", "void runPrepareProductionPair");
   const std::string physicalReceipt = providerSection(
@@ -92,6 +94,14 @@ int main(void)
                    pairWitness.find("mothershipAssignProviderHex128(record.intent.operationUUID, expectedOperation);") != std::string::npos &&
                    pairWitness.find("mothershipAssignProviderHex128(record.intent.ingressWitnessMachineUUID, expectedMachine);") != std::string::npos,
                "production_pair_provider_wire_identities_use_exact_provider_hex");
+  suite.expect(!productionPairCommand.empty() &&
+                   productionPairCommand.find("action == \"abortBeforeTransit\"_ctv") != std::string::npos &&
+                   productionPairCommand.find("mothership-production-pair-pre-transit-abort-receipt-v1") != std::string::npos &&
+                   productionPairCommand.find("runProductionPairProvider(record, source, \"remove\"") <
+                       productionPairCommand.find("closePhysicalServiceTransitBoundaryBeforeTransit") &&
+                   productionPairCommand.find("closePhysicalServiceTransitBoundaryBeforeTransit") <
+                       productionPairCommand.find("abortProductionPairBeforeTransit"),
+               "production_pair_pre_transit_abort_removes_then_closes_then_terminalizes");
   suite.expect(!localAction.empty() && localAction.find("assignItoh") == std::string::npos &&
                    localAction.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos,
                "local_vm_fault_operation_uses_exact_provider_hex");
