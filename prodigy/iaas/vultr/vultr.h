@@ -799,7 +799,7 @@ private:
 
   void reportBGPUnhealthy(const char *reason)
   {
-    basics_log("%s\n", reason);
+    std::fprintf(stderr, "%s\n", reason);
   }
 
   VultrHttpTransport transport(void) const
@@ -821,6 +821,9 @@ private:
                              VultrHttpTransport::getTimeout));
     if (VultrHttpTransport::succeeded(response) == false)
     {
+      reportBGPUnhealthy("vultr: BGP account transport request failed");
+      std::fprintf(stderr, "vultr: BGP account transport status=%u httpStatus=%u\n",
+                   unsigned(response.status), unsigned(response.statusCode));
       co_return false;
     }
 
@@ -828,6 +831,7 @@ private:
     simdjson::dom::element doc;
     if (parser.parse(response.body.c_str(), response.body.size()).get(doc))
     {
+      reportBGPUnhealthy("vultr: BGP account response parse failed");
       co_return false;
     }
     // The docs example shows {"enabled":true, "asn":20473, "pasword":"..."}
@@ -841,12 +845,15 @@ private:
     {
       (void)doc["pasword"].get(pw);
     }
-    if (!enabled || pw.size() == 0 || asnVal == 0)
+    if (!enabled || pw.size() == 0 || asnVal == 0 || asnVal > UINT32_MAX)
     {
+      std::fprintf(stderr, "vultr: BGP account response unusable enabled=%d passwordPresent=%d asnPresent=%d\n",
+                   int(enabled), int(pw.size() > 0), int(asnVal > 0 && asnVal <= UINT32_MAX));
       co_return false;
     }
     bgpMD5.assign(pw);
     customerASN = (uint32_t)asnVal;
+    std::fprintf(stderr, "vultr: BGP account refresh ready customerASN=%u\n", unsigned(customerASN));
     co_return true;
   }
 
@@ -903,9 +910,12 @@ public:
     if (vultrBuildCloudComputeIPv6BGPConfig(
             customerASN, bgpMD5, private4.v4, public6, config) == false)
     {
-      reportBGPUnhealthy("vultr: Cloud Compute BGP account or IPv6 source is unavailable");
+      std::fprintf(stderr, "vultr: Cloud Compute BGP config unavailable customerASNValid=%d passwordPresent=%d bgpIDPresent=%d globalIPv6Present=%d\n",
+                   int(customerASN == 35'870), int(bgpMD5.empty() == false), int(private4.v4 != 0),
+                   int(public6.is6 && public6.isNull() == false));
       return;
     }
+    std::fprintf(stderr, "vultr: Cloud Compute BGP config ready peers=%u\n", unsigned(config.peers.size()));
   }
 
 };

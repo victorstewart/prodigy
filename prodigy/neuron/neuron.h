@@ -5727,6 +5727,8 @@ protected:
       co_return;
     }
 
+    std::fprintf(stderr, "neuron BGP provider refresh start generation=%llu\n",
+                 (unsigned long long)generation);
     const bool ready = co_await iaas->refreshBGPConfiguration(&operation->coro);
     if (lifetime.expired() || bgpConfigurationRefresh.get() != operation ||
         operation->generation != generation || runtimeEnvironmentGeneration != generation)
@@ -5738,11 +5740,19 @@ protected:
     {
       NeuronBGPConfig bgpConfig = {};
       iaas->gatherBGPConfig(bgpConfig, eth, private4);
+      std::fprintf(stderr, "neuron BGP provider refresh complete generation=%llu enabled=%d peers=%u\n",
+                   (unsigned long long)generation, int(bgpConfig.enabled),
+                   unsigned(bgpConfig.peers.size()));
       if (!bgp)
       {
         bgp = std::make_unique<NeuronBGPRuntime>();
       }
       bgp->configure(bgpConfig);
+    }
+    else
+    {
+      std::fprintf(stderr, "neuron BGP provider refresh failed generation=%llu\n",
+                   (unsigned long long)generation);
     }
     operation->settled = true;
 

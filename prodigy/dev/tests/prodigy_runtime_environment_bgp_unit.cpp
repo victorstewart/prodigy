@@ -43,6 +43,74 @@ public:
   }
 };
 
+class FakeVultrBGPHttp {
+public:
+
+  MultiCurlClient::Request request;
+  MultiCurlClient::Callback callback;
+  MultiCurlClient::Ticket ticket {73, 11};
+
+  static MultiCurlClient::Ticket submit(void *context,
+                                        MultiCurlClient::Request&& request,
+                                        MultiCurlClient::Callback callback)
+  {
+    FakeVultrBGPHttp& http = *static_cast<FakeVultrBGPHttp *>(context);
+    http.request = std::move(request);
+    http.callback = callback;
+    return http.ticket;
+  }
+
+  static bool cancel(void *, MultiCurlClient::Ticket)
+  {
+    return true;
+  }
+
+  ProdigyHostHttpSubmission submission(void)
+  {
+    return {this, submit, cancel};
+  }
+
+  void complete(const String& body, uint16_t statusCode = 200)
+  {
+    MultiCurlClient::Result result = {};
+    result.status = MultiCurlClient::Status::success;
+    result.statusCode = statusCode;
+    result.body.assign(body);
+    callback.function(callback.context, ticket, std::move(result));
+  }
+};
+
+class VultrBGPRefreshProbe {
+public:
+
+  CoroutineStack stack;
+  VultrNeuronIaaS& iaas;
+  bool ready = false;
+  bool complete = false;
+
+  explicit VultrBGPRefreshProbe(VultrNeuronIaaS& requestedIaaS)
+      : iaas(requestedIaaS)
+  {}
+
+  void refresh(void)
+  {
+    ready = co_await iaas.refreshBGPConfiguration(&stack);
+    complete = true;
+  }
+};
+
+static const String *findHeader(const MultiCurlClient::Request& request, const String& name)
+{
+  for (const MultiCurlClient::Header& candidate : request.headers)
+  {
+    if (candidate.name == name)
+    {
+      return &candidate.value;
+    }
+  }
+  return nullptr;
+}
+
 static void testRuntimeAwareInventoryUsesConfiguredProviderInsteadOfSharedNatBootstrapSnapshots(TestSuite& suite)
 {
   TestNeuron neuron = {};
@@ -170,6 +238,64 @@ int main(void)
                    35'870, "test-md5"_ctv, private4.v4, IPAddress {}, rejectedVultr) == false &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_requires_global_ipv6_source");
+
+  {
+    FakeVultrBGPHttp http = {};
+    VultrNeuronIaaS vultr = {};
+    ProdigyProviderServices services = {};
+    services.http = http.submission();
+    vultr.configureProviderServices(services);
+    ProdigyRuntimeEnvironmentConfig runtime = {};
+    runtime.kind = ProdigyEnvironmentKind::vultr;
+    runtime.providerCredentialMaterial = "test-token"_ctv;
+    vultr.configureRuntimeEnvironment(runtime);
+
+    VultrBGPRefreshProbe probe(vultr);
+    probe.refresh();
+    const String *authorization = findHeader(http.request, "Authorization"_ctv);
+    suite.expect(probe.complete == false &&
+                     http.request.method == MultiCurlClient::Method::get &&
+                     http.request.url == "https://api.vultr.com/v2/account/bgp"_ctv,
+                 "vultr_bgp_refresh_suspends_on_exact_account_request");
+    suite.expect(authorization != nullptr && *authorization == "Bearer test-token"_ctv &&
+                     http.request.originPolicy.requiredHost == "api.vultr.com"_ctv,
+                 "vultr_bgp_refresh_owns_scoped_authorization");
+    http.complete(R"json({"enabled":true,"asn":35870,"password":"test-md5"})json"_ctv);
+    suite.expect(probe.complete && probe.ready,
+                 "vultr_bgp_refresh_accepts_enabled_customer_account");
+  }
+
+  {
+    FakeVultrBGPHttp http = {};
+    VultrNeuronIaaS vultr = {};
+    ProdigyProviderServices services = {};
+    services.http = http.submission();
+    vultr.configureProviderServices(services);
+    ProdigyRuntimeEnvironmentConfig runtime = {};
+    runtime.kind = ProdigyEnvironmentKind::vultr;
+    runtime.providerCredentialMaterial = "test-token"_ctv;
+    vultr.configureRuntimeEnvironment(runtime);
+
+    VultrBGPRefreshProbe probe(vultr);
+    probe.refresh();
+    http.complete(R"json({"enabled":true,"asn":35870})json"_ctv);
+    suite.expect(probe.complete && probe.ready == false,
+                 "vultr_bgp_refresh_rejects_missing_password");
+  }
+
+#ifdef __linux__
+  {
+    BGPPeer peer = {};
+    peer.is6 = true;
+    peer.setIPVersion(AF_INET6);
+    peer.setHopLimit(2);
+    int hopLimit = 0;
+    socklen_t hopLimitSize = sizeof(hopLimit);
+    suite.expect(getsockopt(peer.fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
+                            &hopLimit, &hopLimitSize) == 0 && hopLimit == 2,
+                 "bgp_first_socket_applies_provider_hop_limit");
+  }
+#endif
 
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

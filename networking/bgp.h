@@ -1113,7 +1113,11 @@ public:
     opt.tcpm_keylen = (uint32_t)std::min<size_t>(md5Key.size(), TCP_MD5SIG_MAXKEYLEN);
     memcpy(opt.tcpm_key, md5Key.data(), opt.tcpm_keylen);
     // Apply to this socket
-    setsockopt(fd, SOL_TCP, TCP_MD5SIG, &opt, sizeof(opt));
+    if (setsockopt(fd, SOL_TCP, TCP_MD5SIG, &opt, sizeof(opt)) != 0)
+    {
+      const int failure = errno;
+      std::fprintf(stderr, "BGP TCP-MD5 socket configuration failed errno=%d\n", failure);
+    }
     // Zeroize local copy of key buffer used for setsockopt stack struct
     memset(opt.tcpm_key, 0, sizeof(opt.tcpm_key));
   }
@@ -1131,7 +1135,21 @@ public:
   void setHopLimit(uint8_t ttl)
   {
     hopLimit = ttl;
-    // configureSocket() will apply when (re)creating sockets
+    // addPeer() creates the socket before it supplies the provider-specific
+    // hop limit. Apply it to that first socket as well as later recreations.
+    if (fd >= 0 && hopLimit > 0)
+    {
+      int v = hopLimit;
+      const int result = is6
+          ? setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, sizeof(v))
+          : setsockopt(fd, IPPROTO_IP, IP_TTL, &v, sizeof(v));
+      if (result != 0)
+      {
+        const int failure = errno;
+        std::fprintf(stderr, "BGP hop-limit socket configuration failed family=%s errno=%d\n",
+                     is6 ? "ipv6" : "ipv4", failure);
+      }
+    }
   }
 
   void sendOpen(void)
@@ -1310,13 +1328,14 @@ public:
     if (hopLimit > 0)
     {
       int v = hopLimit;
-      if (is6)
+      const int result = is6
+          ? setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, sizeof(v))
+          : setsockopt(fd, IPPROTO_IP, IP_TTL, &v, sizeof(v));
+      if (result != 0)
       {
-        setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &v, sizeof(v));
-      }
-      else
-      {
-        setsockopt(fd, IPPROTO_IP, IP_TTL, &v, sizeof(v));
+        const int failure = errno;
+        std::fprintf(stderr, "BGP hop-limit socket reconfiguration failed family=%s errno=%d\n",
+                     is6 ? "ipv6" : "ipv4", failure);
       }
     }
   }
