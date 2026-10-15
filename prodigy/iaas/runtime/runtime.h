@@ -869,14 +869,15 @@ public:
     isBrain = (bootstrapConfig.nodeRole == ProdigyBootstrapNodeRole::brain);
   }
 
-  void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
+  NeuronBGPConfigurationRetry gatherBGPConfig(
+      NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
   {
     if (prodigyResolveRuntimeEnvironmentBGPOverride(runtimeEnvironment, private4, config))
     {
-      return;
+      return NeuronBGPConfigurationRetry::none;
     }
 
-    activeDelegate()->gatherBGPConfig(config, eth, private4);
+    return activeDelegate()->gatherBGPConfig(config, eth, private4);
   }
 
   ProdigyHostTask<bool> refreshBGPConfiguration(CoroutineStack *coro) override

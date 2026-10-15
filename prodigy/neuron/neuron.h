@@ -2789,7 +2789,7 @@ protected:
       bgp = std::make_unique<NeuronBGPRuntime>();
 
       NeuronBGPConfig config = {};
-      iaas->gatherBGPConfig(config, eth, private4);
+      (void)iaas->gatherBGPConfig(config, eth, private4);
       bgp->configure(config);
     }
 
@@ -5743,7 +5743,8 @@ protected:
     if (ready)
     {
       NeuronBGPConfig bgpConfig = {};
-      iaas->gatherBGPConfig(bgpConfig, eth, private4);
+      const NeuronBGPConfigurationRetry configurationRetry =
+          iaas->gatherBGPConfig(bgpConfig, eth, private4);
       std::fprintf(stderr, "neuron BGP provider refresh complete generation=%llu enabled=%d peers=%u\n",
                    (unsigned long long)generation, int(bgpConfig.enabled),
                    unsigned(bgpConfig.peers.size()));
@@ -5753,7 +5754,6 @@ protected:
       }
       bgp->configure(bgpConfig);
 
-      IPAddress globalIPv6 = eth.getGlobal6();
       if (bgpConfig.enabled)
       {
         bgpIPv6ReadinessRetryAttempts = 0;
@@ -5764,7 +5764,8 @@ protected:
         }
       }
       else if (prodigyBGPIPv6ReadinessRetryEligible(
-                   true, bgpConfig, globalIPv6, bgpIPv6ReadinessRetryAttempts))
+                   true, bgpConfig, configurationRetry,
+                   bgpIPv6ReadinessRetryAttempts))
       {
         bgpIPv6ReadinessRetryPendingGeneration = generation;
         if (bgpIPv6ReadinessRetryQueued == false)

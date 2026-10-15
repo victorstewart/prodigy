@@ -525,6 +525,14 @@ public:
   }
 };
 
+// Ephemeral provider-owned gather result. This is deliberately not part of the
+// serialized BGP configuration: it only tells Neuron whether a bounded local
+// readiness retry can make the same provider inputs usable.
+enum class NeuronBGPConfigurationRetry : uint8_t {
+  none,
+  waitForPublicIPv6
+};
+
 class NeuronIaaS {
 protected:
 
@@ -556,11 +564,13 @@ public:
     co_return true;
   }
 
-  virtual void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4)
+  virtual NeuronBGPConfigurationRetry gatherBGPConfig(
+      NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4)
   {
     (void)config;
     (void)eth;
     (void)private4;
+    return NeuronBGPConfigurationRetry::none;
   }
 
   virtual void setLocalContainerPrefixes(const Vector<IPPrefix>& prefixes)

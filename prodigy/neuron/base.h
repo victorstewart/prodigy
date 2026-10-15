@@ -32,10 +32,10 @@ constexpr static uint32_t prodigyBGPIPv6ReadinessRetryInitialDelayMs = 1'000;
 
 static inline bool prodigyBGPIPv6ReadinessRetryEligible(
     bool providerReady, const NeuronBGPConfig& config,
-    const IPAddress& globalIPv6, uint32_t attempts)
+    NeuronBGPConfigurationRetry configurationRetry, uint32_t attempts)
 {
   return providerReady && config.enabled == false &&
-         (globalIPv6.is6 == false || globalIPv6.isNull()) &&
+         configurationRetry == NeuronBGPConfigurationRetry::waitForPublicIPv6 &&
          attempts < prodigyBGPIPv6ReadinessRetryMaximumAttempts;
 }
 

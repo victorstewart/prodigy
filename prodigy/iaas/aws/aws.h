@@ -578,11 +578,13 @@ public:
     }
   }
 
-  void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
+  NeuronBGPConfigurationRetry gatherBGPConfig(
+      NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
   {
     (void)eth;
     (void)private4;
     config = {};
+    return NeuronBGPConfigurationRetry::none;
   }
 
 };

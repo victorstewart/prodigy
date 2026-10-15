@@ -760,7 +760,7 @@ static inline bool vultrExtractPlanMetadata(
   return true;
 }
 
-static inline bool vultrBuildCloudComputeIPv6BGPConfig(
+static inline NeuronBGPConfigurationRetry vultrBuildCloudComputeIPv6BGPConfig(
     uint32_t customerASN,
     const String& md5Password,
     uint32_t bgpID,
@@ -768,10 +768,15 @@ static inline bool vultrBuildCloudComputeIPv6BGPConfig(
     NeuronBGPConfig& config)
 {
   config = {};
-  if (customerASN != 35'870 || md5Password.empty() || bgpID == 0 ||
-      public6.is6 == false || public6.isNull())
+  if (customerASN != 35'870 || md5Password.empty() || bgpID == 0)
   {
-    return false;
+    return NeuronBGPConfigurationRetry::none;
+  }
+
+  if (public6.is6 == false || public6.isNull() ||
+      (public6.v6[0] & 0xe0u) != 0x20u)
+  {
+    return NeuronBGPConfigurationRetry::waitForPublicIPv6;
   }
 
   config.enabled = true;
@@ -786,7 +791,7 @@ static inline bool vultrBuildCloudComputeIPv6BGPConfig(
   peer6.md5Password = md5Password;
   peer6.hopLimit = 2;
   config.peers.push_back(std::move(peer6));
-  return true;
+  return NeuronBGPConfigurationRetry::none;
 }
 
 class VultrNeuronIaaS : public NeuronIaaS {
@@ -896,26 +901,32 @@ public:
     }
   }
 
-  void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
+  NeuronBGPConfigurationRetry gatherBGPConfig(
+      NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4) override
   {
     config = {};
 
     IPAddress public6 = eth.getGlobal6();
+    const bool publicIPv6Ready = public6.is6 && public6.isNull() == false &&
+                                 (public6.v6[0] & 0xe0u) == 0x20u;
     // The current packet encoder is deliberately two-octet-AS only and its
     // local AS is AS35870. Fail closed rather than silently presenting the
     // account ASN as the provider peer or originating another customer's AS.
     // Use only Vultr's Cloud Compute IPv6 peer (AS64515). IPv4 is omitted
     // until the runtime carries a verified public instance source/NEXT_HOP;
     // the private VPC address/default gateway are not substitutes.
-    if (vultrBuildCloudComputeIPv6BGPConfig(
-            customerASN, bgpMD5, private4.v4, public6, config) == false)
+    const NeuronBGPConfigurationRetry retry =
+        vultrBuildCloudComputeIPv6BGPConfig(
+            customerASN, bgpMD5, private4.v4, public6, config);
+    if (config.enabled == false)
     {
       std::fprintf(stderr, "vultr: Cloud Compute BGP config unavailable customerASNValid=%d passwordPresent=%d bgpIDPresent=%d globalIPv6Present=%d\n",
                    int(customerASN == 35'870), int(bgpMD5.empty() == false), int(private4.v4 != 0),
-                   int(public6.is6 && public6.isNull() == false));
-      return;
+                   int(publicIPv6Ready));
+      return retry;
     }
     std::fprintf(stderr, "vultr: Cloud Compute BGP config ready peers=%u\n", unsigned(config.peers.size()));
+    return NeuronBGPConfigurationRetry::none;
   }
 
 };

@@ -216,7 +216,9 @@ int main(void)
   NeuronBGPConfig vultrCloud = {};
   IPAddress vultrPublic6("2001:19f0:5c00:456a:5400:6ff:fedd:d6c9", true);
   suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   35'870, "test-md5"_ctv, private4.v4, vultrPublic6, vultrCloud),
+                   35'870, "test-md5"_ctv, private4.v4, vultrPublic6, vultrCloud) ==
+                   NeuronBGPConfigurationRetry::none &&
+                   vultrCloud.enabled,
                "vultr_cloud_bgp_config_accepts_customer_asn_and_global_ipv6");
   suite.expect(vultrCloud.enabled && vultrCloud.community == 0 && vultrCloud.nextHop4.isNull(),
                "vultr_cloud_bgp_config_does_not_suppress_public_propagation_or_advertise_ipv4");
@@ -231,17 +233,31 @@ int main(void)
 
   NeuronBGPConfig rejectedVultr = {};
   suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   64'512, "test-md5"_ctv, private4.v4, vultrPublic6, rejectedVultr) == false &&
+                   64'512, "test-md5"_ctv, private4.v4, vultrPublic6, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::none &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_rejects_unsupported_customer_asn");
   suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   35'870, "test-md5"_ctv, private4.v4, IPAddress {}, rejectedVultr) == false &&
+                   35'870, String {}, private4.v4, IPAddress {}, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::none &&
                    rejectedVultr.configured() == false,
-               "vultr_cloud_bgp_config_requires_global_ipv6_source");
+               "vultr_cloud_bgp_config_does_not_retry_permanent_account_input_failure");
+  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+                   35'870, "test-md5"_ctv, private4.v4, IPAddress {}, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::waitForPublicIPv6 &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_reports_public_ipv6_pending");
+  IPAddress vultrULA("fdf8:d94c:1::1", true);
+  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+                   35'870, "test-md5"_ctv, private4.v4, vultrULA, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::waitForPublicIPv6 &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_rejects_ula_and_preserves_public_ipv6_retry");
 
-  IPAddress noGlobalIPv6 = {};
-  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(true, rejectedVultr, noGlobalIPv6, 0),
-               "bgp_ipv6_readiness_retry_arms_only_for_ready_provider_missing_global_ipv6");
+  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(
+                   true, rejectedVultr,
+                   NeuronBGPConfigurationRetry::waitForPublicIPv6, 0),
+               "bgp_ipv6_readiness_retry_arms_for_provider_reported_address_pending");
   suite.expect(prodigyBGPIPv6ReadinessRetryDelayMs(0) == 1'000 &&
                    prodigyBGPIPv6ReadinessRetryDelayMs(1) == 2'000 &&
                    prodigyBGPIPv6ReadinessRetryDelayMs(2) == 4'000 &&
@@ -249,10 +265,16 @@ int main(void)
                    prodigyBGPIPv6ReadinessRetryDelayMs(4) == 16'000 &&
                    prodigyBGPIPv6ReadinessRetryDelayMs(5) == 32'000,
                "bgp_ipv6_readiness_retry_backoff_covers_first_63_seconds");
-  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(true, rejectedVultr, noGlobalIPv6,
-                                                     prodigyBGPIPv6ReadinessRetryMaximumAttempts) == false &&
-                   prodigyBGPIPv6ReadinessRetryEligible(false, rejectedVultr, noGlobalIPv6, 0) == false &&
-                   prodigyBGPIPv6ReadinessRetryEligible(true, vultrCloud, noGlobalIPv6, 0) == false,
+  suite.expect(prodigyBGPIPv6ReadinessRetryEligible(
+                   true, rejectedVultr,
+                   NeuronBGPConfigurationRetry::waitForPublicIPv6,
+                   prodigyBGPIPv6ReadinessRetryMaximumAttempts) == false &&
+                   prodigyBGPIPv6ReadinessRetryEligible(
+                       false, rejectedVultr,
+                       NeuronBGPConfigurationRetry::waitForPublicIPv6, 0) == false &&
+                   prodigyBGPIPv6ReadinessRetryEligible(
+                       true, vultrCloud,
+                       NeuronBGPConfigurationRetry::none, 0) == false,
                "bgp_ipv6_readiness_retry_rejects_exhausted_unready_and_enabled_configs");
 
   {
