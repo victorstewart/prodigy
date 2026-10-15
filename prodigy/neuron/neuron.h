@@ -194,6 +194,21 @@ protected:
       }
     }
   };
+
+  struct BGPConfigurationRefreshOperation final {
+    CoroutineStack coro;
+    uint64_t generation = 0;
+    bool settled = false;
+    std::unique_ptr<CoroutineGenerator<uint8_t>> runner;
+
+    ~BGPConfigurationRefreshOperation()
+    {
+      coro.cancelSuspended();
+      runner.reset();
+    }
+  };
+  std::unique_ptr<BGPConfigurationRefreshOperation> bgpConfigurationRefresh;
+  uint64_t runtimeEnvironmentGeneration = 0;
   bytell_hash_map<uint128_t, std::unique_ptr<StateUploadRestoreOperation>> pendingStateUploadRestores;
   constexpr static uint32_t maximumPendingStateUploadRestores = 64;
   uint64_t stateUploadRestoreEpoch = 0;
@@ -3929,6 +3944,7 @@ public:
   ~Neuron()
   {
     asyncOperationLifetime.reset();
+    bgpConfigurationRefresh.reset();
     // Cancel HostTask awaiters before their retained containers or this Ring
     // owner can be destroyed. Late Netlink/command callbacks then observe a
     // detached operation instead of this Neuron.
@@ -5701,6 +5717,58 @@ protected:
     (void)operation.runner->advance();
   }
 
+  CoroutineGenerator<uint8_t> refreshRuntimeEnvironmentBGP(
+      std::weak_ptr<uint8_t> lifetime,
+      uint64_t generation)
+  {
+    BGPConfigurationRefreshOperation *operation = bgpConfigurationRefresh.get();
+    if (operation == nullptr || operation->generation != generation)
+    {
+      co_return;
+    }
+
+    const bool ready = co_await iaas->refreshBGPConfiguration(&operation->coro);
+    if (lifetime.expired() || bgpConfigurationRefresh.get() != operation ||
+        operation->generation != generation || runtimeEnvironmentGeneration != generation)
+    {
+      co_return;
+    }
+
+    if (ready)
+    {
+      NeuronBGPConfig bgpConfig = {};
+      iaas->gatherBGPConfig(bgpConfig, eth, private4);
+      if (!bgp)
+      {
+        bgp = std::make_unique<NeuronBGPRuntime>();
+      }
+      bgp->configure(bgpConfig);
+    }
+    operation->settled = true;
+
+    // Retain an owner for the coroutine frame until the next configuration or
+    // Neuron teardown. A detached HostTask could otherwise resume after its
+    // provider delegate has been replaced.
+    co_yield uint8_t(0);
+  }
+
+  void beginRuntimeEnvironmentReconfiguration(void)
+  {
+    runtimeEnvironmentGeneration += 1;
+    bgpConfigurationRefresh.reset();
+  }
+
+  void scheduleRuntimeEnvironmentBGPRefresh(void)
+  {
+    auto operation = std::make_unique<BGPConfigurationRefreshOperation>();
+    operation->generation = runtimeEnvironmentGeneration;
+    BGPConfigurationRefreshOperation *owned = operation.get();
+    bgpConfigurationRefresh = std::move(operation);
+    owned->runner = std::make_unique<CoroutineGenerator<uint8_t>>(
+        refreshRuntimeEnvironmentBGP(asyncOperationLifetime, owned->generation));
+    (void)owned->runner->advance();
+  }
+
   void retireCompletedStateUploadRestores(void)
   {
     Vector<uint128_t> completed = {};
@@ -6453,14 +6521,12 @@ public:
                 (void)prodigySetTCPMaxSegmentSize(brain->fd, maxSegmentSize);
               }
             }
+            // Cancel an older provider-bound HTTP operation before replacing
+            // its delegate. A late completion is then detached from this
+            // Neuron and the new generation owns the only admissible result.
+            beginRuntimeEnvironmentReconfiguration();
             iaas->configureRuntimeEnvironment(config);
-
-            if (bgp)
-            {
-              NeuronBGPConfig bgpConfig = {};
-              iaas->gatherBGPConfig(bgpConfig, eth, private4);
-              bgp->configure(bgpConfig);
-            }
+            scheduleRuntimeEnvironmentBGPRefresh();
           }
 
           break;

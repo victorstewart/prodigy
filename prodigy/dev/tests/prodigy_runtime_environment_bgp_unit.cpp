@@ -145,5 +145,31 @@ int main(void)
   suite.expect(prodigyResolveRuntimeEnvironmentBGPOverride(fallback, private4, resolved) == false, "runtime_env_bgp_fallback_not_overridden");
   suite.expect(resolved.configured() == false, "runtime_env_bgp_falls_back_to_empty_without_override");
 
+  NeuronBGPConfig vultrCloud = {};
+  IPAddress vultrPublic6("2001:19f0:5c00:456a:5400:6ff:fedd:d6c9", true);
+  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+                   35'870, "test-md5"_ctv, private4.v4, vultrPublic6, vultrCloud),
+               "vultr_cloud_bgp_config_accepts_customer_asn_and_global_ipv6");
+  suite.expect(vultrCloud.enabled && vultrCloud.community == 0 && vultrCloud.nextHop4.isNull(),
+               "vultr_cloud_bgp_config_does_not_suppress_public_propagation_or_advertise_ipv4");
+  suite.expect(vultrCloud.nextHop6.equals(vultrPublic6) && vultrCloud.peers.size() == 1,
+               "vultr_cloud_bgp_config_uses_public_ipv6_next_hop");
+  suite.expect(vultrCloud.peers[0].peerASN == 64'515 &&
+                   vultrCloud.peers[0].peerAddress.equals(IPAddress("2001:19f0:ffff::1", true)) &&
+                   vultrCloud.peers[0].sourceAddress.equals(vultrPublic6) &&
+                   vultrCloud.peers[0].hopLimit == 2 &&
+                   vultrCloud.peers[0].md5Password == "test-md5"_ctv,
+               "vultr_cloud_bgp_config_uses_documented_vps_peer");
+
+  NeuronBGPConfig rejectedVultr = {};
+  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+                   64'512, "test-md5"_ctv, private4.v4, vultrPublic6, rejectedVultr) == false &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_rejects_unsupported_customer_asn");
+  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+                   35'870, "test-md5"_ctv, private4.v4, IPAddress {}, rejectedVultr) == false &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_requires_global_ipv6_source");
+
   return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

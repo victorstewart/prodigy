@@ -879,6 +879,16 @@ public:
     activeDelegate()->gatherBGPConfig(config, eth, private4);
   }
 
+  ProdigyHostTask<bool> refreshBGPConfiguration(CoroutineStack *coro) override
+  {
+    if (runtimeEnvironment.bgp.configured())
+    {
+      co_return true;
+    }
+
+    co_return co_await activeDelegate()->refreshBGPConfiguration(coro);
+  }
+
   void setLocalContainerPrefixes(const Vector<IPPrefix>& prefixes) override
   {
     activeDelegate()->setLocalContainerPrefixes(prefixes);

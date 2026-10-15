@@ -876,7 +876,7 @@ private:
 
     // setting the top bit to 1 signifies we restarted so don't wait for end of rib message
     // before sending us routes
-    wBuffer.append(uint16_t(0b0000'0001'0010'1100)); // bottom 12 bits are timeout but they're ignored
+    wBuffer.append(reverseByteOrder(uint16_t(0b0000'0001'0010'1100))); // bottom 12 bits are timeout but they're ignored
 
     // leftmost bit most significant
 
@@ -973,7 +973,7 @@ private:
       message.append(uint8_t(0b1100'0000)); // optional + transitive
       message.append(uint8_t(0x08)); // COMMUNITY
       message.append(uint8_t(0x04)); // only one community so len always 4
-      message.append(uint32_t(community));
+      message.append(reverseByteOrder(uint32_t(community)));
     }
 
     uint16_t len = reverseByteOrder(uint16_t(message.size() - total_attributes_len_idx - 2)); // -2 -> don't count this length in the total length
@@ -1080,6 +1080,7 @@ private:
 public:
 
   uint32_t bgpid;
+  uint16_t peerASN = 0;
   BGPState state = BGPState::idle;
   bool is6;
   uint8_t hopLimit {0}; // 0 = use system default
@@ -1231,6 +1232,21 @@ public:
         {
           case 1: // Open
             {
+              if (message_len < 29)
+              {
+                state = BGPState::failed;
+                Ring::queueClose(this);
+                break;
+              }
+              const uint8_t *open = message.data();
+              const uint16_t openedASN = uint16_t(open[20]) << 8 | uint16_t(open[21]);
+              if (peerASN != 0 && openedASN != peerASN)
+              {
+                basics_log("BGP OPEN rejected expected peer AS=%hu received AS=%hu\n", peerASN, openedASN);
+                state = BGPState::failed;
+                Ring::queueClose(this);
+                break;
+              }
               sendKeepalive();
               state = BGPState::openconfirm;
 
@@ -1322,6 +1338,7 @@ public:
 
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
+    peer->peerASN = peerASN;
 
     if (peerAddress.is6)
     {
@@ -1352,6 +1369,7 @@ public:
 
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
+    peer->peerASN = peerASN;
 
     if (peerAddress.is6)
     {
@@ -1383,6 +1401,7 @@ public:
 
     BGPPeer *peer = new BGPPeer();
     peer->bgpid = ourBGPID;
+    peer->peerASN = peerASN;
 
     if (peerAddress.is6)
     {

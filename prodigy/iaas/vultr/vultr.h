@@ -760,13 +760,42 @@ static inline bool vultrExtractPlanMetadata(
   return true;
 }
 
+static inline bool vultrBuildCloudComputeIPv6BGPConfig(
+    uint32_t customerASN,
+    const String& md5Password,
+    uint32_t bgpID,
+    const IPAddress& public6,
+    NeuronBGPConfig& config)
+{
+  config = {};
+  if (customerASN != 35'870 || md5Password.empty() || bgpID == 0 ||
+      public6.is6 == false || public6.isNull())
+  {
+    return false;
+  }
+
+  config.enabled = true;
+  config.ourBGPID = bgpID;
+  config.community = 0;
+  config.nextHop6 = public6;
+
+  NeuronBGPPeerConfig peer6 = {};
+  peer6.peerASN = 64'515;
+  peer6.peerAddress = IPAddress("2001:19f0:ffff::1", true);
+  peer6.sourceAddress = public6;
+  peer6.md5Password = md5Password;
+  peer6.hopLimit = 2;
+  config.peers.push_back(std::move(peer6));
+  return true;
+}
+
 class VultrNeuronIaaS : public NeuronIaaS {
 private:
 
   ProdigyRuntimeEnvironmentConfig runtimeEnvironment;
   IPAddress gatewayPrivate4;
   String bgpMD5;
-  uint32_t remoteASN {0};
+  uint32_t customerASN {0};
 
   void reportBGPUnhealthy(const char *reason)
   {
@@ -783,6 +812,8 @@ private:
 
   ProdigyHostTask<bool> fetchBGPAccount(CoroutineStack *coro)
   {
+    bgpMD5.clear();
+    customerASN = 0;
     VultrHttpTransport client = transport();
     String url = "https://api.vultr.com/v2/account/bgp"_ctv;
     MultiCurlClient::Result response = co_await client.send(
@@ -815,7 +846,7 @@ private:
       co_return false;
     }
     bgpMD5.assign(pw);
-    remoteASN = (uint32_t)asnVal;
+    customerASN = (uint32_t)asnVal;
     co_return true;
   }
 
@@ -824,6 +855,11 @@ public:
   void configureRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& config) override
   {
     prodigyOwnRuntimeEnvironmentConfig(config, runtimeEnvironment);
+  }
+
+  ProdigyHostTask<bool> refreshBGPConfiguration(CoroutineStack *coro) override
+  {
+    co_return co_await fetchBGPAccount(coro);
   }
 
   void gatherSelfData(CoroutineStack *coro, uint128_t& uuid, String& metro, bool& isBrain, EthDevice& eth, IPAddress& private4) override
@@ -857,41 +893,19 @@ public:
   {
     config = {};
 
-    if (remoteASN == 0 || bgpMD5.empty())
+    IPAddress public6 = eth.getGlobal6();
+    // The current packet encoder is deliberately two-octet-AS only and its
+    // local AS is AS35870. Fail closed rather than silently presenting the
+    // account ASN as the provider peer or originating another customer's AS.
+    // Use only Vultr's Cloud Compute IPv6 peer (AS64515). IPv4 is omitted
+    // until the runtime carries a verified public instance source/NEXT_HOP;
+    // the private VPC address/default gateway are not substitutes.
+    if (vultrBuildCloudComputeIPv6BGPConfig(
+            customerASN, bgpMD5, private4.v4, public6, config) == false)
     {
-      reportBGPUnhealthy("vultr: /v2/account/bgp disabled or fetch failed");
+      reportBGPUnhealthy("vultr: Cloud Compute BGP account or IPv6 source is unavailable");
       return;
     }
-
-    IPAddress public6 = eth.getGlobal6();
-
-    config.enabled = true;
-    config.ourBGPID = private4.v4;
-    config.community = (uint32_t(20'473) << 16) | 6000u;
-    config.nextHop4 = gatewayPrivate4;
-    config.nextHop6 = public6;
-
-    // Static peers from Vultr docs (bare metal):
-    // IPv4 neighbor 169.254.1.1, IPv6 neighbor 2001:19f0:ffff::1, multihop (TTL) 2
-    IPAddress gateway4 = gatewayPrivate4;
-    IPAddress source4 = private4;
-    eth.addIndirectRoute("169.254.0.0"_ctv, 16, AF_INET, gateway4, source4);
-
-    NeuronBGPPeerConfig peer4 = {};
-    peer4.peerASN = static_cast<uint16_t>(remoteASN);
-    peer4.peerAddress = IPAddress("169.254.1.1", false);
-    peer4.sourceAddress = private4;
-    peer4.md5Password = bgpMD5;
-    peer4.hopLimit = 2;
-    config.peers.push_back(peer4);
-
-    NeuronBGPPeerConfig peer6 = {};
-    peer6.peerASN = static_cast<uint16_t>(remoteASN);
-    peer6.peerAddress = IPAddress("2001:19f0:ffff::1", true);
-    peer6.sourceAddress = public6;
-    peer6.md5Password = bgpMD5;
-    peer6.hopLimit = 2;
-    config.peers.push_back(peer6);
   }
 
 };

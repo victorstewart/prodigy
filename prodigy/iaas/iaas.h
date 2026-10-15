@@ -11,6 +11,7 @@
 #include <networking/eth.h>
 #include <prodigy/host.http.operation.h>
 #include <prodigy/host.delay.operation.h>
+#include <prodigy/host.async.task.h>
 #include <openssl/evp.h>
 #include <chrono>
 #include <cstdio>
@@ -543,6 +544,16 @@ public:
   virtual void configureRuntimeEnvironment(const ProdigyRuntimeEnvironmentConfig& config)
   {
     (void)config;
+  }
+
+  // Provider account data that is intentionally absent from the bootstrap
+  // environment may need to be resolved after Brain supplies the durable
+  // runtime environment.  Keep that resolution asynchronous and provider
+  // owned; callers receive only readiness, never credential material.
+  virtual ProdigyHostTask<bool> refreshBGPConfiguration(CoroutineStack *coro)
+  {
+    (void)coro;
+    co_return true;
   }
 
   virtual void gatherBGPConfig(NeuronBGPConfig& config, EthDevice& eth, const IPAddress& private4)
