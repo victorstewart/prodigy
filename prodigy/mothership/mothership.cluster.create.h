@@ -227,7 +227,22 @@ static inline bool mothershipBuildClusterRuntimeEnvironment(const MothershipProd
 
   runtimeEnvironment.providerScope = cluster.providerScope;
 
-  if (cluster.bgp.configured())
+  if (cluster.providerManagedBGP)
+  {
+    if (mothershipClusterUsesProviderManagedBGP(cluster) == false)
+    {
+      if (failure)
+      {
+        failure->assign("provider-managed BGP intent is invalid"_ctv);
+      }
+      return false;
+    }
+
+    // The concrete peer is machine-local.  Leave the runtime override
+    // unspecified so the provider delegate can fetch the account password and
+    // derive each machine's public IPv6 source/router ID after provisioning.
+  }
+  else if (cluster.bgp.configured())
   {
     if (cluster.deploymentMode != MothershipClusterDeploymentMode::local && cluster.deploymentMode != MothershipClusterDeploymentMode::test && mothershipClusterProviderSupportsManagedBGP(cluster.provider) == false)
     {
@@ -237,7 +252,6 @@ static inline bool mothershipBuildClusterRuntimeEnvironment(const MothershipProd
       }
       return false;
     }
-
     runtimeEnvironment.bgp = cluster.bgp;
   }
 

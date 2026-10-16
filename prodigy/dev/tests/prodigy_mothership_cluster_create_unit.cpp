@@ -2038,6 +2038,65 @@ int main(void)
                                                         ClusterCreateCall::applyAddMachines,
                                                         ClusterCreateCall::configure}),
                  "create_remote_vultr_bgp_call_sequence");
+
+    MothershipProdigyCluster providerManaged = cluster;
+    providerManaged.bgp = {};
+    providerManaged.providerManagedBGP = true;
+    ProdigyRuntimeEnvironmentConfig providerManagedEnvironment = {};
+    ProdigyRuntimeEnvironmentConfig providerManagedProvisioningEnvironment = {};
+    suite.expect(mothershipClusterUsesProviderManagedBGP(providerManaged),
+                 "create_remote_vultr_provider_managed_bgp_detected");
+    suite.expect(mothershipBuildClusterRuntimeEnvironment(
+                     providerManaged, &credential, providerManagedEnvironment, &failure),
+                 "create_remote_vultr_provider_managed_bgp_environment_built");
+    suite.expect(providerManagedEnvironment.bgp.specified == false,
+                 "create_remote_vultr_provider_managed_bgp_runtime_leaves_bgp_unspecified");
+    suite.expect(providerManagedEnvironment.providerCredentialMaterial.equals("vultr-secret"_ctv),
+                 "create_remote_vultr_provider_managed_bgp_runtime_propagates_credential");
+    suite.expect(mothershipBuildClusterProvisioningRuntimeEnvironment(
+                     providerManaged, &credential, providerManagedProvisioningEnvironment, &failure),
+                 "create_remote_vultr_provider_managed_bgp_provisioning_environment_built");
+    suite.expect(providerManagedProvisioningEnvironment.bgp.specified == false,
+                 "create_remote_vultr_provider_managed_bgp_provisioning_leaves_bgp_unspecified");
+    suite.expect(providerManagedProvisioningEnvironment.providerCredentialMaterial.equals("vultr-secret"_ctv),
+                 "create_remote_vultr_provider_managed_bgp_provisioning_propagates_credential");
+
+    FakeClusterCreateHooks providerManagedHooks = {};
+    providerManagedHooks.fetchedTopology = hooks.fetchedTopology;
+    providerManagedHooks.finalTopology = hooks.finalTopology;
+    providerManagedHooks.fetchedTopologySequence.push_back(
+        providerManagedHooks.fetchedTopology);
+    providerManagedHooks.fetchedTopologySequence.push_back(
+        providerManagedHooks.finalTopology);
+
+    failure.clear();
+    suite.expect(mothershipStandUpCluster(
+                     providerManaged, &credential, providerManagedHooks, nullptr, &failure) &&
+                     failure.empty(),
+                 "create_remote_vultr_provider_managed_bgp_flow_ok");
+    suite.expect(!providerManagedHooks.lastRemoteRuntimeEnvironment.bgp.specified,
+                 "create_remote_vultr_provider_managed_bgp_bootstrap_leaves_bgp_unspecified");
+    suite.expect(providerManagedHooks.lastRemoteRuntimeEnvironment.providerCredentialMaterial.empty(),
+                 "create_remote_vultr_provider_managed_bgp_bootstrap_withholds_credential");
+    suite.expect(providerManagedHooks.configureConfigs.size() == 2 &&
+                     !providerManagedHooks.configureConfigs[0].runtimeEnvironment.bgp.specified &&
+                     !providerManagedHooks.configureConfigs[1].runtimeEnvironment.bgp.specified,
+                 "create_remote_vultr_provider_managed_bgp_configure_leaves_bgp_unspecified");
+    suite.expect(providerManagedHooks.configureConfigs.size() == 2 &&
+                     providerManagedHooks.configureConfigs[0].runtimeEnvironment
+                         .providerCredentialMaterial.empty() &&
+                     providerManagedHooks.configureConfigs[1].runtimeEnvironment
+                         .providerCredentialMaterial.equals("vultr-secret"_ctv),
+                 "create_remote_vultr_provider_managed_bgp_final_config_propagates_credential");
+
+    providerManaged.propagateProviderCredentialToProdigy = false;
+    suite.expect(!mothershipClusterUsesProviderManagedBGP(providerManaged),
+                 "create_remote_vultr_provider_managed_bgp_requires_propagated_credential");
+    failure.clear();
+    suite.expect(!mothershipBuildClusterRuntimeEnvironment(
+                     providerManaged, &credential, providerManagedEnvironment, &failure) &&
+                     failure.equals("provider-managed BGP intent is invalid"_ctv),
+                 "create_remote_vultr_provider_managed_bgp_invalid_intent_fails_closed");
   }
 
   {

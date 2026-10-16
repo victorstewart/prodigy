@@ -311,6 +311,10 @@ public:
   uint32_t maxOSDrains = 1;
   uint32_t machineUpdateCadenceMins = 15;
   ProdigyEnvironmentBGPConfig bgp;
+  // The provider derives each machine's BGP session after provisioning.  This
+  // intent is persisted only by the versioned Mothership registry wrapper; it
+  // is deliberately excluded from the base cluster/runtime codec below.
+  bool providerManagedBGP = false;
   // Mothership-only origin authority; deliberately outside the base cluster
   // codec so BrainConfig and runtime-environment bytes stay unchanged.
   Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
@@ -322,23 +326,6 @@ public:
   int64_t lastRefreshMs = 0;
   String lastRefreshFailure;
 };
-
-static inline bool mothershipClusterAuthorizesBGPOriginPrefix(
-    const MothershipProdigyCluster& cluster, const IPPrefix& requested)
-{
-  if (cluster.bgp.config.enabled == false || !requested.equals(requested.canonicalized()))
-  {
-    return false;
-  }
-  for (const IPPrefix& authorized : cluster.bgpAuthorizedOriginPrefixes)
-  {
-    if (authorized.equals(requested))
-    {
-      return true;
-    }
-  }
-  return false;
-}
 
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyCluster& cluster)
@@ -678,6 +665,51 @@ static inline bool mothershipDeleteClusterMachineSchema(
 static inline bool mothershipClusterProviderSupportsManagedBGP(MothershipClusterProvider provider)
 {
   return provider == MothershipClusterProvider::vultr;
+}
+
+// A managed provider must derive per-machine BGP peers after provisioning:
+// the source address and router ID are different on every machine, while the
+// session password comes from the provider credential at runtime.  The
+// versioned providerManagedBGP bit carries that explicit operator intent; a
+// static BGP object is mutually exclusive with it.
+static inline bool mothershipClusterUsesProviderManagedBGP(
+    const MothershipProdigyCluster& cluster)
+{
+  return cluster.providerManagedBGP &&
+      cluster.bgp.configured() == false &&
+      cluster.deploymentMode == MothershipClusterDeploymentMode::remote &&
+      mothershipClusterProviderSupportsManagedBGP(cluster.provider) &&
+      (cluster.desiredEnvironment == ProdigyEnvironmentKind::unknown ||
+       cluster.desiredEnvironment == ProdigyEnvironmentKind::vultr) &&
+      cluster.providerCredentialName.size() > 0 &&
+      cluster.propagateProviderCredentialToProdigy;
+}
+
+static inline bool mothershipClusterBGPEnabled(const MothershipProdigyCluster& cluster)
+{
+  if (cluster.providerManagedBGP)
+  {
+    return mothershipClusterUsesProviderManagedBGP(cluster);
+  }
+  return cluster.bgp.config.enabled;
+}
+
+static inline bool mothershipClusterAuthorizesBGPOriginPrefix(
+    const MothershipProdigyCluster& cluster, const IPPrefix& requested)
+{
+  if (mothershipClusterBGPEnabled(cluster) == false ||
+      !requested.equals(requested.canonicalized()))
+  {
+    return false;
+  }
+  for (const IPPrefix& authorized : cluster.bgpAuthorizedOriginPrefixes)
+  {
+    if (authorized.equals(requested))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 static inline bool mothershipClusterProviderIsIaaS(MothershipClusterProvider provider)

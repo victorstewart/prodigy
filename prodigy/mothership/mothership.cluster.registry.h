@@ -234,6 +234,29 @@ public:
   Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
 };
 
+class MothershipProdigyClusterRecordV8 {
+public:
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
+  uint32_t spareMachineCount = 0;
+  Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
+  bool providerManagedBGP = false;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV8& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+  serializer.value1b(record.internalTransportProfile);
+  serializer.value4b(record.spareMachineCount);
+  serializer.container(record.bgpAuthorizedOriginPrefixes, 256);
+  serializer.value1b(record.providerManagedBGP);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV7& record)
 {
@@ -579,6 +602,7 @@ private:
   constexpr static auto clusterRecordV5Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv;
   constexpr static auto clusterRecordV6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
   constexpr static auto clusterRecordV7Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=7\n\n"_ctv;
+  constexpr static auto clusterRecordV8Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=8\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -789,6 +813,46 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV8Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV8Header.size(), serialized.size() - clusterRecordV8Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV8 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.providerManagedBGP == false ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
+          record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
+          record.bgpAuthorizedOriginPrefixes.size() > 256 ||
+          (record.spareMachineCount > 0 &&
+           (record.cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+            record.cluster.test.specified == false || record.spareMachineCount != 1 ||
+            record.cluster.test.storageDeviceCount != 0 || record.cluster.test.enableFakeIpv4Boundary ||
+            record.cluster.test.machineCount <= record.spareMachineCount || record.cluster.nBrains == 0 ||
+           record.cluster.nBrains > record.cluster.test.machineCount - record.spareMachineCount)) ||
+          (record.internalTransportProfile != MothershipInternalTransportProfile::tls &&
+           record.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)) return false;
+      record.cluster.providerManagedBGP = record.providerManagedBGP;
+      if (record.bgpAuthorizedOriginPrefixes.empty() == false && !mothershipClusterBGPEnabled(record.cluster)) return false;
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      for (uint32_t index = 0; index < record.bgpAuthorizedOriginPrefixes.size(); ++index)
+      {
+        const IPPrefix& prefix = record.bgpAuthorizedOriginPrefixes[index];
+        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized())) return false;
+        for (uint32_t other = 0; other < index; ++other)
+          if (prefix.equals(record.bgpAuthorizedOriginPrefixes[other])) return false;
+      }
+      if (validateClusterEnvironmentBGP(record.cluster, nullptr) == false) return false;
+      record.cluster.internalTransportProfile = record.internalTransportProfile;
+      record.cluster.test.spareMachineCount = record.spareMachineCount;
+      record.cluster.bgpAuthorizedOriginPrefixes = std::move(record.bgpAuthorizedOriginPrefixes);
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
     if (recordHasHeader(serialized, clusterRecordV7Header))
     {
       String payload = {};
@@ -798,7 +862,7 @@ private:
           record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
           record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
           record.bgpAuthorizedOriginPrefixes.size() > 256 ||
-          (record.bgpAuthorizedOriginPrefixes.empty() == false && record.cluster.bgp.config.enabled == false) ||
+          (record.bgpAuthorizedOriginPrefixes.empty() == false && !mothershipClusterBGPEnabled(record.cluster)) ||
           (record.spareMachineCount > 0 &&
            (record.cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
             record.cluster.test.specified == false || record.spareMachineCount != 1 ||
@@ -821,6 +885,7 @@ private:
       }
       record.cluster.internalTransportProfile = record.internalTransportProfile;
       record.cluster.test.spareMachineCount = record.spareMachineCount;
+      record.cluster.providerManagedBGP = false;
       record.cluster.bgpAuthorizedOriginPrefixes = std::move(record.bgpAuthorizedOriginPrefixes);
       cluster = std::move(record.cluster);
       return true;
@@ -850,6 +915,7 @@ private:
       }
       record.cluster.internalTransportProfile = record.internalTransportProfile;
       record.cluster.test.spareMachineCount = record.spareMachineCount;
+      record.cluster.providerManagedBGP = false;
       cluster = std::move(record.cluster);
       return true;
     }
@@ -870,6 +936,7 @@ private:
         record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
       }
       record.cluster.internalTransportProfile = record.internalTransportProfile;
+      record.cluster.providerManagedBGP = false;
       cluster = std::move(record.cluster);
       return true;
     }
@@ -893,6 +960,7 @@ private:
       }
       cluster = std::move(record.cluster);
       cluster.internalTransportProfile = MothershipInternalTransportProfile::tls;
+      cluster.providerManagedBGP = false;
       return true;
     }
 
@@ -912,6 +980,7 @@ private:
         record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
       }
       cluster = std::move(record.cluster);
+      cluster.providerManagedBGP = false;
       return true;
     }
 
@@ -921,7 +990,9 @@ private:
       payload.assign(serialized.substr(clusterRecordV2Header.size(), serialized.size() - clusterRecordV2Header.size(), Copy::yes));
       // V2 serialized the unchanged cluster object directly, so all adopted rack
       // identifiers retain the legacy zero/default semantics after decoding.
-      return BitseryEngine::deserializeSafe(payload, cluster);
+      if (BitseryEngine::deserializeSafe(payload, cluster) == false) return false;
+      cluster.providerManagedBGP = false;
+      return true;
     }
 
     return false;
@@ -941,7 +1012,20 @@ private:
     }
 
     String payload = {};
-    if (cluster.bgpAuthorizedOriginPrefixes.empty() == false)
+    if (cluster.providerManagedBGP)
+    {
+      MothershipProdigyClusterRecordV8 recordV8 = {};
+      recordV8.cluster = std::move(record.cluster);
+      recordV8.adoptedMachineRackUUIDs = std::move(record.adoptedMachineRackUUIDs);
+      recordV8.adoptedMachineUUIDs = std::move(record.adoptedMachineUUIDs);
+      recordV8.internalTransportProfile = record.internalTransportProfile;
+      recordV8.spareMachineCount = cluster.test.spareMachineCount;
+      recordV8.bgpAuthorizedOriginPrefixes = cluster.bgpAuthorizedOriginPrefixes;
+      recordV8.providerManagedBGP = true;
+      BitseryEngine::serialize(payload, recordV8);
+      serialized.assign(clusterRecordV8Header);
+    }
+    else if (cluster.bgpAuthorizedOriginPrefixes.empty() == false)
     {
       MothershipProdigyClusterRecordV7 recordV7 = {};
       recordV7.cluster = std::move(record.cluster);
@@ -1938,8 +2022,15 @@ private:
     return true;
   }
 
-  static bool validateClusterEnvironmentBGP(const ProdigyEnvironmentBGPConfig& bgp, String *failure)
+  static bool validateClusterEnvironmentBGP(const MothershipProdigyCluster& cluster, String *failure)
   {
+    const ProdigyEnvironmentBGPConfig& bgp = cluster.bgp;
+    if (cluster.providerManagedBGP)
+    {
+      if (mothershipClusterUsesProviderManagedBGP(cluster)) return true;
+      if (failure) failure->assign("invalid provider-managed bgp intent"_ctv);
+      return false;
+    }
     if (bgp.configured() == false)
     {
       return true;
@@ -2378,7 +2469,7 @@ private:
       }
     }
 
-    if (validateClusterEnvironmentBGP(cluster.bgp, failure) == false)
+    if (validateClusterEnvironmentBGP(cluster, failure) == false)
     {
       return false;
     }
@@ -5123,7 +5214,7 @@ public:
     }
     MothershipProdigyCluster candidate = cluster;
     if (candidate.bgpAuthorizedOriginPrefixes.size() > 256 ||
-        (candidate.bgpAuthorizedOriginPrefixes.empty() == false && candidate.bgp.config.enabled == false))
+        (candidate.bgpAuthorizedOriginPrefixes.empty() == false && !mothershipClusterBGPEnabled(candidate)))
     {
       if (failure) failure->assign("BGP origin authorization requires an enabled BGP configuration and at most 256 prefixes"_ctv);
       return false;

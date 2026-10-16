@@ -24272,6 +24272,15 @@ private:
           exit(EXIT_FAILURE);
         }
       }
+      else if (key.equal("providerManagedBGP"_ctv))
+      {
+        if (field.value.type() != simdjson::dom::element_type::BOOL ||
+            field.value.get(request.providerManagedBGP) != simdjson::SUCCESS)
+        {
+          basics_log("createCluster.providerManagedBGP requires bool\n");
+          exit(EXIT_FAILURE);
+        }
+      }
       else if (key.equal("desiredEnvironment"_ctv))
       {
         if (field.value.type() != simdjson::dom::element_type::STRING)
@@ -25523,7 +25532,8 @@ private:
       MothershipClusterRegistry registry = openClusterRegistry();
       if (!registry.lockBGPOriginPolicy(policyLock, &failure))
       { basics_log("authorizeBGPOriginPrefix lock failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
-      if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) || !cluster.bgp.config.enabled)
+      if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) ||
+          !mothershipClusterBGPEnabled(cluster))
       { basics_log("authorizeBGPOriginPrefix requires a registered BGP-enabled cluster\n"); exit(EXIT_FAILURE); }
       bool exists = false;
       for (const IPPrefix& existing : cluster.bgpAuthorizedOriginPrefixes)
@@ -25553,7 +25563,8 @@ private:
     MothershipClusterRegistry registry = openClusterRegistry();
     if (!registry.lockBGPOriginPolicy(policyLock, &failure))
     { basics_log("revokeBGPOriginPrefix lock failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
-    if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) || !cluster.bgp.config.enabled)
+    if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) ||
+        !mothershipClusterBGPEnabled(cluster))
     { basics_log("revokeBGPOriginPrefix requires a registered BGP-enabled cluster\n"); exit(EXIT_FAILURE); }
     RoutableSubnetRegistryReport active = {};
     if (!readRoutableSubnets(cluster, active, failure)) { basics_log("revokeBGPOriginPrefix cannot verify active prefixes: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
