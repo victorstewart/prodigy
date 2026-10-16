@@ -1790,6 +1790,11 @@ inline void Brain::handleRegisterRoutableSubnet(Mothership *stream, uint8_t *arg
   {
     response.failure.assign("switchboardFleet routable prefix registration requires bgp-enabled environment"_ctv);
   }
+  else if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet &&
+           (stream == nullptr || activeMotherships.contains(stream) == false || streamIsActive(stream) == false))
+  {
+    response.failure.assign("switchboardFleet routable prefix registration requires an active Mothership control stream"_ctv);
+  }
   else if (request.subnet.routing != ExternalSubnetRouting::switchboardBGP)
   {
     response.failure.assign("routable prefix registration only supports BGP"_ctv);

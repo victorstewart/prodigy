@@ -103,7 +103,7 @@ Vultr uses the shared runtime boot path. Mothership uploads first-boot state wit
 
 Vultr auto-provisioning supports `vm` and `bareMetal`. Created machines use a managed private VPC per region with description `prodigy-managed-vpc-<region>` and explicit `/20` headroom. Mixed VM and bare-metal private deployments must attach both sides to that managed VPC.
 
-Vultr bare-metal BGP behavior fetches MD5 and ASN through `GET https://api.vultr.com/v2/account/bgp`, peers with `169.254.1.1` and `2001:19f0:ffff::1` using TTL `2`, uses TCP-MD5, and announces provider-driven communities such as `20473:6000` for iBGP-only reachability. MD5 keys must not be logged and should be zeroized after socket option application.
+Vultr Cloud Compute BGP fetches the customer ASN and MD5 secret through `GET https://api.vultr.com/v2/account/bgp`, then establishes the IPv6 session to AS64515 at `2001:19f0:ffff::1` with TTL `2` and the instance's public IPv6 address as its source and next hop. The runtime currently fails closed unless the account ASN is AS35870 and a global public IPv6 address is present; it does not substitute the private VPC address or gateway for a public IPv4 BGP source or next hop. MD5 keys must not be logged and should be zeroized after socket option application.
 
 ## Provider-specific docs
 

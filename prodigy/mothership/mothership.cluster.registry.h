@@ -224,6 +224,27 @@ public:
   uint32_t spareMachineCount = 0;
 };
 
+class MothershipProdigyClusterRecordV7 {
+public:
+  MothershipProdigyCluster cluster;
+  Vector<uint32_t> adoptedMachineRackUUIDs;
+  Vector<uint128_t> adoptedMachineUUIDs;
+  MothershipInternalTransportProfile internalTransportProfile = MothershipInternalTransportProfile::tls;
+  uint32_t spareMachineCount = 0;
+  Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProdigyClusterRecordV7& record)
+{
+  serializer.object(record.cluster);
+  serializer.container4b(record.adoptedMachineRackUUIDs, UINT32_MAX);
+  serializer.object(record.adoptedMachineUUIDs);
+  serializer.value1b(record.internalTransportProfile);
+  serializer.value4b(record.spareMachineCount);
+  serializer.container(record.bgpAuthorizedOriginPrefixes, 256);
+}
+
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyClusterRecordV6& record)
 {
@@ -557,6 +578,7 @@ private:
   constexpr static auto clusterRecordV4Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=4\n\n"_ctv;
   constexpr static auto clusterRecordV5Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv;
   constexpr static auto clusterRecordV6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
+  constexpr static auto clusterRecordV7Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=7\n\n"_ctv;
 
   static void resolveDefaultDBPath(String& path)
   {
@@ -767,6 +789,43 @@ private:
     String serialized;
     serialized.append(value, valueSize);
 
+    if (recordHasHeader(serialized, clusterRecordV7Header))
+    {
+      String payload = {};
+      payload.assign(serialized.substr(clusterRecordV7Header.size(), serialized.size() - clusterRecordV7Header.size(), Copy::yes));
+      MothershipProdigyClusterRecordV7 record = {};
+      if (BitseryEngine::deserializeSafe(payload, record) == false ||
+          record.adoptedMachineRackUUIDs.size() != record.cluster.machines.size() ||
+          record.adoptedMachineUUIDs.size() != record.cluster.machines.size() ||
+          record.bgpAuthorizedOriginPrefixes.size() > 256 ||
+          (record.bgpAuthorizedOriginPrefixes.empty() == false && record.cluster.bgp.config.enabled == false) ||
+          (record.spareMachineCount > 0 &&
+           (record.cluster.deploymentMode != MothershipClusterDeploymentMode::test ||
+            record.cluster.test.specified == false || record.spareMachineCount != 1 ||
+            record.cluster.test.storageDeviceCount != 0 || record.cluster.test.enableFakeIpv4Boundary ||
+            record.cluster.test.machineCount <= record.spareMachineCount || record.cluster.nBrains == 0 ||
+            record.cluster.nBrains > record.cluster.test.machineCount - record.spareMachineCount)) ||
+          (record.internalTransportProfile != MothershipInternalTransportProfile::tls &&
+           record.internalTransportProfile != MothershipInternalTransportProfile::aegisX25519V1)) return false;
+      for (uint32_t index = 0; index < record.cluster.machines.size(); ++index)
+      {
+        record.cluster.machines[index].rackUUID = record.adoptedMachineRackUUIDs[index];
+        record.cluster.machines[index].uuid = record.adoptedMachineUUIDs[index];
+      }
+      for (uint32_t index = 0; index < record.bgpAuthorizedOriginPrefixes.size(); ++index)
+      {
+        const IPPrefix& prefix = record.bgpAuthorizedOriginPrefixes[index];
+        if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized())) return false;
+        for (uint32_t other = 0; other < index; ++other)
+          if (prefix.equals(record.bgpAuthorizedOriginPrefixes[other])) return false;
+      }
+      record.cluster.internalTransportProfile = record.internalTransportProfile;
+      record.cluster.test.spareMachineCount = record.spareMachineCount;
+      record.cluster.bgpAuthorizedOriginPrefixes = std::move(record.bgpAuthorizedOriginPrefixes);
+      cluster = std::move(record.cluster);
+      return true;
+    }
+
     if (recordHasHeader(serialized, clusterRecordV6Header))
     {
       String payload = {};
@@ -882,7 +941,19 @@ private:
     }
 
     String payload = {};
-    if (cluster.test.spareMachineCount > 0)
+    if (cluster.bgpAuthorizedOriginPrefixes.empty() == false)
+    {
+      MothershipProdigyClusterRecordV7 recordV7 = {};
+      recordV7.cluster = std::move(record.cluster);
+      recordV7.adoptedMachineRackUUIDs = std::move(record.adoptedMachineRackUUIDs);
+      recordV7.adoptedMachineUUIDs = std::move(record.adoptedMachineUUIDs);
+      recordV7.internalTransportProfile = record.internalTransportProfile;
+      recordV7.spareMachineCount = cluster.test.spareMachineCount;
+      recordV7.bgpAuthorizedOriginPrefixes = cluster.bgpAuthorizedOriginPrefixes;
+      BitseryEngine::serialize(payload, recordV7);
+      serialized.assign(clusterRecordV7Header);
+    }
+    else if (cluster.test.spareMachineCount > 0)
     {
       MothershipProdigyClusterRecordV6 spareRecord = {};
       spareRecord.cluster = std::move(record.cluster);
@@ -2752,6 +2823,32 @@ private:
 
 public:
 
+  // Serializes the registry authorization decision with the corresponding
+  // Brain registration RPC.  This is intentionally a process-shared lock:
+  // Mothership commands are separate processes, so a process-local mutex
+  // would allow a revoke to race an already-authorized registration.
+  struct BGPOriginPolicyLock {
+    int fd = -1;
+    BGPOriginPolicyLock() = default;
+    BGPOriginPolicyLock(const BGPOriginPolicyLock&) = delete;
+    BGPOriginPolicyLock& operator=(const BGPOriginPolicyLock&) = delete;
+    ~BGPOriginPolicyLock() { if (fd >= 0) ::close(fd); }
+  };
+
+  bool lockBGPOriginPolicy(BGPOriginPolicyLock& lock, String *failure = nullptr) const
+  {
+    String path = db.path();
+    path.append(".bgp-origin-policy.lock"_ctv);
+    lock.fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lock.fd < 0 || ::flock(lock.fd, LOCK_EX) != 0)
+    {
+      if (failure) failure->assign("BGP origin policy registry lock unavailable"_ctv);
+      return false;
+    }
+    if (failure) failure->clear();
+    return true;
+  }
+
   static bool validateClusterForStorage(const MothershipProdigyCluster& cluster, MothershipProdigyCluster& normalizedCluster, String *failure = nullptr)
   {
     MothershipProdigyCluster candidate = cluster;
@@ -2769,7 +2866,7 @@ public:
           String resolved;
           resolveDefaultDBPath(resolved);
           return resolved;
-        }())
+        }(), TidesDB::Durability::full)
   {
   }
 
@@ -5025,6 +5122,27 @@ public:
       return false;
     }
     MothershipProdigyCluster candidate = cluster;
+    if (candidate.bgpAuthorizedOriginPrefixes.size() > 256 ||
+        (candidate.bgpAuthorizedOriginPrefixes.empty() == false && candidate.bgp.config.enabled == false))
+    {
+      if (failure) failure->assign("BGP origin authorization requires an enabled BGP configuration and at most 256 prefixes"_ctv);
+      return false;
+    }
+    for (uint32_t index = 0; index < candidate.bgpAuthorizedOriginPrefixes.size(); ++index)
+    {
+      const IPPrefix& prefix = candidate.bgpAuthorizedOriginPrefixes[index];
+      if (prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized()))
+      {
+        if (failure) failure->assign("BGP origin authorization prefixes must be canonical"_ctv);
+        return false;
+      }
+      for (uint32_t other = 0; other < index; ++other)
+        if (prefix.equals(candidate.bgpAuthorizedOriginPrefixes[other]))
+        {
+          if (failure) failure->assign("BGP origin authorization prefixes must be unique"_ctv);
+          return false;
+        }
+    }
     if (normalizeClusterForStorage(candidate, failure) == false)
     {
       return false;
@@ -5087,6 +5205,32 @@ public:
 
   bool upsertCluster(const MothershipProdigyCluster& cluster, MothershipProdigyCluster *storedCluster = nullptr, String *failure = nullptr)
   {
+    return upsertClusterWithBGPOriginPolicyMode(cluster, false, nullptr, storedCluster, failure);
+  }
+
+  // Ordinary cluster writers do not own BGP origin policy. Serialize every
+  // full-record update with the policy lock and retain the durable policy from
+  // the latest record so a stale unrelated update cannot silently erase it.
+  bool upsertClusterWithBGPOriginPolicyMode(const MothershipProdigyCluster& cluster,
+                                             bool replaceBGPOriginPolicy,
+                                             const BGPOriginPolicyLock *heldPolicyLock,
+                                             MothershipProdigyCluster *storedCluster = nullptr,
+                                             String *failure = nullptr)
+  {
+    BGPOriginPolicyLock ownedPolicyLock = {};
+    if (heldPolicyLock == nullptr)
+    {
+      if (lockBGPOriginPolicy(ownedPolicyLock, failure) == false)
+      {
+        return false;
+      }
+    }
+    else if (heldPolicyLock->fd < 0)
+    {
+      if (failure) failure->assign("BGP origin policy lock required"_ctv);
+      return false;
+    }
+
     String serialized;
     MothershipProdigyCluster stored = cluster;
 
@@ -5105,6 +5249,11 @@ public:
     if (hadExistingCluster && stored.clusterUUID == 0)
     {
       stored.clusterUUID = existingCluster.clusterUUID;
+    }
+
+    if (hadExistingCluster && replaceBGPOriginPolicy == false)
+    {
+      stored.bgpAuthorizedOriginPrefixes = existingCluster.bgpAuthorizedOriginPrefixes;
     }
 
     if (hadExistingCluster && mothershipClusterUsesVirtualDatacenter(stored))
@@ -5218,6 +5367,17 @@ public:
     }
 
     return true;
+  }
+
+  // The authorize/revoke commands hold this lock across their registry decision
+  // and any dependent Brain RPC. They are the only callers permitted to replace
+  // the durable policy vector.
+  bool upsertClusterBGPOriginPolicy(const MothershipProdigyCluster& cluster,
+                                    const BGPOriginPolicyLock& heldPolicyLock,
+                                    MothershipProdigyCluster *storedCluster = nullptr,
+                                    String *failure = nullptr)
+  {
+    return upsertClusterWithBGPOriginPolicyMode(cluster, true, &heldPolicyLock, storedCluster, failure);
   }
 
   bool createCluster(const MothershipProdigyCluster& cluster, MothershipProdigyCluster *storedCluster = nullptr, String *failure = nullptr)

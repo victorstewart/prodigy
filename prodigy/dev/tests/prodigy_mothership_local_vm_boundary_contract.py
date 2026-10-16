@@ -91,6 +91,22 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("localMachine.uuid = verifiedLocalVMUUID", helper[verified:fallback])
         self.assertIn("else\n    {\n      ProdigyPersistentStateStore", helper[verified:fallback + 80])
 
+    def test_authority_recovery_seed_uses_only_stored_topology_and_fails_closed(self):
+        begin = MOTHERSHIP.index("bool findLocalAuthorityRecoverySeedMachine")
+        end = MOTHERSHIP.index("bool bootstrapLocalClusterMachine", begin)
+        helper = MOTHERSHIP[begin:end]
+        self.assertIn("prodigyCollectLocalPeerAddressCandidates", helper)
+        self.assertIn("matches == 0", helper)
+        self.assertIn("matches != 1", helper)
+        self.assertIn("MachineConfig::MachineKind::vm", helper)
+        self.assertNotIn("ProdigyPersistentStateStore", helper)
+
+        begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
+        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        owner = MOTHERSHIP[begin:end]
+        self.assertIn("findLocalAuthorityRecoverySeedMachine(cluster.topology, seedMachine, &failure)", owner)
+        self.assertNotIn("buildLocalClusterMachineProbe(cluster, seedMachine", owner)
+
     def test_cold_reboot_accepts_only_fixed_width_provider_operation_identity(self):
         self.assertIn('re.fullmatch(r"[0-9a-f]{32}", value) is not None', KVM_BOUNDARY)
         self.assertIn('canonical_cold_reboot_id(options.get("--operation-id"), "operation ID")', KVM_BOUNDARY)

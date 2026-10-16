@@ -1438,6 +1438,11 @@ private:
   bytell_hash_map<ContainerView *, ContainerView *> pendingStatefulWhiteholeTransfers;
   bytell_hash_set<ContainerView *> retainedStatefulWhiteholeTransfers;
   bytell_hash_set<ContainerView *> rejectedStatefulWhiteholeTransfers;
+  // Planned recovery successors are constructed after the scheduler has
+  // charged their complete placement.  Keep that ownership explicit until
+  // launch admission succeeds so a pre-launch rejection cannot either leak a
+  // real reservation or credit resources which were never debited.
+  bytell_hash_set<ContainerView *> reservedUnlaunchedStatefulWhiteholeTransfers;
   // Resolved from the durable master-authority placement registry at plan admission.
   // It is intentionally not part of DeploymentPlan wire/persistent bytes.
   Vector<uint128_t> committedEligibleMachineUUIDs;
@@ -3057,7 +3062,7 @@ private:
                   std::move(assignedGPUMemoryMBs),
                   std::move(assignedGPUDevices));
               ContainerView *successor = replacementWork->getBase()->container;
-              if (prepareSameMachineStatefulWhiteholeTransfer(container, successor) == false)
+              if (prepareSameMachineStatefulWhiteholeTransfer(container, successor, true) == false)
               {
                 // A resolved binding is admission material.  Do not silently
                 // turn a failed handoff into a different externally visible
@@ -8127,8 +8132,16 @@ public:
     return hasTransferredBinding;
   }
 
-  bool prepareSameMachineStatefulWhiteholeTransfer(ContainerView *predecessor, ContainerView *successor)
+  bool prepareSameMachineStatefulWhiteholeTransfer(
+      ContainerView *predecessor,
+      ContainerView *successor,
+      bool successorOwnsPlacementReservation)
   {
+    if (successor != nullptr && successorOwnsPlacementReservation)
+    {
+      reservedUnlaunchedStatefulWhiteholeTransfers.insert(successor);
+    }
+
     if (predecessor == nullptr || successor == nullptr || predecessor->machine != successor->machine ||
         predecessor->applicationID != successor->applicationID || predecessor->deploymentID != successor->deploymentID ||
         predecessor->applicationID != plan.config.applicationID || predecessor->deploymentID != plan.config.deploymentID() ||
@@ -8226,6 +8239,136 @@ public:
       return false;
     }
     return true;
+  }
+
+  // A same-machine stateful replacement is registered before its launch bundle
+  // is admitted.  If that admission fails, it has never reached a Neuron, so
+  // normal destruction would incorrectly send lifecycle work.  Retire only
+  // that local view and release a transferred tuple if no canonical peer still
+  // claims it.
+  bool abandonUnlaunchedStatefulWhiteholeTransfer(ContainerView *container)
+  {
+    if (container == nullptr || thisBrain == nullptr || container->machine == nullptr ||
+        container->state != ContainerState::planned || container->fragment != 0 ||
+        containers.contains(container) == false ||
+        (retainedStatefulWhiteholeTransfers.contains(container) == false &&
+         rejectedStatefulWhiteholeTransfers.contains(container) == false &&
+         reservedUnlaunchedStatefulWhiteholeTransfers.contains(container) == false))
+    {
+      return false;
+    }
+
+    for (auto transfer = pendingStatefulWhiteholeTransfers.begin();
+         transfer != pendingStatefulWhiteholeTransfers.end();)
+    {
+      if (transfer->first == container || transfer->second == container)
+      {
+        transfer = pendingStatefulWhiteholeTransfers.erase(transfer);
+      }
+      else
+      {
+        ++transfer;
+      }
+    }
+    retainedStatefulWhiteholeTransfers.erase(container);
+    rejectedStatefulWhiteholeTransfers.erase(container);
+    const bool releasePlacementReservation =
+        reservedUnlaunchedStatefulWhiteholeTransfers.erase(container) > 0;
+    waitingOnContainers.erase(container);
+
+    for (const Whitehole& whitehole : container->whiteholes)
+    {
+      if (whiteholeBindingResolved(whitehole) == false)
+      {
+        continue;
+      }
+      bool claimedElsewhere = false;
+      for (const auto& [uuid, candidate] : thisBrain->containers)
+      {
+        (void)uuid;
+        // A destroying view still owns its switchboard binding until its
+        // destruction acknowledgement reaches containerDestroyed().
+        if (candidate == nullptr || candidate == container ||
+            candidate->state == ContainerState::destroyed)
+        {
+          continue;
+        }
+        for (const Whitehole& candidateBinding : candidate->whiteholes)
+        {
+          if (candidateBinding.hasAddress && candidateBinding.address.equals(whitehole.address) &&
+              candidateBinding.sourcePort == whitehole.sourcePort)
+          {
+            claimedElsewhere = true;
+            break;
+          }
+        }
+        if (claimedElsewhere)
+        {
+          break;
+        }
+      }
+      if (claimedElsewhere)
+      {
+        continue;
+      }
+      Vector<RoutableResourceLeaseOwner> owners = {};
+      for (const RoutableResourceLease& lease : thisBrain->routableResourceLeaseRuntimeState)
+      {
+        if (lease.kind == RoutableResourceLeaseKind::whiteholeAddressPort &&
+            lease.address.equals(whitehole.address) && lease.sourcePort == whitehole.sourcePort &&
+            routableResourceLeaseOwnersCompatible(lease.owner, routableResourceLeaseOwner()) &&
+            std::find(owners.begin(), owners.end(), lease.owner) == owners.end())
+        {
+          owners.push_back(lease.owner);
+        }
+      }
+      for (const RoutableResourceLeaseOwner& owner : owners)
+      {
+        releaseWhiteholeAddressPortLease(whitehole, owner);
+      }
+    }
+
+    if (releasePlacementReservation)
+    {
+      const ApplicationConfig reserved = resourceConfigForContainer(container);
+      releaseContainerPlacementCounts(container);
+      prodigyCreditMachineScalarResources(container->machine, reserved, 1);
+      prodigyReleaseContainerGPUs(container);
+    }
+    containers.erase(container);
+    while (containersByShardGroup.eraseEntry(container->shardGroup, container))
+    {
+    }
+    container->machine->removeContainerIndexEntry(container->deploymentID, container);
+    auto canonical = thisBrain->containers.find(container->uuid);
+    if (canonical != thisBrain->containers.end() && canonical->second == container)
+    {
+      thisBrain->containers.erase(canonical);
+    }
+    delete container;
+    return true;
+  }
+
+  void abandonQueuedUnlaunchedStatefulWhiteholeTransfers(void)
+  {
+    Vector<DeploymentWork *> queued = toSchedule;
+    for (DeploymentWork *work : queued)
+    {
+      if (work == nullptr)
+      {
+        continue;
+      }
+      ContainerView *container = work->getBase()->container;
+      if (container == nullptr ||
+          (retainedStatefulWhiteholeTransfers.contains(container) == false &&
+           rejectedStatefulWhiteholeTransfers.contains(container) == false &&
+           reservedUnlaunchedStatefulWhiteholeTransfers.contains(container) == false))
+      {
+        continue;
+      }
+      cancelDeploymentWork(work);
+      (void)abandonUnlaunchedStatefulWhiteholeTransfer(container);
+    }
   }
 
   static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta {}, const ApplicationConfig *configOverride = nullptr)
@@ -9810,6 +9953,7 @@ public:
           plan.config.deploymentID(),
           credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container launch"_ctv),
           generateReport());
+      abandonQueuedUnlaunchedStatefulWhiteholeTransfers();
       co_return;
     }
 
@@ -9937,6 +10081,11 @@ public:
         case LifecycleOp::updateInPlace:
         case LifecycleOp::construct:
           {
+            ContainerView *container = work.container;
+            const bool retainsStatefulWhiteholeTransfer = retainedStatefulWhiteholeTransfers.contains(container);
+            const bool canAbandonUnlaunchedStatefulWhiteholeTransfer =
+                retainsStatefulWhiteholeTransfer || rejectedStatefulWhiteholeTransfers.contains(container) ||
+                reservedUnlaunchedStatefulWhiteholeTransfers.contains(container);
             String credentialFailure = {};
             if (thisBrain->deploymentApiCredentialsAvailableForLaunch(plan, &credentialFailure) == false)
             {
@@ -9948,11 +10097,14 @@ public:
                   credentialFailure.size() ? credentialFailure : String("credential policy unavailable for container launch"_ctv),
                   generateReport());
               cancelDeploymentWork(currentlyExecutingWork);
+              if (canAbandonUnlaunchedStatefulWhiteholeTransfer)
+              {
+                (void)abandonUnlaunchedStatefulWhiteholeTransfer(container);
+              }
               credentialLaunchFailed = true;
               break;
             }
 
-            ContainerView *container = work.container;
             ContainerPlan credentialPlan = {};
             if (thisBrain->applyCredentialsToContainerPlan(plan, *container, credentialPlan) == false)
             {
@@ -9964,11 +10116,14 @@ public:
                   "credential policy unavailable while building container launch bundle"_ctv,
                   generateReport());
               cancelDeploymentWork(currentlyExecutingWork);
+              if (canAbandonUnlaunchedStatefulWhiteholeTransfer)
+              {
+                (void)abandonUnlaunchedStatefulWhiteholeTransfer(container);
+              }
               credentialLaunchFailed = true;
               break;
             }
 
-            const bool retainsStatefulWhiteholeTransfer = retainedStatefulWhiteholeTransfers.contains(container);
             if (rejectedStatefulWhiteholeTransfers.contains(container) ||
                 (retainsStatefulWhiteholeTransfer && statefulWhiteholeTransferMatchesPlan(container) == false))
             {
@@ -9982,9 +10137,14 @@ public:
                   "stateful recovery Whitehole binding transfer no longer matches its declared source identity"_ctv,
                   generateReport());
               cancelDeploymentWork(currentlyExecutingWork);
+              (void)abandonUnlaunchedStatefulWhiteholeTransfer(container);
               credentialLaunchFailed = true;
               break;
             }
+
+            // From here the ordinary scheduled-container lifecycle owns the
+            // reservation and is responsible for releasing it.
+            reservedUnlaunchedStatefulWhiteholeTransfers.erase(container);
 
             ContainerView *replacingContainer = nullptr;
 

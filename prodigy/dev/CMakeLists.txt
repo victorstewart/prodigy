@@ -596,6 +596,7 @@ add_executable(prodigy_wormhole_matrix_probe_container ${CMAKE_CURRENT_SOURCE_DI
 add_executable(prodigy_resumption_readiness_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/resumption_readiness_probe_container.cpp)
 add_executable(prodigy_public_tls_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/public_tls_probe_container.cpp)
 add_executable(prodigy_g6_physical_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_physical_probe_container.cpp)
+add_executable(prodigy_g6_byo_probe_container ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_byo_probe_container.cpp)
 set(
    PRODIGY_RUNTIME_CONTAINER_PROBE_TARGETS
    prodigy_task_probe_container
@@ -613,6 +614,7 @@ set(
    prodigy_resumption_readiness_probe_container
    prodigy_public_tls_probe_container
    prodigy_g6_physical_probe_container
+   prodigy_g6_byo_probe_container
 )
 add_executable(prodigy_gpu_device_mount_smoke ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_gpu_device_mount_smoke.cpp)
 add_executable(prodigy_shared_cpu_affinity_seccomp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_shared_cpu_affinity_seccomp_unit.cpp)
@@ -986,6 +988,7 @@ target_link_libraries(prodigy_resumption_readiness_probe_container PRIVATE picoq
 target_link_libraries(prodigy_public_tls_probe_container PRIVATE openssl::ssl openssl::crypto)
 target_link_libraries(prodigy_g6_physical_probe_container PRIVATE openssl::ssl openssl::crypto)
 target_compile_options(prodigy_g6_physical_probe_container PRIVATE -O2)
+target_compile_options(prodigy_g6_byo_probe_container PRIVATE -O2)
 
 set(PRODIGY_PTHREAD_TARGETS ${PRODIGY_ALL_BUILD_TARGETS})
 list(REMOVE_ITEM PRODIGY_PTHREAD_TARGETS prodigy mothership prodigy_sdk_cpp_unit)
@@ -1797,6 +1800,12 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
    set_tests_properties(prodigy_dev_wormhole_matrix_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
    add_test(
+      NAME prodigy_g6_byo_probe_container_unit
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_byo_probe_container_unit.py ${CMAKE_BINARY_DIR}/prodigy_g6_byo_probe_container
+   )
+   set_tests_properties(prodigy_g6_byo_probe_container_unit PROPERTIES TIMEOUT 10)
+
+   add_test(
       NAME prodigy_dev_resumption_readiness_smoke
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_dev_resumption_readiness_smoke.sh ${CMAKE_BINARY_DIR}/prodigy ${CMAKE_BINARY_DIR}/mothership ${CMAKE_BINARY_DIR}/prodigy_resumption_readiness_probe_container
    )
@@ -2172,6 +2181,8 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=hardware-reservation-profile ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
    add_test(NAME prodigy_machine_schema_persistence_backpressure
       COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=machine-schema-persistence ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
+   add_test(NAME prodigy_routable_fleet_mothership_authorization
+      COMMAND ${CMAKE_COMMAND} -E env PRODIGY_TEST_ONLY=routable-fleet-mothership ${CMAKE_BINARY_DIR}/prodigy_brain_replication_credentials_unit)
    add_test(
       NAME prodigy_async_persistence_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_async_persistence_unit

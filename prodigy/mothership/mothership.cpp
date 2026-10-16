@@ -8869,6 +8869,58 @@ private:
     return false;
   }
 
+  // Local-authority recovery may run beside a live Brain, whose persistent
+  // store is exclusively locked by that Brain.  Its durable cluster topology
+  // already identifies the owned VM boundaries, so resolve the local seed
+  // only by the controller's peer addresses and fail closed unless one exact
+  // eligible boundary matches.
+  bool findLocalAuthorityRecoverySeedMachine(const ClusterTopology& topology,
+                                             ClusterMachine& seedMachine,
+                                             String *failure = nullptr)
+  {
+    seedMachine = {};
+    if (failure) failure->clear();
+
+    Vector<ClusterMachinePeerAddress> localCandidates = {};
+    prodigyCollectLocalPeerAddressCandidates(""_ctv, {}, localCandidates);
+    if (localCandidates.empty())
+    {
+      if (failure) failure->assign("local authority recovery cannot resolve local peer addresses"_ctv);
+      return false;
+    }
+
+    ClusterMachine probe = {};
+    probe.isBrain = true;
+    prodigyAssignClusterMachineAddressesFromPeerCandidates(probe.addresses, localCandidates);
+
+    uint32_t matches = 0;
+    for (const ClusterMachine& machine : topology.machines)
+    {
+      if (!machine.sameIdentityAs(probe)) continue;
+      ++matches;
+      seedMachine = machine;
+    }
+    if (matches == 0)
+    {
+      if (failure) failure->assign("local authority recovery local peer identity is absent from stored topology"_ctv);
+      return false;
+    }
+    if (matches != 1)
+    {
+      seedMachine = {};
+      if (failure) failure->assign("local authority recovery local peer identity is ambiguous in stored topology"_ctv);
+      return false;
+    }
+    if (seedMachine.uuid == 0 || seedMachine.kind != MachineConfig::MachineKind::vm || !seedMachine.isBrain ||
+        seedMachine.backing != ClusterMachineBacking::owned || seedMachine.lifetime != MachineLifetime::owned)
+    {
+      seedMachine = {};
+      if (failure) failure->assign("local authority recovery local peer identity is not one owned VM Brain"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   bool bootstrapLocalClusterMachine(const MothershipProdigyCluster& cluster, const ClusterTopology& currentTopology, ClusterMachine& localMachine, String& failure)
   {
     failure.clear();
@@ -12395,8 +12447,11 @@ private:
   bool readRoutableSubnets(const MothershipProdigyCluster& cluster,
                            RoutableSubnetRegistryReport& report, String& failure)
   {
-    report = {}; socket.close(); String targetName = cluster.name;
-    if (!configureControlTarget(targetName.c_str(), &failure) || !socket.ensureConnected()) return false;
+    report = {}; socket.close();
+    // Callers already resolved this exact cluster record. Configuring from it
+    // avoids opening the exclusive cluster registry again while a caller holds
+    // the BGP origin-policy lock and registry handle across this observation.
+    if (!socket.configureCluster(cluster, &failure) || !socket.ensureConnected()) return false;
     Message::construct(socket.wBuffer, MothershipTopic::pullRoutableSubnets);
     if (!socket.send()) { failure = socket.ioFailureDetail(); socket.close(); return false; }
     Message *response = socket.recvExpectedTopic(MothershipTopic::pullRoutableSubnets);
@@ -14136,7 +14191,7 @@ private:
     }
 
     ClusterMachine seedMachine = {};
-    if (valid) valid = buildLocalClusterMachineProbe(cluster, seedMachine, &failure) && seedMachine.uuid != 0;
+    if (valid) valid = findLocalAuthorityRecoverySeedMachine(cluster.topology, seedMachine, &failure);
     Vector<LocalAuthorityRecoveryTarget> targets = {};
     if (valid)
     {
@@ -25439,16 +25494,82 @@ private:
     }
   }
 
+  void runAuthorizeBGPOriginPrefix(int argc, char *argv[])
+  {
+    if (argc < 2) { basics_log("usage: authorizeBGPOriginPrefix [cluster] [canonical CIDR]\n"); exit(EXIT_FAILURE); }
+    MothershipProdigyCluster cluster = {}; String failure = {};
+    MothershipClusterRegistry::BGPOriginPolicyLock policyLock = {};
+    IPPrefix prefix = {};
+    char canonicalPrefix[INET6_ADDRSTRLEN + 8] = {};
+    if (!parseRoutablePrefixLiteral(argv[1], prefix) || std::strchr(argv[1], '/') == nullptr ||
+        prefix.cidr > (prefix.network.is6 ? 128 : 32) || !prefix.equals(prefix.canonicalized()) ||
+        !formatCIDRPrefix(prefix, canonicalPrefix, sizeof(canonicalPrefix)) || std::strcmp(argv[1], canonicalPrefix) != 0)
+    { basics_log("authorizeBGPOriginPrefix requires a canonical CIDR prefix\n"); exit(EXIT_FAILURE); }
+    bool created = false;
+    {
+      MothershipClusterRegistry registry = openClusterRegistry();
+      if (!registry.lockBGPOriginPolicy(policyLock, &failure))
+      { basics_log("authorizeBGPOriginPrefix lock failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
+      if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) || !cluster.bgp.config.enabled)
+      { basics_log("authorizeBGPOriginPrefix requires a registered BGP-enabled cluster\n"); exit(EXIT_FAILURE); }
+      bool exists = false;
+      for (const IPPrefix& existing : cluster.bgpAuthorizedOriginPrefixes)
+        if (existing.equals(prefix)) { exists = true; break; }
+      if (!exists)
+      {
+        if (cluster.bgpAuthorizedOriginPrefixes.size() >= 256) { basics_log("authorizeBGPOriginPrefix registry full\n"); exit(EXIT_FAILURE); }
+        cluster.bgpAuthorizedOriginPrefixes.push_back(prefix);
+        created = true;
+      }
+      if (created && !registry.upsertClusterBGPOriginPolicy(cluster, policyLock, nullptr, &failure))
+      { basics_log("authorizeBGPOriginPrefix persist failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    }
+    basics_log("authorizeBGPOriginPrefix success=1 created=%u\n", unsigned(created));
+  }
+
+  void runRevokeBGPOriginPrefix(int argc, char *argv[])
+  {
+    if (argc < 2) { basics_log("usage: revokeBGPOriginPrefix [cluster] [canonical CIDR]\n"); exit(EXIT_FAILURE); }
+    MothershipProdigyCluster cluster = {}; String failure = {};
+    MothershipClusterRegistry::BGPOriginPolicyLock policyLock = {};
+    IPPrefix prefix = {};
+    char canonicalPrefix[INET6_ADDRSTRLEN + 8] = {};
+    if (!parseRoutablePrefixLiteral(argv[1], prefix) || std::strchr(argv[1], '/') == nullptr || !prefix.equals(prefix.canonicalized()) ||
+        !formatCIDRPrefix(prefix, canonicalPrefix, sizeof(canonicalPrefix)) || std::strcmp(argv[1], canonicalPrefix) != 0)
+    { basics_log("revokeBGPOriginPrefix requires canonical CIDR prefix\n"); exit(EXIT_FAILURE); }
+    MothershipClusterRegistry registry = openClusterRegistry();
+    if (!registry.lockBGPOriginPolicy(policyLock, &failure))
+    { basics_log("revokeBGPOriginPrefix lock failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    if (!registry.getClusterByIdentity(String(argv[0]), cluster, &failure) || !cluster.bgp.config.enabled)
+    { basics_log("revokeBGPOriginPrefix requires a registered BGP-enabled cluster\n"); exit(EXIT_FAILURE); }
+    RoutableSubnetRegistryReport active = {};
+    if (!readRoutableSubnets(cluster, active, failure)) { basics_log("revokeBGPOriginPrefix cannot verify active prefixes: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    for (const auto& subnet : active.subnets)
+      if (subnet.ingressScope == RoutableIngressScope::switchboardFleet && subnet.subnet.equals(prefix))
+      { basics_log("revokeBGPOriginPrefix prefix remains actively registered\n"); exit(EXIT_FAILURE); }
+    bool removed = false;
+    for (auto it = cluster.bgpAuthorizedOriginPrefixes.begin(); it != cluster.bgpAuthorizedOriginPrefixes.end(); ++it)
+      if (it->equals(prefix)) { cluster.bgpAuthorizedOriginPrefixes.erase(it); removed = true; break; }
+    if (!removed) { basics_log("revokeBGPOriginPrefix prefix is not authorized\n"); exit(EXIT_FAILURE); }
+    if (!registry.upsertClusterBGPOriginPolicy(cluster, policyLock, nullptr, &failure))
+    { basics_log("revokeBGPOriginPrefix persist failed: %s\n", failure.c_str()); exit(EXIT_FAILURE); }
+    basics_log("revokeBGPOriginPrefix success=1 removed=%d\n", int(removed));
+  }
+
+  void runListBGPOriginPrefixes(int argc, char *argv[])
+  {
+    if (argc < 1) { basics_log("usage: listBGPOriginPrefixes [cluster]\n"); exit(EXIT_FAILURE); }
+    MothershipProdigyCluster cluster = {}; String failure = {};
+    if (!openClusterRegistry().getClusterByIdentity(String(argv[0]), cluster, &failure)) { basics_log("listBGPOriginPrefixes unknown cluster\n"); exit(EXIT_FAILURE); }
+    basics_log("listBGPOriginPrefixes success=1 count=%u\n", unsigned(cluster.bgpAuthorizedOriginPrefixes.size()));
+    for (const IPPrefix& prefix : cluster.bgpAuthorizedOriginPrefixes) { char text[INET6_ADDRSTRLEN + 8] = {}; formatCIDRPrefix(prefix, text, sizeof(text)); basics_log("  %s\n", text); }
+  }
+
   void runRegisterRoutableSubnet(int argc, char *argv[])
   {
     if (argc < 2)
     {
       basics_log("too few arguments. ex: registerRoutableSubnet [target: local|clusterName|clusterUUID] [json]\n");
-      exit(EXIT_FAILURE);
-    }
-
-    if (configureControlTarget(argv[0]) == false)
-    {
       exit(EXIT_FAILURE);
     }
 
@@ -25721,6 +25842,63 @@ private:
     if (request.subnet.kind == RoutablePrefixKind::BGP && routableExternalSubnetHasSupportedBreadth(request.subnet) == false)
     {
       basics_log("registerRoutableSubnet prefix CIDR is invalid\n");
+      exit(EXIT_FAILURE);
+    }
+
+    // Fleet BGP origin authorization belongs to Mothership. Keep one
+    // process-shared lock from the exact durable policy decision through the
+    // Brain response so a concurrent revoke cannot pass its active-prefix
+    // check while this registration is in flight. Brain still requires an
+    // active authenticated Mothership control stream before accepting fleet
+    // registrations; no BrainConfig wire or persisted-state codec changes.
+    MothershipClusterRegistry::BGPOriginPolicyLock originPolicyLock = {};
+    if (request.subnet.ingressScope == RoutableIngressScope::switchboardFleet)
+    {
+      String failure = {};
+      String clusterIdentity = {};
+      const bool localTarget = std::strcmp(argv[0], "local") == 0;
+      if (localTarget)
+      {
+        if (!socket.setLocal(&failure) || socket.configuredClusterUUID() == 0)
+        {
+          basics_log("registerRoutableSubnet cannot resolve local cluster policy identity: %s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+        clusterIdentity.assignItoh(socket.configuredClusterUUID());
+      }
+      else
+      {
+        clusterIdentity.assign(argv[0]);
+      }
+
+      MothershipProdigyCluster cluster = {};
+      {
+        MothershipClusterRegistry registry = openClusterRegistry();
+        if (!registry.lockBGPOriginPolicy(originPolicyLock, &failure))
+        {
+          basics_log("registerRoutableSubnet BGP origin policy lock failed: %s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+        if (!registry.getClusterByIdentity(clusterIdentity, cluster, &failure))
+        {
+          basics_log("registerRoutableSubnet unknown BGP policy cluster: %s\n", failure.c_str());
+          exit(EXIT_FAILURE);
+        }
+        if (!mothershipClusterAuthorizesBGPOriginPrefix(cluster, request.subnet.subnet))
+        {
+          basics_log("registerRoutableSubnet exact fleet BGP origin prefix is not authorized\n");
+          exit(EXIT_FAILURE);
+        }
+      }
+
+      if (!localTarget && !socket.configureCluster(cluster, &failure))
+      {
+        basics_log("registerRoutableSubnet cluster has invalid control configuration: %s\n", failure.c_str());
+        exit(EXIT_FAILURE);
+      }
+    }
+    else if (configureControlTarget(argv[0]) == false)
+    {
       exit(EXIT_FAILURE);
     }
 
@@ -27047,6 +27225,7 @@ public:
         {"admitTestPairTarget",             &Mothership::runAdmitTestPairTarget            },
         {"adoptTestClusterSpare",            &Mothership::runAdoptTestClusterSpare           },
         {"applicationReport",               &Mothership::runApplicationReport              },
+        {"authorizeBGPOriginPrefix",        &Mothership::runAuthorizeBGPOriginPrefix       },
         {"cancelDeployment",                &Mothership::runCancelDeployment               },
         {"clusterReport",                   &Mothership::runClusterReport                  },
         {"containerLogs",                   &Mothership::runContainerLogs                  },
@@ -27071,6 +27250,7 @@ public:
         {"faultTestClusters",               &Mothership::runFaultTestClusters              },
         {"inspectLocalVMBoundaries",        &Mothership::runInspectLocalVMBoundaries       },
         {"inspectUpgradeBundle",            &Mothership::runInspectUpgradeBundle           },
+        {"listBGPOriginPrefixes",           &Mothership::runListBGPOriginPrefixes          },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
@@ -27106,6 +27286,7 @@ public:
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
         {"retireAdditionalIngressLocal",    &Mothership::runRetireAdditionalIngressLocal   },
         {"retireTestPairSource",            &Mothership::runRetireTestPairSource           },
+        {"revokeBGPOriginPrefix",           &Mothership::runRevokeBGPOriginPrefix          },
         {"revokeClusterPair",               &Mothership::runRevokeClusterPair              },
         {"rotateClusterPairEpoch",          &Mothership::runRotateClusterPairEpoch         },
         {"setLocalClusterMembership",       &Mothership::runSetLocalClusterMembership      },
@@ -27166,7 +27347,7 @@ int main(int argc, char *argv[])
   if (argc < 2)
   {
     constexpr static char usage[] =
-        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
+        "must be called like: ./mothership [operation: help, createProviderCredential, pullProviderCredential, pullProviderCredentials, removeProviderCredential, destroyProviderMachines, destroyProviderClusterMachines, surveyProviderMachineOffers, estimateClusterHourlyCost, recommendClusterForApplications, createCluster, printClusters, setLocalClusterMembership, setTestClusterMachineCount, faultClusterNetwork, faultLocalClusterMachine, faultRemoteCloudMachine, faultTestCluster, faultTestClusters, prepareProductionPair, productionPair, registerLocalVMBoundary, inspectLocalVMBoundaries, probeTestCluster, upsertMachineSchemas, deltaMachineBudget, deleteMachineSchema, removeCluster, deploy, applicationReport, cancelDeployment, recoverLocalClusterAuthority, recoverMaterializedStatefulDeployment, recoverTestClusterBundle, recoverTestClusterFollowerBrain, taskReport, containerLogs, credentialExpiryNotifications, clusterReport, updateProdigy, reserveApplicationID, reserveServiceID, authorizeBGPOriginPrefix, revokeBGPOriginPrefix, listBGPOriginPrefixes, registerRoutableSubnet, unregisterRoutableSubnet, pullRoutableSubnets, pullRoutableResourceLeases, upsertDNSBinding, deleteDNSBinding, pullDNSBindings, upsertTlsVaultFactory, upsertApiCredentialSet, mintClientTlsIdentity, acme-present-dns-01, acme-cleanup-dns-01, acme-import-lineage]";
     std::fwrite(usage, 1, sizeof(usage) - 1, stdout);
     exit(EXIT_FAILURE);
   }
@@ -27297,6 +27478,12 @@ int main(int argc, char *argv[])
     message.append("\treserves and returns an applicationID for an application name\n");
     message.append("reserveServiceID [target: dev|prod|local|clusterName|clusterUUID] [json|-|@path]\n");
     message.append("\treserves and returns a serviceID for a reserved application service name\n");
+    message.append("authorizeBGPOriginPrefix [clusterName|clusterUUID] [canonical CIDR]\n");
+    message.append("\tpersists one exact Mothership-owned prefix that the cluster may originate through fleet BGP\n");
+    message.append("revokeBGPOriginPrefix [clusterName|clusterUUID] [canonical CIDR]\n");
+    message.append("\trevokes an inactive exact prefix; fails while that prefix remains registered in the cluster\n");
+    message.append("listBGPOriginPrefixes [clusterName|clusterUUID]\n");
+    message.append("\tlists the cluster's durable exact fleet-BGP origin allowlist\n");
     message.append("registerRoutableSubnet [target: local|clusterName|clusterUUID] [json]\n");
     message.append("\tregisters or updates a routable prefix; BGP json.prefix may be CIDR or bare IP; elastic requires json.family and json.elasticIntent any|create|anyOrCreate; json.usage must be wormholes, whiteholes, or both; singleMachine may omit machineUUID only in a one-machine cluster\n");
     message.append("unregisterRoutableSubnet [target: local|clusterName|clusterUUID] [name]\n");

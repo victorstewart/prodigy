@@ -951,6 +951,15 @@ public:
   }
 };
 
+class BGPEnabledNoopBrainIaaS final : public NoopBrainIaaS {
+public:
+
+  bool bgpEnabledForEnvironment(void) const override
+  {
+    return true;
+  }
+};
+
 class TrackingBrainIaaS final : public NoopBrainIaaS {
 public:
 
@@ -16134,6 +16143,71 @@ static void testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(TestSuite& 
   Message::extractToStringView(responseArgs, serializedResponse);
   suite.expect(BitseryEngine::deserializeSafe(serializedResponse, response), "mothership_register_routable_prefix_ambiguous_deserializes_response");
   suite.expect(response.success == false, "mothership_register_routable_prefix_rejects_ambiguous_single_machine_owner");
+}
+
+static void testRegisterRoutablePrefixRequiresActiveMothershipForFleetBGP(TestSuite& suite)
+{
+  ScopedFreshRing scopedRing = {};
+  ScopedSocketPair mothershipSockets = {};
+  TestBrain brain;
+  Mothership mothership;
+  BGPEnabledNoopBrainIaaS iaas;
+  if (suite.require(mothershipSockets.create(suite, "mothership_register_fleet_bgp_creates_socket"),
+                    "mothership_register_fleet_bgp_requires_socket") == false)
+  {
+    return;
+  }
+  brain.iaas = &iaas;
+  brain.weAreMaster = true;
+  brain.noMasterYet = false;
+  brain.brainConfig.clusterUUID = uint128_t(0xB6701);
+  mothership.isFixedFile = true;
+  mothership.fslot = mothershipSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(mothership.fslot >= 0, "mothership_register_fleet_bgp_adopts_socket") == false)
+  {
+    return;
+  }
+
+  RoutableSubnetRegistration request = {};
+  request.subnet.name.assign("fleet-bgp-origin-prefix"_ctv);
+  request.subnet.kind = RoutablePrefixKind::BGP;
+  request.subnet.subnet = IPPrefix("198.51.100.0", false, 24);
+  request.subnet.usage = ExternalSubnetUsage::wormholes;
+  request.subnet.ingressScope = RoutableIngressScope::switchboardFleet;
+  request.subnet.routing = ExternalSubnetRouting::switchboardBGP;
+
+  auto dispatch = [&](const RoutableSubnetRegistration& submitted, RoutableSubnetRegistration& response) -> bool {
+    String serialized = {};
+    RoutableSubnetRegistration requestCopy = submitted;
+    BitseryEngine::serialize(serialized, requestCopy);
+    String messageBuffer = {};
+    Message *message = buildMothershipMessage(messageBuffer, MothershipTopic::registerRoutableSubnet, serialized);
+    mothership.wBuffer.clear();
+    brain.mothershipHandler(&mothership, message);
+    if (mothership.wBuffer.size() < sizeof(Message)) return false;
+    Message *reply = reinterpret_cast<Message *>(mothership.wBuffer.data());
+    String replyBytes = {};
+    uint8_t *replyArgs = reply->args;
+    Message::extractToStringView(replyArgs, replyBytes);
+    response = {};
+    return BitseryEngine::deserializeSafe(replyBytes, response);
+  };
+
+  RoutableSubnetRegistration response = {};
+  suite.expect(dispatch(request, response) && response.success == false &&
+                   response.failure.equal("switchboardFleet routable prefix registration requires an active Mothership control stream"_ctv),
+               "mothership_register_fleet_bgp_rejects_inactive_mothership_stream");
+
+  if (suite.require(brain.activateMothershipConnection(&mothership),
+                    "mothership_register_fleet_bgp_activates_authenticated_stream") == false)
+  {
+    return;
+  }
+  suite.expect(dispatch(request, response) && response.success && response.created,
+               "mothership_register_fleet_bgp_accepts_active_mothership_stream");
+  suite.expect(brain.brainConfig.distributableExternalSubnets.size() == 1,
+               "mothership_register_fleet_bgp_persists_prefix_from_active_stream");
+  brain.activeMotherships.erase(&mothership);
 }
 
 static void testElasticSnapshotPersistenceRetriesSameGeneration(TestSuite& suite)
@@ -37567,6 +37641,18 @@ int main(void)
     testSuspendableResumeQueuesAdoptedBootstrapOnOwner(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only && strcmp(only, "routable-fleet-mothership") == 0)
+  {
+    TestSuite suite;
+    TestNeuron elasticTestSelf;
+    elasticTestSelf.uuid = uint128_t(0x3360);
+    NeuronBase *previousNeuron = thisNeuron;
+    thisNeuron = &elasticTestSelf;
+    testRegisterRoutablePrefixRequiresActiveMothershipForFleetBGP(suite);
+    thisNeuron = previousNeuron;
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   TestSuite suite;
   testMachineInventoryCopyDoesNotCopyTransport(suite);
   testClusterPairEpochOperationCodec(suite);
@@ -38371,6 +38457,7 @@ int main(void)
     NeuronBase *previousNeuron = thisNeuron;
     thisNeuron = &elasticTestSelf;
     testRegisterRoutablePrefixAcceptsSingleMachineHostPrefix(suite);
+    testRegisterRoutablePrefixRequiresActiveMothershipForFleetBGP(suite);
     testElasticSnapshotPersistenceRetriesSameGeneration(suite);
     testCombinedMasterAuthorityAuthorizationAndAckBinding(suite);
     testOrdinaryUpgradeAuthorityAdmission(suite);

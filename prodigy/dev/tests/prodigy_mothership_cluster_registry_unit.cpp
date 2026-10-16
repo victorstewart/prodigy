@@ -119,6 +119,22 @@ static bool equalEnvironmentBGP(const ProdigyEnvironmentBGPConfig& lhs, const Pr
   return lhs == rhs;
 }
 
+static bool equalIPPrefixes(const Vector<IPPrefix>& lhs, const Vector<IPPrefix>& rhs)
+{
+  if (lhs.size() != rhs.size())
+  {
+    return false;
+  }
+  for (uint32_t index = 0; index < lhs.size(); ++index)
+  {
+    if (lhs[index].equals(rhs[index]) == false)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool equalOSUpdatePolicies(const Vector<OperatingSystemUpdatePolicy>& lhs, const Vector<OperatingSystemUpdatePolicy>& rhs)
 {
   if (lhs.size() != rhs.size())
@@ -298,7 +314,7 @@ static NeuronBGPPeerConfig makeEnvironmentBGPPeer(const char *peerAddress, const
 
 static bool equalClusters(const MothershipProdigyCluster& lhs, const MothershipProdigyCluster& rhs)
 {
-  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalACMEConfig(lhs.acme, rhs.acme) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && equalMothershipConnectivity(lhs.mothershipConnectivity, rhs.mothershipConnectivity) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.machineReservedResources == rhs.machineReservedResources && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
+  return lhs.name.equals(rhs.name) && lhs.clusterUUID == rhs.clusterUUID && lhs.deploymentMode == rhs.deploymentMode && lhs.architecture == rhs.architecture && lhs.includeLocalMachine == rhs.includeLocalMachine && lhs.provider == rhs.provider && lhs.providerScope.equals(rhs.providerScope) && lhs.providerCredentialName.equals(rhs.providerCredentialName) && lhs.propagateProviderCredentialToProdigy == rhs.propagateProviderCredentialToProdigy && lhs.dnsProvider == rhs.dnsProvider && lhs.dnsProviderCredentialName.equals(rhs.dnsProviderCredentialName) && equalACMEConfig(lhs.acme, rhs.acme) && equalAwsConfig(lhs.aws, rhs.aws) && equalGcpConfig(lhs.gcp, rhs.gcp) && equalAzureConfig(lhs.azure, rhs.azure) && equalControls(lhs.controls, rhs.controls) && equalMothershipConnectivity(lhs.mothershipConnectivity, rhs.mothershipConnectivity) && lhs.nBrains == rhs.nBrains && equalMachineSchemas(lhs.machineSchemas, rhs.machineSchemas) && equalMachines(lhs.machines, rhs.machines) && lhs.topology == rhs.topology && lhs.bootstrapSshUser.equals(rhs.bootstrapSshUser) && lhs.bootstrapSshKeyPackage == rhs.bootstrapSshKeyPackage && lhs.bootstrapSshHostKeyPackage == rhs.bootstrapSshHostKeyPackage && lhs.bootstrapSshPrivateKeyPath.equals(rhs.bootstrapSshPrivateKeyPath) && lhs.remoteProdigyPath.equals(rhs.remoteProdigyPath) && lhs.sharedCPUOvercommitPermille == rhs.sharedCPUOvercommitPermille && lhs.machineReservedResources == rhs.machineReservedResources && lhs.osUpdatesEnabled == rhs.osUpdatesEnabled && equalOSUpdatePolicies(lhs.osUpdatePolicies, rhs.osUpdatePolicies) && lhs.maxOSDrains == rhs.maxOSDrains && lhs.machineUpdateCadenceMins == rhs.machineUpdateCadenceMins && equalEnvironmentBGP(lhs.bgp, rhs.bgp) && equalIPPrefixes(lhs.bgpAuthorizedOriginPrefixes, rhs.bgpAuthorizedOriginPrefixes) && equalTestConfig(lhs.test, rhs.test) && lhs.desiredEnvironment == rhs.desiredEnvironment && lhs.environmentConfigured == rhs.environmentConfigured && lhs.lastRefreshMs == rhs.lastRefreshMs && lhs.lastRefreshFailure.equals(rhs.lastRefreshFailure);
 }
 
 static void assignFixtureBootstrapSSHKeyPackage(MothershipProdigyCluster& cluster)
@@ -852,6 +868,7 @@ int main(void)
   remoteVultrBGP.aws = {};
   remoteVultrBGP.propagateProviderCredentialToProdigy = true;
   remoteVultrBGP.bgp = localAdopted.bgp;
+  remoteVultrBGP.bgpAuthorizedOriginPrefixes.push_back(IPPrefix("2602:fac0::", true, 40));
   remoteVultrBGP.desiredEnvironment = ProdigyEnvironmentKind::vultr;
   remoteVultrBGP.lastRefreshMs = 0;
 
@@ -1335,6 +1352,41 @@ int main(void)
     storedRemoteVultrBGP.clusterUUID = createdCluster.clusterUUID;
     suite.expect(equalClusters(storedRemoteVultrBGP, createdCluster), "create_remote_vultr_bgp_normalized");
 
+    MothershipProdigyCluster duplicateBGPOrigin = createdCluster;
+    duplicateBGPOrigin.bgpAuthorizedOriginPrefixes.push_back(
+        duplicateBGPOrigin.bgpAuthorizedOriginPrefixes[0]);
+    {
+      MothershipClusterRegistry::BGPOriginPolicyLock duplicatePolicyLock = {};
+      suite.expect(registry.lockBGPOriginPolicy(duplicatePolicyLock, &failure) &&
+                       !registry.upsertClusterBGPOriginPolicy(duplicateBGPOrigin, duplicatePolicyLock, nullptr, &failure) &&
+                       failure.equals("BGP origin authorization prefixes must be unique"_ctv),
+                   "upsert_rejects_duplicate_bgp_origin_prefix");
+    }
+
+    MothershipProdigyCluster noncanonicalBGPOrigin = createdCluster;
+    noncanonicalBGPOrigin.bgpAuthorizedOriginPrefixes[0] = IPPrefix("2602:fac0::1", true, 40);
+    {
+      MothershipClusterRegistry::BGPOriginPolicyLock noncanonicalPolicyLock = {};
+      suite.expect(registry.lockBGPOriginPolicy(noncanonicalPolicyLock, &failure) &&
+                       !registry.upsertClusterBGPOriginPolicy(noncanonicalBGPOrigin, noncanonicalPolicyLock, nullptr, &failure) &&
+                       failure.equals("BGP origin authorization prefixes must be canonical"_ctv),
+                   "upsert_rejects_noncanonical_bgp_origin_prefix");
+    }
+
+    MothershipProdigyCluster disabledBGPOrigin = createdCluster;
+    disabledBGPOrigin.bgp.config.enabled = false;
+    suite.expect(!registry.upsertCluster(disabledBGPOrigin, nullptr, &failure) &&
+                     failure.equals("BGP origin authorization requires an enabled BGP configuration and at most 256 prefixes"_ctv),
+                 "upsert_rejects_bgp_origin_policy_when_bgp_disabled");
+
+    MothershipProdigyCluster staleOrdinaryUpdate = createdCluster;
+    staleOrdinaryUpdate.bgpAuthorizedOriginPrefixes.clear();
+    MothershipProdigyCluster preservedOrdinaryUpdate = {};
+    suite.expect(registry.upsertCluster(staleOrdinaryUpdate, &preservedOrdinaryUpdate, &failure) &&
+                     equalIPPrefixes(preservedOrdinaryUpdate.bgpAuthorizedOriginPrefixes,
+                                     createdCluster.bgpAuthorizedOriginPrefixes),
+                 "ordinary_upsert_preserves_durable_bgp_origin_policy");
+
     bool createInvalidSharedCPUOvercommit = registry.createCluster(invalidSharedCPUOvercommit, nullptr, &failure);
     suite.expect(createInvalidSharedCPUOvercommit == false, "create_invalid_shared_cpu_overcommit_rejected");
     suite.expect(failure.equals("sharedCpuOvercommit must be in 1.0..2.0"_ctv), "create_invalid_shared_cpu_overcommit_reason");
@@ -1382,6 +1434,89 @@ int main(void)
   }
 
   {
+    constexpr auto v7Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=7\n\n"_ctv;
+    String encoded = {};
+    String failure = {};
+    {
+      TidesDB database(dbPath);
+      suite.expect(database.read("clusters"_ctv, remoteVultrBGP.name, encoded, &failure),
+                   "bgp_origin_policy_v7_record_read");
+    }
+    const bool hasV7Header = encoded.size() >= v7Header.size() &&
+        std::memcmp(encoded.data(), v7Header.data(), v7Header.size()) == 0;
+    suite.expect(hasV7Header, "bgp_origin_policy_v7_header");
+
+    MothershipProdigyCluster loaded = {};
+    suite.expect(MothershipClusterRegistry(dbPath).getCluster(remoteVultrBGP.name, loaded, &failure) &&
+                     equalClusters(storedRemoteVultrBGP, loaded),
+                 "bgp_origin_policy_v7_roundtrip");
+    suite.expect(mothershipClusterAuthorizesBGPOriginPrefix(
+                     loaded, IPPrefix("2602:fac0::", true, 40)),
+                 "bgp_origin_policy_authorizes_exact_prefix");
+    suite.expect(!mothershipClusterAuthorizesBGPOriginPrefix(
+                     loaded, IPPrefix("2602:fac0:1::", true, 48)),
+                 "bgp_origin_policy_rejects_more_specific_prefix");
+    suite.expect(!mothershipClusterAuthorizesBGPOriginPrefix(
+                     loaded, IPPrefix("2001:db8::", true, 32)),
+                 "bgp_origin_policy_rejects_foreign_prefix");
+    MothershipProdigyCluster disabled = loaded;
+    disabled.bgp.config.enabled = false;
+    suite.expect(!mothershipClusterAuthorizesBGPOriginPrefix(
+                     disabled, IPPrefix("2602:fac0::", true, 40)),
+                 "bgp_origin_policy_requires_enabled_bgp");
+
+    String malformedDbPath = {};
+    malformedDbPath.snprintf<"{}/malformed-v7"_ctv>(dbPath);
+    auto writeAndRejectV7 = [&](const String& key, MothershipProdigyClusterRecordV7& record) {
+      String payload = {};
+      BitseryEngine::serialize(payload, record);
+      String value = {};
+      value.assign(v7Header);
+      value.append(payload);
+      {
+        TidesDB database(malformedDbPath);
+        suite.expect(database.write("clusters"_ctv, key, value, &failure),
+                     "bgp_origin_policy_malformed_v7_written");
+      }
+      MothershipProdigyCluster ignored = {};
+      return !MothershipClusterRegistry(malformedDbPath).getCluster(key, ignored, &failure);
+    };
+    auto makeV7 = [&]() {
+      MothershipProdigyClusterRecordV7 record = {};
+      record.cluster = storedRemoteVultrBGP;
+      record.internalTransportProfile = storedRemoteVultrBGP.internalTransportProfile;
+      record.spareMachineCount = storedRemoteVultrBGP.test.spareMachineCount;
+      for (const auto& machine : storedRemoteVultrBGP.machines)
+      {
+        record.adoptedMachineRackUUIDs.push_back(machine.rackUUID);
+        record.adoptedMachineUUIDs.push_back(machine.uuid);
+      }
+      record.bgpAuthorizedOriginPrefixes = storedRemoteVultrBGP.bgpAuthorizedOriginPrefixes;
+      return record;
+    };
+
+    MothershipProdigyClusterRecordV7 duplicate = makeV7();
+    duplicate.bgpAuthorizedOriginPrefixes.push_back(duplicate.bgpAuthorizedOriginPrefixes[0]);
+    suite.expect(writeAndRejectV7("duplicate-prefix-v7"_ctv, duplicate),
+                 "bgp_origin_policy_v7_rejects_duplicate_prefix");
+
+    MothershipProdigyClusterRecordV7 noncanonical = makeV7();
+    noncanonical.bgpAuthorizedOriginPrefixes[0] = IPPrefix("2602:fac0::1", true, 40);
+    suite.expect(writeAndRejectV7("noncanonical-prefix-v7"_ctv, noncanonical),
+                 "bgp_origin_policy_v7_rejects_noncanonical_prefix");
+
+    MothershipProdigyClusterRecordV7 disabledBGP = makeV7();
+    disabledBGP.cluster.bgp.config.enabled = false;
+    suite.expect(writeAndRejectV7("disabled-bgp-v7"_ctv, disabledBGP),
+                 "bgp_origin_policy_v7_rejects_disabled_bgp");
+
+    MothershipProdigyClusterRecordV7 invalidSpare = makeV7();
+    invalidSpare.spareMachineCount = 1;
+    suite.expect(writeAndRejectV7("invalid-spare-v7"_ctv, invalidSpare),
+                 "bgp_origin_policy_v7_rejects_invalid_spare_sidecar");
+  }
+
+  {
     constexpr auto v6Header = "PRODIGY-MOTHERSHIP-CLUSTER\nversion=6\n\n"_ctv;
     String spareDbPath = {};
     spareDbPath.snprintf<"{}/test-spare-v6"_ctv>(dbPath);
@@ -1416,6 +1551,7 @@ int main(void)
     suite.expect(hasV6Header, "test_spare_v6_header");
     MothershipProdigyCluster loadedSpare = {};
     suite.expect(MothershipClusterRegistry(spareDbPath).getCluster(spare.name, loadedSpare, &failure) && equalClusters(storedSpare, loadedSpare), "test_spare_v6_roundtrip");
+    suite.expect(loadedSpare.bgpAuthorizedOriginPrefixes.empty(), "test_spare_v6_defaults_empty_bgp_origin_policy");
 
     MothershipProdigyClusterRecordV6 invalidV6 = {};
     invalidV6.cluster = storedSpare;
@@ -1519,6 +1655,8 @@ int main(void)
     suite.expect(readProfile(aegisLoaded) &&
                      aegisLoaded.internalTransportProfile == MothershipInternalTransportProfile::aegisX25519V1,
                  "aegis_profile_v5_roundtrip");
+    suite.expect(aegisLoaded.bgpAuthorizedOriginPrefixes.empty(),
+                 "aegis_profile_v5_defaults_empty_bgp_origin_policy");
 
     aegisRecord.internalTransportProfile = MothershipInternalTransportProfile(99);
     BitseryEngine::serialize(aegisPayload, aegisRecord);
@@ -1539,6 +1677,8 @@ int main(void)
                      readProfile(aegisLoaded) &&
                      aegisLoaded.internalTransportProfile == MothershipInternalTransportProfile::tls,
                  "aegis_profile_v4_defaults_tls");
+    suite.expect(aegisLoaded.bgpAuthorizedOriginPrefixes.empty(),
+                 "aegis_profile_v4_defaults_empty_bgp_origin_policy");
     failure.clear();
 
     MothershipProdigyClusterRecordV4 malformedRecord = {};

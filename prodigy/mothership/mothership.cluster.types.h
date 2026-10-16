@@ -311,6 +311,9 @@ public:
   uint32_t maxOSDrains = 1;
   uint32_t machineUpdateCadenceMins = 15;
   ProdigyEnvironmentBGPConfig bgp;
+  // Mothership-only origin authority; deliberately outside the base cluster
+  // codec so BrainConfig and runtime-environment bytes stay unchanged.
+  Vector<IPPrefix> bgpAuthorizedOriginPrefixes;
   MothershipProdigyClusterTestConfig test;
 
   ProdigyEnvironmentKind desiredEnvironment = ProdigyEnvironmentKind::unknown;
@@ -319,6 +322,23 @@ public:
   int64_t lastRefreshMs = 0;
   String lastRefreshFailure;
 };
+
+static inline bool mothershipClusterAuthorizesBGPOriginPrefix(
+    const MothershipProdigyCluster& cluster, const IPPrefix& requested)
+{
+  if (cluster.bgp.config.enabled == false || !requested.equals(requested.canonicalized()))
+  {
+    return false;
+  }
+  for (const IPPrefix& authorized : cluster.bgpAuthorizedOriginPrefixes)
+  {
+    if (authorized.equals(requested))
+    {
+      return true;
+    }
+  }
+  return false;
+}
 
 template <typename S>
 static void serialize(S&& serializer, MothershipProdigyCluster& cluster)

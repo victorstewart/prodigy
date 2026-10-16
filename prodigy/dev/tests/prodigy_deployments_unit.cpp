@@ -7504,6 +7504,184 @@ int main(void)
     TestBrain brain;
     BrainBase *savedBrain = thisBrain;
     thisBrain = &brain;
+
+    ApplicationDeployment deployment = {};
+    seedCommonPlan(deployment, true);
+    deployment.plan.config.applicationID = 7'812;
+    deployment.plan.config.versionID = 2;
+    deployment.plan.config.type = ApplicationType::stateful;
+    deployment.plan.whiteholes.resize(1);
+    deployment.plan.whiteholes[0].transport = ExternalAddressTransport::tcp;
+    deployment.plan.whiteholes[0].family = ExternalAddressFamily::ipv4;
+    deployment.plan.whiteholes[0].source = ExternalAddressSource::hostPublicAddress;
+
+    Rack rack = {};
+    rack.uuid = 7'812;
+    Machine machine = {};
+    machine.uuid = uint128_t(0x78120001);
+    machine.rack = &rack;
+    machine.state = MachineState::healthy;
+    machine.lifetime = MachineLifetime::owned;
+    rack.machines.insert(&machine);
+    brain.racks.insert_or_assign(rack.uuid, &rack);
+    brain.machines.insert(&machine);
+    brain.deployments.insert_or_assign(deployment.plan.config.deploymentID(), &deployment);
+
+    ContainerView *predecessor = new ContainerView();
+    predecessor->uuid = uint128_t(0x78120002);
+    predecessor->applicationID = deployment.plan.config.applicationID;
+    predecessor->deploymentID = deployment.plan.config.deploymentID();
+    predecessor->machine = &machine;
+    predecessor->isStateful = true;
+    predecessor->shardGroup = 0;
+    predecessor->state = ContainerState::healthy;
+    Whitehole binding = deployment.plan.whiteholes[0];
+    binding.hasAddress = true;
+    binding.address = IPAddress("198.18.7.12", false);
+    binding.sourcePort = 49'152;
+    binding.bindingNonce = 0x78120003;
+    predecessor->whiteholes.push_back(binding);
+    deployment.containers.insert(predecessor);
+    deployment.containersByShardGroup.insert(0, predecessor);
+    brain.containers.insert_or_assign(predecessor->uuid, predecessor);
+    machine.upsertContainerIndexEntry(predecessor->deploymentID, predecessor);
+    prodigyDebitMachineScalarResources(&machine, deployment.plan.config, 1);
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(binding, deployment.routableResourceLeaseOwner()),
+                 "stateful_whitehole_failed_transfer_reserves_predecessor_lease");
+
+    DeploymentWork *work = deployment.planStatefulUpdateInPlace(predecessor);
+    StatefulWork *stateful = std::get_if<StatefulWork>(work);
+    ContainerView *successor = stateful ? stateful->container : nullptr;
+    suite.expect(successor != nullptr && deployment.prepareSameMachineStatefulWhiteholeTransfer(predecessor, successor, true),
+                 "stateful_whitehole_failed_transfer_prepares_exact_successor_binding");
+    prodigyDebitMachineScalarResources(&machine, deployment.plan.config, 1);
+    deployment.destructContainer(predecessor);
+    deployment.containerDestroyed(predecessor);
+
+    const uint64_t neuronBytesBeforeCleanup = machine.neuron.wBuffer.size();
+    const int32_t coresBeforeFailure = machine.nLogicalCores_available;
+    const int32_t memoryBeforeFailure = machine.memoryMB_available;
+    const int32_t storageBeforeFailure = machine.storageMB_available;
+    deployment.toSchedule.push_back(work);
+    brain.credentialLaunchAvailable = false;
+    deployment.schedule(nullptr);
+    suite.expect(deployment.state == DeploymentState::failed && brain.failureCount == 1,
+                 "stateful_whitehole_failed_transfer_credential_failure_reaches_scheduler_cleanup");
+    suite.expect(deployment.containers.size() == 0 && deployment.containersByShardGroup.size() == 0 &&
+                     brain.containers.size() == 0 && machine.containersByDeploymentID.size() == 0,
+                 "stateful_whitehole_failed_transfer_removes_all_local_indexes");
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 0,
+                 "stateful_whitehole_failed_transfer_releases_exact_lease");
+    suite.expect(machine.neuron.wBuffer.size() == neuronBytesBeforeCleanup,
+                 "stateful_whitehole_failed_transfer_sends_no_neuron_lifecycle_work");
+    suite.expect(machine.nLogicalCores_available == coresBeforeFailure + int32_t(deployment.plan.config.nLogicalCores) &&
+                     machine.memoryMB_available == memoryBeforeFailure + int32_t(deployment.plan.config.totalMemoryMB()) &&
+                     machine.storageMB_available == storageBeforeFailure + int32_t(deployment.plan.config.totalStorageMB()),
+                 "stateful_whitehole_failed_transfer_cleanup_credits_successor_reservation");
+
+    // A no-Whitehole successor owns a placement reservation but has no
+    // retained binding entry. It still must be retired if launch credentials
+    // fail before its bundle is admitted.
+    deployment.plan.whiteholes.clear();
+    deployment.state = DeploymentState::deploying;
+    brain.credentialLaunchAvailable = true;
+    ContainerView *emptyPredecessor = new ContainerView();
+    emptyPredecessor->uuid = uint128_t(0x78120005);
+    emptyPredecessor->applicationID = deployment.plan.config.applicationID;
+    emptyPredecessor->deploymentID = deployment.plan.config.deploymentID();
+    emptyPredecessor->machine = &machine;
+    emptyPredecessor->isStateful = true;
+    emptyPredecessor->shardGroup = 0;
+    emptyPredecessor->state = ContainerState::healthy;
+    deployment.containers.insert(emptyPredecessor);
+    deployment.containersByShardGroup.insert(0, emptyPredecessor);
+    brain.containers.insert_or_assign(emptyPredecessor->uuid, emptyPredecessor);
+    machine.upsertContainerIndexEntry(emptyPredecessor->deploymentID, emptyPredecessor);
+    prodigyDebitMachineScalarResources(&machine, deployment.plan.config, 1);
+
+    DeploymentWork *emptyWork = deployment.planStatefulUpdateInPlace(emptyPredecessor);
+    StatefulWork *emptyStateful = std::get_if<StatefulWork>(emptyWork);
+    ContainerView *emptySuccessor = emptyStateful ? emptyStateful->container : nullptr;
+    const bool preparedEmptyTransfer = emptySuccessor != nullptr &&
+                                       deployment.prepareSameMachineStatefulWhiteholeTransfer(emptyPredecessor, emptySuccessor, true);
+    const bool emptySuccessorHasNoWhiteholes = emptySuccessor != nullptr && emptySuccessor->whiteholes.empty();
+    prodigyDebitMachineScalarResources(&machine, deployment.plan.config, 1);
+    deployment.destructContainer(emptyPredecessor);
+    deployment.containerDestroyed(emptyPredecessor);
+
+    const uint64_t emptyNeuronBytesBeforeCleanup = machine.neuron.wBuffer.size();
+    const int32_t emptyCoresBeforeFailure = machine.nLogicalCores_available;
+    const int32_t emptyMemoryBeforeFailure = machine.memoryMB_available;
+    const int32_t emptyStorageBeforeFailure = machine.storageMB_available;
+    deployment.toSchedule.push_back(emptyWork);
+    brain.credentialLaunchAvailable = false;
+    deployment.schedule(nullptr);
+    suite.expect(preparedEmptyTransfer && emptySuccessorHasNoWhiteholes && deployment.state == DeploymentState::failed &&
+                     brain.failureCount == 2,
+                 "stateful_no_whitehole_transfer_credential_failure_reaches_reservation_cleanup");
+    suite.expect(deployment.containers.empty() && deployment.containersByShardGroup.size() == 0 && brain.containers.empty() &&
+                     machine.containersByDeploymentID.size() == 0,
+                 "stateful_no_whitehole_transfer_credential_failure_removes_all_local_indexes");
+    suite.expect(machine.neuron.wBuffer.size() == emptyNeuronBytesBeforeCleanup,
+                 "stateful_no_whitehole_transfer_credential_failure_sends_no_neuron_lifecycle_work");
+    suite.expect(machine.nLogicalCores_available == emptyCoresBeforeFailure + int32_t(deployment.plan.config.nLogicalCores) &&
+                     machine.memoryMB_available == emptyMemoryBeforeFailure + int32_t(deployment.plan.config.totalMemoryMB()) &&
+                     machine.storageMB_available == emptyStorageBeforeFailure + int32_t(deployment.plan.config.totalStorageMB()),
+                 "stateful_no_whitehole_transfer_credential_failure_credits_successor_reservation");
+
+    deployment.plan.whiteholes.resize(1);
+    deployment.plan.whiteholes[0] = binding;
+    ContainerView *drainingOwner = new ContainerView();
+    drainingOwner->uuid = uint128_t(0x78120004);
+    drainingOwner->applicationID = deployment.plan.config.applicationID;
+    drainingOwner->deploymentID = deployment.plan.config.deploymentID();
+    drainingOwner->machine = &machine;
+    drainingOwner->isStateful = true;
+    drainingOwner->shardGroup = 0;
+    drainingOwner->state = ContainerState::destroying;
+    drainingOwner->whiteholes.push_back(binding);
+    deployment.containers.insert(drainingOwner);
+    deployment.containersByShardGroup.insert(0, drainingOwner);
+    brain.containers.insert_or_assign(drainingOwner->uuid, drainingOwner);
+    machine.upsertContainerIndexEntry(drainingOwner->deploymentID, drainingOwner);
+    prodigyDebitMachineScalarResources(&machine, deployment.plan.config, 1);
+    suite.expect(deployment.reserveWhiteholeAddressPortLease(binding, deployment.routableResourceLeaseOwner()),
+                 "stateful_whitehole_failed_transfer_reserves_destroying_owner_lease");
+
+    DeploymentWork *abandonedWork = deployment.planStatefulUpdateInPlace(drainingOwner);
+    StatefulWork *abandonedStateful = std::get_if<StatefulWork>(abandonedWork);
+    ContainerView *abandoned = abandonedStateful ? abandonedStateful->container : nullptr;
+    const bool preparedAbandonedTransfer = abandoned != nullptr &&
+                                         deployment.prepareSameMachineStatefulWhiteholeTransfer(drainingOwner, abandoned, false);
+    deployment.destructContainer(drainingOwner);
+    const int32_t coresBeforeUnreservedAbandon = machine.nLogicalCores_available;
+    const int32_t memoryBeforeUnreservedAbandon = machine.memoryMB_available;
+    const int32_t storageBeforeUnreservedAbandon = machine.storageMB_available;
+    deployment.cancelDeploymentWork(abandonedWork);
+    suite.expect(preparedAbandonedTransfer && deployment.abandonUnlaunchedStatefulWhiteholeTransfer(abandoned) &&
+                     brain.routableResourceLeaseRuntimeState.size() == 1,
+                 "stateful_whitehole_failed_transfer_preserves_destroying_owner_lease_until_ack");
+    suite.expect(machine.nLogicalCores_available == coresBeforeUnreservedAbandon &&
+                     machine.memoryMB_available == memoryBeforeUnreservedAbandon &&
+                     machine.storageMB_available == storageBeforeUnreservedAbandon,
+                 "stateful_whitehole_failed_transfer_does_not_credit_unreserved_successor");
+    deployment.containerDestroyed(drainingOwner);
+    suite.expect(brain.routableResourceLeaseRuntimeState.size() == 0 && deployment.containers.size() == 0 &&
+                     brain.containers.size() == 0 && machine.containersByDeploymentID.size() == 0,
+                 "stateful_whitehole_failed_transfer_releases_destroying_owner_lease_after_ack");
+
+    brain.deployments.erase(deployment.plan.config.deploymentID());
+    rack.machines.erase(&machine);
+    brain.machines.erase(&machine);
+    brain.racks.erase(rack.uuid);
+    thisBrain = savedBrain;
+  }
+
+  {
+    ScopedFreshRing ring;
+    TestBrain brain;
+    BrainBase *savedBrain = thisBrain;
+    thisBrain = &brain;
     brain.brainConfig.runtimeEnvironment.test.enabled = true;
     brain.brainConfig.architecture = nametagCurrentBuildMachineArchitecture();
 
