@@ -35784,6 +35784,17 @@ public:
     }
   }
 
+  static bool addMachinesTransportProjectionTargetRequiresAcknowledgement(
+      const ProdigyPendingAddMachinesOperation& pending, const ClusterMachine& target)
+  {
+    const auto containsExactMachineUUID = [&](const Vector<ClusterMachine>& candidates) {
+      return target.uuid != 0 && std::any_of(candidates.begin(), candidates.end(),
+          [&](const ClusterMachine& candidate) { return candidate.uuid == target.uuid; });
+    };
+    return !containsExactMachineUUID(pending.machinesToBootstrap) &&
+        !containsExactMachineUUID(pending.request.removedMachines);
+  }
+
   virtual bool existingNeuronsHaveAddMachinesTransportProjection(uint64_t operationID) const
   {
     Vector<ProdigyTransportCredentialEnrollment> members;
@@ -35796,7 +35807,7 @@ public:
     if (!pending || !loadAuthoritativeClusterTopology(topology)) return false;
     for (const auto& target : topology.machines)
     {
-      if (prodigyFindClusterMachineByIdentity(pending->machinesToBootstrap, target)) continue;
+      if (!addMachinesTransportProjectionTargetRequiresAcknowledgement(*pending, target)) continue;
       Machine *live = nullptr;
       for (auto *machine : machines)
         if (machine && machine->uuid == target.uuid) { live = machine; break; }

@@ -513,6 +513,11 @@ public:
   {
     return existingNeuronProjectionAvailable;
   }
+
+  bool productionExistingNeuronsHaveAddMachinesTransportProjection(uint64_t operationID) const
+  {
+    return TransportCredentialDeliveryTestBrain::existingNeuronsHaveAddMachinesTransportProjection(operationID);
+  }
 };
 
 class CountingTimeoutDispatcher final : public TimeoutDispatcher {
@@ -37318,6 +37323,34 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   pendingAddMachines.machinesToBootstrap = {machine(newBrainUUID, true), machine(newWorkerUUID, false)};
   cohort.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(pendingAddMachines));
 
+  // A replacement may remove a failed current-topology Neuron before its
+  // successor receives the transport projection.  Only the exact UUIDs named
+  // by the journal are excused; another live machine sharing an address is
+  // still a required acknowledgment.
+  const uint128_t removedNeuronUUID = uint128_t(0x9a63);
+  const uint128_t survivingNeuronUUID = uint128_t(0x9a64);
+  ClusterMachine removedNeuron = machine(removedNeuronUUID, false);
+  ClusterMachine survivingNeuron = machine(survivingNeuronUUID, false);
+  removedNeuron.ssh.address.assign("10.99.0.4"_ctv);
+  survivingNeuron.ssh.address.assign("10.99.0.4"_ctv);
+  ClusterMachine addressOnlyRemovedIdentity = removedNeuron;
+  addressOnlyRemovedIdentity.uuid = 0;
+  ProdigyPendingAddMachinesOperation replacementProjectionPending = {};
+  replacementProjectionPending.machinesToBootstrap = {machine(newWorkerUUID, false)};
+  replacementProjectionPending.request.removedMachines = {removedNeuron, addressOnlyRemovedIdentity};
+  suite.expect(!Brain::addMachinesTransportProjectionTargetRequiresAcknowledgement(
+                   replacementProjectionPending, removedNeuron),
+               "transport_credential_add_machines_removed_neuron_skips_projection_acknowledgment");
+  suite.expect(!Brain::addMachinesTransportProjectionTargetRequiresAcknowledgement(
+                   replacementProjectionPending, machine(newWorkerUUID, false)),
+               "transport_credential_add_machines_bootstrapped_neuron_skips_projection_acknowledgment");
+  suite.expect(Brain::addMachinesTransportProjectionTargetRequiresAcknowledgement(
+                   replacementProjectionPending, survivingNeuron),
+               "transport_credential_add_machines_surviving_neuron_missing_acknowledgment_blocks_release");
+  suite.expect(Brain::addMachinesTransportProjectionTargetRequiresAcknowledgement(
+                   replacementProjectionPending, addressOnlyRemovedIdentity),
+               "transport_credential_add_machines_projection_skip_requires_exact_uuid_not_shared_address");
+
   bool cohortReady = false;
   cohort.holdRuntimePersistence = true;
   suite.expect(cohort.ensurePendingAddMachinesTransportCohort(addMachinesOperationID,
@@ -37361,6 +37394,105 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                "transport_credential_add_machines_active_transition_requires_its_own_exact_quorum");
   suite.require(acknowledgeCurrent(cohort, cohortPeer),
                 "transport_credential_add_machines_records_active_transition_ack");
+
+  // Exercise the production acknowledgment gate with authenticated live
+  // Neurons.  The removed member has no live stream, while both surviving
+  // members must acknowledge the projection independently.
+  {
+    ScopedRing projectionGateRing = {};
+    const uint128_t sharedAddressNeuronUUID = uint128_t(0x9a65);
+    ClusterMachine sharedAddressNeuron = machine(sharedAddressNeuronUUID, false);
+    sharedAddressNeuron.ssh.address.assign("10.99.0.4"_ctv);
+    auto& replacementPending = cohort.masterAuthorityRuntimeState.pendingAddMachinesOperations[0];
+    ClusterTopology originalPlannedTopology = replacementPending.plannedTopology;
+    replacementPending.request.removedMachines = {removedNeuron, addressOnlyRemovedIdentity};
+    replacementPending.plannedTopology.machines = {
+        survivingNeuron, sharedAddressNeuron, machine(newBrainUUID, true), machine(newWorkerUUID, false)};
+    cohort.authoritativeTopology.machines = {removedNeuron, survivingNeuron, sharedAddressNeuron};
+    const uint32_t originalLedgerSize = cohort.masterAuthorityRuntimeState.transportCredentialEnrollments.size();
+    cohort.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a66, survivingNeuronUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 60));
+    cohort.masterAuthorityRuntimeState.transportCredentialEnrollments.push_back(
+        enrollment(0x9a67, sharedAddressNeuronUUID, ProdigyTransportCredentialNodeRole::neuron,
+                   ProdigyTransportCredentialEnrollmentState::active, 60));
+    Machine survivingNeuronMachine = {}, sharedAddressNeuronMachine = {};
+    auto configureProjectionNeuron = [&](Machine& live, uint128_t uuid, int slot) {
+      live.uuid = uuid;
+      live.neuron.machine = &live;
+      live.neuron.connected = true;
+      live.neuron.isFixedFile = true;
+      live.neuron.fslot = slot;
+      live.neuron.ioGeneration = 1;
+      cohort.machines.insert(&live);
+      cohort.neurons.insert(&live.neuron);
+      const auto& authority = cohort.masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
+      const auto& ledger = cohort.masterAuthorityRuntimeState.transportCredentialEnrollments;
+      const auto local = std::find_if(ledger.begin(), ledger.end(), [&](const auto& row) {
+        return row.nodeUUID == uuid && row.role == ProdigyTransportCredentialNodeRole::neuron;
+      });
+      if (local == ledger.end()) return false;
+      ProdigyTransportCredentialPrelude claim = {};
+      claim.operationUUID = local->operationUUID;
+      claim.nodeUUID = local->nodeUUID;
+      claim.authorityEpoch = local->authorityEpoch;
+      claim.keyEpoch = local->keyEpoch;
+      claim.authorityGeneration = local->authorityGeneration;
+      claim.role = local->role;
+      String prelude = {};
+      ProdigyTransportTLSStream remote = {};
+      reserveTransportStream(live.neuron);
+      reserveTransportStream(remote);
+      if (!prodigyRenderTransportCredentialPrelude(claim, prelude) ||
+          !cohort.beginInternalControlTransport(&live.neuron, false,
+              ProdigyTransportCredentialNodeRole::neuron, uuid) ||
+          !remote.beginTransportAEGISWithPrelude(true, uuid, prelude,
+              [&authority, &ledger, uuid](const String& claimed, std::array<uint8_t, 32>& psk,
+                                          String& context, uint128_t& authenticatedUUID) {
+                return prodigyResolveBrainTransportCredentialPeer(authority, ledger, uuid,
+                    ProdigyTransportCredentialNodeRole::neuron, claimed, "brain-neuron"_ctv,
+                    psk.data(), context, authenticatedUUID);
+              }) ||
+          !completeTransportHandshake(live.neuron, remote)) return false;
+      live.neuron.transportPeerProjectionCapable = true;
+      live.neuron.transportPeerProjectionIOGeneration = live.neuron.ioGeneration;
+      live.neuron.transportPeerProjectionAuthorityEpoch = cohort.masterAuthorityEpoch;
+      return live.neuron.transportAEGISEnabled() && live.neuron.isTransportNegotiated() &&
+          live.neuron.tlsPeerVerified && live.neuron.tlsPeerUUID == uuid;
+    };
+    auto acknowledgeProjection = [&](Machine& live) {
+      ProdigyTransportCredentialBootstrap projection = {};
+      String fingerprint = {};
+      if (!cohort.buildPublicNeuronTransportProjection(live.uuid, projection, fingerprint)) return false;
+      live.neuron.transportPeerProjectionAcknowledgedFingerprint = std::move(fingerprint);
+      return true;
+    };
+    suite.require(configureProjectionNeuron(survivingNeuronMachine, survivingNeuronUUID, 51) &&
+                      configureProjectionNeuron(sharedAddressNeuronMachine, sharedAddressNeuronUUID, 52) &&
+                      acknowledgeProjection(survivingNeuronMachine) &&
+                      acknowledgeProjection(sharedAddressNeuronMachine) &&
+                      cohort.productionExistingNeuronsHaveAddMachinesTransportProjection(addMachinesOperationID),
+                  "transport_credential_add_machines_production_gate_skips_removed_failed_neuron");
+    survivingNeuronMachine.neuron.transportPeerProjectionAcknowledgedFingerprint.clear();
+    suite.expect(!cohort.productionExistingNeuronsHaveAddMachinesTransportProjection(addMachinesOperationID),
+                 "transport_credential_add_machines_production_gate_blocks_unacknowledged_survivor");
+    suite.require(acknowledgeProjection(survivingNeuronMachine),
+                  "transport_credential_add_machines_restores_surviving_neuron_projection_acknowledgment");
+    sharedAddressNeuronMachine.neuron.transportPeerProjectionAcknowledgedFingerprint.clear();
+    suite.expect(!cohort.productionExistingNeuronsHaveAddMachinesTransportProjection(addMachinesOperationID),
+                 "transport_credential_add_machines_production_gate_requires_exact_uuid_not_shared_address");
+    suite.require(acknowledgeProjection(sharedAddressNeuronMachine),
+                  "transport_credential_add_machines_restores_shared_address_neuron_projection_acknowledgment");
+    cohort.neurons.erase(&survivingNeuronMachine.neuron);
+    cohort.neurons.erase(&sharedAddressNeuronMachine.neuron);
+    cohort.machines.erase(&survivingNeuronMachine);
+    cohort.machines.erase(&sharedAddressNeuronMachine);
+    replacementPending.request.removedMachines.clear();
+    replacementPending.plannedTopology = std::move(originalPlannedTopology);
+    cohort.masterAuthorityRuntimeState.transportCredentialEnrollments.resize(originalLedgerSize);
+    cohort.authoritativeTopology.machines = {
+        machine(selfUUID, true), machine(peerAUUID, true), machine(peerBUUID, true)};
+  }
   cohort.existingNeuronProjectionAvailable = false;
   cohort.driveTransportCredentialEnrollmentOperations();
 
