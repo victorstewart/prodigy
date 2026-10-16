@@ -115,6 +115,10 @@ struct MothershipUpgradePlannerInput {
   bool providerGatewayScopedL3L4 = false;
   bool providerGatewayAvoidsHostNetworkMutation = false;
   bool publicBaselineHealthy = false;
+  // A fresh Brain observation may prove that this registered remote cluster
+  // has no Mothership-managed deployment at all.  This is a distinct
+  // no-workload receipt, not a claim that a public workload is healthy.
+  bool noManagedPublicWorkloads = false;
   bool emptyIsolatedTestCluster = false;
   uint32_t healthyBrains = 0;
   uint64_t freeBytes = 0;
@@ -462,6 +466,7 @@ static inline bool mothershipUpgradePlanInputDigest(const MothershipUpgradeContr
   mothershipUpgradeAppendBool(encoded, input.providerGatewayScopedL3L4);
   mothershipUpgradeAppendBool(encoded, input.providerGatewayAvoidsHostNetworkMutation);
   mothershipUpgradeAppendBool(encoded, input.publicBaselineHealthy);
+  mothershipUpgradeAppendBool(encoded, input.noManagedPublicWorkloads);
   mothershipUpgradeAppendBool(encoded, input.emptyIsolatedTestCluster);
   mothershipUpgradeAppendUInt(encoded, input.healthyBrains);
   mothershipUpgradeAppendUInt(encoded, input.freeBytes);
@@ -541,7 +546,12 @@ static inline MothershipUpgradePlan mothershipPlanUpgrade(const MothershipUpgrad
     mothershipUpgradeReject(plan, "empty test cluster profile contains workloads"_ctv);
     return plan;
   }
-  if (!input.publicBaselineHealthy && !input.emptyIsolatedTestCluster)
+  if (input.noManagedPublicWorkloads && !input.workloads.empty())
+  {
+    mothershipUpgradeReject(plan, "no-public-workload receipt contains workloads"_ctv);
+    return plan;
+  }
+  if (!input.publicBaselineHealthy && !input.emptyIsolatedTestCluster && !input.noManagedPublicWorkloads)
   {
     mothershipUpgradeReject(plan, "public baseline is unqualified"_ctv);
     return plan;

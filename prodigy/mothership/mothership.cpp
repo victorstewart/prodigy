@@ -11204,11 +11204,17 @@ private:
       input.freeBytes = std::min(input.freeBytes, peer.stagingAvailableBytes);
     if (report.peers.empty()) input.freeBytes = 0;
     // A workload-bearing fleet still needs its own overlap and endpoint proof.
-    // Empty, isolated disposable test clusters have no public app to probe.
+    // Empty isolated test clusters and exact registered remote clusters with no
+    // Mothership-managed deployments have no public app to probe.  The latter
+    // is a distinct planner receipt, not a synthetic healthy-public-baseline.
     input.emptyIsolatedTestCluster = registeredCluster != nullptr &&
         registeredCluster->clusterUUID == report.clusterUUID &&
         registeredCluster->deploymentMode == MothershipClusterDeploymentMode::test &&
         registeredCluster->test.specified && !registeredCluster->test.enableFakeIpv4Boundary &&
+        report.activeDeploymentCount == 0;
+    input.noManagedPublicWorkloads = registeredCluster != nullptr &&
+        registeredCluster->clusterUUID == report.clusterUUID &&
+        registeredCluster->deploymentMode == MothershipClusterDeploymentMode::remote &&
         report.activeDeploymentCount == 0;
     input.overlapCapacityAvailable = report.activeDeploymentCount == 0 &&
         report.stagingCapacityComplete && report.requiredStagingBytes == targetBundle.contract.requiredFreeBytes &&
@@ -24812,7 +24818,7 @@ private:
     request.receiptVersion = report.observationReceiptVersion;
     request.nonce = report.observationNonce;
     request.requiredStagingBytes = observationRequest.requiredStagingBytes;
-    request.requiresEmptyWorkloadSet = input.emptyIsolatedTestCluster;
+    request.requiresEmptyWorkloadSet = input.emptyIsolatedTestCluster || input.noManagedPublicWorkloads;
     request.version = brainConcurrency == 0 ? 1 : 2;
     request.brainConcurrency = brainConcurrency;
     String serializedRequest = {};

@@ -81,12 +81,15 @@ is an installed byte identity, not proof that an uncompromised executable is run
 
 An empty isolated test cluster has a narrow mechanics-qualification path. Mothership
 derives eligibility from its registered `deploymentMode: "test"` configuration with
-no external IPv4 boundary and a fresh zero-workload observation. It does not claim
-a public application baseline. Brain checks the empty-workload condition again
-before publication, including admitted plans and pending artifact requests. A late
-workload fences the operation. Workload-bearing and production clusters still
-require public-continuity evidence, which the candidate does not yet collect.
-This path and the new capacity observations await C++ and real-runtime qualification.
+no external IPv4 boundary and a fresh zero-workload observation. An exact registered
+`deploymentMode: "remote"` cluster may likewise receive an operation-bound
+`no-managed-public-workloads` receipt when that same fresh observation contains no
+Mothership-managed deployment. Neither receipt claims a healthy public application
+baseline. Brain checks the empty-workload condition again before publication,
+including admitted plans and pending artifact requests. A late workload fences the
+operation. Workload-bearing production clusters still require public-continuity
+evidence, which the candidate does not yet collect. The empty-remote receipt and
+the new capacity observations still require exact-artifact real-runtime qualification.
 
 Placement policy is a durable, operation-keyed authority record for one selected
 application successor. It carries a canonical eligible-machine UUID set and is
