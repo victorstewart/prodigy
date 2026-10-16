@@ -1486,6 +1486,14 @@ static void convertClusterMachineSchemaPatch(const MothershipProdigyClusterMachi
   target.kind = source.kind;
   target.hasLifetime = source.hasLifetime;
   target.lifetime = source.lifetime;
+  target.hasIpxeScriptURL = source.hasIpxeScriptURL;
+  target.ipxeScriptURL = source.ipxeScriptURL;
+  target.hasVmImageURI = source.hasVmImageURI;
+  target.vmImageURI = source.vmImageURI;
+  target.hasGcpInstanceTemplate = source.hasGcpInstanceTemplate;
+  target.gcpInstanceTemplate = source.gcpInstanceTemplate;
+  target.hasGcpInstanceTemplateSpot = source.hasGcpInstanceTemplateSpot;
+  target.gcpInstanceTemplateSpot = source.gcpInstanceTemplateSpot;
   target.hasProviderMachineType = source.hasProviderMachineType;
   target.providerMachineType = source.providerMachineType;
   target.hasProviderReservationID = source.hasProviderReservationID;

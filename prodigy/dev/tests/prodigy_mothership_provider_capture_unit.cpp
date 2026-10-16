@@ -76,6 +76,50 @@ int main()
     failed += condition ? 0 : 1;
   };
 
+  MothershipProdigyClusterMachineSchemaPatch sourceSchema = {};
+  sourceSchema.schema = "replacement-vm"_ctv;
+  sourceSchema.hasKind = true;
+  sourceSchema.kind = MachineConfig::MachineKind::vm;
+  sourceSchema.hasLifetime = true;
+  sourceSchema.lifetime = MachineLifetime::ondemand;
+  sourceSchema.hasIpxeScriptURL = true;
+  sourceSchema.ipxeScriptURL = "https://boot.example/ipxe"_ctv;
+  sourceSchema.hasVmImageURI = true;
+  sourceSchema.vmImageURI = "os:2760"_ctv;
+  sourceSchema.hasGcpInstanceTemplate = true;
+  sourceSchema.gcpInstanceTemplate = "replacement-template"_ctv;
+  sourceSchema.hasGcpInstanceTemplateSpot = true;
+  sourceSchema.gcpInstanceTemplateSpot = "replacement-template-spot"_ctv;
+  sourceSchema.hasProviderMachineType = true;
+  sourceSchema.providerMachineType = "vhp-4c-8gb-intel"_ctv;
+  sourceSchema.hasProviderReservationID = true;
+  sourceSchema.providerReservationID = "reservation"_ctv;
+  sourceSchema.hasRegion = true;
+  sourceSchema.region = "ord"_ctv;
+  sourceSchema.hasZone = true;
+  sourceSchema.zone = "ord-1"_ctv;
+  sourceSchema.hasBudget = true;
+  sourceSchema.budget = 1;
+  ProdigyManagedMachineSchemaPatch runtimeSchema = {};
+  convertClusterMachineSchemaPatch(sourceSchema, runtimeSchema);
+  expect(runtimeSchema.schema == sourceSchema.schema &&
+             runtimeSchema.hasKind && runtimeSchema.kind == sourceSchema.kind &&
+             runtimeSchema.hasLifetime && runtimeSchema.lifetime == sourceSchema.lifetime &&
+             runtimeSchema.hasIpxeScriptURL && runtimeSchema.ipxeScriptURL == sourceSchema.ipxeScriptURL &&
+             runtimeSchema.hasVmImageURI && runtimeSchema.vmImageURI == sourceSchema.vmImageURI &&
+             runtimeSchema.hasGcpInstanceTemplate &&
+             runtimeSchema.gcpInstanceTemplate == sourceSchema.gcpInstanceTemplate &&
+             runtimeSchema.hasGcpInstanceTemplateSpot &&
+             runtimeSchema.gcpInstanceTemplateSpot == sourceSchema.gcpInstanceTemplateSpot &&
+             runtimeSchema.hasProviderMachineType &&
+             runtimeSchema.providerMachineType == sourceSchema.providerMachineType &&
+             runtimeSchema.hasProviderReservationID &&
+             runtimeSchema.providerReservationID == sourceSchema.providerReservationID &&
+             runtimeSchema.hasRegion && runtimeSchema.region == sourceSchema.region &&
+             runtimeSchema.hasZone && runtimeSchema.zone == sourceSchema.zone &&
+             runtimeSchema.hasBudget && runtimeSchema.budget == sourceSchema.budget,
+         "machine schema conversion preserves every launch field");
+
   int pipeFD[2] = {-1, -1};
   expect(::pipe2(pipeFD, O_CLOEXEC) == 0, "create overflow capture pipe");
   pid_t writer = failed ? -1 : ::fork();
