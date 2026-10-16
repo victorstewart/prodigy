@@ -107,6 +107,24 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         self.assertIn("findLocalAuthorityRecoverySeedMachine(cluster.topology, seedMachine, &failure)", owner)
         self.assertNotIn("buildLocalClusterMachineProbe(cluster, seedMachine", owner)
 
+    def test_authority_recovery_retry_retains_its_admitted_topology_generation(self):
+        begin = MOTHERSHIP.index("void runRecoverLocalClusterAuthority")
+        end = MOTHERSHIP.index("void runPrepareProductionPair", begin)
+        owner = MOTHERSHIP[begin:end]
+        self.assertIn(
+            "request.topologyVersion = existingCohort ?\n"
+            "          existingCohortRecord.request.topologyVersion : cluster.topology.version;",
+            owner,
+        )
+        self.assertIn(
+            "mothershipLocalAuthorityRecoveryTopologyMatches(existingCohortRecord.request, cluster.topology)",
+            owner,
+        )
+        self.assertIn(
+            "mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request)",
+            owner,
+        )
+
     def test_cold_reboot_accepts_only_fixed_width_provider_operation_identity(self):
         self.assertIn('re.fullmatch(r"[0-9a-f]{32}", value) is not None', KVM_BOUNDARY)
         self.assertIn('canonical_cold_reboot_id(options.get("--operation-id"), "operation ID")', KVM_BOUNDARY)

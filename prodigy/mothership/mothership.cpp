@@ -14235,9 +14235,19 @@ private:
     if (valid)
     {
       request.operationUUID = operationUUID; request.clusterUUID = cluster.clusterUUID;
-      request.topologyVersion = cluster.topology.version; request.timeoutMilliseconds = uint32_t(timeout);
+      // A cohort retry must retain the generation admitted before its first
+      // reboot.  The recovery itself may advance the live Brain topology, and
+      // the completion proof below deliberately accepts that newer generation
+      // only when the exact three owned VM identities are unchanged.
+      request.topologyVersion = existingCohort ?
+          existingCohortRecord.request.topologyVersion : cluster.topology.version;
+      request.timeoutMilliseconds = uint32_t(timeout);
       for (const auto& target : targets) request.executors.push_back(target.executor);
-      if (existingCohort && !mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request))
+      if (existingCohort &&
+          !mothershipLocalAuthorityRecoveryTopologyMatches(existingCohortRecord.request, cluster.topology))
+      { failure.assign("local authority recovery current topology conflicts with its immutable cohort"_ctv); valid = false; }
+      else if (existingCohort &&
+               !mothershipPhysicalFaultExactSerializedEqual(existingCohortRecord.request, request))
       { failure.assign("local authority recovery retry conflicts with its immutable cohort"_ctv); valid = false; }
     }
     for (auto& target : targets)
