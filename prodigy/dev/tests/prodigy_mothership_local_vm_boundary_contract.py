@@ -75,6 +75,10 @@ class LocalVMBoundaryOwnerContract(unittest.TestCase):
         reconcile_end = MOTHERSHIP.index("bool awaitLocalAuthorityRecoveryNonSeed", reconcile_begin)
         reconcile = MOTHERSHIP[reconcile_begin:reconcile_end]
         self.assertIn("reconcileLocalVMBoundaryExecutorForUpgrade", reconcile)
+        self.assertIn("if ((expectedOperationUUID == 0) != (expectedCohortUUID == 0))", reconcile)
+        resume_guard = reconcile.index(
+            "if (!refreshRequired && expectedOperationUUID != 0 && expectedCohortUUID != 0) return true")
+        self.assertLess(resume_guard, reconcile.index("reconcileLocalVMBoundaryExecutorForUpgrade"))
         self.assertLess(reconcile.index("immutable != boundary.immutableStateSHA256"),
                         reconcile.index("refreshLocalVMBoundaryExecutor"))
         self.assertIn('set(prior) == legacy_fields', KVM_BOUNDARY)

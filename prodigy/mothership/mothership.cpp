@@ -14098,6 +14098,9 @@ private:
                        sizeof(mothershipLocalVMBoundarySource));
     if (!prodigyComputeSHA256Hex(sourceBytes, currentExecutorSHA256, &failure)) return false;
     const bool refreshRequired = boundary.executorSHA256 != currentExecutorSHA256;
+    if ((expectedOperationUUID == 0) != (expectedCohortUUID == 0))
+    { failure.assign("local VM executor reconciliation requires one exact ownership pair"_ctv); return false; }
+    if (!refreshRequired && expectedOperationUUID != 0 && expectedCohortUUID != 0) return true;
     String immutable = {};
     if (!reconcileLocalVMBoundaryExecutorForUpgrade(
             boundary, immutable, failure, expectedOperationUUID, expectedCohortUUID) ||
