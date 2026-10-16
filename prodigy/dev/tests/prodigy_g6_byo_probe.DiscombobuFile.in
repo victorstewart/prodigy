@@ -1,0 +1,10 @@
+FROM scratch for @PRODIGY_RESOLVED_TARGET_ARCH@
+COPY {rootfs} ./app /app
+COPY {rootfs} ./g6-byo-proof /g6-byo-proof
+COPY {rootfs} ./lib /lib
+COPY {rootfs} ./lib64 /lib64
+COPY {rootfs} ./usr/lib /usr/lib
+COPY {rootfs} ./usr/lib64 /usr/lib64
+SURVIVE /app/prodigy_g6_byo_probe_container
+SURVIVE /g6-byo-proof
+EXECUTE ["/app/prodigy_g6_byo_probe_container"]

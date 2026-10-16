@@ -444,6 +444,19 @@ set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodi
 set(PRODIGY_MOTHERSHIP_TUNNEL_PROVIDER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-mothership-tunnel-provider.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
 set(PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.DiscombobuFile")
 set(PRODIGY_PINGPONG_UNREADY_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-pingpong-unready.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_G6_BYO_PROBE_DISCOMBOBUFILE "${CMAKE_BINARY_DIR}/prodigy-g6-byo-probe.DiscombobuFile")
+set(PRODIGY_G6_BYO_PROBE_CONTAINER_ARTIFACT "${CMAKE_BINARY_DIR}/prodigy-g6-byo-probe.${PRODIGY_RESOLVED_TARGET_ARCH}.container.zst")
+set(PRODIGY_G6_BYO_PROBE_CONTEXT_DIR "${CMAKE_BINARY_DIR}/prodigy-g6-byo-probe-context")
+set(PRODIGY_G6_BYO_PROBE_CONTEXT_STAMP "${PRODIGY_G6_BYO_PROBE_CONTEXT_DIR}/.prepared")
+set(PRODIGY_G6_BYO_PROBE_BINDING_FILE "${CMAKE_BINARY_DIR}/prodigy-g6-byo-probe.binding")
+set(PRODIGY_G6_BYO_CHALLENGE "" CACHE STRING "One-time SHA-256-shaped challenge bound into the G6 BYO probe artifact")
+set(PRODIGY_G6_BYO_CANDIDATE_COMMIT "" CACHE STRING "Exact Git commit bound into the G6 BYO probe artifact")
+set(PRODIGY_G6_BYO_ROLLOUT_ROW "" CACHE STRING "Rollout evidence row bound into the G6 BYO probe artifact")
+file(CONFIGURE
+   OUTPUT "${PRODIGY_G6_BYO_PROBE_BINDING_FILE}"
+   CONTENT "challenge=${PRODIGY_G6_BYO_CHALLENGE}\ncommit=${PRODIGY_G6_BYO_CANDIDATE_COMMIT}\nrow=${PRODIGY_G6_BYO_ROLLOUT_ROW}\n"
+   @ONLY
+)
 configure_file(
    "${PRODIGY_ROOT}/prodigy/dns/DiscombobuFile.in"
    "${PRODIGY_DNS_RESOLVER_DISCOMBOBUFILE}"
@@ -470,6 +483,11 @@ set(PRODIGY_PINGPONG_PROBE_BINARY prodigy_pingpong_container_unready)
 configure_file(
    "${CMAKE_CURRENT_SOURCE_DIR}/tests/pingpong.DiscombobuFile.in"
    "${PRODIGY_PINGPONG_UNREADY_DISCOMBOBUFILE}"
+   @ONLY
+)
+configure_file(
+   "${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_byo_probe.DiscombobuFile.in"
+   "${PRODIGY_G6_BYO_PROBE_DISCOMBOBUFILE}"
    @ONLY
 )
 configure_file(
@@ -1305,6 +1323,51 @@ add_custom_command(
    VERBATIM
 )
 add_custom_target(prodigy_dns_resolver_container DEPENDS "${PRODIGY_DNS_RESOLVER_CONTAINER_ARTIFACT}")
+
+# The context target is intentionally separate from app packaging.  It is safe
+# to run on the native Linux x86 target build host: it only copies the
+# already-linked probe and its runtime closure.  The resulting context can then
+# be moved into the verified Linux artifact-builder boundary before
+# Discombobulator creates the app blob on any host architecture.
+add_custom_command(
+   OUTPUT "${PRODIGY_G6_BYO_PROBE_CONTEXT_STAMP}"
+   COMMAND "${Python3_EXECUTABLE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_g6_byo_probe_context.py"
+           --binary "$<TARGET_FILE:prodigy_g6_byo_probe_container>"
+           --output "${PRODIGY_G6_BYO_PROBE_CONTEXT_DIR}"
+           --architecture "${PRODIGY_RESOLVED_TARGET_ARCH}"
+           --challenge "${PRODIGY_G6_BYO_CHALLENGE}"
+           --commit "${PRODIGY_G6_BYO_CANDIDATE_COMMIT}"
+           --row "${PRODIGY_G6_BYO_ROLLOUT_ROW}"
+   DEPENDS prodigy_g6_byo_probe_container
+           "${PRODIGY_G6_BYO_PROBE_BINDING_FILE}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prepare_g6_byo_probe_context.py"
+   COMMENT "Preparing the rollout-bound G6 BYO probe app context"
+   VERBATIM
+)
+add_custom_target(prodigy_g6_byo_probe_context DEPENDS "${PRODIGY_G6_BYO_PROBE_CONTEXT_STAMP}")
+
+add_custom_command(
+   OUTPUT "${PRODIGY_G6_BYO_PROBE_CONTAINER_ARTIFACT}"
+   COMMAND "${CMAKE_COMMAND}" -E env
+           CARGO_TARGET_DIR=${DISCOMBOBULATOR_CARGO_TARGET_DIR}
+           cargo run --quiet --manifest-path "${DISCOMBOBULATOR_MANIFEST}" --
+           build
+           --file "${PRODIGY_G6_BYO_PROBE_DISCOMBOBUFILE}"
+           --context "rootfs=${PRODIGY_G6_BYO_PROBE_CONTEXT_DIR}"
+           --output "${PRODIGY_G6_BYO_PROBE_CONTAINER_ARTIFACT}"
+           --kind app
+   DEPENDS prodigy_g6_byo_probe_context
+           "${PRODIGY_G6_BYO_PROBE_CONTEXT_STAMP}"
+           "${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_g6_byo_probe.DiscombobuFile.in"
+           "${PRODIGY_G6_BYO_PROBE_DISCOMBOBUFILE}"
+           "${DISCOMBOBULATOR_MANIFEST}"
+           "${DISCOMBOBULATOR_CARGO_LOCK}"
+           ${DISCOMBOBULATOR_SOURCE_FILES}
+   COMMENT "Building the rollout-bound G6 BYO probe app container"
+   VERBATIM
+)
+add_custom_target(prodigy_g6_byo_probe_container_artifact DEPENDS "${PRODIGY_G6_BYO_PROBE_CONTAINER_ARTIFACT}")
 
 add_custom_command(
    OUTPUT "${PRODIGY_PINGPONG_CONTAINER_ARTIFACT}"
