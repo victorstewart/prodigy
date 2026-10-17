@@ -906,7 +906,10 @@ public:
   {
     config = {};
 
-    IPAddress public6 = eth.getGlobal6();
+    // Basics' EthDevice currently only consumes IFA_LOCAL from IPv6 netlink
+    // records. Linux publishes ordinary IPv6 addresses through IFA_ADDRESS,
+    // so resolve this interface from getifaddrs until that dependency is fixed.
+    IPAddress public6 = prodigyGetGlobalIPv6Address(eth.name);
     const bool publicIPv6Ready = public6.is6 && public6.isNull() == false &&
                                  (public6.v6[0] & 0xe0u) == 0x20u;
     // The current packet encoder is deliberately two-octet-AS only and its

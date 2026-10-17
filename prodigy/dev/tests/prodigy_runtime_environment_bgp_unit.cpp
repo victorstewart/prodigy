@@ -160,11 +160,35 @@ static NeuronBGPPeerConfig makeBGPPeer(const String& peerAddress, const String& 
   return peer;
 }
 
+static void testGlobalIPv6DiscoveryUsesInterfaceAddress(TestSuite& suite)
+{
+  struct sockaddr_in6 linkLocal = {};
+  linkLocal.sin6_family = AF_INET6;
+  (void)inet_pton(AF_INET6, "fe80::1", &linkLocal.sin6_addr);
+  struct sockaddr_in6 global = {};
+  global.sin6_family = AF_INET6;
+  (void)inet_pton(AF_INET6, "2001:19f0:5c00:456a:5400:6ff:fedd:d6c9", &global.sin6_addr);
+
+  struct ifaddrs globalInterface = {};
+  globalInterface.ifa_name = const_cast<char *>("enp1s0");
+  globalInterface.ifa_addr = reinterpret_cast<struct sockaddr *>(&global);
+  struct ifaddrs linkLocalInterface = {};
+  linkLocalInterface.ifa_name = const_cast<char *>("enp1s0");
+  linkLocalInterface.ifa_addr = reinterpret_cast<struct sockaddr *>(&linkLocal);
+  linkLocalInterface.ifa_next = &globalInterface;
+
+  IPAddress resolved = {};
+  suite.expect(prodigyFindGlobalIPv6Address(&linkLocalInterface, "enp1s0"_ctv, resolved) &&
+                   resolved.equals(IPAddress("2001:19f0:5c00:456a:5400:6ff:fedd:d6c9", true)),
+               "global_ipv6_discovery_reads_ipv6_interface_address");
+}
+
 int main(void)
 {
   TestSuite suite = {};
 
   testRuntimeAwareInventoryUsesConfiguredProviderInsteadOfSharedNatBootstrapSnapshots(suite);
+  testGlobalIPv6DiscoveryUsesInterfaceAddress(suite);
 
   prodigySetPrimaryNetworkDeviceOverride("lo");
   DevNeuronIaaS devNeuron;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <cstring>
 #include <cstdlib>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -67,6 +68,52 @@ static inline bool prodigyInterfaceMatchesAddressPolicy(const struct ifaddrs *if
   }
 
   return true;
+}
+
+static inline bool prodigyFindGlobalIPv6Address(
+    const struct ifaddrs *interfaces, const String& deviceName, IPAddress& global6)
+{
+  global6 = {};
+  if (deviceName.empty())
+  {
+    return false;
+  }
+
+  for (const struct ifaddrs *ifa = interfaces; ifa != nullptr; ifa = ifa->ifa_next)
+  {
+    const size_t interfaceNameLength = ifa->ifa_name == nullptr ? 0 : std::strlen(ifa->ifa_name);
+    if (ifa->ifa_name == nullptr || deviceName.size() != interfaceNameLength ||
+        std::memcmp(deviceName.data(), ifa->ifa_name, interfaceNameLength) != 0 ||
+        ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET6)
+    {
+      continue;
+    }
+
+    const struct sockaddr_in6 *address =
+        reinterpret_cast<const struct sockaddr_in6 *>(ifa->ifa_addr);
+    if ((address->sin6_addr.s6_addr[0] & 0xe0u) != 0x20u)
+    {
+      continue;
+    }
+
+    memcpy(global6.v6, address->sin6_addr.s6_addr, sizeof(global6.v6));
+    global6.is6 = true;
+    return true;
+  }
+
+  return false;
+}
+
+static inline IPAddress prodigyGetGlobalIPv6Address(const String& deviceName)
+{
+  IPAddress global6 = {};
+  struct ifaddrs *interfaces = nullptr;
+  if (getifaddrs(&interfaces) == 0 && interfaces != nullptr)
+  {
+    (void)prodigyFindGlobalIPv6Address(interfaces, deviceName, global6);
+    freeifaddrs(interfaces);
+  }
+  return global6;
 }
 
 static inline bool prodigyResolvePrimaryNetworkDevice(String& deviceName)
