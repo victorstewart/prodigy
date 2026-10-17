@@ -19853,6 +19853,7 @@ public:
     }
     if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
     {
+      rearmUnacknowledgedUpdateSelfFollowerTransitions();
       driveUpdateSelfFollowerTransitions();
       maybeRelinquishMasterForUpdateSelf();
     }
@@ -33149,7 +33150,31 @@ public:
     {
       return false;
     }
-    return (bv->pendingSend == false);
+    return bv->pendingSend == false && bv->wBuffer.outstandingBytes() == 0 &&
+           bv->queuedSendOutstandingBytes() == 0 &&
+           bv->hasBufferedTransportCiphertext() == false;
+  }
+
+  bool updateSelfPeerCanReceiveTransition(BrainView *bv) const
+  {
+    // The heartbeat owner deliberately excludes replaced registrations and
+    // streams whose current Brain credential has not authenticated. Keep the
+    // same fence at the command owner: reconnect and send-completion paths can
+    // reach this code outside the heartbeat peer loop.
+    if (bv == nullptr || bv->quarantined || bv->registrationFresh == false ||
+        bv->uuid == 0 || bv->boottimens == 0 || bv->isFixedFile == false ||
+        bv->fslot < 0 || peerSocketActive(bv) == false)
+    {
+      return false;
+    }
+    if (bv->transportEncryptionEnabled() &&
+        (bv->isTransportNegotiated() == false || bv->tlsPeerVerified == false ||
+         bv->tlsPeerUUID != bv->uuid))
+    {
+      return false;
+    }
+    return !bv->isMasterBrain &&
+           internalControlStreamCredentialCurrent(bv, ProdigyTransportCredentialNodeRole::brain);
   }
 
   bool updateSelfFollowerHasRecovered(BrainView *bv, const String& authorityDigest) const
@@ -33252,6 +33277,10 @@ public:
     {
       // Explicit concurrency changes are issued only from a receipt that has
       // durably recorded the occupied slot.
+      return;
+    }
+    if (updateSelfPeerCanReceiveTransition(bv) == false)
+    {
       return;
     }
     if (updateSelfPeerStreamDrained(bv) == false)
@@ -33430,6 +33459,36 @@ public:
         queueUpdateSelfTransitionToPeer(findBrainViewByUpdateSelfPeerKey(peerKey), true);
       }
     });
+  }
+
+  void rearmUnacknowledgedUpdateSelfFollowerTransitions(void)
+  {
+    if (weAreMaster == false || updateSelfPersistencePending || updateSelfPersistenceFailed ||
+        updateSelfState != UpdateSelfState::waitingForFollowerReboots)
+    {
+      return;
+    }
+
+    // transitionToNewBundle deliberately has no application acknowledgement:
+    // the successor registration with a changed boot identity is the receipt.
+    // A completed transport write can therefore be lost with a peer before
+    // that receipt arrives. Once the stream is fully drained, re-arm the
+    // process-local send credit on the normal heartbeat cadence. The durable
+    // issued set continues to own the concurrency slot, so this can only
+    // replay the same idempotent transition and cannot admit another follower.
+    for (uint128_t peerKey : updateSelfTransitionIssuedPeerKeys)
+    {
+      if (updateSelfFollowerRebootedPeerKeys.contains(peerKey) ||
+          updateSelfFollowerReadyPeerKeys.contains(peerKey))
+      {
+        continue;
+      }
+      BrainView *peer = findBrainViewByUpdateSelfPeerKey(peerKey);
+      if (updateSelfPeerCanReceiveTransition(peer) && updateSelfPeerStreamDrained(peer))
+      {
+        updateSelfTransitionSentPeerKeys.erase(peerKey);
+      }
+    }
   }
 
   void queueUpdateSelfRelinquishToPeer(BrainView *bv)

@@ -12914,15 +12914,61 @@ static void testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(TestSuite&
                    serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerA.uuid),
                "update_self_serial_concurrency_issues_only_first_sorted_follower");
 
-  // A reboot registration followed by a disconnect/reconnect is not a recovery
-  // receipt.  The first slot remains occupied until this peer also acknowledges
-  // the current authority and its current inventory is available.
-  serialPeerA.wBuffer.clear();
-  serialPeerA.pendingSend = false;
+  for (BrainView *peer : {&serialPeerA, &serialPeerB})
+  {
+    peer->wBuffer.clear();
+    peer->clearQueuedSendBytes();
+    peer->pendingSend = false;
+    peer->pendingSendBytes = 0;
+  }
+  suite.require(setAuthorityAcknowledgement(serial, serialPeerA) &&
+                    setAuthorityAcknowledgement(serial, serialPeerB),
+                "update_self_serial_acknowledges_durable_issued_checkpoint");
   serial.driveUpdateSelfFollowerTransitions();
+
+  uint32_t firstTransitionFrames = 0;
+  forEachMessageInBuffer(serialPeerA.wBuffer, [&](Message *frame) {
+    firstTransitionFrames += BrainTopic(frame->topic) == BrainTopic::transitionToNewBundle;
+  });
+  suite.require(firstTransitionFrames == 1 &&
+                    serial.updateSelfTransitionSentPeerKeys.contains(serialPeerA.uuid),
+                "update_self_serial_records_first_transition_send_attempt");
+
+  // A completed write is not a reboot receipt. The heartbeat retries the same
+  // durable slot after the stream drains, without admitting the next follower.
+  serialPeerA.wBuffer.clear();
+  serialPeerA.clearQueuedSendBytes();
+  serialPeerA.pendingSend = false;
+  serialPeerA.pendingSendBytes = 0;
+
+  // A replaced registration and an AEGIS-required-but-unnegotiated stream
+  // cannot receive a lifecycle command, even when the durable issued slot has
+  // lost its process-local send credit across a master restart.
+  serialPeerA.registrationFresh = false;
+  serial.rearmUnacknowledgedUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfTransitionSentPeerKeys.contains(serialPeerA.uuid) &&
+                   serialPeerA.wBuffer.outstandingBytes() == 0,
+               "update_self_serial_replaced_stream_does_not_rearm_transition");
+  serialPeerA.registrationFresh = true;
+  serial.transportCredentialBootstrapRequired = true;
+  serial.rearmUnacknowledgedUpdateSelfFollowerTransitions();
+  suite.expect(serial.updateSelfTransitionSentPeerKeys.contains(serialPeerA.uuid) &&
+                   serialPeerA.wBuffer.outstandingBytes() == 0,
+               "update_self_serial_tls_unready_stream_does_not_rearm_transition");
+  serial.updateSelfTransitionSentPeerKeys.erase(serialPeerA.uuid);
+  serial.driveUpdateSelfFollowerTransitions();
+  suite.expect(serialPeerA.wBuffer.outstandingBytes() == 0,
+               "update_self_serial_tls_unready_stream_does_not_send_transition");
+  serial.transportCredentialBootstrapRequired = false;
+  serial.driveUpdateSelfFollowerTransitions();
+  uint32_t retriedTransitionFrames = 0;
+  forEachMessageInBuffer(serialPeerA.wBuffer, [&](Message *frame) {
+    retriedTransitionFrames += BrainTopic(frame->topic) == BrainTopic::transitionToNewBundle;
+  });
   suite.expect(serial.updateSelfTransitionIssuedPeerKeys.size() == 1 &&
-                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid) == false,
-               "update_self_serial_retries_recovered_unsent_slot_without_opening_another");
+                   serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid) == false &&
+                   retriedTransitionFrames == 1,
+               "update_self_serial_heartbeat_retries_same_durable_slot_without_opening_another");
 
   serial.updateSelfFollowerRebootedPeerKeys.insert(serialPeerA.uuid);
   serialPeerA.connected = false;
@@ -35433,13 +35479,33 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   {
     const auto originalLedger = brain.masterAuthorityRuntimeState.transportCredentialEnrollments;
     suite.expect(brain.internalControlStreamCredentialCurrent(&peerA, ProdigyTransportCredentialNodeRole::brain) &&
+                     brain.updateSelfPeerCanReceiveTransition(&peerA) &&
                      !brain.internalControlStreamCredentialCurrent(&peerA, ProdigyTransportCredentialNodeRole::neuron),
                  "transport_live_authority_requires_authenticated_exact_role");
     auto& peerRecord = brain.masterAuthorityRuntimeState.transportCredentialEnrollments[1];
     peerRecord.state = ProdigyTransportCredentialEnrollmentState::revoked;
     suite.expect(peerA.tlsPeerVerified && peerA.tlsPeerUUID == peerAUUID &&
-                     !brain.internalControlStreamCredentialCurrent(&peerA, ProdigyTransportCredentialNodeRole::brain),
+                     !brain.internalControlStreamCredentialCurrent(&peerA, ProdigyTransportCredentialNodeRole::brain) &&
+                     !brain.updateSelfPeerCanReceiveTransition(&peerA),
                  "transport_revocation_fences_already_authenticated_peer_without_uuid_change");
+
+    brain.updateSelfState = Brain::UpdateSelfState::waitingForFollowerReboots;
+    brain.updateSelfFollowerConcurrency = 1;
+    brain.updateSelfFollowerBootNsByPeerKey.insert_or_assign(peerA.uuid, peerA.boottimens);
+    brain.updateSelfTransitionIssuedPeerKeys.insert(peerA.uuid);
+    brain.updateSelfTransitionSentPeerKeys.insert(peerA.uuid);
+    peerA.wBuffer.clear();
+    peerA.pendingSend = false;
+    peerA.pendingSendBytes = 0;
+    brain.rearmUnacknowledgedUpdateSelfFollowerTransitions();
+    suite.expect(brain.updateSelfTransitionSentPeerKeys.contains(peerA.uuid),
+                 "transport_revocation_does_not_rearm_update_transition_on_authenticated_old_stream");
+    brain.updateSelfTransitionSentPeerKeys.erase(peerA.uuid);
+    brain.queueUpdateSelfTransitionToPeer(&peerA, true);
+    suite.expect(peerA.wBuffer.outstandingBytes() == 0 && peerA.queuedSendOutstandingBytes() == 0,
+                 "transport_revocation_does_not_send_update_transition_on_authenticated_old_stream");
+    brain.resetUpdateSelfState();
+
     peerRecord = originalLedger[1];
     ++peerRecord.operationUUID;
     ++peerRecord.authorityGeneration;
