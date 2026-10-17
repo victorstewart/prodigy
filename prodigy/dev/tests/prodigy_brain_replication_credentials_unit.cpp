@@ -7930,6 +7930,7 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
 
   MachineStatusReport localActive = {};
   MachineStatusReport verifiedFollower = {};
+  MachineStatusReport mixedBundleFollower = {};
   MachineStatusReport disconnectedFollower = {};
   MachineStatusReport staleFollower = {};
   MachineStatusReport staleAuthorityFollower = {};
@@ -7941,6 +7942,13 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
   follower.verifiedInstalledBundleSHA256.assign(expectedCurrentDigest);
   follower.verifiedInstalledBundleIOGeneration = follower.ioGeneration;
   follower.verifiedInstalledBundleAuthorityEpoch = 17;
+  NeuronView mixedBundleNeuron = {};
+  const String expectedTargetDigest =
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"_ctv;
+  mixedBundleNeuron.ioGeneration = 41;
+  mixedBundleNeuron.verifiedInstalledBundleSHA256.assign(expectedTargetDigest);
+  mixedBundleNeuron.verifiedInstalledBundleIOGeneration = mixedBundleNeuron.ioGeneration;
+  mixedBundleNeuron.verifiedInstalledBundleAuthorityEpoch = 17;
   const uint64_t firstCapabilityValidation = follower.artifactCapabilityValidationGeneration + 1;
   const uint64_t latestCapabilityValidation = firstCapabilityValidation + 1;
   follower.artifactCapabilityValidationGeneration = latestCapabilityValidation;
@@ -7953,6 +7961,9 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
   prodigyAssignMachineBundleReportDigests(
       verifiedFollower, false, "idle", "master-has-changed-bundle"_ctv, expectedStagedDigest,
       &follower, true, 17);
+  prodigyAssignMachineBundleReportDigests(
+      mixedBundleFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+      &mixedBundleNeuron, true, 17);
   prodigyAssignMachineBundleReportDigests(
       disconnectedFollower, false, "idle", expectedCurrentDigest, expectedStagedDigest,
       &follower, false, 17);
@@ -7976,13 +7987,15 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
           localActive.stagedBundleSHA256.equal(expectedStagedDigest) &&
           verifiedFollower.approvedBundleSHA256.equal(expectedCurrentDigest) &&
           verifiedFollower.stagedBundleSHA256.size() == 0 &&
+          mixedBundleNeuron.artifactChunksEnabled == false &&
+          mixedBundleFollower.approvedBundleSHA256.equal(expectedTargetDigest) &&
           disconnectedFollower.approvedBundleSHA256.size() == 0 &&
           staleFollower.approvedBundleSHA256.size() == 0 &&
           staleAuthorityFollower.approvedBundleSHA256.size() == 0 &&
           pendingFollower.approvedBundleSHA256.size() == 0 &&
           localIdle.approvedBundleSHA256.equal(expectedCurrentDigest) &&
           localIdle.stagedBundleSHA256.size() == 0,
-      "cluster_report_binds_exact_verified_follower_digest_without_master_rewrite");
+      "cluster_report_binds_current_follower_digest_without_master_rewrite");
 
   // Promotion retains a live socket but advances the authority epoch. The
   // existing capability owner must remeasure only a current-generation
@@ -8060,11 +8073,19 @@ static void testClusterReportUsesCurrentInstallAndLocalUpdateAuthority(TestSuite
     suite.expect(pumpArtifactIOForTest([&] {
                    return !neuron.artifactCapabilityPending && !neuron.artifactChunksEnabled &&
                        neuron.artifactCapabilityValidationGeneration == staleValidation + 1 &&
-                       neuron.verifiedInstalledBundleSHA256.empty() &&
-                       neuron.verifiedInstalledBundleIOGeneration == 0 &&
-                       neuron.verifiedInstalledBundleAuthorityEpoch == 0;
+                       neuron.verifiedInstalledBundleSHA256.equal(installedDigest) &&
+                       neuron.verifiedInstalledBundleIOGeneration == neuron.ioGeneration &&
+                       neuron.verifiedInstalledBundleAuthorityEpoch == promotionBrain.masterAuthorityEpoch;
                  }),
-                 "cluster_report_epoch_change_retries_stale_artifact_completion_under_current_authority");
+                 "cluster_report_epoch_change_retries_mixed_bundle_attestation_under_current_authority");
+    MachineStatusReport mixedBundleReport = {};
+    prodigyAssignMachineBundleReportDigests(
+        mixedBundleReport, false, "idle", expectedCurrentDigest, expectedStagedDigest,
+        &neuron, true, promotionBrain.masterAuthorityEpoch);
+    suite.expect(
+        neuron.artifactChunksEnabled == false &&
+            mixedBundleReport.approvedBundleSHA256.equal(installedDigest),
+        "cluster_report_publishes_validated_mixed_bundle_digest_without_artifact_chunks");
     if (promotionBrain.artifactIO)
     {
       (void)quiesceArtifactIOForTest(promotionBrain.artifactIO.get());

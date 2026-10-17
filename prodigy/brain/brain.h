@@ -1306,12 +1306,13 @@ static inline void prodigyAssignMachineBundleReportDigests(
     return;
   }
 
-  // Do not project the current master's digest into a follower report.  This
-  // is the exact digest that follower supplied for its current control-stream
-  // generation and which the existing artifact-capability owner compared to
-  // this master's measured installed bundle.
+  // Do not project the current master's digest into a follower report. This
+  // is the exact digest the follower supplied on its current authenticated
+  // control-stream generation. Artifact transfer compatibility is separate:
+  // a mixed-version follower can attest to its installed target bundle even
+  // though it must not receive artifact chunks from this master's bundle.
   if (controlStreamActive && neuron != nullptr && neuron->artifactCapabilityPending == false &&
-      neuron->artifactChunksEnabled && neuron->verifiedInstalledBundleIOGeneration == neuron->ioGeneration &&
+      neuron->verifiedInstalledBundleIOGeneration == neuron->ioGeneration &&
       neuron->verifiedInstalledBundleAuthorityEpoch == authorityEpoch &&
       prodigyIsSHA256HexDigest(neuron->verifiedInstalledBundleSHA256))
   {
@@ -47603,13 +47604,17 @@ public:
         [this, neuron, generation, authorityEpoch, localDigest, peerDigest, finishCurrentValidation] {
           if (finishCurrentValidation())
           {
-            neuron->artifactChunksEnabled = !localDigest->empty() && localDigest->equals(peerDigest);
-            if (neuron->artifactChunksEnabled)
+            // The registration digest is a current-stream attestation, while
+            // artifact chunk transfer additionally requires both runtimes to
+            // have the same installed bundle. Do not erase the former during
+            // a rolling upgrade merely because the latter is unavailable.
+            if (prodigyIsSHA256HexDigest(peerDigest))
             {
               neuron->verifiedInstalledBundleSHA256.assign(peerDigest);
               neuron->verifiedInstalledBundleIOGeneration = generation;
               neuron->verifiedInstalledBundleAuthorityEpoch = authorityEpoch;
             }
+            neuron->artifactChunksEnabled = !localDigest->empty() && localDigest->equals(peerDigest);
             if (neuron->machine && updateSelfWorkerMachineUUIDs.contains(neuron->machine->uuid) &&
                 !updateSelfWorkerStagedMachineUUIDs.contains(neuron->machine->uuid))
               noteWorkerRegistration(neuron, peerDigest);
@@ -47637,7 +47642,6 @@ public:
     {
       if (neuron == nullptr || neuron->machine == nullptr ||
           streamIsActive(neuron) == false || neuron->artifactCapabilityPending ||
-          neuron->artifactChunksEnabled == false ||
           neuron->verifiedInstalledBundleIOGeneration != neuron->ioGeneration ||
           neuron->verifiedInstalledBundleAuthorityEpoch == masterAuthorityEpoch ||
           prodigyIsSHA256HexDigest(neuron->verifiedInstalledBundleSHA256) == false ||

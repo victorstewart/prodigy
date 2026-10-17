@@ -49,10 +49,11 @@ public:
   bool connected = false;
   bool hadSuccessfulConnection = false;
   bool artifactCapabilityPending = false;
-  // The peer supplied this only with the registration for ioGeneration, and
-  // Brain retained it only after its ArtifactIO worker proved it equals the
-  // locally measured installed bundle.  It is an active-control-stream
-  // observation, not durable identity or binary attestation.
+  // The peer supplied this only with the registration for ioGeneration. Brain
+  // retains a valid digest as an authenticated active-control-stream
+  // observation; artifactChunksEnabled separately proves it equals the
+  // locally measured installed bundle. It is not durable identity or binary
+  // attestation.
   String verifiedInstalledBundleSHA256 = {};
   uint64_t verifiedInstalledBundleIOGeneration = 0;
   uint64_t verifiedInstalledBundleAuthorityEpoch = 0;
