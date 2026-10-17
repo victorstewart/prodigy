@@ -11137,7 +11137,9 @@ private:
     mothershipUpgradeAppendUInt(encoded, report.commissionedBrainCount);
     mothershipUpgradeAppendUInt(encoded, report.healthyCommissionedBrainCount);
     mothershipUpgradeAppendUInt(encoded, report.activeDeploymentCount);
-    mothershipUpgradeAppendUInt(encoded, report.readySchedulableStorageBytes);
+    // Exact schedulable storage is mutable inventory and is not an upgrade
+    // planner input.  Capacity safety is fenced by the target bound and the
+    // per-Brain staging probes below.
     mothershipUpgradeAppendBool(encoded, report.commissionedPeerTransportVerified);
     mothershipUpgradeAppendField(encoded, report.operationID);
     mothershipUpgradeAppendField(encoded, report.targetBundleSHA256);
@@ -11165,7 +11167,9 @@ private:
       mothershipUpgradeAppendField(encoded, peer.targetBundleSHA256);
       mothershipUpgradeAppendField(encoded, peer.targetContractSHA256);
       mothershipUpgradeAppendUInt(encoded, peer.requiredStagingBytes);
-      mothershipUpgradeAppendUInt(encoded, peer.stagingAvailableBytes);
+      mothershipUpgradeAppendUInt(encoded,
+                                  mothershipUpgradeCapacityEvidenceBytes(peer.requiredStagingBytes,
+                                                                         peer.stagingAvailableBytes));
       mothershipUpgradeAppendBool(encoded, peer.stagingCapacityProbeComplete);
       mothershipUpgradeAppendBool(encoded, peer.stagingCapacityVerified);
       mothershipUpgradeAppendField(encoded, peer.installedBundleSHA256);

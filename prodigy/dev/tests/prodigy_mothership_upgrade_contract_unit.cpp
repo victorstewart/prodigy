@@ -138,7 +138,13 @@ int main(void)
   suite.expect(plan.eligible && plan.path == MothershipUpgradePath::sameLogicalRollout && prodigyIsSHA256HexDigest(plan.inputSHA256), "select_same_cluster_serial_rollout");
   suite.expect(mothershipPlanUpgrade(contract, input).inputSHA256 == plan.inputSHA256, "stable_plan_input_hash_for_identical_inputs");
   MothershipUpgradePlannerInput changedInput = input; changedInput.freeBytes += 1;
-  suite.expect(mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256, "input_hash_binds_capacity_evidence");
+  suite.expect(mothershipPlanUpgrade(contract, changedInput).eligible &&
+                   mothershipPlanUpgrade(contract, changedInput).inputSHA256 == plan.inputSHA256,
+               "input_hash_normalizes_sufficient_capacity_evidence");
+  changedInput = input; changedInput.freeBytes = contract.requiredFreeBytes - 1;
+  suite.expect(!mothershipPlanUpgrade(contract, changedInput).eligible &&
+                   mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256,
+               "input_hash_binds_insufficient_capacity_evidence");
   changedInput = input; changedInput.workloads[0].observedPublicContinuity = false;
   suite.expect(mothershipPlanUpgrade(contract, changedInput).inputSHA256 != plan.inputSHA256, "input_hash_binds_workload_evidence");
   changedInput = input; changedInput.noManagedPublicWorkloads = true;

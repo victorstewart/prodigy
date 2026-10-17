@@ -139,6 +139,17 @@ struct MothershipUpgradePlan {
   Vector<String> orderedIntentReceipts = {};
 };
 
+// Capacity admission is a threshold proof.  Preserve exact insufficient
+// readings so a rejected plan remains diagnostic, but collapse every
+// sufficient reading to the contract's required bound.  Otherwise ordinary
+// filesystem activity can change surplus bytes between plan and apply while
+// the safety fact being admitted has not changed.
+static inline uint64_t mothershipUpgradeCapacityEvidenceBytes(uint64_t requiredBytes,
+                                                              uint64_t availableBytes)
+{
+  return requiredBytes != 0 && availableBytes >= requiredBytes ? requiredBytes : availableBytes;
+}
+
 static inline void mothershipUpgradeReject(MothershipUpgradePlan& plan, const String& reason)
 {
   plan.path = MothershipUpgradePath::reject;
@@ -469,7 +480,9 @@ static inline bool mothershipUpgradePlanInputDigest(const MothershipUpgradeContr
   mothershipUpgradeAppendBool(encoded, input.noManagedPublicWorkloads);
   mothershipUpgradeAppendBool(encoded, input.emptyIsolatedTestCluster);
   mothershipUpgradeAppendUInt(encoded, input.healthyBrains);
-  mothershipUpgradeAppendUInt(encoded, input.freeBytes);
+  mothershipUpgradeAppendUInt(encoded,
+                              mothershipUpgradeCapacityEvidenceBytes(contract.requiredFreeBytes,
+                                                                     input.freeBytes));
   mothershipUpgradeAppendUInt(encoded, input.workloads.size());
   for (const MothershipUpgradeWorkloadInput& workload : input.workloads)
   {
