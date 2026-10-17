@@ -7579,6 +7579,7 @@ public:
   virtual bool queueClusterMachineBootstrapAsync(
       ProdigyRemoteBootstrapCoordinator& coordinator,
       ProdigyRemoteBootstrapBundleApprovalCache& bundleApprovalCache,
+      uint64_t operationID,
       const ClusterMachine& clusterMachine,
       const AddMachines& request,
       const ClusterTopology& topology,
@@ -7589,7 +7590,7 @@ public:
     const ProdigyInitialTransportCredentialProjection *projectionPtr = nullptr;
     if (internalTransportAEGISRequired())
     {
-      if (!buildAddMachinesTransportProjection(clusterMachine, projection))
+      if (!buildAddMachinesTransportProjection(operationID, clusterMachine, projection))
       { failure.assign("missing qualified addMachines transport projection"_ctv); return false; }
       projectionPtr = &projection;
     }
@@ -7614,7 +7615,7 @@ public:
     if (projectionPtr != nullptr)
     {
       ProdigyInitialTransportCredentialProjection current = {};
-      if (masterAuthorityEpoch != epoch || !buildAddMachinesTransportProjection(clusterMachine, current) ||
+      if (masterAuthorityEpoch != epoch || !buildAddMachinesTransportProjection(operationID, clusterMachine, current) ||
           current.committedAuthorityGeneration != projection.committedAuthorityGeneration)
       { failure.assign("addMachines transport authority changed during bootstrap preparation"_ctv); return false; }
     }
@@ -7626,6 +7627,7 @@ public:
 
 
   virtual bool bootstrapClusterMachineBlocking(
+      uint64_t operationID,
       const ClusterMachine& clusterMachine,
       const AddMachines& request,
       const ClusterTopology& topology,
@@ -7637,7 +7639,7 @@ public:
     const ProdigyInitialTransportCredentialProjection *projectionPtr = nullptr;
     if (internalTransportAEGISRequired())
     {
-      if (!buildAddMachinesTransportProjection(clusterMachine, projection))
+      if (!buildAddMachinesTransportProjection(operationID, clusterMachine, projection))
       { failure.assign("missing qualified addMachines transport projection"_ctv); return false; }
       projectionPtr = &projection;
     }
@@ -7670,7 +7672,7 @@ public:
     if (projectionPtr != nullptr)
     {
       ProdigyInitialTransportCredentialProjection current = {};
-      if (masterAuthorityEpoch != epoch || !buildAddMachinesTransportProjection(clusterMachine, current) ||
+      if (masterAuthorityEpoch != epoch || !buildAddMachinesTransportProjection(operationID, clusterMachine, current) ||
           current.committedAuthorityGeneration != projection.committedAuthorityGeneration)
       { failure.assign("addMachines transport authority changed during bootstrap preparation"_ctv); return false; }
     }
@@ -8007,7 +8009,7 @@ public:
         ProdigyRemoteBootstrapCoordinator coordinator = {};
         for (const ClusterMachine& machine : operation.machinesToBootstrap)
           if (!queueClusterMachineBootstrapAsync(coordinator, bootstrapBundleApprovalCache,
-                machine, operation.request, operation.plannedTopology, failure)) break;
+                operationID, machine, operation.request, operation.plannedTopology, failure)) break;
         while (coordinator.pendingTasks > 0 || coordinator.openSockets > 0)
           co_await coordinator.suspend();
         if (lifetime.expired() || masterAuthorityEpoch != epoch) co_return;
@@ -8020,9 +8022,9 @@ public:
       {
         bootstrapped = prodigyBootstrapItemsConcurrently<ClusterMachine>(
             operation.machinesToBootstrap,
-            [this, &operation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine,
+            [this, operationID, &operation, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine,
                                                                String& bootstrapFailure) -> bool {
-              return bootstrapClusterMachineBlocking(clusterMachine, operation.request,
+              return bootstrapClusterMachineBlocking(operationID, clusterMachine, operation.request,
                   operation.plannedTopology, bootstrapFailure, &bootstrapBundleApprovalCache);
             }, collectOnly, &startedMachines, failure);
       }
@@ -8047,8 +8049,8 @@ public:
     {
       for (const ClusterMachine& machine : startedMachines)
       {
-        const bool delivered = co_await ProdigyHostCompletion<bool>([this, uuid = machine.uuid](auto receipt) {
-          markAddMachinesTransportCredentialDeliveredAsync(uuid, std::move(receipt));
+        const bool delivered = co_await ProdigyHostCompletion<bool>([this, operationID, uuid = machine.uuid](auto receipt) {
+          markAddMachinesTransportCredentialDeliveredAsync(operationID, uuid, std::move(receipt));
         });
         if (lifetime.expired() || masterAuthorityEpoch != epoch || !delivered)
         {
@@ -36108,23 +36110,20 @@ public:
     return true;
   }
 
-  bool buildAddMachinesTransportProjection(const ClusterMachine& machine,
+  bool buildAddMachinesTransportProjection(uint64_t operationID,
+                                           const ClusterMachine& machine,
                                            ProdigyInitialTransportCredentialProjection& projection) const
   {
     projection = {};
     if (!internalTransportAEGISRequired()) return true;
     const auto& root = masterAuthorityRuntimeState.transportCredentialAuthorityRoot;
-    if (!root.valid() || machine.uuid == 0) return false;
-    uint32_t journals = 0;
-    for (const auto& pending : masterAuthorityRuntimeState.pendingAddMachinesOperations)
-      if (const auto *target = prodigyFindClusterMachineByIdentity(pending.machinesToBootstrap, machine);
-          target && target->uuid == machine.uuid && target->isBrain == machine.isBrain)
-      {
-        if (!addMachinesTransportCohortQualified(pending.operationID, machine.uuid) ||
-            !existingNeuronsHaveAddMachinesTransportProjection(pending.operationID)) return false;
-        ++journals;
-      }
-    if (journals != 1) return false;
+    if (!root.valid() || operationID == 0 || machine.uuid == 0) return false;
+    const ProdigyPendingAddMachinesOperation *pending = findPendingAddMachinesOperation(operationID);
+    if (pending == nullptr) return false;
+    const ClusterMachine *target = prodigyFindClusterMachineByIdentity(pending->machinesToBootstrap, machine);
+    if (target == nullptr || target->uuid != machine.uuid || target->isBrain != machine.isBrain ||
+        !addMachinesTransportCohortQualified(operationID, machine.uuid) ||
+        !existingNeuronsHaveAddMachinesTransportProjection(operationID)) return false;
     projection.authority = root;
     projection.ledger = masterAuthorityRuntimeState.transportCredentialEnrollments;
     projection.committedAuthorityGeneration = masterAuthorityRuntimeState.generation;
@@ -36336,18 +36335,17 @@ public:
         });
   }
 
-  void markAddMachinesTransportCredentialDeliveredAsync(uint128_t machineUUID, PersistenceCompletion completion = {})
+  void markAddMachinesTransportCredentialDeliveredAsync(
+      uint64_t operationID, uint128_t machineUUID, PersistenceCompletion completion = {})
   {
     auto reject = [&]() { if (completion) completion(false); };
-    if (!weAreMaster || masterAuthorityEpoch == 0 || machineUUID == 0 ||
+    if (!weAreMaster || masterAuthorityEpoch == 0 || operationID == 0 || machineUUID == 0 ||
         masterAuthorityRuntimeState.generation == UINT64_MAX) { reject(); return; }
-    uint64_t journalID = 0;
-    for (const auto& pending : masterAuthorityRuntimeState.pendingAddMachinesOperations)
-      for (const auto& machine : pending.machinesToBootstrap)
-        if (machine.uuid == machineUUID)
-        { if (journalID != 0) { reject(); return; } journalID = pending.operationID; }
+    const ProdigyPendingAddMachinesOperation *pending = findPendingAddMachinesOperation(operationID);
+    if (pending == nullptr || std::none_of(pending->machinesToBootstrap.begin(), pending->machinesToBootstrap.end(),
+        [&](const ClusterMachine& machine) { return machine.uuid == machineUUID; })) { reject(); return; }
     Vector<ProdigyTransportCredentialEnrollment> members;
-    if (journalID == 0 || !inspectAddMachinesTransportCohort(journalID, members) || members.empty())
+    if (!inspectAddMachinesTransportCohort(operationID, members) || members.empty())
     { reject(); return; }
     bool changed = false;
     for (const auto& operation : masterAuthorityRuntimeState.transportCredentialEnrollmentOperations)
@@ -40183,7 +40181,8 @@ public:
             String bootstrapFailure = {};
             if (bootstrapCoordinator != nullptr && bootstrapBundleApprovalCache != nullptr &&
                 owner->queueClusterMachineBootstrapAsync(*bootstrapCoordinator, *bootstrapBundleApprovalCache,
-                                                         createdMachine, *request, *targetTopology, bootstrapFailure))
+                                                         *pendingOperationID, createdMachine, *request,
+                                                         *targetTopology, bootstrapFailure))
             {
 #if PRODIGY_DEBUG
               basics_log("addMachines incremental bootstrap-queued cloudID=%s op=%llu ssh=%s:%u mode=coordinator pendingTasks=%u openSockets=%u streamed=%u queued=%u started=%u\n",
@@ -40221,7 +40220,7 @@ public:
                      uint32_t(machinesToBootstrap->size()),
                      uint32_t(startedMachines->size()));
 #endif
-          if (owner->bootstrapClusterMachineBlocking(createdMachine, *request, *targetTopology,
+          if (owner->bootstrapClusterMachineBlocking(*pendingOperationID, createdMachine, *request, *targetTopology,
                                                      bootstrapFailure, bootstrapBundleApprovalCache))
           {
 #if PRODIGY_DEBUG
@@ -41032,8 +41031,8 @@ public:
 #endif
           if (response.failure.size() == 0 && prodigyBootstrapItemsConcurrently<ClusterMachine>(
                                                   machinesToBootstrap,
-                                                  [this, &request, &targetTopology, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine, String& failure) -> bool {
-                                                    return bootstrapClusterMachineBlocking(clusterMachine, request, targetTopology, failure, &bootstrapBundleApprovalCache);
+                                                  [this, pendingAddMachinesOperationID, &request, &targetTopology, &bootstrapBundleApprovalCache](const ClusterMachine& clusterMachine, String& failure) -> bool {
+                                                    return bootstrapClusterMachineBlocking(pendingAddMachinesOperationID, clusterMachine, request, targetTopology, failure, &bootstrapBundleApprovalCache);
                                                   },
                                                   rollbackBootstrapped,
                                                   &startedMachines,
@@ -41062,8 +41061,8 @@ public:
               }
 
               if (queueClusterMachineBootstrapAsync(
-                      bootstrapCoordinator, bootstrapBundleApprovalCache, clusterMachine, request, targetTopology,
-                      response.failure) == false)
+                      bootstrapCoordinator, bootstrapBundleApprovalCache, pendingAddMachinesOperationID,
+                      clusterMachine, request, targetTopology, response.failure) == false)
               {
                 break;
               }
@@ -41113,8 +41112,10 @@ public:
       {
         for (const ClusterMachine& machine : startedMachines)
         {
-          const bool delivered = co_await ProdigyHostCompletion<bool>([this, uuid = machine.uuid](auto receipt) {
-            markAddMachinesTransportCredentialDeliveredAsync(uuid, std::move(receipt));
+          const bool delivered = co_await ProdigyHostCompletion<bool>(
+              [this, pendingAddMachinesOperationID, uuid = machine.uuid](auto receipt) {
+            markAddMachinesTransportCredentialDeliveredAsync(
+                pendingAddMachinesOperationID, uuid, std::move(receipt));
           });
           if (operationLifetime.expired() || masterAuthorityEpoch != operationEpoch) co_return;
           if (!delivered) { response.failure.assign("failed to persist addMachines transport credential delivery receipt"_ctv); break; }

@@ -314,6 +314,7 @@ public:
   }
 
   bool bootstrapClusterMachineBlocking(
+      uint64_t operationID,
       const ClusterMachine& clusterMachine,
       const AddMachines& request,
       const ClusterTopology& topology,
@@ -321,7 +322,7 @@ public:
       ProdigyRemoteBootstrapBundleApprovalCache *bundleApprovalCache = nullptr) const override
   {
     const bool bootstrapped = ResumableAddMachinesBrain::bootstrapClusterMachineBlocking(
-        clusterMachine, request, topology, failure, bundleApprovalCache);
+        operationID, clusterMachine, request, topology, failure, bundleApprovalCache);
     if (bootstrapped && topologyAdvancedDuringBootstrap == false)
     {
       auto& owner = const_cast<StaleAddMachinesTopologyReconciliationBrain&>(*this);

@@ -809,12 +809,14 @@ public:
   }
 
   bool bootstrapClusterMachineBlocking(
+      uint64_t operationID,
       const ClusterMachine& clusterMachine,
       const AddMachines& request,
       const ClusterTopology& topology,
       String& failure,
       ProdigyRemoteBootstrapBundleApprovalCache *bundleApprovalCache = nullptr) const override
   {
+    (void)operationID;
     (void)request;
     (void)topology;
     std::lock_guard<std::mutex> lock(bootstrapRecordsMutex);
@@ -859,11 +861,13 @@ public:
   bool queueClusterMachineBootstrapAsync(
       ProdigyRemoteBootstrapCoordinator& coordinator,
       ProdigyRemoteBootstrapBundleApprovalCache& bundleApprovalCache,
+      uint64_t operationID,
       const ClusterMachine& clusterMachine,
       const AddMachines& request,
       const ClusterTopology& topology,
       String& failure) const override
   {
+    (void)operationID;
     (void)bundleApprovalCache;
     (void)request;
     (void)topology;
@@ -37729,12 +37733,12 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
                                }),
                "transport_credential_add_machines_durable_staging_waits_for_pending_exact_quorum");
   ProdigyInitialTransportCredentialProjection stagedProjection = {};
-  suite.expect(!cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), stagedProjection) &&
+  suite.expect(!cohort.buildAddMachinesTransportProjection(addMachinesOperationID, machine(newBrainUUID, true), stagedProjection) &&
                    cohort.transportCredentialDeliveryCalls == 0,
                "transport_credential_add_machines_never_projects_or_delivers_while_staging");
   bool prematureReceiptRejected = false;
   cohort.markAddMachinesTransportCredentialDeliveredAsync(
-      newWorkerUUID, [&](bool durable) { prematureReceiptRejected = !durable; });
+      addMachinesOperationID, newWorkerUUID, [&](bool durable) { prematureReceiptRejected = !durable; });
   suite.expect(prematureReceiptRejected,
                "transport_credential_add_machines_rejects_delivery_receipt_before_active_cohort");
 
@@ -37860,19 +37864,29 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
 
   ProdigyInitialTransportCredentialProjection cohortProjection = {};
   suite.expect(!cohortReady &&
-                   !cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), cohortProjection) &&
+                   !cohort.buildAddMachinesTransportProjection(addMachinesOperationID, machine(newBrainUUID, true), cohortProjection) &&
                    cohort.transportCredentialDeliveryCalls == 0,
                "transport_credential_add_machines_active_quorum_waits_for_existing_neuron_projection");
   cohort.existingNeuronProjectionAvailable = true;
   cohort.driveTransportCredentialEnrollmentOperations();
   suite.expect(cohortReady &&
-                   cohort.buildAddMachinesTransportProjection(machine(newBrainUUID, true), cohortProjection) &&
+                   cohort.buildAddMachinesTransportProjection(addMachinesOperationID, machine(newBrainUUID, true), cohortProjection) &&
                    cohortProjection.authority.valid() && cohortProjection.ledger.size() == 6 &&
                    cohort.transportCredentialDeliveryCalls == 0,
                "transport_credential_add_machines_releases_root_projection_after_existing_neuron_projection");
+  ProdigyPendingAddMachinesOperation retainedRetry =
+      cohort.masterAuthorityRuntimeState.pendingAddMachinesOperations.front();
+  retainedRetry.operationID = addMachinesOperationID + 1;
+  cohort.masterAuthorityRuntimeState.pendingAddMachinesOperations.push_back(std::move(retainedRetry));
+  suite.require(acknowledgeCurrent(cohort, cohortPeer),
+                "transport_credential_add_machines_retained_retry_reacknowledges_current_authority");
+  ProdigyInitialTransportCredentialProjection retryProjection = {};
+  suite.expect(cohort.buildAddMachinesTransportProjection(
+                   addMachinesOperationID, machine(newBrainUUID, true), retryProjection),
+               "transport_credential_add_machines_projection_selects_requested_operation_among_retained_retries");
   bool workerReceiptDurable = false;
   cohort.markAddMachinesTransportCredentialDeliveredAsync(
-      newWorkerUUID, [&](bool durable) { workerReceiptDurable = durable; });
+      addMachinesOperationID, newWorkerUUID, [&](bool durable) { workerReceiptDurable = durable; });
   suite.expect(!workerReceiptDurable,
                "transport_credential_add_machines_worker_receipt_waits_for_durable_commit");
   cohort.finishRuntimePersistence(true);
