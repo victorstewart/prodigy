@@ -8143,6 +8143,182 @@ public:
     }
   }
 
+  static void appendElectionFrontierU64(String& encoded, uint64_t value)
+  {
+    uint8_t bytes[sizeof(value)] = {};
+    for (uint32_t index = 0; index < sizeof(value); ++index)
+      bytes[index] = uint8_t(value >> (index * 8));
+    encoded.append(bytes, sizeof(bytes));
+  }
+
+  static void appendElectionFrontierBytes(String& encoded, const String& value)
+  {
+    appendElectionFrontierU64(encoded, value.size());
+    encoded.append(reinterpret_cast<const uint8_t *>(value.data()), value.size());
+  }
+
+  template <typename Map, typename Compare, typename AppendKey>
+  static void appendCanonicalElectionFrontierMap(
+      String& encoded, const char *tag, const Map& values, Compare&& compare, AppendKey&& appendKey)
+  {
+    // bytell_hash_subvector exposes only a non-const iterator. The frontier
+    // codec only reads its entries; retain the const input contract while
+    // using that iterator interface.
+    Map& iterable = const_cast<Map&>(values);
+    using Pair = std::remove_reference_t<decltype(*iterable.begin())>;
+    using Key = std::remove_const_t<std::remove_reference_t<decltype(std::declval<Pair>().first)>>;
+    using Value = std::remove_const_t<std::remove_reference_t<decltype(std::declval<Pair>().second)>>;
+    Vector<std::pair<const Key *, const Value *>> entries = {};
+    entries.reserve(iterable.size());
+    for (const auto& [key, value] : iterable) entries.push_back({&key, &value});
+    std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) {
+      return compare(*lhs.first, *rhs.first);
+    });
+    encoded.append(reinterpret_cast<const uint8_t *>(tag), std::strlen(tag));
+    appendElectionFrontierU64(encoded, entries.size());
+    for (const auto& [key, value] : entries)
+    {
+      appendKey(encoded, *key);
+      String serializedValue = {};
+      Value ownedValue = *value;
+      BitseryEngine::serialize(serializedValue, ownedValue);
+      appendElectionFrontierBytes(encoded, serializedValue);
+    }
+  }
+
+  template <typename Set, typename Compare, typename AppendValue>
+  static void appendCanonicalElectionFrontierSet(
+      String& encoded, const char *tag, const Set& values, Compare&& compare, AppendValue&& appendValue)
+  {
+    // Match the map helper's read-only use of bytell_hash containers whose
+    // iterator API is not const-qualified.
+    Set& iterable = const_cast<Set&>(values);
+    using Value = std::remove_const_t<std::remove_reference_t<decltype(*iterable.begin())>>;
+    Vector<const Value *> entries = {};
+    entries.reserve(iterable.size());
+    for (const Value& value : iterable) entries.push_back(&value);
+    std::sort(entries.begin(), entries.end(), [&](const Value *lhs, const Value *rhs) {
+      return compare(*lhs, *rhs);
+    });
+    encoded.append(reinterpret_cast<const uint8_t *>(tag), std::strlen(tag));
+    appendElectionFrontierU64(encoded, entries.size());
+    for (const Value *value : entries) appendValue(encoded, *value);
+  }
+
+  static void appendCanonicalElectionFrontierMaps(
+      String& encoded, const ProdigyMasterAuthorityStateTransition& transition)
+  {
+    const auto numericLess = [](uint64_t lhs, uint64_t rhs) { return lhs < rhs; };
+    const auto stringLess = [](const String& lhs, const String& rhs) {
+      return prodigyPersistentStringComesBefore(lhs, rhs);
+    };
+    const auto appendU64 = [](String& target, uint64_t key) {
+      appendElectionFrontierU64(target, key);
+    };
+    const auto appendString = [](String& target, const String& key) {
+      appendElectionFrontierBytes(target, key);
+    };
+    const auto appendCapability = [](String& target, int capability) {
+      appendElectionFrontierU64(target, uint64_t(int64_t(capability)));
+    };
+    const auto appendApplicationCapabilities = [&](const char *prefix, const ApplicationConfig& config) {
+      String tag = {};
+      tag.assign(prefix);
+      tag.append("/capabilities"_ctv);
+      appendCanonicalElectionFrontierSet(encoded, tag.c_str(), config.capabilities,
+          [](int lhs, int rhs) { return lhs < rhs; }, appendCapability);
+    };
+    const auto appendCredentialMetadata = [&](const char *prefix, const CredentialBundle& bundle) {
+      for (uint32_t credentialIndex = 0; credentialIndex < bundle.apiCredentials.size(); ++credentialIndex)
+      {
+        String tag = {};
+        tag.assign(prefix);
+        tag.append("/credential/"_ctv);
+        String indexText = {};
+        indexText.snprintf<"{}"_ctv>(credentialIndex);
+        tag.append(indexText);
+        tag.append("/metadata"_ctv);
+        appendCanonicalElectionFrontierMap(encoded, tag.c_str(), bundle.apiCredentials[credentialIndex].metadata,
+            stringLess, appendString);
+      }
+    };
+    const auto appendContainerPlanMaps = [&](const char *prefix, const ContainerPlan& plan) {
+      String tag = {};
+      tag.assign(prefix);
+      tag.append("/subscriptions"_ctv);
+      appendCanonicalElectionFrontierMap(encoded, tag.c_str(), plan.subscriptions, numericLess, appendU64);
+      tag.assign(prefix);
+      tag.append("/advertisements"_ctv);
+      appendCanonicalElectionFrontierMap(encoded, tag.c_str(), plan.advertisements, numericLess, appendU64);
+      tag.assign(prefix);
+      tag.append("/subscription-pairings"_ctv);
+      appendCanonicalElectionFrontierMap(encoded, tag.c_str(), plan.subscriptionPairings, numericLess, appendU64);
+      tag.assign(prefix);
+      tag.append("/advertisement-pairings"_ctv);
+      appendCanonicalElectionFrontierMap(encoded, tag.c_str(), plan.advertisementPairings, numericLess, appendU64);
+      appendApplicationCapabilities(prefix, plan.config);
+      appendCredentialMetadata(prefix, plan.credentialBundle);
+    };
+
+    appendCanonicalElectionFrontierMap(encoded, "tls-resumption", transition.runtimeState.tlsResumptionSnapshotsByWormhole,
+        stringLess, appendString);
+    appendCanonicalElectionFrontierMap(encoded, "task-executions", transition.runtimeState.taskExecutions,
+        numericLess, appendU64);
+    appendCanonicalElectionFrontierMap(encoded, "machine-configs", transition.brainConfig.configBySlug,
+        stringLess, appendString);
+    appendCanonicalElectionFrontierMap(encoded, "dns-metadata", transition.brainConfig.dnsCredential.metadata,
+        stringLess, appendString);
+    for (uint32_t index = 0; index < transition.runtimeState.statefulServingAuthorities.size(); ++index)
+    {
+      String prefix = {};
+      prefix.assign("stateful-authority/"_ctv);
+      String indexText = {};
+      indexText.snprintf<"{}"_ctv>(index);
+      prefix.append(indexText);
+      appendApplicationCapabilities(prefix.c_str(), transition.runtimeState.statefulServingAuthorities[index].targetConfig);
+    }
+    for (uint32_t index = 0; index < transition.servingRuntimeStates.size(); ++index)
+    {
+      String prefix = {};
+      prefix.assign("serving/"_ctv);
+      String indexText = {};
+      indexText.snprintf<"{}"_ctv>(index);
+      prefix.append(indexText);
+      appendContainerPlanMaps(prefix.c_str(), transition.servingRuntimeStates[index].plan);
+    }
+    for (uint32_t index = 0; index < transition.statelessAdmissionPlans.size(); ++index)
+    {
+      String prefix = {};
+      prefix.assign("stateless-admission/"_ctv);
+      String indexText = {};
+      indexText.snprintf<"{}"_ctv>(index);
+      prefix.append(indexText);
+      appendApplicationCapabilities(prefix.c_str(), transition.statelessAdmissionPlans[index].config);
+    }
+  }
+
+  static void clearElectionFrontierMaps(ProdigyMasterAuthorityStateTransition& transition)
+  {
+    transition.runtimeState.tlsResumptionSnapshotsByWormhole.clear();
+    transition.runtimeState.taskExecutions.clear();
+    transition.brainConfig.configBySlug.clear();
+    transition.brainConfig.dnsCredential.metadata.clear();
+    for (auto& authority : transition.runtimeState.statefulServingAuthorities)
+      authority.targetConfig.capabilities.clear();
+    for (auto& state : transition.servingRuntimeStates)
+    {
+      state.plan.subscriptions.clear();
+      state.plan.advertisements.clear();
+      state.plan.subscriptionPairings.clear();
+      state.plan.advertisementPairings.clear();
+      state.plan.config.capabilities.clear();
+      for (auto& credential : state.plan.credentialBundle.apiCredentials)
+        credential.metadata.clear();
+    }
+    for (auto& plan : transition.statelessAdmissionPlans)
+      plan.config.capabilities.clear();
+  }
+
   bool serializeCurrentMasterAuthorityTransition(
       String& serialized, String& digest, bool canonicalElectionFrontier = false) const
   {
@@ -8208,6 +8384,19 @@ public:
     transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
     transition.runtimeState.updateSelfFollowerReadyPeerKeys.clear();
     ownBrainConfig(brainConfig, transition.brainConfig);
+    if (canonicalElectionFrontier)
+    {
+      // Replication receipts retain their established bytes. The election
+      // frontier instead hashes a map-free transition backbone followed by
+      // sorted map entries, so equivalent hash-table layouts cannot fence a
+      // designated handoff.
+      ProdigyMasterAuthorityStateTransition canonicalMaps = transition;
+      clearElectionFrontierMaps(transition);
+      BitseryEngine::serialize(serialized, transition);
+      serialized.append("prodigy/election-frontier/maps/v1"_ctv);
+      appendCanonicalElectionFrontierMaps(serialized, canonicalMaps);
+      return prodigyComputeSHA256Hex(serialized, digest);
+    }
     BitseryEngine::serialize(serialized, transition);
     return prodigyComputeSHA256Hex(serialized, digest);
   }

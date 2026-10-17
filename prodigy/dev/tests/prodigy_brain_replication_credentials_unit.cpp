@@ -34784,6 +34784,250 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   }
 
   {
+    // The election digest is a semantic frontier, not a byte-for-byte image
+    // of independently rebuilt hash tables.  Exercise the map-bearing fields
+    // that are intentionally sorted only by the election codec.
+    TransportCredentialDeliveryTestBrain left = {}, right = {};
+    configureAuthority(left, 42, 191);
+    configureAuthority(right, 42, 191);
+    TlsResumptionSnapshot firstSnapshot = {}, secondSnapshot = {};
+    firstSnapshot.generation = secondSnapshot.generation = 7;
+    firstSnapshot.wormholeName = "first"_ctv;
+    secondSnapshot.wormholeName = "second"_ctv;
+    left.masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole.insert_or_assign("second-key"_ctv, secondSnapshot);
+    left.masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole.insert_or_assign("first-key"_ctv, firstSnapshot);
+    right.masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole.insert_or_assign("first-key"_ctv, firstSnapshot);
+    right.masterAuthorityRuntimeState.tlsResumptionSnapshotsByWormhole.insert_or_assign("second-key"_ctv, secondSnapshot);
+    TaskExecutionRecord firstTask = {}, secondTask = {};
+    firstTask.executionID = 101; secondTask.executionID = 202;
+    left.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(202, secondTask);
+    left.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(101, firstTask);
+    right.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(101, firstTask);
+    right.masterAuthorityRuntimeState.taskExecutions.insert_or_assign(202, secondTask);
+    MachineConfig firstMachine = {}, secondMachine = {};
+    firstMachine.slug = "first"_ctv; secondMachine.slug = "second"_ctv;
+    left.brainConfig.configBySlug.insert_or_assign("second"_ctv, secondMachine);
+    left.brainConfig.configBySlug.insert_or_assign("first"_ctv, firstMachine);
+    right.brainConfig.configBySlug.insert_or_assign("first"_ctv, firstMachine);
+    right.brainConfig.configBySlug.insert_or_assign("second"_ctv, secondMachine);
+    left.brainConfig.dnsCredential.metadata.insert_or_assign("second"_ctv, "two"_ctv);
+    left.brainConfig.dnsCredential.metadata.insert_or_assign("first"_ctv, "one"_ctv);
+    right.brainConfig.dnsCredential.metadata.insert_or_assign("first"_ctv, "one"_ctv);
+    right.brainConfig.dnsCredential.metadata.insert_or_assign("second"_ctv, "two"_ctv);
+    String leftTransition = {}, leftTransitionDigest = {}, rightTransition = {}, rightTransitionDigest = {};
+    uint64_t leftGeneration = 0, rightGeneration = 0;
+    String leftFrontier = {}, rightFrontier = {};
+    suite.require(left.serializeCurrentMasterAuthorityTransition(leftTransition, leftTransitionDigest) &&
+                      right.serializeCurrentMasterAuthorityTransition(rightTransition, rightTransitionDigest) &&
+                      left.localAuthorityElectionFrontier(leftGeneration, leftFrontier) &&
+                      right.localAuthorityElectionFrontier(rightGeneration, rightFrontier),
+                  "authority_election_map_frontier_serializes_reverse_insertions");
+    suite.expect(leftGeneration == rightGeneration && leftFrontier.equals(rightFrontier),
+                 "authority_election_frontier_canonicalizes_tls_task_and_config_hash_maps");
+
+    ProdigyMasterAuthorityStateTransition leftServing = {}, rightServing = {};
+    leftServing.servingRuntimeStates.resize(1);
+    rightServing.servingRuntimeStates.resize(1);
+    Subscription firstSubscription = {}, secondSubscription = {};
+    Advertisement firstAdvertisement = {}, secondAdvertisement = {};
+    leftServing.servingRuntimeStates[0].plan.subscriptions.insert_or_assign(22, secondSubscription);
+    leftServing.servingRuntimeStates[0].plan.subscriptions.insert_or_assign(11, firstSubscription);
+    rightServing.servingRuntimeStates[0].plan.subscriptions.insert_or_assign(11, firstSubscription);
+    rightServing.servingRuntimeStates[0].plan.subscriptions.insert_or_assign(22, secondSubscription);
+    leftServing.servingRuntimeStates[0].plan.advertisements.insert_or_assign(22, secondAdvertisement);
+    leftServing.servingRuntimeStates[0].plan.advertisements.insert_or_assign(11, firstAdvertisement);
+    rightServing.servingRuntimeStates[0].plan.advertisements.insert_or_assign(11, firstAdvertisement);
+    rightServing.servingRuntimeStates[0].plan.advertisements.insert_or_assign(22, secondAdvertisement);
+    leftServing.servingRuntimeStates[0].plan.subscriptionPairings.entriesFor(22).push_back({});
+    leftServing.servingRuntimeStates[0].plan.subscriptionPairings.entriesFor(11).push_back({});
+    rightServing.servingRuntimeStates[0].plan.subscriptionPairings.entriesFor(11).push_back({});
+    rightServing.servingRuntimeStates[0].plan.subscriptionPairings.entriesFor(22).push_back({});
+    leftServing.servingRuntimeStates[0].plan.advertisementPairings.entriesFor(22).push_back({});
+    leftServing.servingRuntimeStates[0].plan.advertisementPairings.entriesFor(11).push_back({});
+    rightServing.servingRuntimeStates[0].plan.advertisementPairings.entriesFor(11).push_back({});
+    rightServing.servingRuntimeStates[0].plan.advertisementPairings.entriesFor(22).push_back({});
+    leftServing.servingRuntimeStates[0].plan.config.capabilities.insert(22);
+    leftServing.servingRuntimeStates[0].plan.config.capabilities.insert(11);
+    rightServing.servingRuntimeStates[0].plan.config.capabilities.insert(11);
+    rightServing.servingRuntimeStates[0].plan.config.capabilities.insert(22);
+    leftServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials.resize(1);
+    rightServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials.resize(1);
+    leftServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("second"_ctv, "two"_ctv);
+    leftServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("first"_ctv, "one"_ctv);
+    rightServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("first"_ctv, "one"_ctv);
+    rightServing.servingRuntimeStates[0].plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("second"_ctv, "two"_ctv);
+    leftServing.runtimeState.statefulServingAuthorities.resize(1);
+    rightServing.runtimeState.statefulServingAuthorities.resize(1);
+    leftServing.runtimeState.statefulServingAuthorities[0].targetConfig.capabilities.insert(22);
+    leftServing.runtimeState.statefulServingAuthorities[0].targetConfig.capabilities.insert(11);
+    rightServing.runtimeState.statefulServingAuthorities[0].targetConfig.capabilities.insert(11);
+    rightServing.runtimeState.statefulServingAuthorities[0].targetConfig.capabilities.insert(22);
+    leftServing.statelessAdmissionPlans.resize(1);
+    rightServing.statelessAdmissionPlans.resize(1);
+    leftServing.statelessAdmissionPlans[0].config.capabilities.insert(22);
+    leftServing.statelessAdmissionPlans[0].config.capabilities.insert(11);
+    rightServing.statelessAdmissionPlans[0].config.capabilities.insert(11);
+    rightServing.statelessAdmissionPlans[0].config.capabilities.insert(22);
+    String leftServingMaps = {}, rightServingMaps = {};
+    Brain::appendCanonicalElectionFrontierMaps(leftServingMaps, leftServing);
+    Brain::appendCanonicalElectionFrontierMaps(rightServingMaps, rightServing);
+    suite.expect(leftServingMaps.equals(rightServingMaps),
+                 "authority_election_frontier_canonicalizes_nested_serving_plan_hash_maps_and_capability_metadata_hashes");
+    auto canonicalElectionEncoding = [](ProdigyMasterAuthorityStateTransition transition) {
+      ProdigyMasterAuthorityStateTransition canonicalMaps = transition;
+      Brain::clearElectionFrontierMaps(transition);
+      String encoded = {};
+      BitseryEngine::serialize(encoded, transition);
+      encoded.append("prodigy/election-frontier/maps/v1"_ctv);
+      Brain::appendCanonicalElectionFrontierMaps(encoded, canonicalMaps);
+      return encoded;
+    };
+    suite.expect(canonicalElectionEncoding(leftServing).equals(canonicalElectionEncoding(rightServing)),
+                 "authority_election_frontier_full_encoding_excludes_nested_hash_table_layout");
+
+    auto makeServingStates = [](bool reverseInsertion) {
+      Vector<BrainReplicatedContainerRuntimeState> states = {};
+      for (uint32_t index = 0; index < 3; ++index)
+      {
+        BrainReplicatedContainerRuntimeState state = {};
+        state.machineUUID = 0x9800 + index;
+        ContainerPlan& plan = state.plan;
+        plan.uuid = 0x9900 + index;
+        plan.config.applicationID = 77;
+        plan.config.versionID = 9;
+        plan.config.type = ApplicationType::stateful;
+        plan.config.nLogicalCores = 4;
+        plan.isStateful = true;
+        plan.statefulMeshRoles.client = 99;
+        plan.statefulTopology.shardGroup = 0;
+        plan.statefulTopology.topologyEpoch = 22;
+        plan.statefulTopology.workerCount = 4;
+        plan.statefulTopology.servingMode = StatefulTopologyServingMode::serve;
+        plan.statefulTopology.sourceEpoch = 22;
+        plan.statefulTopology.targetEpoch = 22;
+        plan.statefulTopology.bridgeMode = StatefulTopologyBridgeMode::none;
+        if (index == 0)
+          plan.advertisements.emplace(99, Advertisement(99, ContainerState::healthy, ContainerState::destroying, 1234));
+        Subscription firstSubscription = {}, secondSubscription = {};
+        Advertisement firstAdvertisement(101, ContainerState::healthy, ContainerState::destroying, 1235);
+        Advertisement secondAdvertisement(202, ContainerState::healthy, ContainerState::destroying, 1236);
+        if (reverseInsertion)
+        {
+          plan.subscriptions.insert_or_assign(22, secondSubscription);
+          plan.subscriptions.insert_or_assign(11, firstSubscription);
+          plan.advertisements.insert_or_assign(202, secondAdvertisement);
+          plan.advertisements.insert_or_assign(101, firstAdvertisement);
+          plan.subscriptionPairings.entriesFor(22).push_back({});
+          plan.subscriptionPairings.entriesFor(11).push_back({});
+          plan.advertisementPairings.entriesFor(22).push_back({});
+          plan.advertisementPairings.entriesFor(11).push_back({});
+        }
+        else
+        {
+          plan.subscriptions.insert_or_assign(11, firstSubscription);
+          plan.subscriptions.insert_or_assign(22, secondSubscription);
+          plan.advertisements.insert_or_assign(101, firstAdvertisement);
+          plan.advertisements.insert_or_assign(202, secondAdvertisement);
+          plan.subscriptionPairings.entriesFor(11).push_back({});
+          plan.subscriptionPairings.entriesFor(22).push_back({});
+          plan.advertisementPairings.entriesFor(11).push_back({});
+          plan.advertisementPairings.entriesFor(22).push_back({});
+        }
+        plan.hasCredentialBundle = true;
+        plan.credentialBundle.apiCredentials.resize(1);
+        if (reverseInsertion)
+        {
+          plan.config.capabilities.insert(22); plan.config.capabilities.insert(11);
+          plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("second"_ctv, "two"_ctv);
+          plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("first"_ctv, "one"_ctv);
+        }
+        else
+        {
+          plan.config.capabilities.insert(11); plan.config.capabilities.insert(22);
+          plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("first"_ctv, "one"_ctv);
+          plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("second"_ctv, "two"_ctv);
+        }
+        states.push_back(std::move(state));
+      }
+      return states;
+    };
+    auto makeServingAuthority = [](const Vector<BrainReplicatedContainerRuntimeState>& states) {
+      ProdigyStatefulServingAuthority authority = {};
+      authority.deploymentID = states[0].plan.config.deploymentID();
+      authority.applicationID = states[0].plan.config.applicationID;
+      authority.operationID = 77;
+      authority.revision = 42;
+      authority.phase = StatefulWorkerTopologyUpgradePhase::none;
+      authority.sourceEpoch = 11;
+      authority.targetEpoch = 22;
+      authority.targetConfig = states[0].plan.config;
+      for (const BrainReplicatedContainerRuntimeState& state : states)
+      {
+        ProdigyStatefulServingAuthorityMember member = {};
+        member.containerUUID = state.plan.uuid;
+        member.machineUUID = state.machineUUID;
+        member.shardGroup = state.plan.shardGroup;
+        member.isSource = false;
+        member.advertiseClient = state.plan.advertisements.contains(99);
+        prodigyStatefulServingRuntimeDigest(state, member.planSHA256);
+        authority.members.push_back(std::move(member));
+      }
+      return authority;
+    };
+    left.statefulServingRuntimeStates = makeServingStates(true);
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    left.masterAuthorityRuntimeState.statefulServingAuthorities = {makeServingAuthority(left.statefulServingRuntimeStates)};
+    right.masterAuthorityRuntimeState.statefulServingAuthorities = {makeServingAuthority(right.statefulServingRuntimeStates)};
+    uint64_t leftNestedGeneration = 0, rightNestedGeneration = 0;
+    String leftNestedFrontier = {}, rightNestedFrontier = {};
+    suite.require(left.localAuthorityElectionFrontier(leftNestedGeneration, leftNestedFrontier) &&
+                      right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_nested_hashes");
+    suite.expect(leftNestedGeneration == rightNestedGeneration && leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_canonicalizes_nested_hashes");
+
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    right.statefulServingRuntimeStates[0].plan.subscriptions.erase(11);
+    right.masterAuthorityRuntimeState.statefulServingAuthorities[0] = makeServingAuthority(right.statefulServingRuntimeStates);
+    suite.require(right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_subscription_change");
+    suite.expect(!leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_binds_subscription_change");
+
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    right.statefulServingRuntimeStates[0].plan.advertisements.erase(101);
+    right.masterAuthorityRuntimeState.statefulServingAuthorities[0] = makeServingAuthority(right.statefulServingRuntimeStates);
+    suite.require(right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_advertisement_change");
+    suite.expect(!leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_binds_advertisement_change");
+
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    right.statefulServingRuntimeStates[0].plan.subscriptionPairings.entriesFor(11).clear();
+    right.masterAuthorityRuntimeState.statefulServingAuthorities[0] = makeServingAuthority(right.statefulServingRuntimeStates);
+    suite.require(right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_subscription_pairing_change");
+    suite.expect(!leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_binds_subscription_pairing_change");
+
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    right.statefulServingRuntimeStates[0].plan.advertisementPairings.entriesFor(11).clear();
+    right.masterAuthorityRuntimeState.statefulServingAuthorities[0] = makeServingAuthority(right.statefulServingRuntimeStates);
+    suite.require(right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_advertisement_pairing_change");
+    suite.expect(!leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_binds_advertisement_pairing_change");
+
+    right.statefulServingRuntimeStates = makeServingStates(false);
+    right.statefulServingRuntimeStates[0].plan.credentialBundle.apiCredentials[0].metadata.insert_or_assign("first"_ctv, "changed"_ctv);
+    right.masterAuthorityRuntimeState.statefulServingAuthorities[0] = makeServingAuthority(right.statefulServingRuntimeStates);
+    suite.require(right.localAuthorityElectionFrontier(rightNestedGeneration, rightNestedFrontier),
+                  "authority_election_frontier_production_path_serializes_nested_metadata_change");
+    suite.expect(!leftNestedFrontier.equals(rightNestedFrontier),
+                 "authority_election_frontier_production_path_binds_nested_metadata_change");
+  }
+
+  {
     // The leader and the higher-UUID survivor held qualified generation 14;
     // this lower-UUID survivor still has generation 12 when the leader dies.
     ScopedRing electionRing;
@@ -35020,9 +35264,11 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     bool preferred = false;
     suite.expect(!majority.resolveFailoverMasterByActivePeerAddressOrder(preferred),
         "authority_election_same_generation_split_waits_for_all_frontiers");
-    String serialized, majorityDigest;
+    uint64_t majorityGeneration = 0;
+    String majorityDigest;
     const String conflictingDigest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
-    suite.require(majority.serializeCurrentMasterAuthorityTransition(serialized, majorityDigest) &&
+    suite.require(majority.localAuthorityElectionFrontier(majorityGeneration, majorityDigest) &&
+        majorityGeneration == 14 &&
         majority.acceptAuthorityElectionFrontier(&matchingPeer, matchingPeer.authorityElectionRequestNonce,
             14, majorityDigest) &&
         majority.acceptAuthorityElectionFrontier(&conflictingPeer, conflictingPeer.authorityElectionRequestNonce,
