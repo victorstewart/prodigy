@@ -105,6 +105,9 @@ public:
   uint32_t updateSelfPersistenceBackpressureResponses = 0;
   uint32_t updateSelfPersistenceAdmissionCalls = 0;
   bool rejectUpdateSelfPersistenceAdmission = false;
+  uint32_t replicatedDeploymentCandidatePersistCalls = 0;
+  uint64_t lastReplicatedDeploymentCandidateID = 0;
+  std::function<void(uint64_t)> inlineReplicatedDeploymentCandidateCompletionObserver;
   uint32_t masterAuthorityTransitionCandidatePersistCalls = 0;
   bool holdClusterOwnership = false;
   uint32_t clusterOwnershipBackpressureResponses = 0;
@@ -227,6 +230,29 @@ public:
     {
       --updateSelfPersistenceBackpressureResponses;
       return UpdateSelfPersistenceAdmission::backpressured;
+    }
+    return UpdateSelfPersistenceAdmission::admitted;
+  }
+
+  UpdateSelfPersistenceAdmission persistReplicatedDeploymentPlanCandidate(
+      const DeploymentPlan& plan, PersistenceCompletion completion) override
+  {
+    const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+    if (admission != UpdateSelfPersistenceAdmission::admitted) return admission;
+    replicatedDeploymentCandidatePersistCalls += 1;
+    lastReplicatedDeploymentCandidateID = plan.config.deploymentID();
+    persistCalls += 1;
+    const bool result = persistSucceeds;
+    const std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
+    auto guarded = [lifetime, completion = std::move(completion)](bool durable) mutable {
+      if (!lifetime.expired() && completion) completion(durable);
+    };
+    if (holdRuntimePersistence) pendingRuntimePersistence.push_back(std::move(guarded));
+    else
+    {
+      guarded(result);
+      if (inlineReplicatedDeploymentCandidateCompletionObserver)
+        inlineReplicatedDeploymentCandidateCompletionObserver(plan.config.deploymentID());
     }
     return UpdateSelfPersistenceAdmission::admitted;
   }
@@ -4718,16 +4744,354 @@ static void testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(Test
   BitseryEngine::serialize(serializedPlan, plan);
   String messageBuffer = {};
 
-  follower.persistSucceeds = false;
+  follower.holdRuntimePersistence = true;
   follower.brainHandler(&master, buildBrainMessage(messageBuffer, BrainTopic::replicateDeployment, serializedPlan, ""_ctv));
   suite.expect(master.wBuffer.empty(),
-               "replicated_deployment_does_not_ack_before_persistence_succeeds");
+               "replicated_deployment_does_not_ack_before_persistence_completes");
 
-  follower.persistSucceeds = true;
-  follower.brainHandler(&master, buildBrainMessage(messageBuffer, BrainTopic::replicateDeployment, serializedPlan, ""_ctv));
+  follower.finishRuntimePersistence(true);
   suite.expect(master.wBuffer.empty() == false,
                "replicated_deployment_acks_after_persistence_succeeds");
   follower.deploymentPlans.erase(plan.config.deploymentID());
+}
+
+static void testReplicatedMetadataDeploymentPersistenceAdmission(TestSuite& suite)
+{
+  auto authorizeActiveMasterPeer = [&](TestBrain& brain,
+                                       BrainView& peer,
+                                       ScopedSocketPair& sockets,
+                                       const char *socketName,
+                                       uint128_t uuid,
+                                       int64_t bootNs) -> bool {
+    if (sockets.create(suite, socketName) == false)
+    {
+      return false;
+    }
+    const int fixedSlot = sockets.adoptLeftIntoFixedFileSlot();
+    if (suite.require(fixedSlot >= 0, testName(socketName, "adopts_fixed_slot")) == false)
+    {
+      return false;
+    }
+    authorizeMasterPeerForTest(brain, peer, fixedSlot, uuid, bootNs);
+    // Keep protocol frames observable in the fixture outbox. The tests inspect
+    // them synchronously and drain any close SQEs before stack-owned peers die.
+    peer.pendingSend = true;
+    return true;
+  };
+
+  auto sendMetadata = [&](TestBrain& follower, BrainView& master, uint16_t applicationID, String& frame) {
+    DeploymentPlan plan = {};
+    seedDeployRequestPlan(plan, applicationID);
+    String serializedPlan = {};
+    BitseryEngine::serialize(serializedPlan, plan);
+    follower.brainHandler(&master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, ""_ctv));
+    return plan;
+  };
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_inline_receipt_master_socket",
+                                  uint128_t(0x62'024'01), 62'024) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    bool pendingDuringInlineReceipt = false;
+    bool ackDuringInlineReceipt = false;
+    follower.inlineReplicatedDeploymentCandidateCompletionObserver = [&](uint64_t deploymentID) {
+      pendingDuringInlineReceipt = follower.pendingReplicatedDeploymentPersistence.contains(deploymentID);
+      ackDuringInlineReceipt = countTopicFrames(master.wBuffer, BrainTopic::replicateDeployment) != 0;
+    };
+
+    const DeploymentPlan plan = sendMetadata(follower, master, 62'024, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    suite.expect(pendingDuringInlineReceipt && ackDuringInlineReceipt == false &&
+                     follower.deploymentPlans.contains(deploymentID) &&
+                     follower.replicatedDeploymentCandidatePersistCalls == 1 &&
+                     follower.pendingReplicatedDeploymentPersistence.empty() &&
+                     countTopicFrames(master.wBuffer, BrainTopic::replicateDeployment) == 1,
+                 "replicated_metadata_inline_receipt_projects_before_single_ack");
+    follower.deploymentPlans.erase(deploymentID);
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_backpressure_master_socket",
+                                  uint128_t(0x62'025'01), 62'025) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    const uint16_t applicationID = 62'025;
+
+    follower.updateSelfPersistenceBackpressureResponses = 1;
+    const DeploymentPlan plan = sendMetadata(follower, master, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    suite.expect(follower.deploymentPlans.contains(deploymentID) == false && master.wBuffer.empty() &&
+                     follower.peerArtifactReconciliationDefers(&master, deploymentID),
+                 "replicated_metadata_persistence_backpressure_does_not_apply_or_ack");
+
+    follower.runBrainPeerHeartbeatTick();
+    suite.expect(countTopicFrames(master.wBuffer, BrainTopic::reconcileState) == 1,
+                 "replicated_metadata_persistence_backpressure_requests_reconciliation");
+
+    master.wBuffer.clear();
+    follower.holdRuntimePersistence = true;
+    sendMetadata(follower, master, applicationID, frame);
+    suite.expect(follower.deploymentPlans.contains(deploymentID) && master.wBuffer.empty() &&
+                     follower.replicatedDeploymentCandidatePersistCalls == 1 &&
+                     follower.lastReplicatedDeploymentCandidateID == deploymentID,
+                 "replicated_metadata_replay_waits_for_durable_receipt");
+    sendMetadata(follower, master, applicationID, frame);
+    suite.expect(follower.replicatedDeploymentCandidatePersistCalls == 1 &&
+                     follower.pendingRuntimePersistence.size() == 1 && master.wBuffer.empty(),
+                 "replicated_metadata_inflight_replay_reuses_candidate_without_duplicate_submission");
+    follower.finishRuntimePersistence(true);
+    uint32_t durableAcks = 0;
+    uint64_t durableAckID = 0;
+    forEachMessageInBuffer(master.wBuffer, [&](Message *message) {
+      if (BrainTopic(message->topic) == BrainTopic::replicateDeployment && message->payloadSize() == sizeof(uint64_t))
+      {
+        uint8_t *args = message->args;
+        Message::extractArg<ArgumentNature::fixed>(args, durableAckID);
+        durableAcks += 1;
+      }
+    });
+    suite.expect(durableAcks == 1 && durableAckID == deploymentID &&
+                     follower.deploymentPlans.contains(deploymentID) &&
+                     follower.peerArtifactReconciliationDefers(&master, deploymentID) == false,
+                 "replicated_metadata_replay_clears_deferral_before_durable_ack");
+    follower.deploymentPlans.erase(deploymentID);
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair currentMasterSockets = {};
+    ScopedSocketPair conflictingPeerSockets = {};
+    BrainView currentMaster = {};
+    BrainView conflictingPeer = {};
+    if (authorizeActiveMasterPeer(follower, currentMaster, currentMasterSockets,
+                                  "replicated_metadata_inflight_current_master_socket",
+                                  uint128_t(0x62'026'21), 62'026) == false) return;
+    follower.brains.insert(&currentMaster);
+    String frame = {};
+    const uint16_t applicationID = 62'026;
+
+    follower.holdRuntimePersistence = true;
+    const DeploymentPlan plan = sendMetadata(follower, currentMaster, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    if (authorizeActiveMasterPeer(follower, conflictingPeer, conflictingPeerSockets,
+                                  "replicated_metadata_inflight_conflicting_peer_socket",
+                                  uint128_t(0x62'026'22), 62'027) == false) return;
+    follower.brains.insert(&conflictingPeer);
+    follower.finishRuntimePersistence(true);
+    suite.expect(follower.deploymentPlans.contains(deploymentID) && follower.persistCalls == 1 &&
+                     currentMaster.wBuffer.empty() && conflictingPeer.wBuffer.empty(),
+                 "replicated_metadata_inflight_master_conflict_suppresses_durable_ack");
+    follower.deploymentPlans.erase(deploymentID);
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_rejection_master_socket",
+                                  uint128_t(0x62'026'01), 62'026) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    const uint16_t applicationID = 62'026;
+
+    follower.rejectUpdateSelfPersistenceAdmission = true;
+    const DeploymentPlan plan = sendMetadata(follower, master, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    suite.expect(follower.deploymentPlans.contains(deploymentID) == false && master.wBuffer.empty() &&
+                     follower.deferredPeerArtifactReconciliations.empty() && Ring::socketIsClosing(&master),
+                 "replicated_metadata_persistence_rejection_closes_without_apply_or_ack");
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair currentMasterSockets = {};
+    ScopedSocketPair stalePeerSockets = {};
+    BrainView currentMaster = {};
+    BrainView stalePeer = {};
+    if (authorizeActiveMasterPeer(follower, currentMaster, currentMasterSockets,
+                                  "replicated_metadata_conflict_current_master_socket",
+                                  uint128_t(0x62'026'01), 62'026) == false ||
+        authorizeActiveMasterPeer(follower, stalePeer, stalePeerSockets,
+                                  "replicated_metadata_conflict_stale_peer_socket",
+                                  uint128_t(0x62'026'02), 62'025) == false) return;
+    // Keep the stale transport's original fresh, self-claiming master state:
+    // consistency, rather than unordered peer iteration, must reject it.
+    follower.brains.insert(&currentMaster);
+    follower.brains.insert(&stalePeer);
+    String frame = {};
+    const uint16_t applicationID = 62'026;
+
+    const DeploymentPlan plan = sendMetadata(follower, stalePeer, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    suite.expect(stalePeer.isMasterBrain && stalePeer.registrationFresh &&
+                     stalePeer.existingMasterUUID == stalePeer.uuid && currentMaster.isMasterBrain &&
+                     currentMaster.existingMasterUUID == currentMaster.uuid &&
+                     follower.deploymentPlans.contains(deploymentID) == false && follower.deployments.empty() &&
+                     follower.persistCalls == 0 && follower.updateSelfPersistenceAdmissionCalls == 0 &&
+                     stalePeer.wBuffer.empty(),
+                 "replicated_metadata_conflicting_self_claiming_peer_cannot_apply_persist_or_ack");
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair currentMasterSockets = {};
+    ScopedSocketPair stalePeerSockets = {};
+    BrainView currentMaster = {};
+    BrainView stalePeer = {};
+    if (authorizeActiveMasterPeer(follower, currentMaster, currentMasterSockets,
+                                  "replicated_metadata_stale_registration_current_master_socket",
+                                  uint128_t(0x62'026'11), 62'026) == false ||
+        authorizeActiveMasterPeer(follower, stalePeer, stalePeerSockets,
+                                  "replicated_metadata_stale_registration_peer_socket",
+                                  uint128_t(0x62'026'12), 62'025) == false) return;
+    // This record remains connected and self-claiming, but it is no longer a
+    // registered incarnation and must not veto the active master's ingress.
+    stalePeer.registrationFresh = false;
+    follower.brains.insert(&currentMaster);
+    follower.brains.insert(&stalePeer);
+    String frame = {};
+    const uint16_t applicationID = 62'026;
+
+    follower.holdRuntimePersistence = true;
+    const DeploymentPlan plan = sendMetadata(follower, currentMaster, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    suite.expect(stalePeer.connected && stalePeer.isMasterBrain && stalePeer.registrationFresh == false &&
+                     follower.deploymentPlans.contains(deploymentID) && follower.persistCalls == 1 &&
+                     follower.updateSelfPersistenceAdmissionCalls == 1 && currentMaster.wBuffer.empty(),
+                 "replicated_metadata_ignores_stale_registration_claim_for_current_master_ingress");
+    follower.finishRuntimePersistence(true);
+    suite.expect(follower.deploymentPlans.contains(deploymentID) &&
+                     countTopicFrames(currentMaster.wBuffer, BrainTopic::replicateDeployment) == 1,
+                 "replicated_metadata_current_master_acks_after_ignoring_stale_registration_claim");
+    follower.deploymentPlans.erase(deploymentID);
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_incarnation_master_socket",
+                                  uint128_t(0x62'027'01), 62'027) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    const uint16_t applicationID = 62'027;
+
+    follower.updateSelfPersistenceBackpressureResponses = 1;
+    const DeploymentPlan plan = sendMetadata(follower, master, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    master.ioGeneration += 1;
+    follower.runBrainPeerHeartbeatTick();
+    suite.expect(follower.deferredPeerArtifactReconciliations.empty() &&
+                     countTopicFrames(master.wBuffer, BrainTopic::reconcileState) == 0,
+                 "replicated_metadata_stale_peer_incarnation_discards_deferred_retry");
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_bounded_master_socket",
+                                  uint128_t(0x62'028'01), 62'028) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    const uint16_t firstApplicationID = 62'028;
+    uint64_t firstDeploymentID = 0;
+    uint64_t overflowDeploymentID = 0;
+    for (uint32_t index = 0; index <= ProdigyArtifactIO::maximumJobs; ++index)
+    {
+      follower.updateSelfPersistenceBackpressureResponses = 1;
+      const DeploymentPlan plan = sendMetadata(
+          follower, master, uint16_t(firstApplicationID + index), frame);
+      if (index == 0) firstDeploymentID = plan.config.deploymentID();
+      if (index == ProdigyArtifactIO::maximumJobs) overflowDeploymentID = plan.config.deploymentID();
+    }
+    auto deferred = follower.deferredPeerArtifactReconciliations.find(master.uuid);
+    suite.expect(deferred != follower.deferredPeerArtifactReconciliations.end() &&
+                     deferred->second.missingDeploymentIDs.size() == ProdigyArtifactIO::maximumJobs &&
+                     firstDeploymentID != 0 && overflowDeploymentID != 0 &&
+                     follower.deploymentPlans.contains(overflowDeploymentID) == false &&
+                     Ring::socketIsClosing(&master),
+                 "replicated_metadata_persistence_deferral_is_bounded_and_overflow_closes_peer");
+    scopedRing.runFor(10);
+  }
+
+  {
+    ScopedAsyncMothershipRing scopedRing = {};
+    TestBrain follower = {};
+    NoopBrainIaaS iaas = {};
+    follower.iaas = &iaas;
+    ScopedSocketPair masterSockets = {};
+    BrainView master = {};
+    if (authorizeActiveMasterPeer(follower, master, masterSockets,
+                                  "replicated_metadata_failed_receipt_master_socket",
+                                  uint128_t(0x62'029'01), 62'029) == false) return;
+    follower.brains.insert(&master);
+    String frame = {};
+    const uint16_t applicationID = 62'029;
+
+    follower.holdRuntimePersistence = true;
+    const DeploymentPlan plan = sendMetadata(follower, master, applicationID, frame);
+    const uint64_t deploymentID = plan.config.deploymentID();
+    follower.updateSelfPersistenceBackpressureResponses = 1;
+    follower.finishRuntimePersistence(false);
+    suite.expect(master.wBuffer.empty() && follower.deploymentPlans.contains(deploymentID) &&
+                     follower.peerArtifactReconciliationDefers(&master, deploymentID),
+                 "replicated_metadata_failed_receipt_requeues_only_on_backpressure");
+
+    follower.runBrainPeerHeartbeatTick();
+    suite.expect(countTopicFrames(master.wBuffer, BrainTopic::reconcileState) == 1,
+                 "replicated_metadata_failed_receipt_backpressure_retries_on_heartbeat");
+    master.wBuffer.clear();
+    follower.rejectUpdateSelfPersistenceAdmission = true;
+    follower.runBrainPeerHeartbeatTick();
+    suite.expect(master.wBuffer.empty() && follower.deferredPeerArtifactReconciliations.empty() &&
+                     Ring::socketIsClosing(&master),
+                 "replicated_metadata_failed_receipt_rejection_closes_peer_without_ack");
+    scopedRing.runFor(10);
+  }
 }
 
 static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuite& suite)
@@ -4960,6 +5324,105 @@ static void testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(TestSuit
                "replicated_artifact_capacity_replaces_stale_generation_before_reconciliation");
   ContainerStore::destroy(plan.config.deploymentID());
   if (follower.artifactIO) { (void)quiesceArtifactIOForTest(follower.artifactIO.get()); follower.artifactIO.reset(); }
+}
+
+static void testReplicatedArtifactInflightMasterConflictSuppressesApplyAndAck(TestSuite& suite)
+{
+  ScopedAsyncMothershipRing scopedRing = {};
+  TestBrain follower = {};
+  NoopBrainIaaS iaas = {};
+  follower.iaas = &iaas;
+
+  ScopedSocketPair masterSockets = {};
+  if (masterSockets.create(suite, "replicated_artifact_conflict_creates_master_socket") == false) return;
+  const int masterSlot = masterSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(masterSlot >= 0, "replicated_artifact_conflict_adopts_master_socket") == false) return;
+  BrainView master = {};
+  authorizeMasterPeerForTest(follower, master, masterSlot, uint128_t(0x62'030'01), 62'030);
+  // Keep any attempted control frame in the fixture outbox.
+  master.pendingSend = true;
+  follower.brains.insert(&master);
+  if (suite.require(follower.ensureArtifactIO(), "replicated_artifact_conflict_starts_worker") == false) return;
+
+  std::atomic<bool> releaseBlocker = false;
+  std::atomic<uint32_t> blockerCompletions = 0;
+  if (suite.require(follower.artifactIO->submit(
+                        1,
+                        [&releaseBlocker] {
+                          while (!releaseBlocker.load()) std::this_thread::yield();
+                        },
+                        [&blockerCompletions] { blockerCompletions += 1; },
+                        [](std::exception_ptr) {}),
+                    "replicated_artifact_conflict_queues_worker_barrier") == false) return;
+
+  DeploymentPlan plan = {};
+  seedDeployRequestPlan(plan, 62'030);
+  String blob = prodigyDiscombobulatorBlobHeaderText();
+  blob.append("replicated-conflicting-master-artifact"_ctv);
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers"_ctv, 0755) >= 0 || errno == EEXIST,
+                "replicated_artifact_conflict_creates_container_root");
+  suite.require(Filesystem::createDirectoryAt(-1, "/containers/store"_ctv, 0755) >= 0 || errno == EEXIST,
+                "replicated_artifact_conflict_creates_artifact_store");
+  suite.require(prodigyComputeSHA256Hex(blob, plan.config.containerBlobSHA256),
+                "replicated_artifact_conflict_hashes_fixture");
+  plan.config.containerBlobBytes = blob.size();
+  String serializedPlan = {};
+  BitseryEngine::serialize(serializedPlan, plan);
+  String frame = {};
+  follower.brainHandler(
+      &master, buildBrainMessage(frame, BrainTopic::replicateDeployment, serializedPlan, blob));
+
+  ScopedSocketPair conflictingSockets = {};
+  if (conflictingSockets.create(suite, "replicated_artifact_conflict_creates_conflicting_socket") == false)
+  {
+    releaseBlocker = true;
+    (void)quiesceArtifactIOForTest(follower.artifactIO.get());
+    follower.artifactIO.reset();
+    return;
+  }
+  const int conflictingSlot = conflictingSockets.adoptLeftIntoFixedFileSlot();
+  if (suite.require(conflictingSlot >= 0, "replicated_artifact_conflict_adopts_conflicting_socket") == false)
+  {
+    releaseBlocker = true;
+    (void)quiesceArtifactIOForTest(follower.artifactIO.get());
+    follower.artifactIO.reset();
+    return;
+  }
+  BrainView conflictingPeer = {};
+  authorizeMasterPeerForTest(
+      follower, conflictingPeer, conflictingSlot, uint128_t(0x62'030'02), 62'031);
+  conflictingPeer.pendingSend = true;
+  follower.brains.insert(&conflictingPeer);
+
+  // This sentinel is queued behind the artifact preparation. Its completion
+  // proves the Ring already dispatched the earlier artifact continuation,
+  // which must revalidate authority before publishing or mutating live state.
+  std::atomic<uint32_t> sentinelCompletions = 0;
+  if (suite.require(follower.artifactIO->submit(
+                        1, [] {}, [&sentinelCompletions] { sentinelCompletions += 1; },
+                        [](std::exception_ptr) {}),
+                    "replicated_artifact_conflict_queues_completion_sentinel") == false)
+  {
+    releaseBlocker = true;
+    (void)quiesceArtifactIOForTest(follower.artifactIO.get());
+    follower.artifactIO.reset();
+    return;
+  }
+  releaseBlocker = true;
+  suite.require(pumpArtifactIOForTest([&] { return sentinelCompletions == 1; }),
+                "replicated_artifact_conflict_dispatches_preparation_before_sentinel");
+  suite.expect(blockerCompletions == 1 && follower.persistCalls == 0 &&
+                   follower.deploymentPlans.contains(plan.config.deploymentID()) == false &&
+                   follower.deployments.contains(plan.config.deploymentID()) == false &&
+                   master.wBuffer.empty() && conflictingPeer.wBuffer.empty(),
+               "replicated_artifact_inflight_master_conflict_suppresses_apply_persist_and_ack");
+
+  if (follower.artifactIO)
+  {
+    (void)quiesceArtifactIOForTest(follower.artifactIO.get());
+    follower.artifactIO.reset();
+  }
+  ContainerStore::destroy(plan.config.deploymentID());
 }
 
 static void testStoreBackedArtifactBulkReservation(TestSuite& suite)
@@ -38658,12 +39121,21 @@ int main(void)
     testRecoveredIndexedSuccessorWaitsForDurableReplication(suite);
     testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
     testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
+    testReplicatedMetadataDeploymentPersistenceAdmission(suite);
     testCertificateLifecycleSchedulers(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only != nullptr && strcmp(only, "replicated-metadata-persistence") == 0)
+  {
+    testReplicatedMetadataDeploymentPersistenceAdmission(suite);
+    std::printf("REPLICATED_METADATA_PERSISTENCE_RESULT failed_assertions=%d\n", suite.failed);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "artifact-capacity-reconciliation") == 0)
   {
     testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
+    testReplicatedArtifactInflightMasterConflictSuppressesApplyAndAck(suite);
     testStoreBackedArtifactBulkReservation(suite);
     testStoreBackedArtifactReadDefersWithoutClosingPeer(suite);
     std::printf("ARTIFACT_CAPACITY_RESULT failed_assertions=%d\n", suite.failed);
@@ -39138,7 +39610,9 @@ int main(void)
   testRecoveredIndexedSuccessorWaitsForDurableReplication(suite);
   testRestoredDeploymentChainOrderingAndLateAcknowledgements(suite);
   testReplicatedDeploymentAcknowledgesOnlyAfterDurablePersistence(suite);
+  testReplicatedMetadataDeploymentPersistenceAdmission(suite);
   testReplicatedArtifactCapacityReconcilesWithoutPrematureAck(suite);
+  testReplicatedArtifactInflightMasterConflictSuppressesApplyAndAck(suite);
   testStoreBackedArtifactBulkReservation(suite);
   testStoreBackedArtifactReadDefersWithoutClosingPeer(suite);
   testLargePayloadPeerKeepaliveUsesFixedFileSocketCommand(suite);

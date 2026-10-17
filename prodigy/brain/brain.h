@@ -1889,6 +1889,20 @@ public:
     bool requestPending = false;
   };
   bytell_hash_map<uint128_t, DeferredPeerArtifactReconciliation> deferredPeerArtifactReconciliations;
+  class PendingReplicatedDeploymentPersistence
+  {
+  public:
+    uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    uint64_t peerGeneration = 0;
+    int peerSlot = -1;
+    String serializedPlan = {};
+    bool projectionApplied = false;
+    bool completionArrived = false;
+    bool durable = false;
+  };
+  bytell_hash_map<uint64_t, std::shared_ptr<PendingReplicatedDeploymentPersistence>>
+      pendingReplicatedDeploymentPersistence;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronReconnectWaiters;
   bytell_hash_map<NeuronView *, TimeoutPacket *> neuronHandshakeWaiters;
   Vector<Machine *> operatingSystemUpdateOrder;
@@ -11733,6 +11747,18 @@ public:
     return UpdateSelfPersistenceAdmission::rejected;
   }
 
+  // A follower must durably admit the exact metadata-only deployment
+  // candidate before exposing any of its runtime projection.  Production
+  // persistence overrides this to size, detach and submit a snapshot that
+  // already contains plan; a true completion is its durable receipt.
+  virtual UpdateSelfPersistenceAdmission persistReplicatedDeploymentPlanCandidate(
+      const DeploymentPlan& plan, PersistenceCompletion completion)
+  {
+    (void)plan;
+    (void)completion;
+    return UpdateSelfPersistenceAdmission::rejected;
+  }
+
   // The candidate must be detached before the worker reads it. A true result
   // accepts exactly one Ring completion; false admits nothing and never calls
   // completion. Success includes the cluster ownership prerequisite and every
@@ -16954,6 +16980,36 @@ public:
     return conflictingExistingMasterUUID ? uint128_t(0) : existingMasterUUID;
   }
 
+  // Deployment ingress must not be vetoed by an old connected BrainView whose
+  // registration is no longer fresh.  Keep this narrower than election
+  // resolution: only active, boot-identified, quorum-eligible registrations
+  // participate in the authoritative sender consistency check.
+  uint128_t resolveConsistentActiveFreshMasterUUIDForDeploymentIngress(void) const
+  {
+    uint128_t existingMasterUUID = 0;
+
+    for (BrainView *brain : brains)
+    {
+      if (peerEligibleForClusterQuorum(brain) == false || brain->registrationFresh == false ||
+          brain->uuid == 0 || brain->boottimens == 0 || brain->existingMasterUUID == 0 ||
+          peerSocketActive(brain) == false)
+      {
+        continue;
+      }
+
+      if (existingMasterUUID == 0)
+      {
+        existingMasterUUID = brain->existingMasterUUID;
+      }
+      else if (existingMasterUUID != brain->existingMasterUUID)
+      {
+        return 0;
+      }
+    }
+
+    return existingMasterUUID;
+  }
+
   bool peerHasFreshExistingMasterClaim(BrainView *peer) const
   {
     if (peerEligibleForClusterQuorum(peer) == false)
@@ -19899,7 +19955,22 @@ public:
         deferredPeerArtifactReconciliations.erase(deferred);
         continue;
       }
-      if (artifactIO == nullptr || artifactIO->admission(deferred->second.requiredBytes) != ProdigyArtifactIO::Admission::admitted)
+      if (deferred->second.requiredBytes == 0)
+      {
+        const UpdateSelfPersistenceAdmission admission = updateSelfPersistenceAdmission();
+        if (admission == UpdateSelfPersistenceAdmission::backpressured)
+        {
+          continue;
+        }
+        if (admission != UpdateSelfPersistenceAdmission::admitted)
+        {
+          queueBrainCloseIfActive(peer, "deployment-metadata-persistence-unavailable", -ENOBUFS);
+          deferredPeerArtifactReconciliations.erase(deferred);
+          continue;
+        }
+      }
+      else if (artifactIO == nullptr ||
+               artifactIO->admission(deferred->second.requiredBytes) != ProdigyArtifactIO::Admission::admitted)
       {
         continue;
       }
@@ -37617,6 +37688,8 @@ public:
     BrainView *peer = nullptr;
     uint64_t transportGeneration = 0;
     uint128_t peerUUID = 0;
+    int64_t peerBootTime = 0;
+    int peerSlot = -1;
     uint128_t masterUUID = 0;
     DeploymentPlan plan;
     String blob;
@@ -37625,34 +37698,97 @@ public:
     bool success = false;
   };
 
-  void completeDeferredPeerArtifactReconciliation(const PeerArtifactStore& operation)
+  bool completeDeferredPeerArtifactReconciliation(
+      BrainView *peer, uint128_t peerUUID, int64_t peerBootTime, uint64_t peerGeneration,
+      int peerSlot, uint64_t deploymentID)
   {
-    auto deferred = deferredPeerArtifactReconciliations.find(operation.peerUUID);
-    if (deferred == deferredPeerArtifactReconciliations.end() || operation.peer == nullptr ||
-        deferred->second.peerBootTime != operation.peer->boottimens ||
-        deferred->second.peerGeneration != operation.transportGeneration || deferred->second.peerSlot != operation.peer->fslot)
+    if (peer == nullptr || brains.contains(peer) == false || peer->uuid != peerUUID ||
+        peer->boottimens != peerBootTime || peer->ioGeneration != peerGeneration || peer->fslot != peerSlot)
     {
-      return;
+      return false;
+    }
+    auto deferred = deferredPeerArtifactReconciliations.find(peerUUID);
+    if (deferred == deferredPeerArtifactReconciliations.end())
+    {
+      return true;
+    }
+    if (deferred->second.peerBootTime != peerBootTime || deferred->second.peerGeneration != peerGeneration ||
+        deferred->second.peerSlot != peerSlot)
+    {
+      return false;
     }
     for (size_t index = 0; index < deferred->second.missingDeploymentIDs.size(); ++index)
     {
-      if (deferred->second.missingDeploymentIDs[index] == operation.plan.config.deploymentID())
+      if (deferred->second.missingDeploymentIDs[index] == deploymentID)
       {
         deferred->second.missingDeploymentIDs.erase(deferred->second.missingDeploymentIDs.begin() + index);
         break;
       }
     }
     if (deferred->second.missingDeploymentIDs.empty()) deferredPeerArtifactReconciliations.erase(deferred);
+    return true;
+  }
+
+  bool completeDeferredPeerArtifactReconciliation(const PeerArtifactStore& operation)
+  {
+    if (operation.peer == nullptr) return false;
+    return completeDeferredPeerArtifactReconciliation(
+        operation.peer, operation.peerUUID, operation.peerBootTime, operation.transportGeneration,
+        operation.peerSlot, operation.plan.config.deploymentID());
+  }
+
+  void completeReplicatedDeploymentPersistence(
+      uint64_t deploymentID, const std::shared_ptr<PendingReplicatedDeploymentPersistence>& pending)
+  {
+    if (!pending || !pending->projectionApplied || !pending->completionArrived) return;
+    auto current = pendingReplicatedDeploymentPersistence.find(deploymentID);
+    if (current == pendingReplicatedDeploymentPersistence.end() || current->second != pending) return;
+    pendingReplicatedDeploymentPersistence.erase(current);
+
+    BrainView *peer = findBrainViewByUUID(pending->peerUUID);
+    if (peer == nullptr || !brains.contains(peer) || peer->boottimens != pending->peerBootTime ||
+        peer->ioGeneration != pending->peerGeneration || peer->fslot != pending->peerSlot ||
+        resolveConsistentActiveFreshMasterUUIDForDeploymentIngress() != pending->peerUUID ||
+        peerRepresentsCurrentMaster(peer) == false ||
+        peerHasFreshMasterOwnershipClaim(peer) == false || peerSocketActive(peer) == false) return;
+    if (!pending->durable)
+    {
+      const UpdateSelfPersistenceAdmission retryAdmission = updateSelfPersistenceAdmission();
+      if (retryAdmission == UpdateSelfPersistenceAdmission::backpressured &&
+          deferPeerArtifactReconciliation(peer, deploymentID, 0))
+      {
+        return;
+      }
+      queueBrainCloseIfActive(
+          peer,
+          retryAdmission == UpdateSelfPersistenceAdmission::backpressured
+              ? "deployment-metadata-persistence-backpressure"
+              : "deployment-metadata-persistence-unavailable",
+          -ENOBUFS);
+      return;
+    }
+    if (!completeDeferredPeerArtifactReconciliation(
+            peer, pending->peerUUID, pending->peerBootTime, pending->peerGeneration,
+            pending->peerSlot, deploymentID))
+    {
+      return;
+    }
+    Message::construct(peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
+    Ring::queueSend(peer);
   }
 
   bool peerArtifactStoreStillCurrent(const PeerArtifactStore& operation)
   {
     auto failed = failedDeployments.find(operation.plan.config.deploymentID());
-    return brains.contains(operation.peer) &&
+    return operation.peer != nullptr && brains.contains(operation.peer) &&
            operation.peer->ioGeneration == operation.transportGeneration &&
            operation.peer->uuid == operation.peerUUID &&
-           operation.peer->canQueueSend() &&
-           getExistingMasterUUID() == operation.masterUUID &&
+           operation.peer->boottimens == operation.peerBootTime &&
+           operation.peer->fslot == operation.peerSlot &&
+           resolveConsistentActiveFreshMasterUUIDForDeploymentIngress() == operation.peerUUID &&
+           peerRepresentsCurrentMaster(operation.peer) &&
+           peerHasFreshMasterOwnershipClaim(operation.peer) && peerSocketActive(operation.peer) &&
+           operation.masterUUID == operation.peerUUID &&
            (failed == failedDeployments.end() || failed->second.hasOperatorCancellation == false);
   }
 
@@ -37675,7 +37811,12 @@ public:
     operation->peer = peer;
     operation->transportGeneration = peer->ioGeneration;
     operation->peerUUID = peer->uuid;
-    operation->masterUUID = getExistingMasterUUID();
+    operation->peerBootTime = peer->boottimens;
+    operation->peerSlot = peer->fslot;
+    // queuePeerArtifactStore is entered only after the inbound deployment
+    // guard proves this exact live incarnation is the unique fresh master.
+    // Retain that canonical identity rather than an unordered legacy view.
+    operation->masterUUID = peer->uuid;
     operation->plan = plan;
     operation->blob.append(blob.data(), blob.size());
     auto failure = [this, operation](std::exception_ptr) {
@@ -37730,7 +37871,7 @@ public:
                     return;
                   }
                   if (lifetime.expired() || !peerArtifactStoreStillCurrent(*operation)) return;
-                  completeDeferredPeerArtifactReconciliation(*operation);
+                  if (!completeDeferredPeerArtifactReconciliation(*operation)) return;
                   Message::construct(operation->peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
                   Ring::queueSend(operation->peer);
                 });
@@ -38092,6 +38233,20 @@ public:
           {
             // plan{4} containerBlob{4}
 
+            // Only an active, registered master incarnation may authoritatively
+            // install a deployment frame.  Echoes above flow in the opposite
+            // direction, so fence the inbound plan/blob owner here rather than
+            // applying this policy to the whole topic.
+            const uint128_t consistentMasterUUID = resolveConsistentActiveFreshMasterUUIDForDeploymentIngress();
+            if (bv == nullptr || weAreMaster || noMasterYet || brains.contains(bv) == false ||
+                consistentMasterUUID == 0 || bv->uuid != consistentMasterUUID ||
+                peerRepresentsCurrentMaster(bv) == false ||
+                peerHasFreshMasterOwnershipClaim(bv) == false || peerSocketActive(bv) == false)
+            {
+              queueBrainCloseIfActive(bv, "replicate-deployment-noncurrent-master", -EACCES);
+              break;
+            }
+
             String serializedPlan;
             Message::extractToStringView(args, serializedPlan);
 
@@ -38134,23 +38289,78 @@ public:
               }
               break;
             }
-            // Metadata-only reconciliation retains its existing durable ACK.
-            deploymentPlans.insert_or_assign(deploymentID, plan);
-            applyReplicatedDeploymentPlanLiveState(plan);
-            applyPendingReplicatedContainerRuntimeStates(deploymentID);
             const uint128_t peerUUID = bv->uuid;
             const int64_t peerBootTime = bv->boottimens;
             const uint64_t peerGeneration = bv->ioGeneration;
             const int peerSlot = bv->fslot;
+            auto existingCandidate = pendingReplicatedDeploymentPersistence.find(deploymentID);
+            if (existingCandidate != pendingReplicatedDeploymentPersistence.end())
+            {
+              const auto& retained = existingCandidate->second;
+              const bool sameIncarnation = retained && retained->peerUUID == peerUUID &&
+                  retained->peerBootTime == peerBootTime && retained->peerGeneration == peerGeneration &&
+                  retained->peerSlot == peerSlot;
+              if (sameIncarnation && retained->serializedPlan.equal(serializedPlan))
+              {
+                break;
+              }
+              if (sameIncarnation)
+              {
+                queueBrainCloseIfActive(bv, "deployment-metadata-conflicting-inflight-candidate", -EBADMSG);
+                break;
+              }
+              pendingReplicatedDeploymentPersistence.erase(existingCandidate);
+            }
+            auto pending = std::make_shared<PendingReplicatedDeploymentPersistence>();
+            pending->peerUUID = peerUUID;
+            pending->peerBootTime = peerBootTime;
+            pending->peerGeneration = peerGeneration;
+            pending->peerSlot = peerSlot;
+            pending->serializedPlan = String(
+                serializedPlan.data(), serializedPlan.size(), Copy::yes, serializedPlan.size());
+            if (pending->serializedPlan.size() != serializedPlan.size())
+            {
+              queueBrainCloseIfActive(bv, "deployment-metadata-candidate-ownership-failed", -ENOMEM);
+              break;
+            }
+            pendingReplicatedDeploymentPersistence.insert_or_assign(deploymentID, pending);
             std::weak_ptr<uint8_t> lifetime = persistenceLifetime;
-            persistLocalRuntimeStateAsync([this, lifetime, peerUUID, peerBootTime, peerGeneration, peerSlot, deploymentID](bool durable) {
-              if (!durable || lifetime.expired()) return;
-              BrainView *peer = findBrainViewByUUID(peerUUID);
-              if (peer == nullptr || !brains.contains(peer) || !peer->connected || peer->boottimens != peerBootTime ||
-                  peer->ioGeneration != peerGeneration || peer->fslot != peerSlot) return;
-              Message::construct(peer->wBuffer, BrainTopic::replicateDeployment, deploymentID);
-              Ring::queueSend(peer);
+            const UpdateSelfPersistenceAdmission admission = persistReplicatedDeploymentPlanCandidate(
+                plan,
+                [this, lifetime, pending, deploymentID](bool durable) {
+              if (lifetime.expired()) return;
+              pending->completionArrived = true;
+              pending->durable = durable;
+              completeReplicatedDeploymentPersistence(deploymentID, pending);
             });
+            if (admission == UpdateSelfPersistenceAdmission::admitted)
+            {
+              // The exact candidate is now retained by the FIFO writer. Apply
+              // it before another Ring turn can build a later snapshot, so a
+              // later durable write cannot omit an admitted deployment.
+              deploymentPlans.insert_or_assign(deploymentID, plan);
+              applyReplicatedDeploymentPlanLiveState(plan);
+              applyPendingReplicatedContainerRuntimeStates(deploymentID);
+              pending->projectionApplied = true;
+              completeReplicatedDeploymentPersistence(deploymentID, pending);
+            }
+            else
+            {
+              auto retained = pendingReplicatedDeploymentPersistence.find(deploymentID);
+              if (retained != pendingReplicatedDeploymentPersistence.end() && retained->second == pending)
+                pendingReplicatedDeploymentPersistence.erase(retained);
+              if (admission == UpdateSelfPersistenceAdmission::backpressured &&
+                  deferPeerArtifactReconciliation(bv, deploymentID, 0))
+              {
+                break;
+              }
+              queueBrainCloseIfActive(
+                  bv,
+                  admission == UpdateSelfPersistenceAdmission::backpressured
+                      ? "deployment-metadata-persistence-backpressure"
+                      : "deployment-metadata-persistence-unavailable",
+                  -ENOBUFS);
+            }
           }
 
           break;
