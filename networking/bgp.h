@@ -1082,6 +1082,7 @@ public:
   uint32_t bgpid;
   uint16_t peerASN = 0;
   BGPState state = BGPState::idle;
+  uint32_t reconnectFailures = 0;
   bool is6;
   uint8_t hopLimit {0}; // 0 = use system default
 
@@ -1287,6 +1288,8 @@ public:
               if (state == BGPState::openconfirm)
               {
                 state = BGPState::established;
+                reconnectFailures = 0;
+                basics_log("BGP peer session established\n");
                 pushRoutes();
               }
               else
@@ -1346,10 +1349,43 @@ private:
 
   bytell_hash_set<BGPPeer *> peers;
   bool shuttingDown = false;
+  TimeoutPacket reconnectTimer = {};
+  bool reconnectTimerQueued = false;
+  bool reconnectTimerCancellationQueued = false;
+
+  void scheduleReconnect(BGPPeer *peer)
+  {
+    if (shuttingDown || reconnectTimerQueued)
+    {
+      return;
+    }
+
+    if (peer->reconnectFailures < 7)
+    {
+      peer->reconnectFailures += 1;
+    }
+    reconnectTimer.clear();
+    reconnectTimer.originator = this;
+    reconnectTimer.setTimeoutMs(reconnectDelayMs(peer->reconnectFailures));
+    reconnectTimerQueued = true;
+    reconnectTimerCancellationQueued = false;
+    basics_log("BGP peer reconnect scheduled failures=%u delayMs=%u\n",
+               unsigned(peer->reconnectFailures),
+               unsigned(reconnectDelayMs(peer->reconnectFailures)));
+    Ring::queueTimeout(&reconnectTimer);
+  }
 
 public:
 
   uint32_t ourBGPID;
+
+  constexpr static uint32_t reconnectDelayMs(uint32_t failures)
+  {
+    constexpr uint32_t initialDelayMs = 1000;
+    constexpr uint32_t maximumExponent = 6;
+    const uint32_t exponent = failures > 0 ? std::min(failures - 1, maximumExponent) : 0;
+    return initialDelayMs << exponent;
+  }
 
   void addPeer(uint16_t peerASN, const IPAddress& peerAddress, const IPAddress& srcAddress)
   {
@@ -1516,12 +1552,15 @@ public:
 
     if (result == 0)
     {
+      basics_log("BGP peer TCP connected\n");
       peer->sendOpen();
       Ring::queueRecv(peer);
     }
     else
     {
-      Ring::queueConnect(peer);
+      peer->state = BGPState::failed;
+      basics_log("BGP peer TCP connect failed result=%d\n", result);
+      Ring::queueClose(peer);
     }
   }
 
@@ -1545,7 +1584,7 @@ public:
       }
       else if (result != -9)
       {
-        peer->goIdle();
+        peer->state = BGPState::failed;
         Ring::queueClose(peer);
       }
     }
@@ -1573,7 +1612,7 @@ public:
       else if (result != -9)
       {
         peer->wBuffer.noteSendCompleted();
-        peer->goIdle();
+        peer->state = BGPState::failed;
         Ring::queueClose(peer);
       }
       else
@@ -1604,19 +1643,18 @@ public:
 
     if (peers.contains(peer)) // otherwise being withdrawn
     {
-      if (peer->state != BGPState::failed)
-      {
-        peer->recreateSocket();
-        Ring::installFDIntoFixedFileSlot(peer);
-        Ring::queueConnect(peer);
-      }
-      else if (shuttingDown)
+      if (shuttingDown)
       {
         peers.erase(peer);
         if (peers.size() == 0)
         {
           hasShutdownBGP();
         }
+      }
+      else
+      {
+        peer->state = BGPState::failed;
+        scheduleReconnect(peer);
       }
     }
     else
@@ -1626,9 +1664,41 @@ public:
     }
   }
 
+  void timeoutHandler(TimeoutPacket *packet, int result) override
+  {
+    if (packet != &reconnectTimer)
+    {
+      return;
+    }
+
+    reconnectTimerQueued = false;
+    reconnectTimerCancellationQueued = false;
+    if (result == -ECANCELED || shuttingDown)
+    {
+      return;
+    }
+
+    for (BGPPeer *peer : peers)
+    {
+      if (peer->state == BGPState::failed)
+      {
+        basics_log("BGP peer reconnect attempt failures=%u\n", unsigned(peer->reconnectFailures));
+        peer->recreateSocket();
+        Ring::installFDIntoFixedFileSlot(peer);
+        Ring::queueConnect(peer);
+      }
+    }
+  }
+
   void shutdown(void)
   {
     shuttingDown = true;
+
+    if (reconnectTimerQueued && !reconnectTimerCancellationQueued)
+    {
+      reconnectTimerCancellationQueued = true;
+      Ring::queueCancelTimeout(&reconnectTimer);
+    }
 
     for (BGPPeer *peer : peers)
     {

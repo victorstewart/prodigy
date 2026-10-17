@@ -183,12 +183,22 @@ static void testGlobalIPv6DiscoveryUsesInterfaceAddress(TestSuite& suite)
                "global_ipv6_discovery_reads_ipv6_interface_address");
 }
 
+static void testBGPPeerReconnectBackoffIsBounded(TestSuite& suite)
+{
+  suite.expect(BGPHub::reconnectDelayMs(0) == 1000, "bgp_reconnect_initial_delay");
+  suite.expect(BGPHub::reconnectDelayMs(1) == 1000, "bgp_reconnect_first_failure_delay");
+  suite.expect(BGPHub::reconnectDelayMs(2) == 2000, "bgp_reconnect_second_failure_backoff");
+  suite.expect(BGPHub::reconnectDelayMs(7) == 64'000, "bgp_reconnect_backoff_cap");
+  suite.expect(BGPHub::reconnectDelayMs(UINT32_MAX) == 64'000, "bgp_reconnect_large_failure_cap");
+}
+
 int main(void)
 {
   TestSuite suite = {};
 
   testRuntimeAwareInventoryUsesConfiguredProviderInsteadOfSharedNatBootstrapSnapshots(suite);
   testGlobalIPv6DiscoveryUsesInterfaceAddress(suite);
+  testBGPPeerReconnectBackoffIsBounded(suite);
 
   prodigySetPrimaryNetworkDeviceOverride("lo");
   DevNeuronIaaS devNeuron;
