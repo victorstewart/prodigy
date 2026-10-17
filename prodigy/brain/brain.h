@@ -38828,6 +38828,15 @@ public:
             if (BitseryEngine::deserializeSafe(serialized, acknowledgement))
             {
               acknowledgeMasterAuthorityTransition(bv, acknowledgement);
+              // A follower's ready checkpoint is fenced by this exact
+              // authority receipt.  Once it arrives, wake the serial update
+              // scheduler immediately so its durable slot can release the
+              // next follower; waiting only for an unrelated heartbeat leaves
+              // a live rolling update stranded after the first reboot.
+              if (updateSelfState == UpdateSelfState::waitingForFollowerReboots)
+              {
+                driveUpdateSelfFollowerTransitions();
+              }
               driveTransportCredentialEnrollmentOperations();
               driveClusterPairEnrollmentOperations();
             }

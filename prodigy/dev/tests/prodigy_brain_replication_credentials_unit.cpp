@@ -12871,6 +12871,33 @@ static void testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(TestSuite&
     return true;
   };
 
+  auto deliverAuthorityAcknowledgement = [](TestBrain& brain, BrainView& peer) {
+    String serialized = {};
+    String digest = {};
+    if (brain.serializeCurrentMasterAuthorityTransition(serialized, digest) == false) return false;
+    Brain::MasterAuthorityReplicationPeerState& tracking =
+        brain.masterAuthorityReplicationByPeer[&peer];
+    tracking.uuid = peer.uuid;
+    tracking.bootNs = peer.boottimens;
+    tracking.ioGeneration = peer.ioGeneration;
+    tracking.transportEpoch = peer.transportEpoch;
+    tracking.fileSlot = peer.fslot;
+    tracking.sentTransitionDigestsByGeneration.insert_or_assign(
+        brain.masterAuthorityRuntimeState.generation, digest);
+    ProdigyMasterAuthorityStateTransitionAck acknowledgement = {};
+    acknowledgement.generation = brain.masterAuthorityRuntimeState.generation;
+    acknowledgement.peerUUID = peer.uuid;
+    acknowledgement.peerBootNs = peer.boottimens;
+    acknowledgement.transitionDigest.assign(digest);
+    String encodedAcknowledgement = {};
+    BitseryEngine::serialize(encodedAcknowledgement, acknowledgement);
+    String frame = {};
+    Message::construct(frame, BrainTopic::replicateMasterAuthorityState, encodedAcknowledgement);
+    brain.brainHandler(&peer, reinterpret_cast<Message *>(frame.data()));
+    return tracking.acknowledgedGeneration == acknowledgement.generation &&
+           tracking.acknowledgedTransitionDigest.equals(digest);
+  };
+
   auto configureFollower = [](BrainView& peer, Machine& machine, uint128_t peerUUID,
                               uint64_t bootNs, int fslot) {
     machine.uuid = peerUUID + 0x1000;
@@ -12989,13 +13016,12 @@ static void testUpdateSelfFollowerConcurrencySchedulesDurableRecovery(TestSuite&
   suite.expect(serial.updateSelfFollowerReadyPeerKeys.contains(serialPeerA.uuid) &&
                    serial.updateSelfTransitionIssuedPeerKeys.size() == 1,
                "update_self_serial_readiness_checkpoint_waits_for_new_authority_ack");
-  suite.require(setAuthorityAcknowledgement(serial, serialPeerA),
-                "update_self_serial_acknowledges_durable_readiness_checkpoint");
-  serial.driveUpdateSelfFollowerTransitions();
+  suite.require(deliverAuthorityAcknowledgement(serial, serialPeerA),
+                "update_self_serial_receives_durable_readiness_checkpoint_ack");
   suite.expect(serial.updateSelfFollowerReadyPeerKeys.contains(serialPeerA.uuid) &&
                    serial.updateSelfTransitionIssuedPeerKeys.size() == 2 &&
                    serial.updateSelfTransitionIssuedPeerKeys.contains(serialPeerB.uuid),
-               "update_self_serial_witness_authority_ack_and_inventory_free_next_slot");
+               "update_self_serial_authority_ack_immediately_frees_next_slot");
 
   serial.masterAuthorityRuntimeState.generation += 1;
   serial.driveUpdateSelfFollowerTransitions();
