@@ -1393,6 +1393,120 @@ static void testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactL
   }
 }
 
+static void testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(TestSuite& suite)
+{
+  // Bundle preparation receipts retain their request frame and bundle bytes
+  // through the Ring callback. Fill every remaining job slot from that
+  // receipt, then begin the local-recovery checkpoint. It must start on the
+  // following Ring turn, once the preparation receipt has released its slot.
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_local_recovery_artifact_lease_worker_starts");
+  if (!io) return;
+
+  std::atomic<bool> releaseFillers = false;
+  std::atomic<uint32_t> snapshotWrites = 0;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io,
+      [&](auto& backing, auto& request) {
+        if (!request.writeSnapshot) return;
+        ++snapshotWrites;
+        request.result.snapshotDurable = backing.saveBrainSnapshot(request.snapshot, &request.result.failure);
+        request.result.durable = request.result.snapshotDurable;
+        if (request.result.snapshotDurable)
+          request.result.bootStateDurable = backing.saveBootState(request.bootState, &request.result.failure);
+      });
+
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  ProdigyHostControlNetwork network;
+  uint32_t fillersCompleted = 0, ticks = 0;
+  bool artifactReceipt = false, fillersQueued = false, recoveryStarted = false;
+  bool recoveryStartedInsideArtifactReceipt = false, recoveryDurable = false;
+  {
+    ProdigyBrain brain(network, writer);
+    brain.brainConfig.clusterUUID = 0xA5512000ULL;
+    brain.brainConfig.bootstrapSshUser.assign("recovery-artifact-receipt"_ctv);
+    brain.weAreMaster = true;
+    brain.masterAuthorityRuntimeStateDurable = true;
+    brain.durableMasterAuthorityRuntimeStateGeneration = brain.masterAuthorityRuntimeState.generation;
+    Machine machine = {};
+    machine.uuid = 0xA5512001ULL;
+    machine.state = MachineState::healthy;
+    machine.runtimeReady = true;
+    brain.machines.insert(&machine);
+    brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+    brain.persistedMachineInventoryUploaded.insert(machine.uuid);
+    brain.persistedMachineStateUploadPlansByMachine.insert_or_assign(machine.uuid, Vector<String> {});
+
+    const bool queued = io->submit(1, [] {}, [&] {
+      artifactReceipt = true;
+      for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs - 1; ++index)
+      {
+        const bool admitted = io->submit(1,
+            [&] {
+              while (!releaseFillers.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            },
+            [&] { ++fillersCompleted; },
+            [&](std::exception_ptr) { Ring::exit = true; });
+        suite.expect(admitted, "runtime_local_recovery_fills_remaining_artifact_slots");
+      }
+      fillersQueued = true;
+      const bool deferred = brain.deferUpdateSelfArtifactReceiptContinuation([&] {
+        recoveryStarted = true;
+        brain.prepareLocalBundleExecRecoveryAsync([&](bool durable) {
+          recoveryDurable = durable;
+        });
+      });
+      suite.expect(deferred, "runtime_local_recovery_defers_checkpoint_from_artifact_receipt");
+      recoveryStartedInsideArtifactReceipt = recoveryStarted;
+    }, [&](std::exception_ptr) { Ring::exit = true; });
+
+    ring.tickAction = [&] {
+      ++ticks;
+      if (fillersQueued && brain.masterAuthorityPersistencePending != 0)
+      {
+        releaseFillers = true;
+      }
+      if (recoveryDurable && fillersCompleted == ProdigyArtifactIO::maximumJobs - 1)
+      {
+        Ring::exit = true;
+        return;
+      }
+      ring.armTick(1);
+    };
+    ring.armTick(1);
+    ring.armDeadline(3000);
+    Ring::start();
+    releaseFillers = true;
+
+    suite.expect(queued && artifactReceipt && !ring.timedOut && ticks > 1 && fillersQueued &&
+                     fillersCompleted == ProdigyArtifactIO::maximumJobs - 1,
+                 "runtime_local_recovery_releases_artifact_lease_before_checkpoint_admission");
+    suite.expect(!recoveryStartedInsideArtifactReceipt && recoveryStarted && recoveryDurable &&
+                     snapshotWrites.load() == 1 && brain.recoveringPersistedNeuronInventory,
+                 "runtime_local_recovery_checkpoint_runs_after_full_artifact_receipt_returns");
+    brain.persistedMachineStateUploadPlansByMachine.erase(machine.uuid);
+    brain.persistedMachineInventoryUploaded.erase(machine.uuid);
+    brain.machinesByUUID.erase(machine.uuid);
+    brain.machines.erase(&machine);
+  }
+  writer.reset();
+  io->stop();
+  ring.drainStoppedIO();
+  io.reset();
+  (void)network.shutdown();
+  store.close();
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+}
+
 static void testFollowerMetricIngestionTrimsBeforePersistence(TestSuite& suite)
 {
   PersistenceRing ring;
@@ -2397,6 +2511,13 @@ int main(void)
     return suite.failed == 0 ? 0 : 1;
   }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "local-recovery-artifact-lease") == 0)
+  {
+    testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(suite);
+    std::printf("LOCAL_RECOVERY_ARTIFACT_LEASE_RESULT failed_assertions=%d\n", suite.failed);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "materialized-recovery-historical-cull") == 0)
   {
     testDurableMaterializedRecoveryHistoricalCull(suite);
@@ -2416,6 +2537,7 @@ int main(void)
     return suite.failed == 0 ? 0 : 1;
   }
   testProductionUpdateProgressDefersReentrantPersistenceUntilArtifactLeaseReleases(suite);
+  testLocalBundleRecoveryDefersCheckpointUntilArtifactLeaseReleases(suite);
   testFollowerMetricIngestionTrimsBeforePersistence(suite);
   testLargeMetricHistoryUsesImmutableAsyncCapture(suite);
   testProductionPersistenceAPI(suite);

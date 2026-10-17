@@ -29718,6 +29718,7 @@ public:
       updateSelfPersistenceTickQueued = false;
       if (updateSelfPersistenceQueued) submitQueuedUpdateSelfPersistence();
       else resumeDurableUpdateSelfProgress();
+      resumeDeferredUpdateSelfArtifactReceiptContinuations();
       return;
     }
     if (packet == &bundleExecRetryTick)
@@ -33571,6 +33572,7 @@ public:
   bool updateSelfPersistenceReady = false;
   uint64_t updateSelfPersistenceVersion = 1;
   uint64_t updateSelfPersistenceQueuedEpoch = 0;
+  Vector<std::function<void()>> deferredUpdateSelfArtifactReceiptContinuations;
 
   void completeUpdateSelfPersistence(uint64_t version, bool durable)
   {
@@ -33688,6 +33690,27 @@ public:
     updateSelfPersistenceTickQueued = true;
     Ring::queueTimeout(&updateSelfPersistenceTick);
     return true;
+  }
+
+  // ArtifactIO keeps the completed request's admission lease until its Ring
+  // receipt returns. A local bundle-recovery checkpoint is a new snapshot,
+  // so it must not attempt admission from that receipt while the update
+  // request's frame and bundle still consume the final byte capacity.
+  bool deferUpdateSelfArtifactReceiptContinuation(std::function<void()> continuation)
+  {
+    if (!continuation) return false;
+    deferredUpdateSelfArtifactReceiptContinuations.push_back(std::move(continuation));
+    if (armUpdateSelfPersistenceTick()) return true;
+    deferredUpdateSelfArtifactReceiptContinuations.pop_back();
+    return false;
+  }
+
+  void resumeDeferredUpdateSelfArtifactReceiptContinuations()
+  {
+    if (deferredUpdateSelfArtifactReceiptContinuations.empty()) return;
+    Vector<std::function<void()>> continuations = std::move(deferredUpdateSelfArtifactReceiptContinuations);
+    deferredUpdateSelfArtifactReceiptContinuations.clear();
+    for (auto& continuation : continuations) continuation();
   }
 
   void persistUpdateSelfProgress(std::function<void()> continuation = {})
@@ -44512,24 +44535,39 @@ public:
               {
                 const uint64_t epoch = masterAuthorityEpoch;
                 const uint64_t incarnation = mothership->connectionIncarnation;
-                prepareLocalBundleExecRecoveryAsync([this, epoch, incarnation, mothership, pending,
-                    expectedPeerEchos](bool durable) {
-                  if (masterAuthorityEpoch != epoch || !activeMotherships.contains(mothership) ||
+                if (!deferUpdateSelfArtifactReceiptContinuation(
+                        [this, epoch, incarnation, mothership, pending, expectedPeerEchos] {
+                  if (masterAuthorityEpoch != epoch || pendingMothershipUpdateArtifact != pending ||
+                      !activeMotherships.contains(mothership) ||
                       mothership->connectionIncarnation != incarnation || !streamIsActive(mothership)) return;
+                  prepareLocalBundleExecRecoveryAsync([this, epoch, incarnation, mothership, pending,
+                      expectedPeerEchos](bool durable) {
+                    if (masterAuthorityEpoch != epoch || !activeMotherships.contains(mothership) ||
+                        mothership->connectionIncarnation != incarnation || !streamIsActive(mothership)) return;
+                    MothershipResponse reply = {};
+                    reply.success = durable;
+                    if (!durable) reply.failure = updateSelfWorkerFailure;
+                    String payload;
+                    BitseryEngine::serialize(payload, reply);
+                    Message::construct(mothership->wBuffer, pending->responseTopic, payload);
+                    if (durable)
+                    {
+                      updateSelfTransitionAfterMothershipAck = expectedPeerEchos == 0;
+                      beginUpdateSelfBundle(expectedPeerEchos);
+                    }
+                    if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
+                    (void)flushActiveMothershipSendBuffer(mothership, "bundle-recovery-durable");
+                  });
+                }))
+                {
                   MothershipResponse reply = {};
-                  reply.success = durable;
-                  if (!durable) reply.failure = updateSelfWorkerFailure;
+                  reply.failure.assign("bundle recovery persistence continuation could not be deferred"_ctv);
                   String payload;
                   BitseryEngine::serialize(payload, reply);
                   Message::construct(mothership->wBuffer, pending->responseTopic, payload);
-                  if (durable)
-                  {
-                    updateSelfTransitionAfterMothershipAck = expectedPeerEchos == 0;
-                    beginUpdateSelfBundle(expectedPeerEchos);
-                  }
                   if (pendingMothershipUpdateArtifact == pending) pendingMothershipUpdateArtifact.reset();
-                  (void)flushActiveMothershipSendBuffer(mothership, "bundle-recovery-durable");
-                });
+                  (void)flushActiveMothershipSendBuffer(mothership, "bundle-recovery-defer-failed");
+                }
                 break;
               }
             }
