@@ -8141,7 +8141,8 @@ public:
     }
   }
 
-  bool serializeCurrentMasterAuthorityTransition(String& serialized, String& digest) const
+  bool serializeCurrentMasterAuthorityTransition(
+      String& serialized, String& digest, bool canonicalElectionFrontier = false) const
   {
     ProdigyMasterAuthorityStateTransition transition;
     transition.runtimeState = masterAuthorityRuntimeState;
@@ -8197,7 +8198,10 @@ public:
           [](const auto& permission) { return permission.protocolVersion >= ProdigyLocalCousinServicePermission::baselineVersion; }) ? 8 : 7;
     if (transportCredentialLifecycleOperationsPresent()) transition.version = 9;
     if (!transition.runtimeState.cousinRoutes.empty()) transition.version = 10;
-    transition.runtimeState.updateSelf = projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
+    // Replication receipts bind the recovery witness. Elections compare only
+    // cluster-wide authority: every Brain owns a different local coordinator.
+    transition.runtimeState.updateSelf = canonicalElectionFrontier ? ProdigyPersistentUpdateSelfState{} :
+        projectUpdateSelfRecoveryWitness(transition.runtimeState.updateSelf);
     transition.runtimeState.updateSelfFollowerConcurrency = 0;
     transition.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.clear();
     transition.runtimeState.updateSelfFollowerReadyPeerKeys.clear();
@@ -11423,9 +11427,17 @@ public:
       return false;
     }
     ProdigyMasterAuthorityRuntimeState comparableIncoming = incoming.runtimeState;
+    // These fields are retained per follower and are normalized again by the
+    // runtime preparer below. They cannot make an equal shared revision conflict.
     comparableIncoming.updateSelf = {};
+    comparableIncoming.updateSelfFollowerConcurrency = 0;
+    comparableIncoming.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    comparableIncoming.updateSelfFollowerReadyPeerKeys.clear();
     ProdigyMasterAuthorityRuntimeState comparableCurrent = masterAuthorityRuntimeState;
     comparableCurrent.updateSelf = {};
+    comparableCurrent.updateSelfFollowerConcurrency = 0;
+    comparableCurrent.updateSelfFollowerTransitionIssuedPeerKeys.clear();
+    comparableCurrent.updateSelfFollowerReadyPeerKeys.clear();
     if (incoming.runtimeState.generation == masterAuthorityRuntimeState.generation &&
         (comparableIncoming != comparableCurrent || configChanged))
     {
@@ -16863,7 +16875,7 @@ public:
         durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
       return false;
     String serialized;
-    if (!serializeCurrentMasterAuthorityTransition(serialized, digest)) return false;
+    if (!serializeCurrentMasterAuthorityTransition(serialized, digest, true)) return false;
     generation = durableMasterAuthorityRuntimeStateGeneration;
     return generation != 0 && prodigyIsSHA256HexDigest(digest);
   }
@@ -35342,14 +35354,16 @@ public:
     auto found = std::find_if(cousinSessions.begin(), cousinSessions.end(), [&](const auto& state) { return state.record.sessionUUID == ack.sessionUUID; });
     if (found == cousinSessions.end()) return;
     auto& state = *found;
-    if (state.authorityEpoch != masterAuthorityEpoch || !state.awaitingDestinationAcks || ack.leaseGeneration != state.leaseGeneration ||
+    if (state.authorityEpoch != masterAuthorityEpoch || ack.leaseGeneration != state.leaseGeneration ||
         std::find(state.admissionFleet.begin(), state.admissionFleet.end(), std::make_pair(neuron->machine->uuid, neuron->ioGeneration)) == state.admissionFleet.end()) return;
-    auto pending = std::find(state.pendingAdmissionMachines.begin(), state.pendingAdmissionMachines.end(), neuron->machine->uuid);
-    if (pending == state.pendingAdmissionMachines.end()) return;
-    if (!ack.success || ack.revoked || ack.containerID != state.record.destination.containerID ||
-        ack.wormholeRevision != state.record.destination.wormholeRevision || !cousinSessionLocalCurrent(state)) {
+    if (ack.containerID != state.record.destination.containerID ||
+        ack.wormholeRevision != state.record.destination.wormholeRevision) return;
+    if (!ack.success || ack.revoked || !cousinSessionLocalCurrent(state)) {
       revokeCousinSession(state); return;
     }
+    if (!state.awaitingDestinationAcks) return;
+    auto pending = std::find(state.pendingAdmissionMachines.begin(), state.pendingAdmissionMachines.end(), neuron->machine->uuid);
+    if (pending == state.pendingAdmissionMachines.end()) return;
     state.pendingAdmissionMachines.erase(pending); finishCousinSessionDestination(state);
   }
 

@@ -11845,6 +11845,55 @@ static void testSwitchboardResetInvalidatesCousinAdmissionLedger(TestSuite& suit
                "switchboard_reset_invalidates_cousin_admission_renewal_ledger_even_when_map_cleanup_fails");
 }
 
+static void testPostReadyCousinAdmissionFailureRevokesSession(TestSuite& suite)
+{
+  ScopedRing ring = {};
+  TestBrain brain = {};
+  brain.weAreMaster = true;
+  brain.masterAuthorityEpoch = 7;
+  Machine machine = {};
+  machine.uuid = uint128_t(0xA556);
+  machine.neuron.machine = &machine;
+  machine.neuron.connected = true;
+  machine.neuron.isFixedFile = true;
+  machine.neuron.fslot = 56;
+  brain.machines.insert(&machine);
+  brain.machinesByUUID.insert_or_assign(machine.uuid, &machine);
+  brain.neurons.insert(&machine.neuron);
+  TestNeuron localNeuron = {};
+  localNeuron.uuid = machine.uuid;
+  NeuronBase *previousNeuron = thisNeuron;
+  thisNeuron = &localNeuron;
+
+  Brain::CousinSessionState state = {};
+  state.record.sessionUUID = uint128_t(0xA557);
+  state.record.destination.containerID = 0x01020304;
+  state.record.destination.wormholeRevision.assign(
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"_ctv);
+  state.leaseGeneration = 3;
+  state.authorityEpoch = brain.masterAuthorityEpoch;
+  state.expiresAtMs = Time::msSinceBoot() + ProdigyCousinSessionLeaseMs;
+  state.admissionFleet.push_back({machine.uuid, machine.neuron.ioGeneration});
+  brain.cousinSessions.push_back(state);
+
+  ProdigyCousinAdmissionAck acknowledgement = {};
+  acknowledgement.sessionUUID = state.record.sessionUUID;
+  acknowledgement.leaseGeneration = state.leaseGeneration;
+  acknowledgement.containerID = state.record.destination.containerID;
+  acknowledgement.wormholeRevision = state.record.destination.wormholeRevision;
+  acknowledgement.failure.assign("switchboard reset invalidated cousin admission"_ctv);
+  ProdigyCousinAdmissionAck mismatched = acknowledgement;
+  ++mismatched.containerID;
+  brain.receiveCousinAdmissionAck(&machine.neuron, mismatched);
+  suite.expect(brain.cousinSessions.size() == 1 && brain.cousinSessions.front().expiresAtMs != 0,
+               "post_ready_cousin_admission_failure_rejects_mismatched_destination_identity");
+  brain.receiveCousinAdmissionAck(&machine.neuron, acknowledgement);
+
+  suite.expect(brain.cousinSessions.size() == 1 && brain.cousinSessions.front().expiresAtMs == 0,
+               "post_ready_cousin_admission_failure_revokes_active_session");
+  thisNeuron = previousNeuron;
+}
+
 // A retained stateless process can report healthy after its restored deployment
 // has returned to `none`.  That receipt must re-enter the existing full
 // recovery owner once, after the complete target is healthy; it must not turn
@@ -17431,6 +17480,22 @@ static void testElasticReplicationIdentityAndDivergenceGuards(TestSuite& suite)
   TestBrain brain;
   brain.masterAuthorityRuntimeState.generation = 5;
   brain.masterAuthorityRuntimeState.nextPendingElasticAddressOperationID = 1;
+  {
+    ProdigyMasterAuthorityStateTransition localReconciliation = {};
+    localReconciliation.runtimeState = brain.masterAuthorityRuntimeState;
+    localReconciliation.runtimeState.updateSelfFollowerConcurrency = 2;
+    localReconciliation.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys = {0x7101};
+    localReconciliation.runtimeState.updateSelfFollowerReadyPeerKeys = {0x7102};
+    localReconciliation.brainConfig = brain.brainConfig;
+    Brain::PreparedMasterAuthorityTransition prepared = {};
+    suite.expect(brain.prepareReplicatedMasterAuthorityTransition(localReconciliation, prepared) &&
+                     prepared.runtime.sameState &&
+                     prepared.runtime.runtimeState.updateSelfFollowerConcurrency == 0 &&
+                     prepared.runtime.runtimeState.updateSelfFollowerTransitionIssuedPeerKeys.empty() &&
+                     prepared.runtime.runtimeState.updateSelfFollowerReadyPeerKeys.empty() &&
+                     brain.persistCalls == 0,
+                 "master_authority_same_generation_ignores_follower_local_update_bookkeeping");
+  }
   ProdigyMasterAuthorityRuntimeState divergent = brain.masterAuthorityRuntimeState;
   divergent.nextPendingElasticAddressOperationID = 2;
   suite.expect(brain.applyReplicatedMasterAuthorityRuntimeState(divergent, true) == false &&
@@ -31042,6 +31107,7 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   {
     ProdigyPersistentUpdateSelfMachineRecoveryWitness witness = {};
     witness.machineUUID = machineUUID;
+    witness.bundleRegistered = true;
     witness.containerBootstraps.push_back("captured-bootstrap"_ctv);
     brain.updateSelfMachineRecoveryWitnesses.push_back(std::move(witness));
   }
@@ -31062,6 +31128,10 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   peer.transportEpoch = 3;
   peer.registrationFresh = true;
   peer.existingMasterUUID = self.uuid;
+  Machine peerMachine = {};
+  peerMachine.uuid = peer.uuid;
+  peerMachine.runtimeReady = true;
+  peer.machine = &peerMachine;
   brain.brains.insert(&peer);
   BrainView secondPeer = {};
   secondPeer.uuid = uint128_t(0x521b0003);
@@ -31073,7 +31143,13 @@ static void testUpdateSelfRecoveryWitnessRequiresCurrentPeerAckBeforeHandoff(Tes
   secondPeer.transportEpoch = 5;
   secondPeer.registrationFresh = true;
   secondPeer.existingMasterUUID = self.uuid;
+  Machine secondPeerMachine = {};
+  secondPeerMachine.uuid = secondPeer.uuid;
+  secondPeerMachine.runtimeReady = true;
+  secondPeer.machine = &secondPeerMachine;
   brain.brains.insert(&secondPeer);
+  brain.persistedMachineInventoryUploaded.insert(peerMachine.uuid);
+  brain.persistedMachineInventoryUploaded.insert(secondPeerMachine.uuid);
   brain.updateSelfFollowerRebootedPeerKeys.insert(peer.uuid);
   brain.updateSelfFollowerRebootedPeerKeys.insert(secondPeer.uuid);
   auto serializeState = [&](const ProdigyMasterAuthorityRuntimeState& authority, String& digest) {
@@ -34669,6 +34745,41 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   };
 
   {
+    TransportCredentialDeliveryTestBrain localFrontier = {};
+    configureAuthority(localFrontier, 41, 191);
+    String transitionBytes = {}, transitionDigestBefore = {}, transitionDigestAfter = {};
+    uint64_t generationBefore = 0, generationAfter = 0, authoritativeGeneration = 0;
+    String frontierBefore = {}, frontierAfter = {}, authoritativeFrontier = {};
+    suite.require(localFrontier.serializeCurrentMasterAuthorityTransition(
+                      transitionBytes, transitionDigestBefore) &&
+                      localFrontier.localAuthorityElectionFrontier(generationBefore, frontierBefore),
+                  "authority_election_local_update_witness_captures_baseline_frontier");
+    localFrontier.masterAuthorityRuntimeState.updateSelf.workerExpectedBundleSHA256 =
+        "abababababababababababababababababababababababababababababababab"_ctv;
+    localFrontier.masterAuthorityRuntimeState.updateSelf.localMachineUUID = selfUUID;
+    localFrontier.masterAuthorityRuntimeState.updateSelf.localContainerBootstraps =
+        {"local-container-bootstrap"_ctv};
+    localFrontier.masterAuthorityRuntimeState.updateSelfFollowerConcurrency = 2;
+    localFrontier.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys =
+        {peerAUUID};
+    localFrontier.masterAuthorityRuntimeState.updateSelfFollowerReadyPeerKeys = {peerBUUID};
+    suite.require(localFrontier.serializeCurrentMasterAuthorityTransition(
+                      transitionBytes, transitionDigestAfter) &&
+                      localFrontier.localAuthorityElectionFrontier(generationAfter, frontierAfter),
+                  "authority_election_local_update_witness_captures_restarted_frontier");
+    suite.expect(!transitionDigestAfter.equals(transitionDigestBefore) &&
+                     generationAfter == generationBefore && frontierAfter.equals(frontierBefore),
+                 "authority_election_frontier_excludes_machine_local_update_recovery_state");
+    ++localFrontier.masterAuthorityRuntimeState.nextDNSIntentRevision;
+    suite.require(localFrontier.localAuthorityElectionFrontier(
+                      authoritativeGeneration, authoritativeFrontier),
+                  "authority_election_authoritative_change_captures_frontier");
+    suite.expect(authoritativeGeneration == generationAfter &&
+                     !authoritativeFrontier.equals(frontierAfter),
+                 "authority_election_frontier_retains_shared_authority_changes");
+  }
+
+  {
     // The leader and the higher-UUID survivor held qualified generation 14;
     // this lower-UUID survivor still has generation 12 when the leader dies.
     ScopedRing electionRing;
@@ -34688,8 +34799,19 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     suite.expect(!stale.resolveFailoverMasterByActivePeerAddressOrder(preferSelf) && !preferSelf,
         "authority_election_requires_fresh_frontier_before_uuid_ordering");
     const uint64_t nonce = fresh.authorityElectionRequestNonce;
-    String localBytes, localDigest;
-    suite.require(nonce != 0 && stale.serializeCurrentMasterAuthorityTransition(localBytes, localDigest),
+    stale.masterAuthorityRuntimeState.updateSelf.workerExpectedBundleSHA256 =
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"_ctv;
+    stale.masterAuthorityRuntimeState.updateSelf.localMachineUUID = selfUUID;
+    stale.masterAuthorityRuntimeState.updateSelf.localContainerBootstraps =
+        {"election-local-container-bootstrap"_ctv};
+    stale.masterAuthorityRuntimeState.updateSelfFollowerConcurrency = 1;
+    stale.masterAuthorityRuntimeState.updateSelfFollowerTransitionIssuedPeerKeys = {peerAUUID};
+    String localBytes, replicationDigest, localDigest;
+    uint64_t localGeneration = 0;
+    suite.require(nonce != 0 &&
+                      stale.serializeCurrentMasterAuthorityTransition(localBytes, replicationDigest) &&
+                      stale.localAuthorityElectionFrontier(localGeneration, localDigest) &&
+                      localGeneration == 12 && !replicationDigest.equals(localDigest),
         "authority_election_captures_request_and_canonical_local_digest");
     // Exercise the responder owner too: inbound fields are read-only views,
     // so the response digest must be built in its own writable String.
@@ -38368,6 +38490,7 @@ int main(void)
     testSwitchboardStateSyncReplaysWhiteholes(suite);
     testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
     testSwitchboardResetInvalidatesCousinAdmissionLedger(suite);
+    testPostReadyCousinAdmissionFailureRevokesSession(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (const char *only = getenv("PRODIGY_TEST_ONLY");
@@ -38796,6 +38919,7 @@ int main(void)
   testSwitchboardWormholeFleetAcknowledgementTransaction(suite);
   testRecoveredStatelessWormholesReplayAndAwaitAcknowledgement(suite);
   testSwitchboardResetInvalidatesCousinAdmissionLedger(suite);
+  testPostReadyCousinAdmissionFailureRevokesSession(suite);
   testRetainedStatelessHealthRestoresRunning(suite);
   testRecoveredWormholeFleetReplayWaitsForAssignedIdentity(suite);
   testApplyReplicatedDeploymentPlanLiveStateRetainsAllocatedWhiteholes(suite);

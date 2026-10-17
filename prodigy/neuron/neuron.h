@@ -3266,6 +3266,8 @@ public:
   struct CousinAdmissionInstalled {
     uint128_t sessionUUID = 0;
     uint64_t leaseGeneration = 0;
+    uint32_t destinationContainerID = 0;
+    String destinationWormholeRevision = {};
     switchboard_pair_admission_route_key routeKey = {};
     switchboard_pair_admission_grant_key grantKey = {};
     uint64_t rootGeneration = 0;
@@ -3477,11 +3479,34 @@ public:
         installed.routeKey, installed.rootGeneration, installed.keyEpoch);
   }
 
+  void forwardCousinAdmissionResetInvalidation(const CousinAdmissionInstalled& installed)
+  {
+    NeuronBrainControlStream *stream = brain;
+    const uint64_t generation = stream ? stream->ioGeneration : 0;
+    const uint128_t peerUUID = stream ? stream->tlsPeerUUID : 0;
+    if (installed.expiresAtMs <= Time::msSinceBoot() || installed.destinationContainerID == 0 ||
+        !prodigyIsSHA256HexDigest(installed.destinationWormholeRevision) ||
+        !cousinSessionCarrierCurrent(stream, generation, peerUUID)) return;
+    ProdigyCousinAdmissionAck acknowledgement = {};
+    acknowledgement.leaseGeneration = installed.leaseGeneration;
+    acknowledgement.sessionUUID = installed.sessionUUID;
+    acknowledgement.containerID = installed.destinationContainerID;
+    acknowledgement.wormholeRevision = installed.destinationWormholeRevision;
+    acknowledgement.failure.assign("switchboard reset invalidated cousin admission"_ctv);
+    String encoded = {};
+    if (BitseryEngine::serialize(encoded, acknowledgement) && encoded.size() <= ProdigyCousinSessionMaximumBytes &&
+        cousinSessionCarrierCurrent(stream, generation, peerUUID)) {
+      Message::construct(stream->wBuffer, NeuronTopic::cousinAdmissionAck, encoded);
+      Ring::queueSend(stream);
+    }
+  }
+
   void invalidateCousinAdmissionsForSwitchboardReset()
   {
     uint32_t cleanupFailures = 0;
     for (const CousinAdmissionInstalled& installed : cousinAdmissionInstalled)
     {
+      forwardCousinAdmissionResetInvalidation(installed);
       if (!clearCousinAdmissionGrant(installed))
       {
         ++cleanupFailures;
@@ -3624,7 +3649,8 @@ public:
         (void)Container::revokeVerifiedPairAdmissionRoute(tcx_egress_program, routeKey, revoked);
         return false;
       }
-      cousinAdmissionInstalled.push_back({command.session.sessionUUID, command.leaseGeneration, routeKey, key,
+      cousinAdmissionInstalled.push_back({command.session.sessionUUID, command.leaseGeneration,
+          command.session.destination.containerID, command.session.destination.wormholeRevision, routeKey, key,
           command.session.rootGeneration, command.session.keyEpoch, std::move(digest),
           Time::msSinceBoot() + command.validForMs});
     } else { existing->leaseGeneration = command.leaseGeneration; existing->expiresAtMs = Time::msSinceBoot() + command.validForMs; }

@@ -763,7 +763,7 @@ static inline bool vultrExtractPlanMetadata(
   return true;
 }
 
-static inline NeuronBGPConfigurationRetry vultrBuildCloudComputeIPv6BGPConfig(
+static inline NeuronBGPConfigurationRetry vultrBuildCloudComputeBGPConfig(
     uint32_t customerASN,
     const String& md5Password,
     uint32_t bgpID,
@@ -771,7 +771,8 @@ static inline NeuronBGPConfigurationRetry vultrBuildCloudComputeIPv6BGPConfig(
     NeuronBGPConfig& config)
 {
   config = {};
-  if (customerASN != 35'870 || md5Password.empty() || bgpID == 0)
+  if (customerASN != 35'870 || md5Password.empty() ||
+      prodigyIPv4IsGlobalUnicast(bgpID) == false)
   {
     return NeuronBGPConfigurationRetry::none;
   }
@@ -785,7 +786,21 @@ static inline NeuronBGPConfigurationRetry vultrBuildCloudComputeIPv6BGPConfig(
   config.enabled = true;
   config.ourBGPID = bgpID;
   config.community = 0;
+  config.nextHop4.is6 = false;
+  config.nextHop4.v4 = bgpID;
   config.nextHop6 = public6;
+
+  // Vultr Cloud Compute requires separate IPv4 and IPv6 sessions to AS64515.
+  // The selected primary device's globally routable IPv4 address is the BGP
+  // source and NEXT_HOP. A VPC, link-local, or other special-use address is
+  // rejected above.
+  NeuronBGPPeerConfig peer4 = {};
+  peer4.peerASN = 64'515;
+  peer4.peerAddress = IPAddress("169.254.169.254", false);
+  peer4.sourceAddress = config.nextHop4;
+  peer4.md5Password = md5Password;
+  peer4.hopLimit = 2;
+  config.peers.push_back(std::move(peer4));
 
   NeuronBGPPeerConfig peer6 = {};
   peer6.peerASN = 64'515;
@@ -918,16 +933,16 @@ public:
     // The current packet encoder is deliberately two-octet-AS only and its
     // local AS is AS35870. Fail closed rather than silently presenting the
     // account ASN as the provider peer or originating another customer's AS.
-    // Use only Vultr's Cloud Compute IPv6 peer (AS64515). IPv4 is omitted
-    // until the runtime carries a verified public instance source/NEXT_HOP;
-    // the private VPC address/default gateway are not substitutes.
+    // Resolve the public IPv4 independently from private4. Vultr machines may
+    // also carry a VPC address, which is not a valid BGP source or NEXT_HOP.
+    const IPAddress public4 = prodigyGetGlobalIPv4Address(eth.name);
     const NeuronBGPConfigurationRetry retry =
-        vultrBuildCloudComputeIPv6BGPConfig(
-            customerASN, bgpMD5, private4.v4, public6, config);
+        vultrBuildCloudComputeBGPConfig(
+            customerASN, bgpMD5, public4.v4, public6, config);
     if (config.enabled == false)
     {
       std::fprintf(stderr, "vultr: Cloud Compute BGP config unavailable customerASNValid=%d passwordPresent=%d bgpIDPresent=%d globalIPv6Present=%d\n",
-                   int(customerASN == 35'870), int(bgpMD5.empty() == false), int(private4.v4 != 0),
+                   int(customerASN == 35'870), int(bgpMD5.empty() == false), int(public4.v4 != 0),
                    int(publicIPv6Ready));
       return retry;
     }

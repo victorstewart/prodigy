@@ -248,42 +248,61 @@ int main(void)
   suite.expect(resolved.configured() == false, "runtime_env_bgp_falls_back_to_empty_without_override");
 
   NeuronBGPConfig vultrCloud = {};
+  IPAddress vultrPublic4("149.28.50.10", false);
   IPAddress vultrPublic6("2001:19f0:5c00:456a:5400:6ff:fedd:d6c9", true);
-  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   35'870, "test-md5"_ctv, private4.v4, vultrPublic6, vultrCloud) ==
+  suite.expect(vultrBuildCloudComputeBGPConfig(
+                   35'870, "test-md5"_ctv, vultrPublic4.v4, vultrPublic6, vultrCloud) ==
                    NeuronBGPConfigurationRetry::none &&
                    vultrCloud.enabled,
                "vultr_cloud_bgp_config_accepts_customer_asn_and_global_ipv6");
-  suite.expect(vultrCloud.enabled && vultrCloud.community == 0 && vultrCloud.nextHop4.isNull(),
-               "vultr_cloud_bgp_config_does_not_suppress_public_propagation_or_advertise_ipv4");
-  suite.expect(vultrCloud.nextHop6.equals(vultrPublic6) && vultrCloud.peers.size() == 1,
-               "vultr_cloud_bgp_config_uses_public_ipv6_next_hop");
+  suite.expect(vultrCloud.enabled && vultrCloud.community == 0 &&
+                   vultrCloud.nextHop4.equals(vultrPublic4) &&
+                   vultrCloud.nextHop6.equals(vultrPublic6),
+               "vultr_cloud_bgp_config_uses_verified_dual_stack_next_hops");
+  suite.expect(vultrCloud.peers.size() == 2,
+               "vultr_cloud_bgp_config_has_one_peer_per_address_family");
   suite.expect(vultrCloud.peers[0].peerASN == 64'515 &&
-                   vultrCloud.peers[0].peerAddress.equals(IPAddress("2001:19f0:ffff::1", true)) &&
-                   vultrCloud.peers[0].sourceAddress.equals(vultrPublic6) &&
+                   vultrCloud.peers[0].peerAddress.equals(IPAddress("169.254.169.254", false)) &&
+                   vultrCloud.peers[0].sourceAddress.equals(vultrPublic4) &&
                    vultrCloud.peers[0].hopLimit == 2 &&
                    vultrCloud.peers[0].md5Password == "test-md5"_ctv,
-               "vultr_cloud_bgp_config_uses_documented_vps_peer");
+               "vultr_cloud_bgp_config_uses_documented_ipv4_peer");
+  suite.expect(vultrCloud.peers[1].peerASN == 64'515 &&
+                   vultrCloud.peers[1].peerAddress.equals(IPAddress("2001:19f0:ffff::1", true)) &&
+                   vultrCloud.peers[1].sourceAddress.equals(vultrPublic6) &&
+                   vultrCloud.peers[1].hopLimit == 2 &&
+                   vultrCloud.peers[1].md5Password == "test-md5"_ctv,
+               "vultr_cloud_bgp_config_retains_documented_ipv6_peer");
 
   NeuronBGPConfig rejectedVultr = {};
-  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+  suite.expect(vultrBuildCloudComputeBGPConfig(
                    64'512, "test-md5"_ctv, private4.v4, vultrPublic6, rejectedVultr) ==
                    NeuronBGPConfigurationRetry::none &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_rejects_unsupported_customer_asn");
-  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
+  suite.expect(vultrBuildCloudComputeBGPConfig(
                    35'870, String {}, private4.v4, IPAddress {}, rejectedVultr) ==
                    NeuronBGPConfigurationRetry::none &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_does_not_retry_permanent_account_input_failure");
-  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   35'870, "test-md5"_ctv, private4.v4, IPAddress {}, rejectedVultr) ==
+  suite.expect(vultrBuildCloudComputeBGPConfig(
+                   35'870, "test-md5"_ctv, 0, vultrPublic6, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::none &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_rejects_missing_public_ipv4_source");
+  suite.expect(vultrBuildCloudComputeBGPConfig(
+                   35'870, "test-md5"_ctv, private4.v4, vultrPublic6, rejectedVultr) ==
+                   NeuronBGPConfigurationRetry::none &&
+                   rejectedVultr.configured() == false,
+               "vultr_cloud_bgp_config_rejects_private_ipv4_source");
+  suite.expect(vultrBuildCloudComputeBGPConfig(
+                   35'870, "test-md5"_ctv, vultrPublic4.v4, IPAddress {}, rejectedVultr) ==
                    NeuronBGPConfigurationRetry::waitForPublicIPv6 &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_reports_public_ipv6_pending");
   IPAddress vultrULA("fdf8:d94c:1::1", true);
-  suite.expect(vultrBuildCloudComputeIPv6BGPConfig(
-                   35'870, "test-md5"_ctv, private4.v4, vultrULA, rejectedVultr) ==
+  suite.expect(vultrBuildCloudComputeBGPConfig(
+                   35'870, "test-md5"_ctv, vultrPublic4.v4, vultrULA, rejectedVultr) ==
                    NeuronBGPConfigurationRetry::waitForPublicIPv6 &&
                    rejectedVultr.configured() == false,
                "vultr_cloud_bgp_config_rejects_ula_and_preserves_public_ipv6_retry");
