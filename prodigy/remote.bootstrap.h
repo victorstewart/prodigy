@@ -2088,7 +2088,7 @@ static inline bool prodigyBuildRemoteBootstrapPlan(const ClusterMachine& cluster
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteBootJSONPath);
   plan.installCommand.append(" "_ctv);
   prodigyAppendShellSingleQuoted(plan.installCommand, plan.remoteTransportTLSJSONPath);
-  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; ufw allow 315/tcp >/dev/null 2>&1 || true; fi && systemctl daemon-reload && systemctl enable prodigy && systemctl restart prodigy"_ctv);
+  plan.installCommand.append(" && if command -v ufw >/dev/null 2>&1 && ufw status | grep -F 'Status: active' >/dev/null 2>&1; then ufw allow 312/tcp >/dev/null 2>&1 || true; ufw allow 313/tcp >/dev/null 2>&1 || true; ufw allow 315/tcp >/dev/null 2>&1 || true; ufw default allow routed >/dev/null; fi && systemctl daemon-reload && systemctl enable prodigy && systemctl restart prodigy"_ctv);
   if (prodigyRemoteBootstrapShouldAwaitControlSocket(clusterMachine, bootState))
   {
     plan.installCommand.append(" && "_ctv);
