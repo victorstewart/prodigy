@@ -9933,9 +9933,80 @@ int main(void)
     suite.expect(brain.weAreMaster, "relinquish_status_designated_self_elects_self");
     suite.expect(brain.persistCalls == 2, "relinquish_status_designated_self_persists");
 
+    uint32_t relinquishAcknowledgements = 0;
+    forEachMessageInBuffer(peer->wBuffer, [&](Message *queued) {
+      if (BrainTopic(queued->topic) == BrainTopic::relinquishMasterStatus && queued->isEcho())
+      {
+        relinquishAcknowledgements += 1;
+      }
+    });
+    suite.expect(relinquishAcknowledgements == 1,
+                 "relinquish_status_designated_self_acknowledges_only_after_promotion");
+
     brain.brains.erase(peer);
     delete peer;
   });
+
+  {
+    ScopedRing scopedRing = {};
+
+    const char *previousSocketPath = ::getenv("PRODIGY_MOTHERSHIP_SOCKET");
+    String previousSocketPathText = {};
+    if (previousSocketPath != nullptr)
+    {
+      previousSocketPathText.assign(previousSocketPath);
+    }
+
+    String overlongSocketPath = "/tmp/"_ctv;
+    for (uint32_t index = 0; index < 128; ++index)
+    {
+      overlongSocketPath.append("x"_ctv);
+    }
+    ::setenv("PRODIGY_MOTHERSHIP_SOCKET", overlongSocketPath.c_str(), 1);
+
+    TestBrain brain = {};
+    brain.iaas = new NoopBrainIaaS();
+
+    BrainView *peer = makePeer(uint128_t(0x201), 21, IPAddress("10.0.0.12", false).v4);
+    peer->connected = true;
+    peer->isFixedFile = true;
+    peer->fslot = 44;
+    brain.brains.insert(peer);
+
+    String buffer = {};
+    Message *message = buildBrainMessage(
+        buffer,
+        BrainTopic::relinquishMasterStatus,
+        uint8_t(1),
+        uint128_t(neuron.private4.v4));
+    brain.testBrainHandler(peer, message);
+
+    uint32_t relinquishAcknowledgements = 0;
+    forEachMessageInBuffer(peer->wBuffer, [&](Message *queued) {
+      if (BrainTopic(queued->topic) == BrainTopic::relinquishMasterStatus && queued->isEcho())
+      {
+        relinquishAcknowledgements += 1;
+      }
+    });
+    suite.expect(brain.weAreMaster == false,
+                 "relinquish_status_designated_self_listener_failure_does_not_promote");
+    suite.expect(relinquishAcknowledgements == 0,
+                 "relinquish_status_designated_self_listener_failure_does_not_acknowledge");
+    suite.expect(brain.persistCalls == 0,
+                 "relinquish_status_designated_self_listener_failure_does_not_durably_acknowledge");
+
+    brain.brains.erase(peer);
+    delete peer;
+
+    if (previousSocketPath != nullptr)
+    {
+      ::setenv("PRODIGY_MOTHERSHIP_SOCKET", previousSocketPathText.c_str(), 1);
+    }
+    else
+    {
+      ::unsetenv("PRODIGY_MOTHERSHIP_SOCKET");
+    }
+  }
 
   withUniqueMothershipSocket("relinquish_status_designated_self_replaces_live_listener_socket_dir_created", [&] {
     TestBrain brain = {};

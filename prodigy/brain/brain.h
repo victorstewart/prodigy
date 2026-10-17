@@ -38564,9 +38564,10 @@ public:
                          designatedPeerKeyText.c_str());
             }
 
+            const bool designatedMasterIsLocal = updateSelfPeerKeyMatchesLocal(designatedMasterPeerKey, bv);
             bool electedDesignatedMaster = false;
             bool designatedMasterKnown = false;
-            if (updateSelfPeerKeyMatchesLocal(designatedMasterPeerKey, bv))
+            if (designatedMasterIsLocal)
             {
               designatedMasterKnown = true;
               basics_log("relinquishMasterStatus elect-self reason=designated-master\n");
@@ -38605,7 +38606,14 @@ public:
               }
             }
 
-            acknowledgeDurableRelinquish(bv);
+            // The designated successor's durable acknowledgement is the old
+            // master's fence before it execs.  Do not acknowledge its own
+            // handoff until promotion (including the control listener) has
+            // completed, or the old master could leave the cluster masterless.
+            if (designatedMasterIsLocal == false || electedDesignatedMaster)
+            {
+              acknowledgeDurableRelinquish(bv);
+            }
           }
 
           break;
