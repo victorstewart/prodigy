@@ -34819,6 +34819,57 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
   }
 
   {
+    // A complete three-Brain view may contain two one-vote highest-generation
+    // revisions and one strictly older voter while a fresh cluster converges.
+    // The lower UUID must be the deterministic recovery target; this is not a
+    // 2:1 digest split and every configured voter is present.
+    ScopedRing electionRing;
+    TransportCredentialDeliveryTestBrain highWater;
+    configureAuthority(highWater, 14, 191);
+    highWater.weAreMaster = false;
+    highWater.noMasterYet = true;
+    highWater.hasCompletedInitialMasterElection = true;
+    highWater.nBrains = 3;
+    highWater.boottimens = 10;
+    BrainView conflictingHighPeer, stalePeer;
+    suite.require(authenticatePeer(highWater, conflictingHighPeer, peerAUUID) &&
+        authenticatePeer(highWater, stalePeer, peerBUUID),
+        "authority_election_high_water_split_authenticates_full_three_node_view");
+    conflictingHighPeer.version = stalePeer.version = ProdigyBinaryVersion;
+    String capability;
+    highWater.brainHandler(&conflictingHighPeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    capability.clear();
+    highWater.brainHandler(&stalePeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    bool preferred = false;
+    suite.expect(!highWater.resolveFailoverMasterByActivePeerAddressOrder(preferred),
+        "authority_election_high_water_split_waits_for_all_frontiers");
+    String serialized, localDigest;
+    const String conflictingDigest = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"_ctv;
+    const String staleDigest = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"_ctv;
+    suite.require(highWater.serializeCurrentMasterAuthorityTransition(serialized, localDigest) &&
+        highWater.acceptAuthorityElectionFrontier(&conflictingHighPeer,
+            conflictingHighPeer.authorityElectionRequestNonce, 14, conflictingDigest) &&
+        highWater.acceptAuthorityElectionFrontier(&stalePeer,
+            stalePeer.authorityElectionRequestNonce, 13, staleDigest),
+        "authority_election_high_water_split_records_two_distinct_maximum_frontiers");
+    suite.expect(highWater.resolveFailoverMasterByActivePeerAddressOrder(preferred) && preferred,
+        "authority_election_high_water_split_converges_to_lowest_uuid");
+    suite.expect(highWater.resolveAuthorityElectionFrontier(preferred, true, &conflictingHighPeer) && !preferred,
+        "authority_election_high_water_split_rejects_higher_uuid_revision");
+    stalePeer.authorityElectionGeneration = 14;
+    suite.expect(!highWater.resolveFailoverMasterByActivePeerAddressOrder(preferred) &&
+        !highWater.resolveAuthorityElectionFrontier(preferred, true, &conflictingHighPeer),
+        "authority_election_three_distinct_high_water_revisions_fail_closed");
+    conflictingHighPeer.authorityElectionDigest = staleDigest;
+    suite.expect(!highWater.resolveFailoverMasterByActivePeerAddressOrder(preferred) &&
+        highWater.resolveAuthorityElectionFrontier(preferred, true, &conflictingHighPeer) && preferred,
+        "authority_election_high_water_minority_cannot_override_two_matching_revisions");
+    highWater.brains.clear();
+  }
+
+  {
     // A strict quorum may recover a same-generation digest split; the lone
     // divergent voter cannot veto the exact durable revision held by two nodes.
     ScopedRing electionRing;

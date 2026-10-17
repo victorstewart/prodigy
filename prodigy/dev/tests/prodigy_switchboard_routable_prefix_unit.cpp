@@ -105,6 +105,56 @@ int main(void)
   suite.expect(memcmp(keys6[0].addr, expectedMixedIPv6, sizeof(expectedMixedIPv6)) == 0, "switchboard_routable_prefix_mixed_ipv6_canonicalizes");
 
   {
+    Vector<switchboard_owned_routable_prefix6_key> installed;
+    Vector<switchboard_owned_routable_prefix6_key> desired;
+    desired.push_back(switchboardMakeOwnedRoutablePrefix6Key(makeSubnet("retry-v6", "2602:fac0::1/40").subnet));
+
+    uint32_t updateAttempts = 0;
+    auto less = [](const switchboard_owned_routable_prefix6_key& lhs, const switchboard_owned_routable_prefix6_key& rhs) -> bool {
+      if (lhs.prefixlen != rhs.prefixlen)
+      {
+        return lhs.prefixlen < rhs.prefixlen;
+      }
+      return std::memcmp(lhs.addr, rhs.addr, sizeof(lhs.addr)) < 0;
+    };
+
+    bool firstReconciled = switchboardReconcileOwnedRoutablePrefixKeys(
+        installed,
+        desired,
+        less,
+        [&](const switchboard_owned_routable_prefix6_key&) -> bool {
+          ++updateAttempts;
+          return false;
+        },
+        [](const switchboard_owned_routable_prefix6_key&) -> bool { return true; });
+    if (firstReconciled)
+    {
+      installed = desired;
+    }
+
+    suite.expect(firstReconciled == false, "switchboard_routable_prefix_failed_update_does_not_reconcile");
+    suite.expect(installed.empty(), "switchboard_routable_prefix_failed_update_does_not_advance_snapshot");
+
+    bool secondReconciled = switchboardReconcileOwnedRoutablePrefixKeys(
+        installed,
+        desired,
+        less,
+        [&](const switchboard_owned_routable_prefix6_key&) -> bool {
+          ++updateAttempts;
+          return true;
+        },
+        [](const switchboard_owned_routable_prefix6_key&) -> bool { return true; });
+    if (secondReconciled)
+    {
+      installed = desired;
+    }
+
+    suite.expect(secondReconciled, "switchboard_routable_prefix_same_config_retry_reconciles");
+    suite.expect(updateAttempts == 2, "switchboard_routable_prefix_same_config_retry_reissues_failed_update");
+    suite.expect(installed.size() == 1, "switchboard_routable_prefix_successful_retry_advances_snapshot");
+  }
+
+  {
     local_container_subnet6 subnet = {
         .dpfx = 0x01,
         .mpfx = {0xf2, 0x66, 0xe5}

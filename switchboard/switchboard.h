@@ -1993,6 +1993,7 @@ private:
       return;
     }
 
+    bool reconciled = false;
     bpf_router->openMap(mapName, [&](int map_fd) -> void {
       if (map_fd < 0)
       {
@@ -2010,20 +2011,17 @@ private:
                        unsigned(desiredKeys.size()),
                        unsigned(installedKeys.size()));
 
-      Vector<Key> installedSorted = installedKeys;
-      Vector<Key> desiredSorted = desiredKeys;
-      std::sort(installedSorted.begin(), installedSorted.end(), less);
-      std::sort(desiredSorted.begin(), desiredSorted.end(), less);
-
-      auto installedIt = installedSorted.begin();
-      auto desiredIt = desiredSorted.begin();
       __u8 present = 1;
-      while (installedIt != installedSorted.end() || desiredIt != desiredSorted.end())
-      {
-        if (installedIt == installedSorted.end())
-        {
-          if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
-          {
+      reconciled = switchboardReconcileOwnedRoutablePrefixKeys(
+          installedKeys,
+          desiredKeys,
+          less,
+          [&](const Key& key) -> bool {
+            if (bpf_map_update_elem(map_fd, &key, &present, BPF_ANY) == 0)
+            {
+              return true;
+            }
+
             basics_log("Switchboard owned-routable update failed map=%s ifidx=%u errno=%d\n",
                        mapName.c_str(),
                        eth.ifidx,
@@ -2032,15 +2030,14 @@ private:
                              eth.ifidx,
                              mapName.c_str(),
                              errno);
-          }
-          ++desiredIt;
-          continue;
-        }
+            return false;
+          },
+          [&](const Key& key) -> bool {
+            if (bpf_map_delete_elem(map_fd, &key) == 0 || errno == ENOENT)
+            {
+              return true;
+            }
 
-        if (desiredIt == desiredSorted.end())
-        {
-          if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
-          {
             basics_log("Switchboard owned-routable delete failed map=%s ifidx=%u errno=%d\n",
                        mapName.c_str(),
                        eth.ifidx,
@@ -2049,51 +2046,14 @@ private:
                              eth.ifidx,
                              mapName.c_str(),
                              errno);
-          }
-          ++installedIt;
-          continue;
-        }
-
-        if (less(*installedIt, *desiredIt))
-        {
-          if (bpf_map_delete_elem(map_fd, &(*installedIt)) != 0)
-          {
-            basics_log("Switchboard owned-routable delete failed map=%s ifidx=%u errno=%d\n",
-                       mapName.c_str(),
-                       eth.ifidx,
-                       errno);
-            appendAttachLogf("Switchboard owned-routable delete failed ifidx=%u map=%s errno=%d",
-                             eth.ifidx,
-                             mapName.c_str(),
-                             errno);
-          }
-          ++installedIt;
-          continue;
-        }
-
-        if (less(*desiredIt, *installedIt))
-        {
-          if (bpf_map_update_elem(map_fd, &(*desiredIt), &present, BPF_ANY) != 0)
-          {
-            basics_log("Switchboard owned-routable update failed map=%s ifidx=%u errno=%d\n",
-                       mapName.c_str(),
-                       eth.ifidx,
-                       errno);
-            appendAttachLogf("Switchboard owned-routable update failed ifidx=%u map=%s errno=%d",
-                             eth.ifidx,
-                             mapName.c_str(),
-                             errno);
-          }
-          ++desiredIt;
-          continue;
-        }
-
-        ++installedIt;
-        ++desiredIt;
-      }
+            return false;
+          });
     });
 
-    installedKeys = desiredKeys;
+    if (reconciled)
+    {
+      installedKeys = desiredKeys;
+    }
   }
 
   void syncOwnedRoutablePrefixMaps(void)

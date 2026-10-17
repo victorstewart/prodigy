@@ -2687,6 +2687,50 @@ int main(void)
     }
   }
 
+  {
+    TestBrain brain = {};
+    NoopBrainIaaS iaas = {};
+    brain.iaas = &iaas;
+
+    Machine local = {};
+    local.uuid = uint128_t(0x9463);
+    local.fragment = 0x53;
+    ClusterMachinePeerAddress localPublic6 = {};
+    localPublic6.address.assign("2602:fac0:0:12ab:34cd::10"_ctv);
+    localPublic6.cidr = 64;
+    local.peerAddresses.push_back(localPublic6);
+    local.hardware.inventoryComplete = true;
+    local.hardware.cpu.logicalCores = 4;
+    local.hardware.memory.totalMB = 4096;
+    local.hardware.network.nics.push_back(makeNic("bond0", "5e:b7:78:2a:48:7b", "fe80::10/64"));
+
+    Machine remote = {};
+    remote.uuid = uint128_t(0x9464);
+    remote.fragment = 0x54;
+    ClusterMachinePeerAddress remotePublic6 = {};
+    remotePublic6.address.assign("2602:fac0:0:12ab:34cd::20"_ctv);
+    remotePublic6.cidr = 64;
+    remotePublic6.gateway.assign("fe80::1"_ctv);
+    remote.peerAddresses.push_back(remotePublic6);
+    remote.hardware.inventoryComplete = true;
+    remote.hardware.cpu.logicalCores = 4;
+    remote.hardware.memory.totalMB = 4096;
+    remote.hardware.network.nics.push_back(makeNic("bond0", "fa:6d:18:7d:9f:5e", "2602:fac0:0:12ab:34cd::20/64"));
+
+    brain.machines.insert(&local);
+    brain.machines.insert(&remote);
+
+    SwitchboardOverlayRoutingConfig config = {};
+    suite.expect(brain.testBuildSwitchboardOverlayRoutingConfig(&local, config), "build_overlay_routing_config_accepts_public_peer_via_link_local_gateway");
+    suite.expect(config.machineRoutes.size() == 1, "build_overlay_routing_config_builds_public_gateway_route");
+    if (config.machineRoutes.size() == 1)
+    {
+      suite.expect(config.machineRoutes[0].nextHop.equals(IPAddress("2602:fac0:0:12ab:34cd::20", true)), "build_overlay_routing_config_preserves_public_gateway_peer_destination");
+      suite.expect(config.machineRoutes[0].sourceAddress.equals(IPAddress("2602:fac0:0:12ab:34cd::10", true)), "build_overlay_routing_config_uses_public_source_for_link_local_gateway");
+      suite.expect(config.machineRoutes[0].useGatewayMAC, "build_overlay_routing_config_marks_link_local_gateway_route");
+    }
+  }
+
   thisNeuron = nullptr;
 
   if (createdRing)

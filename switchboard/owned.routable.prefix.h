@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cstring>
 
@@ -14,6 +15,58 @@ static inline bool switchboardOwnedRoutablePrefix4Equals(const switchboard_owned
 static inline bool switchboardOwnedRoutablePrefix6Equals(const switchboard_owned_routable_prefix6_key& lhs, const switchboard_owned_routable_prefix6_key& rhs)
 {
   return lhs.prefixlen == rhs.prefixlen && memcmp(lhs.addr, rhs.addr, sizeof(lhs.addr)) == 0;
+}
+
+template <typename Key, typename Less, typename Update, typename Remove>
+static inline bool switchboardReconcileOwnedRoutablePrefixKeys(const Vector<Key>& installedKeys,
+                                                               const Vector<Key>& desiredKeys,
+                                                               Less&& less,
+                                                               Update&& update,
+                                                               Remove&& remove)
+{
+  Vector<Key> installedSorted = installedKeys;
+  Vector<Key> desiredSorted = desiredKeys;
+  std::sort(installedSorted.begin(), installedSorted.end(), less);
+  std::sort(desiredSorted.begin(), desiredSorted.end(), less);
+
+  auto installedIt = installedSorted.begin();
+  auto desiredIt = desiredSorted.begin();
+  bool reconciled = true;
+  while (installedIt != installedSorted.end() || desiredIt != desiredSorted.end())
+  {
+    if (installedIt == installedSorted.end())
+    {
+      reconciled = update(*desiredIt) && reconciled;
+      ++desiredIt;
+      continue;
+    }
+
+    if (desiredIt == desiredSorted.end())
+    {
+      reconciled = remove(*installedIt) && reconciled;
+      ++installedIt;
+      continue;
+    }
+
+    if (less(*installedIt, *desiredIt))
+    {
+      reconciled = remove(*installedIt) && reconciled;
+      ++installedIt;
+      continue;
+    }
+
+    if (less(*desiredIt, *installedIt))
+    {
+      reconciled = update(*desiredIt) && reconciled;
+      ++desiredIt;
+      continue;
+    }
+
+    ++installedIt;
+    ++desiredIt;
+  }
+
+  return reconciled;
 }
 
 static inline void switchboardMaskIPv6PrefixBytes(uint8_t address[16], uint8_t prefixLength)

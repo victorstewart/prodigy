@@ -469,29 +469,20 @@ inline bool BrainBase::buildSwitchboardOverlayRoutingConfig(Machine *machine, Sw
           continue;
         }
 
-        IPAddress layer2NextHop = transportAddress;
         if (remoteCandidate.gateway.size() > 0)
         {
-          if (ClusterMachine::parseIPAddressLiteral(remoteCandidate.gateway, layer2NextHop) == false || layer2NextHop.is6 == false)
+          IPAddress gatewayAddress = {};
+          if (ClusterMachine::parseIPAddressLiteral(remoteCandidate.gateway, gatewayAddress) == false || gatewayAddress.is6 == false)
           {
             continue;
           }
         }
 
         IPAddress sourceAddress = {};
-        if (const MachineNicHardwareProfile *localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, layer2NextHop);
-            localNextHopNic != nullptr)
-        {
-          const MachineNicSubnetHardwareProfile *localNextHopSubnet = nullptr;
-          localNextHopNic = prodigyFindMachineNicContainingAddress(*machine, layer2NextHop, &localNextHopSubnet);
-          if (localNextHopSubnet == nullptr || localNextHopSubnet->address.is6 == false)
-          {
-            continue;
-          }
-
-          sourceAddress = localNextHopSubnet->address;
-        }
-        else if (prodigyResolvePreferredLocalSourceAddress(localCandidates, remoteCandidate, sourceAddress) == false || sourceAddress.is6 == false)
+        // The gateway only determines the L2 destination.  The outer IPv6
+        // header is addressed to transportAddress, so select its source from
+        // that peer rather than from a link-local provider gateway.
+        if (prodigyResolvePreferredLocalSourceAddress(localCandidates, remoteCandidate, sourceAddress) == false || sourceAddress.is6 == false)
         {
           continue;
         }
@@ -16952,25 +16943,57 @@ public:
     // same-generation digest split needs an exact-revision quorum: a strict
     // majority is unique, so it admits a 2:1 survivor group without permitting
     // a two-node split.
-    bool sameGenerationDigestConflict =
-        localGeneration == generation && !localDigest.equals(digest);
-    uint32_t matchingVoters =
-        (localGeneration == generation && localDigest.equals(digest)) ? 1u : 0u;
+    uint64_t highestGeneration = localGeneration;
     for (BrainView *peer : brains)
     {
       if (!peerEligibleForClusterQuorum(peer) || !peerSocketActive(peer) ||
           !internalBrainLifecycleStreamAuthorized(peer) ||
           !internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain)) continue;
+      highestGeneration = std::max(highestGeneration, peer->authorityElectionGeneration);
+    }
+    bool sameGenerationDigestConflict =
+        localGeneration == generation && !localDigest.equals(digest);
+    uint32_t matchingVoters =
+        (localGeneration == generation && localDigest.equals(digest)) ? 1u : 0u;
+    uint32_t highestGenerationVoters = 0;
+    if (localGeneration == highestGeneration) ++highestGenerationVoters;
+    for (BrainView *peer : brains)
+    {
+      if (!peerEligibleForClusterQuorum(peer) || !peerSocketActive(peer) ||
+          !internalBrainLifecycleStreamAuthorized(peer) ||
+          !internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain)) continue;
+      if (peer->authorityElectionGeneration == highestGeneration)
+      {
+        ++highestGenerationVoters;
+      }
       if (peer->authorityElectionGeneration != generation) continue;
       if (peer->authorityElectionDigest.equals(digest)) ++matchingVoters;
       else sameGenerationDigestConflict = true;
     }
-    if (sameGenerationDigestConflict && matchingVoters <= nBrains / 2) return false;
+    // A newly connected three-Brain cluster can expose two independently
+    // durable highest-generation frontiers before either can project its
+    // authority, while the third voter is known to be strictly stale.  All
+    // three current credentials and frontier replies are required here; UUID
+    // ordering then gives every voter the same recovery target.  Do not apply
+    // this to a two-node split or a 2:1 same-generation split, where an exact
+    // digest majority remains the only admissible winner.
+    const bool completeThreeNodeHighWaterSplit =
+        nBrains == 3 && voters == 3 && generation == highestGeneration &&
+        sameGenerationDigestConflict && matchingVoters == 1 &&
+        highestGenerationVoters == 2;
+    if (sameGenerationDigestConflict && matchingVoters <= nBrains / 2 &&
+        !completeThreeNodeHighWaterSplit) return false;
     preferred = true;
     auto compare = [&](uint64_t otherGeneration, const String& otherDigest, uint128_t otherUUID) {
-      // The qualified revision group above settles equal-generation splits;
-      // UUID ordering remains a tie-break only within that exact revision.
-      if (otherGeneration == generation && !otherDigest.equals(digest)) return true;
+      // The qualified revision group above normally settles equal-generation
+      // splits.  The complete three-node high-water recovery is the sole case
+      // where UUID ordering also selects between two different revisions.
+      if (otherGeneration == generation && !otherDigest.equals(digest))
+      {
+        if (completeThreeNodeHighWaterSplit && breakUUIDTies && otherUUID < uuid)
+          preferred = false;
+        return true;
+      }
       if (otherGeneration > generation ||
           (breakUUIDTies && otherGeneration == generation && otherUUID < uuid)) preferred = false;
       return true;
