@@ -1022,6 +1022,95 @@ static void testProductionPersistenceAdmissionFromArtifactCompletion(TestSuite& 
   reopened.close();
 }
 
+static void testProductionOrdinarySnapshotBackpressureCoalesces(TestSuite& suite)
+{
+  PersistenceRing ring;
+  ScopedPersistentRoot root;
+  ProdigyPersistentStateStore store(root.path);
+  auto io = ProdigyArtifactIO::startOwned();
+  suite.expect(io != nullptr, "runtime_ordinary_snapshot_backpressure_worker_starts");
+  if (!io) return;
+
+  std::atomic<bool> releaseFillers = false;
+  std::atomic<uint32_t> snapshotWrites = 0;
+  auto writer = std::make_shared<ProdigyPersistentStateWriter>(store, *io,
+      [&](auto& backing, auto& request) {
+        if (!request.writeSnapshot) return;
+        ++snapshotWrites;
+        request.result.snapshotDurable = backing.saveBrainSnapshot(request.snapshot, &request.result.failure);
+        request.result.durable = request.result.snapshotDurable;
+        if (request.result.snapshotDurable)
+          request.result.bootStateDurable = backing.saveBootState(request.bootState, &request.result.failure);
+      });
+
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+  ProdigyHostControlNetwork network;
+  uint32_t fillersCompleted = 0;
+  bool exactReceipt = false, exactReceiptDurable = true, retried = false;
+  {
+    ProdigyBrain brain(network, writer);
+    brain.brainConfig.clusterUUID = 0xA51F;
+    for (uint32_t index = 0; index < ProdigyArtifactIO::maximumJobs; ++index)
+    {
+      const bool admitted = io->submit(1,
+          [&] {
+            while (!releaseFillers.load())
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          },
+          [&] { ++fillersCompleted; },
+          [&](std::exception_ptr) { Ring::exit = true; });
+      suite.expect(admitted, "runtime_ordinary_snapshot_backpressure_fills_artifact_slots");
+    }
+
+    // An exact operation remains terminal on capacity rejection; only the
+    // subsequent fire-and-forget snapshots share the one deferred retry.
+    brain.persistLocalRuntimeStateAsync([&](bool durable) {
+      exactReceipt = true;
+      exactReceiptDurable = durable;
+    });
+    brain.brainConfig.bootstrapSshUser.assign("first-rejected-snapshot"_ctv);
+    brain.persistLocalRuntimeStateAsync();
+    brain.brainConfig.bootstrapSshUser.assign("coalesced-latest-snapshot"_ctv);
+    brain.persistLocalRuntimeStateAsync();
+    releaseFillers = true;
+
+    ring.tickAction = [&] {
+      if (fillersCompleted == ProdigyArtifactIO::maximumJobs && !retried)
+      {
+        retried = true;
+        brain.retryDeferredPersistenceBackpressureContinuations();
+      }
+      if (retried && snapshotWrites == 1 && havePersistedBrainSnapshot)
+      {
+        Ring::exit = true;
+        return;
+      }
+      ring.armTick(1);
+    };
+    ring.armTick(1);
+    ring.armDeadline(3000);
+    Ring::start();
+
+    suite.expect(!ring.timedOut && exactReceipt && !exactReceiptDurable && retried &&
+                     snapshotWrites == 1 && havePersistedBrainSnapshot &&
+                     persistedBrainSnapshot.brainConfig.bootstrapSshUser.equals("coalesced-latest-snapshot"_ctv),
+                 "runtime_ordinary_snapshot_backpressure_coalesces_latest_no_receipt_retry");
+  }
+  writer.reset();
+  io->stop();
+  ring.drainStoppedIO();
+  io.reset();
+  (void)network.shutdown();
+  store.close();
+  persistentLocalBrainState = {};
+  persistentBootState = {};
+  persistedBrainSnapshot = {};
+  havePersistedBrainSnapshot = false;
+}
+
 static ClusterTopology runtimePersistenceTopology(uint64_t version, uint128_t uuid)
 {
   ClusterTopology topology = {};
@@ -2530,6 +2619,12 @@ int main(void)
     return suite.failed == 0 ? 0 : 1;
   }
   if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
+      std::strcmp(only, "ordinary-snapshot-backpressure") == 0)
+  {
+    testProductionOrdinarySnapshotBackpressureCoalesces(suite);
+    return suite.failed == 0 ? 0 : 1;
+  }
+  if (const char *only = std::getenv("PRODIGY_TEST_ONLY"); only != nullptr &&
       std::strcmp(only, "writer-schema-detachment") == 0)
   {
     testPersistentWriterPreservesTransportLifecycleSchema(suite);
@@ -2544,6 +2639,7 @@ int main(void)
   testPersistentWriterPreservesTransportLifecycleSchema(suite);
   testTerminalLocalBrainFenceOverridesOlderSnapshot(suite);
   testProductionPersistenceAdmissionFromArtifactCompletion(suite);
+  testProductionOrdinarySnapshotBackpressureCoalesces(suite);
   testProductionTopologySnapshotOverlap(suite);
   testPersistentWriterDetachesViewBackedSchemaFields(suite);
   testPersistentWriterRetainedAccountingChargesManyShortStrings(suite);

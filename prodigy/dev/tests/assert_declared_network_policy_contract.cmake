@@ -145,6 +145,25 @@ if(_restore_configured EQUAL -1 OR _restore_udev LESS_EQUAL _restore_configured 
    message(FATAL_ERROR "retained network restoration must await netlink and udev, apply IPv4 source validation, then publish readiness")
 endif()
 
+# A stale preattached netkit program can be discovered by attach type before
+# its wormhole map contract is known.  Retained recovery must reject that
+# program pair before touching any of its maps or publishing peer bindings.
+string(FIND "${_containers}" "  bool finishNetworkRestore(String *failureReport)" _finish_restore_start)
+string(FIND "${_containers}" "  static void retireRestoreDescriptor" _finish_restore_end)
+if(_finish_restore_start EQUAL -1 OR _finish_restore_end LESS_EQUAL _finish_restore_start)
+   message(FATAL_ERROR "retained network restoration finalization boundary missing")
+endif()
+math(EXPR _finish_restore_length "${_finish_restore_end} - ${_finish_restore_start}")
+string(SUBSTRING "${_containers}" ${_finish_restore_start} ${_finish_restore_length} _finish_restore)
+string(FIND "${_finish_restore}" "primary_program = netdevs.host.loadPreattachedProgram" _finish_primary_load)
+string(FIND "${_finish_restore}" "if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false)" _finish_wormhole_gate)
+string(FIND "${_finish_restore}" "peer_program->setArrayElement(\"lc_subnet\"_ctv" _finish_peer_write)
+string(FIND "${_finish_restore}" "thisNeuron->syncWhiteholeBindingsForContainerPeer(this);" _finish_whitehole_sync)
+if(_finish_primary_load EQUAL -1 OR _finish_wormhole_gate LESS_EQUAL _finish_primary_load OR
+   _finish_peer_write LESS_EQUAL _finish_wormhole_gate OR _finish_whitehole_sync LESS_EQUAL _finish_wormhole_gate)
+   message(FATAL_ERROR "retained network restoration must validate preattached wormhole maps before map writes or peer synchronization")
+endif()
+
 file(GLOB_RECURSE _ebpf_sources
    "${PRODIGY_ROOT}/ebpf/*.c"
    "${PRODIGY_ROOT}/ebpf/*.h"

@@ -2198,30 +2198,17 @@ public:
       return false;
     }
     peer_program = netdevs.host.loadPreattachedProgram(prodigyContainerEgressNetkitAttachType(), path);
-    if (peer_program)
-    {
-      peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
-      peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
-      peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
-      peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
-      if (syncSystemEgressAllowlist(failureReport) == false)
-      {
-        return false;
-      }
-      thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
-    }
 
     if (prodigyResolveContainerRouterBPFPath(plan.networkAccess, true, path, failureReport) == false)
     {
       return false;
     }
     primary_program = netdevs.host.loadPreattachedProgram(prodigyContainerIngressNetkitAttachType(), path);
-    if (primary_program)
-    {
-      primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
-      primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
-    }
-
+    // A retained netkit pair can outlive the program family that created it.
+    // Do not write any maps or synchronize this candidate until both attached
+    // programs prove they share the host's authoritative wormhole flow maps.
+    // In particular, loadPreattachedProgram can identify a stale program by
+    // attach type before its map contract has been validated.
     if (peer_program == nullptr || primary_program == nullptr || wormholeFlowMapsShared() == false)
     {
       if (failureReport)
@@ -2230,6 +2217,19 @@ public:
       }
       return false;
     }
+
+    peer_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
+    peer_program->setArrayElement("mac_map"_ctv, 0, thisNeuron->eth.mac);
+    peer_program->setArrayElement("gw_mac_map"_ctv, 0, thisNeuron->eth.gateway_mac);
+    peer_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
+    if (syncSystemEgressAllowlist(failureReport) == false)
+    {
+      return false;
+    }
+    thisNeuron->syncWhiteholeBindingsForContainerPeer(this);
+
+    primary_program->setArrayElement("lc_subnet"_ctv, 0, thisNeuron->lcsubnet6);
+    primary_program->setArrayElement("ct_net_policy"_ctv, 0, networkPolicy);
 
     if (plan.networkAccess == ContainerNetworkAccess::declaredOnly &&
         (tcpFlowMapsShared() == false || syncDeclaredNetworkPolicy() == false))

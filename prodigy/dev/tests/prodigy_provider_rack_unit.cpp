@@ -970,6 +970,28 @@ int main(void)
     configureVultrProviderForTest(provider, http);
     CoroutineStack stack = {};
     String failure = {};
+    provider.hardRebootMachine(&stack, "reboot-machine"_ctv, failure);
+    http.complete(MultiCurlClient::Status::success, 404);
+    http.complete(MultiCurlClient::Status::success, 200,
+                  R"json({"instance":{"id":"reboot-machine"}})json"_ctv);
+    suite.expect(stack.hasSuspendedCoroutines() && http.requests.size() == 3 &&
+                     http.requests[2].method == MultiCurlClient::Method::post &&
+                     http.requests[2].url ==
+                         "https://api.vultr.com/v2/instances/reboot"_ctv &&
+                     http.requests[2].body ==
+                         R"json({"instance_ids":["reboot-machine"]})json"_ctv,
+                 "vultr_hard_reboot_uses_framed_single_machine_batch_request");
+    http.complete(MultiCurlClient::Status::success, 204);
+    suite.expect(stack.hasSuspendedCoroutines() == false && failure.empty(),
+                 "vultr_hard_reboot_accepts_empty_success_receipt");
+  }
+
+  {
+    ScriptedVultrHttp http = {};
+    VultrBrainIaaS provider = {};
+    configureVultrProviderForTest(provider, http);
+    CoroutineStack stack = {};
+    String failure = {};
     provider.destroyMachine(&stack, "ambiguous-machine"_ctv, failure);
     http.complete(MultiCurlClient::Status::success, 404);
     http.complete(MultiCurlClient::Status::transportFailure, 404);

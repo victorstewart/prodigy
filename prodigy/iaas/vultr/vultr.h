@@ -2912,12 +2912,28 @@ public:
         continue;
       }
       String url;
-      url.snprintf<"https://api.vultr.com/v2/{}/{}/reboot"_ctv>(String(resourcePath(kind)), cloudID);
-      MultiCurlClient::Result result = co_await client.send(
-          coro, client.request(MultiCurlClient::Method::post, url));
+      url.snprintf<"https://api.vultr.com/v2/{}/reboot"_ctv>(String(resourcePath(kind)));
+      String body;
+      if (kind == MachineConfig::MachineKind::bareMetal)
+      {
+        body.assign("{\"baremetal_ids\":["_ctv);
+      }
+      else
+      {
+        body.assign("{\"instance_ids\":["_ctv);
+      }
+      prodigyAppendEscapedJSONStringLiteral(body, cloudID);
+      body.append("]}"_ctv);
+      // Use Vultr's batch endpoint even for one machine.  Its explicit JSON
+      // body keeps the asynchronous HTTP transport from treating a bodyless
+      // POST as an upload whose end-of-stream was never framed.
+      MultiCurlClient::Request request =
+          client.request(MultiCurlClient::Method::post, url, &body);
+      MultiCurlClient::Result result = co_await client.send(coro, std::move(request));
       if (VultrHttpTransport::succeeded(result) == false)
       {
-        failure.assign("vultr reboot request failed"_ctv);
+        failure.snprintf<"vultr reboot request failed transport={itoa} http={itoa}"_ctv>(
+            uint32_t(result.status), uint32_t(result.statusCode));
       }
       co_return;
     }

@@ -904,6 +904,10 @@ class ProdigyBrain : public Brain {
   std::shared_ptr<Vector<PersistenceCompletion>> admittedAuthoritativeTopologyWaiters = {};
   RuntimeAwareBrainIaaS *runtimeAwareIaaS = nullptr;
   bool runtimePersistenceStarted = false;
+  // Fire-and-forget ordinary snapshots may be superseded while ArtifactIO is
+  // full. Keep one retry request; its eventual submission rebuilds the latest
+  // runtime state instead of retaining every rejected snapshot.
+  bool ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
   struct ExecPersistenceState { bool prepared = false, durable = false, closed = false; String failure; };
   std::shared_ptr<ExecPersistenceState> execPersistence = std::make_shared<ExecPersistenceState>();
 
@@ -1553,7 +1557,24 @@ public:
                    "ProdigyBrain snapshot persistence rejected: writer did not admit request admission=%s retainedBytes=%llu\n",
                    prodigyArtifactIOAdmissionName(admission), static_cast<unsigned long long>(retainedBytes));
       std::fflush(stderr);
-      if (*callback) (*callback)(false);
+      if (*callback)
+      {
+        (*callback)(false);
+      }
+      else if ((admission == ProdigyArtifactIO::Admission::jobCapacity ||
+                admission == ProdigyArtifactIO::Admission::byteCapacity) &&
+               !ordinaryRuntimeSnapshotBackpressureRetryQueued)
+      {
+        ordinaryRuntimeSnapshotBackpressureRetryQueued = true;
+        if (!deferPersistenceBackpressureContinuation([this, lifetime] {
+              if (lifetime.expired()) return;
+              ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
+              persistLocalRuntimeStateAsync();
+            }))
+        {
+          ordinaryRuntimeSnapshotBackpressureRetryQueued = false;
+        }
+      }
     }
   }
 

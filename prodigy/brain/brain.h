@@ -16948,9 +16948,29 @@ public:
     const uint64_t generation = candidate ? candidate->authorityElectionGeneration : localGeneration;
     const String& digest = candidate ? candidate->authorityElectionDigest : localDigest;
     const uint128_t uuid = candidate ? candidate->uuid : selfBrainUUID();
+    // Preserve the existing newer-generation recovery rule. Only an actual
+    // same-generation digest split needs an exact-revision quorum: a strict
+    // majority is unique, so it admits a 2:1 survivor group without permitting
+    // a two-node split.
+    bool sameGenerationDigestConflict =
+        localGeneration == generation && !localDigest.equals(digest);
+    uint32_t matchingVoters =
+        (localGeneration == generation && localDigest.equals(digest)) ? 1u : 0u;
+    for (BrainView *peer : brains)
+    {
+      if (!peerEligibleForClusterQuorum(peer) || !peerSocketActive(peer) ||
+          !internalBrainLifecycleStreamAuthorized(peer) ||
+          !internalControlStreamCredentialCurrent(peer, ProdigyTransportCredentialNodeRole::brain)) continue;
+      if (peer->authorityElectionGeneration != generation) continue;
+      if (peer->authorityElectionDigest.equals(digest)) ++matchingVoters;
+      else sameGenerationDigestConflict = true;
+    }
+    if (sameGenerationDigestConflict && matchingVoters <= nBrains / 2) return false;
     preferred = true;
     auto compare = [&](uint64_t otherGeneration, const String& otherDigest, uint128_t otherUUID) {
-      if (otherGeneration == generation && !otherDigest.equals(digest)) return false;
+      // The qualified revision group above settles equal-generation splits;
+      // UUID ordering remains a tie-break only within that exact revision.
+      if (otherGeneration == generation && !otherDigest.equals(digest)) return true;
       if (otherGeneration > generation ||
           (breakUUIDTies && otherGeneration == generation && otherUUID < uuid)) preferred = false;
       return true;
@@ -25211,8 +25231,10 @@ public:
         rack->machines.insert(machine);
       };
 
-      canonical->isBrain = candidate->isBrain;
-      canonical->isThisMachine = candidate->isThisMachine;
+      // The authoritative topology owns cluster roles. Provider inventory
+      // snapshots describe backing-machine state and may omit both flags, so a
+      // sparse refresh must not erase an already established Brain or local
+      // machine identity.
       if (candidate->private4 != 0)
       {
         canonical->private4 = candidate->private4;
@@ -27104,8 +27126,7 @@ public:
         {
           // If a live quorum reports us as master, keep ownership.
           basics_log("deriveMasterBrain elect-self reason=consistent-existing-master\n");
-          selfElectAsMaster("deriveMasterBrain:consistent-existing-master");
-          adoptedExistingMaster = true;
+          adoptedExistingMaster = selfElectAsMaster("deriveMasterBrain:consistent-existing-master");
         }
         else
         {

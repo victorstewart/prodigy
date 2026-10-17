@@ -32777,6 +32777,7 @@ static void testMothershipHandlerReplaysReadyLocalHardwareProfile(TestSuite& sui
 
 static void testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(TestSuite& suite)
 {
+  ScopedRing scopedRing = {};
   ResumableAddMachinesBrain brain = {};
   AutoProvisionBrainIaaS iaas = {};
   brain.iaas = &iaas;
@@ -32816,8 +32817,9 @@ static void testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(TestSuit
 
   Machine *bootstrapSnapshot = new Machine();
   bootstrapSnapshot->uuid = neuron.uuid;
-  bootstrapSnapshot->isBrain = true;
-  bootstrapSnapshot->isThisMachine = true;
+  // Provider inventory owns backing-machine state, not topology roles. Keep
+  // these sparse to prove reconciliation does not demote the canonical Brain
+  // or lose the local-machine identity.
   bootstrapSnapshot->private4 = IPAddress("10.0.0.10", false).v4;
   bootstrapSnapshot->privateAddress = "10.0.0.10"_ctv;
   bootstrapSnapshot->slug = "bootstrap"_ctv;
@@ -32833,6 +32835,8 @@ static void testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(TestSuit
   suite.expect(machine != nullptr, "brain_get_machines_preserves_topology_schema_machine_present");
   if (machine != nullptr)
   {
+    suite.expect(machine->isBrain, "brain_get_machines_preserves_topology_brain_role");
+    suite.expect(machine->isThisMachine, "brain_get_machines_preserves_topology_local_identity");
     suite.expect(machine->slug.equals("dev-baremetal"_ctv), "brain_get_machines_preserves_topology_schema");
     suite.expect(machine->lifetime == MachineLifetime::reserved, "brain_get_machines_preserves_topology_lifetime");
     suite.expect(machine->totalLogicalCores == 6, "brain_get_machines_applies_preserved_schema_total_cores");
@@ -32843,14 +32847,16 @@ static void testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(TestSuit
     suite.expect(machine->ownedStorageMB == 61'440, "brain_get_machines_applies_preserved_schema_owned_storage");
   }
 
+  // getMachines() takes ownership of provider snapshots and destroys this
+  // duplicate after reconciling it into the topology-owned Machine.
   iaas.inventorySnapshots.clear();
-  delete bootstrapSnapshot;
   thisBrain = previousBrain;
   thisNeuron = previousNeuron;
 }
 
 static void testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot(TestSuite& suite)
 {
+  ScopedRing scopedRing = {};
   ResumableAddMachinesBrain brain = {};
   AutoProvisionBrainIaaS iaas = {};
   brain.iaas = &iaas;
@@ -32907,8 +32913,8 @@ static void testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot
     suite.expect(configuredAddressText.equals("fd00:88::13"_ctv), "brain_get_machines_preserves_ipv6_neuron_endpoint_address");
   }
 
+  // The sparse provider snapshot is likewise consumed by reconciliation.
   iaas.inventorySnapshots.clear();
-  delete sparseSnapshot;
   thisBrain = previousBrain;
   thisNeuron = previousNeuron;
 }
@@ -34810,6 +34816,76 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         "authority_election_cannot_adopt_older_claimed_master");
     freshOwner.brains.clear();
     self.uuid = selfUUID;
+  }
+
+  {
+    // A strict quorum may recover a same-generation digest split; the lone
+    // divergent voter cannot veto the exact durable revision held by two nodes.
+    ScopedRing electionRing;
+    TransportCredentialDeliveryTestBrain majority;
+    configureAuthority(majority, 14, 191);
+    majority.weAreMaster = false;
+    majority.noMasterYet = true;
+    majority.hasCompletedInitialMasterElection = true;
+    majority.nBrains = 3;
+    majority.boottimens = 10;
+    BrainView matchingPeer, conflictingPeer;
+    suite.require(authenticatePeer(majority, matchingPeer, peerAUUID) &&
+        authenticatePeer(majority, conflictingPeer, peerBUUID),
+        "authority_election_same_generation_split_authenticates_all_voters");
+    matchingPeer.version = conflictingPeer.version = ProdigyBinaryVersion;
+    String capability;
+    majority.brainHandler(&matchingPeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    capability.clear();
+    majority.brainHandler(&conflictingPeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    bool preferred = false;
+    suite.expect(!majority.resolveFailoverMasterByActivePeerAddressOrder(preferred),
+        "authority_election_same_generation_split_waits_for_all_frontiers");
+    String serialized, majorityDigest;
+    const String conflictingDigest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"_ctv;
+    suite.require(majority.serializeCurrentMasterAuthorityTransition(serialized, majorityDigest) &&
+        majority.acceptAuthorityElectionFrontier(&matchingPeer, matchingPeer.authorityElectionRequestNonce,
+            14, majorityDigest) &&
+        majority.acceptAuthorityElectionFrontier(&conflictingPeer, conflictingPeer.authorityElectionRequestNonce,
+            14, conflictingDigest),
+        "authority_election_same_generation_split_records_authenticated_frontiers");
+    suite.expect(majority.resolveFailoverMasterByActivePeerAddressOrder(preferred) && preferred,
+        "authority_election_same_generation_quorum_digest_can_elect");
+    suite.expect(majority.resolveAuthorityElectionFrontier(preferred, false, &matchingPeer) && preferred,
+        "authority_election_same_generation_quorum_digest_can_adopt_matching_peer");
+    suite.expect(!majority.resolveAuthorityElectionFrontier(preferred, false, &conflictingPeer),
+        "authority_election_same_generation_minority_digest_cannot_adopt");
+    majority.brains.clear();
+  }
+
+  {
+    ScopedRing electionRing;
+    TransportCredentialDeliveryTestBrain split;
+    configureAuthority(split, 14, 191);
+    split.weAreMaster = false;
+    split.noMasterYet = true;
+    split.hasCompletedInitialMasterElection = true;
+    split.nBrains = 2;
+    split.boottimens = 10;
+    BrainView conflictingPeer;
+    suite.require(authenticatePeer(split, conflictingPeer, peerAUUID),
+        "authority_election_two_node_split_authenticates_peer");
+    conflictingPeer.version = ProdigyBinaryVersion;
+    String capability;
+    split.brainHandler(&conflictingPeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    bool preferred = true;
+    suite.expect(!split.resolveFailoverMasterByActivePeerAddressOrder(preferred),
+        "authority_election_two_node_split_waits_for_frontier");
+    const String conflictingDigest = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"_ctv;
+    suite.require(split.acceptAuthorityElectionFrontier(&conflictingPeer,
+        conflictingPeer.authorityElectionRequestNonce, 14, conflictingDigest),
+        "authority_election_two_node_split_records_authenticated_conflict");
+    suite.expect(!split.resolveFailoverMasterByActivePeerAddressOrder(preferred),
+        "authority_election_two_node_conflicting_digests_remain_rejected");
+    split.brains.clear();
   }
 
   {
@@ -37817,6 +37893,14 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
 
 int main(void)
 {
+  if (const char *only = getenv("PRODIGY_TEST_ONLY");
+      only && strcmp(only, "machine-inventory-topology-reconciliation") == 0)
+  {
+    TestSuite suite;
+    testGetMachinesPreservesTopologySchemaOverBootstrapSnapshot(suite);
+    testGetMachinesPreservesTopologyIPv6ControlAddressOverSparseSnapshot(suite);
+    return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   if (getenv("PRODIGY_TEST_STATEFUL_SERVING_AUTHORITY_ONLY") != nullptr)
   {
     TestSuite suite;
