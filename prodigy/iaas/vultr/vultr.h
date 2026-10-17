@@ -75,6 +75,16 @@ static inline uint32_t vultrExtractRackUUID(simdjson::dom::element dev)
     }
   }
 
+  std::string_view id = {};
+  (void)dev["id"].get(id);
+  if (id.size() > 0)
+  {
+    // Vultr's public instance shape commonly omits physical placement.  Keep
+    // distinct VMs as distinct logical failure domains instead of collapsing
+    // every same-plan VM in a region into one fictitious rack.
+    return vultrHashRackIdentity(id);
+  }
+
   std::string_view region = {};
   std::string_view plan = {};
   (void)dev["region"].get(region);
@@ -84,13 +94,6 @@ static inline uint32_t vultrExtractRackUUID(simdjson::dom::element dev)
     String combo = {};
     combo.snprintf<"{}/{}"_ctv>(String(region), String(plan));
     return vultrHashRackIdentity(std::string_view(combo.c_str(), combo.size()));
-  }
-
-  std::string_view id = {};
-  (void)dev["id"].get(id);
-  if (id.size() > 0)
-  {
-    return vultrHashRackIdentity(id);
   }
 
   return Random::generateNumberWithNBits<32, uint32_t>();

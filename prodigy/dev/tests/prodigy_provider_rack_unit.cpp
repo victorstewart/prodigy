@@ -541,7 +541,7 @@ int main(void)
   {
     simdjson::dom::parser parser;
     simdjson::dom::element doc = {};
-    String json = "{\"id\":\"abc123\",\"region\":\"ewr\",\"plan\":\"vc2-2c-4gb\"}"_ctv;
+    String json = "{\"region\":\"ewr\",\"plan\":\"vc2-2c-4gb\"}"_ctv;
     bool parsed = parseJSON(json, parser, doc);
     suite.expect(parsed, "vultr_region_plan_fallback_json_parses");
 
@@ -550,6 +550,24 @@ int main(void)
       String combo = {};
       combo.snprintf<"{}/{}"_ctv>("ewr"_ctv, "vc2-2c-4gb"_ctv);
       suite.expect(vultrExtractRackUUID(doc) == vultrHashRackIdentity(std::string_view(combo.c_str(), combo.size())), "vultr_rack_uuid_falls_back_to_region_plan");
+    }
+  }
+
+  {
+    simdjson::dom::parser firstParser;
+    simdjson::dom::element first = {};
+    simdjson::dom::parser secondParser;
+    simdjson::dom::element second = {};
+    String firstJSON = "{\"id\":\"instance-a\",\"region\":\"ewr\",\"plan\":\"vc2-2c-4gb\"}"_ctv;
+    String secondJSON = "{\"id\":\"instance-b\",\"region\":\"ewr\",\"plan\":\"vc2-2c-4gb\"}"_ctv;
+    bool firstParsed = parseJSON(firstJSON, firstParser, first);
+    bool secondParsed = parseJSON(secondJSON, secondParser, second);
+    suite.expect(firstParsed && secondParsed, "vultr_instance_rack_fallback_json_parses");
+
+    if (firstParsed && secondParsed)
+    {
+      suite.expect(vultrExtractRackUUID(first) == vultrHashRackIdentity("instance-a"), "vultr_rack_uuid_falls_back_to_instance_id");
+      suite.expect(vultrExtractRackUUID(first) != vultrExtractRackUUID(second), "vultr_instance_rack_fallback_distinguishes_same_plan_instances");
     }
   }
 
