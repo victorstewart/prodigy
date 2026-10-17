@@ -3041,6 +3041,87 @@ static void exerciseBalancerOwnedRoutableMissPassesToKernel(TestSuite& suite)
   balancerProgram.close();
 }
 
+static void exerciseBalancerLocalIPv6PortalPassesUnchangedToHostIngress(TestSuite& suite)
+{
+  const char *label = "switchboard_balancer_local_ipv6_tcp_portal_passes_unchanged";
+  auto expectNamed = [&](bool condition, const char *suffix) -> void {
+    char name[256] = {};
+    std::snprintf(name, sizeof(name), "%s_%s", label, suffix);
+    suite.expect(condition, name);
+  };
+
+  String balancerObjectPath = {};
+  balancerObjectPath.assign(PRODIGY_TEST_BINARY_DIR);
+  balancerObjectPath.append("/balancer.ebpf.o"_ctv);
+
+  BPFProgram balancerProgram = {};
+  expectNamed(balancerProgram.load(balancerObjectPath, "bal_ingress"_ctv), "loads_program");
+  if (balancerProgram.prog_fd < 0)
+  {
+    return;
+  }
+
+  local_container_subnet6 localSubnet = {};
+  localSubnet.dpfx = 0x01;
+  localSubnet.mpfx[0] = 0xf0;
+  localSubnet.mpfx[1] = 0xc8;
+  localSubnet.mpfx[2] = 0x18;
+  balancerProgram.setArrayElement("lc_subnet"_ctv, 0, localSubnet);
+
+  uint8_t external6[16] = {};
+  uint8_t client6[16] = {};
+  expectNamed(inet_pton(AF_INET6, "2602:fac0::1", external6) == 1, "parses_external");
+  expectNamed(inet_pton(AF_INET6, "2001:db8:200::99", client6) == 1, "parses_client");
+
+  switchboard_owned_routable_prefix6_key ownedKey = {};
+  ownedKey.prefixlen = 40;
+  std::memcpy(ownedKey.addr, external6, sizeof(ownedKey.addr));
+  __u8 present = 1;
+  expectNamed(updateProgramMapElement(balancerProgram, "owned_pfx6"_ctv, ownedKey, present),
+              "sets_owned_external_prefix");
+
+  portal_definition portal = {};
+  std::memcpy(portal.addr6, external6, sizeof(portal.addr6));
+  portal.port = htons(443);
+  portal.proto = IPPROTO_TCP;
+  portal_meta meta = {};
+  meta.slot = 31;
+  expectNamed(updateProgramMapElement(balancerProgram, "ext_portals"_ctv, portal, meta),
+              "installs_external_portal");
+
+  uint8_t localContainerID[5] = {localSubnet.dpfx,
+                                 localSubnet.mpfx[0],
+                                 localSubnet.mpfx[1],
+                                 localSubnet.mpfx[2],
+                                 0x20};
+  expectNamed(installSingleContainerPortalRing(balancerProgram, meta.slot, localContainerID),
+              "installs_local_target_ring");
+  switchboard_wormhole_target_key targetKey = {};
+  targetKey.slot = meta.slot;
+  std::memcpy(targetKey.container, localContainerID, sizeof(targetKey.container));
+  __be16 targetPort = htons(2888);
+  expectNamed(updateProgramMapElement(balancerProgram, "wh_targets"_ctv, targetKey, targetPort),
+              "installs_selected_target_binding");
+
+  std::vector<uint8_t> frame = makeIPv6L4EthernetFrame(client6, external6, IPPROTO_TCP, 49'152, 443);
+  std::vector<uint8_t> output(frame.size() + 128u);
+  LIBBPF_OPTS(bpf_test_run_opts, opts,
+              .data_in = frame.data(),
+              .data_out = output.data(),
+              .data_size_in = static_cast<__u32>(frame.size()),
+              .data_size_out = static_cast<__u32>(output.size()),
+              .repeat = 1, );
+
+  int runResult = bpf_prog_test_run_opts(balancerProgram.prog_fd, &opts);
+  expectNamed(runResult == 0, "test_run_succeeds");
+  expectNamed(opts.retval == XDP_PASS, "returns_xdp_pass");
+  expectNamed(opts.data_size_out == frame.size(), "preserves_frame_size");
+  expectNamed(opts.data_size_out == frame.size() && std::memcmp(output.data(), frame.data(), frame.size()) == 0,
+              "preserves_frame_bytes_for_host_ingress");
+
+  balancerProgram.close();
+}
+
 static void verifyWhiteholeBindingValue(TestSuite& suite)
 {
   Whitehole whitehole = {};
@@ -3730,6 +3811,7 @@ int main(int argc, char **argv)
   exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_UDP, false);
   exerciseHostIngressRemotePortalRoute(suite, true, IPPROTO_TCP, true);
   exerciseBalancerOwnedRoutableMissPassesToKernel(suite);
+  exerciseBalancerLocalIPv6PortalPassesUnchangedToHostIngress(suite);
   exerciseBalancerRemotePortalRoutesWithOverlay(suite);
   exerciseWormholeSharedFlowOwnership(suite);
   exerciseWormholeTCPPromotionMapFull(suite);

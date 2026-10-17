@@ -384,11 +384,10 @@ __attribute__((__always_inline__)) static inline int process_packet(struct xdp_m
 
     if (localDelivery)
     {
-      if (portal_meta != NULL &&
-          encap_wormhole_v6(xdp, true, localcontainersubnet6, &containerID, packet_len, is_ipv6) == false)
-      {
-        return XDP_DROP;
-      }
+      // Keep same-machine public ingress unchanged for host TC.  XDP metadata
+      // is not guaranteed to survive native-driver XDP_PASS conversion into
+      // an skb, while host_ingress already owns the local portal selection,
+      // flow learning, tuple rewrite, and container redirect.
       return XDP_PASS;
     }
 
