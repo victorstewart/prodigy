@@ -263,8 +263,19 @@ int main(void)
                    prodigyBGPIPv6ReadinessRetryDelayMs(2) == 4'000 &&
                    prodigyBGPIPv6ReadinessRetryDelayMs(3) == 8'000 &&
                    prodigyBGPIPv6ReadinessRetryDelayMs(4) == 16'000 &&
-                   prodigyBGPIPv6ReadinessRetryDelayMs(5) == 32'000,
-               "bgp_ipv6_readiness_retry_backoff_covers_first_63_seconds");
+                   prodigyBGPIPv6ReadinessRetryDelayMs(5) == 32'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(6) == 60'000 &&
+                   prodigyBGPIPv6ReadinessRetryDelayMs(
+                       prodigyBGPIPv6ReadinessRetryMaximumAttempts - 1) == 60'000,
+               "bgp_ipv6_readiness_retry_backoff_caps_at_one_minute");
+  uint32_t bgpIPv6ReadinessRetryTotalDelayMs = 0;
+  for (uint32_t attempt = 0;
+       attempt < prodigyBGPIPv6ReadinessRetryMaximumAttempts; attempt += 1)
+  {
+    bgpIPv6ReadinessRetryTotalDelayMs += prodigyBGPIPv6ReadinessRetryDelayMs(attempt);
+  }
+  suite.expect(bgpIPv6ReadinessRetryTotalDelayMs == 603'000,
+               "bgp_ipv6_readiness_retry_covers_ten_minute_provider_window");
   suite.expect(prodigyBGPIPv6ReadinessRetryEligible(
                    true, rejectedVultr,
                    NeuronBGPConfigurationRetry::waitForPublicIPv6,
