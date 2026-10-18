@@ -1300,6 +1300,10 @@ private:
   Machine *buildMachineFromVultr(simdjson::dom::element dev, MachineConfig::MachineKind kind)
   {
     Machine *m = new Machine();
+    // Vultr currently has no spot/preemptible instance class.  Provider
+    // inventory snapshots are merged into the topology-owned Machine and must
+    // carry a deterministic lifetime instead of the enum's zero value (spot).
+    m->lifetime = MachineLifetime::ondemand;
     std::string_view id;
     (void)dev["id"].get(id);
     m->cloudID.assign(id);

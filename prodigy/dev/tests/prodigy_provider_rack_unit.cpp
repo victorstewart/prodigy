@@ -315,16 +315,21 @@ int main(void)
                   R"json({"instances":[{"id":"instance-with-vpc","main_ip":"45.76.166.5","v6_main_ip":"2001:19f0:6001:48e4:5400:06ff:fe05:9ea6","internal_ip":"10.1.96.3","region":"ewr","tags":["prodigy"]}]})json"_ctv);
     http.complete(MultiCurlClient::Status::success, 500);
     bool privateFirst = false;
+    bool ondemandLifetime = false;
     for (Machine *machine : machines)
     {
       privateFirst = machine->peerAddresses.size() == 2 &&
           machine->peerAddresses[0].address == "10.1.96.3"_ctv &&
           machine->peerAddresses[1].address == "2001:19f0:6001:48e4:5400:6ff:fe05:9ea6"_ctv;
+      ondemandLifetime = machine->lifetime == MachineLifetime::ondemand;
       delete machine;
     }
     suite.expect(!stack.hasSuspendedCoroutines() && failure.empty() &&
                      machines.size() == 1 && privateFirst,
                  "vultr_machine_inventory_prefers_internal_ipv4_when_vpc_lookup_fails");
+    suite.expect(!stack.hasSuspendedCoroutines() && failure.empty() &&
+                     machines.size() == 1 && ondemandLifetime,
+                 "vultr_machine_inventory_sets_ondemand_lifetime");
   }
 
   {
