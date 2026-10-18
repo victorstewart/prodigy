@@ -577,6 +577,31 @@ static inline bool mothershipLocalMembershipCleanupIntentEqual(
   return leftBytes == rightBytes;
 }
 
+static inline bool mothershipApplicationPlacementRequired(uint16_t applicationID)
+{ return applicationID == 2 || applicationID == 5 || applicationID == 10; }
+
+class MothershipApplicationPlacement {
+public:
+  enum class Policy : uint8_t { hardSingleton = 1, retainedSource = 2 };
+  uint32_t version = 1;
+  uint16_t applicationID = 10;
+  uint128_t ownerClusterUUID = 0;
+  uint64_t generation = 1;
+  String observationReceiptSHA256;
+  Policy policy = Policy::hardSingleton;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipApplicationPlacement& placement)
+{
+  serializer.value4b(placement.version);
+  serializer.value2b(placement.applicationID);
+  serializer.value16b(placement.ownerClusterUUID);
+  serializer.value8b(placement.generation);
+  serializer.text1b(placement.observationReceiptSHA256, 64);
+  serializer.value1b(placement.policy);
+}
+
 class MothershipClusterRegistry {
 private:
 
@@ -590,6 +615,7 @@ private:
   constexpr static auto cousinRouteReceiptsColumnFamily = "cousin_route_receipts"_ctv;
   constexpr static auto clusterPairEnrollmentsColumnFamily = "cluster_pair_enrollments"_ctv;
   constexpr static auto productionPairsColumnFamily = "production_pairs"_ctv;
+  constexpr static auto applicationPlacementsColumnFamily = "application_placements"_ctv;
   constexpr static auto physicalTransitBoundariesColumnFamily = "physical_transit_boundaries"_ctv;
   constexpr static auto physicalNetworkFaultsColumnFamily = "physical_network_faults"_ctv;
   constexpr static auto localVMBoundariesColumnFamily = "local_vm_boundaries"_ctv;
@@ -4019,6 +4045,72 @@ public:
     return true;
   }
 
+  bool loadApplicationPlacement(uint16_t applicationID, MothershipApplicationPlacement& placement, String *failure = nullptr)
+  {
+    placement = {};
+    String encoded, key;
+    key.assignItoa(applicationID);
+    if (!db.read(applicationPlacementsColumnFamily, key, encoded, failure)) return false;
+    if (!BitseryEngine::deserializeSafe(encoded, placement) || placement.version != 1 ||
+        placement.applicationID != applicationID || !mothershipApplicationPlacementRequired(applicationID) ||
+        placement.ownerClusterUUID == 0 || placement.generation == 0 ||
+        placement.policy != (applicationID == 10 ? MothershipApplicationPlacement::Policy::hardSingleton : MothershipApplicationPlacement::Policy::retainedSource) ||
+        !prodigyIsSHA256HexDigest(placement.observationReceiptSHA256)) {
+      placement = {};
+      if (failure) failure->assign("Truth singleton placement is corrupt"_ctv);
+      return false;
+    }
+    return true;
+  }
+
+  // Mothership supplies a fresh complete registered-cluster observation before
+  // first admission. No absence, deploy UUID or completed migration removes
+  // this ownership. A future reassignment needs its own fenced transfer.
+  bool admitApplicationPlacement(uint16_t applicationID, uint128_t clusterUUID, const String& observationReceiptSHA256,
+      MothershipApplicationPlacement& placement, bool& resumed, String *failure = nullptr)
+  {
+    resumed = false;
+    if (!mothershipApplicationPlacementRequired(applicationID) ||
+        clusterUUID == 0 || !prodigyIsSHA256HexDigest(observationReceiptSHA256)) return false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure)) return false;
+    String readFailure;
+    if (loadApplicationPlacement(applicationID, placement, &readFailure)) {
+      if (placement.ownerClusterUUID != clusterUUID) {
+        if (failure) failure->assign("Truth may be admitted only on its durable owner cluster"_ctv);
+        return false;
+      }
+      resumed = true;
+      return true;
+    }
+    if (readFailure != "record not found"_ctv) { if (failure) *failure = readFailure; return false; }
+    placement = {};
+    placement.applicationID = applicationID;
+    placement.policy = applicationID == 10 ? MothershipApplicationPlacement::Policy::hardSingleton : MothershipApplicationPlacement::Policy::retainedSource;
+    placement.ownerClusterUUID = clusterUUID;
+    placement.observationReceiptSHA256 = observationReceiptSHA256;
+    String encoded, key;
+    key.assignItoa(applicationID);
+    BitseryEngine::serialize(encoded, placement);
+    return db.write(applicationPlacementsColumnFamily, key, encoded, failure);
+  }
+
+  bool loadTruthPlacement(MothershipApplicationPlacement& placement, String *failure = nullptr)
+  { return loadApplicationPlacement(10, placement, failure); }
+
+  bool admitApplicationPlacement(const DeploymentPlan& plan, uint128_t clusterUUID, const String& receipt,
+      MothershipApplicationPlacement& placement, bool& resumed, String *failure = nullptr)
+  {
+    // Application identity, not a caller's stateless/stateful declaration,
+    // selects the retained-placement policy on every admission transport.
+    if (!mothershipApplicationPlacementRequired(plan.config.applicationID)) { placement = {}; resumed = false; return true; }
+    return admitApplicationPlacement(plan.config.applicationID, clusterUUID, receipt, placement, resumed, failure);
+  }
+
+  bool admitTruthPlacement(uint128_t clusterUUID, const String& receipt,
+      MothershipApplicationPlacement& placement, bool& resumed, String *failure = nullptr)
+  { return admitApplicationPlacement(10, clusterUUID, receipt, placement, resumed, failure); }
+
   bool loadProductionPair(uint128_t operationUUID, MothershipProductionPairRecord& record,
                           String *failure = nullptr)
   {
@@ -4088,6 +4180,8 @@ public:
 
     Vector<String> values = {};
     if (!db.listValues(productionPairsColumnFamily, values, failure)) return false;
+    MothershipProductionPairRecord latestStateful;
+    bool hasStatefulHistory = false;
     for (const auto& value : values)
     {
       MothershipProductionPairRecord prior = {};
@@ -4098,6 +4192,10 @@ public:
       }
       if (!mothershipProductionPairTerminal(prior.phase) &&
           (prior.intent.route.routeUUID == intent.route.routeUUID ||
+           ((prior.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion ||
+             intent.protocolVersion == MothershipProductionPairIntent::statefulVersion) &&
+            prior.intent.sourceWorkload.applicationID == intent.sourceWorkload.applicationID &&
+            prior.intent.stateful.shardGroup == intent.stateful.shardGroup) ||
            (prior.intent.route.sourceClusterUUID == intent.route.sourceClusterUUID &&
             prior.intent.route.destinationClusterUUID == intent.route.destinationClusterUUID &&
             prior.intent.route.logicalWorkloadUUID == intent.route.logicalWorkloadUUID)))
@@ -4105,6 +4203,41 @@ public:
         if (failure) failure->assign("production pair route or workload scope already has an open coordinator"_ctv);
         return false;
       }
+      if (prior.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion &&
+          prior.intent.sourceWorkload.applicationID == intent.sourceWorkload.applicationID &&
+          prior.intent.stateful.shardGroup == intent.stateful.shardGroup &&
+          (prior.phase == MothershipProductionPairPhase::cleanupComplete ||
+           prior.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence) &&
+          (!hasStatefulHistory ||
+           (prior.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence ? prior.intent.stateful.sourceRetainedEpoch : prior.intent.stateful.targetOwnershipEpoch) >
+           (latestStateful.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence ? latestStateful.intent.stateful.sourceRetainedEpoch : latestStateful.intent.stateful.targetOwnershipEpoch)))
+      {
+        latestStateful = prior;
+        hasStatefulHistory = true;
+      }
+    }
+    const bool priorAborted = hasStatefulHistory && latestStateful.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence;
+    if (hasStatefulHistory &&
+        (intent.protocolVersion != MothershipProductionPairIntent::statefulVersion ||
+         intent.stateful.previousOperationUUID != latestStateful.intent.operationUUID ||
+         intent.stateful.previousAuthorityEpoch != (priorAborted ? latestStateful.intent.stateful.sourceRetainedEpoch : latestStateful.intent.stateful.targetOwnershipEpoch) ||
+         intent.route.sourceClusterUUID != (priorAborted ? latestStateful.intent.route.sourceClusterUUID : latestStateful.intent.route.destinationClusterUUID) ||
+         intent.route.destinationClusterUUID != (priorAborted ? latestStateful.intent.route.destinationClusterUUID : latestStateful.intent.route.sourceClusterUUID) ||
+         intent.stateful.datasetUUID != latestStateful.intent.stateful.datasetUUID ||
+         intent.stateful.contractSHA256 != latestStateful.intent.stateful.contractSHA256 ||
+         intent.stateful.shardManifestSHA256 != latestStateful.intent.stateful.shardManifestSHA256 ||
+         intent.stateful.sourceFenceEpoch < latestStateful.intent.stateful.targetOwnershipEpoch ||
+         intent.stateful.targetOwnershipEpoch <= latestStateful.intent.stateful.targetOwnershipEpoch ||
+         intent.stateful.sourceDurableWatermark < latestStateful.intent.stateful.sourceDurableWatermark))
+    {
+      if (failure) failure->assign("stateful ownership transfer requires the latest owner, exact reverse lineage, newer epochs and no watermark regression"_ctv);
+      return false;
+    }
+    if (!hasStatefulHistory && intent.protocolVersion == MothershipProductionPairIntent::statefulVersion &&
+        intent.stateful.previousOperationUUID != 0)
+    {
+      if (failure) failure->assign("stateful pair predecessor is absent from durable ownership history"_ctv);
+      return false;
     }
 
     if (!mothershipProductionPairBegin(intent, nowMs, recorded, failure)) return false;
@@ -4113,6 +4246,73 @@ public:
     if (!db.write(productionPairsColumnFamily, key, encoded, failure)) { recorded = {}; return false; }
     if (failure) failure->clear();
     return true;
+  }
+
+  bool prepareProductionPairStatefulCommand(uint128_t operationUUID, MothershipProductionPairPhase phase,
+      int64_t nowMs, MothershipProductionPairRecord& record, String *failure = nullptr)
+  {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, record, failure)) return false;
+    StatefulDataAuthorityOperation command;
+    if (!mothershipProductionPairStatefulCommand(record, phase, command) ||
+        mothershipProductionPairPhaseOrder(record.intent, phase) != mothershipProductionPairPhaseOrder(record.intent, record.phase) + 1 ||
+        (record.hasPendingStatefulCommand && record.pendingStatefulPhase != phase)) return false;
+    if (record.hasPendingStatefulCommand) return true;
+    record.hasPendingStatefulCommand = true; record.pendingStatefulPhase = phase;
+    record.transitionedAtMs = nowMs; ++record.transitionGeneration;
+    String key, encoded; key.assignItoh(operationUUID); BitseryEngine::serialize(encoded, record);
+    return mothershipProductionPairRecordValid(record, failure) && db.write(productionPairsColumnFamily, key, encoded, failure);
+  }
+
+  bool applyProductionPairStatefulReceipt(uint128_t operationUUID,
+      const MothershipProductionStatefulReceipt& proof, int64_t nowMs,
+      MothershipProductionPairRecord& recorded, bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, recorded, failure)) return false;
+    auto updated = recorded;
+    if (!mothershipProductionPairApplyStatefulReceipt(updated, proof, nowMs, failure)) return false;
+    resumed = updated.transitionGeneration == recorded.transitionGeneration;
+    if (!resumed) {
+      String key, encoded;
+      key.assignItoh(operationUUID);
+      BitseryEngine::serialize(encoded, updated);
+      if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
+    }
+    recorded = std::move(updated);
+    return true;
+  }
+
+  bool abortProductionPairStatefulBeforeFence(uint128_t operationUUID, const String& receiptSHA256,
+      int64_t nowMs, bool completed, MothershipProductionPairRecord& record, String *failure = nullptr,
+      const MothershipProductionStatefulReceipt *cleanup = nullptr, const String *targetCompensation = nullptr)
+  {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, record, failure)) return false;
+    if (!mothershipProductionPairAbortStatefulBeforeFence(record, receiptSHA256, nowMs, completed, failure, cleanup, targetCompensation)) return false;
+    String key, encoded; key.assignItoh(operationUUID); BitseryEngine::serialize(encoded, record);
+    return db.write(productionPairsColumnFamily, key, encoded, failure);
+  }
+
+  bool observeProductionPairStatefulAbort(uint128_t operationUUID, const MothershipProductionStatefulReceipt& proof,
+      int64_t nowMs, MothershipProductionPairRecord& record, String *failure = nullptr)
+  {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, record, failure) ||
+        !mothershipProductionPairObserveStatefulAbort(record, proof, nowMs, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID); BitseryEngine::serialize(encoded, record);
+    return db.write(productionPairsColumnFamily, key, encoded, failure);
+  }
+
+  bool observeProductionPairStatefulTargetCompensation(uint128_t operationUUID, const String& receiptSHA256,
+      int64_t nowMs, MothershipProductionPairRecord& record, String *failure = nullptr)
+  {
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, record, failure) ||
+        !mothershipProductionPairObserveStatefulTargetCompensation(record, receiptSHA256, nowMs, failure)) return false;
+    String key, encoded; key.assignItoh(operationUUID); BitseryEngine::serialize(encoded, record);
+    return db.write(productionPairsColumnFamily, key, encoded, failure);
   }
 
   bool advanceProductionPair(uint128_t operationUUID, MothershipProductionPairPhase phase,
@@ -4249,6 +4449,7 @@ public:
     if (!lockG6Operations(lock, failure)) return false;
     MothershipProductionPairRecord pair = {};
     if (!loadProductionPair(requested.pairOperationUUID, pair, failure) ||
+        pair.intent.protocolVersion != MothershipProductionPairIntent::version ||
         pair.phase < MothershipProductionPairPhase::targetAdmitted ||
         pair.phase >= MothershipProductionPairPhase::cleanupComplete ||
         pair.intent.physicalBoundaryUUID != requested.boundaryUUID ||

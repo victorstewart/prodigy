@@ -16,6 +16,26 @@ constexpr static uint16_t mothershipPairControlBoundaryPort = 315;
 constexpr static uint32_t mothershipPairControlBoundaryMaximumEndpoints = 16;
 constexpr static uint32_t mothershipPairControlFaultMaximumDelayMilliseconds = 30000;
 constexpr static uint32_t mothershipPairControlFaultMaximumDurationMilliseconds = 60000;
+constexpr static uint32_t mothershipPairControlFaultMaximumLatencyMilliseconds = 30000;
+
+enum class MothershipPairControlFaultKind : uint8_t {
+  drop = 0,
+  delay = 1,
+  loss = 2,
+  reorder = 3,
+};
+
+static inline const char *mothershipPairControlFaultKindName(MothershipPairControlFaultKind kind)
+{
+  switch (kind)
+  {
+    case MothershipPairControlFaultKind::drop: return "drop";
+    case MothershipPairControlFaultKind::delay: return "delay";
+    case MothershipPairControlFaultKind::loss: return "loss";
+    case MothershipPairControlFaultKind::reorder: return "reorder";
+  }
+  return nullptr;
+}
 
 // A test-only fault is deliberately limited to the already admitted pair
 // carrier.  It carries no interface, namespace, route, or cluster selector.
@@ -67,23 +87,55 @@ static inline bool mothershipPairControlFaultDirectionParse(const String& text,
 
 class MothershipPairControlFault {
 public:
+  MothershipPairControlFaultKind kind = MothershipPairControlFaultKind::drop;
+  // Legacy delayMilliseconds is the onset, not netem packet latency.
   uint32_t delayMilliseconds = 0;
   uint32_t durationMilliseconds = 0;
   MothershipPairControlFaultDirection direction = MothershipPairControlFaultDirection::both;
+  uint32_t latencyMilliseconds = 0;
+  uint32_t percentageBasisPoints = 0;
+  uint32_t seed = 0;
 };
 
 static inline bool mothershipPairControlFaultValid(const MothershipPairControlFault& fault,
                                                    String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (mothershipPairControlFaultDirectionName(fault.direction) == nullptr ||
+  const bool drop = fault.kind == MothershipPairControlFaultKind::drop;
+  const bool latency = fault.kind == MothershipPairControlFaultKind::delay ||
+                       fault.kind == MothershipPairControlFaultKind::reorder;
+  const bool percentage = fault.kind == MothershipPairControlFaultKind::loss ||
+                          fault.kind == MothershipPairControlFaultKind::reorder;
+  if (mothershipPairControlFaultKindName(fault.kind) == nullptr ||
+      mothershipPairControlFaultDirectionName(fault.direction) == nullptr ||
       fault.delayMilliseconds > mothershipPairControlFaultMaximumDelayMilliseconds ||
       fault.durationMilliseconds == 0 ||
-      fault.durationMilliseconds > mothershipPairControlFaultMaximumDurationMilliseconds)
+      fault.durationMilliseconds > mothershipPairControlFaultMaximumDurationMilliseconds ||
+      (latency ? fault.latencyMilliseconds == 0 ||
+                 fault.latencyMilliseconds > mothershipPairControlFaultMaximumLatencyMilliseconds :
+                 fault.latencyMilliseconds != 0) ||
+      (percentage ? fault.percentageBasisPoints == 0 || fault.percentageBasisPoints > 10000 :
+                    fault.percentageBasisPoints != 0) ||
+      (drop ? fault.seed != 0 : fault.seed == 0))
   {
-    if (failure) failure->assign("pair-control fault direction, delay, or duration is outside the bounded test window");
+    if (failure) failure->assign(drop ?
+        "pair-control fault direction, delay, or duration is outside the bounded test window" :
+        "pair-control fault kind, direction, or parameters are outside the bounded test window");
     return false;
   }
+  return true;
+}
+
+static inline bool mothershipPairControlFaultUnsignedParse(const String& text, uint32_t& value)
+{
+  if (text.empty() || (text.size() > 1 && text[0] == '0')) return false;
+  uint64_t parsed = 0;
+  for (char byte : text)
+  {
+    if (byte < '0' || byte > '9' || parsed > (UINT32_MAX - uint64_t(byte - '0')) / 10) return false;
+    parsed = parsed * 10 + uint64_t(byte - '0');
+  }
+  value = uint32_t(parsed);
   return true;
 }
 
@@ -92,19 +144,9 @@ static inline bool mothershipPairControlFaultParse(const String& delayText, cons
                                                    MothershipPairControlFault& fault, String *failure = nullptr)
 {
   if (failure) failure->clear();
-  auto parse = [](const String& text, uint32_t& value) {
-    if (text.empty() || (text.size() > 1 && text[0] == '0')) return false;
-    uint64_t parsed = 0;
-    for (char byte : text)
-    {
-      if (byte < '0' || byte > '9' || parsed > (UINT32_MAX - uint64_t(byte - '0')) / 10) return false;
-      parsed = parsed * 10 + uint64_t(byte - '0');
-    }
-    value = uint32_t(parsed);
-    return true;
-  };
-  fault.direction = MothershipPairControlFaultDirection::both;
-  if (!parse(delayText, fault.delayMilliseconds) || !parse(durationText, fault.durationMilliseconds) ||
+  fault = {};
+  if (!mothershipPairControlFaultUnsignedParse(delayText, fault.delayMilliseconds) ||
+      !mothershipPairControlFaultUnsignedParse(durationText, fault.durationMilliseconds) ||
       (directionText != nullptr && !mothershipPairControlFaultDirectionParse(*directionText, fault.direction)) ||
       !mothershipPairControlFaultValid(fault, failure))
   {
@@ -118,6 +160,48 @@ static inline bool mothershipPairControlFaultParse(const String& delayText, cons
                                                    MothershipPairControlFault& fault, String *failure = nullptr)
 {
   return mothershipPairControlFaultParse(delayText, durationText, nullptr, fault, failure);
+}
+
+// Extended provider tuple: kind, onset, duration, latency, percentage-bps,
+// deterministic seed, direction. DROP deliberately retains only its old tuple.
+static inline bool mothershipPairControlFaultParse(
+    const String& kindText, const String& onsetText, const String& durationText,
+    const String& latencyText, const String& percentageText, const String& seedText,
+    const String& directionText, MothershipPairControlFault& fault, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  fault = {};
+  if (kindText == "delay"_ctv) fault.kind = MothershipPairControlFaultKind::delay;
+  else if (kindText == "loss"_ctv) fault.kind = MothershipPairControlFaultKind::loss;
+  else if (kindText == "reorder"_ctv) fault.kind = MothershipPairControlFaultKind::reorder;
+  else { if (failure) failure->assign("unsupported extended pair-control fault kind"); return false; }
+  if (!mothershipPairControlFaultUnsignedParse(onsetText, fault.delayMilliseconds) ||
+      !mothershipPairControlFaultUnsignedParse(durationText, fault.durationMilliseconds) ||
+      !mothershipPairControlFaultUnsignedParse(latencyText, fault.latencyMilliseconds) ||
+      !mothershipPairControlFaultUnsignedParse(percentageText, fault.percentageBasisPoints) ||
+      !mothershipPairControlFaultUnsignedParse(seedText, fault.seed) ||
+      !mothershipPairControlFaultDirectionParse(directionText, fault.direction) ||
+      !mothershipPairControlFaultValid(fault, failure))
+  {
+    if (failure && failure->empty()) failure->assign("extended pair-control fault tuple must be canonical and bounded");
+    return false;
+  }
+  return true;
+}
+
+static inline const char *mothershipPairControlFaultQdiscWitness(
+    MothershipPairControlFaultDirection direction, bool restored)
+{
+  switch (direction)
+  {
+    case MothershipPairControlFaultDirection::both:
+      return restored ? "second0:7d02:ABSENT,first0:7d01:ABSENT" : "second0:7d02:netem,first0:7d01:netem";
+    case MothershipPairControlFaultDirection::firstToSecond:
+      return restored ? "second0:7d02:ABSENT" : "second0:7d02:netem";
+    case MothershipPairControlFaultDirection::secondToFirst:
+      return restored ? "first0:7d01:ABSENT" : "first0:7d01:netem";
+  }
+  return nullptr;
 }
 
 // One operation-scoped, direct TCP flow is optional after the pair-control
@@ -520,6 +604,19 @@ static inline bool mothershipPairControlFaultArguments(
   if (!mothershipPairControlFaultValid(fault, failure) ||
       !mothershipPairControlBoundaryArguments(descriptor, "query"_ctv, arguments, failure)) return false;
   arguments[1] = "fault"_ctv;
+  if (fault.kind != MothershipPairControlFaultKind::drop)
+  {
+    String kind = {}; kind.assign(mothershipPairControlFaultKindName(fault.kind));
+    arguments.push_back(std::move(kind));
+    for (const uint32_t value : {fault.delayMilliseconds, fault.durationMilliseconds,
+         fault.latencyMilliseconds, fault.percentageBasisPoints, fault.seed})
+    {
+      String text = {}; text.assignItoa(value); arguments.push_back(std::move(text));
+    }
+    String direction = {}; direction.assign(mothershipPairControlFaultDirectionName(fault.direction));
+    arguments.push_back(std::move(direction));
+    return true;
+  }
   String delay = {}, duration = {};
   delay.assignItoa(fault.delayMilliseconds);
   duration.assignItoa(fault.durationMilliseconds);
@@ -545,7 +642,17 @@ static inline bool mothershipPairControlFaultReceipt(
   String operation = {}, delay = {}, duration = {}, begin = {}, end = {};
   operation.assignItoh(descriptor.operationUUID); delay.assignItoa(fault.delayMilliseconds);
   duration.assignItoa(fault.durationMilliseconds); begin.assignItoa(beginNanoseconds); end.assignItoa(endNanoseconds);
-  if (fault.direction == MothershipPairControlFaultDirection::both)
+  if (fault.kind != MothershipPairControlFaultKind::drop)
+  {
+    String kind = {}, latency = {}, percentage = {}, seed = {}, direction = {}, installed = {}, restored = {};
+    kind.assign(mothershipPairControlFaultKindName(fault.kind));
+    latency.assignItoa(fault.latencyMilliseconds); percentage.assignItoa(fault.percentageBasisPoints);
+    seed.assignItoa(fault.seed); direction.assign(mothershipPairControlFaultDirectionName(fault.direction));
+    installed.assign(mothershipPairControlFaultQdiscWitness(fault.direction, false));
+    restored.assign(mothershipPairControlFaultQdiscWitness(fault.direction, true));
+    expected.snprintf<"PAIR_CONTROL_FAULT operationID={} clock=CLOCK_BOOTTIME kind={} onsetMs={} durationMs={} latencyMs={} percentageBps={} seed={} direction={} installQdisc={} restoreQdisc={} beginNs={} endNs={}\n"_ctv>(operation, kind, delay, duration, latency, percentage, seed, direction, installed, restored, begin, end);
+  }
+  else if (fault.direction == MothershipPairControlFaultDirection::both)
     expected.snprintf<"PAIR_CONTROL_FAULT operationID={} clock=CLOCK_BOOTTIME delayMs={} durationMs={} beginNs={} endNs={}\n"_ctv>(operation, delay, duration, begin, end);
   else
   {
@@ -565,6 +672,20 @@ static inline bool mothershipPairControlFaultReceiptValid(
     const String& receipt)
 {
   if (!mothershipPairControlFaultValid(fault)) return false;
+  if (fault.kind != MothershipPairControlFaultKind::drop)
+  {
+    char operation[35] = {}, clock[32] = {}, kind[16] = {}, direction[32] = {}, installed[96] = {}, restored[96] = {};
+    unsigned onset = 0, duration = 0, latency = 0, percentage = 0, seed = 0;
+    unsigned long long begin = 0, end = 0;
+    String text = receipt;
+    if (std::sscanf(text.c_str(), "PAIR_CONTROL_FAULT operationID=%34s clock=%31s kind=%15s onsetMs=%u durationMs=%u latencyMs=%u percentageBps=%u seed=%u direction=%31s installQdisc=%95s restoreQdisc=%95s beginNs=%llu endNs=%llu",
+        operation, clock, kind, &onset, &duration, &latency, &percentage, &seed, direction, installed, restored, &begin, &end) != 13)
+      return false;
+    // Re-rendering checks every identity/parameter, canonical spelling, exact
+    // egress witness, interval, and trailing bytes in one shared owner.
+    String expected = {};
+    return mothershipPairControlFaultReceipt(descriptor, fault, uint64_t(begin), uint64_t(end), expected) && receipt == expected;
+  }
   char operation[35] = {}, clock[32] = {}, direction[32] = {}, installed[64] = {}, restored[64] = {};
   unsigned delay = 0, duration = 0;
   unsigned long long begin = 0, end = 0;

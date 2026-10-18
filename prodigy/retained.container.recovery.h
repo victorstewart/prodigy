@@ -43,7 +43,7 @@ static inline bool prodigyRetainedRecoveryGeneratedStatefulRoles(
     ProdigyContainerServiceDefinitions *definitionsOut = nullptr)
 {
   roles = deployment.isStateful
-      ? StatefulMeshRoles::forShardGroup(deployment.stateful, deployment.config.applicationID, 0)
+      ? StatefulMeshRoles::forShardGroup(deployment.stateful, deployment.config.applicationID, topology.shardGroup)
       : StatefulMeshRoles{};
   ProdigyContainerServiceDefinitionContext context = {};
   context.isStateful = deployment.isStateful;
@@ -52,7 +52,7 @@ static inline bool prodigyRetainedRecoveryGeneratedStatefulRoles(
   context.advertiseClient = advertiseClient;
   context.seedingAlways = deployment.stateful.seedingAlways;
   context.dataStrategy = seedingData ? DataStrategy::seeding : DataStrategy::genesis;
-  context.nShardGroups = deployment.isStateful ? 1 : 0;
+  context.nShardGroups = deployment.isStateful ? topology.shardGroup + 1 : 0;
   ProdigyContainerServiceDefinitions definitions = {};
   if (prodigyBuildContainerServiceDefinitions(deployment, context, definitions) == false)
   {
@@ -102,7 +102,8 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
     uint8_t expectedDatacenterFragment,
     int64_t observedCreatedAtMs,
     NeuronContainerBootstrap& bootstrap,
-    String *failure)
+    String *failure,
+    const ProdigyStatefulServingAuthority *applicationAuthority = nullptr)
 {
   if (failure) failure->clear();
   bootstrap = {};
@@ -136,9 +137,25 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
     return prodigyRetainedRecoveryFail(failure, "retained recovery resource snapshot differs from authoritative deployment");
   }
   const StatefulMeshRoles expectedRoles = deployment.isStateful
-      ? StatefulMeshRoles::forShardGroup(deployment.stateful, deployment.config.applicationID, 0)
+      ? StatefulMeshRoles::forShardGroup(deployment.stateful, deployment.config.applicationID, parameters.statefulTopology.shardGroup)
       : StatefulMeshRoles{};
-  if (deployment.isStateful &&
+  const bool application = deployment.isStateful &&
+      parameters.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority;
+  if (application) {
+    const auto *member = applicationAuthority ? [&]() -> const ProdigyStatefulServingAuthorityMember * {
+      for (const auto& value : applicationAuthority->members)
+        if (value.containerUUID == parameters.uuid) return &value;
+      return nullptr;
+    }() : nullptr;
+    if (!applicationAuthority || applicationAuthority->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority ||
+        applicationAuthority->sourceRetired || applicationAuthority->deploymentID != parameters.deploymentID || !member ||
+        !prodigyStatefulDataAuthorityValid(applicationAuthority->dataAuthority) ||
+        !prodigyStatefulDataAuthorityEqual(applicationAuthority->dataAuthority, parameters.statefulTopology.dataAuthority) ||
+        member->shardGroup != parameters.statefulTopology.shardGroup ||
+        member->advertiseClient != (parameters.statefulMeshRoles.client != 0 && parameters.advertisesOnPorts.contains(expectedRoles.client)))
+      return prodigyRetainedRecoveryFail(failure, "retained application data authority differs from the durable pair owner");
+  }
+  if (deployment.isStateful && !application &&
       (parameters.statefulTopology.configured() == false ||
        parameters.statefulTopology.operationID != 0 ||
        parameters.statefulTopology.bridgeMode != StatefulTopologyBridgeMode::none ||
@@ -154,7 +171,7 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
   }
   ProdigyContainerServiceDefinitions definitions = {};
   StatefulMeshRoles expectedRetainedRoles = {};
-  const bool advertiseClient = deployment.isStateful && parameters.advertisesOnPorts.contains(expectedRoles.client);
+  const bool advertiseClient = deployment.isStateful && parameters.statefulMeshRoles.client != 0 && parameters.advertisesOnPorts.contains(expectedRoles.client);
   if (deployment.isStateful && deployment.stateful.allMasters && !advertiseClient)
     return prodigyRetainedRecoveryFail(failure, "retained all-master replica is missing its client service");
   if (prodigyRetainedRecoveryGeneratedStatefulRoles(
@@ -179,6 +196,13 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
   ContainerPlan& plan = bootstrap.plan;
   plan.uuid = parameters.uuid;
   plan.config = config;
+  if (application) {
+    auto declared = parameters.advertisesOnPorts.find(expectedRoles.client);
+    if (declared == parameters.advertisesOnPorts.end() || declared->second < 1024)
+      return prodigyRetainedRecoveryFail(failure, "retained application is missing its exact private client port declaration");
+    plan.declaredStatefulClientService = expectedRoles.client;
+    plan.declaredStatefulClientPort = declared->second;
+  }
   for (const Subscription& subscription : definitions.subscriptions)
   {
     plan.subscriptions.emplace(subscription.service, subscription);
@@ -194,7 +218,8 @@ static inline bool prodigyBuildRetainedContainerBootstrap(
     advertisement.port = port->second;
     plan.advertisements.emplace(advertisement.service, advertisement);
   }
-  if (plan.advertisements.size() != parameters.advertisesOnPorts.size())
+  const uint32_t privateClientDeclarations = application && !plan.advertisements.contains(plan.declaredStatefulClientService) ? 1 : 0;
+  if (plan.advertisements.size() + privateClientDeclarations != parameters.advertisesOnPorts.size())
   {
     return prodigyRetainedRecoveryFail(failure, "retained recovery parameters contain an unknown advertised service");
   }

@@ -2009,6 +2009,8 @@ public:
     ProdigyStatelessDeploymentAdmissionRequest statelessAdmissionRequest = {};
     String statelessAdmissionRequestPlanSHA256 = {};
     bool statelessAdmissionDurable = false;
+    bool statefulAdmission = false;
+    StatefulDataAuthorityOperation statefulAdmissionRequest;
   };
 
   bytell_hash_map<uint64_t, std::shared_ptr<PendingMothershipSpinArtifact>> pendingMothershipSpinArtifacts;
@@ -2019,6 +2021,9 @@ public:
     String requestPlanSHA256;
   };
   bytell_hash_map<uint64_t, PendingStatelessDeploymentAdmissionRequest> pendingStatelessDeploymentAdmissionRequests;
+  // Ring-local handoff into the ordinary Discombobulator artifact admission.
+  // The durable authority remains statefulServingAuthorities, not this map.
+  bytell_hash_map<uint64_t, StatefulDataAuthorityOperation> pendingStatefulDeploymentAdmissionRequests;
 
   class PendingMothershipUpdateArtifact
   {
@@ -8380,6 +8385,7 @@ public:
     }
     if (!prodigyValidateStatefulServingAuthorities(transition.runtimeState.statefulServingAuthorities,
           transition.servingRuntimeStates, transition.runtimeState.generation) ||
+        !prodigyStatefulRetirementTombstonesWitnessed(transition.runtimeState) ||
         (!transition.runtimeState.localCousinServicePermissions.empty() &&
          !prodigyLocalCousinServicePermissionsValid(transition.runtimeState.localCousinServicePermissions,
            brainConfig.clusterUUID, transition.runtimeState.generation)) ||
@@ -8972,6 +8978,246 @@ public:
           !peer->statefulServingAuthorityCapabilityAcknowledged) return false;
     }
     return true;
+  }
+
+  bool statefulDataAuthorityPeersCapable() const
+  {
+    if (!statefulServingPeersCapable()) return false;
+    ClusterTopology topology;
+    if (!loadAuthoritativeClusterTopology(topology)) return false;
+    for (const auto& member : topology.machines) {
+      if (!member.isBrain || clusterMachineMatchesThisBrain(member)) continue;
+      const auto *peer = brainPeerForTopologyMember(member);
+      if (!peer || peer->version < ProdigyStatefulDataAuthorityMinimumVersion ||
+          !peer->statefulDataAuthorityCapabilityAcknowledged) return false;
+    }
+    return true;
+  }
+
+  bool desiredStatefulDataAuthority(uint64_t deploymentID, StatefulDataAuthority& authority, uint32_t shardGroup = UINT32_MAX) const override
+  {
+    for (const auto& saved : masterAuthorityRuntimeState.statefulServingAuthorities)
+      if (saved.deploymentID == deploymentID && saved.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          (shardGroup == UINT32_MAX || saved.dataAuthority.shardGroup == shardGroup)) {
+        authority = saved.dataAuthority;
+        return true;
+      }
+    return false;
+  }
+
+  bool desiredStatefulReplicaCount(uint64_t deploymentID, uint32_t shardGroup, uint32_t& replicas) const override
+  {
+    bool application = false;
+    for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities) {
+      if (authority.deploymentID != deploymentID) continue;
+      application |= authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+      if (!prodigyStatefulServingAuthorityMatchesShard(authority, deploymentID, shardGroup)) continue;
+      replicas = authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          (authority.sourceRetired || prodigyStatefulDataAuthoritySourceNonwriter(authority.dataAuthority) ||
+           statefulCatchupCompensationFenced(deploymentID, shardGroup, authority.dataAuthority.operationUUID)) ? 0 : 3;
+      return true;
+    }
+    if (application) { replicas = 0; return true; }
+    return false;
+  }
+
+  uint32_t desiredStatefulShardGroupCount(uint64_t deploymentID) const override
+  {
+    uint32_t count = 0;
+    for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities) {
+      if (authority.deploymentID != deploymentID) continue;
+      if (authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority)
+        count = std::max(count, authority.dataAuthority.shardGroup + 1);
+      for (const auto& member : authority.members) count = std::max(count, member.shardGroup + 1);
+    }
+    return count;
+  }
+
+  StatefulDataAuthorityOperation statefulDataAuthorityOperation(const StatefulDataAuthorityOperation& request)
+  {
+    StatefulDataAuthorityOperation response = request;
+    response.accepted = response.ready = false;
+    response.receipts.clear(); response.failure.clear();
+    response.expectedAuthorityGeneration = masterAuthorityRuntimeState.generation;
+    response.expectedMasterUUID = getExistingMasterUUID();
+    response.expectedMasterBootNs = response.expectedMasterUUID == selfBrainUUID() ? boottimens : 0;
+    auto reject = [&](const char *reason) { response.failure.assign(reason); return response; };
+    if (request.version != 1 || !weAreMaster || !statefulDataAuthorityPeersCapable() ||
+        !statefulServingRecoveryReady() || masterAuthorityPersistencePending != 0 ||
+        !containerRetirementAuthorityAcknowledged())
+      return reject("stateful data operation requires settled, capable current authority");
+    auto& authorities = masterAuthorityRuntimeState.statefulServingAuthorities;
+    auto current = std::find_if(authorities.begin(), authorities.end(), [&](const auto& value) {
+      return prodigyStatefulServingAuthorityMatchesShard(value, request.deploymentID, request.authority.shardGroup);
+    });
+    if (request.query) {
+      if (current == authorities.end() || current->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority ||
+          current->pairIntentSHA256 != request.pairIntentSHA256 ||
+          !prodigyStatefulDataAuthorityEqual(current->dataAuthority, request.authority)) return response;
+      response.accepted = true;
+      response.cohort = current->members;
+      for (const auto& member : current->members) {
+        auto live = containers.find(member.containerUUID);
+        if (live == containers.end() || !live->second || !live->second->machine ||
+            live->second->machine->uuid != member.machineUUID ||
+            live->second->state != ContainerState::healthy || !live->second->runtimeReady ||
+            !statefulServingResourceObservationSupported(live->second->machine) ||
+            live->second->statefulDataAuthorityReceiptIOGeneration != live->second->machine->neuron.ioGeneration ||
+            live->second->statefulDataAuthorityReceiptAuthorityEpoch != masterAuthorityEpoch ||
+            live->second->statefulDataAuthorityReceiptCrashCount != live->second->nCrashes ||
+            !prodigyStatefulDataAuthorityReceiptValid(live->second->statefulDataAuthorityReceipt) ||
+            !prodigyStatefulDataAuthorityEqual(live->second->statefulDataAuthorityReceipt.authority, current->dataAuthority)) continue;
+        response.receipts.push_back({member.containerUUID, member.machineUUID, live->second->statefulDataAuthorityReceipt});
+      }
+      std::sort(response.receipts.begin(), response.receipts.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
+      response.ready = response.cohort.size() == 3 && response.receipts.size() == 3 &&
+          std::all_of(response.receipts.begin(), response.receipts.end(), [](const auto& member) { return member.receipt.ready; });
+      return response;
+    }
+    if (request.expectedAuthorityGeneration != masterAuthorityRuntimeState.generation || request.expectedMasterUUID != selfBrainUUID() ||
+        request.expectedMasterBootNs != boottimens || request.deploymentID == 0 ||
+        (uint16_t(request.deploymentID >> 48) != 3 && uint16_t(request.deploymentID >> 48) != 4) ||
+        !prodigyIsSHA256HexDigest(request.pairIntentSHA256) || !prodigyStatefulDataAuthorityValid(request.authority) ||
+        request.authority.localClusterUUID != brainConfig.clusterUUID)
+      return reject("stateful data command does not bind the exact application, cluster and authority");
+    if (statefulCatchupCompensationFenced(request.deploymentID, request.authority.shardGroup, request.authority.operationUUID))
+      return reject("this exact target operation is durably compensated; only a fresh lineage may be admitted");
+    if (current != authorities.end() && current->phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority) {
+      if (current->pairIntentSHA256 == request.pairIntentSHA256 &&
+          prodigyStatefulDataAuthorityEqual(current->dataAuthority, request.authority)) {
+        auto query = request; query.query = true;
+        return statefulDataAuthorityOperation(query);
+      }
+      if (!prodigyStatefulDataAuthorityCanAdvance(current->dataAuthority, request.authority))
+        return reject("stateful data command replays or contradicts durable ownership");
+      if (request.authority.mode == StatefulDataAuthorityMode::writeOwner &&
+          !prodigyIsSHA256HexDigest(request.sourceFenceReceiptSHA256))
+        return reject("target write ownership requires the durable source fence receipt");
+      if (request.authority.mode == StatefulDataAuthorityMode::writeOwner ||
+          (request.authority.mode == StatefulDataAuthorityMode::retainedSource &&
+           request.authority.writeOwnerClusterUUID == request.authority.targetClusterUUID)) {
+        auto query = request; query.query = true; query.authority = current->dataAuthority; query.pairIntentSHA256 = current->pairIntentSHA256;
+        const auto predecessor = statefulDataAuthorityOperation(query);
+        if (!predecessor.ready || predecessor.receipts.size() != 3 ||
+            !std::all_of(predecessor.receipts.begin(), predecessor.receipts.end(), [&](const auto& member) {
+              return member.receipt.appliedWatermarkSHA256 == request.authority.requiredAppliedWatermarkSHA256;
+            })) return reject("promotion or post-fence cleanup requires three current exact final-watermark receipts");
+      }
+    } else if (request.authority.mode != StatefulDataAuthorityMode::snapshotPreparing &&
+               request.authority.mode != StatefulDataAuthorityMode::catchupOnly)
+      return reject("initial stateful authority must preserve source writes or admit a catchup-only target");
+    DeploymentPlan plan;
+    auto storedPlan = deploymentPlans.find(request.deploymentID);
+    if (storedPlan != deploymentPlans.end()) plan = storedPlan->second;
+    else if (!BitseryEngine::deserializeSafe(request.deploymentPlan, plan))
+      return reject("initial target authority requires its exact deployment plan");
+    if (!plan.isStateful || plan.config.type != ApplicationType::stateful || plan.config.deploymentID() != request.deploymentID ||
+        plan.useHostNetworkNamespace || plan.stateful.allMasters || !plan.horizontalScalers.empty() ||
+        !plan.verticalScalers.empty() || plan.canaryCount != 0)
+      return reject("stateful data profile forbids host networking, all-masters, autoscaling and canaries");
+    String planBytes, planDigest;
+    BitseryEngine::serialize(planBytes, plan);
+    if (!prodigyComputeSHA256Hex(planBytes, planDigest)) return reject("stateful data plan digest failed");
+    ProdigyStatefulServingAuthority next;
+    next.deploymentID = request.deploymentID; next.applicationID = plan.config.applicationID;
+    next.operationID = uint64_t(request.authority.operationUUID);
+    next.revision = masterAuthorityRuntimeState.generation + 1;
+    next.phase = StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+    next.sourceEpoch = next.targetEpoch = 1;
+    next.targetConfig = plan.config; next.dataAuthority = request.authority;
+    next.pairIntentSHA256 = request.pairIntentSHA256;
+    next.sourceFenceReceiptSHA256 = request.sourceFenceReceiptSHA256;
+    next.admittedPlanSHA256 = planDigest;
+    next.requestPlanSHA256 = current != authorities.end() &&
+        current->phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority
+        ? current->requestPlanSHA256 : planDigest;
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    auto deployment = deployments.find(request.deploymentID);
+    if (deployment != deployments.end() && deployment->second) {
+      Vector<ContainerView *> selected;
+      for (auto *container : deployment->second->containers)
+        if (container && container->shardGroup == request.authority.shardGroup) selected.push_back(container);
+      std::sort(selected.begin(), selected.end(), [](auto *a, auto *b) { return a->uuid < b->uuid; });
+      if (selected.size() != 3 && !(selected.empty() && request.authority.mode == StatefulDataAuthorityMode::catchupOnly))
+        return reject("stateful command requires one exact three-member shard or an unlaunched catchup target");
+      ContainerView *clientOwner = selected.empty() ? nullptr : selected.front();
+      if (request.authority.localClusterUUID == request.authority.sourceClusterUUID)
+        for (const auto& declared : request.cohort)
+          if (declared.advertiseClient)
+            for (auto *candidate : selected) if (candidate->uuid == declared.containerUUID) clientOwner = candidate;
+      for (auto *container : selected) {
+        if (!container->machine || !statefulServingResourceObservationSupported(container->machine))
+          return reject("stateful command requires exact-build authenticated Neuron witnesses");
+        BrainReplicatedContainerRuntimeState state;
+        if (!captureReplicatedContainerRuntimeState(container, state)) return reject("stateful data cohort capture failed");
+        if (request.authority.localClusterUUID == request.authority.sourceClusterUUID) {
+          auto declared = std::find_if(request.cohort.begin(), request.cohort.end(), [&](const auto& value) {
+            return value.containerUUID == container->uuid && value.machineUUID == container->machine->uuid &&
+                   value.shardGroup == container->shardGroup;
+          });
+          String priorDigest;
+          if (request.cohort.size() != 3 || declared == request.cohort.end() ||
+              ((current == authorities.end() || current->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority) &&
+               (!prodigyStatefulServingRuntimeDigest(state, priorDigest) || priorDigest != declared->planSHA256)))
+            return reject("source snapshot command does not bind the declared exact source cohort");
+        }
+        auto& topology = state.plan.statefulTopology;
+        topology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+        topology.dataAuthority = request.authority;
+        const bool serving = prodigyStatefulTopologyServesClients(topology);
+        const uint64_t client = StatefulMeshRoles::forShardGroup(plan.stateful,
+            plan.config.applicationID, container->shardGroup).client;
+        state.plan.declaredStatefulClientService = client;
+        if (!state.plan.declaredStatefulClientPort) {
+          auto advertisement = state.plan.advertisements.find(client);
+          state.plan.declaredStatefulClientPort = advertisement != state.plan.advertisements.end()
+              ? advertisement->second.port : container->getRandomAdvertisementPort();
+        }
+        if (!serving || container != clientOwner) {
+          state.plan.advertisements.erase(client); state.plan.advertisementPairings.map.erase(client);
+        } else if (!state.plan.advertisements.contains(client))
+          state.plan.advertisements.emplace(client, Advertisement(client, ContainerState::healthy, ContainerState::destroying, state.plan.declaredStatefulClientPort));
+        state.plan.statefulMeshRoles.client = serving && container == clientOwner ? client : 0;
+        ProdigyStatefulServingAuthorityMember member;
+        member.containerUUID = container->uuid; member.machineUUID = container->machine->uuid;
+        member.shardGroup = container->shardGroup; member.isSource = request.authority.localClusterUUID == request.authority.sourceClusterUUID;
+        member.advertiseClient = state.plan.advertisements.contains(client);
+        if (!prodigyStatefulServingRuntimeDigest(state, member.planSHA256)) return reject("stateful data member digest failed");
+        next.members.push_back(member); states.push_back(std::move(state));
+      }
+    } else if (request.authority.mode != StatefulDataAuthorityMode::catchupOnly)
+      return reject("source stateful authority requires a live materialized shard");
+    if (!prodigyValidateStatefulServingAuthority(next, states, next.revision)) return reject("stateful data desired package is invalid");
+    if (current == authorities.end() && deployment != deployments.end() && deployment->second &&
+        request.authority.localClusterUUID == request.authority.sourceClusterUUID) {
+      ProdigyStatefulServingAuthority siblings;
+      siblings.deploymentID = request.deploymentID; siblings.applicationID = plan.config.applicationID;
+      siblings.operationID = 1; siblings.revision = next.revision;
+      siblings.sourceEpoch = siblings.targetEpoch = 1; siblings.targetConfig = plan.config;
+      Vector<BrainReplicatedContainerRuntimeState> siblingStates;
+      for (auto *container : deployment->second->containers) {
+        if (!container || container->shardGroup == request.authority.shardGroup) continue;
+        BrainReplicatedContainerRuntimeState state;
+        if (!captureReplicatedContainerRuntimeState(container, state)) return reject("unselected source shard capture failed");
+        ProdigyStatefulServingAuthorityMember member;
+        member.containerUUID = container->uuid; member.machineUUID = state.machineUUID; member.shardGroup = container->shardGroup;
+        member.advertiseClient = state.plan.advertisements.contains(state.plan.statefulMeshRoles.client);
+        if (!prodigyStatefulServingRuntimeDigest(state, member.planSHA256)) return reject("unselected source shard digest failed");
+        siblings.members.push_back(member); siblingStates.push_back(state);
+      }
+      std::sort(siblings.members.begin(), siblings.members.end(), [](const auto& a, const auto& b) {
+        return a.shardGroup != b.shardGroup ? a.shardGroup < b.shardGroup : a.containerUUID < b.containerUUID;
+      });
+      if (!siblings.members.empty()) {
+        if (!prodigyValidateStatefulServingAuthority(siblings, siblingStates, siblings.revision))
+          return reject("unselected source shards require an exact steady serving authority");
+        authorities.push_back(std::move(siblings));
+        for (auto& state : siblingStates) statefulServingRuntimeStates.push_back(std::move(state));
+      }
+    }
+    deploymentPlans.insert_or_assign(request.deploymentID, plan);
+    (void)commitStatefulServingDecision(std::move(next), std::move(states));
+    return response; // Not accepted until the same package has durable peer ACKs.
   }
 
   bool pairedSourceRetirementPeersCapable() const
@@ -9861,15 +10107,31 @@ public:
     if (!prodigyValidateStatefulServingAuthority(authority, states, authority.revision)) return false;
     auto& authorities = masterAuthorityRuntimeState.statefulServingAuthorities;
     const uint64_t deploymentID = authority.deploymentID;
+    const bool application = authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+    const uint32_t shardGroup = authority.dataAuthority.shardGroup;
+    if (application) {
+      // Split only the selected shard from a legacy deployment-wide decision.
+      // Unselected shards retain their exact existing authority and payload.
+      for (auto& value : authorities)
+        if (value.deploymentID == deploymentID && value.phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority)
+          { std::erase_if(value.members, [&](const auto& member) { return member.shardGroup == shardGroup; });
+            value.revision = masterAuthorityRuntimeState.generation + 1; }
+      std::erase_if(authorities, [&](const auto& value) {
+        return value.deploymentID == deploymentID && value.phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority && value.members.empty();
+      });
+    }
     auto existing = std::find_if(authorities.begin(), authorities.end(),
-        [=](const auto& value) { return value.deploymentID == deploymentID; });
+        [&](const auto& value) { return prodigyStatefulServingAuthoritySameScope(value, authority); });
     if (existing == authorities.end()) authorities.push_back(std::move(authority));
     else *existing = std::move(authority);
     std::sort(authorities.begin(), authorities.end(), [](const auto& lhs, const auto& rhs) {
-      return lhs.deploymentID < rhs.deploymentID;
+      if (lhs.deploymentID != rhs.deploymentID) return lhs.deploymentID < rhs.deploymentID;
+      const bool la = lhs.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+      const bool ra = rhs.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+      return la != ra ? la < ra : lhs.dataAuthority.shardGroup < rhs.dataAuthority.shardGroup;
     });
     std::erase_if(statefulServingRuntimeStates,
-        [=](const auto& state) { return state.plan.config.deploymentID() == deploymentID; });
+        [=](const auto& state) { return state.plan.config.deploymentID() == deploymentID && (!application || state.plan.shardGroup == shardGroup); });
     for (auto& state : states) statefulServingRuntimeStates.push_back(std::move(state));
     std::sort(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
         [](const auto& lhs, const auto& rhs) { return lhs.plan.uuid < rhs.plan.uuid; });
@@ -9887,10 +10149,53 @@ public:
       return StatefulServingLaunchAdmission::rejected;
     auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
         masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
-          return value.deploymentID == launchPlan.config.deploymentID();
+          return prodigyStatefulServingAuthorityMatchesShard(value, launchPlan.config.deploymentID(), launchPlan.shardGroup);
         });
     if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end())
-      return StatefulServingLaunchAdmission::ready;
+      return launchPlan.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority
+          ? StatefulServingLaunchAdmission::rejected : StatefulServingLaunchAdmission::ready;
+    if (current->phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority)
+    {
+      if (current->sourceRetired || statefulCatchupCompensationFenced(current->deploymentID,
+          current->dataAuthority.shardGroup, current->dataAuthority.operationUUID)) return StatefulServingLaunchAdmission::rejected;
+      if (!weAreMaster || !statefulDataAuthorityPeersCapable() || !statefulServingRecoveryReady() ||
+          !container->machine || container->machine->uuid != machineUUID ||
+          !statefulServingResourceObservationSupported(container->machine) ||
+          launchPlan.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+          launchPlan.shardGroup != current->dataAuthority.shardGroup ||
+          !prodigyStatefulDataAuthorityEqual(launchPlan.statefulTopology.dataAuthority, current->dataAuthority))
+        return StatefulServingLaunchAdmission::rejected;
+      if (!containerRetirementAuthorityAcknowledged()) return StatefulServingLaunchAdmission::pending;
+      BrainReplicatedContainerRuntimeState admitted;
+      if (!captureReplicatedContainerRuntimeState(container, admitted)) return StatefulServingLaunchAdmission::rejected;
+      admitted.machineUUID = machineUUID;
+      admitted.plan = launchPlan;
+      String digest;
+      if (!prodigyStatefulServingRuntimeDigest(admitted, digest)) return StatefulServingLaunchAdmission::rejected;
+      auto member = std::find_if(current->members.begin(), current->members.end(),
+          [&](const auto& value) { return value.containerUUID == launchPlan.uuid; });
+      if (member != current->members.end())
+        return member->machineUUID == machineUUID && member->planSHA256 == digest
+            ? StatefulServingLaunchAdmission::ready : StatefulServingLaunchAdmission::rejected;
+      // New UUIDs are admitted only into the initial non-serving target cohort.
+      // A fenced source and promoted target can restore only exact saved UUIDs.
+      if (current->dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly || current->members.size() >= 3 ||
+          launchPlan.advertisements.contains(launchPlan.statefulMeshRoles.client)) return StatefulServingLaunchAdmission::rejected;
+      auto next = *current;
+      next.revision = masterAuthorityRuntimeState.generation + 1;
+      ProdigyStatefulServingAuthorityMember added;
+      added.containerUUID = launchPlan.uuid; added.machineUUID = machineUUID; added.shardGroup = launchPlan.shardGroup;
+      added.planSHA256 = digest;
+      next.members.push_back(added);
+      std::sort(next.members.begin(), next.members.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
+      Vector<BrainReplicatedContainerRuntimeState> states;
+      for (const auto& saved : statefulServingRuntimeStates)
+        if (saved.plan.config.deploymentID() == launchPlan.config.deploymentID() && saved.plan.shardGroup == launchPlan.shardGroup) states.push_back(saved);
+      states.push_back(std::move(admitted));
+      if (!prodigyValidateStatefulServingAuthority(next, states, next.revision)) return StatefulServingLaunchAdmission::rejected;
+      (void)commitStatefulServingDecision(std::move(next), std::move(states));
+      return StatefulServingLaunchAdmission::pending;
+    }
     auto owner = deployments.find(launchPlan.config.deploymentID());
     auto canonical = containers.find(launchPlan.uuid);
     if (!weAreMaster || owner == deployments.end() || owner->second != deployment ||
@@ -9978,7 +10283,7 @@ public:
     if (owner == deployments.end() || owner->second != deployment) return false;
     auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
         masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
-          return value.deploymentID == owner->first;
+          return prodigyStatefulServingAuthorityMatchesShard(value, owner->first, shardGroup);
         });
     if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end()) return false;
     ContainerView *selected = nullptr;
@@ -9997,42 +10302,53 @@ public:
     Vector<BrainReplicatedContainerRuntimeState> states;
     for (const auto& saved : statefulServingRuntimeStates)
     {
-      if (saved.plan.config.deploymentID() != authority.deploymentID) continue;
-      auto state = saved;
-      if (state.plan.shardGroup == shardGroup)
-      {
-        const uint64_t client = state.plan.statefulMeshRoles.client;
-        if (state.plan.uuid == selected->uuid)
-        {
-          if (!state.plan.advertisements.contains(client))
-            state.plan.advertisements.emplace(client,
-                Advertisement(client, ContainerState::healthy, ContainerState::destroying, selected->getRandomAdvertisementPort()));
-        }
-        else
-        {
-          state.plan.advertisements.erase(client);
-          state.plan.advertisementPairings.map.erase(client);
-        }
-        for (auto& member : authority.members)
-          if (member.containerUUID == state.plan.uuid)
-          {
-            member.advertiseClient = state.plan.uuid == selected->uuid;
-            if (!prodigyStatefulServingRuntimeDigest(state, member.planSHA256)) return false;
-          }
-      }
-      states.push_back(std::move(state));
+      if (prodigyStatefulServingAuthorityMatchesShard(authority, saved.plan.config.deploymentID(), saved.plan.shardGroup)) states.push_back(saved);
     }
+    const auto client = StatefulMeshRoles::forShardGroup(deployment->plan.stateful, authority.applicationID, shardGroup).client;
+    if (!prodigyStatefulServingSelectClient(authority, states, shardGroup, selected->uuid, client,
+        authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority ? 0 : selected->getRandomAdvertisementPort())) return false;
     return commitStatefulServingDecision(std::move(authority), std::move(states));
+  }
+
+  bool sealStatefulDataOwnershipReady(uint64_t deploymentID, uint32_t shardGroup)
+  {
+    auto current = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+          return prodigyStatefulServingAuthorityMatchesShard(value, deploymentID, shardGroup);
+        });
+    if (current == masterAuthorityRuntimeState.statefulServingAuthorities.end() ||
+        current->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority ||
+        current->dataAuthority.mode != StatefulDataAuthorityMode::writeOwner ||
+        !current->ownershipReadyReceiptSHA256.empty() || masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) return false;
+    StatefulDataAuthorityOperation query;
+    query.query = true; query.deploymentID = deploymentID; query.authority = current->dataAuthority;
+    query.pairIntentSHA256 = current->pairIntentSHA256;
+    auto proof = statefulDataAuthorityOperation(query);
+    if (!proof.ready || !prodigyStatefulServingOwnershipReadyReceiptsValid(*current, proof.receipts)) return false;
+    auto authority = *current; String encoded;
+    BitseryEngine::serialize(encoded, proof);
+    if (!prodigyComputeSHA256Hex(encoded, authority.ownershipReadyReceiptSHA256)) return false;
+    authority.revision = masterAuthorityRuntimeState.generation + 1;
+    Vector<BrainReplicatedContainerRuntimeState> states;
+    for (const auto& state : statefulServingRuntimeStates)
+      if (prodigyStatefulServingAuthorityMatchesShard(authority, state.plan.config.deploymentID(), state.plan.shardGroup)) states.push_back(state);
+    (void)commitStatefulServingDecision(std::move(authority), std::move(states));
+    return true; // Discovery waits for this exact package's durable peer ACKs.
   }
 
   bool restoreStatefulServingDecision(ApplicationDeployment *deployment) override
   {
     if (deployment == nullptr) return false;
-    auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
-        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& candidate) {
-          return candidate.deploymentID == deployment->plan.config.deploymentID();
-        });
-    if (authority == masterAuthorityRuntimeState.statefulServingAuthorities.end()) return true;
+    bool restored = true;
+    for (const auto& authority : masterAuthorityRuntimeState.statefulServingAuthorities)
+      if (authority.deploymentID == deployment->plan.config.deploymentID())
+        restored &= restoreStatefulServingDecisionScope(deployment, authority);
+    return restored;
+  }
+
+  bool restoreStatefulServingDecisionScope(ApplicationDeployment *deployment, const ProdigyStatefulServingAuthority& selected)
+  {
+    const auto *authority = &selected;
     if (deployment->statefulWorkerTopologyUpgradePending &&
         deployment->statefulWorkerTopologyUpgradeOperationID != authority->operationID)
     {
@@ -10042,6 +10358,9 @@ public:
              prepareStatefulServingTransition(deployment, StatefulWorkerTopologyUpgradePhase::greenBootstrap);
     }
     if (!statefulServingPeersCapable() || !containerRetirementAuthorityAcknowledged()) return false;
+    if (authority->phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+        !prodigyStatefulServingClientPublicationReady(*authority) &&
+        sealStatefulDataOwnershipReady(authority->deploymentID, authority->dataAuthority.shardGroup)) return false;
     if (!authority->allMasters && !recoveringPersistedNeuronInventory &&
         !pendingReplicatedContainerRuntimeStates.contains(authority->deploymentID))
       for (const auto& member : authority->members)
@@ -10060,6 +10379,25 @@ public:
     // containers; cold restore accounting is rebuilt from indexed ownership.
     deployment->applyStatefulServingResourceTargets(*authority, statefulServingRuntimeStates);
     deployment->resumeDurableContainerSpinsAfterServingAuthority();
+    if (authority->phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority) {
+      StatefulDataAuthorityReceipt command;
+      command.authority = authority->dataAuthority;
+      String encoded;
+      BitseryEngine::serialize(encoded, command);
+      for (const auto& member : authority->members) {
+        auto live = containers.find(member.containerUUID);
+        if (live == containers.end() || !live->second || !live->second->machine ||
+            live->second->machine->uuid != member.machineUUID ||
+            !statefulServingResourceObservationSupported(live->second->machine)) continue;
+        if (!prodigyStatefulDataAuthorityEqual(live->second->statefulDataAuthorityReceipt.authority, authority->dataAuthority)) {
+          live->second->statefulDataAuthorityReceipt = {};
+          live->second->statefulDataAuthorityReceiptIOGeneration = 0;
+          live->second->statefulDataAuthorityReceiptAuthorityEpoch = 0;
+        }
+        Message::construct(live->second->machine->neuron.wBuffer, NeuronTopic::statefulDataAuthority, member.containerUUID, encoded);
+        Ring::queueSend(&live->second->machine->neuron);
+      }
+    }
     return true;
   }
 
@@ -10077,6 +10415,10 @@ public:
         continue;
       }
       if (authority.applicationID != plan.config.applicationID) return false;
+      if (authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          authority.dataAuthority.shardGroup != plan.shardGroup) continue;
+      if (authority.phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          !prodigyStatefulServingAuthorityMatchesShard(authority, plan.config.deploymentID(), plan.shardGroup)) continue;
       if (member == authority.members.end() || member->machineUUID != machineUUID || member->shardGroup != plan.shardGroup) return false;
       if (!masterAuthorityRuntimeStateDurable ||
           durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation ||
@@ -10087,8 +10429,11 @@ public:
       plan.config = desired->plan.config;
       plan.statefulMeshRoles = desired->plan.statefulMeshRoles;
       plan.statefulTopology = desired->plan.statefulTopology;
+      plan.declaredStatefulClientService = desired->plan.declaredStatefulClientService;
+      plan.declaredStatefulClientPort = desired->plan.declaredStatefulClientPort;
       plan.advertisements = desired->plan.advertisements;
       plan.subscriptions = desired->plan.subscriptions;
+      prodigyProjectStatefulServingClientPublication(authority, plan);
       for (auto it = plan.advertisementPairings.map.begin(); it != plan.advertisementPairings.map.end();)
         if (!plan.advertisements.contains(it->first)) it = plan.advertisementPairings.map.erase(it); else ++it;
       for (auto it = plan.subscriptionPairings.map.begin(); it != plan.subscriptionPairings.map.end();)
@@ -10197,12 +10542,34 @@ public:
   {
     ProdigyContainerRetirementJournal journal = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return true;
-    return prodigyFindPairedSourceRetirementFenceByDeploymentInValidatedJournal(journal, deploymentID) != nullptr;
+    const auto *fence = prodigyFindPairedSourceRetirementFenceByDeploymentInValidatedJournal(journal, deploymentID);
+    if (!fence) return false;
+    if (fence->hasStatefulScope) return false; // scoped fence, never a sibling deployment cancellation
+    if (!fence->cohort.empty()) {
+      const auto *intent = prodigyFindContainerRetirementIntentInValidatedJournal(journal, fence->cohort.front().containerUUID);
+      if (intent && intent->kind == ProdigyContainerRetirementKind::statefulPairedMigration) return false;
+    }
+    StatefulDataAuthority desired;
+    // A fresh reverse transfer is the only way to re-admit a retired source.
+    // The historical retirement fence remains immutable in the journal.
+    if (desiredStatefulDataAuthority(deploymentID, desired) &&
+        desired.mode == StatefulDataAuthorityMode::catchupOnly &&
+        desired.previousOperationUUID == fence->operationID &&
+        desired.sourceClusterUUID == fence->targetClusterUUID &&
+        desired.targetClusterUUID == fence->sourceClusterUUID) return false;
+    return true;
   }
 
   bool deploymentLaunchFenced(uint64_t deploymentID) const override
   {
     return pairedSourceRetirementLaunchFenced(deploymentID);
+  }
+
+  bool statefulCatchupCompensationFenced(uint64_t deploymentID, uint32_t shardGroup, uint128_t operationUUID) const override
+  {
+    ProdigyContainerRetirementJournal journal;
+    if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return true;
+    return prodigyPairedCatchupCompensationFencedInValidatedJournal(journal, deploymentID, shardGroup, operationUUID);
   }
 
   // A v4 replicated fence is accepted only when the receiving source still
@@ -10214,8 +10581,14 @@ public:
     {
       if (fence.sourceClusterUUID != brainConfig.clusterUUID) return false;
       auto plan = deploymentPlans.find(fence.sourceDeploymentID);
-      if (plan == deploymentPlans.end() || plan->second.isStateful ||
-          !prodigyStatelessDeploymentAdmissionPlanEligible(plan->second) ||
+      StatefulDataAuthority desired;
+      const auto *member = fence.cohort.empty() ? nullptr :
+          prodigyFindContainerRetirementIntentInValidatedJournal(journal, fence.cohort.front().containerUUID);
+      const bool stateful = plan != deploymentPlans.end() && plan->second.isStateful &&
+          (fence.hasStatefulScope || (member && member->kind == ProdigyContainerRetirementKind::statefulPairedMigration)) &&
+          (plan->second.config.applicationID == 3 || plan->second.config.applicationID == 4);
+      if (plan == deploymentPlans.end() ||
+          (!stateful && !prodigyStatelessDeploymentAdmissionPlanEligible(plan->second)) ||
           plan->second.config.containerBlobSHA256.equals(fence.sourceBlobSHA256) == false ||
           plan->second.config.containerBlobBytes != fence.sourceBlobBytes) return false;
       DeploymentPlan normalized = plan->second; String encoded = {}, digest = {}, failure = {};
@@ -10357,6 +10730,80 @@ public:
     return !sources.empty() && containerRetirementAuthorityAcknowledged();
   }
 
+  bool preparePairedCatchupCompensation(const ProdigyPairedSourceRetirementRequest& request,
+      ProdigyContainerRetirementJournal journal, PairedSourceRetirementReceipt& receipt)
+  {
+    auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+        masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+          return prodigyStatefulServingAuthorityMatchesShard(value, request.sourceDeploymentID, request.shardGroup);
+        });
+    auto plan = deploymentPlans.find(request.sourceDeploymentID);
+    String authorityBytes, authorityDigest, planBytes, planDigest;
+    if (!statefulDataAuthorityPeersCapable() || authority == masterAuthorityRuntimeState.statefulServingAuthorities.end() ||
+        authority->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority || authority->sourceRetired ||
+        authority->dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly ||
+        authority->dataAuthority.operationUUID != request.operationID ||
+        authority->dataAuthority.localClusterUUID != request.sourceClusterUUID ||
+        authority->dataAuthority.targetClusterUUID != request.sourceClusterUUID ||
+        authority->dataAuthority.sourceClusterUUID != request.targetClusterUUID ||
+        authority->pairIntentSHA256 != request.pairIntentSHA256 || authority->members.size() > 3 ||
+        plan == deploymentPlans.end() || !plan->second.isStateful ||
+        plan->second.config.containerBlobSHA256 != request.sourceBlobSHA256 ||
+        plan->second.config.containerBlobBytes != request.sourceBlobBytes ||
+        !BitseryEngine::serialize(authorityBytes, authority->dataAuthority) ||
+        !prodigyComputeSHA256Hex(authorityBytes, authorityDigest) || authorityDigest != request.dataAuthoritySHA256 ||
+        !BitseryEngine::serialize(planBytes, plan->second) ||
+        !prodigyComputeSHA256Hex(planBytes, planDigest) || planDigest != request.sourceNormalizedPlanSHA256 ||
+        masterAuthorityRuntimeState.generation >= UINT64_MAX - 1) {
+      receipt.failure.assign("catchup compensation does not bind the exact admitted non-writer shard, plan and artifact"_ctv); return false;
+    }
+    ProdigyPairedSourceRetirementFence fence;
+    fence.operationID = request.operationID; fence.sourceClusterUUID = request.sourceClusterUUID;
+    fence.targetClusterUUID = request.targetClusterUUID; fence.sourceDeploymentID = request.sourceDeploymentID;
+    fence.targetDeploymentID = request.targetDeploymentID; fence.sourceNormalizedPlanSHA256 = request.sourceNormalizedPlanSHA256;
+    fence.sourceBlobSHA256 = request.sourceBlobSHA256; fence.sourceBlobBytes = request.sourceBlobBytes;
+    fence.hasStatefulScope = true; fence.catchupTargetCompensation = true; fence.shardGroup = request.shardGroup;
+    fence.pairIntentSHA256 = request.pairIntentSHA256; fence.dataAuthoritySHA256 = request.dataAuthoritySHA256;
+    for (const auto& member : authority->members) {
+      auto saved = std::find_if(statefulServingRuntimeStates.begin(), statefulServingRuntimeStates.end(),
+          [&](const auto& value) { return value.plan.uuid == member.containerUUID; });
+      String digest;
+      if (saved == statefulServingRuntimeStates.end() || saved->machineUUID != member.machineUUID ||
+          saved->plan.shardGroup != request.shardGroup ||
+          !prodigyStatefulDataAuthorityEqual(saved->plan.statefulTopology.dataAuthority, authority->dataAuthority) ||
+          !prodigyStatefulServingRuntimeDigest(*saved, digest) || digest != member.planSHA256 ||
+          prodigyFindContainerRetirementIntentInValidatedJournal(journal, member.containerUUID)) {
+        receipt.failure.assign("catchup compensation cohort differs from the durable admitted launch plans"_ctv); return false;
+      }
+      ProdigyContainerRetirementIntent intent;
+      intent.containerUUID = member.containerUUID; intent.machineUUID = member.machineUUID;
+      intent.deploymentID = request.sourceDeploymentID; intent.applicationID = authority->applicationID;
+      intent.kind = ProdigyContainerRetirementKind::statefulPairedMigration;
+      intent.intentGeneration = masterAuthorityRuntimeState.generation + 1;
+      intent.pairedOperationID = request.operationID; intent.pairedSourceClusterUUID = request.sourceClusterUUID;
+      intent.pairedTargetClusterUUID = request.targetClusterUUID; intent.pairedTargetDeploymentID = request.targetDeploymentID;
+      NeuronContainerBootstrap bootstrap; bootstrap.plan = saved->plan; bootstrap.plan.restartOnFailure = false;
+      bootstrap.metricPolicy = deriveNeuronMetricPolicyForDeployment(plan->second);
+      BitseryEngine::serialize(intent.bootstrap, bootstrap);
+      fence.cohort.push_back({member.containerUUID, member.machineUUID, intent.intentGeneration});
+      journal.intents.push_back(std::move(intent));
+    }
+    journal.version = ProdigyContainerRetirementJournal::statefulVersion;
+    journal.pairedSourceFences.push_back(fence);
+    std::sort(journal.intents.begin(), journal.intents.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
+    std::sort(journal.pairedSourceFences.begin(), journal.pairedSourceFences.end(), [](const auto& a, const auto& b) { return a.operationID < b.operationID; });
+    if (!prodigyStoreContainerRetirementJournalCarrier(masterAuthorityRuntimeState.taskExecutions, journal, Time::now<TimeResolution::ms>())) {
+      receipt.failure.assign("catchup compensation journal rejected"_ctv); return false;
+    }
+    // Empty admission is already terminal. The fence and tombstone enter the
+    // same master-authority package before any stale scheduler continuation.
+    if (fence.cohort.empty()) {
+      authority->sourceRetired = true; authority->revision = masterAuthorityRuntimeState.generation + 1;
+    }
+    commitMasterAuthorityStateChangeAsync([this](bool durable) { if (durable) (void)reconcileContainerRetirements(); });
+    return false; // exact retry/pull witnesses the replicated sealed generation
+  }
+
   bool preparePairedSourceRetirement(const ProdigyPairedSourceRetirementRequest& request,
                                      PairedSourceRetirementReceipt& receipt)
   {
@@ -10382,23 +10829,19 @@ public:
     auto existing = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, request.operationID);
     if (existing != nullptr)
     {
-      if (existing->sourceClusterUUID != request.sourceClusterUUID ||
-          existing->targetClusterUUID != request.targetClusterUUID ||
-          existing->sourceDeploymentID != request.sourceDeploymentID ||
-          existing->targetDeploymentID != request.targetDeploymentID ||
-          existing->sourceNormalizedPlanSHA256.equals(request.sourceNormalizedPlanSHA256) == false ||
-          existing->sourceBlobSHA256.equals(request.sourceBlobSHA256) == false ||
-          existing->sourceBlobBytes != request.sourceBlobBytes)
+      if (!prodigyPairedSourceRetirementFenceMatchesRequest(*existing, request))
       {
         receipt.failure.assign("paired source retirement operation conflicts with sealed fence"_ctv);
         return false;
       }
       BitseryEngine::serialize(receipt.sealedFence, *existing);
+      if (existing->hasStatefulScope) {
+        receipt.version = 2; ProdigyScopedPairedSourceRetirementFence scoped; scoped.fence = *existing;
+        BitseryEngine::serialize(receipt.scopedFence, scoped);
+      }
       receipt.sealed = masterAuthorityRuntimeStateDurable && pairedSourceRetirementPeersCapable() &&
                        containerRetirementAuthorityAcknowledged();
-      receipt.terminal = receipt.sealed && std::all_of(journal.intents.begin(), journal.intents.end(), [&](const auto& intent) {
-        return intent.pairedOperationID != request.operationID || intent.killAcked;
-      });
+      receipt.terminal = receipt.sealed && prodigyPairedSourceRetirementFenceTerminalInValidatedJournal(journal, *existing);
       return receipt.sealed;
     }
     if (!receipt.peersCapable)
@@ -10414,15 +10857,37 @@ public:
       receipt.failure.assign("paired source retirement requires settled current source authority"_ctv);
       return false;
     }
+    if (request.version == 2) return preparePairedCatchupCompensation(request, std::move(journal), receipt);
     auto owner = deployments.find(request.sourceDeploymentID);
-    if (owner == deployments.end() || owner->second == nullptr || owner->second->plan.isStateful ||
-        !prodigyStatelessDeploymentAdmissionPlanEligible(owner->second->plan) ||
+    StatefulDataAuthority desired;
+    for (const auto& value : masterAuthorityRuntimeState.statefulServingAuthorities)
+      if (value.deploymentID == request.sourceDeploymentID &&
+          value.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          value.dataAuthority.operationUUID == request.operationID) desired = value.dataAuthority;
+    const bool stateful = owner != deployments.end() && owner->second && owner->second->plan.isStateful &&
+        statefulDataAuthorityPeersCapable() &&
+        desired.mode == StatefulDataAuthorityMode::retainedSource &&
+        desired.writeOwnerClusterUUID == desired.targetClusterUUID &&
+        prodigyStatefulDataAuthoritySourceNonwriter(desired) && desired.operationUUID == request.operationID &&
+        desired.sourceClusterUUID == request.sourceClusterUUID && desired.targetClusterUUID == request.targetClusterUUID;
+    if (owner == deployments.end() || owner->second == nullptr ||
+        (!stateful && !prodigyStatelessDeploymentAdmissionPlanEligible(owner->second->plan)) ||
         owner->second->plan.config.containerBlobSHA256.equals(request.sourceBlobSHA256) == false ||
         owner->second->plan.config.containerBlobBytes != request.sourceBlobBytes ||
         pairedSourceRetirementLaunchFenced(request.sourceDeploymentID))
     {
       receipt.failure.assign("paired source retirement source plan is not current"_ctv);
       return false;
+    }
+    if (stateful) {
+      StatefulDataAuthorityOperation query;
+      query.query = true; query.deploymentID = request.sourceDeploymentID; query.authority = desired;
+      for (const auto& value : masterAuthorityRuntimeState.statefulServingAuthorities)
+        if (prodigyStatefulServingAuthorityMatchesShard(value, request.sourceDeploymentID, desired.shardGroup)) query.pairIntentSHA256 = value.pairIntentSHA256;
+      const auto cleanup = statefulDataAuthorityOperation(query);
+      if (!cleanup.ready || cleanup.receipts.size() != 3) {
+        receipt.failure.assign("source retirement requires three fresh authenticated non-writer cleanup receipts"_ctv); return false;
+      }
     }
     DeploymentPlan normalized = owner->second->plan;
     String encoded = {}, digest = {}, failure = {};
@@ -10447,8 +10912,15 @@ public:
     fence.sourceNormalizedPlanSHA256 = request.sourceNormalizedPlanSHA256;
     fence.sourceBlobSHA256 = request.sourceBlobSHA256;
     fence.sourceBlobBytes = request.sourceBlobBytes;
+    if (stateful) {
+      fence.hasStatefulScope = true; fence.shardGroup = desired.shardGroup;
+      for (const auto& value : masterAuthorityRuntimeState.statefulServingAuthorities)
+        if (prodigyStatefulServingAuthorityMatchesShard(value, request.sourceDeploymentID, desired.shardGroup)) fence.pairIntentSHA256 = value.pairIntentSHA256;
+      String bytes; BitseryEngine::serialize(bytes, desired); prodigyComputeSHA256Hex(bytes, fence.dataAuthoritySHA256);
+    }
     for (ContainerView *container : owner->second->containers)
     {
+      if (stateful && container && container->shardGroup != desired.shardGroup) continue;
       if (container == nullptr || container->machine == nullptr || container->uuid == 0 || container->machine->uuid == 0 ||
           container->deploymentID != request.sourceDeploymentID || container->state != ContainerState::healthy ||
           container->plannedWork != nullptr || !container->runtimeReady || prodigyFindContainerRetirementIntentInValidatedJournal(journal, container->uuid) != nullptr)
@@ -10457,7 +10929,7 @@ public:
       intent.containerUUID = container->uuid; intent.deploymentID = request.sourceDeploymentID;
       intent.applicationID = owner->second->plan.config.applicationID; intent.machineUUID = container->machine->uuid;
       intent.intentGeneration = masterAuthorityRuntimeState.generation + 1;
-      intent.kind = ProdigyContainerRetirementKind::statelessPairedMigration;
+      intent.kind = stateful ? ProdigyContainerRetirementKind::statefulPairedMigration : ProdigyContainerRetirementKind::statelessPairedMigration;
       intent.pairedOperationID = request.operationID; intent.pairedSourceClusterUUID = request.sourceClusterUUID;
       intent.pairedTargetClusterUUID = request.targetClusterUUID; intent.pairedTargetDeploymentID = request.targetDeploymentID;
       ApplicationConfig config = owner->second->resourceConfigForContainer(container);
@@ -10470,7 +10942,7 @@ public:
     }
     std::sort(fence.cohort.begin(), fence.cohort.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
     std::sort(journal.intents.begin(), journal.intents.end(), [](const auto& a, const auto& b) { return a.containerUUID < b.containerUUID; });
-    journal.version = ProdigyContainerRetirementJournal::currentVersion;
+    journal.version = std::max(journal.version, stateful ? ProdigyContainerRetirementJournal::statefulVersion : ProdigyContainerRetirementJournal::currentVersion);
     journal.pairedSourceFences.push_back(std::move(fence));
     std::sort(journal.pairedSourceFences.begin(), journal.pairedSourceFences.end(), [](const auto& a, const auto& b) { return a.operationID < b.operationID; });
     if (!prodigyStoreContainerRetirementJournalCarrier(masterAuthorityRuntimeState.taskExecutions, journal, Time::now<TimeResolution::ms>()))
@@ -10507,13 +10979,34 @@ public:
     if (existing == nullptr || !containerRetirementNeuronAuthorized(neuron, existing->machineUUID) ||
         !containerRetirementAuthorityAcknowledged()) return false;
     if (existing->killAcked) return true;
-    if (existing->kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+    if (prodigyContainerRetirementIsPaired(existing->kind))
       basics_log("brain paired source retirement kill acknowledged deploymentID=%llu containerUUID=%llu\n",
           (unsigned long long)existing->deploymentID, (unsigned long long)containerUUID);
     for (auto& intent : journal.intents)
       if (intent.containerUUID == containerUUID) { intent.killAcked = true; intent.bootstrap.clear(); break; }
     if (!prodigyStoreContainerRetirementJournalCarrier(masterAuthorityRuntimeState.taskExecutions,
           journal, Time::now<TimeResolution::ms>())) return false;
+    if (existing->kind == ProdigyContainerRetirementKind::statefulPairedMigration &&
+        std::all_of(journal.intents.begin(), journal.intents.end(), [&](const auto& intent) {
+          return intent.pairedOperationID != existing->pairedOperationID || intent.killAcked;
+        })) {
+      auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+          masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+            return value.deploymentID == existing->deploymentID &&
+                value.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+                value.dataAuthority.operationUUID == existing->pairedOperationID;
+          });
+      if (authority == masterAuthorityRuntimeState.statefulServingAuthorities.end() ||
+          authority->dataAuthority.operationUUID != existing->pairedOperationID ||
+          (!prodigyStatefulDataAuthoritySourceNonwriter(authority->dataAuthority) &&
+           authority->dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly)) return false;
+      authority->sourceRetired = true;
+      authority->members.clear();
+      authority->revision = masterAuthorityRuntimeState.generation + 1;
+      std::erase_if(statefulServingRuntimeStates, [&](const auto& state) {
+        return state.plan.config.deploymentID() == existing->deploymentID && state.plan.shardGroup == authority->dataAuthority.shardGroup;
+      });
+    }
     commitMasterAuthorityStateChangeAsync({});
     return true;
   }
@@ -10524,10 +11017,17 @@ public:
   {
     ProdigyContainerRetirementJournal journal = {};
     if (!decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal)) return false;
-    if (journal.intents.empty()) return true;
     if (!containerRetirementAuthorityAcknowledged() ||
         (!journal.pairedSourceFences.empty() && !pairedSourceRetirementPeersCapable())) return false;
     bool settled = true;
+    for (const auto& fence : journal.pairedSourceFences) {
+      if (!fence.hasStatefulScope || !fence.catchupTargetCompensation) continue;
+      auto owner = deployments.find(fence.sourceDeploymentID);
+      Vector<uint128_t> admitted;
+      for (const auto& member : fence.cohort) admitted.push_back(member.containerUUID);
+      if (owner != deployments.end() && owner->second &&
+          !owner->second->compensateUnadmittedStatefulCatchup(fence.shardGroup, fence.operationID, admitted)) settled = false;
+    }
     for (const auto& intent : journal.intents)
     {
       if (intent.killAcked)
@@ -10544,7 +11044,7 @@ public:
       settled = false;
       Machine *machine = findMachineByUUID(intent.machineUUID);
       if (machine == nullptr || !containerRetirementNeuronAuthorized(&machine->neuron, intent.machineUUID)) continue;
-      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+      if (prodigyContainerRetirementIsPaired(intent.kind))
       {
         auto live = containers.find(intent.containerUUID);
         if (live != containers.end() && live->second != nullptr && live->second->state != ContainerState::destroying)
@@ -10552,7 +11052,12 @@ public:
           ContainerView *container = live->second;
           auto owner = deployments.find(intent.deploymentID);
           if (container->machine != machine || container->deploymentID != intent.deploymentID ||
-              owner == deployments.end() || owner->second == nullptr || container->plannedWork != nullptr) return false;
+              owner == deployments.end() || owner->second == nullptr) return false;
+          const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, intent.pairedOperationID);
+          if (container->plannedWork) {
+            if (!fence || !fence->catchupTargetCompensation) continue;
+            owner->second->cancelCompensatedStatefulWork(container);
+          }
           // The ordinary destruction owner releases placement, capacity and
           // routing exactly once. Keep its object alive for Neuron's kill ACK.
           owner->second->releaseContainerPlacementCounts(container);
@@ -10768,7 +11273,8 @@ public:
            !localCousinServicePermissionScopeAllowsRoute(*permission, route))) return false;
     }
     if (!prodigyValidateStatefulServingAuthorities(restoredRuntimeState.statefulServingAuthorities,
-          package.servingRuntimeStates, restoredRuntimeState.generation)) return false;
+          package.servingRuntimeStates, restoredRuntimeState.generation) ||
+        !prodigyStatefulRetirementTombstonesWitnessed(restoredRuntimeState)) return false;
     ProdigyMachineRetirementJournal retirementJournal = {};
     if (decodeMachineRetirementJournal(restoredRuntimeState, retirementJournal) == false)
     {
@@ -11611,6 +12117,7 @@ public:
             incoming.brainConfig.datacenterFragment) ||
         !prodigyValidateStatefulServingAuthorities(incoming.runtimeState.statefulServingAuthorities,
               incoming.servingRuntimeStates, incoming.runtimeState.generation) ||
+        !prodigyStatefulRetirementTombstonesWitnessed(incoming.runtimeState) ||
         validatePendingElasticAddressOperations(incoming.runtimeState, &incoming.brainConfig) == false ||
         elasticAddressSagaFencesRuntimeEnvironment(incoming.brainConfig.runtimeEnvironment) ||
         (brainConfig.clusterUUID != 0 && incomingHasPendingElasticOperations &&
@@ -11656,8 +12163,20 @@ public:
     {
       auto next = std::find_if(incoming.runtimeState.statefulServingAuthorities.begin(),
           incoming.runtimeState.statefulServingAuthorities.end(), [&](const auto& authority) {
-            return authority.deploymentID == previous.deploymentID;
+            return prodigyStatefulServingAuthoritySameScope(authority, previous);
           });
+      if (next == incoming.runtimeState.statefulServingAuthorities.end() &&
+          previous.phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+          std::all_of(previous.members.begin(), previous.members.end(), [&](const auto& member) {
+            return std::any_of(incoming.runtimeState.statefulServingAuthorities.begin(), incoming.runtimeState.statefulServingAuthorities.end(),
+                [&](const auto& value) {
+                  return value.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+                      prodigyStatefulServingAuthorityMatchesShard(value, previous.deploymentID, member.shardGroup) &&
+                      std::any_of(value.members.begin(), value.members.end(), [&](const auto& adopted) {
+                        return adopted.containerUUID == member.containerUUID && adopted.machineUUID == member.machineUUID;
+                      });
+                });
+          })) continue;
       if (next == incoming.runtimeState.statefulServingAuthorities.end() || next->revision < previous.revision ||
           (next->revision == previous.revision && *next != previous)) return false;
     }
@@ -12063,6 +12582,12 @@ public:
                 clusterPairRevocationOperationsPresent(), clusterPairRotationOperationsPresent()))) &&
            (masterAuthorityRuntimeState.statefulServingAuthorities.empty() ||
             (containerRetirementPeerCapabilityCurrent(peer) && peer->statefulServingAuthorityCapabilityAcknowledged)) &&
+           (std::none_of(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+                         masterAuthorityRuntimeState.statefulServingAuthorities.end(), [](const auto& authority) {
+              return authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+            }) || (containerRetirementPeerCapabilityCurrent(peer) &&
+                   peer->version >= ProdigyStatefulDataAuthorityMinimumVersion &&
+                   peer->statefulDataAuthorityCapabilityAcknowledged)) &&
            (!masterAuthorityRuntimeState.taskExecutions.contains(prodigyContainerRetirementJournalExecutionID) ||
             (containerRetirementPeerCapabilityCurrent(peer) && [&]() {
               ProdigyContainerRetirementJournal journal = {};
@@ -12374,7 +12899,7 @@ public:
     {
       // Followers persist the fence before acknowledging it, but cannot
       // infer that every commissioned peer has committed the same fence.
-      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration && !intent.killAcked) continue;
+      if (prodigyContainerRetirementIsPaired(intent.kind) && !intent.killAcked) continue;
       auto indexed = containers.find(intent.containerUUID);
       if (indexed == containers.end() || indexed->second == nullptr) continue;
       ContainerView *container = indexed->second;
@@ -12402,7 +12927,7 @@ public:
       // Preserve object lifetime for the existing destruction receipt owner.
       // It is no longer a serving or placement entry on this follower.
       owner->second->waitingOnContainers.insert_or_assign(container, ContainerState::destroyed);
-      if (intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration)
+      if (prodigyContainerRetirementIsPaired(intent.kind))
         owner->second->rebuildRecoveredContainerCounts();
     }
   }
@@ -12419,8 +12944,13 @@ public:
     container->lifetime = plan.lifetime;
     container->state = plan.state;
     container->runtimeReady = plan.runtimeReady;
+    container->declaredStatefulClientService = plan.declaredStatefulClientService;
+    container->declaredStatefulClientPort = plan.declaredStatefulClientPort;
     if (container->runtimeReady == false)
     {
+      container->statefulDataAuthorityReceipt = {};
+      container->statefulDataAuthorityReceiptIOGeneration = 0;
+      container->statefulDataAuthorityReceiptAuthorityEpoch = 0;
       container->clearStatefulTopologyCutoverBarrier();
     }
     container->machine = machine;
@@ -15764,6 +16294,10 @@ public:
       return false;
     }
 
+    StatefulDataAuthority desired;
+    if (desiredStatefulDataAuthority(deployment->plan.config.deploymentID(), desired) &&
+        (!statefulDataAuthorityPeersCapable() || !containerRetirementAuthorityAcknowledged())) return false;
+
     if (deploymentReplicationAcknowledgedByAuthoritativePeers(deployment) == false)
     {
       pushSpinApplicationProgressToMothership(
@@ -15827,7 +16361,11 @@ public:
                    statelessDeploymentAdmissionMatchesPlan(admission, deployment->plan) &&
                    statelessDeploymentAdmissionPlanIsCurrent(admission);
           });
-      if (!admitted) continue;
+      StatefulDataAuthority desired;
+      const bool pairAdmitted = desiredStatefulDataAuthority(deployment->plan.config.deploymentID(), desired) &&
+          desired.mode == StatefulDataAuthorityMode::catchupOnly && statefulDataAuthorityPeersCapable() &&
+          containerRetirementAuthorityAcknowledged();
+      if (!admitted && !pairAdmitted) continue;
       if (deploymentIsIndexedApplicationChainMember(deployment))
       {
         // Cold reconstruction owns an indexed NONE-state head.  It has the
@@ -38585,6 +39123,8 @@ public:
             bv->clearAuthorityElectionObservation();
           bv->placementPolicyCapabilityAcknowledged = false;
           bv->containerRetirementCapabilityAcknowledged = false;
+          bv->statefulServingAuthorityCapabilityAcknowledged = false;
+          bv->statefulDataAuthorityCapabilityAcknowledged = false;
           bv->statelessDeploymentAdmissionCapabilityAcknowledged = false;
           bv->pairedSourceRetirementCapabilityAcknowledged = false;
           bv->clusterPairEnrollmentCapabilityAcknowledged = false;
@@ -38601,7 +39141,8 @@ public:
           bv->containerRetirementCapabilityIOGeneration = 0;
           if (bv->version >= ProdigyBrainUpgradeCapabilityProtocolMinimumVersion)
           {
-            const uint64_t advertised = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+            const uint64_t advertised = (bv->version >= ProdigyStatefulDataAuthorityMinimumVersion ? uint64_t(16384) : 0) |
+                                      (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                       (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                       (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) : 0);
             Message::construct(bv->wBuffer, BrainTopic::advertiseCapabilities, advertised);
@@ -39268,7 +39809,8 @@ public:
               bv->version < ProdigyBrainUpgradeCapabilityProtocolMinimumVersion) break;
           uint64_t capabilities = 0;
           Message::extractArg<ArgumentNature::fixed>(args, capabilities);
-          const uint64_t supported = (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
+          const uint64_t supported = (bv->version >= ProdigyStatefulDataAuthorityMinimumVersion ? uint64_t(16384) : 0) |
+                                     (bv->version >= ProdigyPairedSourceRetirementCapabilityMinimumVersion ? 31 :
                                      (bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion ? 15 : 7)) |
                                      (bv->transportAEGISEnabled() ? uint64_t(32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192) : 0);
           Message::construct(bv->wBuffer, BrainTopic::acknowledgeCapabilities, capabilities & supported);
@@ -39298,6 +39840,8 @@ public:
           {
             bv->containerRetirementCapabilityAcknowledged = true;
             bv->statefulServingAuthorityCapabilityAcknowledged = (capabilities & uint64_t(4)) != 0;
+            bv->statefulDataAuthorityCapabilityAcknowledged =
+                bv->version >= ProdigyStatefulDataAuthorityMinimumVersion && (capabilities & uint64_t(16384)) != 0;
             bv->statelessDeploymentAdmissionCapabilityAcknowledged =
                 bv->version >= ProdigyStatelessDeploymentAdmissionCapabilityMinimumVersion && (capabilities & uint64_t(8)) != 0;
             bv->pairedSourceRetirementCapabilityAcknowledged =
@@ -42603,7 +43147,13 @@ public:
     const uint64_t deploymentID = pending->deploymentID;
     if (pendingMothershipSpinArtifactIsCurrent(pending))
     {
-      if (pending->statelessAdmission)
+      if (pending->statefulAdmission) {
+        auto query = pending->statefulAdmissionRequest; query.query = true; query.launchTarget = false;
+        auto receipt = statefulDataAuthorityOperation(query); receipt.failure = reason;
+        String encoded; BitseryEngine::serialize(encoded, receipt);
+        Message::construct(pending->stream->wBuffer, MothershipTopic::statefulDataAuthority, encoded);
+      }
+      else if (pending->statelessAdmission)
       {
         StatelessDeploymentAdmissionReceipt receipt = {};
         receipt.supported = true;
@@ -46034,19 +46584,84 @@ public:
           receipt.peersCapable = pairedSourceRetirementPeersCapable();
           if (args == message->terminal() && requestVersion == 1 && operationID != 0)
           {
+            (void)reconcileContainerRetirements();
             ProdigyContainerRetirementJournal journal = {};
             if (decodeContainerRetirementJournal(masterAuthorityRuntimeState, journal))
               if (const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, operationID))
               {
                 BitseryEngine::serialize(receipt.sealedFence, *fence);
+                if (fence->hasStatefulScope) {
+                  receipt.version = 2; ProdigyScopedPairedSourceRetirementFence scoped; scoped.fence = *fence;
+                  BitseryEngine::serialize(receipt.scopedFence, scoped);
+                }
                 receipt.sealed = masterAuthorityRuntimeStateDurable && receipt.peersCapable && containerRetirementAuthorityAcknowledged();
-                receipt.terminal = receipt.sealed && std::all_of(journal.intents.begin(), journal.intents.end(), [&](const auto& intent) {
-                  return intent.pairedOperationID != operationID || intent.killAcked;
-                });
+                receipt.terminal = receipt.sealed && prodigyPairedSourceRetirementFenceTerminalInValidatedJournal(journal, *fence);
+                if (fence->catchupTargetCompensation) {
+                  auto owner = deployments.find(fence->sourceDeploymentID);
+                  StatefulDataAuthority desired;
+                  if (owner != deployments.end() && owner->second &&
+                      desiredStatefulDataAuthority(fence->sourceDeploymentID, desired, fence->shardGroup) && desired.operationUUID == operationID)
+                    for (auto *container : owner->second->containers)
+                      if (container && container->shardGroup == fence->shardGroup) receipt.terminal = false;
+                }
               }
           }
           String serialized = {}; BitseryEngine::serialize(serialized, receipt);
           Message::construct(mothership->wBuffer, MothershipTopic::pullPairedSourceRetirement, serialized);
+          break;
+        }
+      case MothershipTopic::statefulDataAuthority:
+        {
+          String encoded, blob;
+          Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityOperation request, response;
+          if (args != message->terminal()) Message::extractToStringView(args, blob);
+          if (args != message->terminal() || !BitseryEngine::deserializeSafe(encoded, request) ||
+              (!request.launchTarget && !blob.empty()))
+            response.failure.assign("invalid stateful data authority operation"_ctv);
+          else if (!request.launchTarget) response = statefulDataAuthorityOperation(request);
+          else {
+            auto query = request; query.query = true; query.launchTarget = false;
+            response = statefulDataAuthorityOperation(query);
+            DeploymentPlan plan;
+            String digest;
+            auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+                masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+                  return value.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+                      prodigyStatefulServingAuthorityMatchesShard(value, request.deploymentID, request.authority.shardGroup);
+                });
+            const bool exact = response.accepted && !request.query &&
+                !statefulCatchupCompensationFenced(request.deploymentID, request.authority.shardGroup, request.authority.operationUUID) &&
+                request.authority.mode == StatefulDataAuthorityMode::catchupOnly &&
+                authority != masterAuthorityRuntimeState.statefulServingAuthorities.end() &&
+                request.expectedAuthorityGeneration == response.expectedAuthorityGeneration &&
+                request.expectedMasterUUID == response.expectedMasterUUID &&
+                request.expectedMasterBootNs == response.expectedMasterBootNs &&
+                BitseryEngine::deserializeSafe(request.deploymentPlan, plan) &&
+                prodigyComputeSHA256Hex(request.deploymentPlan, digest) && digest == authority->requestPlanSHA256 &&
+                plan.config.deploymentID() == request.deploymentID && !blob.empty();
+            if (!exact) response.failure.assign("target launch does not bind durable catchup admission and exact artifact request"_ctv);
+            else if (auto live = deployments.find(request.deploymentID); live != deployments.end() && live->second) {
+              // A previously admitted deployment may acquire a second shard,
+              // or rebuild a retained reverse target. Reuse its trusted image
+              // and ordinary scheduler; never instantiate another deployment.
+              if (live->second->plan.config.containerBlobSHA256 != plan.config.containerBlobSHA256 ||
+                  live->second->plan.config.containerBlobBytes != plan.config.containerBlobBytes ||
+                  !live->second->admitApplicationDataAuthorityShard(request.authority.shardGroup))
+                response.failure.assign("existing target cannot resume the exact catchup shard through its deployment owner"_ctv);
+            }
+            else if (!deployments.contains(request.deploymentID) && !pendingMothershipSpinArtifacts.contains(request.deploymentID)) {
+              pendingStatefulDeploymentAdmissionRequests.insert_or_assign(request.deploymentID, request);
+              String spinFrame;
+              Message::construct(spinFrame, MothershipTopic::spinApplication, plan.config.applicationID, request.deploymentPlan, blob);
+              mothershipHandler(mothership, reinterpret_cast<Message *>(spinFrame.data()));
+              pendingStatefulDeploymentAdmissionRequests.erase(request.deploymentID);
+              break; // Ordinary artifact owner sends the typed asynchronous reply.
+            }
+          }
+          String reply;
+          BitseryEngine::serialize(reply, response);
+          Message::construct(mothership->wBuffer, MothershipTopic::statefulDataAuthority, reply);
           break;
         }
       case MothershipTopic::preparePairedSourceRetirement:
@@ -46468,6 +47083,14 @@ public:
               delete deployment;
               return;
             }
+            if (auto pair = pendingStatefulDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
+                pair != pendingStatefulDeploymentAdmissionRequests.end()) {
+              auto receipt = pair->second; receipt.accepted = receipt.ready = false; receipt.failure = reasonText;
+              String encoded; BitseryEngine::serialize(encoded, receipt);
+              Message::construct(mothership->wBuffer, MothershipTopic::statefulDataAuthority, encoded);
+              pendingStatefulDeploymentAdmissionRequests.erase(pair);
+              delete deployment; return;
+            }
             auto requested = pendingStatelessDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
             if (requested != pendingStatelessDeploymentAdmissionRequests.end())
             {
@@ -46618,7 +47241,21 @@ public:
           {
             exactDurableStatelessAdmission = true;
           }
-          if (!exactDurableStatelessAdmission && deploymentIDAdmissionAllowed(deployment->plan) == false)
+          bool exactStatefulAdmission = false;
+          StatefulDataAuthorityOperation pairRequest;
+          if (auto requested = pendingStatefulDeploymentAdmissionRequests.find(deployment->plan.config.deploymentID());
+              requested != pendingStatefulDeploymentAdmissionRequests.end()) pairRequest = requested->second;
+          else if (existingPending && existingPending->statefulAdmission) pairRequest = existingPending->statefulAdmissionRequest;
+          if (pairRequest.launchTarget) {
+            auto query = pairRequest; query.query = true; query.launchTarget = false;
+            const auto admission = statefulDataAuthorityOperation(query);
+            String digest;
+            exactStatefulAdmission = admission.accepted && pairRequest.authority.mode == StatefulDataAuthorityMode::catchupOnly &&
+                pairRequest.deploymentID == deployment->plan.config.deploymentID() &&
+                prodigyComputeSHA256Hex(serializedPlan, digest) &&
+                serializedPlan == pairRequest.deploymentPlan && !deployments.contains(pairRequest.deploymentID);
+          }
+          if (!exactDurableStatelessAdmission && !exactStatefulAdmission && deploymentIDAdmissionAllowed(deployment->plan) == false)
           {
             rejectInvalidPlan("invalid plan: deploymentID already exists"_ctv);
             return;
@@ -46854,6 +47491,10 @@ public:
             pending->streamIncarnation = mothership->connectionIncarnation;
             pending->authorityEpoch = masterAuthorityEpoch;
             pending->deploymentID = deploymentID;
+            if (exactStatefulAdmission) {
+              pending->statefulAdmission = true;
+              pending->statefulAdmissionRequest = pairRequest;
+            }
             if (auto requested = pendingStatelessDeploymentAdmissionRequests.find(deploymentID);
                 requested != pendingStatelessDeploymentAdmissionRequests.end())
             {
@@ -47137,6 +47778,38 @@ public:
 
           deployment->plan.config.containerBlobSHA256 = trustedContainerBlobSHA256;
           deployment->plan.config.containerBlobBytes = trustedContainerBlobBytes;
+          if (pending->statefulAdmission) {
+            // Same artifact owner and normalized-plan persistence as ordinary
+            // deploy. Only the already durable pair may reserve this ID.
+            auto authority = std::find_if(masterAuthorityRuntimeState.statefulServingAuthorities.begin(),
+                masterAuthorityRuntimeState.statefulServingAuthorities.end(), [&](const auto& value) {
+                  return value.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+                      prodigyStatefulServingAuthorityMatchesShard(value, deploymentID, pending->statefulAdmissionRequest.authority.shardGroup);
+                });
+            DeploymentPlan requested;
+            if (authority == masterAuthorityRuntimeState.statefulServingAuthorities.end() ||
+                authority->phase != StatefulWorkerTopologyUpgradePhase::applicationDataAuthority ||
+                authority->sourceRetired || statefulCatchupCompensationFenced(deploymentID,
+                    pending->statefulAdmissionRequest.authority.shardGroup, pending->statefulAdmissionRequest.authority.operationUUID) ||
+                !prodigyStatefulDataAuthorityEqual(authority->dataAuthority, pending->statefulAdmissionRequest.authority) ||
+                !authority->members.empty() || !BitseryEngine::deserializeSafe(pending->statefulAdmissionRequest.deploymentPlan, requested) ||
+                requested.config.containerBlobSHA256 != trustedContainerBlobSHA256 ||
+                requested.config.containerBlobBytes != trustedContainerBlobBytes) {
+              rejectPendingMothershipSpinArtifact(pending, "pair target artifact or desired catchup authority changed"_ctv);
+              delete deployment; return;
+            }
+            String normalized, digest;
+            BitseryEngine::serialize(normalized, deployment->plan);
+            if (!prodigyComputeSHA256Hex(normalized, digest)) {
+              rejectPendingMothershipSpinArtifact(pending, "pair normalized target plan digest failed"_ctv);
+              delete deployment; return;
+            }
+            authority->targetConfig = deployment->plan.config;
+            authority->admittedPlanSHA256 = digest;
+            authority->revision = masterAuthorityRuntimeState.generation + 1;
+            deploymentPlans.insert_or_assign(deploymentID, deployment->plan);
+            commitMasterAuthorityStateChangeAsync({});
+          }
           if (pending->statelessAdmission && pending->statelessAdmissionDurable)
           {
             auto admitted = std::find_if(masterAuthorityRuntimeState.statelessDeploymentAdmissions.begin(),
@@ -47369,7 +48042,13 @@ public:
             queueBrainDeploymentReplication(trustedSerializedPlan, containerBlob);
           }
 
-          if (pending->statelessAdmission)
+          if (pending->statefulAdmission) {
+            auto query = pending->statefulAdmissionRequest; query.query = true; query.launchTarget = false;
+            auto receipt = statefulDataAuthorityOperation(query);
+            String encoded; BitseryEngine::serialize(encoded, receipt);
+            Message::construct(mothership->wBuffer, MothershipTopic::statefulDataAuthority, encoded);
+          }
+          else if (pending->statelessAdmission)
           {
             StatelessDeploymentAdmissionReceipt receipt = {};
             receipt.supported = true;
@@ -49484,6 +50163,28 @@ public:
             }
           }
 
+          break;
+        }
+      case NeuronTopic::statefulDataAuthority:
+        {
+          uint128_t uuid = 0;
+          String encoded;
+          Message::extractArg<ArgumentNature::fixed>(args, uuid);
+          Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityReceipt receipt;
+          auto live = containers.find(uuid);
+          if (args != terminal || !weAreMaster || neuron == nullptr || neuron->machine == nullptr ||
+              &neuron->machine->neuron != neuron || !machines.contains(neuron->machine) ||
+              !statefulServingResourceObservationSupported(neuron->machine) ||
+              live == containers.end() || !live->second || live->second->machine != neuron->machine ||
+              !BitseryEngine::deserializeSafe(encoded, receipt) || !prodigyStatefulDataAuthorityReceiptValid(receipt) ||
+              live->second->explicitStatefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+              !prodigyStatefulDataAuthorityEqual(receipt.authority, live->second->explicitStatefulTopology.dataAuthority)) break;
+          live->second->statefulDataAuthorityReceipt = std::move(receipt);
+          live->second->statefulDataAuthorityReceiptIOGeneration = neuron->ioGeneration;
+          live->second->statefulDataAuthorityReceiptAuthorityEpoch = masterAuthorityEpoch;
+          live->second->statefulDataAuthorityReceiptCrashCount = live->second->nCrashes;
+          (void)sealStatefulDataOwnershipReady(live->second->deploymentID, live->second->shardGroup);
           break;
         }
       case NeuronTopic::refreshContainerCredentials:

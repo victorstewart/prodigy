@@ -1777,14 +1777,20 @@ PAIR_PROBE
 # two currently-live VDC parent namespaces.
 pair_control_parse()
 {
-   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 15 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
+   [[ ( "$#" -eq 12 || "$#" -eq 14 || "$#" -eq 15 || "$#" -eq 19 || "$#" -eq 25 ) && "${EUID}" -eq 0 ]] || return 2
    pair_control_args=("${@:1:12}")
    pair_control_service_args=()
    pair_control_fault_delay_ms=""; pair_control_fault_duration_ms=""; pair_control_fault_direction=both
+   pair_control_fault_kind=drop; pair_control_fault_latency_ms=0; pair_control_fault_percentage_bps=0; pair_control_fault_seed=0
    if [[ "$#" -eq 25 ]]; then pair_control_service_args=("${@:13:13}"); fi
    if [[ "$#" -eq 14 || "$#" -eq 15 ]]; then
       pair_control_fault_delay_ms="${13}"; pair_control_fault_duration_ms="${14}"
       [[ "$#" -eq 15 ]] && pair_control_fault_direction="${15}"
+   fi
+   if [[ "$#" -eq 19 ]]; then
+      pair_control_fault_kind="${13}"; pair_control_fault_delay_ms="${14}"; pair_control_fault_duration_ms="${15}"
+      pair_control_fault_latency_ms="${16}"; pair_control_fault_percentage_bps="${17}"; pair_control_fault_seed="${18}"; pair_control_fault_direction="${19}"
+      pair_control_netem_validate || return 2
    fi
    pair_control_id="$1"; pair_control_first_uuid="$2"; pair_control_second_uuid="$3"
    pair_control_first_workspace="$4"; pair_control_second_workspace="$5"
@@ -2033,7 +2039,17 @@ PAIR_CONTROL_ADDRESSES
 
 pair_control_cleanup_inside()
 {
-   local status=0 side other_subnet gateway link expected route
+   local status=0 side other_subnet gateway link expected route netem_abandoned=0
+   if [[ -e "$pair_control_dir/netem-active" || -L "$pair_control_dir/netem-active" ]]; then
+      pair_control_netem_load_active || return 1
+      if [[ -e "/run/netns/${pair_control_router_ns:-}" ]]; then
+         # Refuse further topology teardown on foreign/changed qdisc state.
+         pair_control_netem_restore || return 1
+      else
+         [[ -e /run/netns/pc-first && -e /run/netns/pc-second ]] || return 1
+         netem_abandoned=1
+      fi
+   fi
    for side in first second; do
       [[ -e "/run/netns/pc-$side" ]] || continue
       if [[ "$side" == first ]]; then other_subnet="$pair_control_second_subnet"; gateway="${pair_control_first_router:-}"; link="${pair_control_first_link:-}"; else other_subnet="$pair_control_first_subnet"; gateway="${pair_control_second_router:-}"; link="${pair_control_second_link:-}"; fi
@@ -2098,8 +2114,18 @@ pair_control_cleanup_inside()
       [[ -e "/run/netns/pc-$side" ]] || continue
       link="${pair_control_first_link:-}"; [[ "$side" == first ]] || link="${pair_control_second_link:-}"
       [[ -n "$link" ]] && pair_control_remove_owned_link "$side" "$link" || status=1
+      if [[ "$netem_abandoned" == 1 ]]; then
+         if pair_link_presence "pc-$side" "$link"; then status=1; else [[ "$?" == 1 ]] || status=1; fi
+      fi
       umount "/run/netns/pc-$side" || status=1
    done
+   if [[ "$netem_abandoned" == 1 ]]; then
+      # A dead supervisor's private router mount may no longer exist. Its
+      # egress qdiscs cannot outlive deletion of both owned veth peers. Never
+      # claim absence merely because a fresh mount namespace has no netns file.
+      [[ "$status" == 0 ]] || return 1
+      pair_control_netem_forget_removed_links || return 1
+   fi
    [[ "$status" == 0 ]] && pair_write "$pair_control_dir/phase" removed
    return "$status"
 }
@@ -2677,6 +2703,229 @@ time.sleep(int(sys.argv[1]) / 1000)
 PAIR_CONTROL_FAULT_SLEEP
 }
 
+# Netem is confined to the pre-admitted router; callers cannot select an
+# interface or namespace. Fixed handles are private to this operation's netns.
+pair_control_netem_validate()
+{
+   python3 - "$pair_control_fault_kind" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" \
+      "$pair_control_fault_latency_ms" "$pair_control_fault_percentage_bps" "$pair_control_fault_seed" "$pair_control_fault_direction" <<'PAIR_CONTROL_NETEM_VALIDATE'
+import sys
+kind,onset,duration,latency,percentage,seed,direction=sys.argv[1:]
+assert kind in ('delay','loss','reorder') and direction in ('both','first-to-second','second-to-first')
+assert all(x.isascii() and x.isdecimal() and str(int(x))==x for x in (onset,duration,latency,percentage,seed))
+onset,duration,latency,percentage,seed=map(int,(onset,duration,latency,percentage,seed))
+assert 0<=onset<=30000 and 1<=duration<=60000 and 1<=seed<=2**32-1
+assert (1<=latency<=30000 if kind in ('delay','reorder') else latency==0)
+assert (1<=percentage<=10000 if kind in ('loss','reorder') else percentage==0)
+PAIR_CONTROL_NETEM_VALIDATE
+}
+
+pair_control_netem_tuple()
+{
+   printf 'operationID=%s kind=%s onsetMs=%s durationMs=%s latencyMs=%s percentageBps=%s seed=%s direction=%s\n' \
+      "$pair_control_id" "$pair_control_fault_kind" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" \
+      "$pair_control_fault_latency_ms" "$pair_control_fault_percentage_bps" "$pair_control_fault_seed" "$pair_control_fault_direction"
+}
+
+pair_control_netem_device()
+{
+   case "$1" in first) printf '%s\n' second0 ;; second) printf '%s\n' first0 ;; *) return 2 ;; esac
+}
+
+pair_control_netem_handle()
+{
+   case "$1" in first) printf '%s\n' 7d02: ;; second) printf '%s\n' 7d01: ;; *) return 2 ;; esac
+}
+
+pair_control_netem_scope()
+{
+   [[ "$pair_control_router_ns" == "pc-r-$(pair_control_tag)" &&
+      -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" &&
+      -e "/run/netns/$pair_control_router_ns" &&
+      "$(stat -Lc %i "/run/netns/$pair_control_router_ns")" == "$(<"$pair_control_dir/router-namespace")" ]]
+}
+
+pair_control_netem_intent()
+{
+   local side="$1" device index
+   pair_control_netem_scope || return 1
+   device="$(pair_control_netem_device "$side")" || return 1
+   index="$(ip -n "$pair_control_router_ns" -j link show dev "$device" | python3 -c 'import json,sys; x=json.load(sys.stdin); assert len(x)==1 and x[0]["ifindex"]>0; print(x[0]["ifindex"])')" || return 1
+   printf '%s routerInode=%s ifindex=%s egress=%s handle=%s\n' "$(pair_control_netem_tuple)" \
+      "$(<"$pair_control_dir/router-namespace")" "$index" "$device" "$(pair_control_netem_handle "$side")"
+}
+
+# Only default noqueue is an admissible root before add. The exact netem
+# readback includes defaults too: an extra impairment is never silently owned.
+pair_control_netem_state()
+{
+   local side="$1" state="$2" device json
+   pair_control_netem_scope || return 1
+   device="$(pair_control_netem_device "$side")" || return 1
+   json="$(ip netns exec "$pair_control_router_ns" tc -j qdisc show dev "$device")" || return 1
+   python3 - "$state" "$(pair_control_netem_handle "$side")" "$pair_control_fault_kind" \
+      "$pair_control_fault_latency_ms" "$pair_control_fault_percentage_bps" "$pair_control_fault_seed" "$json" <<'PAIR_CONTROL_NETEM_STATE'
+import json,math,sys
+state,handle,kind,latency,percentage,seed,raw=sys.argv[1:]
+rows=json.loads(raw); assert isinstance(rows,list)
+roots=[x for x in rows if x.get('root',False)]
+if state=='absent':
+    assert len(roots)==0 or (len(roots)==1 and roots[0]['kind']=='noqueue' and roots[0]['handle']=='0:')
+else:
+    assert state=='owned' and len(roots)==1
+    q=roots[0]; assert q['kind']=='netem' and q['handle']==handle
+    o=q['options']; keys={'limit','seed','ecn','gap'}
+    assert o['limit']==1000 and o['seed']==int(seed) and o['ecn'] is False
+    assert o['gap']==(1 if kind=='reorder' else 0)
+    def equal(a,b): assert math.isfinite(a) and math.isclose(a,b,rel_tol=1e-6,abs_tol=1e-8)
+    if kind in ('delay','reorder'):
+        keys.add('delay'); d=o['delay']; assert set(d)=={'delay','jitter','correlation'}
+        equal(d['delay'],int(latency)/1000); assert d['jitter']==0 and d['correlation']==0
+    if kind=='loss':
+        keys.add('loss-random'); p=o['loss-random']; assert set(p)=={'loss','correlation'}
+        equal(p['loss'],int(percentage)/10000); assert p['correlation']==0
+    if kind=='reorder':
+        keys.add('reorder'); p=o['reorder']; assert set(p)=={'reorder','correlation'}
+        equal(p['reorder'],int(percentage)/10000); assert p['correlation']==0
+    assert set(o)==keys
+PAIR_CONTROL_NETEM_STATE
+}
+
+pair_control_netem_preflight()
+{
+   local side help
+   pair_control_netem_validate && pair_control_netem_scope || return 1
+   command -v tc >/dev/null || return 1
+   # Parsing help never sends an RTM_NEWQDISC request. Kernel support is then
+   # proved by add + exact readback, with durable intent already in place.
+   help="$(ip netns exec "$pair_control_router_ns" tc qdisc add netem help 2>&1)" || :
+   [[ "$help" == *netem* && "$help" == *seed* && "$help" == *delay* && "$help" == *loss* && "$help" == *reorder* ]] || return 1
+   while IFS= read -r side; do pair_control_netem_state "$side" absent || return 1; done < <(pair_control_fault_selected_sides)
+}
+
+pair_control_netem_install()
+{
+   local side="$1" device handle intent percentage
+   device="$(pair_control_netem_device "$side")"; handle="$(pair_control_netem_handle "$side")" || return 1
+   intent="$(pair_control_netem_intent "$side")" || return 1
+   pair_control_netem_state "$side" absent || return 1
+   pair_write "$pair_control_dir/netem-$side-intent" "$intent" || return 1
+   local args=(qdisc add dev "$device" root handle "$handle" netem limit 1000)
+   printf -v percentage '%d.%02d%%' "$((pair_control_fault_percentage_bps / 100))" "$((pair_control_fault_percentage_bps % 100))"
+   case "$pair_control_fault_kind" in
+      delay) args+=(delay "${pair_control_fault_latency_ms}ms") ;;
+      loss) args+=(loss random "$percentage" 0%) ;;
+      reorder) args+=(delay "${pair_control_fault_latency_ms}ms" reorder "$percentage" 0%) ;;
+      *) return 2 ;;
+   esac
+   args+=(seed "$pair_control_fault_seed")
+   ip netns exec "$pair_control_router_ns" tc "${args[@]}" || return 1
+   pair_control_netem_state "$side" owned || return 1
+   pair_write "$pair_control_dir/netem-$side-installed" "$intent"
+}
+
+pair_control_netem_remove()
+{
+   local side="$1" intent device handle path="$pair_control_dir/netem-$1"
+   if [[ ! -e "$path-intent" && ! -L "$path-intent" && ! -e "$path-installed" && ! -L "$path-installed" ]]; then
+      pair_control_netem_state "$side" absent; return
+   fi
+   intent="$(pair_control_netem_intent "$side")" || return 1
+   [[ -f "$path-intent" && ! -L "$path-intent" && "$(<"$path-intent")" == "$intent" ]] || return 1
+   if [[ -e "$path-installed" || -L "$path-installed" ]]; then
+      [[ -f "$path-installed" && ! -L "$path-installed" && "$(<"$path-installed")" == "$intent" ]] || return 1
+   fi
+   if ! pair_control_netem_state "$side" absent 2>/dev/null; then
+      pair_control_netem_state "$side" owned || return 1
+      device="$(pair_control_netem_device "$side")"; handle="$(pair_control_netem_handle "$side")" || return 1
+      # Never replace/change, and never delete a root with another handle.
+      ip netns exec "$pair_control_router_ns" tc qdisc del dev "$device" root handle "$handle" || return 1
+      pair_control_netem_state "$side" absent || return 1
+   fi
+   rm -f -- "$path-installed" "$path-intent"
+}
+
+pair_control_netem_restore()
+{
+   [[ -f "$pair_control_dir/netem-active" && ! -L "$pair_control_dir/netem-active" &&
+      "$(<"$pair_control_dir/netem-active")" == "$(pair_control_netem_tuple)" ]] || return 1
+   local side status=0
+   while IFS= read -r side; do pair_control_netem_remove "$side" || status=1; done < <(pair_control_fault_selected_sides)
+   [[ "$status" == 0 ]] || return 1
+   pair_write "$pair_control_dir/netem-restored" "$(pair_control_netem_tuple) restored=ABSENT" || return 1
+   rm -f -- "$pair_control_dir/netem-active"
+}
+
+pair_control_netem_load_active()
+{
+   [[ -f "$pair_control_dir/netem-active" && ! -L "$pair_control_dir/netem-active" ]] || return 1
+   local operation kind onset duration latency percentage seed direction extra
+   read -r operation kind onset duration latency percentage seed direction extra < "$pair_control_dir/netem-active" || return 1
+   [[ -z "$extra" && "$operation" == "operationID=$pair_control_id" ]] || return 1
+   pair_control_fault_kind="${kind#kind=}"; pair_control_fault_delay_ms="${onset#onsetMs=}"; pair_control_fault_duration_ms="${duration#durationMs=}"
+   pair_control_fault_latency_ms="${latency#latencyMs=}"; pair_control_fault_percentage_bps="${percentage#percentageBps=}"; pair_control_fault_seed="${seed#seed=}"
+   pair_control_fault_direction="${direction#direction=}"
+   pair_control_netem_validate && [[ "$(<"$pair_control_dir/netem-active")" == "$(pair_control_netem_tuple)" ]]
+}
+
+pair_control_netem_forget_removed_links()
+{
+   local side path
+   [[ -f "$pair_control_dir/router-namespace" && ! -L "$pair_control_dir/router-namespace" ]] || return 1
+   for side in first second; do
+      # cleanup_inside has verified both owned peers absent before unmounting
+      # the matching parent namespaces; validate the abandoned intent too.
+      path="$pair_control_dir/netem-$side"
+      [[ ! -L "$path-intent" && ! -L "$path-installed" ]] || return 1
+      if [[ -e "$path-intent" || -e "$path-installed" ]]; then
+         [[ -f "$path-intent" ]] || return 1
+         python3 - "$(<"$path-intent")" "$(pair_control_netem_tuple)" \
+            "$(<"$pair_control_dir/router-namespace")" "$(pair_control_netem_device "$side")" "$(pair_control_netem_handle "$side")" <<'PAIR_CONTROL_NETEM_FORGET'
+import re,sys
+raw,base,inode,device,handle=sys.argv[1:]
+assert re.fullmatch(re.escape(base+' routerInode='+inode)+r' ifindex=[1-9][0-9]*'+re.escape(' egress='+device+' handle='+handle),raw)
+PAIR_CONTROL_NETEM_FORGET
+         [[ "$?" == 0 ]] || return 1
+         if [[ -e "$path-installed" ]]; then [[ -f "$path-installed" && "$(<"$path-installed")" == "$(<"$path-intent")" ]] || return 1; fi
+         rm -f -- "$path-installed" "$path-intent"
+      fi
+   done
+   pair_write "$pair_control_dir/netem-restored" "$(pair_control_netem_tuple) restored=ABSENT ownedPeersRemoved=1" || return 1
+   rm -f -- "$pair_control_dir/netem-active"
+}
+
+pair_control_netem_inside()
+{
+   pair_control_query_inside >/dev/null || return 1
+   [[ ! -e "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" &&
+      ! -e "$pair_control_dir/netem-active" && ! -L "$pair_control_dir/netem-active" ]] || return 1
+   pair_control_netem_preflight || return 1
+   local side begin end installed="" restored="" device handle
+   for side in first second; do
+      [[ ! -e "$pair_control_dir/netem-$side-intent" && ! -L "$pair_control_dir/netem-$side-intent" &&
+         ! -e "$pair_control_dir/netem-$side-installed" && ! -L "$pair_control_dir/netem-$side-installed" ]] || return 1
+   done
+   pair_write "$pair_control_dir/netem-active" "$(pair_control_netem_tuple)" || return 1
+   trap 'pair_control_netem_restore' EXIT; trap 'exit 130' TERM INT HUP
+   pair_control_fault_sleep "$pair_control_fault_delay_ms" || return 1
+   while IFS= read -r side; do
+      pair_control_netem_install "$side" || return 1
+      device="$(pair_control_netem_device "$side")"; handle="$(pair_control_netem_handle "$side")" || return 1
+      installed+="${installed:+,}$device:${handle}netem"; restored+="${restored:+,}$device:${handle}ABSENT"
+   done < <(pair_control_fault_selected_sides)
+   begin="$(pair_control_fault_monotonic_ns)" || return 1
+   pair_control_fault_sleep "$pair_control_fault_duration_ms" || return 1
+   # Bracket only the interval when all selected qdiscs remain installed.
+   while IFS= read -r side; do pair_control_netem_state "$side" owned || return 1; done < <(pair_control_fault_selected_sides)
+   end="$(pair_control_fault_monotonic_ns)" || return 1
+   pair_control_netem_restore || return 1
+   pair_write "$pair_control_dir/netem-last" "$(pair_control_netem_tuple) beginNs=$begin endNs=$end installQdisc=$installed restoreQdisc=$restored" || return 1
+   printf 'PAIR_CONTROL_FAULT operationID=%s clock=CLOCK_BOOTTIME kind=%s onsetMs=%s durationMs=%s latencyMs=%s percentageBps=%s seed=%s direction=%s installQdisc=%s restoreQdisc=%s beginNs=%s endNs=%s\n' \
+      "$pair_control_id" "$pair_control_fault_kind" "$pair_control_fault_delay_ms" "$pair_control_fault_duration_ms" \
+      "$pair_control_fault_latency_ms" "$pair_control_fault_percentage_bps" "$pair_control_fault_seed" "$pair_control_fault_direction" "$installed" "$restored" "$begin" "$end"
+   trap - EXIT TERM INT HUP
+}
+
 pair_control_fault_selected_sides()
 {
    case "$pair_control_fault_direction" in
@@ -2779,6 +3028,8 @@ pair_control_fault_restore_inside()
 
 pair_control_fault_inside()
 {
+   if [[ "${pair_control_fault_kind:-drop}" != drop ]]; then pair_control_netem_inside; return; fi
+   [[ ! -e "$pair_control_dir/netem-active" && ! -L "$pair_control_dir/netem-active" ]] || return 1
    pair_control_query_inside >/dev/null || return 1
    [[ ! -e "$pair_control_dir/fault-active" && ! -L "$pair_control_dir/fault-active" ]] || return 1
    local journal side rule begin end install_witness restore_witness

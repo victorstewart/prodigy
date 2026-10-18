@@ -72,8 +72,149 @@ static ProdigyStatefulServingAuthority authorityFor(const Vector<BrainReplicated
   return authority;
 }
 
+static String digest(char value)
+{
+  String result; for (uint32_t index = 0; index < 64; ++index) result.append(value); return result;
+}
+
+static ProdigyStatefulServingAuthority applicationAuthority(uint32_t shard, StatefulDataAuthorityMode mode,
+    Vector<BrainReplicatedContainerRuntimeState>& states)
+{
+  states = cohort(StatefulWorkerTopologyUpgradePhase::none);
+  ProdigyStatefulServingAuthority result;
+  result.applicationID = 3; result.operationID = 700 + shard; result.revision = 10;
+  result.phase = StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+  result.sourceEpoch = result.targetEpoch = 1;
+  result.pairIntentSHA256 = digest('a'); result.sourceFenceReceiptSHA256 = digest('b');
+  result.admittedPlanSHA256 = result.requestPlanSHA256 = digest('c');
+  auto& data = result.dataAuthority;
+  data.operationUUID = result.operationID; data.datasetUUID = 20; data.snapshotUUID = 21;
+  data.sourceClusterUUID = 30; data.targetClusterUUID = 40; data.authorityEpoch = 5; data.shardGroup = shard;
+  data.mode = mode; data.contractSHA256 = digest('d'); data.shardManifestSHA256 = digest('e');
+  const bool source = mode == StatefulDataAuthorityMode::fenced || mode == StatefulDataAuthorityMode::snapshotPreparing;
+  const bool serving = mode == StatefulDataAuthorityMode::writeOwner || mode == StatefulDataAuthorityMode::snapshotPreparing;
+  data.localClusterUUID = source ? data.sourceClusterUUID : data.targetClusterUUID;
+  data.writeOwnerClusterUUID = mode == StatefulDataAuthorityMode::writeOwner ? data.targetClusterUUID : data.sourceClusterUUID;
+  if (mode != StatefulDataAuthorityMode::snapshotPreparing) data.snapshotBoundarySHA256 = digest('f');
+  if (!source) data.requiredAppliedWatermarkSHA256 = digest('f');
+  for (uint32_t index = 0; index < states.size(); ++index) {
+    auto& state = states[index]; auto& plan = state.plan;
+    plan.config.applicationID = 3; plan.uuid += uint128_t(shard + 1) * 1000;
+    plan.shardGroup = shard; plan.statefulTopology.shardGroup = shard;
+    plan.statefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+    plan.statefulTopology.dataAuthority = data;
+    plan.declaredStatefulClientService = 99; plan.declaredStatefulClientPort = 1234 + index;
+    plan.statefulMeshRoles.client = serving && index == 0 ? 99 : 0;
+    plan.advertisements.clear();
+    if (serving && index == 0) plan.advertisements.emplace(99, Advertisement(99, ContainerState::healthy, ContainerState::destroying, 1234));
+    ProdigyStatefulServingAuthorityMember member;
+    member.containerUUID = plan.uuid; member.machineUUID = state.machineUUID; member.shardGroup = shard;
+    member.isSource = source; member.advertiseClient = serving && index == 0;
+    check(prodigyStatefulServingRuntimeDigest(state, member.planSHA256), "app scoped member digest");
+    result.members.push_back(member);
+  }
+  result.deploymentID = states.front().plan.config.deploymentID(); result.targetConfig = states.front().plan.config;
+  return result;
+}
+
+static void testApplicationShardAuthority()
+{
+  Vector<BrainReplicatedContainerRuntimeState> firstStates, secondStates;
+  auto first = applicationAuthority(1, StatefulDataAuthorityMode::writeOwner, firstStates);
+  auto second = applicationAuthority(2, StatefulDataAuthorityMode::catchupOnly, secondStates);
+  check(prodigyValidateStatefulServingAuthority(first, firstStates, 10), "promoted shard owns one exact serving cohort");
+  check(!prodigyStatefulServingClientPublicationReady(first), "desired writer is not an ownership-ready publication receipt");
+  auto pendingWriter = firstStates.front().plan;
+  prodigyProjectStatefulServingClientPublication(first, pendingWriter);
+  check(pendingWriter.statefulMeshRoles.client == 0 && !pendingWriter.advertisements.contains(99) &&
+      pendingWriter.declaredStatefulClientPort == 1234 &&
+      pendingWriter.statefulTopology.dataAuthority.mode == StatefulDataAuthorityMode::writeOwner &&
+      firstStates.front().plan.advertisements.contains(99),
+      "pending writer dispatch preserves permission and private listener while withholding only discovery");
+  Vector<StatefulDataAuthorityMemberReceipt> ownershipReceipts;
+  for (const auto& member : first.members) {
+    StatefulDataAuthorityMemberReceipt observed;
+    observed.containerUUID = member.containerUUID; observed.machineUUID = member.machineUUID;
+    observed.receipt.authority = first.dataAuthority; observed.receipt.ready = true;
+    observed.receipt.snapshotReceiptSHA256 = first.dataAuthority.snapshotBoundarySHA256;
+    observed.receipt.appliedWatermarkSHA256 = first.dataAuthority.requiredAppliedWatermarkSHA256;
+    ownershipReceipts.push_back(observed);
+  }
+  check(prodigyStatefulServingOwnershipReadyReceiptsValid(first, ownershipReceipts), "exact three-member ownership ready proof admitted");
+  auto wrongOwnership = ownershipReceipts; wrongOwnership.pop_back();
+  check(!prodigyStatefulServingOwnershipReadyReceiptsValid(first, wrongOwnership), "partial ownership proof cannot publish");
+  wrongOwnership = ownershipReceipts; wrongOwnership[1] = wrongOwnership[0];
+  check(!prodigyStatefulServingOwnershipReadyReceiptsValid(first, wrongOwnership), "duplicate member proof cannot publish");
+  wrongOwnership = ownershipReceipts; wrongOwnership[0].receipt.authority.authorityEpoch--;
+  check(!prodigyStatefulServingOwnershipReadyReceiptsValid(first, wrongOwnership), "stale authority proof cannot publish");
+  wrongOwnership = ownershipReceipts; wrongOwnership[0].machineUUID++;
+  check(!prodigyStatefulServingOwnershipReadyReceiptsValid(first, wrongOwnership), "foreign incarnation cohort proof cannot publish");
+  first.ownershipReadyReceiptSHA256 = digest('9');
+  auto readyWriter = firstStates.front().plan;
+  prodigyProjectStatefulServingClientPublication(first, readyWriter);
+  check(prodigyStatefulServingClientPublicationReady(first) && readyWriter.advertisements.contains(99),
+      "sealed ownership receipt permits the existing desired client projection");
+  auto scopedFailover = first; auto scopedStates = firstStates;
+  check(prodigyStatefulServingSelectClient(scopedFailover, scopedStates, 1, first.members[1].containerUUID) &&
+      scopedStates[1].plan.advertisements.at(99).port == 1235 && scopedStates[1].plan.statefulMeshRoles.client == 99 &&
+      scopedStates[0].plan.statefulMeshRoles.client == 0 && !scopedStates[0].plan.advertisements.contains(99) &&
+      scopedFailover.ownershipReadyReceiptSHA256 == first.ownershipReadyReceiptSHA256,
+      "shard follower promotion reuses the exact private listener and durable ownership seal");
+  check(!prodigyStatefulServingSelectClient(scopedFailover, scopedStates, 2, first.members[1].containerUUID),
+      "client failover cannot select another shard");
+  auto wrongPayload = scopedStates; wrongPayload.push_back(secondStates.front());
+  check(!prodigyStatefulServingSelectClient(scopedFailover, wrongPayload, 1, first.members[1].containerUUID),
+      "client failover rejects sibling payload rather than replacing its authority");
+  ProdigyStatefulServingAuthority restoredOwner; String ownerBytes; BitseryEngine::serialize(ownerBytes, scopedFailover);
+  check(BitseryEngine::deserializeSafe(ownerBytes, restoredOwner) && restoredOwner == scopedFailover &&
+      prodigyStatefulServingClientPublicationReady(restoredOwner), "cold restart preserves exact activation seal and scoped follower selection");
+  check(prodigyValidateStatefulServingAuthority(second, secondStates, 10), "next shard starts as nonserving target");
+  for (const auto& state : secondStates) {
+    ContainerParameters parameters = {};
+    parameters.statefulMeshRoles = state.plan.statefulMeshRoles;
+    parameters.statefulMeshRoles.client = 0;
+    parameters.statefulTopology = state.plan.statefulTopology;
+    check(prodigyProjectStatefulDataClientPort(state.plan, parameters) && parameters.statefulMeshRoles.client == 0 &&
+        parameters.advertisesOnPorts.at(99) == state.plan.declaredStatefulClientPort && !state.plan.advertisements.contains(99),
+        "catchup startup retains exact private IPv6 client port without an advertiser or client role");
+    String encoded; BitseryEngine::serialize(encoded, parameters); ContainerParameters decoded = {};
+    check(BitseryEngine::deserializeSafe(encoded, decoded) && decoded.advertisesOnPorts.at(99) == state.plan.declaredStatefulClientPort &&
+        decoded.statefulMeshRoles.client == 0 && prodigyStatefulDataAuthorityEqual(decoded.statefulTopology.dataAuthority, second.dataAuthority),
+        "full startup codec preserves private port and catchup-only authority");
+  }
+  auto pending = second; pending.members.clear();
+  check(prodigyValidateStatefulServingAuthority(pending, {}, 10), "empty desired target authority precedes construction");
+  for (uint32_t count = 1; count <= 3; ++count) {
+    auto partial = second; partial.members.resize(count); auto plans = secondStates; plans.resize(count);
+    check(prodigyValidateStatefulServingAuthority(partial, plans, 10), "each exact target member persists before serial launch");
+  }
+  Vector<BrainReplicatedContainerRuntimeState> all = firstStates;
+  all.insert(all.end(), secondStates.begin(), secondStates.end());
+  check(prodigyValidateStatefulServingAuthorities({first, second}, all, 10), "serial shard B cannot overwrite promoted shard A");
+  check(!prodigyValidateStatefulServingAuthorities({first, first, second}, all, 10), "duplicate shard scope rejects");
+  auto premature = secondStates;
+  premature.front().plan.advertisements.emplace(99, Advertisement(99, ContainerState::healthy, ContainerState::destroying, 1234));
+  check(!prodigyValidateStatefulServingAuthority(second, premature, 10), "catchup target cannot advertise clients before owner receipt");
+  Vector<BrainReplicatedContainerRuntimeState> oldSource;
+  auto retired = applicationAuthority(1, StatefulDataAuthorityMode::fenced, oldSource);
+  retired.sourceRetired = true; retired.members.clear();
+  check(prodigyValidateStatefulServingAuthority(retired, {}, 10), "terminal source tombstone needs no restartable cohort");
+  check(prodigyValidateStatefulServingAuthorities({retired, second}, secondStates, 10), "retired shard A coexists with admitted shard B");
+  all = secondStates; all.push_back(oldSource.front());
+  check(!prodigyValidateStatefulServingAuthorities({retired, second}, all, 10), "stale retired source UUID cannot reappear in cold payload");
+  ProdigyPersistentMasterAuthorityPackage saved, restored;
+  saved.runtimeState.generation = 10; saved.runtimeState.statefulServingAuthorities = {retired, second};
+  saved.servingRuntimeStates = secondStates;
+  String encoded; BitseryEngine::serialize(encoded, saved);
+  check(BitseryEngine::deserializeSafe(encoded, restored) &&
+      prodigyValidateStatefulServingAuthorities(restored.runtimeState.statefulServingAuthorities, restored.servingRuntimeStates, 10) &&
+      restored.runtimeState.statefulServingAuthorities[0].sourceRetired,
+      "cold/master recovery preserves independent shard scopes and terminal source fence");
+}
+
 int main()
 {
+  testApplicationShardAuthority();
   const auto steadyPhase = StatefulWorkerTopologyUpgradePhase::none;
   const auto bluePhase = StatefulWorkerTopologyUpgradePhase::blueDraining;
   const auto greenPhase = StatefulWorkerTopologyUpgradePhase::greenBootstrap;

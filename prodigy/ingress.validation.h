@@ -277,6 +277,9 @@ static bool validateMothershipPayload(uint16_t rawTopic, uint8_t *args, uint8_t 
 
   switch (MothershipTopic(rawTopic))
   {
+    case MothershipTopic::statefulDataAuthority:
+      return consumeVariableBounded(cursor, terminal, 2 * 1024 * 1024) &&
+             (cursor == terminal || consumeVariable(cursor, terminal)) && cursor == terminal;
     case MothershipTopic::configure:
     case MothershipTopic::upsertMachineSchemas:
     case MothershipTopic::deltaMachineBudget:
@@ -735,6 +738,12 @@ static bool validateNeuronPayloadForBrain(uint16_t rawTopic, uint8_t *args, uint
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::statefulDataAuthority:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+      }
     case NeuronTopic::cousinSessionRequest:
     case NeuronTopic::cousinSessionAck:
       {
@@ -1004,6 +1013,12 @@ static bool validateNeuronPayloadForNeuron(uint16_t rawTopic, uint8_t *args, uin
 
   switch (NeuronTopic(rawTopic))
   {
+    case NeuronTopic::statefulDataAuthority:
+      {
+        uint128_t containerUUID = 0;
+        return extractFixed(cursor, terminal, containerUUID) && containerUUID != 0 &&
+            consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
+      }
     case NeuronTopic::cousinSessionCommand:
       {
         uint128_t containerUUID = 0;
@@ -1338,6 +1353,8 @@ static bool validateContainerPayloadForNeuron(uint16_t rawTopic, uint8_t *args, 
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::statefulDataAuthority:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
     case ContainerTopic::cousinSessionRequest:
     case ContainerTopic::cousinSessionAck:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
@@ -1395,6 +1412,8 @@ static bool validateContainerPayloadForHub(uint16_t rawTopic, uint8_t *args, uin
 
   switch (ContainerTopic(rawTopic))
   {
+    case ContainerTopic::statefulDataAuthority:
+      return consumeVariableBounded(cursor, terminal, 4096) && cursor == terminal;
     case ContainerTopic::cousinSessionCommand:
       return consumeVariableBounded(cursor, terminal, ProdigyCousinSessionMaximumBytes) && cursor == terminal;
     case ContainerTopic::none:

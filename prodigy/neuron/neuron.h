@@ -4950,6 +4950,22 @@ public:
 
           break;
         }
+      case ContainerTopic::statefulDataAuthority:
+        {
+          String encoded;
+          Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityReceipt receipt;
+          if (args != terminal || !brain ||
+              !BitseryEngine::deserializeSafe(encoded, receipt) ||
+              !prodigyStatefulDataAuthorityReceiptValid(receipt) ||
+              container->plan.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+              !prodigyStatefulDataAuthorityEqual(receipt.authority, container->plan.statefulTopology.dataAuthority)) break;
+          // Container identity comes from the local control socket, never the
+          // payload. The Brain rechecks the owning authenticated Neuron.
+          Message::construct(brain->wBuffer, NeuronTopic::statefulDataAuthority, container->plan.uuid, encoded);
+          Ring::queueSend(brain);
+          break;
+        }
       case ContainerTopic::resourceDeltaAck:
         {
           bool accepted = false;
@@ -6102,6 +6118,34 @@ public:
           if (args != terminal || !BitseryEngine::deserializeSafe(serialized, command) ||
               !prodigyCousinSessionLocalCommandValid(command)) { if (brain) queueCloseIfActive(brain); break; }
           receiveCousinSessionLocalCommand(containerUUID, command);
+          break;
+        }
+      case NeuronTopic::statefulDataAuthority:
+        {
+          uint128_t uuid = 0;
+          String encoded;
+          Message::extractArg<ArgumentNature::fixed>(args, uuid);
+          Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityReceipt command;
+          auto live = containers.find(uuid);
+          if (args != terminal || live == containers.end() || !live->second ||
+              !BitseryEngine::deserializeSafe(encoded, command) || command.ready ||
+              !command.snapshotReceiptSHA256.empty() || !command.appliedWatermarkSHA256.empty() ||
+              !command.fenceReceiptSHA256.empty() || !command.cleanupReceiptSHA256.empty() || !prodigyStatefulDataAuthorityValid(command.authority) ||
+              (live->second->plan.config.applicationID != 3 && live->second->plan.config.applicationID != 4) ||
+              live->second->plan.shardGroup != command.authority.shardGroup ||
+              command.authority.localClusterUUID != controlTransportCredentials.self.clusterUUID) break;
+          auto& topology = live->second->plan.statefulTopology;
+          if (topology.servingMode == StatefulTopologyServingMode::applicationDataAuthority
+              ? !prodigyStatefulDataAuthorityCanAdvance(topology.dataAuthority, command.authority)
+              : command.authority.mode != StatefulDataAuthorityMode::snapshotPreparing) break;
+          // Brain sends this projection only after its existing durable serving
+          // package and exact cohort have peer ACKs. That package is the plan
+          // persistence owner; Neuron updates its retained inventory projection.
+          topology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+          topology.dataAuthority = command.authority;
+          Message::construct(live->second->wBuffer, ContainerTopic::statefulDataAuthority, encoded);
+          Ring::queueSend(live->second);
           break;
         }
       case NeuronTopic::cousinSessionControlSend:

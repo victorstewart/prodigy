@@ -19,6 +19,7 @@
 #include <prodigy/transport.credentials.h>
 #include <prodigy/biphasal.key.h>
 #include <prodigy/server.state.h>
+#include <prodigy/sha256.digest.h>
 #include <switchboard/common/constants.h>
 
 #ifndef PRODIGY_ENABLE_CREATE_TIMING_ATTRIBUTION
@@ -4111,8 +4112,214 @@ enum class StatefulTopologyServingMode : uint8_t {
   none,
   serve,
   catchupOnly,
-  drainOnly
+  drainOnly,
+  // Explicit versioned tail. Existing topology encodings remain unchanged.
+  applicationDataAuthority
 };
+
+enum class StatefulDataAuthorityMode : uint8_t {
+  retainedSource = 1,
+  catchupOnly = 2,
+  writeOwner = 3,
+  fenced = 4,
+  snapshotPreparing = 5
+};
+
+// Application data authority is separate from network reachability. Hashes
+// bind the application's canonical sorted UUID->durable-head map; Prodigy
+// neither reconstructs that map nor infers a write fence from healthy replicas.
+class StatefulDataAuthority {
+public:
+  uint32_t contractVersion = 1;
+  uint128_t operationUUID = 0;
+  uint128_t previousOperationUUID = 0;
+  uint64_t previousAuthorityEpoch = 0;
+  uint128_t datasetUUID = 0;
+  uint128_t snapshotUUID = 0;
+  uint128_t sourceClusterUUID = 0;
+  uint128_t targetClusterUUID = 0;
+  uint128_t localClusterUUID = 0;
+  uint128_t writeOwnerClusterUUID = 0;
+  uint64_t authorityEpoch = 0;
+  uint32_t shardGroup = 0;
+  StatefulDataAuthorityMode mode = StatefulDataAuthorityMode::catchupOnly;
+  String contractSHA256;
+  String shardManifestSHA256;
+  String snapshotBoundarySHA256;
+  String requiredAppliedWatermarkSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthority& authority)
+{
+  serializer.value4b(authority.contractVersion);
+  serializer.value16b(authority.operationUUID);
+  serializer.value16b(authority.previousOperationUUID);
+  serializer.value8b(authority.previousAuthorityEpoch);
+  serializer.value16b(authority.datasetUUID);
+  serializer.value16b(authority.snapshotUUID);
+  serializer.value16b(authority.sourceClusterUUID);
+  serializer.value16b(authority.targetClusterUUID);
+  serializer.value16b(authority.localClusterUUID);
+  serializer.value16b(authority.writeOwnerClusterUUID);
+  serializer.value8b(authority.authorityEpoch);
+  serializer.value4b(authority.shardGroup);
+  serializer.value1b(authority.mode);
+  serializer.text1b(authority.contractSHA256, 64);
+  serializer.text1b(authority.shardManifestSHA256, 64);
+  serializer.text1b(authority.snapshotBoundarySHA256, 64);
+  serializer.text1b(authority.requiredAppliedWatermarkSHA256, 64);
+}
+
+static inline bool prodigyStatefulDataAuthorityValid(const StatefulDataAuthority& authority)
+{
+  if (authority.contractVersion != 1 || authority.operationUUID == 0 ||
+      authority.datasetUUID == 0 || authority.snapshotUUID == 0 ||
+      ((authority.previousOperationUUID == 0) != (authority.previousAuthorityEpoch == 0)) ||
+      (authority.previousAuthorityEpoch != 0 && authority.authorityEpoch <= authority.previousAuthorityEpoch) ||
+      authority.sourceClusterUUID == 0 || authority.targetClusterUUID == 0 ||
+      authority.sourceClusterUUID == authority.targetClusterUUID || authority.authorityEpoch == 0 ||
+      (authority.localClusterUUID != authority.sourceClusterUUID && authority.localClusterUUID != authority.targetClusterUUID) ||
+      (authority.writeOwnerClusterUUID != authority.sourceClusterUUID && authority.writeOwnerClusterUUID != authority.targetClusterUUID) ||
+      !prodigyIsSHA256HexDigest(authority.contractSHA256) ||
+      !prodigyIsSHA256HexDigest(authority.shardManifestSHA256)) return false;
+  if (authority.mode == StatefulDataAuthorityMode::snapshotPreparing)
+    return authority.localClusterUUID == authority.sourceClusterUUID &&
+        authority.writeOwnerClusterUUID == authority.sourceClusterUUID &&
+        authority.snapshotBoundarySHA256.empty() && authority.requiredAppliedWatermarkSHA256.empty();
+  if (authority.mode == StatefulDataAuthorityMode::retainedSource)
+    return authority.localClusterUUID == authority.sourceClusterUUID &&
+        (authority.snapshotBoundarySHA256.empty() || prodigyIsSHA256HexDigest(authority.snapshotBoundarySHA256)) &&
+        (authority.writeOwnerClusterUUID == authority.sourceClusterUUID ? authority.requiredAppliedWatermarkSHA256.empty() :
+         (prodigyIsSHA256HexDigest(authority.snapshotBoundarySHA256) && prodigyIsSHA256HexDigest(authority.requiredAppliedWatermarkSHA256)));
+  if (!prodigyIsSHA256HexDigest(authority.snapshotBoundarySHA256) ||
+      (authority.mode != StatefulDataAuthorityMode::fenced &&
+       !prodigyIsSHA256HexDigest(authority.requiredAppliedWatermarkSHA256)) ||
+      (authority.mode == StatefulDataAuthorityMode::fenced && !authority.requiredAppliedWatermarkSHA256.empty())) return false;
+  switch (authority.mode) {
+    case StatefulDataAuthorityMode::retainedSource:
+      return authority.localClusterUUID == authority.sourceClusterUUID &&
+             authority.writeOwnerClusterUUID == authority.sourceClusterUUID;
+    case StatefulDataAuthorityMode::catchupOnly:
+      return authority.localClusterUUID == authority.targetClusterUUID &&
+             authority.writeOwnerClusterUUID == authority.sourceClusterUUID;
+    case StatefulDataAuthorityMode::writeOwner:
+      return authority.localClusterUUID == authority.writeOwnerClusterUUID;
+    case StatefulDataAuthorityMode::fenced:
+      return authority.localClusterUUID == authority.sourceClusterUUID;
+    case StatefulDataAuthorityMode::snapshotPreparing: return false;
+  }
+  return false;
+}
+
+static inline bool prodigyStatefulDataAuthorityEqual(const StatefulDataAuthority& a,
+                                                    const StatefulDataAuthority& b)
+{
+  String left, right;
+  auto ac = a, bc = b;
+  BitseryEngine::serialize(left, ac);
+  BitseryEngine::serialize(right, bc);
+  return left == right;
+}
+
+static inline bool prodigyStatefulDataAuthoritySourceNonwriter(const StatefulDataAuthority& value)
+{
+  return value.localClusterUUID == value.sourceClusterUUID &&
+      (value.mode == StatefulDataAuthorityMode::fenced ||
+       (value.mode == StatefulDataAuthorityMode::retainedSource && value.writeOwnerClusterUUID == value.targetClusterUUID));
+}
+
+static inline bool prodigyStatefulDataAuthorityCanAdvance(const StatefulDataAuthority& previous,
+                                                         const StatefulDataAuthority& next)
+{
+  if (!prodigyStatefulDataAuthorityValid(previous) || !prodigyStatefulDataAuthorityValid(next)) return false;
+  if (prodigyStatefulDataAuthorityEqual(previous, next)) return true;
+  if (next.authorityEpoch <= previous.authorityEpoch || next.contractSHA256 != previous.contractSHA256 ||
+      next.shardManifestSHA256 != previous.shardManifestSHA256 || next.shardGroup != previous.shardGroup ||
+      next.datasetUUID != previous.datasetUUID || next.localClusterUUID != previous.localClusterUUID) return false;
+  if (next.operationUUID != previous.operationUUID) {
+    if (next.previousOperationUUID != previous.operationUUID ||
+        (next.previousAuthorityEpoch < previous.authorityEpoch &&
+         !(previous.mode == StatefulDataAuthorityMode::retainedSource &&
+           previous.writeOwnerClusterUUID == previous.targetClusterUUID && next.previousAuthorityEpoch != 0))) return false;
+    const bool reversed = next.sourceClusterUUID == previous.targetClusterUUID && next.targetClusterUUID == previous.sourceClusterUUID;
+    if (prodigyStatefulDataAuthoritySourceNonwriter(previous) && next.mode == StatefulDataAuthorityMode::catchupOnly)
+      return reversed && next.localClusterUUID == next.targetClusterUUID;
+    if (previous.mode == StatefulDataAuthorityMode::catchupOnly && next.mode == StatefulDataAuthorityMode::catchupOnly)
+      return next.sourceClusterUUID == previous.sourceClusterUUID && next.targetClusterUUID == previous.targetClusterUUID;
+    if (previous.mode == StatefulDataAuthorityMode::retainedSource && previous.writeOwnerClusterUUID == previous.sourceClusterUUID &&
+        next.mode == StatefulDataAuthorityMode::snapshotPreparing)
+      return next.sourceClusterUUID == previous.sourceClusterUUID && next.targetClusterUUID == previous.targetClusterUUID;
+    return previous.mode == StatefulDataAuthorityMode::writeOwner &&
+        previous.localClusterUUID == previous.targetClusterUUID &&
+        next.mode == StatefulDataAuthorityMode::snapshotPreparing &&
+        next.previousOperationUUID == previous.operationUUID && next.previousAuthorityEpoch == previous.authorityEpoch &&
+        reversed;
+  }
+  if (next.previousOperationUUID != previous.previousOperationUUID || next.previousAuthorityEpoch != previous.previousAuthorityEpoch ||
+      next.sourceClusterUUID != previous.sourceClusterUUID || next.targetClusterUUID != previous.targetClusterUUID ||
+      next.snapshotUUID != previous.snapshotUUID) return false;
+  if (previous.mode == StatefulDataAuthorityMode::snapshotPreparing)
+    return next.mode == StatefulDataAuthorityMode::fenced ||
+        (next.mode == StatefulDataAuthorityMode::retainedSource && next.writeOwnerClusterUUID == next.sourceClusterUUID);
+  if (previous.mode == StatefulDataAuthorityMode::fenced)
+    return next.mode == StatefulDataAuthorityMode::retainedSource && next.writeOwnerClusterUUID == next.targetClusterUUID &&
+        next.snapshotBoundarySHA256 == previous.snapshotBoundarySHA256;
+  if (previous.mode == StatefulDataAuthorityMode::catchupOnly)
+    return next.snapshotBoundarySHA256 == previous.snapshotBoundarySHA256 &&
+        (next.mode == StatefulDataAuthorityMode::catchupOnly || next.mode == StatefulDataAuthorityMode::writeOwner);
+  return false;
+}
+
+class StatefulDataAuthorityReceipt {
+public:
+  StatefulDataAuthority authority;
+  bool ready = false;
+  String snapshotReceiptSHA256;
+  String appliedWatermarkSHA256;
+  String fenceReceiptSHA256;
+  String cleanupReceiptSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthorityReceipt& receipt)
+{
+  serializer.object(receipt.authority);
+  serializer.value1b(receipt.ready);
+  serializer.text1b(receipt.snapshotReceiptSHA256, 64);
+  serializer.text1b(receipt.appliedWatermarkSHA256, 64);
+  serializer.text1b(receipt.fenceReceiptSHA256, 64);
+  serializer.text1b(receipt.cleanupReceiptSHA256, 64);
+}
+
+static inline bool prodigyStatefulDataAuthorityReceiptStaged(const StatefulDataAuthorityReceipt& receipt)
+{
+  return prodigyStatefulDataAuthorityValid(receipt.authority) && !receipt.ready &&
+      receipt.authority.mode == StatefulDataAuthorityMode::catchupOnly &&
+      prodigyIsSHA256HexDigest(receipt.snapshotReceiptSHA256) &&
+      receipt.snapshotReceiptSHA256 == receipt.authority.snapshotBoundarySHA256 &&
+      receipt.appliedWatermarkSHA256.empty() && receipt.fenceReceiptSHA256.empty() && receipt.cleanupReceiptSHA256.empty();
+}
+
+static inline bool prodigyStatefulDataAuthorityReceiptValid(const StatefulDataAuthorityReceipt& receipt)
+{
+  if (prodigyStatefulDataAuthorityReceiptStaged(receipt)) return true;
+  if (!prodigyStatefulDataAuthorityValid(receipt.authority) || !receipt.ready) return false;
+  if (receipt.authority.mode == StatefulDataAuthorityMode::retainedSource)
+    return prodigyIsSHA256HexDigest(receipt.cleanupReceiptSHA256) && prodigyIsSHA256HexDigest(receipt.appliedWatermarkSHA256) &&
+        (receipt.authority.writeOwnerClusterUUID == receipt.authority.sourceClusterUUID ? receipt.fenceReceiptSHA256.empty() :
+         (prodigyIsSHA256HexDigest(receipt.fenceReceiptSHA256) && receipt.appliedWatermarkSHA256 == receipt.authority.requiredAppliedWatermarkSHA256)) &&
+        receipt.snapshotReceiptSHA256 == receipt.authority.snapshotBoundarySHA256;
+  if (!receipt.cleanupReceiptSHA256.empty() || !prodigyIsSHA256HexDigest(receipt.snapshotReceiptSHA256)) return false;
+  if (receipt.authority.mode == StatefulDataAuthorityMode::snapshotPreparing)
+    return receipt.appliedWatermarkSHA256.empty() && receipt.fenceReceiptSHA256.empty();
+  if (receipt.authority.mode == StatefulDataAuthorityMode::fenced)
+    return receipt.snapshotReceiptSHA256 == receipt.authority.snapshotBoundarySHA256 &&
+        prodigyIsSHA256HexDigest(receipt.appliedWatermarkSHA256) && prodigyIsSHA256HexDigest(receipt.fenceReceiptSHA256);
+  if (receipt.snapshotReceiptSHA256 != receipt.authority.snapshotBoundarySHA256) return false;
+  if (receipt.appliedWatermarkSHA256 != receipt.authority.requiredAppliedWatermarkSHA256) return false;
+  return receipt.fenceReceiptSHA256.empty();
+}
 
 enum class StatefulTopologyBridgeMode : uint8_t {
   none,
@@ -4124,7 +4331,8 @@ enum class StatefulTopologyBridgeMode : uint8_t {
 enum class StatefulWorkerTopologyUpgradePhase : uint8_t {
   none,
   greenBootstrap,
-  blueDraining
+  blueDraining,
+  applicationDataAuthority
 };
 
 class StatefulTopology {
@@ -4138,6 +4346,7 @@ public:
   uint32_t sourceEpoch = 0;
   uint32_t targetEpoch = 0;
   StatefulTopologyBridgeMode bridgeMode = StatefulTopologyBridgeMode::none;
+  StatefulDataAuthority dataAuthority;
 
   bool configured(void) const
   {
@@ -4156,6 +4365,8 @@ static void serialize(S&& serializer, StatefulTopology& topology)
   serializer.value4b(topology.sourceEpoch);
   serializer.value4b(topology.targetEpoch);
   serializer.value1b(topology.bridgeMode);
+  if (topology.servingMode == StatefulTopologyServingMode::applicationDataAuthority)
+    serializer.object(topology.dataAuthority);
 }
 
 static inline void prodigyPopulateDefaultStatefulTopology(StatefulTopology& topology, uint32_t shardGroup, const ApplicationConfig& config)
@@ -4190,6 +4401,12 @@ static inline void prodigyPopulateDefaultStatefulTopology(StatefulTopology& topo
 
 static inline bool prodigyStatefulTopologyServesClients(const StatefulTopology& topology)
 {
+  if (topology.servingMode == StatefulTopologyServingMode::applicationDataAuthority)
+    return prodigyStatefulDataAuthorityValid(topology.dataAuthority) &&
+        (topology.dataAuthority.mode == StatefulDataAuthorityMode::writeOwner ||
+         (topology.dataAuthority.mode == StatefulDataAuthorityMode::retainedSource &&
+          topology.dataAuthority.writeOwnerClusterUUID == topology.dataAuthority.localClusterUUID) ||
+         topology.dataAuthority.mode == StatefulDataAuthorityMode::snapshotPreparing);
   return (topology.servingMode == StatefulTopologyServingMode::serve);
 }
 
@@ -4350,12 +4567,25 @@ public:
   bool allMasters = false;
   // Canonical order: shardGroup, isSource, containerUUID.
   Vector<ProdigyStatefulServingAuthorityMember> members;
+  StatefulDataAuthority dataAuthority;
+  String pairIntentSHA256;
+  String sourceFenceReceiptSHA256;
+  String admittedPlanSHA256;
+  String requestPlanSHA256;
+  String ownershipReadyReceiptSHA256;
+  bool sourceRetired = false;
 
   bool operator==(const ProdigyStatefulServingAuthority& other) const
   {
     if (deploymentID != other.deploymentID || applicationID != other.applicationID || operationID != other.operationID ||
         revision != other.revision || phase != other.phase || sourceEpoch != other.sourceEpoch || targetEpoch != other.targetEpoch ||
         allMasters != other.allMasters || !prodigyStatefulServingApplicationConfigEqual(targetConfig, other.targetConfig) ||
+        (phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+         (!prodigyStatefulDataAuthorityEqual(dataAuthority, other.dataAuthority) ||
+          pairIntentSHA256 != other.pairIntentSHA256 || sourceFenceReceiptSHA256 != other.sourceFenceReceiptSHA256 ||
+          admittedPlanSHA256 != other.admittedPlanSHA256 || requestPlanSHA256 != other.requestPlanSHA256 ||
+          ownershipReadyReceiptSHA256 != other.ownershipReadyReceiptSHA256 ||
+          sourceRetired != other.sourceRetired)) ||
         members.size() != other.members.size()) return false;
     for (uint32_t i = 0; i < members.size(); ++i) if (members[i] != other.members[i]) return false;
     return true;
@@ -4370,6 +4600,88 @@ static void serialize(S&& serializer, ProdigyStatefulServingAuthority& authority
   serializer.value8b(authority.operationID); serializer.value8b(authority.revision); serializer.value1b(authority.phase);
   serializer.value4b(authority.sourceEpoch); serializer.value4b(authority.targetEpoch); serializer.object(authority.targetConfig);
   serializer.value1b(authority.allMasters); serializer.container(authority.members, 4096);
+  if (authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority) {
+    serializer.object(authority.dataAuthority);
+    serializer.text1b(authority.pairIntentSHA256, 64);
+    serializer.text1b(authority.sourceFenceReceiptSHA256, 64);
+    serializer.text1b(authority.admittedPlanSHA256, 64);
+    serializer.text1b(authority.requestPlanSHA256, 64);
+    serializer.text1b(authority.ownershipReadyReceiptSHA256, 64);
+    serializer.value1b(authority.sourceRetired);
+  }
+}
+
+// Legacy topology decisions cover the deployment's remaining shard groups;
+// application data decisions have one explicit shard scope. Both use the same
+// serving authority package and may coexist with disjoint member UUIDs.
+static inline bool prodigyStatefulServingAuthoritySameScope(
+    const ProdigyStatefulServingAuthority& a, const ProdigyStatefulServingAuthority& b)
+{
+  const bool aa = a.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+  const bool ba = b.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+  return a.deploymentID == b.deploymentID && aa == ba && (!aa || a.dataAuthority.shardGroup == b.dataAuthority.shardGroup);
+}
+
+static inline bool prodigyStatefulServingAuthorityMatchesShard(
+    const ProdigyStatefulServingAuthority& authority, uint64_t deploymentID, uint32_t shardGroup)
+{
+  return authority.deploymentID == deploymentID &&
+      (authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority
+       ? authority.dataAuthority.shardGroup == shardGroup
+       : std::any_of(authority.members.begin(), authority.members.end(), [&](const auto& member) {
+           return member.shardGroup == shardGroup;
+         }));
+}
+
+class StatefulDataAuthorityMemberReceipt {
+public:
+  uint128_t containerUUID = 0;
+  uint128_t machineUUID = 0;
+  StatefulDataAuthorityReceipt receipt;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthorityMemberReceipt& value)
+{
+  serializer.value16b(value.containerUUID); serializer.value16b(value.machineUUID);
+  serializer.object(value.receipt);
+}
+
+// One request/response payload on one authenticated Mothership topic. Direction
+// supplies request versus receipt semantics; the runtime never accepts an app
+// proof supplied by the coordinator as an observation of a local process.
+class StatefulDataAuthorityOperation {
+public:
+  uint32_t version = 1;
+  bool query = false;
+  bool launchTarget = false;
+  uint64_t deploymentID = 0;
+  uint64_t expectedAuthorityGeneration = 0;
+  uint128_t expectedMasterUUID = 0;
+  int64_t expectedMasterBootNs = 0;
+  String pairIntentSHA256;
+  StatefulDataAuthority authority;
+  Vector<ProdigyStatefulServingAuthorityMember> cohort;
+  String sourceFenceReceiptSHA256;
+  String deploymentPlan;
+  bool supported = true;
+  bool accepted = false;
+  bool ready = false;
+  String failure;
+  Vector<StatefulDataAuthorityMemberReceipt> receipts;
+};
+
+template <typename S>
+static void serialize(S&& serializer, StatefulDataAuthorityOperation& value)
+{
+  serializer.value4b(value.version); serializer.value1b(value.query); serializer.value1b(value.launchTarget);
+  serializer.value8b(value.deploymentID); serializer.value8b(value.expectedAuthorityGeneration);
+  serializer.value16b(value.expectedMasterUUID); serializer.value8b(value.expectedMasterBootNs);
+  serializer.text1b(value.pairIntentSHA256, 64); serializer.object(value.authority);
+  serializer.container(value.cohort, 4096); serializer.text1b(value.sourceFenceReceiptSHA256, 64);
+  serializer.text1b(value.deploymentPlan, 1024 * 1024);
+  serializer.value1b(value.supported); serializer.value1b(value.accepted); serializer.value1b(value.ready);
+  serializer.text1b(value.failure, 4096); serializer.container(value.receipts, 4096);
 }
 
 class ProdigyDeferredStatefulScaleIntent {
@@ -9111,6 +9423,8 @@ public:
   bool isStateful = false;
   StatefulMeshRoles statefulMeshRoles;
   StatefulTopology statefulTopology;
+  uint64_t declaredStatefulClientService = 0;
+  uint16_t declaredStatefulClientPort = 0;
 
   bool hasCredentialBundle = false;
   CredentialBundle credentialBundle;
@@ -9389,6 +9703,10 @@ static void serialize(S&& serializer, ContainerPlan& plan)
   serializer.value1b(plan.isStateful);
   serializer.object(plan.statefulMeshRoles);
   serializer.object(plan.statefulTopology);
+  if (plan.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority) {
+    serializer.value8b(plan.declaredStatefulClientService);
+    serializer.value2b(plan.declaredStatefulClientPort);
+  }
   serializer.value1b(plan.hasCredentialBundle);
   serializer.object(plan.credentialBundle);
 }
@@ -10429,6 +10747,20 @@ public:
 
   Vector<uint64_t> flags;
 };
+
+// A private listener declaration is carried to the process without publishing
+// a mesh advertisement. The application still needs authenticated writeOwner
+// authority before restoring its pruned client role and installing the socket.
+static inline bool prodigyProjectStatefulDataClientPort(const ContainerPlan& plan, ContainerParameters& parameters)
+{
+  if (plan.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority) return true;
+  if (!prodigyStatefulDataAuthorityValid(plan.statefulTopology.dataAuthority) ||
+      !plan.declaredStatefulClientService || plan.declaredStatefulClientPort < 1024) return false;
+  auto advertisement = plan.advertisements.find(plan.declaredStatefulClientService);
+  if (advertisement != plan.advertisements.end() && advertisement->second.port != plan.declaredStatefulClientPort) return false;
+  parameters.advertisesOnPorts.insert_or_assign(plan.declaredStatefulClientService, plan.declaredStatefulClientPort);
+  return true;
+}
 
 template <typename S>
 static void serialize(S&& serializer, ContainerParameters& params)

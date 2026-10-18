@@ -1008,6 +1008,70 @@ int main(void)
   faultChangedBoundary.firstRuntimeIdentity = controlBoundary.secondRuntimeIdentity;
   suite.require(!mothershipPairControlFaultArguments(faultChangedBoundary, fault, faultArguments, &failure),
                 "pair_control_fault_rejects_non_distinct_boundary_identity");
+  suite.require(mothershipPairControlFaultParse("delay"_ctv, "0"_ctv, "1000"_ctv, "17"_ctv,
+                    "0"_ctv, "12345"_ctv, "first-to-second"_ctv, parsedFault, &failure) &&
+                parsedFault.kind == MothershipPairControlFaultKind::delay && parsedFault.latencyMilliseconds == 17 &&
+                parsedFault.seed == 12345 &&
+                mothershipPairControlFaultArguments(controlBoundary, parsedFault, faultArguments, &failure) &&
+                faultArguments.size() == 21 && faultArguments[14] == "delay"_ctv && faultArguments[15] == "0"_ctv &&
+                faultArguments[16] == "1000"_ctv && faultArguments[17] == "17"_ctv && faultArguments[18] == "0"_ctv &&
+                faultArguments[19] == "12345"_ctv && faultArguments[20] == "first-to-second"_ctv &&
+                mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 1'001'000'000ULL, receipt) &&
+                mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault, receipt) &&
+                receipt == "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME kind=delay onsetMs=0 durationMs=1000 latencyMs=17 percentageBps=0 seed=12345 direction=first-to-second installQdisc=second0:7d02:netem restoreQdisc=second0:7d02:ABSENT beginNs=1000000 endNs=1001000000\n"_ctv,
+                "pair_control_netem_delay_binds_exact_tuple_egress_and_receipt");
+  MothershipPairControlFault changedFault = parsedFault;
+  changedFault.seed++;
+  suite.require(!mothershipPairControlFaultReceiptValid(controlBoundary, changedFault, receipt),
+                "pair_control_netem_receipt_rejects_changed_seed");
+  changedFault = parsedFault; changedFault.direction = MothershipPairControlFaultDirection::secondToFirst;
+  suite.require(!mothershipPairControlFaultReceiptValid(controlBoundary, changedFault, receipt),
+                "pair_control_netem_receipt_rejects_wrong_egress");
+  const char *receiptMutations[][2] = {
+    {"operationID=0x0900", "operationID=0x0901"}, {"kind=delay", "kind=loss"},
+    {"onsetMs=0", "onsetMs=1"}, {"durationMs=1000", "durationMs=999"},
+    {"latencyMs=17", "latencyMs=18"}, {"percentageBps=0", "percentageBps=1"},
+    {"seed=12345", "seed=12346"}, {"second0:7d02:netem", "first0:7d02:netem"},
+    {"second0:7d02:ABSENT", "second0:7d02:netem"}, {"endNs=1001000000", "endNs=1000999999"},
+  };
+  bool rejectedReceipts = true;
+  for (const auto& mutation : receiptMutations)
+  {
+    std::string text = receipt.c_str(); const size_t at = text.find(mutation[0]);
+    if (at == std::string::npos) { rejectedReceipts = false; continue; }
+    text.replace(at, std::strlen(mutation[0]), mutation[1]);
+    rejectedReceipts = !mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault, String(text.c_str())) && rejectedReceipts;
+  }
+  suite.require(rejectedReceipts, "pair_control_netem_receipt_binds_every_parameter_install_restore_and_interval");
+  suite.require(mothershipPairControlFaultParse("loss"_ctv, "30000"_ctv, "60000"_ctv, "0"_ctv,
+                    "10000"_ctv, "4294967295"_ctv, "both"_ctv, parsedFault, &failure) &&
+                mothershipPairControlFaultReceipt(controlBoundary, parsedFault, 1'000'000ULL, 60'001'000'000ULL, receipt) &&
+                mothershipPairControlFaultReceiptValid(controlBoundary, parsedFault, receipt) &&
+                mothershipPairControlFaultParse("reorder"_ctv, "0"_ctv, "1"_ctv, "30000"_ctv,
+                    "1"_ctv, "1"_ctv, "second-to-first"_ctv, parsedFault, &failure),
+                "pair_control_netem_accepts_exact_inclusive_bounds");
+  const char *badTuples[][7] = {
+    {"drop","0","1","0","0","1","both"}, {"DELAY","0","1","1","0","1","both"},
+    {"delay","01","1","1","0","1","both"}, {"delay","30001","1","1","0","1","both"},
+    {"delay","0","0","1","0","1","both"}, {"delay","0","60001","1","0","1","both"},
+    {"delay","0","1","0","0","1","both"}, {"delay","0","1","30001","0","1","both"},
+    {"delay","0","1","1","1","1","both"}, {"delay","0","1","1","0","0","both"},
+    {"delay","0","1","1","0","4294967296","both"}, {"delay","0","1","1","0","01","both"},
+    {"loss","0","1","1","1","1","both"}, {"loss","0","1","0","0","1","both"},
+    {"loss","0","1","0","10001","1","both"}, {"reorder","0","1","0","1","1","both"},
+    {"reorder","0","1","1","0","1","both"}, {"reorder","0","1","1","1","1","forward"},
+  };
+  bool rejectedTuples = true;
+  for (const auto& tuple : badTuples)
+    rejectedTuples = !mothershipPairControlFaultParse(String(tuple[0]), String(tuple[1]), String(tuple[2]),
+        String(tuple[3]), String(tuple[4]), String(tuple[5]), String(tuple[6]), parsedFault, &failure) && rejectedTuples;
+  suite.require(rejectedTuples, "pair_control_netem_rejects_noncanonical_inapplicable_or_unbounded_parameters");
+  suite.require(mothershipPairControlFaultParse("0"_ctv, "1"_ctv, parsedFault, &failure) &&
+                parsedFault.kind == MothershipPairControlFaultKind::drop && parsedFault.seed == 0 &&
+                parsedFault.latencyMilliseconds == 0 && parsedFault.percentageBasisPoints == 0 &&
+                mothershipPairControlFaultArguments(controlBoundary, parsedFault, faultArguments, &failure) &&
+                faultArguments.size() == 16,
+                "pair_control_legacy_parse_resets_extended_parameters_and_keeps_old_argv");
   auto unresolvedTransit = serviceTransit; unresolvedTransit.sourceIngressPrivate6 = {};
   suite.require(!mothershipPairControlServiceTransitValid(unresolvedTransit, pairIntent.firstClusterUUID, pairIntent.secondClusterUUID),
                 "pair_control_service_transit_rejects_unresolved_ingress_owner");

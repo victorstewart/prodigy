@@ -1488,6 +1488,10 @@ private:
     {
       return nullptr;
     }
+    const auto& data = deferred.launchPlan.statefulTopology.dataAuthority;
+    if (deferred.launchPlan.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority &&
+        brain->statefulCatchupCompensationFenced(deferred.deploymentID, deferred.launchPlan.shardGroup, data.operationUUID))
+      return nullptr;
     return containerIt->second;
   }
 
@@ -3648,6 +3652,7 @@ private:
         }
       }
 
+      if (thisBrain) nShardGroups = std::max(nShardGroups, thisBrain->desiredStatefulShardGroupCount(plan.config.deploymentID()));
       nTargetBase = 0;
       for (uint32_t shardGroup = 0; shardGroup < nShardGroups; ++shardGroup)
       {
@@ -3933,8 +3938,28 @@ public:
 
   uint32_t desiredReplicaCountForShardGroup(uint32_t shardGroup) const
   {
+    uint32_t replicas = 0;
+    if (thisBrain && thisBrain->desiredStatefulReplicaCount(plan.config.deploymentID(), shardGroup, replicas)) return replicas;
     bool keepBlueAndGreen = (statefulWorkerTopologyUpgradeLocksShardGroup(shardGroup) && statefulWorkerTopologyUpgradePhase == StatefulWorkerTopologyUpgradePhase::greenBootstrap);
     return uint32_t(3 + (keepBlueAndGreen ? 3 : 0));
+  }
+
+  bool admitApplicationDataAuthorityShard(uint32_t shardGroup)
+  {
+    StatefulDataAuthority desired;
+    if (!thisBrain || !plan.isStateful ||
+        !thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, shardGroup) ||
+        desired.mode != StatefulDataAuthorityMode::catchupOnly || !thisBrain->statefulServingRecoveryReady()) return false;
+    uint32_t materialized = 0;
+    for (auto *container : containers)
+      if (container && container->shardGroup == shardGroup) ++materialized;
+    if (materialized) return materialized == 3;
+    nShardGroups = std::max(nShardGroups, shardGroup + 1);
+    recomputeStatefulBaseTargetFromShardGroups();
+    Vector<uint32_t> groups(3, shardGroup);
+    spinStateful(nullptr, groups);
+    if (!toSchedule.empty()) schedule(nullptr);
+    return true;
   }
 
   uint32_t maxReplicasPerRackForShardGroup(uint32_t shardGroup) const
@@ -4434,7 +4459,8 @@ public:
       if (live != containers.end() && ((*live)->machine == nullptr ||
           (*live)->machine->uuid != member.machineUUID || (*live)->shardGroup != member.shardGroup)) return false;
     }
-    const bool phaseChanged = statefulWorkerTopologyUpgradePhase != authority.phase;
+    const bool applicationAuthority = authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority;
+    const bool phaseChanged = !applicationAuthority && statefulWorkerTopologyUpgradePhase != authority.phase;
     if (authority.phase == StatefulWorkerTopologyUpgradePhase::none)
     {
       plan.config = authority.targetConfig;
@@ -4449,12 +4475,14 @@ public:
     for (const auto& desired : states)
     {
       if (desired.plan.config.deploymentID() != authority.deploymentID) continue;
+      if (!prodigyStatefulServingAuthorityMatchesShard(authority, authority.deploymentID, desired.plan.shardGroup)) continue;
       auto live = std::find_if(containers.begin(), containers.end(), [&](ContainerView *container) {
         return container != nullptr && container->uuid == desired.plan.uuid;
       });
       if (live == containers.end()) continue;
       ContainerView *container = *live;
-      const ContainerPlan& candidate = desired.plan;
+      ContainerPlan candidate = desired.plan;
+      prodigyProjectStatefulServingClientPublication(authority, candidate);
       // Remove obsolete mesh declarations while the previous ports are known.
       for (const auto& [service, advertisement] : container->advertisements)
       {
@@ -4467,6 +4495,8 @@ public:
           thisBrain->mesh->stopSubscription(service, container, subscription.nature, false);
       container->explicitStatefulMeshRoles = candidate.statefulMeshRoles;
       container->explicitStatefulTopology = candidate.statefulTopology;
+      container->declaredStatefulClientService = candidate.declaredStatefulClientService;
+      container->declaredStatefulClientPort = candidate.declaredStatefulClientPort;
       container->advertisements = candidate.advertisements;
       container->subscriptions = candidate.subscriptions;
       container->advertisingOnPorts.clear();
@@ -7247,6 +7277,14 @@ public:
 
   DeploymentWork *planStatefulConstruction(Machine *machine, ContainerView *container, DataStrategy dataStrategy)
   {
+    StatefulDataAuthority desired;
+    if (thisBrain && thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, container->shardGroup) &&
+        desired.shardGroup == container->shardGroup) {
+      prodigyPopulateDefaultStatefulTopology(container->explicitStatefulTopology, container->shardGroup, plan.config);
+      container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+      container->explicitStatefulTopology.dataAuthority = desired;
+      if (desired.mode == StatefulDataAuthorityMode::catchupOnly) dataStrategy = DataStrategy::seeding;
+    }
     if (statefulWorkerTopologyUpgradeLocksShardGroup(container->shardGroup) && container->explicitStatefulTopology.configured() == false)
     {
       configureStatefulWorkerTopologyUpgradeTarget(container);
@@ -8369,6 +8407,48 @@ public:
       cancelDeploymentWork(work);
       (void)abandonUnlaunchedStatefulWhiteholeTransfer(container);
     }
+  }
+
+  // The paired retirement journal has already fenced this exact shard. Views
+  // absent from its admitted cohort never passed the durable launch gate, so
+  // release them locally through the ordinary deployment owner, without a
+  // fabricated Neuron kill/ACK or cancelling sibling shards.
+  void cancelCompensatedStatefulWork(ContainerView *container)
+  {
+    if (!container || !container->plannedWork) return;
+    auto *meta = container->plannedWork; auto *work = meta->getBase();
+    const bool current = meta == currentlyExecutingWork;
+    cancelDeploymentWork(meta);
+    // schedule() retains a suspended work object until its own continuation.
+    // Detach only the cancelled view; its resume guard cannot dereference it.
+    if (current) {
+      if (work->container == container) work->container = nullptr;
+      if (work->oldContainer == container) work->oldContainer = nullptr;
+    }
+  }
+
+  bool compensateUnadmittedStatefulCatchup(uint32_t shardGroup, uint128_t operationUUID,
+      const Vector<uint128_t>& admitted)
+  {
+    if (!thisBrain || !thisBrain->statefulCatchupCompensationFenced(plan.config.deploymentID(), shardGroup, operationUUID)) return false;
+    StatefulDataAuthority current;
+    if (!thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), current, shardGroup) ||
+        current.operationUUID != operationUUID) return true; // historical fence cannot cancel a fresh operation
+    Vector<ContainerView *> selected;
+    for (auto *container : containers)
+      if (container && container->shardGroup == shardGroup &&
+          std::find(admitted.begin(), admitted.end(), container->uuid) == admitted.end())
+        selected.push_back(container);
+    for (auto *container : selected) {
+      if ((container->state != ContainerState::planned && container->state != ContainerState::scheduled) || container->runtimeReady) return false;
+      cancelCompensatedStatefulWork(container);
+      std::erase_if(deferredDurableContainerSpins, [&](const auto& spin) { return spin.containerUUID == container->uuid; });
+      waitingOnContainers.erase(container);
+      releaseContainerPlacementCounts(container);
+      destructContainer(container, false);
+      containerDestroyed(container);
+    }
+    return true;
   }
 
   static uint32_t nFitOnMachine(ApplicationDeployment *deployment, Machine *machine, uint32_t budget, const MachineResourcesDelta& deltas = MachineResourcesDelta {}, const ApplicationConfig *configOverride = nullptr)
@@ -9997,6 +10077,15 @@ public:
         credentialLaunchFailed = true;
         return;
       }
+      if constexpr (std::is_same_v<T, StatefulWork>) {
+        if (!work.container) return; // cancelled exact target while this coroutine was suspended
+        StatefulDataAuthority desired;
+        if (work.container && thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, work.container->shardGroup) &&
+            thisBrain->statefulCatchupCompensationFenced(plan.config.deploymentID(), work.container->shardGroup, desired.operationUUID)) {
+          cancelDeploymentWork(currentlyExecutingWork);
+          return;
+        }
+      }
       last = work.lifecycle;
 
       Machine *machine = work.machine;
@@ -10208,6 +10297,29 @@ public:
               replacingContainer->destructionWaiterDeploymentID = plan.config.deploymentID();
             }
 
+            if constexpr (std::is_same_v<T, StatefulWork>)
+            {
+              StatefulDataAuthority desired;
+              if (thisBrain->desiredStatefulDataAuthority(plan.config.deploymentID(), desired, container->shardGroup)) {
+                // This must precede mesh declarations, ContainerPlan creation
+                // and bootstrap serialization. Catchup is the first target mode.
+                if (desired.shardGroup != container->shardGroup) {
+                  state = DeploymentState::failed;
+                  thisBrain->deploymentFailed(this, plan.config.applicationID, plan.config.deploymentID(),
+                      "pair admission does not cover this shard"_ctv, generateReport());
+                  cancelDeploymentWork(currentlyExecutingWork);
+                  credentialLaunchFailed = true;
+                  break;
+                }
+                container->explicitStatefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+                container->explicitStatefulTopology.dataAuthority = desired;
+                container->declaredStatefulClientService = StatefulMeshRoles::forShardGroup(plan.stateful,
+                    plan.config.applicationID, container->shardGroup).client;
+                if (!container->declaredStatefulClientPort)
+                  container->declaredStatefulClientPort = container->getRandomAdvertisementPort();
+                if (desired.mode == StatefulDataAuthorityMode::catchupOnly) work.data = DataStrategy::seeding;
+              }
+            }
             setupContainerServices(container);
 
             ApplicationConfig containerConfig = resourceConfigForContainer(container);

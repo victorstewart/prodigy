@@ -3395,7 +3395,8 @@ static bool prodigyParsePersistentContainerRetirementDescriptor(
       carrier.fingerprint.size() > prodigyContainerRetirementJournalMaximumPayloadBytes ||
       BitseryEngine::deserializeSafe(carrier.fingerprint, journal) == false ||
       !prodigyContainerRetirementJournalVersionSupported(
-          journal.version, ProdigyContainerRetirementJournal::currentVersion) || journal.intents.empty() ||
+          journal.version, ProdigyContainerRetirementJournal::statefulVersion) ||
+      (journal.intents.empty() && journal.pairedSourceFences.empty()) ||
       journal.intents.size() > prodigyContainerRetirementJournalMaximumEntries)
   {
     return false;
@@ -3975,7 +3976,8 @@ static inline bool prodigyExtractPersistentBrainSnapshotSecrets(
           snapshot.masterAuthority.runtimeState.transportCredentialEnrollments,
           snapshot.masterAuthority.runtimeState.generation, failure)) return false;
   if (!prodigyValidateStatefulServingAuthorities(snapshot.masterAuthority.runtimeState.statefulServingAuthorities,
-        snapshot.masterAuthority.servingRuntimeStates, snapshot.masterAuthority.runtimeState.generation))
+        snapshot.masterAuthority.servingRuntimeStates, snapshot.masterAuthority.runtimeState.generation) ||
+      !prodigyStatefulRetirementTombstonesWitnessed(snapshot.masterAuthority.runtimeState))
   {
     if (failure) failure->assign("persistent brain snapshot serving authority is incomplete or invalid"_ctv);
     return false;
@@ -4639,7 +4641,8 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
       const ProdigyContainerRetirementIntent *intent =
           prodigyFindContainerRetirementIntentInValidatedJournal(journal, retirementSecrets.containerUUID);
       if ((journal.version != ProdigyContainerRetirementJournal::pairedIntentVersion &&
-           journal.version != ProdigyContainerRetirementJournal::currentVersion) ||
+           journal.version != ProdigyContainerRetirementJournal::currentVersion &&
+           journal.version != ProdigyContainerRetirementJournal::statefulVersion) ||
           intent == nullptr || intent->killAcked || !retirementSecrets.matches(*intent))
       {
         if (failure) failure->assign("persistent brain snapshot retirement bootstrap sidecar identity differs"_ctv);
@@ -4663,7 +4666,8 @@ static inline bool prodigyApplyPersistentBrainSnapshotSecrets(
   }
 
   if (!prodigyValidateStatefulServingAuthorities(snapshot.masterAuthority.runtimeState.statefulServingAuthorities,
-        snapshot.masterAuthority.servingRuntimeStates, snapshot.masterAuthority.runtimeState.generation))
+        snapshot.masterAuthority.servingRuntimeStates, snapshot.masterAuthority.runtimeState.generation) ||
+      !prodigyStatefulRetirementTombstonesWitnessed(snapshot.masterAuthority.runtimeState))
   {
     if (failure) failure->assign("persistent brain snapshot serving authority is incomplete or invalid"_ctv);
     return false;

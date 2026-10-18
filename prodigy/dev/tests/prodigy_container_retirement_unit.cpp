@@ -244,7 +244,7 @@ static void testMalformedTrailingAndVersionRejected(TestSuite& suite)
                "container_retirement_oversized_carrier_rejected_before_decode");
 
   ProdigyContainerRetirementJournal wrongVersion = journal;
-  wrongVersion.version = 4;
+  wrongVersion.version = 5;
   suite.expect(prodigyWriteContainerRetirementJournalCarrier(carrier, wrongVersion, 1) == false,
                "container_retirement_version_rejected");
 }
@@ -540,6 +540,91 @@ static void testBootstrapSemanticOrderAndTrailingFences(TestSuite& suite)
   Hasher::setThreadSeed(priorHasherSeed);
 }
 
+static ProdigyContainerRetirementJournal makeCatchupCompensation(uint32_t count)
+{
+  auto journal = makePairedSourceFenceJournal(0);
+  journal.version = ProdigyContainerRetirementJournal::statefulVersion;
+  auto& fence = journal.pairedSourceFences.front();
+  fence.sourceDeploymentID = fence.targetDeploymentID = (uint64_t(3) << 48) | 41;
+  fence.hasStatefulScope = true; fence.catchupTargetCompensation = true; fence.shardGroup = 7;
+  fence.pairIntentSHA256 = fence.sourceBlobSHA256;
+  StatefulDataAuthority data;
+  data.operationUUID = fence.operationID; data.datasetUUID = 71; data.snapshotUUID = 72;
+  data.sourceClusterUUID = fence.targetClusterUUID; data.targetClusterUUID = data.localClusterUUID = fence.sourceClusterUUID;
+  data.writeOwnerClusterUUID = data.sourceClusterUUID; data.authorityEpoch = 2; data.shardGroup = fence.shardGroup;
+  data.contractSHA256 = data.shardManifestSHA256 = data.snapshotBoundarySHA256 = data.requiredAppliedWatermarkSHA256 = fence.sourceBlobSHA256;
+  String bytes; BitseryEngine::serialize(bytes, data); prodigyComputeSHA256Hex(bytes, fence.dataAuthoritySHA256);
+  for (uint32_t index = 0; index < count; ++index) {
+    auto intent = makePairedStatelessIntent(index + 1);
+    intent.kind = ProdigyContainerRetirementKind::statefulPairedMigration; intent.applicationID = 3;
+    intent.deploymentID = fence.sourceDeploymentID; intent.pairedOperationID = fence.operationID;
+    intent.pairedSourceClusterUUID = fence.sourceClusterUUID; intent.pairedTargetClusterUUID = fence.targetClusterUUID;
+    intent.pairedTargetDeploymentID = fence.targetDeploymentID;
+    NeuronContainerBootstrap bootstrap;
+    bootstrap.plan.uuid = intent.containerUUID; bootstrap.plan.isStateful = true;
+    bootstrap.plan.config.applicationID = 3; bootstrap.plan.config.versionID = 41; bootstrap.plan.config.type = ApplicationType::stateful;
+    bootstrap.plan.config.containerBlobSHA256 = fence.sourceBlobSHA256; bootstrap.plan.config.containerBlobBytes = fence.sourceBlobBytes;
+    bootstrap.plan.shardGroup = fence.shardGroup; bootstrap.plan.restartOnFailure = false;
+    bootstrap.plan.statefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+    bootstrap.plan.statefulTopology.dataAuthority = data;
+    BitseryEngine::serialize(intent.bootstrap, bootstrap);
+    fence.cohort.push_back({intent.containerUUID, intent.machineUUID, intent.intentGeneration});
+    journal.intents.push_back(intent);
+  }
+  return journal;
+}
+
+static void testScopedCatchupCompensation(TestSuite& suite)
+{
+  for (uint32_t count = 0; count <= 3; ++count) {
+    auto journal = makeCatchupCompensation(count);
+    suite.expect(prodigyValidateContainerRetirementJournal(journal), "catchup_compensation_empty_partial_complete_journal_valid");
+    auto fence = journal.pairedSourceFences.front();
+    suite.expect(prodigyPairedSourceRetirementFenceTerminalInValidatedJournal(journal, fence) == (count == 0),
+        "catchup_compensation_zero_terminal_present_members_require_ack");
+    suite.expect(prodigyPairedCatchupCompensationFencedInValidatedJournal(journal, fence.sourceDeploymentID, fence.shardGroup, fence.operationID),
+        "catchup_compensation_launch_fence_covers_any_stale_or_new_uuid");
+    suite.expect(!prodigyPairedCatchupCompensationFencedInValidatedJournal(journal, fence.sourceDeploymentID, fence.shardGroup + 1, fence.operationID) &&
+        !prodigyPairedCatchupCompensationFencedInValidatedJournal(journal, fence.sourceDeploymentID, fence.shardGroup, fence.operationID + 1),
+        "catchup_compensation_does_not_cancel_sibling_or_later_operation");
+    String encoded; BitseryEngine::serialize(encoded, journal);
+    ProdigyContainerRetirementJournal restored;
+    suite.expect(BitseryEngine::deserializeSafe(encoded, restored) && prodigyValidateContainerRetirementJournal(restored) &&
+        restored.pairedSourceFences.front().sameIdentity(fence), "catchup_compensation_v4_cold_restart_exact_scope");
+    ProdigyPairedSourceRetirementRequest request;
+    request.version = 2; request.catchupTargetCompensation = true;
+    request.operationID = fence.operationID; request.sourceClusterUUID = fence.sourceClusterUUID; request.targetClusterUUID = fence.targetClusterUUID;
+    request.sourceDeploymentID = fence.sourceDeploymentID; request.targetDeploymentID = fence.targetDeploymentID;
+    request.expectedAuthorityGeneration = 1; request.expectedMasterUUID = 2; request.expectedMasterBootNs = 3;
+    request.sourceNormalizedPlanSHA256 = fence.sourceNormalizedPlanSHA256; request.sourceBlobSHA256 = fence.sourceBlobSHA256;
+    request.sourceBlobBytes = fence.sourceBlobBytes; request.shardGroup = fence.shardGroup;
+    request.pairIntentSHA256 = fence.pairIntentSHA256; request.dataAuthoritySHA256 = fence.dataAuthoritySHA256;
+    suite.expect(prodigyPairedSourceRetirementFenceMatchesRequest(fence, request), "catchup_compensation_exact_request_replays");
+    request.shardGroup++;
+    suite.expect(!prodigyPairedSourceRetirementFenceMatchesRequest(fence, request), "catchup_compensation_wrong_shard_request_rejected");
+    auto conflicting = restored; conflicting.pairedSourceFences.front().dataAuthoritySHA256 = fence.sourceNormalizedPlanSHA256;
+    ProdigyContainerRetirementJournal merged;
+    suite.expect(!prodigyMergeContainerRetirementJournal(restored, conflicting, merged), "catchup_compensation_cannot_rebind_sealed_authority");
+    for (uint32_t index = 0; index < count; ++index) {
+      auto& intent = restored.intents[index]; intent.killAcked = true; intent.bootstrap.clear();
+      suite.expect(prodigyValidateContainerRetirementJournal(restored) &&
+          prodigyPairedSourceRetirementFenceTerminalInValidatedJournal(restored, fence) == (index + 1 == count),
+          "catchup_compensation_duplicate_delayed_acks_terminal_only_after_all_present");
+    }
+    suite.expect(prodigyMergeContainerRetirementJournal(journal, restored, merged), "catchup_compensation_monotonic_kill_ack_recovery");
+    auto sibling = makeCatchupCompensation(0).pairedSourceFences.front();
+    sibling.operationID++; sibling.shardGroup++;
+    restored.pairedSourceFences.push_back(sibling);
+    suite.expect(prodigyValidateContainerRetirementJournal(restored), "catchup_compensation_disjoint_shard_tombstones_coexist");
+    auto legacy = journal; legacy.version = 3;
+    suite.expect(!prodigyValidateContainerRetirementJournal(legacy), "catchup_compensation_requires_explicit_v4_scope");
+  }
+  auto four = makeCatchupCompensation(4);
+  suite.expect(!prodigyValidateContainerRetirementJournal(four), "catchup_compensation_more_than_selected_three_rejected");
+  auto wrongRole = makeCatchupCompensation(0); wrongRole.pairedSourceFences.front().catchupTargetCompensation = false;
+  suite.expect(!prodigyValidateContainerRetirementJournal(wrongRole), "source_retirement_may_not_claim_empty_target_compensation");
+}
+
 static void testCarrierCollisionAndBound(TestSuite& suite)
 {
   bytell_hash_map<uint64_t, TaskExecutionRecord> records = {};
@@ -570,5 +655,6 @@ int main(void)
   testIdentityAndMonotonicAckFences(suite);
   testBootstrapSemanticOrderAndTrailingFences(suite);
   testCarrierCollisionAndBound(suite);
+  testScopedCatchupCompensation(suite);
   return suite.failed == 0 ? 0 : 1;
 }

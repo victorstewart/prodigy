@@ -12705,6 +12705,11 @@ public:
         parameters.whiteholes = container->plan.whiteholes;
         parameters.statefulMeshRoles = container->plan.statefulMeshRoles;
         parameters.statefulTopology = container->plan.statefulTopology;
+        // This is a private startup port declaration, not a mesh advertisement.
+        // Catchup starts with client role zero; only authenticated writeOwner
+        // may install this already-bound IPv6 listener at the application.
+        if (!prodigyProjectStatefulDataClientPort(container->plan, parameters))
+          failStartup("invalid private stateful client port declaration");
         for (const IPPrefix& address : container->plan.addresses)
         {
           if (address.network.is6)

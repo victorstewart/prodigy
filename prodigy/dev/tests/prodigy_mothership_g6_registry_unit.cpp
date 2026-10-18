@@ -531,6 +531,23 @@ int main()
 
   {
     MothershipClusterRegistry reopened(path);
+    MothershipApplicationPlacement placement;
+    bool placementResumed = false;
+    for (uint16_t applicationID : {uint16_t(2), uint16_t(5), uint16_t(10)}) {
+      assert(reopened.admitApplicationPlacement(applicationID, 0x201, digest('a'), placement, placementResumed, &failure) && !placementResumed);
+      assert(placement.ownerClusterUUID == 0x201 && placement.generation == 1);
+      assert(placement.policy == (applicationID == 10 ? MothershipApplicationPlacement::Policy::hardSingleton : MothershipApplicationPlacement::Policy::retainedSource));
+      assert(reopened.admitApplicationPlacement(applicationID, 0x201, digest('b'), placement, placementResumed, &failure) && placementResumed);
+      assert(!reopened.admitApplicationPlacement(applicationID, 0x202, digest('c'), placement, placementResumed, &failure));
+      assert(!reopened.admitApplicationPlacement(applicationID, 0x203, digest('d'), placement, placementResumed, &failure));
+      DeploymentPlan pairedStateless;
+      pairedStateless.config.applicationID = applicationID;
+      pairedStateless.config.type = ApplicationType::stateless; pairedStateless.isStateful = false;
+      assert(mothershipApplicationPlacementRequired(pairedStateless.config.applicationID));
+      assert(!reopened.admitApplicationPlacement(pairedStateless, 0x202, digest('e'), placement, placementResumed, &failure));
+      assert(reopened.admitApplicationPlacement(pairedStateless, 0x201, digest('e'), placement, placementResumed, &failure) && placementResumed);
+      assert(reopened.loadApplicationPlacement(applicationID, placement, &failure) && placement.ownerClusterUUID == 0x201);
+    }
     MothershipProductionPairRecord pair = {}; MothershipPhysicalServiceTransitBoundary boundary = {};
     MothershipLocalVMBoundaryDescriptor localBoundary = {};
     assert(reopened.loadProductionPair(intent.operationUUID, pair, &failure) &&
@@ -549,6 +566,11 @@ int main()
            cohort.phase == MothershipLocalAuthorityRecoveryPhase::recovered);
   }
 
-  std::puts("PASS: G6 registry persists exact production-pair, transit, and fault owners");
+  { // A new registry object/fresh deploy identity does not release source ownership.
+    MothershipClusterRegistry reopened(path); MothershipApplicationPlacement placement; bool resumed = false;
+    assert(reopened.loadTruthPlacement(placement, &failure) && placement.ownerClusterUUID == 0x201);
+    assert(!reopened.admitTruthPlacement(0x202, digest('f'), placement, resumed, &failure));
+  }
+  std::puts("PASS: G6 registry persists exact production-pair, transit, fault and retained-placement owners");
   return 0;
 }

@@ -12421,7 +12421,7 @@ private:
   }
 
   bool readDeploymentIdentity(const MothershipProdigyCluster& cluster, uint64_t deploymentID,
-                              DeploymentIdentityReport& report, String& failure)
+                              DeploymentIdentityReport& report, String& failure, bool requireLive = true)
   {
     report = {};
     socket.close();
@@ -12435,7 +12435,7 @@ private:
     String encoded = {};
     Message::extractToStringView(args, encoded);
     const bool valid = args == response->terminal() && BitseryEngine::deserializeSafe(encoded, report) &&
-                       report.version == 1 && report.found && report.live &&
+                       report.version == 1 && report.found && (!requireLive || report.live) &&
                        report.clusterUUID == cluster.clusterUUID && report.deploymentID == deploymentID;
     socket.close();
     if (!valid) failure.assign("exact live deployment identity is unavailable"_ctv);
@@ -15497,7 +15497,10 @@ private:
     uint128_t operationID = 0;
     if (!prodigyParseCanonicalHex128(record.boundary.operationID, operationID)) return false;
     socket.close();
-    if (!configureControlTarget(target.name.c_str(), &failure) || !socket.ensureConnected()) return false;
+    DeploymentPlan targetPlan;
+    if (!BitseryEngine::deserializeSafe(record.targetRequestPlan, targetPlan) ||
+        !configureControlTarget(target.name.c_str(), &failure) || !admitTruthDeploymentPlacement(targetPlan, failure) ||
+        !socket.ensureConnected()) return false;
     const int64_t admissionDeadlineMs = Time::now<TimeResolution::ms>() + 30'000;
     StatelessDeploymentAdmissionReceipt receipt = {};
     auto queryAdmission = [&]() {
@@ -15585,7 +15588,8 @@ private:
     String encoded = {};
     if (!response || MothershipTopic(response->topic) != expected ||
         !ProdigyIngressValidation::extractVariableStringView(args, response->terminal(), encoded) ||
-        args != response->terminal() || !BitseryEngine::deserializeSafe(encoded, receipt) || receipt.version != 1)
+        args != response->terminal() || !BitseryEngine::deserializeSafe(encoded, receipt) ||
+        (receipt.version != 1 && receipt.version != 2))
     {
       failure.assign("source retirement outcome is unavailable; resume the same paired operation"_ctv);
       return false;
@@ -15768,12 +15772,17 @@ private:
     {
       DeploymentIdentityReport sourceReport = {};
       MothershipProductionWorkloadIdentity sourceIdentity = {};
-      valid = productionWorkloadIdentity(source, record.intent.sourceWorkload.deploymentID,
+      const bool stateful = record.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion;
+      if (stateful) {
+        valid = readDeploymentIdentity(source, record.intent.sourceWorkload.deploymentID, sourceReport, failure) &&
+            sourceReport.isStateful && sourceReport.canonicalPlanSHA256 == record.intent.sourceWorkload.canonicalPlanSHA256 &&
+            sourceReport.containerBlobSHA256 == record.intent.sourceWorkload.artifactSHA256;
+      } else valid = productionWorkloadIdentity(source, record.intent.sourceWorkload.deploymentID,
                                          sourceIdentity, sourceReport, failure) &&
           productionWorkloadIdentityEqual(sourceIdentity, record.intent.sourceWorkload);
       if (!valid && failure.empty()) failure.assign("live source differs from the production pair"_ctv);
       ProductionPairProviderState drainState = {}; String drainOutput = {}, providerEvidence = {};
-      valid = valid && runProductionPairProvider(record, source, "drain", drainState, drainOutput,
+      if (!stateful) valid = valid && runProductionPairProvider(record, source, "drain", drainState, drainOutput,
                                                  providerEvidence, failure) &&
           productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::sourceDrained,
                                              drainState, failure);
@@ -15822,6 +15831,309 @@ private:
     return valid;
   }
 
+  bool exchangeStatefulDataAuthority(const MothershipProdigyCluster& cluster,
+      const StatefulDataAuthorityOperation& request, StatefulDataAuthorityOperation& response,
+      const String *artifactPath, String& failure)
+  {
+    socket.close(); String name = cluster.name;
+    if (!configureControlTarget(name.c_str(), &failure) || !socket.ensureConnected()) return false;
+    auto copy = request; String encoded; BitseryEngine::serialize(encoded, copy);
+    const uint32_t offset = Message::appendHeader(socket.wBuffer, MothershipTopic::statefulDataAuthority);
+    Message::appendValue(socket.wBuffer, encoded);
+    if (artifactPath) Message::appendFile(socket.wBuffer, *artifactPath);
+    Message::finish(socket.wBuffer, offset);
+    if (!socket.send()) { failure = socket.ioFailureDetail(); return false; }
+    Message *message = socket.recvExpectedTopic(MothershipTopic::statefulDataAuthority);
+    if (!message || MothershipTopic(message->topic) != MothershipTopic::statefulDataAuthority) {
+      failure.assign("stateful command outcome is unknown; resume the exact pair operation"_ctv); return false;
+    }
+    auto *args = message->args; String payload;
+    if (!ProdigyIngressValidation::extractVariableStringView(args, message->terminal(), payload) ||
+        args != message->terminal() || !BitseryEngine::deserializeSafe(payload, response) || response.version != 1 ||
+        response.deploymentID != request.deploymentID || response.pairIntentSHA256 != request.pairIntentSHA256 ||
+        !prodigyStatefulDataAuthorityEqual(response.authority, request.authority)) {
+      failure.assign("stateful owner returned a mismatched operation receipt"_ctv); return false;
+    }
+    if (!response.failure.empty()) { failure = response.failure; return false; }
+    return true;
+  }
+
+  bool compensateNametagStatefulTarget(const MothershipProductionPairRecord& record,
+      const MothershipProdigyCluster& source, const MothershipProdigyCluster& target,
+      const StatefulDataAuthorityOperation& catchup, String& receiptSHA256, String& failure)
+  {
+    PairedSourceRetirementReceipt receipt;
+    String authorityBytes, authorityDigest;
+    auto data = catchup.authority;
+    BitseryEngine::serialize(authorityBytes, data);
+    if (!prodigyComputeSHA256Hex(authorityBytes, authorityDigest)) return false;
+    auto query = [&]() {
+      socket.close(); String name = target.name;
+      if (!configureControlTarget(name.c_str(), &failure) || !socket.ensureConnected()) return false;
+      Message::construct(socket.wBuffer, MothershipTopic::pullPairedSourceRetirement, uint8_t(1), record.intent.operationUUID);
+      return socket.send() && readPairedSourceRetirementReceipt(socket.recvExpectedTopic(MothershipTopic::pullPairedSourceRetirement),
+          MothershipTopic::pullPairedSourceRetirement, receipt, failure);
+    };
+    auto matches = [&]() {
+      ProdigyScopedPairedSourceRetirementFence scoped;
+      if (receipt.version != 2 || !BitseryEngine::deserializeSafe(receipt.scopedFence, scoped) || scoped.version != 4) return false;
+      const auto& fence = scoped.fence;
+      if (!prodigyPairedSourceRetirementFenceValid(fence) || !fence.hasStatefulScope || !fence.catchupTargetCompensation ||
+          fence.operationID != record.intent.operationUUID || fence.sourceClusterUUID != target.clusterUUID ||
+          fence.targetClusterUUID != source.clusterUUID || fence.sourceDeploymentID != record.intent.targetWorkload.deploymentID ||
+          fence.targetDeploymentID != record.intent.sourceWorkload.deploymentID || fence.shardGroup != record.intent.stateful.shardGroup ||
+          fence.pairIntentSHA256 != catchup.pairIntentSHA256 || fence.dataAuthoritySHA256 != authorityDigest ||
+          fence.sourceBlobSHA256 != record.intent.targetWorkload.artifactSHA256 ||
+          fence.sourceBlobBytes != record.intent.targetWorkload.artifactBytes) return false;
+      for (const auto& member : fence.cohort)
+        if (std::find(record.intent.stateful.targetMachineUUIDs.begin(), record.intent.stateful.targetMachineUUIDs.end(), member.machineUUID) ==
+            record.intent.stateful.targetMachineUUIDs.end()) return false;
+      return true;
+    };
+    if (!query()) return false;
+    if (receipt.sealedFence.empty()) {
+      DeploymentIdentityReport identity;
+      if (!readDeploymentIdentity(target, record.intent.targetWorkload.deploymentID, identity, failure, false) ||
+          !identity.isStateful || identity.containerBlobSHA256 != record.intent.targetWorkload.artifactSHA256 ||
+          identity.containerBlobBytes != record.intent.targetWorkload.artifactBytes || !query()) return false;
+      ProdigyPairedSourceRetirementRequest request;
+      request.version = 2; request.catchupTargetCompensation = true; request.operationID = record.intent.operationUUID;
+      request.sourceClusterUUID = target.clusterUUID; request.targetClusterUUID = source.clusterUUID;
+      request.sourceDeploymentID = record.intent.targetWorkload.deploymentID; request.targetDeploymentID = record.intent.sourceWorkload.deploymentID;
+      request.expectedAuthorityGeneration = receipt.currentAuthorityGeneration; request.expectedMasterUUID = receipt.currentMasterUUID;
+      request.expectedMasterBootNs = receipt.currentMasterBootNs; request.sourceNormalizedPlanSHA256 = identity.canonicalPlanSHA256;
+      request.sourceBlobSHA256 = identity.containerBlobSHA256; request.sourceBlobBytes = identity.containerBlobBytes;
+      request.shardGroup = record.intent.stateful.shardGroup; request.pairIntentSHA256 = catchup.pairIntentSHA256;
+      request.dataAuthoritySHA256 = authorityDigest;
+      String encoded; BitseryEngine::serialize(encoded, request);
+      Message::construct(socket.wBuffer, MothershipTopic::preparePairedSourceRetirement, encoded);
+      if (!socket.send() || !readPairedSourceRetirementReceipt(socket.recvExpectedTopic(MothershipTopic::preparePairedSourceRetirement),
+          MothershipTopic::preparePairedSourceRetirement, receipt, failure)) return false;
+    }
+    for (uint32_t poll = 0; poll < 1500 && !receipt.terminal; ++poll) {
+      if (!receipt.sealedFence.empty() && !matches()) { failure.assign("target compensation conflicts with its durable shard admission"_ctv); return false; }
+      ::usleep(100'000); if (!query()) return false;
+    }
+    socket.close();
+    if (!receipt.sealed || !receipt.terminal || !matches()) {
+      failure.assign("exact catchup target compensation is pending; resume this abort"_ctv); return false;
+    }
+    return prodigyComputeSHA256Hex(receipt.scopedFence, receiptSHA256);
+  }
+
+  bool abortNametagStatefulPairBeforeFence(MothershipProductionPairRecord& record, String& failure)
+  {
+    if (record.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence) return true;
+    MothershipProdigyCluster source, target;
+    if (!productionPairTransportReady(record, source, target, failure)) return false;
+    const auto operation = record.intent.operationUUID;
+    if (record.phase != MothershipProductionPairPhase::statefulAbortBeforeFencePending) {
+      auto copy = record.intent; String bytes, digest;
+      BitseryEngine::serialize(bytes, copy); bytes.append("abortBeforeFence"_ctv);
+      if (!prodigyComputeSHA256Hex(bytes, digest)) return false;
+      auto registry = openClusterRegistry();
+      if (!registry.abortProductionPairStatefulBeforeFence(operation, digest, Time::now<TimeResolution::ms>(), false, record, &failure)) return false;
+    }
+    auto observe = [&](StatefulDataAuthorityOperation command, MothershipProductionPairPhase phase,
+        MothershipProductionStatefulReceipt& proof) {
+      StatefulDataAuthorityOperation response;
+      auto query = command; query.query = true;
+      if (!exchangeStatefulDataAuthority(source, query, response, nullptr, failure)) return false;
+      if (!response.accepted) {
+        command.expectedAuthorityGeneration = response.expectedAuthorityGeneration; command.expectedMasterUUID = response.expectedMasterUUID;
+        command.expectedMasterBootNs = response.expectedMasterBootNs;
+        if (!exchangeStatefulDataAuthority(source, command, response, nullptr, failure)) return false;
+      }
+      for (uint32_t poll = 0; poll < 300 && !response.ready; ++poll) {
+        ::usleep(100'000); if (!exchangeStatefulDataAuthority(source, query, response, nullptr, failure)) return false;
+      }
+      if (!response.ready || response.cohort.size() != 3 || response.receipts.size() != 3) {
+        failure.assign("abort awaits three fresh source-owned cleanup/snapshot receipts"_ctv); return false;
+      }
+      proof.phase = phase; proof.operationUUID = operation; proof.intentSHA256 = command.pairIntentSHA256;
+      proof.observedMasterUUID = response.expectedMasterUUID; proof.observedMasterBootNs = response.expectedMasterBootNs;
+      proof.observedAuthorityGeneration = response.expectedAuthorityGeneration; proof.cohort = response.cohort;
+      for (const auto& member : response.receipts) proof.members.push_back({member.containerUUID, member.machineUUID, member.receipt});
+      auto registry = openClusterRegistry();
+      return registry.observeProductionPairStatefulAbort(operation, proof, Time::now<TimeResolution::ms>(), record, &failure);
+    };
+    if (record.statefulReceipts.empty()) {
+      StatefulDataAuthorityOperation preparing; MothershipProductionStatefulReceipt snapshot;
+      if (!mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::snapshotVerified, preparing) ||
+          !observe(preparing, MothershipProductionPairPhase::snapshotVerified, snapshot)) return false;
+    }
+    String targetReceipt;
+    if (record.statefulAbortTargetAdmissionIssued) {
+      StatefulDataAuthorityOperation catchup, response;
+      if (!mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::catchupVerified, catchup)) return false;
+      auto query = catchup; query.query = true;
+      if (!exchangeStatefulDataAuthority(target, query, response, nullptr, failure)) return false;
+      if (!response.accepted) {
+        // A lost initial command may have had no effects. Re-establish only
+        // its empty non-writer admission, never the artifact launch substep.
+        catchup.expectedAuthorityGeneration = response.expectedAuthorityGeneration; catchup.expectedMasterUUID = response.expectedMasterUUID;
+        catchup.expectedMasterBootNs = response.expectedMasterBootNs;
+        if (!exchangeStatefulDataAuthority(target, catchup, response, nullptr, failure)) return false;
+        for (uint32_t poll = 0; poll < 300 && !response.accepted; ++poll) {
+          ::usleep(100'000); if (!exchangeStatefulDataAuthority(target, query, response, nullptr, failure)) return false;
+        }
+        if (!response.accepted) return false;
+      }
+      if (!compensateNametagStatefulTarget(record, source, target, catchup, targetReceipt, failure)) return false;
+    } else {
+      String evidence; auto snapshot = record.statefulReceipts.front();
+      BitseryEngine::serialize(evidence, snapshot); evidence.append("no-target-command-issued"_ctv);
+      if (!prodigyComputeSHA256Hex(evidence, targetReceipt)) return false;
+    }
+    // Remove seeding peers first: a disconnected target may otherwise retain
+    // source snapshot cursors forever. The source remains writer throughout.
+    { auto registry = openClusterRegistry();
+      if (!registry.observeProductionPairStatefulTargetCompensation(operation, targetReceipt,
+          Time::now<TimeResolution::ms>(), record, &failure)) return false; }
+    if (!record.hasStatefulAbortReceipt) {
+      StatefulDataAuthorityOperation cleanup; MothershipProductionStatefulReceipt proof;
+      if (!mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::snapshotVerified, cleanup)) return false;
+      cleanup.authority.mode = StatefulDataAuthorityMode::retainedSource;
+      cleanup.authority.authorityEpoch = record.intent.stateful.sourceRetainedEpoch;
+      cleanup.authority.snapshotBoundarySHA256 = record.statefulReceipts.front().members.front().receipt.snapshotReceiptSHA256;
+      if (!observe(cleanup, MothershipProductionPairPhase::statefulAbortedBeforeFence, proof)) return false;
+    }
+    String evidence, digest; auto cleanup = record.statefulAbortReceipt;
+    BitseryEngine::serialize(evidence, cleanup); evidence.append(targetReceipt);
+    if (!prodigyComputeSHA256Hex(evidence, digest)) return false;
+    auto registry = openClusterRegistry();
+    return registry.abortProductionPairStatefulBeforeFence(operation, digest, Time::now<TimeResolution::ms>(), true,
+        record, &failure, &cleanup, &targetReceipt);
+  }
+
+  bool advanceNametagStatefulPair(MothershipProductionPairRecord& record, const String& artifactPath, String& failure)
+  {
+    MothershipProdigyCluster source, target;
+    if (!productionPairTransportReady(record, source, target, failure)) return false;
+    const auto& intent = record.intent;
+    String artifactDigest; uint64_t artifactBytes = 0;
+    if (!mothershipValidateDiscombobulatorContainerBlobContract(artifactPath, &failure) ||
+        !prodigyComputeFileSHA256Hex(artifactPath, artifactDigest, &artifactBytes, &failure) ||
+        artifactDigest != intent.targetWorkload.artifactSHA256 || artifactBytes != intent.targetWorkload.artifactBytes) return false;
+    bool resumed = false;
+    if (record.phase == MothershipProductionPairPhase::prepared) {
+      DeploymentIdentityReport observed;
+      if (!readDeploymentIdentity(source, intent.sourceWorkload.deploymentID, observed, failure) ||
+          !observed.live || !observed.isStateful || observed.canonicalPlanSHA256 != intent.sourceWorkload.canonicalPlanSHA256 ||
+          observed.containerBlobSHA256 != intent.sourceWorkload.artifactSHA256 || observed.containerBlobBytes != artifactBytes) {
+        failure.assign("stateful declaration does not bind the authenticated current source deployment"_ctv); return false;
+      }
+      String evidence, digest; BitseryEngine::serialize(evidence, observed);
+      evidence.append(intent.stateful.targetDeploymentPlan);
+      if (!prodigyComputeSHA256Hex(evidence, digest)) return false;
+      auto registry = openClusterRegistry();
+      return registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+          digest, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+    }
+    constexpr MothershipProductionPairPhase phases[] = {
+      MothershipProductionPairPhase::snapshotVerified, MothershipProductionPairPhase::catchupVerified,
+      MothershipProductionPairPhase::sourceWriterFenced, MothershipProductionPairPhase::fencedCatchupVerified,
+      MothershipProductionPairPhase::targetOwnershipActive};
+    const auto order = mothershipProductionPairPhaseOrder(intent, record.phase);
+    if ((order >= 2 && order < 7) || record.phase == MothershipProductionPairPhase::targetSelected) {
+      const auto phase = order == 8 ? MothershipProductionPairPhase::sourceCleanupVerified : phases[order - 2];
+      { auto registry = openClusterRegistry();
+        if (!registry.prepareProductionPairStatefulCommand(intent.operationUUID, phase, Time::now<TimeResolution::ms>(), record, &failure)) return false; }
+      StatefulDataAuthorityOperation command, response;
+      if (!mothershipProductionPairStatefulCommand(record, phase, command)) return false;
+      const auto& cluster = command.authority.localClusterUUID == source.clusterUUID ? source : target;
+      auto query = command; query.query = true;
+      if (!exchangeStatefulDataAuthority(cluster, query, response, nullptr, failure)) return false;
+      if (!response.accepted) {
+        command.expectedAuthorityGeneration = response.expectedAuthorityGeneration;
+        command.expectedMasterUUID = response.expectedMasterUUID; command.expectedMasterBootNs = response.expectedMasterBootNs;
+        if (!exchangeStatefulDataAuthority(cluster, command, response, nullptr, failure)) return false;
+      }
+      // Persisted desired authority may be visible before peer ACKs or after an
+      // election. Poll only this exact operation; no operator app proof enters.
+      for (uint32_t poll = 0; poll < 300 && !response.accepted; ++poll) {
+        ::usleep(100'000);
+        if (!exchangeStatefulDataAuthority(cluster, query, response, nullptr, failure)) return false;
+      }
+      if (!response.accepted) { failure.assign("stateful desired authority awaits durable peer acknowledgements"_ctv); return false; }
+      if (phase == MothershipProductionPairPhase::catchupVerified && response.cohort.empty()) {
+        command.launchTarget = true;
+        command.expectedAuthorityGeneration = response.expectedAuthorityGeneration;
+        command.expectedMasterUUID = response.expectedMasterUUID; command.expectedMasterBootNs = response.expectedMasterBootNs;
+        if (!exchangeStatefulDataAuthority(cluster, command, response, &artifactPath, failure)) return false;
+      }
+      auto gateObserved = [&]() {
+        if (response.cohort.size() != 3 || response.receipts.size() != 3) return false;
+        return phase == MothershipProductionPairPhase::catchupVerified
+            ? std::all_of(response.receipts.begin(), response.receipts.end(), [](const auto& member) {
+                return prodigyStatefulDataAuthorityReceiptStaged(member.receipt);
+              }) : response.ready;
+      };
+      for (uint32_t poll = 0; poll < 300 && !gateObserved(); ++poll) {
+        ::usleep(100'000);
+        if (!exchangeStatefulDataAuthority(cluster, query, response, nullptr, failure)) return false;
+      }
+      if (!gateObserved()) {
+        failure.assign("stateful gate awaits three fresh authenticated application receipts"_ctv); return false;
+      }
+      MothershipProductionStatefulReceipt proof;
+      proof.phase = phase; proof.operationUUID = intent.operationUUID; proof.intentSHA256 = command.pairIntentSHA256;
+      proof.observedMasterUUID = response.expectedMasterUUID; proof.observedMasterBootNs = response.expectedMasterBootNs;
+      proof.observedAuthorityGeneration = response.expectedAuthorityGeneration; proof.cohort = response.cohort;
+      for (const auto& member : response.receipts) proof.members.push_back({member.containerUUID, member.machineUUID, member.receipt});
+      auto registry = openClusterRegistry();
+      return registry.applyProductionPairStatefulReceipt(intent.operationUUID, proof, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+    }
+    if (record.phase == MothershipProductionPairPhase::targetOwnershipActive) {
+      StatefulDataAuthorityOperation query, response;
+      if (!mothershipProductionPairStatefulCommand(record, MothershipProductionPairPhase::targetOwnershipActive, query)) return false;
+      query.query = true;
+      if (!exchangeStatefulDataAuthority(target, query, response, nullptr, failure) || !response.ready ||
+          !productionPairTransportReady(record, source, target, failure)) return false;
+      String evidence, digest; BitseryEngine::serialize(evidence, response);
+      auto route = intent.route; String routeBytes; BitseryEngine::serialize(routeBytes, route); evidence.append(routeBytes);
+      if (!prodigyComputeSHA256Hex(evidence, digest)) return false;
+      auto registry = openClusterRegistry();
+      return registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::targetSelected,
+          digest, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+    }
+    if (record.phase == MothershipProductionPairPhase::sourceCleanupVerified) {
+      String digest;
+      if (!retireProductionPairSource(record, source, target, digest, failure)) return false;
+      auto registry = openClusterRegistry();
+      return registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::sourceRetired,
+          digest, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+    }
+    if (record.phase == MothershipProductionPairPhase::sourceRetired) {
+      auto registry = openClusterRegistry();
+      return registry.advanceProductionPair(intent.operationUUID, MothershipProductionPairPhase::cleanupComplete,
+          record.sourceRetirementReceiptSHA256, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+    }
+    return record.phase == MothershipProductionPairPhase::cleanupComplete;
+  }
+
+  // Versioned declaration input contains immutable intent/plan, never app
+  // receipts. Every data, route and retirement proof is collected from owners.
+  void runNametagStatefulPair(int argc, char *argv[])
+  {
+    String encoded, failure;
+    MothershipProductionPairIntent intent; MothershipProductionPairRecord record;
+    bool resumed = false;
+    const bool abort = argc == 3 && String(argv[2]) == "abortBeforeFence"_ctv;
+    if (argc == 2 || abort) Filesystem::openReadAtClose(-1, String(argv[0]), encoded, 2 * 1024 * 1024);
+    bool valid = (argc == 2 || abort) && !encoded.empty() &&
+        BitseryEngine::deserializeSafe(encoded, intent) && intent.protocolVersion == MothershipProductionPairIntent::statefulVersion &&
+        mothershipProductionPairIntentValid(intent, &failure);
+    if (valid) { auto registry = openClusterRegistry();
+      valid = registry.admitProductionPair(intent, Time::now<TimeResolution::ms>(), record, resumed, &failure); }
+    if (valid && abort && record.phase == MothershipProductionPairPhase::prepared)
+      valid = advanceNametagStatefulPair(record, String(argv[1]), failure);
+    if (valid) valid = abort ? abortNametagStatefulPairBeforeFence(record, failure) : advanceNametagStatefulPair(record, String(argv[1]), failure);
+    basics_log("nametagStatefulPair success=%u phase=%u complete=%u failure=%s\n", unsigned(valid), unsigned(record.phase),
+        unsigned(valid && mothershipProductionPairTerminal(record.phase)), failure.c_str());
+    if (!valid) exit(EXIT_FAILURE);
+  }
+
   void runProductionPair(int argc, char *argv[])
   {
     String failure = {}, action = argc > 1 ? String(argv[1]) : String(), receiptSHA256 = {};
@@ -15838,6 +16150,9 @@ private:
     {
       auto registry = openClusterRegistry();
       valid = registry.loadProductionPair(operationUUID, record, &failure);
+      if (valid && record.intent.protocolVersion != MothershipProductionPairIntent::version) {
+        failure.assign("stateful pairs use nametagStatefulPair; physical productionPair actions are forbidden"_ctv); valid = false;
+      }
       String sourceIdentity = {}, targetIdentity = {};
       sourceIdentity.assignItoh(record.intent.route.sourceClusterUUID);
       targetIdentity.assignItoh(record.intent.route.destinationClusterUUID);
@@ -16923,6 +17238,69 @@ private:
     String failure = {};
   };
 
+  bool admitTruthDeploymentPlacement(const DeploymentPlan& plan, String& failure)
+  {
+    const uint16_t applicationID = plan.config.applicationID;
+    if (!mothershipApplicationPlacementRequired(applicationID)) return true;
+    const uint128_t requested = socket.configuredClusterUUID();
+    if (requested == 0) { failure.assign("Truth admission requires an exact registered cluster identity"_ctv); return false; }
+    Vector<MothershipProdigyCluster> clusters;
+    {
+      auto registry = openClusterRegistry();
+      MothershipApplicationPlacement existing;
+      String readFailure;
+      if (registry.loadApplicationPlacement(applicationID, existing, &readFailure)) {
+        if (existing.ownerClusterUUID == requested) return true;
+        failure.assign("Truth destination admission conflicts with its durable source placement"_ctv);
+        return false;
+      }
+      if (readFailure != "record not found"_ctv || !registry.listClusters(clusters, &failure)) {
+        if (failure.empty()) failure = readFailure;
+        return false;
+      }
+    }
+    std::sort(clusters.begin(), clusters.end(), [](const auto& a, const auto& b) { return a.clusterUUID < b.clusterUUID; });
+    auto target = std::find_if(clusters.begin(), clusters.end(), [&](const auto& cluster) { return cluster.clusterUUID == requested; });
+    if (target == clusters.end()) {
+      failure.assign("Truth first admission requires a registered target and a complete cluster observation"_ctv);
+      return false;
+    }
+    String observations;
+    uint128_t observedOwner = 0;
+    for (const auto& cluster : clusters) {
+      ClusterStatusReport report;
+      if (!readManagedClusterStatus(cluster, report, failure) || !report.hasTopology) {
+        socket.configureCluster(*target, nullptr);
+        if (failure.empty()) failure.assign("Truth singleton observation is unavailable on a registered cluster"_ctv);
+        return false;
+      }
+      String encoded;
+      BitseryEngine::serialize(encoded, report);
+      observations.append(reinterpret_cast<const uint8_t *>(&cluster.clusterUUID), sizeof(cluster.clusterUUID));
+      observations.append(encoded);
+      for (const auto& application : report.applicationReports) if (application.applicationID == applicationID && !application.deploymentReports.empty()) {
+        if (observedOwner != 0 && observedOwner != cluster.clusterUUID) {
+          socket.configureCluster(*target, nullptr);
+          failure.assign("Truth is already declared by more than one cluster; admission is fenced"_ctv);
+          return false;
+        }
+        observedOwner = cluster.clusterUUID;
+      }
+    }
+    if (!socket.configureCluster(*target, &failure)) return false;
+    String receipt;
+    if (!prodigyComputeSHA256Hex(observations, receipt, &failure)) return false;
+    auto registry = openClusterRegistry();
+    MothershipApplicationPlacement placement;
+    bool resumed = false;
+    if (!registry.admitApplicationPlacement(plan, observedOwner != 0 ? observedOwner : requested, receipt, placement, resumed, &failure)) return false;
+    if (placement.ownerClusterUUID != requested) {
+      failure.assign("Truth remains assigned to its observed source cluster; fresh deploy cannot transfer ownership"_ctv);
+      return false;
+    }
+    return true;
+  }
+
   // Dispatches one already parsed and validated plan over the ordinary
   // measureApplication/spinApplication control path.  An accepted result is
   // deliberately not a readiness assertion: test-cluster callers continue to
@@ -16942,6 +17320,7 @@ private:
       }
     };
     result = {};
+    if (!admitTruthDeploymentPlacement(plan, result.failure)) return false;
     String serializedPlan = {};
     BitseryEngine::serialize(serializedPlan, plan);
     String contractFailure = {};
@@ -23712,7 +24091,7 @@ private:
     MothershipPairControlServiceTransit service = {};
     MothershipPairControlFault fault = {};
     TestPairLifecycleLock lock = {};
-    bool valid = argc >= 2 && argc <= 5 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
+    bool valid = argc >= 2 && argc <= 9 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0;
     if (valid) action.assign(argv[1]);
     valid = valid && (action == "prepare"_ctv || action == "query"_ctv || action == "remove"_ctv || action == "service"_ctv || action == "fault"_ctv);
     if (valid && action == "service"_ctv)
@@ -23722,7 +24101,10 @@ private:
       String direction = {};
       if (argc == 5) direction.assign(argv[4]);
       valid = argc == 4 ? mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), fault, &failure) :
-          argc == 5 && mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), &direction, fault, &failure);
+          argc == 5 ? mothershipPairControlFaultParse(String(argv[2]), String(argv[3]), &direction, fault, &failure) :
+          argc == 9 && mothershipPairControlFaultParse(
+              String(argv[2]), String(argv[3]), String(argv[4]), String(argv[5]),
+              String(argv[6]), String(argv[7]), String(argv[8]), fault, &failure);
     }
     else valid = valid && argc == 2;
     valid = valid && lockTestPairLifecycle(lock, failure);
@@ -27439,6 +27821,7 @@ public:
         {"listBGPOriginPrefixes",           &Mothership::runListBGPOriginPrefixes          },
         {"migrateTidesDB9To10",             &Mothership::runMigrateTidesDB9To10             },
         {"mintClientTlsIdentity",           &Mothership::runMintClientTlsIdentity          },
+        {"nametagStatefulPair",              &Mothership::runNametagStatefulPair             },
         {"offlineDNSCleanupInventory",      &Mothership::runOfflineDNSCleanupInventory     },
         {"pairBoundary",                    &Mothership::runPairBoundary                   },
         {"placementPolicy",                 &Mothership::runCommitDeploymentPlacementPolicy },
@@ -27602,6 +27985,8 @@ int main(int argc, char *argv[])
     message.append("prepareProductionPair [operationUUID] [activeRouteUUID] [physicalBoundaryUUID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIngressAddress] [ingressPort]\n");
     message.append("\tadmits two exact non-test stateless workloads, their production COUSIN transport, and one durable source-machine ingress relay\n");
     message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit|abortBeforeCutover]\n");
+    message.append("nametagStatefulPair [versioned intent binary path] [Discombobulator app artifact path] [abortBeforeFence]\n");
+    message.append("\tadvances exactly one durable Hot/Cold shard gate using authenticated runtime receipts; no physical IPv4 selector\n");
     message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, post-withdrawal cleanup, or a pre-transit/pre-cutover abort\n");
     message.append("registerLocalVMBoundary [cluster] [machineUUID] [boundaryUUID] [taskID] [hostAddress] [hostPort] [hostUser] [hostPrivateKey] [hostPublicKey] [statePath]\n");
     message.append("\tregisters the exact pinned external KVM owner for one VM member of a three-Brain deploymentMode=local cluster; Mothership owns and seals the launcher bytes\n");

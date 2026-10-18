@@ -103,6 +103,7 @@ public:
   bool placementPolicyCapabilityAcknowledged = false;
   bool containerRetirementCapabilityAcknowledged = false;
   bool statefulServingAuthorityCapabilityAcknowledged = false;
+  bool statefulDataAuthorityCapabilityAcknowledged = false;
   bool statelessDeploymentAdmissionCapabilityAcknowledged = false;
   bool pairedSourceRetirementCapabilityAcknowledged = false;
   bool clusterPairEnrollmentCapabilityAcknowledged = false;
@@ -205,6 +206,7 @@ public:
     placementPolicyCapabilityAcknowledged = false;
     containerRetirementCapabilityAcknowledged = false;
     statefulServingAuthorityCapabilityAcknowledged = false;
+    statefulDataAuthorityCapabilityAcknowledged = false;
     statelessDeploymentAdmissionCapabilityAcknowledged = false;
     pairedSourceRetirementCapabilityAcknowledged = false;
     clusterPairEnrollmentCapabilityAcknowledged = false;
@@ -802,6 +804,10 @@ public:
   enum class StatefulServingResourceAdjustmentAdmission : uint8_t { ready, pending, rejected };
   virtual bool statefulServingDecisionExists(uint64_t) const { return false; }
   virtual bool statefulServingRecoveryReady() const { return true; }
+  virtual bool desiredStatefulDataAuthority(uint64_t, StatefulDataAuthority&, uint32_t = UINT32_MAX) const { return false; }
+  virtual bool statefulCatchupCompensationFenced(uint64_t, uint32_t, uint128_t) const { return false; }
+  virtual bool desiredStatefulReplicaCount(uint64_t, uint32_t, uint32_t&) const { return false; }
+  virtual uint32_t desiredStatefulShardGroupCount(uint64_t) const { return 0; }
   virtual StatefulServingResourceAdjustmentAdmission prepareStatefulServingResourceAdjustment(
       ApplicationDeployment *, const ApplicationConfig&)
   {

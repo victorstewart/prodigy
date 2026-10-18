@@ -89,7 +89,8 @@ enum class MothershipTopic : uint16_t {
   // appended so an older Brain rejects the request rather than decoding it as
   // an unrelated operation.
   commitCousinRoute,
-  pullCousinRoute
+  pullCousinRoute,
+  statefulDataAuthority
 };
 
 constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
@@ -204,6 +205,8 @@ constexpr static const char *prodigyMothershipTopicName(MothershipTopic topic)
       return "commitCousinRoute";
     case MothershipTopic::pullCousinRoute:
       return "pullCousinRoute";
+    case MothershipTopic::statefulDataAuthority:
+      return "statefulDataAuthority";
   }
 
   return "unknown";
@@ -306,7 +309,8 @@ enum class NeuronTopic : uint16_t {
   cousinAdmissionCommand,
   cousinAdmissionAck,
   transportCredentialLifecycle,
-  transportCredentialLifecycleAck
+  transportCredentialLifecycleAck,
+  statefulDataAuthority
 };
 
 enum class ContainerTopic : uint16_t {
@@ -329,6 +333,7 @@ enum class ContainerTopic : uint16_t {
   cousinSessionRequest,
   cousinSessionCommand,
   cousinSessionAck,
+  statefulDataAuthority,
 };
 
 enum class PulseTopic : uint16_t {

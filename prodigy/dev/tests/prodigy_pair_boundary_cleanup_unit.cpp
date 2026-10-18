@@ -754,6 +754,230 @@ run_case second-to-first 'PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOT
   std::filesystem::remove_all(temporary, error);
 }
 
+static void testPairControlNetemOwnershipAndCleanup(TestSuite& suite)
+{
+  std::string sourcePath = __FILE__;
+  const size_t root = sourcePath.rfind("/dev/tests/");
+  if (root == std::string::npos) { suite.expect(false, "pair_netem_locates_provider"); return; }
+  sourcePath.resize(root); sourcePath += "/mothership/mothership.virtual.datacenter.provider.sh";
+  std::ifstream source(sourcePath);
+  if (!source) { suite.expect(false, "pair_netem_reads_provider"); return; }
+  std::string text((std::istreambuf_iterator<char>(source)), std::istreambuf_iterator<char>());
+  const size_t begin = text.find("pair_control_netem_validate()\n{\n");
+  const size_t end = text.find("\npair_control_fault_rule_text()\n", begin);
+  const size_t cleanupBegin = text.find("pair_control_cleanup_inside()\n{\n");
+  const size_t cleanupEnd = text.find("\npair_control_bind_parents()\n", cleanupBegin);
+  suite.expect(begin != std::string::npos && end != std::string::npos &&
+               cleanupBegin != std::string::npos && cleanupEnd != std::string::npos, "pair_netem_extracts_real_owner");
+  if (begin == std::string::npos || end == std::string::npos ||
+      cleanupBegin == std::string::npos || cleanupEnd == std::string::npos) return;
+  std::string cleanup = text.substr(cleanupBegin, cleanupEnd - cleanupBegin);
+  // Redirect only the namespace mountpoint inventory to ordinary fixture
+  // files. All external operations remain mocked; no real /run path is used.
+  for (size_t at = 0; (at = cleanup.find("/run/netns/", at)) != std::string::npos; )
+  { cleanup.replace(at, 11, "$PWD/namespaces/"); at += 16; }
+  // No namespaces, links, or qdiscs are created. Only the external ip/tc
+  // boundary is mocked; parser, exact JSON validation, journals, trap cleanup,
+  // partial-install recovery, and receipt construction are real provider code.
+  const std::string script = "set -euo pipefail\n" + text.substr(begin, end - begin) + cleanup + R"TEST(
+pair_control_dir="$PWD/pair"; mkdir -p "$pair_control_dir" "$PWD/state"
+pair_control_id=0x0900; pair_control_router_ns=pc-r-unit
+pair_control_netem_scope() { return 0; }
+tc() { return 99; } # command -v only; every invocation must pass through ip.
+pair_write() { printf '%s\n' "$2" > "$1"; }
+pair_control_query_inside() { printf 'preflight-must-not-leak\n'; }
+pair_control_fault_monotonic_ns() {
+  if [[ -e "$PWD/clock" ]]; then printf 1001000000; else : > "$PWD/clock"; printf 1000000; fi
+}
+pair_control_fault_sleep() {
+  if [[ "$1" == 1000 && "$failure" == interrupt ]]; then return 1; fi
+  if [[ "$1" == 1000 && "$failure" == signal ]]; then kill -TERM "$BASHPID"; fi
+}
+reset_fixture() {
+  rm -f "$pair_control_dir"/netem-* "$PWD/state/first0" "$PWD/state/second0" "$PWD/deletions" "$PWD/clock" "$PWD/output"
+  printf '999\n' > "$pair_control_dir/router-namespace"
+  pair_control_fault_kind=delay; pair_control_fault_delay_ms=0; pair_control_fault_duration_ms=1000
+  pair_control_fault_latency_ms=17; pair_control_fault_percentage_bps=0; pair_control_fault_seed=12345
+  pair_control_fault_direction=both; failure=none
+}
+fixture_json() {
+  case "$pair_control_fault_kind" in
+    delay) printf '[{"kind":"netem","handle":"%s","root":true,"refcnt":2,"options":{"limit":1000,"delay":{"delay":0.017,"jitter":0,"correlation":0},"seed":12345,"ecn":false,"gap":0}}]\n' "$1" ;;
+    loss) printf '[{"kind":"netem","handle":"%s","root":true,"refcnt":2,"options":{"limit":1000,"loss-random":{"loss":0.0456,"correlation":0},"seed":12345,"ecn":false,"gap":0}}]\n' "$1" ;;
+    reorder) printf '[{"kind":"netem","handle":"%s","root":true,"refcnt":2,"options":{"limit":1000,"delay":{"delay":0.023,"jitter":0,"correlation":0},"reorder":{"reorder":0.1234,"correlation":0},"seed":12345,"ecn":false,"gap":1}}]\n' "$1" ;;
+  esac
+}
+ip() {
+  local device handle side expected actual="$*"
+  case "$actual" in
+    'netns del pc-r-unit') rm -f "$PWD/namespaces/pc-r-unit"; return ;;
+    '-n pc-r-unit -j link show dev first0') printf '[{"ifindex":10}]\n'; return ;;
+    '-n pc-r-unit -j link show dev second0') printf '[{"ifindex":11}]\n'; return ;;
+    'netns exec pc-r-unit tc qdisc add netem help') printf 'Usage: netem delay loss reorder seed\n' >&2; return 1 ;;
+  esac
+  [[ "$1 $2 $3 $4" == 'netns exec pc-r-unit tc' ]] || return 91
+  shift 4
+  if [[ "$1 $2 $3 $4 $5" == '-j qdisc show dev first0' || "$1 $2 $3 $4 $5" == '-j qdisc show dev second0' ]]; then
+    if [[ -f "$PWD/state/$5" ]]; then cat "$PWD/state/$5"; else printf '[{"kind":"noqueue","handle":"0:","root":true}]\n'; fi
+    return
+  fi
+  [[ "$1" == qdisc && "$3" == dev && "$5" == root ]] || return 92
+  device="$4"
+  case "$device" in first0) handle=7d01:; side=second ;; second0) handle=7d02:; side=first ;; *) return 93 ;; esac
+  if [[ "$2" == del ]]; then
+    [[ "$*" == "qdisc del dev $device root handle $handle" && -f "$pair_control_dir/netem-$side-intent" ]] || return 94
+    printf '%s\n' "$device" >> "$PWD/deletions"; rm -f "$PWD/state/$device"; return
+  fi
+  [[ "$2" == add && ! -f "$PWD/state/$device" && -f "$pair_control_dir/netem-$side-intent" ]] || return 95
+  [[ "$(<"$pair_control_dir/netem-$side-intent")" == "$(pair_control_netem_tuple) routerInode=999 ifindex=$([[ "$device" == first0 ]] && printf 10 || printf 11) egress=$device handle=$handle" ]] || return 96
+  expected="qdisc add dev $device root handle $handle netem limit 1000"
+  case "$pair_control_fault_kind" in
+    delay) expected+=' delay 17ms' ;;
+    loss) expected+=' loss random 4.56% 0%' ;;
+    reorder) expected+=' delay 23ms reorder 12.34% 0%' ;;
+  esac
+  [[ "$*" == "$expected seed 12345" ]] || return 97
+  [[ "$failure:$device" != second-add:first0 ]] || return 7
+  fixture_json "$handle" > "$PWD/state/$device"
+  [[ "$failure" != after-add ]] || return 7
+}
+reset_fixture
+[[ "$(pair_control_netem_device first)" == second0 && "$(pair_control_netem_device second)" == first0 ]]
+[[ "$(pair_control_netem_handle first)" == 7d02: && "$(pair_control_netem_handle second)" == 7d01: ]]
+pair_control_netem_validate
+for field in pair_control_fault_delay_ms pair_control_fault_duration_ms pair_control_fault_latency_ms pair_control_fault_percentage_bps pair_control_fault_seed; do
+  reset_fixture
+  case "$field" in
+    pair_control_fault_delay_ms) pair_control_fault_delay_ms=30001 ;;
+    pair_control_fault_duration_ms) pair_control_fault_duration_ms=60001 ;;
+    pair_control_fault_latency_ms) pair_control_fault_latency_ms=30001 ;;
+    pair_control_fault_percentage_bps) pair_control_fault_percentage_bps=1 ;;
+    pair_control_fault_seed) pair_control_fault_seed=0 ;;
+  esac
+  if pair_control_netem_validate 2>/dev/null; then exit 1; fi
+done
+reset_fixture; pair_control_fault_kind=reorder; pair_control_fault_percentage_bps=1; pair_control_fault_latency_ms=0
+if pair_control_netem_validate 2>/dev/null; then exit 1; fi
+reset_fixture; pair_control_fault_seed=01
+if pair_control_netem_validate 2>/dev/null; then exit 1; fi
+for kind in delay loss reorder; do
+  reset_fixture; pair_control_fault_kind="$kind"
+  case "$kind" in loss) pair_control_fault_latency_ms=0; pair_control_fault_percentage_bps=456 ;; reorder) pair_control_fault_latency_ms=23; pair_control_fault_percentage_bps=1234 ;; esac
+  output="$(pair_control_netem_inside)"
+  [[ "$output" == "PAIR_CONTROL_FAULT operationID=0x0900 clock=CLOCK_BOOTTIME kind=$kind onsetMs=0 durationMs=1000 latencyMs=$pair_control_fault_latency_ms percentageBps=$pair_control_fault_percentage_bps seed=12345 direction=both installQdisc=second0:7d02:netem,first0:7d01:netem restoreQdisc=second0:7d02:ABSENT,first0:7d01:ABSENT beginNs=1000000 endNs=1001000000" ]]
+  [[ ! -e "$pair_control_dir/netem-active" && ! -e "$PWD/state/first0" && ! -e "$PWD/state/second0" ]]
+  [[ "$(<"$PWD/deletions")" == $'second0\nfirst0' ]]
+done
+for direction in first-to-second second-to-first; do
+  reset_fixture; pair_control_fault_direction="$direction"
+  pair_control_netem_inside > "$PWD/output"
+  device=second0; handle=7d02:; [[ "$direction" == first-to-second ]] || { device=first0; handle=7d01:; }
+  [[ "$(<"$PWD/deletions")" == "$device" && "$(<"$PWD/output")" == *" direction=$direction installQdisc=$device:${handle}netem restoreQdisc=$device:${handle}ABSENT "* ]]
+done
+# Both an error before second add and a failed ACK after kernel installation
+# must clean only the first owned handle and publish no completed interval.
+for mode in second-add after-add interrupt; do
+  reset_fixture; failure="$mode"
+  if (pair_control_netem_inside > "$PWD/output"); then exit 1; fi
+  [[ ! -s "$PWD/output" && ! -e "$pair_control_dir/netem-last" && ! -e "$pair_control_dir/netem-active" ]]
+  [[ ! -e "$PWD/state/first0" && ! -e "$PWD/state/second0" && -e "$pair_control_dir/netem-restored" ]]
+done
+# Test a real shell signal only, never a runtime process/network fault.
+if [[ -n "${BASHPID:-}" ]]; then
+  reset_fixture; failure=signal
+  if (pair_control_netem_inside > "$PWD/output"); then exit 1; fi
+  [[ ! -s "$PWD/output" && ! -e "$pair_control_dir/netem-active" && ! -e "$PWD/state/first0" && ! -e "$PWD/state/second0" ]]
+fi
+# Foreign roots, altered parameters, and malformed readbacks must not be
+# overwritten/deleted even if an ownership journal exists.
+for changed in foreign wrong-seed wrong-latency malformed; do
+  reset_fixture; pair_control_fault_direction=first-to-second
+  pair_write "$pair_control_dir/netem-active" "$(pair_control_netem_tuple)"
+  pair_control_netem_install first
+  case "$changed" in
+    foreign) printf '[{"kind":"fq_codel","handle":"abcd:","root":true}]\n' > "$PWD/state/second0" ;;
+    wrong-seed) fixture_json 7d02: | sed 's/12345/54321/' > "$PWD/state/second0" ;;
+    wrong-latency) fixture_json 7d02: | sed 's/0.017/0.019/' > "$PWD/state/second0" ;;
+    malformed) printf 'not-json\n' > "$PWD/state/second0" ;;
+  esac
+  if pair_control_netem_restore 2>/dev/null; then exit 1; fi
+  [[ -e "$pair_control_dir/netem-active" && ! -e "$PWD/deletions" ]]
+done
+reset_fixture
+printf '[{"kind":"fq_codel","handle":"abcd:","root":true}]\n' > "$PWD/state/second0"
+if pair_control_netem_preflight 2>/dev/null; then exit 1; fi
+[[ ! -e "$pair_control_dir/netem-active" && ! -e "$PWD/deletions" ]]
+# Restart/dead-owner restoration reloads the exact persisted tuple, including
+# direction, without guessing from the caller's default DROP arguments.
+reset_fixture; pair_control_fault_direction=first-to-second
+pair_write "$pair_control_dir/netem-active" "$(pair_control_netem_tuple)"
+pair_control_netem_install first
+pair_control_fault_kind=drop; pair_control_fault_seed=0; pair_control_fault_direction=both
+pair_control_netem_load_active
+[[ "$pair_control_fault_kind" == delay && "$pair_control_fault_seed" == 12345 && "$pair_control_fault_direction" == first-to-second ]]
+pair_control_netem_restore
+[[ ! -e "$PWD/state/second0" && ! -e "$pair_control_dir/netem-active" ]]
+reset_fixture; pair_control_fault_direction=first-to-second
+pair_write "$pair_control_dir/netem-active" "$(pair_control_netem_tuple)"
+pair_control_netem_install first
+# Simulate cleanup_inside's separately verified removal of both owned peers.
+rm -f "$PWD/state/second0"
+pair_control_netem_forget_removed_links
+[[ ! -e "$pair_control_dir/netem-active" && ! -e "$pair_control_dir/netem-first-intent" && "$(<"$pair_control_dir/netem-restored")" == *'ownedPeersRemoved=1' ]]
+# Exercise the actual supervisor/dead-owner cleanup integration as well as
+# the helpers. Namespace inventories below are only empty fixture files.
+pair_control_load_service_descriptor() { return 3; }
+pair_control_service_path() { printf '%s/%s-%s' "$pair_control_dir" "$1" "$2"; }
+pair_control_remove_owned_link() {
+  [[ "$failure:$1" != cleanup-link:second ]] || return 1
+  rm -f "$PWD/state/pc-$1"
+  if [[ "$1" == first ]]; then rm -f "$PWD/state/second0"; else rm -f "$PWD/state/first0"; fi
+}
+pair_link_presence() { [[ -e "$PWD/state/$1" ]] && return 0; return 1; }
+umount() { rm -f -- "$1"; }
+stat() { [[ "$*" == "-Lc %i $PWD/namespaces/pc-r-unit" ]] || return 1; printf 999; }
+setup_cleanup() {
+  reset_fixture
+  mkdir -p "$PWD/namespaces"
+  : > "$PWD/namespaces/pc-first"; : > "$PWD/namespaces/pc-second"; : > "$PWD/namespaces/pc-r-unit"
+  : > "$PWD/state/pc-first"; : > "$PWD/state/pc-second"
+  pair_control_first_link=pcunita; pair_control_second_link=pcunitb
+  pair_control_first_subnet=fd42:1::/64; pair_control_second_subnet=fd42:2::/64
+  pair_control_fault_direction=first-to-second
+  pair_write "$pair_control_dir/netem-active" "$(pair_control_netem_tuple)"
+  pair_control_netem_install first
+}
+setup_cleanup
+pair_control_cleanup_inside
+[[ "$(<"$pair_control_dir/phase")" == removed && ! -e "$PWD/state/second0" && ! -e "$pair_control_dir/netem-active" ]]
+setup_cleanup
+printf '[{"kind":"fq_codel","handle":"abcd:","root":true}]\n' > "$PWD/state/second0"
+if pair_control_cleanup_inside 2>/dev/null; then exit 1; fi
+[[ -e "$pair_control_dir/netem-active" && -e "$PWD/namespaces/pc-r-unit" && -e "$PWD/state/pc-first" && -e "$PWD/state/pc-second" ]]
+setup_cleanup
+rm -f "$PWD/namespaces/pc-r-unit"
+pair_control_cleanup_inside
+[[ "$(<"$pair_control_dir/phase")" == removed && "$(<"$pair_control_dir/netem-restored")" == *'ownedPeersRemoved=1' && ! -e "$pair_control_dir/netem-active" ]]
+setup_cleanup
+rm -f "$PWD/namespaces/pc-r-unit" "$pair_control_dir/phase"; failure=cleanup-link
+if pair_control_cleanup_inside; then exit 1; fi
+[[ -e "$pair_control_dir/netem-active" && -e "$PWD/state/pc-second" && ! -e "$pair_control_dir/phase" ]]
+)TEST";
+  char temporary[] = "./pair-netem-unit.XXXXXX";
+  if (::mkdtemp(temporary) == nullptr) { suite.expect(false, "pair_netem_creates_directory"); return; }
+  String path = {}, failure = {};
+  mothershipVirtualDatacenterPath(String(temporary), "probe.sh", path);
+  const bool written = mothershipVirtualDatacenterWriteFile(path, String(script.c_str()), 0700, &failure);
+  const pid_t child = written ? ::fork() : -1;
+  if (child == 0) { if (::chdir(temporary) != 0) _exit(125); ::execl("/bin/bash", "bash", "probe.sh", static_cast<char *>(nullptr)); _exit(127); }
+  int status = 0; pid_t waited = -1;
+  if (child > 0) do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  suite.expect(written && child > 0 && waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "pair_netem_exact_parameters_partial_failure_signal_and_dead_owner_cleanup");
+  std::error_code error;
+  std::filesystem::remove_all(temporary, error);
+}
+
 int main()
 {
   TestSuite suite;
@@ -761,6 +985,7 @@ int main()
   testPairControlServiceDescriptorStatusIsolation(suite);
   testPairControlFaultDirectionSelection(suite);
   testPairControlFaultEmitsOnlyFaultReceipt(suite);
+  testPairControlNetemOwnershipAndCleanup(suite);
   testPairDrainObservationParser(suite);
   testPairGuestResetFenceParser(suite);
   testPairGuestResetAbsenceProofFailsClosed(suite);

@@ -24,6 +24,9 @@ public:
   virtual void resourceDelta(uint16_t nLogicalCores, uint32_t memoryMB, uint32_t storageMB, bool isDownscale, uint32_t graceSeconds) {}
   virtual void credentialsRefresh(const CredentialDelta& delta) {}
   virtual void wormholesRefresh(const Vector<Wormhole>& wormholes) {}
+  // The workload persists and applies this desired authority through its
+  // domain owner before acknowledging readiness with an app-computed receipt.
+  virtual bool statefulDataAuthority(const StatefulDataAuthority&) { return false; }
   // Return true only after the native workload installed, activated, renewed, or
   // revoked the exact private session command.
   virtual bool cousinSessionCommand(const ProdigyCousinSessionLocalCommand&) { return false; }
@@ -724,6 +727,16 @@ public:
     (void)queueStatisticsFrame(metricPairs);
   }
 
+  bool publishStatefulDataAuthorityReceipt(const StatefulDataAuthorityReceipt& receipt)
+  {
+    if (parameters.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+        !prodigyStatefulDataAuthorityReceiptValid(receipt) ||
+        !prodigyStatefulDataAuthorityEqual(receipt.authority, parameters.statefulTopology.dataAuthority)) return false;
+    String encoded;
+    return BitseryEngine::serialize(encoded, receipt) && encoded.size() <= 4096 &&
+        queueCousinSessionFrame(ContainerTopic::statefulDataAuthority, encoded);
+  }
+
   void neuronHandler(Message *message)
   {
     uint8_t *args = message->args;
@@ -925,6 +938,26 @@ public:
           String encoded = {};
           if (BitseryEngine::serialize(encoded, ack) && encoded.size() <= ProdigyCousinSessionMaximumBytes)
             (void)queueCousinSessionFrame(ContainerTopic::cousinSessionAck, encoded);
+          break;
+        }
+      case ContainerTopic::statefulDataAuthority:
+        {
+          String encoded;
+          Message::extractToStringView(args, encoded);
+          StatefulDataAuthorityReceipt command;
+          if (args != terminal || !BitseryEngine::deserializeSafe(encoded, command) ||
+              command.ready || !command.snapshotReceiptSHA256.empty() ||
+              !command.appliedWatermarkSHA256.empty() || !command.fenceReceiptSHA256.empty() || !command.cleanupReceiptSHA256.empty() ||
+              !prodigyStatefulDataAuthorityValid(command.authority)) break;
+          if (parameters.statefulTopology.servingMode == StatefulTopologyServingMode::applicationDataAuthority
+              ? !prodigyStatefulDataAuthorityCanAdvance(parameters.statefulTopology.dataAuthority, command.authority)
+              : command.authority.mode != StatefulDataAuthorityMode::snapshotPreparing) break;
+          // Startup-only authority is insufficient: the same callback owns
+          // source fencing and target activation while the process is live.
+          if (target->statefulDataAuthority(command.authority)) {
+            parameters.statefulTopology.servingMode = StatefulTopologyServingMode::applicationDataAuthority;
+            parameters.statefulTopology.dataAuthority = command.authority;
+          }
           break;
         }
       case ContainerTopic::wormholesRefresh:

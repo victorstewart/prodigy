@@ -21,8 +21,13 @@ constexpr static uint64_t prodigyContainerRetirementJournalMaximumPayloadBytes =
 // its existing authority until the v2 capability gate has completed.
 enum class ProdigyContainerRetirementKind : uint8_t {
   statefulTopology = 1,
-  statelessPairedMigration = 2
+  statelessPairedMigration = 2,
+  statefulPairedMigration = 3
 };
+
+static inline bool prodigyContainerRetirementIsPaired(ProdigyContainerRetirementKind kind)
+{ return kind == ProdigyContainerRetirementKind::statelessPairedMigration ||
+         kind == ProdigyContainerRetirementKind::statefulPairedMigration; }
 
 class ProdigyContainerRetirementIntent {
 public:
@@ -96,6 +101,11 @@ public:
   String sourceBlobSHA256;
   uint64_t sourceBlobBytes = 0;
   Vector<ProdigyPairedSourceRetirementCohortMember> cohort;
+  bool hasStatefulScope = false; // journal v4 only; v3 descriptors remain byte-identical
+  bool catchupTargetCompensation = false;
+  uint32_t shardGroup = 0;
+  String pairIntentSHA256;
+  String dataAuthoritySHA256;
 
   bool sameIdentity(const ProdigyPairedSourceRetirementFence& other) const
   {
@@ -104,7 +114,9 @@ public:
         targetDeploymentID != other.targetDeploymentID ||
         sourceNormalizedPlanSHA256.equals(other.sourceNormalizedPlanSHA256) == false ||
         sourceBlobSHA256.equals(other.sourceBlobSHA256) == false || sourceBlobBytes != other.sourceBlobBytes ||
-        cohort.size() != other.cohort.size()) return false;
+        cohort.size() != other.cohort.size() || hasStatefulScope != other.hasStatefulScope ||
+        catchupTargetCompensation != other.catchupTargetCompensation || shardGroup != other.shardGroup ||
+        pairIntentSHA256 != other.pairIntentSHA256 || dataAuthoritySHA256 != other.dataAuthoritySHA256) return false;
     for (uint32_t index = 0; index < cohort.size(); ++index)
       if (cohort[index].sameIdentity(other.cohort[index]) == false) return false;
     return true;
@@ -126,6 +138,29 @@ static void serialize(S&& serializer, ProdigyPairedSourceRetirementFence& fence)
                        [](S& serializer, ProdigyPairedSourceRetirementCohortMember& member) { serializer.object(member); });
 }
 
+template <typename S>
+static void prodigySerializePairedSourceRetirementFenceV4(S&& serializer, ProdigyPairedSourceRetirementFence& fence)
+{
+  serializer.object(fence);
+  serializer.value1b(fence.hasStatefulScope);
+  if (fence.hasStatefulScope) {
+    serializer.value1b(fence.catchupTargetCompensation); serializer.value4b(fence.shardGroup);
+    serializer.text1b(fence.pairIntentSHA256, 64); serializer.text1b(fence.dataAuthoritySHA256, 64);
+  }
+}
+
+class ProdigyScopedPairedSourceRetirementFence {
+public:
+  uint8_t version = 4;
+  ProdigyPairedSourceRetirementFence fence;
+};
+template <typename S>
+static void serialize(S&& serializer, ProdigyScopedPairedSourceRetirementFence& value)
+{
+  serializer.value1b(value.version);
+  prodigySerializePairedSourceRetirementFenceV4(serializer, value.fence);
+}
+
 // Cross-cluster source-retirement authority is intentionally separate from a
 // target admission. The request carries only immutable source identity and a
 // currently-observed source authority tuple; bootstrap material stays in the
@@ -144,6 +179,10 @@ public:
   String sourceNormalizedPlanSHA256;
   String sourceBlobSHA256;
   uint64_t sourceBlobBytes = 0;
+  bool catchupTargetCompensation = false; // v2: retire only this operation's non-writer target shard
+  uint32_t shardGroup = 0;
+  String pairIntentSHA256;
+  String dataAuthoritySHA256;
 };
 
 template <typename S>
@@ -161,12 +200,20 @@ static void serialize(S&& serializer, ProdigyPairedSourceRetirementRequest& requ
   serializer.text1b(request.sourceNormalizedPlanSHA256, 64);
   serializer.text1b(request.sourceBlobSHA256, 64);
   serializer.value8b(request.sourceBlobBytes);
+  if (request.version == 2) {
+    serializer.value1b(request.catchupTargetCompensation); serializer.value4b(request.shardGroup);
+    serializer.text1b(request.pairIntentSHA256, 64); serializer.text1b(request.dataAuthoritySHA256, 64);
+  }
 }
 
 static inline bool prodigyPairedSourceRetirementRequestValid(
     const ProdigyPairedSourceRetirementRequest& request)
 {
-  return request.version == 1 && request.operationID != 0 && request.sourceClusterUUID != 0 &&
+  return ((request.version == 1 && !request.catchupTargetCompensation && request.shardGroup == 0 &&
+           request.pairIntentSHA256.empty() && request.dataAuthoritySHA256.empty()) ||
+          (request.version == 2 && request.catchupTargetCompensation &&
+          prodigyIsSHA256HexDigest(request.pairIntentSHA256) && prodigyIsSHA256HexDigest(request.dataAuthoritySHA256))) &&
+         request.operationID != 0 && request.sourceClusterUUID != 0 &&
          request.targetClusterUUID != 0 && request.sourceClusterUUID != request.targetClusterUUID &&
          request.sourceDeploymentID != 0 && request.targetDeploymentID != 0 &&
          request.expectedAuthorityGeneration != 0 && request.expectedMasterUUID != 0 &&
@@ -187,6 +234,7 @@ public:
   // A serialized v3 fence remains secret-free and lets Mothership compare an
   // exact retry without obtaining bootstrap material.
   String sealedFence;
+  String scopedFence; // v2 receipt; authenticated v4 scope, including an empty target cohort
   uint64_t currentAuthorityGeneration = 0;
   uint128_t currentMasterUUID = 0;
   int64_t currentMasterBootNs = 0;
@@ -205,6 +253,7 @@ static void serialize(S&& serializer, PairedSourceRetirementReceipt& receipt)
   serializer.value8b(receipt.currentAuthorityGeneration);
   serializer.value16b(receipt.currentMasterUUID);
   serializer.value8b(receipt.currentMasterBootNs);
+  if (receipt.version == 2) serializer.text1b(receipt.scopedFence, 1024 * 1024);
 }
 
 template <typename S>
@@ -246,6 +295,7 @@ public:
   constexpr static uint8_t legacyVersion = 1;
   constexpr static uint8_t pairedIntentVersion = 2;
   constexpr static uint8_t currentVersion = 3;
+  constexpr static uint8_t statefulVersion = 4;
 
   // Existing stateful callers value-initialize this journal.  They must keep
   // emitting the legacy framing until a dedicated v2 stateless admission has
@@ -273,21 +323,26 @@ static void serialize(S&& serializer, ProdigyContainerRetirementJournal& journal
                            prodigySerializeContainerRetirementIntentV2(serializer, intent);
                          });
   }
-  else if (journal.version == ProdigyContainerRetirementJournal::currentVersion)
+  else if (journal.version == ProdigyContainerRetirementJournal::currentVersion ||
+           journal.version == ProdigyContainerRetirementJournal::statefulVersion)
   {
     serializer.container(journal.intents, prodigyContainerRetirementJournalMaximumEntries,
                          [](S& serializer, ProdigyContainerRetirementIntent& intent) {
                            prodigySerializeContainerRetirementIntentV2(serializer, intent);
                          });
     serializer.container(journal.pairedSourceFences, prodigyContainerRetirementJournalMaximumEntries,
-                         [](S& serializer, ProdigyPairedSourceRetirementFence& fence) { serializer.object(fence); });
+                         [&](S& serializer, ProdigyPairedSourceRetirementFence& fence) {
+                           if (journal.version == ProdigyContainerRetirementJournal::statefulVersion)
+                             prodigySerializePairedSourceRetirementFenceV4(serializer, fence);
+                           else serializer.object(fence);
+                         });
   }
 }
 
 static bool prodigyContainerRetirementJournalVersionSupported(uint8_t version, uint32_t readerVersion)
 {
   return version >= ProdigyContainerRetirementJournal::legacyVersion &&
-         version <= ProdigyContainerRetirementJournal::currentVersion &&
+         version <= ProdigyContainerRetirementJournal::statefulVersion &&
          readerVersion >= version;
 }
 
@@ -303,13 +358,15 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
   }
   const bool statefulTopology = intent.kind == ProdigyContainerRetirementKind::statefulTopology;
   const bool statelessPaired = intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration;
-  if (!statefulTopology && !statelessPaired) return false;
+  const bool statefulPaired = intent.kind == ProdigyContainerRetirementKind::statefulPairedMigration;
+  if (!statefulTopology && !statelessPaired && !statefulPaired) return false;
+  if (statefulPaired && intent.applicationID != 3 && intent.applicationID != 4) return false;
   if (statefulTopology &&
       (intent.topologyOperationID == 0 || intent.sourceEpoch == 0 || intent.targetEpoch == 0 ||
        intent.sourceEpoch == intent.targetEpoch || intent.pairedOperationID != 0 ||
        intent.pairedSourceClusterUUID != 0 || intent.pairedTargetClusterUUID != 0 ||
        intent.pairedTargetDeploymentID != 0)) return false;
-  if (statelessPaired &&
+  if ((statelessPaired || statefulPaired) &&
       (intent.topologyOperationID != 0 || intent.sourceEpoch != 0 || intent.targetEpoch != 0 ||
        intent.pairedOperationID == 0 || intent.pairedSourceClusterUUID == 0 ||
        intent.pairedTargetClusterUUID == 0 || intent.pairedSourceClusterUUID == intent.pairedTargetClusterUUID ||
@@ -322,8 +379,15 @@ static bool prodigyContainerRetirementIntentValid(const ProdigyContainerRetireme
       bootstrap.plan.uuid != intent.containerUUID ||
       bootstrap.plan.config.deploymentID() != intent.deploymentID ||
       bootstrap.plan.config.applicationID != intent.applicationID ||
-      bootstrap.plan.isStateful != statefulTopology ||
-      bootstrap.plan.config.type != (statefulTopology ? ApplicationType::stateful : ApplicationType::stateless) ||
+      bootstrap.plan.isStateful != (statefulTopology || statefulPaired) ||
+      bootstrap.plan.config.type != ((statefulTopology || statefulPaired) ? ApplicationType::stateful : ApplicationType::stateless) ||
+      (statefulPaired &&
+       ((intent.applicationID != 3 && intent.applicationID != 4) ||
+        bootstrap.plan.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+        (!prodigyStatefulDataAuthoritySourceNonwriter(bootstrap.plan.statefulTopology.dataAuthority) &&
+         bootstrap.plan.statefulTopology.dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly) ||
+        bootstrap.plan.statefulTopology.dataAuthority.operationUUID != intent.pairedOperationID ||
+        !prodigyStatefulDataAuthorityValid(bootstrap.plan.statefulTopology.dataAuthority))) ||
       bootstrap.plan.restartOnFailure)
   {
     return false;
@@ -340,13 +404,20 @@ static bool prodigyPairedSourceRetirementFenceValid(const ProdigyPairedSourceRet
   if (fence.operationID == 0 || fence.sourceClusterUUID == 0 || fence.targetClusterUUID == 0 ||
       fence.sourceClusterUUID == fence.targetClusterUUID || fence.sourceDeploymentID == 0 ||
       fence.targetDeploymentID == 0 || fence.sourceNormalizedPlanSHA256.size() != 64 ||
-      fence.sourceBlobSHA256.size() != 64 || fence.sourceBlobBytes == 0 || fence.cohort.empty() ||
+      fence.sourceBlobSHA256.size() != 64 || fence.sourceBlobBytes == 0 ||
+      (fence.cohort.empty() && !(fence.hasStatefulScope && fence.catchupTargetCompensation)) ||
       fence.cohort.size() > prodigyContainerRetirementJournalMaximumEntries ||
       prodigyIsSHA256HexDigest(fence.sourceNormalizedPlanSHA256) == false ||
       prodigyIsSHA256HexDigest(fence.sourceBlobSHA256) == false)
   {
     return false;
   }
+  if (fence.hasStatefulScope ?
+      ((!prodigyIsSHA256HexDigest(fence.pairIntentSHA256) || !prodigyIsSHA256HexDigest(fence.dataAuthoritySHA256)) ||
+       fence.cohort.size() > 3 ||
+       (uint16_t(fence.sourceDeploymentID >> 48) != 3 && uint16_t(fence.sourceDeploymentID >> 48) != 4)) :
+      (fence.catchupTargetCompensation || fence.shardGroup != 0 || !fence.pairIntentSHA256.empty() || !fence.dataAuthoritySHA256.empty()))
+    return false;
   uint128_t previousUUID = 0;
   for (const auto& member : fence.cohort)
   {
@@ -361,6 +432,18 @@ static bool prodigyPairedSourceRetirementFenceValid(const ProdigyPairedSourceRet
 static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerRetirementJournal& journal);
 static const ProdigyContainerRetirementIntent *prodigyFindContainerRetirementIntentInValidatedJournal(
     const ProdigyContainerRetirementJournal& journal, uint128_t containerUUID);
+
+static inline bool prodigyPairedSourceRetirementFenceMatchesRequest(const ProdigyPairedSourceRetirementFence& fence,
+    const ProdigyPairedSourceRetirementRequest& request)
+{
+  return prodigyPairedSourceRetirementRequestValid(request) && fence.operationID == request.operationID &&
+      fence.sourceClusterUUID == request.sourceClusterUUID && fence.targetClusterUUID == request.targetClusterUUID &&
+      fence.sourceDeploymentID == request.sourceDeploymentID && fence.targetDeploymentID == request.targetDeploymentID &&
+      fence.sourceNormalizedPlanSHA256 == request.sourceNormalizedPlanSHA256 && fence.sourceBlobSHA256 == request.sourceBlobSHA256 &&
+      fence.sourceBlobBytes == request.sourceBlobBytes && fence.catchupTargetCompensation == request.catchupTargetCompensation &&
+      (request.version != 2 || (fence.hasStatefulScope && fence.shardGroup == request.shardGroup &&
+       fence.pairIntentSHA256 == request.pairIntentSHA256 && fence.dataAuthoritySHA256 == request.dataAuthoritySHA256));
+}
 
 // Call only after journal validation.  Fences are sorted by operation ID;
 // source-deployment lookup is a bounded linear scan because deployment IDs
@@ -389,6 +472,23 @@ static const ProdigyPairedSourceRetirementFence *prodigyFindPairedSourceRetireme
   return nullptr;
 }
 
+static inline bool prodigyPairedCatchupCompensationFencedInValidatedJournal(const ProdigyContainerRetirementJournal& journal,
+    uint64_t deploymentID, uint32_t shardGroup, uint128_t operationID)
+{
+  const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, operationID);
+  return fence && fence->hasStatefulScope && fence->catchupTargetCompensation &&
+      fence->sourceDeploymentID == deploymentID && fence->shardGroup == shardGroup;
+}
+
+static inline bool prodigyPairedSourceRetirementFenceTerminalInValidatedJournal(const ProdigyContainerRetirementJournal& journal,
+    const ProdigyPairedSourceRetirementFence& fence)
+{
+  return std::all_of(fence.cohort.begin(), fence.cohort.end(), [&](const auto& member) {
+    const auto *intent = prodigyFindContainerRetirementIntentInValidatedJournal(journal, member.containerUUID);
+    return intent && intent->pairedOperationID == fence.operationID && intent->killAcked;
+  });
+}
+
 static const ProdigyPairedSourceRetirementFence *prodigyFindPairedSourceRetirementFenceByOperation(
     const ProdigyContainerRetirementJournal& journal, uint128_t operationID)
 {
@@ -406,8 +506,8 @@ static const ProdigyPairedSourceRetirementFence *prodigyFindPairedSourceRetireme
 static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerRetirementJournal& journal)
 {
   if (!prodigyContainerRetirementJournalVersionSupported(
-          journal.version, ProdigyContainerRetirementJournal::currentVersion) ||
-      journal.intents.empty() ||
+          journal.version, ProdigyContainerRetirementJournal::statefulVersion) ||
+      (journal.intents.empty() && journal.pairedSourceFences.empty()) ||
       journal.intents.size() > prodigyContainerRetirementJournalMaximumEntries)
   {
     return false;
@@ -422,6 +522,8 @@ static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerReti
          (intent.kind != ProdigyContainerRetirementKind::statefulTopology || intent.pairedOperationID != 0 ||
           intent.pairedSourceClusterUUID != 0 || intent.pairedTargetClusterUUID != 0 ||
           intent.pairedTargetDeploymentID != 0)) ||
+        (journal.version < ProdigyContainerRetirementJournal::statefulVersion &&
+         intent.kind == ProdigyContainerRetirementKind::statefulPairedMigration) ||
         prodigyContainerRetirementIntentValid(intent) == false ||
         (previousUUID != 0 && intent.containerUUID <= previousUUID) ||
         intent.bootstrap.size() > prodigyContainerRetirementJournalMaximumPayloadBytes - totalBootstrapBytes)
@@ -430,31 +532,50 @@ static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerReti
     }
     totalBootstrapBytes += intent.bootstrap.size();
     previousUUID = intent.containerUUID;
-    pairedIntentCount += intent.kind == ProdigyContainerRetirementKind::statelessPairedMigration;
+    pairedIntentCount += prodigyContainerRetirementIsPaired(intent.kind);
   }
-  if (journal.version != ProdigyContainerRetirementJournal::currentVersion)
+  if (journal.version < ProdigyContainerRetirementJournal::currentVersion)
     return journal.pairedSourceFences.empty();
   if (journal.pairedSourceFences.size() > prodigyContainerRetirementJournalMaximumEntries ||
-      (pairedIntentCount == 0 && journal.pairedSourceFences.empty() == false) ||
       (pairedIntentCount != 0 && journal.pairedSourceFences.empty())) return false;
   uint128_t previousOperationID = 0;
   uint32_t cohortCount = 0;
-  bytell_hash_set<uint64_t> sourceDeploymentIDs = {};
   for (const auto& fence : journal.pairedSourceFences)
   {
     if (!prodigyPairedSourceRetirementFenceValid(fence) ||
+        (journal.version < ProdigyContainerRetirementJournal::statefulVersion && fence.hasStatefulScope) ||
         (previousOperationID != 0 && fence.operationID <= previousOperationID) ||
-        sourceDeploymentIDs.insert(fence.sourceDeploymentID).second == false ||
         fence.cohort.size() > prodigyContainerRetirementJournalMaximumEntries - cohortCount) return false;
+    // Legacy stateless fences own a whole deployment. Only explicit stateful
+    // scopes may coexist for disjoint shards (or later ownership operations).
+    for (const auto& prior : journal.pairedSourceFences) {
+      if (prior.operationID >= fence.operationID) break;
+      if (prior.sourceDeploymentID == fence.sourceDeploymentID &&
+          (!prior.hasStatefulScope || !fence.hasStatefulScope)) return false;
+    }
     for (const auto& member : fence.cohort)
     {
       const auto *intent = prodigyFindContainerRetirementIntentInValidatedJournal(journal, member.containerUUID);
-      if (intent == nullptr || intent->kind != ProdigyContainerRetirementKind::statelessPairedMigration ||
+      if (intent == nullptr || !prodigyContainerRetirementIsPaired(intent->kind) ||
           intent->machineUUID != member.machineUUID || intent->intentGeneration != member.intentGeneration ||
           intent->deploymentID != fence.sourceDeploymentID || intent->pairedOperationID != fence.operationID ||
           intent->pairedSourceClusterUUID != fence.sourceClusterUUID ||
           intent->pairedTargetClusterUUID != fence.targetClusterUUID ||
-          intent->pairedTargetDeploymentID != fence.targetDeploymentID) return false;
+          intent->pairedTargetDeploymentID != fence.targetDeploymentID ||
+          (fence.hasStatefulScope && intent->kind != ProdigyContainerRetirementKind::statefulPairedMigration)) return false;
+      if (fence.hasStatefulScope && !intent->killAcked) {
+        NeuronContainerBootstrap bootstrap; String bytes, digest;
+        if (!BitseryEngine::deserializeSafe(intent->bootstrap, bootstrap) ||
+            bootstrap.plan.shardGroup != fence.shardGroup ||
+            bootstrap.plan.config.containerBlobSHA256 != fence.sourceBlobSHA256 ||
+            bootstrap.plan.config.containerBlobBytes != fence.sourceBlobBytes ||
+            !BitseryEngine::serialize(bytes, bootstrap.plan.statefulTopology.dataAuthority) ||
+            !prodigyComputeSHA256Hex(bytes, digest) || digest != fence.dataAuthoritySHA256 ||
+            (fence.catchupTargetCompensation &&
+             (bootstrap.plan.statefulTopology.dataAuthority.mode != StatefulDataAuthorityMode::catchupOnly ||
+              bootstrap.plan.statefulTopology.dataAuthority.localClusterUUID != fence.sourceClusterUUID ||
+              bootstrap.plan.statefulTopology.dataAuthority.targetClusterUUID != fence.sourceClusterUUID))) return false;
+      }
     }
     cohortCount += uint32_t(fence.cohort.size());
     previousOperationID = fence.operationID;
@@ -462,7 +583,7 @@ static bool prodigyValidateContainerRetirementJournal(const ProdigyContainerReti
   if (cohortCount != pairedIntentCount) return false;
   for (const auto& intent : journal.intents)
   {
-    if (intent.kind != ProdigyContainerRetirementKind::statelessPairedMigration) continue;
+    if (!prodigyContainerRetirementIsPaired(intent.kind)) continue;
     const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, intent.pairedOperationID);
     if (fence == nullptr || fence->sourceDeploymentID != intent.deploymentID) return false;
   }
@@ -616,6 +737,30 @@ static bool prodigyWriteContainerRetirementJournalCarrier(
   carrier.expiresAtMs = 0;
   return prodigyContainerRetirementJournalCarrier(carrier) &&
          prodigyParseContainerRetirementJournalCarrier(carrier, checked);
+}
+
+static inline bool prodigyStatefulRetirementTombstonesWitnessed(const ProdigyMasterAuthorityRuntimeState& state)
+{
+  ProdigyContainerRetirementJournal journal;
+  auto carrier = state.taskExecutions.find(prodigyContainerRetirementJournalExecutionID);
+  if (carrier != state.taskExecutions.end() && !prodigyParseContainerRetirementJournalCarrier(carrier->second, journal)) return false;
+  for (const auto& authority : state.statefulServingAuthorities) {
+    if (!authority.sourceRetired) continue;
+    const auto *fence = prodigyFindPairedSourceRetirementFenceByOperationInValidatedJournal(journal, authority.dataAuthority.operationUUID);
+    if (!fence || fence->sourceDeploymentID != authority.deploymentID ||
+        (fence->hasStatefulScope && (fence->shardGroup != authority.dataAuthority.shardGroup ||
+         fence->pairIntentSHA256 != authority.pairIntentSHA256 ||
+         (fence->catchupTargetCompensation != (authority.dataAuthority.mode == StatefulDataAuthorityMode::catchupOnly)))) ||
+        !std::all_of(fence->cohort.begin(), fence->cohort.end(), [&](const auto& member) {
+          const auto *intent = prodigyFindContainerRetirementIntentInValidatedJournal(journal, member.containerUUID);
+          return intent && intent->kind == ProdigyContainerRetirementKind::statefulPairedMigration && intent->killAcked;
+        })) return false;
+    if (fence->hasStatefulScope) {
+      String bytes, digest; auto data = authority.dataAuthority;
+      if (!BitseryEngine::serialize(bytes, data) || !prodigyComputeSHA256Hex(bytes, digest) || digest != fence->dataAuthoritySHA256) return false;
+    }
+  }
+  return true;
 }
 
 static bool prodigyStoreContainerRetirementJournalCarrier(

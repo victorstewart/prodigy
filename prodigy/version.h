@@ -2,7 +2,8 @@
 
 // Unified binary version for both Brain and Neuron.
 // Bump this when shipping a new prodigy binary.
-constexpr inline uint64_t ProdigyBinaryVersion = 25;
+constexpr inline uint64_t ProdigyBinaryVersion = 26;
+constexpr inline uint64_t ProdigyStatefulDataAuthorityMinimumVersion = 26;
 
 // Versions 19 and 20 reject unknown Brain topics. This floor chooses the wire
 // vocabulary only; an authenticated, current-connection acknowledgement is

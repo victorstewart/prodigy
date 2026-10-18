@@ -156,6 +156,8 @@ static inline bool mothershipRetainedRecoveryOrphanedStatefulPredecessorParamete
          observed.statefulTopology.sourceEpoch == historical.statefulTopology.sourceEpoch &&
          observed.statefulTopology.targetEpoch == historical.statefulTopology.targetEpoch &&
          observed.statefulTopology.servingMode == historical.statefulTopology.servingMode &&
+         (observed.statefulTopology.servingMode != StatefulTopologyServingMode::applicationDataAuthority ||
+          prodigyStatefulDataAuthorityEqual(observed.statefulTopology.dataAuthority, historical.statefulTopology.dataAuthority)) &&
          observed.statefulTopology.bridgeMode == historical.statefulTopology.bridgeMode;
 }
 
@@ -644,10 +646,15 @@ static inline bool mothershipPrepareRetainedRecoverySnapshot(
       }
       NeuronContainerBootstrap bootstrap = {};
       String bootstrapFailure = {};
+      const ProdigyStatefulServingAuthority *applicationAuthority = nullptr;
+      for (const auto& authority : snapshot.masterAuthority.runtimeState.statefulServingAuthorities)
+        if (authority.deploymentID == parameters.deploymentID &&
+            authority.phase == StatefulWorkerTopologyUpgradePhase::applicationDataAuthority &&
+            authority.dataAuthority.shardGroup == parameters.statefulTopology.shardGroup) applicationAuthority = &authority;
       if (prodigyBuildRetainedContainerBootstrap(
               existing->second, parameters, machine.machineFragment,
               snapshot.brainConfig.datacenterFragment, machine.observedCreatedAtMs[index],
-              bootstrap, &bootstrapFailure) == false)
+              bootstrap, &bootstrapFailure, applicationAuthority) == false)
       {
         if (failure) failure->assign(bootstrapFailure);
         return false;

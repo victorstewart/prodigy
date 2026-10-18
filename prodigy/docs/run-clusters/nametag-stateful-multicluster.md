@@ -1,21 +1,26 @@
 # Nametag stateful multicluster qualification
 
 This specification freezes the bounded functional profile and its verification
-gates. It does not qualify a runtime, authorize a live deployment or cutover,
-resume the paused dev recovery, or authorize provider purchases. A component
-test proves only its named invariant. The existing [upgrade and relocation
-guide](upgrade-and-relocation.md) remains the source of prior qualification and
-its exclusions.
+gates. Prodigy binary v26 and the corresponding Nametag candidate implement the
+control and application contracts described below, but implementation and
+component tests do not by themselves qualify a runtime. This document does not
+authorize a live deployment or cutover, resume the paused dev recovery, or
+authorize provider purchases. A component test proves only its named invariant.
+The existing [upgrade and relocation guide](upgrade-and-relocation.md) remains
+the source of prior qualification and its exclusions.
 
 ## Topology and classification
 
 Use two independent clusters with separate Brain authorities, membership,
 credentials, private prefixes, storage and lifecycle ownership. Deterministic
-qualification uses two three-Brain `deploymentMode: "test"` clusters created by
-Mothership in one verified disposable guest. Freeze their exact identities,
-membership, plans, artifacts, capacity and declared directed COUSIN permissions
-before the first mutation. A network bridge provides reachability, never shared
-quorum, scheduling, database authority or permission to copy controller state.
+qualification requires two three-Brain production-mode cluster records created
+and owned by Mothership in one verified disposable guest. The production-pair
+admission path deliberately rejects `deploymentMode: "test"`; the existing
+test-VDC graph harness is therefore not runtime qualification evidence. Freeze
+the exact identities, membership, plans, artifacts, capacity and declared
+directed COUSIN permissions before the first mutation. A network bridge provides
+reachability, never shared quorum, scheduling, database authority or permission
+to copy controller state.
 
 | Nametag owner | Application ID | Frozen behavior |
 | --- | ---: | --- |
@@ -25,9 +30,10 @@ quorum, scheduling, database authority or permission to copy controller state.
 | Radar | 5 | Retained at source; reject a move request explicitly. |
 | Pulse | 2 | Retained at source; reject a move request explicitly. |
 
-The classification selects implementation and qualification scope; it is not
-evidence that Hot or Cold already moves safely. Retained services remain
-accessible only through their existing declared service and authenticated
+The classification selects implementation and qualification scope; the
+candidate supports one selected Hot or Cold shard group per serial operation,
+but only completed qualification evidence proves a safe move. Retained services
+remain accessible only through their existing declared service and authenticated
 COUSIN permissions. Admission must reject retained-owner movement before target
 launch, data export, writer fencing or endpoint effects. Unknown applications,
 versions, mapping profiles and credential capabilities fail closed. The phase
@@ -50,11 +56,11 @@ supplies request/response role semantics.
 
 ## Transition requirements
 
-The following names describe required semantic receipts, not new CLI commands
-or a claim that every transition has an implementation. Mothership owns one
-durable operation and its start, status, resume, abort and recovery. Each Brain
-retains authority over its local runtime, discovery, credentials and storage.
-Extend those owners; the harness must not become a migration controller.
+The following names describe the semantic receipts implemented by the candidate.
+They are not operator-supplied proofs. Mothership owns one durable operation and
+its start, status, resume, pre-fence abort and recovery. Each Brain retains
+authority over its local runtime, discovery, credentials and storage; Nametag
+issues the data receipts. The harness must not become a migration controller.
 
 1. **TargetAdmissionReceipt.** Persist an immutable operation binding source
    and target cluster, application/version, shard/range mapping, source and
@@ -67,7 +73,7 @@ Extend those owners; the harness must not become a migration controller.
    as catchup only: no client advertisement, independent writes or promotion from a
    generic healthy report. Bind acknowledgements to current connection,
    cluster, machine, process incarnation and authority generation.
-3. **SnapshotBoundaryReceipt and AppliedCatchupReceipt.** The application's
+3. **SnapshotBoundaryReceipt and initial AppliedCatchupReceipt.** The application's
    existing data owner exports a consistent snapshot and ordered change history,
    with durable checkpoint, sequence/watermark, range and digest identities. It authenticates the exact
    destination and restores through its ordinary import/seeding owner. The
@@ -81,25 +87,30 @@ Extend those owners; the harness must not become a migration controller.
    unreachable writer, missing ACK, stale ownership generation or uncertain
    fence blocks promotion; a lease timeout or empty inventory alone is not a
    terminal writer fence. Unselected applications continue under their owners.
-5. **TargetOwnershipReceipt.** Revalidate the entire declared destination
-   cohort and retained dependencies. Require a fresh AppliedCatchupReceipt at
-   the final source-fenced watermark; every selected shard must match its count
-   and canonical digest. Durably bind successor ownership to the exact
-   predecessor fence and machine identities. Only then may the existing
-   serving/discovery owner grant the target writer and advertise it. No source
-   and destination may acknowledge conflicting writes concurrently.
+5. **FencedCatchupReceipt and TargetOwnershipReceipt.** After the source fence,
+   replay through the final fenced watermark and require the target's fresh
+   receipt for the exact snapshot, watermark, fence and admitted cohort.
+   Revalidate the entire declared destination cohort and retained dependencies.
+   Durably bind successor ownership to the exact predecessor fence and machine
+   identities. Only then may the application grant the target writer and
+   acknowledge its private client listener, after which the existing
+   serving/discovery owner may advertise it. No source and destination may
+   acknowledge conflicting writes concurrently.
 6. **RouteSelectionReceipt.** Persist the exact endpoint/route generation and
    ownership decision before externally visible selection. Retain an
    acknowledged client-operation history across selection and existing-flow
    drain. A client ACK is attributed to one writer generation. Delayed source
    registration, healthy upserts, seed completions and route replays cannot
    restore the old writer or replace the recorded desired serving cohort.
-7. **SourceRetirementReceipt.** Require fresh target readiness, observed source
-   drain and the exact durable retirement fence. Use the existing Brain/Neuron
-   retirement journal and authenticated terminal receipts. Persist and
-   replicate terminal acknowledgement before claiming success. Recovery may
-   adopt a still-existing fenced source for destruction; it must not restart
-   a missing retired source or create a replacement source UUID.
+7. **SourceCleanupReceipt and SourceRetirementReceipt.** First require Nametag's
+   source cleanup receipt in retained-source mode, preserving the exact writer
+   fence and final watermark while releasing only operation-owned snapshot and
+   replay state. Then require fresh target readiness, observed source drain and
+   the exact durable retirement fence. Use the existing Brain/Neuron retirement
+   journal and authenticated terminal receipts. Persist and replicate terminal
+   acknowledgement before claiming success. Recovery may adopt a still-existing
+   fenced source for destruction; it must not restart a missing retired source
+   or create a replacement source UUID.
 8. **Closed.** Retain terminal operation, ownership and retirement identities;
    remove only operation-owned temporary transport and provider resources.
    Exact retries return the durable result. Stale generations and altered
@@ -112,14 +123,21 @@ owner after a crash. A successful handshake authenticates a credential; it
 does not attest executable bytes or prove rotation/revocation handling.
 
 The selected production-pair extension uses intent v7 / record v3, preserving
-legacy intent v6 / record v2. Its explicit phases are
+legacy intent v6 / record v2. Its explicit data phases are
 `targetAdmitted -> snapshotVerified -> catchupVerified -> sourceWriterFenced ->
-targetOwnershipActive -> transitApplied`. These names describe candidate
-control-plane transitions; a unit pass cannot replace the authenticated
-application receipts or prove data transfer and enforced fencing.
+fencedCatchupVerified -> targetOwnershipActive -> targetSelected ->
+sourceCleanupVerified -> sourceRetired -> cleanupComplete`. The
+`nametagStatefulPair` command advances or resumes exactly one durable phase per
+invocation after collecting owner-issued receipts. A unit pass cannot replace
+those authenticated application receipts or prove runtime data transfer and
+enforced fencing.
 
-Abort before source fencing removes the catchup target and temporary resources
-through ordinary owners, preserving the source writer. After fencing, resuming
+Abort before source fencing first makes the abort intent durable, records or
+recovers its exact snapshot boundary, and then removes only the admitted target
+cohort through the existing shard-scoped retirement journal. After its terminal
+kill acknowledgement is durable, Nametag releases source-side snapshot state
+and Mothership seals the terminal abort record. The source remains the writer
+throughout, and a crash resumes the same compensation. After fencing, resuming
 source writes requires a separately durable cancellation that proves the target
 never acquired writer authority and grants source ownership in a new authority
 epoch. After target promotion or cutover, do not unfence the source or reverse
@@ -219,6 +237,14 @@ inventory and cleanup receipt digests, including residual resources and their
 owner. Preserve evidence before the Darwin launcher stops this serial batch's
 guest. Provider cleanup needs provider observations, not only local absence.
 
+The virtual-datacenter fault boundary supports deterministic, journaled egress
+DROP, delay, loss and reorder. Typed delay/loss/reorder requests bind the exact
+network namespace, interface index, bounded values and nonzero seed; cleanup
+removes only its owned qdisc and fails closed on foreign root state. Kernel and
+`tc` preflight proves capability only. A qualification claim still requires the
+fault's installed/read-back receipt, monotonic interval, observed workload
+effect and restoration receipt for the named matrix case.
+
 ## Public dev and blocked gates
 
 A future authorized persistent dev deployment must preserve the enrolled
@@ -239,13 +265,22 @@ The following gates remain explicit until new exact-input evidence closes them:
   recovery needs its own bounded authorized coordinator action and healthy
   public baseline before any cutover. Do not reset accounts/data or blindly
   restart the master to satisfy this phase.
-- Existing pair faults provide directed DROP. Their `delayMs` schedules fault
-  onset; it is not packet latency. Typed packet delay/loss/reorder support and
-  witnessed runtime qualification remain blocked. Message replay/delay fixtures
-  do not close those network gates.
-- Cross-machine writer/volume fences and each selected owner's data-transfer
-  contract require implementation and the matrix above. Pure state transitions,
-  transport passes and stateless P6/G5/G6 evidence cannot qualify them.
+- Typed directed DROP/delay/loss/reorder is implemented, and a disposable guest
+  namespace preflight may establish kernel support. Witnessed runtime cases for
+  each selected owner remain pending; message replay/delay fixtures and qdisc
+  readback alone do not close those gates.
+- Cross-machine writer fencing, exact snapshot/tail transfer, final fenced
+  catchup, promotion acknowledgement, source cleanup and shard-scoped retirement
+  are implemented by the candidate. The finite runtime matrix above remains
+  pending until exact data-oracle and fault evidence exists. Pure state
+  transitions, component tests and stateless P6/G5/G6 evidence cannot qualify it.
+- No current local Mothership harness supplies two disposable production-mode
+  clusters, genuine Discombobulator application artifacts and authenticated
+  COUSIN/application receipts for `nametagStatefulPair`. The test-VDC harness is
+  rejected at production-pair admission, while Nametag's older dynamic battery
+  requires separately authorized BPF and external R2 access. Under a no-BPF,
+  no-external-write run, end-to-end execution is therefore pending rather than
+  simulated with weaker fixtures.
 - Runtime19b first-hop continuity, real-provider networking/capacity/cleanup,
   live credential transitions and public Nametag continuity need their own
   exact-route evidence and authority. No irreversible live cutover, provider

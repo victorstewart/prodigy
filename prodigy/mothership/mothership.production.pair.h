@@ -7,8 +7,10 @@
 // fail closed without embedding a test-provider boundary or provider secret.
 
 #include <arpa/inet.h>
+#include <array>
 
 #include <prodigy/cousin.route.h>
+#include <prodigy/persistent.codec.h>
 #include <prodigy/mothership/mothership.physical.fault.h>
 
 enum class MothershipProductionPairPhase : uint8_t {
@@ -34,19 +36,29 @@ enum class MothershipProductionPairPhase : uint8_t {
   // nonterminal: retries must finish that exact compensation before the
   // boundary can close.
   abortBeforeCutoverPending = 12,
+  // Version-seven application data gates precede the existing transit phases.
+  snapshotVerified = 13,
+  catchupVerified = 14,
+  sourceWriterFenced = 15,
+  targetOwnershipActive = 16,
+  statefulAbortBeforeFencePending = 17,
+  statefulAbortedBeforeFence = 18,
+  fencedCatchupVerified = 19,
+  sourceCleanupVerified = 20,
 };
 
 static inline bool mothershipProductionPairPhaseValid(MothershipProductionPairPhase phase)
 {
   return phase >= MothershipProductionPairPhase::prepared &&
-         phase <= MothershipProductionPairPhase::abortBeforeCutoverPending;
+         phase <= MothershipProductionPairPhase::sourceCleanupVerified;
 }
 
 static inline bool mothershipProductionPairTerminal(MothershipProductionPairPhase phase)
 {
   return phase == MothershipProductionPairPhase::cleanupComplete ||
          phase == MothershipProductionPairPhase::abortedBeforeTransit ||
-         phase == MothershipProductionPairPhase::abortedBeforeCutover;
+         phase == MothershipProductionPairPhase::abortedBeforeCutover ||
+         phase == MothershipProductionPairPhase::statefulAbortedBeforeFence;
 }
 
 // An opaque owner-issued receipt is recorded only by its exact SHA-256 digest.
@@ -97,7 +109,7 @@ static void serialize(S&& serializer, MothershipProductionWorkloadIdentity& iden
 }
 
 static inline bool mothershipProductionWorkloadIdentityValid(
-    const MothershipProductionWorkloadIdentity& identity)
+    const MothershipProductionWorkloadIdentity& identity, bool stateful = false)
 {
   struct in_addr address4 = {};
   struct in6_addr address6 = {};
@@ -107,14 +119,131 @@ static inline bool mothershipProductionWorkloadIdentityValid(
          uint16_t(identity.deploymentID >> 48) == identity.applicationID &&
          mothershipProductionPairReceiptValid(identity.canonicalPlanSHA256) &&
          mothershipProductionPairReceiptValid(identity.artifactSHA256) && identity.artifactBytes != 0 &&
-         identity.replicas == 1 && identity.endpointMachineUUID != 0 && identity.endpointTCPPort != 0 &&
-         (::inet_pton(AF_INET, endpoint.c_str(), &address4) == 1 ||
-          ::inet_pton(AF_INET6, endpoint.c_str(), &address6) == 1);
+         identity.replicas == (stateful ? 3u : 1u) &&
+         (stateful ? (identity.endpointMachineUUID == 0 && identity.endpointTCPPort == 0 && endpoint.empty()) :
+          (identity.endpointMachineUUID != 0 && identity.endpointTCPPort != 0 &&
+           (::inet_pton(AF_INET, endpoint.c_str(), &address4) == 1 || ::inet_pton(AF_INET6, endpoint.c_str(), &address6) == 1)));
+}
+
+class MothershipProductionCredentialIdentity {
+public:
+  uint128_t clusterUUID = 0;
+  String name;
+  uint64_t generation = 0;
+  String applyReceiptSHA256;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProductionCredentialIdentity& value)
+{
+  serializer.value16b(value.clusterUUID);
+  serializer.text1b(value.name, 256);
+  serializer.value8b(value.generation);
+  serializer.text1b(value.applyReceiptSHA256, 64);
+}
+
+// This is the one declared Nametag profile, not a general database migration
+// protocol. The application owns the meaning and enforcement of these proofs.
+class MothershipProductionStatefulIntent {
+public:
+  uint32_t contractVersion = 1;
+  String contractSHA256;
+  String shardManifestSHA256;
+  uint128_t datasetUUID = 0;
+  uint128_t snapshotUUID = 0;
+  String snapshotBoundarySHA256;
+  uint64_t sourceDurableWatermark = 0;
+  String sourceDurableWatermarkSHA256;
+  uint64_t sourceFenceEpoch = 0;
+  uint64_t targetOwnershipEpoch = 0;
+  uint64_t snapshotPreparingEpoch = 0;
+  uint64_t initialCatchupEpoch = 0;
+  uint64_t fencedCatchupEpoch = 0;
+  uint64_t sourceRetainedEpoch = 0;
+  uint32_t shardGroup = 0;
+  uint128_t previousOperationUUID = 0;
+  uint64_t previousAuthorityEpoch = 0;
+  Vector<ProdigyStatefulServingAuthorityMember> cohort;
+  Vector<uint128_t> targetMachineUUIDs;
+  String credentialManifestSHA256;
+  uint32_t credentialCount = 0;
+  Vector<MothershipProductionCredentialIdentity> credentials;
+  String targetDeploymentPlan;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProductionStatefulIntent& value)
+{
+  serializer.value4b(value.contractVersion);
+  serializer.text1b(value.contractSHA256, 64);
+  serializer.text1b(value.shardManifestSHA256, 64);
+  serializer.value16b(value.datasetUUID);
+  serializer.value16b(value.snapshotUUID);
+  serializer.text1b(value.snapshotBoundarySHA256, 64);
+  serializer.value8b(value.sourceDurableWatermark);
+  serializer.text1b(value.sourceDurableWatermarkSHA256, 64);
+  serializer.value8b(value.sourceFenceEpoch);
+  serializer.value8b(value.targetOwnershipEpoch);
+  serializer.value8b(value.snapshotPreparingEpoch);
+  serializer.value8b(value.initialCatchupEpoch);
+  serializer.value8b(value.fencedCatchupEpoch);
+  serializer.value8b(value.sourceRetainedEpoch);
+  serializer.value4b(value.shardGroup);
+  serializer.value16b(value.previousOperationUUID);
+  serializer.value8b(value.previousAuthorityEpoch);
+  serializer.container(value.cohort, 4096);
+  serializer.container(value.targetMachineUUIDs, 3, [](auto& nested, uint128_t& uuid) { nested.value16b(uuid); });
+  serializer.text1b(value.credentialManifestSHA256, 64);
+  serializer.value4b(value.credentialCount);
+  serializer.container(value.credentials, 256);
+  serializer.text1b(value.targetDeploymentPlan, 1024 * 1024);
+}
+
+class MothershipProductionStatefulMemberReceipt {
+public:
+  uint128_t containerUUID = 0;
+  uint128_t machineUUID = 0;
+  StatefulDataAuthorityReceipt receipt;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProductionStatefulMemberReceipt& value)
+{
+  serializer.value16b(value.containerUUID);
+  serializer.value16b(value.machineUUID);
+  serializer.object(value.receipt);
+}
+
+class MothershipProductionStatefulReceipt {
+public:
+  MothershipProductionPairPhase phase = MothershipProductionPairPhase::snapshotVerified;
+  uint128_t operationUUID = 0;
+  String intentSHA256;
+  // An authenticated owner observation, never JSON supplied by the operator.
+  uint128_t observedMasterUUID = 0;
+  int64_t observedMasterBootNs = 0;
+  uint64_t observedAuthorityGeneration = 0;
+  Vector<MothershipProductionStatefulMemberReceipt> members;
+  Vector<ProdigyStatefulServingAuthorityMember> cohort;
+};
+
+template <typename S>
+static void serialize(S&& serializer, MothershipProductionStatefulReceipt& value)
+{
+  serializer.value1b(value.phase);
+  serializer.value16b(value.operationUUID);
+  serializer.text1b(value.intentSHA256, 64);
+  serializer.value16b(value.observedMasterUUID);
+  serializer.value8b(value.observedMasterBootNs);
+  serializer.value8b(value.observedAuthorityGeneration);
+  serializer.container(value.members, 4096);
+  serializer.container(value.cohort, 3);
 }
 
 class MothershipProductionPairIntent {
 public:
   static constexpr uint32_t version = 6;
+  static constexpr uint32_t statefulVersion = 7;
 
   uint32_t protocolVersion = version;
   uint128_t operationUUID = 0;
@@ -139,6 +268,7 @@ public:
   MothershipPhysicalFaultExecutorKind ingressWitnessExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
   uint128_t ingressWitnessLocalVMBoundaryUUID = 0;
   String ingressWitnessCloudID = {};
+  MothershipProductionStatefulIntent stateful;
 };
 
 template <typename S>
@@ -164,6 +294,8 @@ static void serialize(S&& serializer, MothershipProductionPairIntent& intent)
   serializer.value1b(intent.ingressWitnessExecutorKind);
   serializer.value16b(intent.ingressWitnessLocalVMBoundaryUUID);
   serializer.text1b(intent.ingressWitnessCloudID, 1024);
+  if (intent.protocolVersion == MothershipProductionPairIntent::statefulVersion)
+    serializer.object(intent.stateful);
 }
 
 // The relay must be one concrete address on the admitted source machine.  A
@@ -197,16 +329,17 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
   const auto& route = intent.route;
   const auto& source = intent.sourcePermission;
   const auto& destination = intent.destinationPermission;
-  if (intent.protocolVersion != MothershipProductionPairIntent::version || intent.operationUUID == 0 ||
+  const bool stateful = intent.protocolVersion == MothershipProductionPairIntent::statefulVersion;
+  if ((!stateful && intent.protocolVersion != MothershipProductionPairIntent::version) || intent.operationUUID == 0 ||
       !cousinRouteStructurallyValid(route) || !cousinRouteCurrentContract(route) ||
       route.state != CousinRouteState::active ||
       !prodigyLocalCousinServicePermissionValid(source) ||
       !prodigyLocalCousinServicePermissionValid(destination) ||
       source.state != ProdigyLocalCousinServicePermissionState::active ||
       destination.state != ProdigyLocalCousinServicePermissionState::active ||
-      !mothershipProductionWorkloadIdentityValid(intent.sourceWorkload) ||
-      !mothershipProductionWorkloadIdentityValid(intent.targetWorkload) ||
-      intent.physicalBoundaryUUID == 0 ||
+      !mothershipProductionWorkloadIdentityValid(intent.sourceWorkload, stateful) ||
+      !mothershipProductionWorkloadIdentityValid(intent.targetWorkload, stateful) ||
+      (!stateful && (intent.physicalBoundaryUUID == 0 ||
       intent.selectorMachineUUID == 0 ||
       !mothershipPhysicalFaultExecutorIdentityValid(intent.selectorExecutorKind,
                                                      intent.selectorLocalVMBoundaryUUID,
@@ -215,7 +348,11 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
       intent.selectorTCPPort == 0 || intent.ingressWitnessMachineUUID == 0 ||
       !mothershipPhysicalFaultExecutorIdentityValid(intent.ingressWitnessExecutorKind,
                                                      intent.ingressWitnessLocalVMBoundaryUUID,
-                                                     intent.ingressWitnessCloudID))
+                                                     intent.ingressWitnessCloudID))) ||
+      (stateful && (intent.physicalBoundaryUUID != 0 || intent.selectorMachineUUID != 0 ||
+       intent.selectorLocalVMBoundaryUUID != 0 || !intent.selectorCloudID.empty() || !intent.selectorAddress.empty() ||
+       intent.selectorTCPPort != 0 || intent.ingressWitnessMachineUUID != 0 ||
+       intent.ingressWitnessLocalVMBoundaryUUID != 0 || !intent.ingressWitnessCloudID.empty())))
     return reject("production pair intent has an invalid operation, active route, or active permission");
 
   if (source.localHalf != CousinRouteHalf::source || destination.localHalf != CousinRouteHalf::destination ||
@@ -232,27 +369,195 @@ static inline bool mothershipProductionPairIntentValid(const MothershipProductio
       destination.peerCousinServicePrefix != route.sourceCousinServicePrefix ||
       source.slots != route.slots || destination.slots != route.slots ||
       source.permissionUUID != route.sourcePermissionUUID || destination.permissionUUID != route.destinationPermissionUUID ||
-      source.localDeploymentID == destination.localDeploymentID ||
+      (!stateful && source.localDeploymentID == destination.localDeploymentID) ||
       intent.sourceWorkload.clusterUUID != route.sourceClusterUUID ||
       intent.targetWorkload.clusterUUID != route.destinationClusterUUID ||
-      intent.ingressWitnessMachineUUID == intent.selectorMachineUUID ||
-      intent.sourceWorkload.deploymentID == source.localDeploymentID ||
-      intent.targetWorkload.deploymentID == destination.localDeploymentID ||
+      (!stateful && intent.ingressWitnessMachineUUID == intent.selectorMachineUUID) ||
+      (!stateful && intent.sourceWorkload.deploymentID == source.localDeploymentID) ||
+      (!stateful && intent.targetWorkload.deploymentID == destination.localDeploymentID) ||
       intent.sourceWorkload.applicationID != intent.targetWorkload.applicationID ||
       intent.sourceWorkload.artifactSHA256 != intent.targetWorkload.artifactSHA256 ||
       intent.sourceWorkload.artifactBytes != intent.targetWorkload.artifactBytes ||
-      intent.sourceWorkload.endpointIPv4 == intent.targetWorkload.endpointIPv4)
+      (!stateful && intent.sourceWorkload.endpointIPv4 == intent.targetWorkload.endpointIPv4))
     return reject("production pair intent permissions do not exactly bind the route scope");
 
   if (!cousinRouteReceiptsAcknowledgedAt(route, intent.sourceRouteReceipt, intent.destinationRouteReceipt,
                                          route.issuedAtMs))
     return reject("production pair intent route receipts do not acknowledge the exact active route");
+  if (stateful)
+  {
+    const auto& data = intent.stateful;
+    if ((intent.sourceWorkload.applicationID != 3 && intent.sourceWorkload.applicationID != 4) ||
+        data.contractVersion != 1 || !prodigyIsSHA256HexDigest(data.contractSHA256) ||
+        !prodigyIsSHA256HexDigest(data.shardManifestSHA256) || data.datasetUUID == 0 || data.snapshotUUID == 0 ||
+        (!data.snapshotBoundarySHA256.empty() && !prodigyIsSHA256HexDigest(data.snapshotBoundarySHA256)) ||
+        (!data.sourceDurableWatermarkSHA256.empty() && !prodigyIsSHA256HexDigest(data.sourceDurableWatermarkSHA256)) || data.sourceFenceEpoch == 0 ||
+        data.snapshotPreparingEpoch == 0 || data.initialCatchupEpoch <= data.snapshotPreparingEpoch ||
+        ((data.previousOperationUUID == 0) != (data.previousAuthorityEpoch == 0)) ||
+        (data.previousAuthorityEpoch != 0 && data.snapshotPreparingEpoch <= data.previousAuthorityEpoch) ||
+        data.sourceFenceEpoch <= data.initialCatchupEpoch || data.fencedCatchupEpoch <= data.sourceFenceEpoch ||
+        data.targetOwnershipEpoch <= data.fencedCatchupEpoch || data.sourceRetainedEpoch <= data.targetOwnershipEpoch ||
+        !route.slots.contains(uint16_t(data.shardGroup)) ||
+        data.shardGroup > UINT16_MAX || data.cohort.size() != 3 || data.targetMachineUUIDs.size() != 3 ||
+        !prodigyIsSHA256HexDigest(data.credentialManifestSHA256) ||
+        data.credentialCount != data.credentials.size() || data.credentials.size() > 256)
+      return reject("Nametag stateful pair requires Hot/Cold and an exact versioned data, epoch, cohort and credential contract");
+    bytell_hash_set<uint128_t> containers;
+    bytell_hash_map<uint32_t, std::array<uint32_t, 4>> groups;
+    const ProdigyStatefulServingAuthorityMember *previous = nullptr;
+    for (const auto& member : data.cohort) {
+      if (!member.isSource || member.shardGroup != data.shardGroup || member.containerUUID == 0 || member.machineUUID == 0 || !prodigyIsSHA256HexDigest(member.planSHA256) ||
+          !containers.insert(member.containerUUID).second || (previous &&
+          (member.shardGroup < previous->shardGroup || (member.shardGroup == previous->shardGroup &&
+          (member.isSource < previous->isSource || (member.isSource == previous->isSource && member.containerUUID <= previous->containerUUID))))))
+        return reject("Nametag stateful cohort is incomplete, duplicated or noncanonical");
+      previous = &member;
+      auto& counts = groups[member.shardGroup];
+      ++counts[member.isSource ? 0 : 1];
+      if (member.advertiseClient) ++counts[member.isSource ? 2 : 3];
+    }
+    for (const auto& [shard, counts] : groups)
+      if (counts[0] != 3 || counts[1] != 0 || counts[2] != 1 || counts[3] != 0)
+        return reject("Nametag immutable admission binds only the source cohort; target identities come from the deployment owner");
+    uint128_t previousMachine = 0;
+    for (uint128_t machine : data.targetMachineUUIDs) {
+      if (machine <= previousMachine) return reject("Nametag target machine set is not canonical");
+      previousMachine = machine;
+    }
+    const MothershipProductionCredentialIdentity *previousCredential = nullptr;
+    bool sourceCredentials = false, targetCredentials = false;
+    for (const auto& credential : data.credentials) {
+      if ((credential.clusterUUID != route.sourceClusterUUID && credential.clusterUUID != route.destinationClusterUUID) ||
+          credential.name.empty() || credential.name.size() > 256 || credential.generation == 0 ||
+          !prodigyIsSHA256HexDigest(credential.applyReceiptSHA256) || (previousCredential &&
+          (credential.clusterUUID < previousCredential->clusterUUID || (credential.clusterUUID == previousCredential->clusterUUID &&
+           !prodigyPersistentStringComesBefore(previousCredential->name, credential.name)))))
+        return reject("Nametag stateful credential application identities are invalid or noncanonical");
+      previousCredential = &credential;
+      sourceCredentials |= credential.clusterUUID == route.sourceClusterUUID;
+      targetCredentials |= credential.clusterUUID == route.destinationClusterUUID;
+    }
+    if (!data.credentials.empty() && (!sourceCredentials || !targetCredentials))
+      return reject("Nametag credentials require application receipts on both clusters");
+    auto credentials = data.credentials;
+    String credentialBytes, credentialDigest;
+    BitseryEngine::serialize(credentialBytes, credentials);
+    if (!prodigyComputeSHA256Hex(credentialBytes, credentialDigest) || credentialDigest != data.credentialManifestSHA256)
+      return reject("Nametag credential manifest does not bind the exact declared set, including the empty set");
+    DeploymentPlan targetPlan;
+    String targetDigest;
+    if (!BitseryEngine::deserializeSafe(data.targetDeploymentPlan, targetPlan) ||
+        !prodigyComputeSHA256Hex(data.targetDeploymentPlan, targetDigest) || targetDigest != intent.targetWorkload.canonicalPlanSHA256 ||
+        !targetPlan.isStateful || targetPlan.config.type != ApplicationType::stateful ||
+        targetPlan.config.deploymentID() != intent.targetWorkload.deploymentID ||
+        targetPlan.config.applicationID != intent.targetWorkload.applicationID ||
+        targetPlan.config.containerBlobSHA256 != intent.targetWorkload.artifactSHA256 ||
+        targetPlan.config.containerBlobBytes != intent.targetWorkload.artifactBytes ||
+        targetPlan.stateful.allMasters || targetPlan.useHostNetworkNamespace || !targetPlan.wormholes.empty() ||
+        !targetPlan.whiteholes.empty() || !targetPlan.horizontalScalers.empty() || !targetPlan.verticalScalers.empty() ||
+        targetPlan.canaryCount != 0)
+      return reject("Nametag target admission requires the exact internal-only deployment and Discombobobulator artifact plan");
+  }
+  return true;
+}
+
+static inline uint8_t mothershipProductionPairPhaseOrder(const MothershipProductionPairIntent& intent,
+                                                         MothershipProductionPairPhase phase)
+{
+  if (intent.protocolVersion != MothershipProductionPairIntent::statefulVersion)
+    return uint8_t(phase);
+  switch (phase) {
+    case MothershipProductionPairPhase::prepared: return 1;
+    case MothershipProductionPairPhase::targetAdmitted: return 2;
+    case MothershipProductionPairPhase::snapshotVerified: return 3;
+    case MothershipProductionPairPhase::catchupVerified: return 4;
+    case MothershipProductionPairPhase::sourceWriterFenced: return 5;
+    case MothershipProductionPairPhase::fencedCatchupVerified: return 6;
+    case MothershipProductionPairPhase::targetOwnershipActive: return 7;
+    case MothershipProductionPairPhase::targetSelected: return 8;
+    case MothershipProductionPairPhase::sourceCleanupVerified: return 9;
+    case MothershipProductionPairPhase::sourceRetired: return 10;
+    case MothershipProductionPairPhase::cleanupComplete: return 11;
+    default: return 0;
+  }
+}
+
+static inline bool mothershipProductionStatefulReceiptValid(const MothershipProductionPairIntent& intent,
+                                                            const MothershipProductionStatefulReceipt& proof)
+{
+  String encoded, intentDigest;
+  auto copy = intent;
+  if (intent.protocolVersion != MothershipProductionPairIntent::statefulVersion ||
+      !mothershipProductionPairIntentValid(intent) || proof.operationUUID != intent.operationUUID ||
+      !BitseryEngine::serialize(encoded, copy) || !prodigyComputeSHA256Hex(encoded, intentDigest) ||
+      proof.intentSHA256 != intentDigest || proof.observedMasterUUID == 0 ||
+      proof.observedMasterBootNs <= 0 || proof.observedAuthorityGeneration == 0 ||
+      (proof.phase != MothershipProductionPairPhase::snapshotVerified &&
+       proof.phase != MothershipProductionPairPhase::catchupVerified &&
+       proof.phase != MothershipProductionPairPhase::sourceWriterFenced &&
+       proof.phase != MothershipProductionPairPhase::fencedCatchupVerified &&
+       proof.phase != MothershipProductionPairPhase::targetOwnershipActive &&
+       proof.phase != MothershipProductionPairPhase::sourceCleanupVerified &&
+       proof.phase != MothershipProductionPairPhase::statefulAbortedBeforeFence))
+    return false;
+  const bool preparing = proof.phase == MothershipProductionPairPhase::snapshotVerified;
+  const bool cleanup = proof.phase == MothershipProductionPairPhase::sourceCleanupVerified;
+  const bool retained = cleanup || proof.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence;
+  const bool source = retained || preparing || proof.phase == MothershipProductionPairPhase::sourceWriterFenced;
+  const bool active = proof.phase == MothershipProductionPairPhase::targetOwnershipActive;
+  if (proof.members.size() != 3 || proof.cohort.size() != 3) return false;
+  uint128_t previousCohort = 0;
+  uint32_t clients = 0;
+  bytell_hash_set<uint128_t> machines;
+  for (const auto& member : proof.cohort) {
+    if (member.containerUUID <= previousCohort || member.machineUUID == 0 || member.shardGroup != intent.stateful.shardGroup ||
+        member.isSource != source || !prodigyIsSHA256HexDigest(member.planSHA256) || !machines.insert(member.machineUUID).second) return false;
+    previousCohort = member.containerUUID;
+    if (member.advertiseClient) ++clients;
+  }
+  if (clients != ((preparing || (retained && !cleanup) || active) ? 1u : 0u)) return false;
+  uint128_t previous = 0;
+  for (const auto& observed : proof.members) {
+    if (observed.containerUUID <= previous) return false;
+    previous = observed.containerUUID;
+    const auto member = std::find_if(proof.cohort.begin(), proof.cohort.end(), [&](const auto& candidate) {
+      return candidate.containerUUID == observed.containerUUID && candidate.machineUUID == observed.machineUUID && candidate.isSource == source;
+    });
+    if (source) {
+      if (std::none_of(intent.stateful.cohort.begin(), intent.stateful.cohort.end(), [&](const auto& candidate) {
+        return candidate.containerUUID == observed.containerUUID && candidate.machineUUID == observed.machineUUID;
+      })) return false;
+    } else if (std::find(intent.stateful.targetMachineUUIDs.begin(), intent.stateful.targetMachineUUIDs.end(), observed.machineUUID) ==
+               intent.stateful.targetMachineUUIDs.end()) return false;
+    const auto& data = observed.receipt.authority;
+    const auto expectedMode = retained ? StatefulDataAuthorityMode::retainedSource : (preparing ? StatefulDataAuthorityMode::snapshotPreparing :
+        (source ? StatefulDataAuthorityMode::fenced :
+         (active ? StatefulDataAuthorityMode::writeOwner : StatefulDataAuthorityMode::catchupOnly)));
+    if (member == proof.cohort.end() || !prodigyStatefulDataAuthorityReceiptValid(observed.receipt) ||
+        (proof.phase == MothershipProductionPairPhase::catchupVerified
+         ? !prodigyStatefulDataAuthorityReceiptStaged(observed.receipt) : !observed.receipt.ready) ||
+        data.operationUUID != intent.operationUUID || data.datasetUUID != intent.stateful.datasetUUID ||
+        data.snapshotUUID != intent.stateful.snapshotUUID || data.shardGroup != intent.stateful.shardGroup ||
+        data.previousOperationUUID != intent.stateful.previousOperationUUID || data.sourceClusterUUID != intent.route.sourceClusterUUID ||
+        data.previousAuthorityEpoch != intent.stateful.previousAuthorityEpoch ||
+        data.targetClusterUUID != intent.route.destinationClusterUUID ||
+        data.localClusterUUID != (source ? intent.route.sourceClusterUUID : intent.route.destinationClusterUUID) ||
+        data.writeOwnerClusterUUID != ((active || cleanup) ? intent.route.destinationClusterUUID : intent.route.sourceClusterUUID) ||
+        data.authorityEpoch != (retained ? intent.stateful.sourceRetainedEpoch : (preparing ? intent.stateful.snapshotPreparingEpoch :
+          (proof.phase == MothershipProductionPairPhase::catchupVerified ? intent.stateful.initialCatchupEpoch :
+           (source ? intent.stateful.sourceFenceEpoch :
+            (active ? intent.stateful.targetOwnershipEpoch : intent.stateful.fencedCatchupEpoch))))) ||
+        data.mode != expectedMode ||
+        data.contractSHA256 != intent.stateful.contractSHA256 || data.shardManifestSHA256 != intent.stateful.shardManifestSHA256 ||
+        (!preparing && !intent.stateful.snapshotBoundarySHA256.empty() && data.snapshotBoundarySHA256 != intent.stateful.snapshotBoundarySHA256)) return false;
+  }
   return true;
 }
 
 class MothershipProductionPairRecord {
 public:
   static constexpr uint32_t version = 2;
+  static constexpr uint32_t statefulVersion = 3;
 
   uint32_t protocolVersion = version;
   MothershipProductionPairIntent intent = {};
@@ -268,6 +573,13 @@ public:
   String sourceDrainReceiptSHA256 = {};
   String sourceRetirementReceiptSHA256 = {};
   String cleanupReceiptSHA256 = {};
+  Vector<MothershipProductionStatefulReceipt> statefulReceipts;
+  bool hasStatefulAbortReceipt = false;
+  MothershipProductionStatefulReceipt statefulAbortReceipt;
+  bool hasPendingStatefulCommand = false;
+  MothershipProductionPairPhase pendingStatefulPhase = MothershipProductionPairPhase::prepared;
+  bool statefulAbortTargetAdmissionIssued = false;
+  String statefulTargetCompensationReceiptSHA256;
 };
 
 template <typename S>
@@ -286,6 +598,15 @@ static void serialize(S&& serializer, MothershipProductionPairRecord& record)
   serializer.text1b(record.sourceDrainReceiptSHA256, 64);
   serializer.text1b(record.sourceRetirementReceiptSHA256, 64);
   serializer.text1b(record.cleanupReceiptSHA256, 64);
+  if (record.protocolVersion == MothershipProductionPairRecord::statefulVersion) {
+    serializer.container(record.statefulReceipts, 6);
+    serializer.value1b(record.hasStatefulAbortReceipt);
+    if (record.hasStatefulAbortReceipt) serializer.object(record.statefulAbortReceipt);
+    serializer.value1b(record.hasPendingStatefulCommand);
+    serializer.value1b(record.pendingStatefulPhase);
+    serializer.value1b(record.statefulAbortTargetAdmissionIssued);
+    serializer.text1b(record.statefulTargetCompensationReceiptSHA256, 64);
+  }
 }
 
 static inline bool mothershipProductionPairRecordValid(const MothershipProductionPairRecord& record,
@@ -293,10 +614,91 @@ static inline bool mothershipProductionPairRecordValid(const MothershipProductio
 {
   if (failure) failure->clear();
   auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
-  if (record.protocolVersion != MothershipProductionPairRecord::version ||
+  const bool stateful = record.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion;
+  if (record.protocolVersion != (stateful ? MothershipProductionPairRecord::statefulVersion : MothershipProductionPairRecord::version) ||
       !mothershipProductionPairIntentValid(record.intent) || !mothershipProductionPairPhaseValid(record.phase) ||
       record.transitionGeneration == 0 || record.transitionedAtMs <= 0)
     return reject("production pair record has an invalid immutable intent or transition identity");
+  if (stateful) {
+    const uint8_t order = mothershipProductionPairPhaseOrder(record.intent, record.phase);
+    if (record.hasPendingStatefulCommand &&
+        (mothershipProductionPairPhaseOrder(record.intent, record.pendingStatefulPhase) != order + 1 ||
+         (mothershipProductionPairPhaseOrder(record.intent, record.pendingStatefulPhase) > 7 &&
+          record.pendingStatefulPhase != MothershipProductionPairPhase::sourceCleanupVerified)))
+      return reject("stateful desired command is not the exact next durable data gate");
+    const bool aborting = record.phase == MothershipProductionPairPhase::statefulAbortBeforeFencePending ||
+                          record.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence ||
+                          record.phase == MothershipProductionPairPhase::abortedBeforeTransit;
+    if ((!aborting && (order == 0 || record.statefulReceipts.size() !=
+          (order >= 9 ? 6u : std::min<uint8_t>(order > 2 ? order - 2 : 0, 5)))) ||
+        (aborting && record.statefulReceipts.size() > 2))
+      return reject("Nametag stateful record has missing, premature or unsupported data gates");
+    constexpr MothershipProductionPairPhase phases[] = {
+      MothershipProductionPairPhase::snapshotVerified, MothershipProductionPairPhase::catchupVerified,
+      MothershipProductionPairPhase::sourceWriterFenced, MothershipProductionPairPhase::fencedCatchupVerified,
+      MothershipProductionPairPhase::targetOwnershipActive, MothershipProductionPairPhase::sourceCleanupVerified};
+    for (uint32_t index = 0; index < record.statefulReceipts.size(); ++index)
+      if (record.statefulReceipts[index].phase != phases[index] ||
+          !mothershipProductionStatefulReceiptValid(record.intent, record.statefulReceipts[index]))
+        return reject("Nametag stateful record has a stale or contradictory application receipt");
+    if (!record.statefulReceipts.empty()) {
+      const auto& snapshot = record.statefulReceipts.front().members.front().receipt.snapshotReceiptSHA256;
+      String finalWatermark;
+      if (record.statefulReceipts.size() >= 3)
+        finalWatermark = record.statefulReceipts[2].members.front().receipt.appliedWatermarkSHA256;
+      for (uint32_t index = 0; index < record.statefulReceipts.size(); ++index)
+        for (const auto& member : record.statefulReceipts[index].members) {
+          const auto& receipt = member.receipt;
+          if ((index == 0 && receipt.snapshotReceiptSHA256 != snapshot) ||
+              (index != 0 && receipt.authority.snapshotBoundarySHA256 != snapshot) ||
+              (index == 1 && !prodigyStatefulDataAuthorityReceiptStaged(receipt)) ||
+              (index >= 2 && receipt.appliedWatermarkSHA256 != finalWatermark))
+            return reject("stateful proof does not preserve the authenticated snapshot and final fenced watermark");
+          if (index == 5) {
+            const auto& fences = record.statefulReceipts[2].members;
+            auto fence = std::find_if(fences.begin(), fences.end(), [&](const auto& value) { return value.containerUUID == member.containerUUID; });
+            if (fence == fences.end() || receipt.fenceReceiptSHA256 != fence->receipt.fenceReceiptSHA256)
+              return reject("source cleanup must preserve the exact durable source fence receipt");
+          }
+        }
+      if (record.statefulReceipts.size() > 3) {
+        const auto& initial = record.statefulReceipts[1].cohort;
+        for (uint32_t index : {3u, 4u}) {
+          if (index >= record.statefulReceipts.size()) continue;
+          const auto& later = record.statefulReceipts[index].cohort;
+          for (uint32_t member = 0; member < initial.size(); ++member)
+            if (initial[member].containerUUID != later[member].containerUUID || initial[member].machineUUID != later[member].machineUUID ||
+                initial[member].shardGroup != later[member].shardGroup)
+              return reject("stateful promotion changes the exact admitted target cohort");
+        }
+      }
+    }
+    if (aborting && record.phase != MothershipProductionPairPhase::abortedBeforeTransit) {
+      if (!mothershipProductionPairReceiptValid(record.targetAdmissionReceiptSHA256) ||
+          !mothershipProductionPairReceiptValid(record.cleanupReceiptSHA256) ||
+          !record.transitApplyReceiptSHA256.empty() || !record.sourceIngressWitnessReceiptSHA256.empty() ||
+          !record.targetSelectionReceiptSHA256.empty() || !record.targetIngressWitnessReceiptSHA256.empty() ||
+          !record.sourceDrainReceiptSHA256.empty() || !record.sourceRetirementReceiptSHA256.empty())
+        return reject("stateful pre-fence compensation contains traffic or writer-transfer effects");
+      const bool terminal = record.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence;
+      if ((terminal && (!record.hasStatefulAbortReceipt || !mothershipProductionPairReceiptValid(record.statefulTargetCompensationReceiptSHA256))) ||
+          (!record.statefulTargetCompensationReceiptSHA256.empty() && !mothershipProductionPairReceiptValid(record.statefulTargetCompensationReceiptSHA256)) ||
+          (record.hasStatefulAbortReceipt && !mothershipProductionStatefulReceiptValid(record.intent, record.statefulAbortReceipt)))
+        return reject("stateful abort lacks the authenticated source-retained cleanup receipt");
+      if (record.hasStatefulAbortReceipt) {
+        if (record.statefulReceipts.empty() || !mothershipProductionPairReceiptValid(record.statefulTargetCompensationReceiptSHA256))
+          return reject("source cleanup lacks its recorded transactional snapshot and target compensation");
+        const auto& snapshot = record.statefulReceipts.front().members.front().receipt.snapshotReceiptSHA256;
+        for (const auto& member : record.statefulAbortReceipt.members)
+          if (member.receipt.authority.snapshotBoundarySHA256 != snapshot || member.receipt.snapshotReceiptSHA256 != snapshot)
+            return reject("source abort cleanup differs from its authenticated snapshot");
+      }
+      return true;
+    }
+    if (record.hasStatefulAbortReceipt || record.statefulAbortTargetAdmissionIssued || !record.statefulTargetCompensationReceiptSHA256.empty())
+      return reject("stateful abort receipt is premature");
+  } else if (!record.statefulReceipts.empty() || record.phase >= MothershipProductionPairPhase::snapshotVerified)
+    return reject("stateless pair cannot contain application data phases");
   if (record.phase == MothershipProductionPairPhase::abortedBeforeTransit)
   {
     // A prepare preflight can fail after the immutable intent is durable but
@@ -338,8 +740,19 @@ static inline bool mothershipProductionPairRecordValid(const MothershipProductio
     return true;
   }
   const auto require = [&](const String& receipt, MothershipProductionPairPhase atLeast) {
-    return record.phase < atLeast ? receipt.empty() : mothershipProductionPairReceiptValid(receipt);
+    return mothershipProductionPairPhaseOrder(record.intent, record.phase) < mothershipProductionPairPhaseOrder(record.intent, atLeast)
+        ? receipt.empty() : mothershipProductionPairReceiptValid(receipt);
   };
+  if (stateful) {
+    if (!record.transitApplyReceiptSHA256.empty() || !record.sourceIngressWitnessReceiptSHA256.empty() ||
+        !record.targetIngressWitnessReceiptSHA256.empty() || !record.sourceDrainReceiptSHA256.empty() ||
+        !require(record.targetAdmissionReceiptSHA256, MothershipProductionPairPhase::targetAdmitted) ||
+        !require(record.targetSelectionReceiptSHA256, MothershipProductionPairPhase::targetSelected) ||
+        !require(record.sourceRetirementReceiptSHA256, MothershipProductionPairPhase::sourceRetired) ||
+        !require(record.cleanupReceiptSHA256, MothershipProductionPairPhase::cleanupComplete))
+      return reject("stateful pair requires internal COUSIN selection and retirement receipts, never a physical IPv4 selector");
+    return true;
+  }
   if (!require(record.targetAdmissionReceiptSHA256, MothershipProductionPairPhase::targetAdmitted) ||
       !require(record.transitApplyReceiptSHA256, MothershipProductionPairPhase::transitApplied) ||
       !require(record.sourceIngressWitnessReceiptSHA256, MothershipProductionPairPhase::sourceIngressWitnessed) ||
@@ -359,6 +772,194 @@ static inline bool mothershipProductionPairRecordMatchesIntent(const MothershipP
          mothershipProductionPairIntentExactMatches(record.intent, intent);
 }
 
+static inline bool mothershipProductionPairStatefulCommand(const MothershipProductionPairRecord& record,
+    MothershipProductionPairPhase phase, StatefulDataAuthorityOperation& command)
+{
+  command = {};
+  if (!mothershipProductionPairRecordValid(record) ||
+      record.intent.protocolVersion != MothershipProductionPairIntent::statefulVersion) return false;
+  const auto& intent = record.intent; const auto& data = intent.stateful;
+  const bool preparing = phase == MothershipProductionPairPhase::snapshotVerified;
+  const bool cleanup = phase == MothershipProductionPairPhase::sourceCleanupVerified;
+  const bool source = preparing || cleanup || phase == MothershipProductionPairPhase::sourceWriterFenced;
+  const bool active = phase == MothershipProductionPairPhase::targetOwnershipActive;
+  const bool initialCatchup = phase == MothershipProductionPairPhase::catchupVerified;
+  if (!preparing && !source && !active && !initialCatchup && phase != MothershipProductionPairPhase::fencedCatchupVerified) return false;
+  if (!preparing && record.statefulReceipts.empty()) return false;
+  if ((active || cleanup || phase == MothershipProductionPairPhase::fencedCatchupVerified) && record.statefulReceipts.size() < 3) return false;
+  auto& authority = command.authority;
+  command.deploymentID = source ? intent.sourceWorkload.deploymentID : intent.targetWorkload.deploymentID;
+  auto copy = intent; String bytes; BitseryEngine::serialize(bytes, copy);
+  if (!prodigyComputeSHA256Hex(bytes, command.pairIntentSHA256)) return false;
+  command.cohort = source ? data.cohort : Vector<ProdigyStatefulServingAuthorityMember>{};
+  command.deploymentPlan = source ? String() : data.targetDeploymentPlan;
+  authority.operationUUID = intent.operationUUID; authority.previousOperationUUID = data.previousOperationUUID;
+  authority.previousAuthorityEpoch = data.previousAuthorityEpoch;
+  authority.datasetUUID = data.datasetUUID; authority.snapshotUUID = data.snapshotUUID;
+  authority.sourceClusterUUID = intent.route.sourceClusterUUID; authority.targetClusterUUID = intent.route.destinationClusterUUID;
+  authority.localClusterUUID = source ? authority.sourceClusterUUID : authority.targetClusterUUID;
+  authority.writeOwnerClusterUUID = active || cleanup ? authority.targetClusterUUID : authority.sourceClusterUUID;
+  authority.shardGroup = data.shardGroup; authority.contractSHA256 = data.contractSHA256;
+  authority.shardManifestSHA256 = data.shardManifestSHA256;
+  authority.mode = cleanup ? StatefulDataAuthorityMode::retainedSource : (preparing ? StatefulDataAuthorityMode::snapshotPreparing :
+      (source ? StatefulDataAuthorityMode::fenced : (active ? StatefulDataAuthorityMode::writeOwner : StatefulDataAuthorityMode::catchupOnly)));
+  authority.authorityEpoch = cleanup ? data.sourceRetainedEpoch : (preparing ? data.snapshotPreparingEpoch : (source ? data.sourceFenceEpoch :
+      (initialCatchup ? data.initialCatchupEpoch : (active ? data.targetOwnershipEpoch : data.fencedCatchupEpoch))));
+  if (!preparing) authority.snapshotBoundarySHA256 = record.statefulReceipts.front().members.front().receipt.snapshotReceiptSHA256;
+  if (!source || cleanup) authority.requiredAppliedWatermarkSHA256 = initialCatchup ? authority.snapshotBoundarySHA256 :
+      record.statefulReceipts[2].members.front().receipt.appliedWatermarkSHA256;
+  if (active || cleanup) {
+    auto fence = record.statefulReceipts[2]; String encoded; BitseryEngine::serialize(encoded, fence);
+    if (!prodigyComputeSHA256Hex(encoded, command.sourceFenceReceiptSHA256)) return false;
+  }
+  return prodigyStatefulDataAuthorityValid(authority);
+}
+
+static inline bool mothershipProductionPairApplyStatefulReceipt(MothershipProductionPairRecord& record,
+    const MothershipProductionStatefulReceipt& proof, int64_t nowMs, String *failure = nullptr)
+{
+  if (failure) failure->clear();
+  auto reject = [&](const char *reason) { if (failure) failure->assign(reason); return false; };
+  if (!mothershipProductionPairRecordValid(record) || nowMs < record.transitionedAtMs ||
+      !mothershipProductionStatefulReceiptValid(record.intent, proof))
+    return reject("stateful pair proof does not bind the exact admitted application authority");
+  if (record.phase == proof.phase) {
+    String expected, observed;
+    auto saved = record.statefulReceipts.back(), incoming = proof;
+    BitseryEngine::serialize(expected, saved); BitseryEngine::serialize(observed, incoming);
+    return expected == observed || reject("stateful pair replay changed its durable owner receipt");
+  }
+  if (mothershipProductionPairPhaseOrder(record.intent, proof.phase) !=
+      mothershipProductionPairPhaseOrder(record.intent, record.phase) + 1)
+    return reject("stateful pair requires snapshot, catchup, source fence, then target ownership in order");
+  // Snapshot identity is immutable across catchup and activation. Authority
+  // observations may advance after election, but an older same-master receipt
+  // cannot supersede the admitted application proof.
+  for (const auto& previous : record.statefulReceipts) {
+    if (previous.observedMasterUUID == proof.observedMasterUUID &&
+        previous.observedMasterBootNs == proof.observedMasterBootNs &&
+        previous.observedAuthorityGeneration > proof.observedAuthorityGeneration)
+      return reject("stateful pair proof rolls back the observed authority generation");
+    for (const auto& member : proof.members) for (const auto& saved : previous.members)
+      if (member.containerUUID == saved.containerUUID &&
+          member.receipt.snapshotReceiptSHA256 != saved.receipt.snapshotReceiptSHA256)
+        return reject("stateful pair proof changes the admitted snapshot receipt");
+  }
+  auto updated = record;
+  updated.statefulReceipts.push_back(proof);
+  updated.hasPendingStatefulCommand = false;
+  updated.pendingStatefulPhase = MothershipProductionPairPhase::prepared;
+  updated.phase = proof.phase;
+  ++updated.transitionGeneration;
+  updated.transitionedAtMs = nowMs;
+  if (!mothershipProductionPairRecordValid(updated, failure)) return false;
+  record = std::move(updated);
+  return true;
+}
+
+static inline bool mothershipProductionPairAbortStatefulBeforeFence(MothershipProductionPairRecord& record,
+    const String& receiptSHA256, int64_t nowMs, bool completed, String *failure = nullptr,
+    const MothershipProductionStatefulReceipt *sourceCleanup = nullptr,
+    const String *targetCompensationReceiptSHA256 = nullptr)
+{
+  if (failure) failure->clear();
+  const auto requested = completed ? MothershipProductionPairPhase::statefulAbortedBeforeFence :
+                                    MothershipProductionPairPhase::statefulAbortBeforeFencePending;
+  if (!mothershipProductionPairRecordValid(record) ||
+      record.intent.protocolVersion != MothershipProductionPairIntent::statefulVersion ||
+      !mothershipProductionPairReceiptValid(receiptSHA256) || nowMs < record.transitionedAtMs) return false;
+  if (record.hasPendingStatefulCommand &&
+      mothershipProductionPairPhaseOrder(record.intent, record.pendingStatefulPhase) >= 5) {
+    if (failure) failure->assign("source fence command may already be durable; pre-fence compensation is forbidden"_ctv);
+    return false;
+  }
+  if (record.phase == requested) {
+    if (record.cleanupReceiptSHA256 != receiptSHA256) return false;
+    if (!completed) return true;
+    if (!sourceCleanup || !targetCompensationReceiptSHA256 ||
+        record.statefulTargetCompensationReceiptSHA256 != *targetCompensationReceiptSHA256) return false;
+    auto saved = record.statefulAbortReceipt, incoming = *sourceCleanup;
+    String savedBytes, incomingBytes;
+    BitseryEngine::serialize(savedBytes, saved); BitseryEngine::serialize(incomingBytes, incoming);
+    return savedBytes == incomingBytes;
+  }
+  if (completed ? record.phase != MothershipProductionPairPhase::statefulAbortBeforeFencePending :
+      (record.phase != MothershipProductionPairPhase::targetAdmitted &&
+       record.phase != MothershipProductionPairPhase::snapshotVerified &&
+       record.phase != MothershipProductionPairPhase::catchupVerified)) {
+    if (failure) failure->assign("stateful compensation is allowed only before the source writer fence"_ctv);
+    return false;
+  }
+  auto updated = record;
+  if (!completed) updated.statefulAbortTargetAdmissionIssued =
+      record.phase == MothershipProductionPairPhase::catchupVerified ||
+      (record.hasPendingStatefulCommand && record.pendingStatefulPhase == MothershipProductionPairPhase::catchupVerified);
+  updated.hasPendingStatefulCommand = false;
+  updated.pendingStatefulPhase = MothershipProductionPairPhase::prepared;
+  if (completed) {
+    if (!sourceCleanup || sourceCleanup->phase != MothershipProductionPairPhase::statefulAbortedBeforeFence ||
+        !mothershipProductionStatefulReceiptValid(record.intent, *sourceCleanup) ||
+        !record.hasStatefulAbortReceipt || !targetCompensationReceiptSHA256 ||
+        record.statefulTargetCompensationReceiptSHA256 != *targetCompensationReceiptSHA256 ||
+        !mothershipProductionPairReceiptValid(*targetCompensationReceiptSHA256)) return false;
+    String savedBytes, incomingBytes;
+    auto saved = record.statefulAbortReceipt, incoming = *sourceCleanup;
+    BitseryEngine::serialize(savedBytes, saved); BitseryEngine::serialize(incomingBytes, incoming);
+    if (savedBytes != incomingBytes) return false;
+    updated.hasStatefulAbortReceipt = true;
+    updated.statefulAbortReceipt = *sourceCleanup;
+    updated.statefulTargetCompensationReceiptSHA256 = *targetCompensationReceiptSHA256;
+  }
+  updated.phase = requested;
+  updated.cleanupReceiptSHA256 = receiptSHA256;
+  updated.transitionedAtMs = nowMs;
+  ++updated.transitionGeneration;
+  if (!mothershipProductionPairRecordValid(updated, failure)) return false;
+  record = std::move(updated);
+  return true;
+}
+
+// Abort evidence is checkpointed before the next effect. A lost cleanup reply
+// can therefore resume without re-opening a snapshot or accepting caller proof.
+static inline bool mothershipProductionPairObserveStatefulAbort(MothershipProductionPairRecord& record,
+    const MothershipProductionStatefulReceipt& proof, int64_t nowMs, String *failure = nullptr)
+{
+  if (!mothershipProductionPairRecordValid(record) ||
+      record.phase != MothershipProductionPairPhase::statefulAbortBeforeFencePending || nowMs < record.transitionedAtMs ||
+      !mothershipProductionStatefulReceiptValid(record.intent, proof)) return false;
+  auto updated = record;
+  MothershipProductionStatefulReceipt *existing = nullptr;
+  if (proof.phase == MothershipProductionPairPhase::snapshotVerified) {
+    if (updated.statefulReceipts.empty()) updated.statefulReceipts.push_back(proof);
+    else existing = &updated.statefulReceipts.front();
+  } else if (proof.phase == MothershipProductionPairPhase::statefulAbortedBeforeFence) {
+    if (!mothershipProductionPairReceiptValid(record.statefulTargetCompensationReceiptSHA256)) return false;
+    if (updated.hasStatefulAbortReceipt) existing = &updated.statefulAbortReceipt;
+    else { updated.hasStatefulAbortReceipt = true; updated.statefulAbortReceipt = proof; }
+  } else return false;
+  if (existing) {
+    String a, b; auto copy = proof;
+    BitseryEngine::serialize(a, *existing); BitseryEngine::serialize(b, copy);
+    return a == b;
+  }
+  ++updated.transitionGeneration; updated.transitionedAtMs = nowMs;
+  if (!mothershipProductionPairRecordValid(updated, failure)) return false;
+  record = std::move(updated); return true;
+}
+
+static inline bool mothershipProductionPairObserveStatefulTargetCompensation(MothershipProductionPairRecord& record,
+    const String& receiptSHA256, int64_t nowMs, String *failure = nullptr)
+{
+  if (!mothershipProductionPairRecordValid(record) ||
+      record.phase != MothershipProductionPairPhase::statefulAbortBeforeFencePending ||
+      record.statefulReceipts.empty() || !mothershipProductionPairReceiptValid(receiptSHA256) || nowMs < record.transitionedAtMs) return false;
+  if (!record.statefulTargetCompensationReceiptSHA256.empty()) return record.statefulTargetCompensationReceiptSHA256 == receiptSHA256;
+  auto updated = record; updated.statefulTargetCompensationReceiptSHA256 = receiptSHA256;
+  ++updated.transitionGeneration; updated.transitionedAtMs = nowMs;
+  if (!mothershipProductionPairRecordValid(updated, failure)) return false;
+  record = std::move(updated); return true;
+}
+
 static inline bool mothershipProductionPairBegin(const MothershipProductionPairIntent& intent, int64_t nowMs,
                                                  MothershipProductionPairRecord& record, String *failure = nullptr)
 {
@@ -368,6 +969,8 @@ static inline bool mothershipProductionPairBegin(const MothershipProductionPairI
     return false;
   }
   record = {};
+  if (intent.protocolVersion == MothershipProductionPairIntent::statefulVersion)
+    record.protocolVersion = MothershipProductionPairRecord::statefulVersion;
   record.intent = intent;
   record.transitionedAtMs = nowMs;
   return true;
@@ -404,7 +1007,8 @@ static inline bool mothershipProductionPairAdvance(MothershipProductionPairRecor
     if (failure) failure->assign("production pair advance has invalid record, phase, receipt, or timestamp");
     return false;
   }
-  const uint8_t current = uint8_t(record.phase), requested = uint8_t(next);
+  const uint8_t current = mothershipProductionPairPhaseOrder(record.intent, record.phase);
+  const uint8_t requested = mothershipProductionPairPhaseOrder(record.intent, next);
   if (next == MothershipProductionPairPhase::transitApplied ||
       next == MothershipProductionPairPhase::abortedBeforeTransit ||
       next == MothershipProductionPairPhase::abortedBeforeCutover ||
@@ -514,7 +1118,8 @@ static inline bool mothershipProductionPairMarkTransitApplied(MothershipProducti
                                                               String *failure = nullptr)
 {
   if (failure) failure->clear();
-  if (!mothershipProductionPairRecordValid(record) || nowMs < record.transitionedAtMs ||
+  if (record.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion ||
+      !mothershipProductionPairRecordValid(record) || nowMs < record.transitionedAtMs ||
       !mothershipProductionPairReceiptValid(receiptSHA256)) {
     if (failure) failure->assign("production pair transit requires the durably admitted target");
     return false;
@@ -524,7 +1129,9 @@ static inline bool mothershipProductionPairMarkTransitApplied(MothershipProducti
     if (failure) failure->assign("production pair transit retry receipt conflicts with durable receipt");
     return false;
   }
-  if (record.phase != MothershipProductionPairPhase::targetAdmitted) {
+  const auto expected = record.intent.protocolVersion == MothershipProductionPairIntent::statefulVersion
+      ? MothershipProductionPairPhase::targetOwnershipActive : MothershipProductionPairPhase::targetAdmitted;
+  if (record.phase != expected) {
     if (failure) failure->assign("production pair transit requires the durably admitted target");
     return false;
   }

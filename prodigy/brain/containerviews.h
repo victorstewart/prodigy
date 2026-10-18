@@ -56,11 +56,19 @@ public:
   bool statefulTopologyCutoverReady = false;
   uint32_t statefulTopologyCutoverSourceEpoch = 0;
   uint32_t statefulTopologyCutoverTargetEpoch = 0;
+  // Current-stream observation only. Durable pair authority retains any
+  // accepted proof; reconnect/recovery must request a fresh application reply.
+  StatefulDataAuthorityReceipt statefulDataAuthorityReceipt;
+  uint64_t statefulDataAuthorityReceiptIOGeneration = 0;
+  uint64_t statefulDataAuthorityReceiptAuthorityEpoch = 0;
+  uint32_t statefulDataAuthorityReceiptCrashCount = 0;
 
   bool isStateful = false;
   uint32_t shardGroup = 0; // only for stateful
   StatefulMeshRoles explicitStatefulMeshRoles = {};
   StatefulTopology explicitStatefulTopology = {};
+  uint64_t declaredStatefulClientService = 0;
+  uint16_t declaredStatefulClientPort = 0;
 
   // Runtime resource assignments tracked on the brain
   uint16_t runtime_nLogicalCores = 0;
@@ -605,6 +613,8 @@ public:
       pruneRole(plan.statefulMeshRoles.sharding);
       pruneRole(plan.statefulMeshRoles.topologyBridge);
       plan.statefulTopology = effectiveStatefulTopology(dplan, &plan.config);
+      plan.declaredStatefulClientService = declaredStatefulClientService;
+      plan.declaredStatefulClientPort = declaredStatefulClientPort;
     }
 
     plan.lifetime = lifetime;
