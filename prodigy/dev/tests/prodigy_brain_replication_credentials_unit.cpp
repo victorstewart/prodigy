@@ -524,6 +524,14 @@ public:
   }
 };
 
+class AuthorityApplyRetryTestBrain : public TestBrain {
+public:
+  void drivePendingDesignationAfterAuthorityApplyForTest(void)
+  {
+    drivePendingDesignatedMasterElection("test-authority-apply");
+  }
+};
+
 class TransportCredentialCohortTestBrain final : public TransportCredentialDeliveryTestBrain {
 public:
   ClusterTopology authoritativeTopology = {};
@@ -35106,6 +35114,71 @@ static void testTransportCredentialDerivationSymmetry(TestSuite& suite)
   suite.expect(!operation.valid(), "transport_credentials_pending_operation_rejects_duplicate_voter");
 }
 
+static void testPendingDesignatedMasterRetriesAfterAuthorityApply(TestSuite& suite)
+{
+  AuthorityApplyRetryTestBrain brain = {};
+  brain.weAreMaster = false;
+  brain.noMasterYet = true;
+  brain.nBrains = 2;
+  brain.hasCompletedInitialMasterElection = false;
+  brain.masterAuthorityRuntimeState.generation = 41;
+  brain.masterAuthorityRuntimeStateDurable = true;
+  brain.durableMasterAuthorityRuntimeStateGeneration = 41;
+
+  BrainView designated = {};
+  designated.uuid = uint128_t(0x9b01);
+  designated.boottimens = 901;
+  designated.connected = true;
+  designated.registrationFresh = true;
+  designated.isFixedFile = true;
+  designated.fslot = 91;
+  brain.brains.insert(&designated);
+  brain.pendingDesignatedMasterPeerKey = designated.uuid;
+
+  // A failed/incomplete authority receipt must leave the designation fenced.
+  brain.masterAuthorityRuntimeStateDurable = false;
+  brain.drivePendingDesignationAfterAuthorityApplyForTest();
+  suite.expect(designated.isMasterBrain == false && brain.pendingDesignatedMasterPeerKey == designated.uuid,
+               "pending_designated_master_does_not_elect_before_durable_authority_apply");
+
+  // Once the exact authority generation is durable, re-use normal peer-master
+  // election rather than waiting for another registration frame.
+  brain.masterAuthorityRuntimeStateDurable = true;
+  // Hold the peer-election persistence completion: the assertion covers the
+  // election state transition itself without requiring a live peer transport
+  // for the subsequent identity publication.
+  brain.holdRuntimePersistence = true;
+  brain.drivePendingDesignationAfterAuthorityApplyForTest();
+  suite.expect(designated.isMasterBrain && brain.pendingDesignatedMasterPeerKey == 0,
+               "pending_designated_master_retries_peer_election_after_durable_authority_apply");
+
+  // A stale durable-generation claim remains fenced; a frontier attempt must
+  // never run against a revision that has not crossed the durable boundary.
+  AuthorityApplyRetryTestBrain conflicted = {};
+  conflicted.weAreMaster = false;
+  conflicted.noMasterYet = true;
+  conflicted.nBrains = 2;
+  conflicted.masterAuthorityRuntimeState.generation = 52;
+  conflicted.masterAuthorityRuntimeStateDurable = true;
+  conflicted.durableMasterAuthorityRuntimeStateGeneration = 51;
+  BrainView conflictingPeer = {};
+  conflictingPeer.uuid = uint128_t(0x9b02);
+  conflictingPeer.boottimens = 902;
+  conflictingPeer.connected = true;
+  conflictingPeer.registrationFresh = true;
+  conflictingPeer.isFixedFile = true;
+  conflictingPeer.fslot = 92;
+  conflicted.brains.insert(&conflictingPeer);
+  conflicted.pendingDesignatedMasterPeerKey = conflictingPeer.uuid;
+  conflicted.drivePendingDesignationAfterAuthorityApplyForTest();
+  suite.expect(conflictingPeer.isMasterBrain == false &&
+                   conflicted.pendingDesignatedMasterPeerKey == conflictingPeer.uuid,
+               "pending_designated_master_stale_authority_remains_fenced_after_authority_apply");
+
+  conflicted.brains.erase(&conflictingPeer);
+  brain.brains.erase(&designated);
+}
+
 static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
 {
   const uint128_t selfUUID = uint128_t(0x9a01);
@@ -35132,7 +35205,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     value.state = state;
     return value;
   };
-  auto configureAuthority = [&](TransportCredentialDeliveryTestBrain& brain,
+  auto configureAuthority = [&](TestBrain& brain,
                                 uint64_t generation, uint64_t epoch) {
     brain.weAreMaster = true;
     brain.noMasterYet = false;
@@ -35154,7 +35227,7 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
         enrollment(0x9a13, peerBUUID, ProdigyTransportCredentialNodeRole::brain,
                    ProdigyTransportCredentialEnrollmentState::active, generation)};
   };
-  auto authenticatePeer = [&](TransportCredentialDeliveryTestBrain& brain,
+  auto authenticatePeer = [&](TestBrain& brain,
                               BrainView& peer, uint128_t peerUUID) {
     peer.uuid = peerUUID;
     peer.connected = true;
@@ -35210,6 +35283,40 @@ static void testTransportCredentialEnrollmentOwner(TestSuite& suite)
     brain.masterAuthorityReplicationByPeer.insert_or_assign(&peer, std::move(tracking));
     return true;
   };
+
+  {
+    // The deferred designation must stay pinned when the authoritative
+    // frontier reply conflicts; the reply handler must not fall back to a
+    // general election or acknowledge the relinquish.
+    ScopedRing electionRing;
+    AuthorityApplyRetryTestBrain conflictedDesignation;
+    configureAuthority(conflictedDesignation, 53, 191);
+    conflictedDesignation.weAreMaster = false;
+    conflictedDesignation.noMasterYet = true;
+    conflictedDesignation.hasCompletedInitialMasterElection = true;
+    conflictedDesignation.nBrains = 2;
+    conflictedDesignation.boottimens = 10;
+    BrainView designatedPeer;
+    suite.require(authenticatePeer(conflictedDesignation, designatedPeer, peerAUUID),
+                  "pending_designated_master_frontier_conflict_authenticates_peer");
+    designatedPeer.version = ProdigyBinaryVersion;
+    String capability;
+    conflictedDesignation.brainHandler(&designatedPeer,
+        buildBrainMessage(capability, BrainTopic::acknowledgeCapabilities, uint64_t(2 | 4096)));
+    conflictedDesignation.pendingDesignatedMasterPeerKey = peerAUUID;
+    conflictedDesignation.drivePendingDesignationAfterAuthorityApplyForTest();
+    const uint64_t nonce = designatedPeer.authorityElectionRequestNonce;
+    const String conflictingDigest =
+        "abababababababababababababababababababababababababababababababab"_ctv;
+    String observation;
+    conflictedDesignation.brainHandler(&designatedPeer,
+        buildBrainMessage(observation, BrainTopic::observeAuthorityElection,
+            uint8_t(1), nonce, uint64_t(53), conflictingDigest));
+    suite.expect(nonce != 0 && !designatedPeer.isMasterBrain &&
+                     conflictedDesignation.pendingDesignatedMasterPeerKey == peerAUUID,
+                 "pending_designated_master_conflicting_frontier_remains_fenced_after_authority_apply");
+    conflictedDesignation.brains.clear();
+  }
 
   {
     TransportCredentialDeliveryTestBrain localFrontier = {};
@@ -38862,6 +38969,7 @@ int main(void)
     testMachineInventoryCopyDoesNotCopyTransport(suite);
     testClusterPairEpochOperationCodec(suite);
     testTransportCredentialDerivationSymmetry(suite);
+    testPendingDesignatedMasterRetriesAfterAuthorityApply(suite);
     testTransportCredentialEnrollmentOwner(suite);
     testSuspendableResumeQueuesAdoptedBootstrapOnOwner(suite);
     return suite.failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -38882,6 +38990,7 @@ int main(void)
   testMachineInventoryCopyDoesNotCopyTransport(suite);
   testClusterPairEpochOperationCodec(suite);
   testTransportCredentialDerivationSymmetry(suite);
+  testPendingDesignatedMasterRetriesAfterAuthorityApply(suite);
   testTransportCredentialEnrollmentOwner(suite);
 
   if (const char *only = getenv("PRODIGY_TEST_ONLY"); only && strcmp(only, "placement-policy") == 0)

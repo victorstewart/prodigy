@@ -478,96 +478,39 @@ Clusters retain separate Brain authority; foreign traffic enters the
 destination through Switchboard, and Mothership remains the only migration and
 test-lifecycle coordinator.
 
-### G6 physical-boundary preparation — 2026-10-12 (not qualified)
+### G6 physical EWR→ORD stateless paired-migration qualification — 2026-10-18
 
-G6 remains a physical-evidence gate. A local virtual-datacenter result, schema
-validation, or provider API submission cannot qualify the VM-isolated
-LAN-to-Vultr and cloud-to-cloud rows.
+G6 completed one production-equivalent EWR→ORD migration of the declared
+one-replica stateless workload. Mothership owned paired operation
+`0x88f9057e151968dadde0d4e3e031d993` and physical boundary
+`0x61641e4c48c46154ab1bbc5fb72362ac`. The immutable operation recorded the
+source and target cluster, machine, deployment, artifact, route, transport
+permission, and receipt identities. Its live evidence is preserved under
+`.run/g6-live-20261013/r48-final-20261018/`.
 
-The candidate closes bootstrap and endpoint prerequisites without claiming that
-result. Fresh local and remote `aegis-x25519-v1` creation resolve the seed's
-durable machine UUID and use the same initial-cohort builder as the test
-provider, producing independent Brain and hosted-Neuron credentials under one
-new cluster authority. The local path carries the private projection through a
-mode-0600 ephemeral file into Prodigy's existing durable private-state owner,
-removes that file before service start, and rejects adopted local seeds that
-cannot use that path. Subsequent membership still uses the ordinary Brain
-lifecycle. Cloud Brains now prefer a valid global-unicast IPv6 pair-control
-endpoint from the public roster and fall back to private IPv6; `dev` and unknown
-environments preserve private-first selection.
+The migration selector used source address `66.135.27.67:32000`; it did not use
+the BYO prefix. `prepareProductionPair`, `productionPair selectTarget`, `drain`,
+`retireSource`, and `cleanup` completed in order. The route advanced from
+`active` through `draining` to `withdrawn`. An existing source flow overlapped
+target selection and survived the fault. Probes recorded 117 successes and 13
+failures before recovery. The source
+retired to zero deployed replicas; the target was healthy at 1/1, each transport
+was healthy at 3/3, and both clusters were healthy at 3/3 with one master.
+Mothership then destroyed the R48 clusters.
 
-Mothership also exposes one bounded provider fault operation:
-`faultRemoteCloudMachine CLUSTER MACHINE_UUID hard-reboot`. It refreshes the
-cluster's authoritative topology, accepts only an exact Mothership-created cloud
-machine UUID in a remote Vultr cluster, and requires the refreshed cluster view
-to preserve the complete durable machine roster and every source, backing and
-cloud-identity authorization. It then uses the cluster's stored provider
-credential and submits exactly one provider hard reboot. The command does not
-accept a caller-supplied cloud ID or secret, cannot authorize a changed target or
-non-target from the cluster report, and does not claim recovery; subsequent
-`clusterReport` evidence must prove it.
+Mothership alone issued bounded physical-network-fault operation
+`0x2332d802644782d83787f944823085ce` against that boundary in `both` directions
+for 3000 ms. The associated evidence binds the admitted route and exact endpoint
+identities, fault installation/restoration, and recovery observations; neither a
+harness nor an operator shell installed the partition or repaired runtime state.
 
-`prodigy_g6_preflight.py` is an offline, fail-closed evidence-contract check.
-`result: planned` validates only a proposed run. `result: pass` additionally
-requires exact candidate, binary, bundle and Discombobulator contract/build
-identities; both physical rows; actual spend within the total cap; Mothership
-command and fault receipts inside the execution window; all four G5 lifecycle
-cases; the full routing, NAT, IPv4/IPv6, MTU/PMTU, DNS, TLS/client-identity,
-service-discovery and full/asymmetric-partition boundary matrix; monotonic active,
-drain, retirement, withdrawal and stale-replay evidence; and verified zero
-G6/task-owned residual instances, VPCs, blocks and IPs after cleanup. For each
-boundary claim, the manifest binds both its Mothership topology or fault receipt
-and a distinct method-specific SHA-256 receipt from a read-only physical probe;
-one `clusterReport` receipt cannot be relabeled as DNS, TLS, PMTU, discovery, or
-service-path evidence. For each
-resource class, the manifest binds a non-secret exact pre-existing account
-identity-set hash, a separate task-owned identity-set hash, and distinct account
-and task-owned inventory queries. A passing result requires the post-cleanup
-pre-existing hash to match exactly and the task-owned observed count to be zero;
-it must preserve unrelated resources rather than treating a global account count
-of zero as cleanup proof. Its versioned schema rejects unknown fields and embedded
-secret material rather than treating names or provider submissions as proof.
+Separately, BYO IPv4 BGP ingress was qualified at `23.144.200.49:19090`. That is
+ingress evidence only and must not be read as the migration selector address.
+Earlier typed local-boundary qualification also established three exact registered
+KVM-backed VM owners for a `deploymentMode: local` cluster. It remains distinct
+from this EWR→ORD migration and does not imply that local cluster was its source.
 
-No physical G6 run was performed at this checkpoint. On 2026-10-13 the replacement
-Vultr credential reference `codex` authenticated successfully and the read-only
-account, region, plan, OS and resource inventories were established. The baseline
-contains one pre-existing non-G6 instance, reserved IP and VPC and no block
-storage. Those resource identities must remain exactly represented by the
-preserved pre-existing identity-set receipts; no G6 provider resource was created
-and no new spend was incurred.
-
-An exact x86_64 preparation candidate was then built on `wizard` from commit
-`b1199ccc374cb662588d16e1a732b3488a879b75` with Clang 22.1.8. The Prodigy bundle
-SHA-256 is `68b55a301cac5b865b4e14c460b3aedc7c0abf5e994157ac8f2629cf5bfc72f7` and the
-Discombobulator `--kind app` ping-pong artifact SHA-256 is
-`295a0146a981b661fa28905e0de21acce09ef2d8aeba3360a646658afb801d39`.
-The focused provider/removal regressions and full Mothership, bundle and app-artifact
-builds passed there. This closes only the missing-candidate preparation item; it is
-not physical qualification and none of the binaries was launched.
-
-Production-equivalent remote service transit, a Mothership-owned physical
-network-partition operation, and a typed local-VM machine fault operation still do
-not exist outside the test provider, while the G5 migration coordinator remains
-test-cluster-specific. The approved Apple Linux guest is available for isolated
-development but is not a registered three-machine `deploymentMode: local` fault
-boundary, and no verified external KVM guest creator is available for the LAN row.
-
-The same checkpoint removes the discovered Vultr cleanup hazard for future
-clusters. A nonzero provisioning cluster UUID now selects a deterministic
-cluster-scoped VPC identity rather than the legacy region-global identity.
-Teardown waits for tagged machines and their discovered boot blocks, then removes
-only one VPC whose region, cluster-scoped description, subnet and prefix all match;
-absence and a raced not-found response are idempotent, while legacy, colliding or
-ambiguous VPCs fail closed or remain untouched. `removeCluster` invokes that
-cluster-scoped provider sweep for a fully managed Vultr cluster even when a retry
-or partial create has left no durable machine records. Clusters containing adopted
-machines retain exact machine-ID deletion and never broaden their shared cluster
-tag into delete authority. The focused provider and removal regressions, plus the
-full Mothership build, passed in the pinned Apple Linux guest. No live VPC deletion
-was used as evidence.
-
-The preflight names the remaining owners and cannot accept a passing manifest
-without their receipts. Those are implementation or environment blockers, not
-evidence that may be waived by a local topology or an authenticated provider
-submission. Stateful/application data semantics, G4, and live Nametag
-qualification remain deferred application stages.
+This qualification is limited to the exact stateless EWR→ORD paired operation.
+It does not qualify stateful or database replication, volume or writer ownership,
+arbitrary application migration, steady-state cross-datacenter replication, or
+home-LAN→cloud state transfer.

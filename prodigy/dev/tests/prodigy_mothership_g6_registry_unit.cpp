@@ -106,14 +106,15 @@ int main()
   intent.targetWorkload.replicas = 1; intent.targetWorkload.endpointMachineUUID = 0x602;
   intent.targetWorkload.endpointIPv4 = "198.51.100.2"_ctv; intent.targetWorkload.endpointTCPPort = 8080;
   intent.physicalBoundaryUUID = 0x501;
-  intent.selectorMachineUUID = intent.sourceWorkload.endpointMachineUUID;
+  intent.selectorMachineUUID = 0x603;
   intent.selectorExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
   intent.selectorLocalVMBoundaryUUID = 0x801;
   intent.selectorAddress = "192.0.2.3"_ctv;
   intent.selectorTCPPort = 18080;
-  intent.ingressWitnessMachineUUID = 0x603;
+  intent.ingressWitnessMachineUUID = 0x601;
   intent.ingressWitnessExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
   intent.ingressWitnessLocalVMBoundaryUUID = 0x803;
+  assert(intent.selectorMachineUUID != intent.sourceWorkload.endpointMachineUUID);
 
   {
     MothershipClusterRegistry registry(path);
@@ -199,7 +200,7 @@ int main()
 
     MothershipLocalVMBoundaryDescriptor localBoundary = {};
     localBoundary.vmBoundaryUUID = 0x801; localBoundary.clusterUUID = intent.route.sourceClusterUUID;
-    localBoundary.machineUUID = intent.sourceWorkload.endpointMachineUUID; localBoundary.taskID = "g6-local-1"_ctv;
+    localBoundary.machineUUID = intent.selectorMachineUUID; localBoundary.taskID = "g6-local-1"_ctv;
     localBoundary.hostAddress = "192.0.2.10"_ctv;
     localBoundary.hostUser = "root"_ctv; localBoundary.hostPrivateKeyPath = "/tmp/g6-key"_ctv;
     localBoundary.hostPublicKeyOpenSSH = "ssh-ed25519 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA g6"_ctv;
@@ -256,7 +257,7 @@ int main()
     auto secondBoundary = localBoundary;
     secondBoundary.vmBoundaryUUID = 0x804; secondBoundary.machineUUID = 0x602;
     auto thirdBoundary = localBoundary;
-    thirdBoundary.vmBoundaryUUID = 0x805; thirdBoundary.machineUUID = 0x603;
+    thirdBoundary.vmBoundaryUUID = 0x805; thirdBoundary.machineUUID = 0x601;
     inspectedBoundaries.push_back(secondBoundary); inspectedBoundaries.push_back(thirdBoundary);
     assert(MothershipClusterRegistry::activeLocalVMBoundariesExactForMachines(
         localBoundary.clusterUUID, expectedBoundaryMachines, inspectedBoundaries, &failure));
@@ -279,14 +280,14 @@ int main()
     boundary.routeUUID = intent.route.routeUUID; boundary.routeGeneration = intent.route.generation;
     boundary.sourceClusterUUID = intent.route.sourceClusterUUID;
     boundary.targetClusterUUID = intent.route.destinationClusterUUID;
-    boundary.sourceMachineUUID = 0x601; boundary.targetMachineUUID = 0x602;
+    boundary.sourceMachineUUID = intent.selectorMachineUUID; boundary.targetMachineUUID = 0x602;
     boundary.sourceExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
     boundary.targetExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
     boundary.sourceLocalVMBoundaryUUID = localBoundary.vmBoundaryUUID;
     boundary.targetLocalVMBoundaryUUID = targetLocal.vmBoundaryUUID;
-    boundary.sourceAddress = intent.sourceWorkload.endpointIPv4;
+    boundary.sourceAddress = intent.selectorAddress;
     boundary.targetAddress = intent.targetWorkload.endpointIPv4;
-    boundary.sourceTCPPort = intent.sourceWorkload.endpointTCPPort;
+    boundary.sourceTCPPort = intent.selectorTCPPort;
     boundary.targetTCPPort = intent.targetWorkload.endpointTCPPort; boundary.pathMTU = intent.route.pathMTU;
     assert(cousinRouteAuthorizationDigest(intent.route, boundary.routeAuthorizationSHA256));
     boundary.admissionReceiptSHA256 = digest('2'); boundary.admittedAtMs = 1002;
@@ -479,9 +480,53 @@ int main()
                                                                       closed, resumed, &failure) && resumed);
     assert(!registry.abortProductionPairBeforeTransit(abortedIntent.operationUUID, digest('d'), 1012,
                                                       pair, resumed, &failure));
+
+    MothershipProductionPairIntent preCutoverIntent = intent;
+    preCutoverIntent.operationUUID = 0x404; preCutoverIntent.physicalBoundaryUUID = 0x504;
+    assert(registry.admitProductionPair(preCutoverIntent, 1013, pair, resumed, &failure) && !resumed);
+    assert(registry.advanceProductionPair(preCutoverIntent.operationUUID, MothershipProductionPairPhase::targetAdmitted,
+                                          digest('a'), 1014, pair, resumed, &failure));
+    MothershipPhysicalServiceTransitBoundary preCutoverBoundary = boundary;
+    preCutoverBoundary.boundaryUUID = preCutoverIntent.physicalBoundaryUUID;
+    preCutoverBoundary.pairOperationUUID = preCutoverIntent.operationUUID;
+    preCutoverBoundary.admissionReceiptSHA256 = digest('b');
+    preCutoverBoundary.cleanupReceiptSHA256.clear(); preCutoverBoundary.closed = false;
+    assert(registry.admitPhysicalServiceTransitBoundary(preCutoverBoundary, storedBoundary, resumed, &failure) && !resumed);
+    assert(registry.advanceProductionPair(preCutoverIntent.operationUUID, MothershipProductionPairPhase::transitApplied,
+                                          digest('c'), 1015, pair, resumed, &failure));
+    const String preCutoverPendingReceipt = digest('d');
+    const String preCutoverAbortReceipt = digest('e');
+    assert(registry.prepareProductionPairAbortBeforeCutover(preCutoverIntent.operationUUID, preCutoverPendingReceipt,
+                                                            1016, pair, resumed, &failure) && !resumed);
+    assert(pair.phase == MothershipProductionPairPhase::abortBeforeCutoverPending &&
+           pair.cleanupReceiptSHA256 == preCutoverPendingReceipt);
+    // Simulate a crash after the provider has removed the selector but before
+    // the terminal pair write.  The durable pending record is the retry input.
+    assert(registry.loadProductionPair(preCutoverIntent.operationUUID, pair, &failure) &&
+           pair.phase == MothershipProductionPairPhase::abortBeforeCutoverPending &&
+           pair.cleanupReceiptSHA256 == preCutoverPendingReceipt);
+    assert(registry.prepareProductionPairAbortBeforeCutover(preCutoverIntent.operationUUID, preCutoverPendingReceipt,
+                                                            1016, pair, resumed, &failure) && resumed);
+    assert(!registry.prepareProductionPairAbortBeforeCutover(preCutoverIntent.operationUUID, digest('f'), 1016,
+                                                             pair, resumed, &failure));
+    assert(!registry.closePhysicalServiceTransitBoundary(preCutoverBoundary.boundaryUUID, preCutoverAbortReceipt,
+                                                         closed, resumed, &failure));
+    assert(registry.abortProductionPairBeforeCutover(preCutoverIntent.operationUUID, preCutoverAbortReceipt, 1016,
+                                                     pair, resumed, &failure) && !resumed);
+    assert(pair.phase == MothershipProductionPairPhase::abortedBeforeCutover);
+    assert(registry.abortProductionPairBeforeCutover(preCutoverIntent.operationUUID, preCutoverAbortReceipt, 1016,
+                                                     pair, resumed, &failure) && resumed);
+    assert(!registry.abortProductionPairBeforeCutover(preCutoverIntent.operationUUID, digest('f'), 1016,
+                                                      pair, resumed, &failure));
+    assert(registry.closePhysicalServiceTransitBoundary(preCutoverBoundary.boundaryUUID, preCutoverAbortReceipt,
+                                                        closed, resumed, &failure) && !resumed);
+    assert(registry.closePhysicalServiceTransitBoundary(preCutoverBoundary.boundaryUUID, preCutoverAbortReceipt,
+                                                        closed, resumed, &failure) && resumed);
+    assert(!registry.closePhysicalServiceTransitBoundary(preCutoverBoundary.boundaryUUID, digest('f'),
+                                                         closed, resumed, &failure));
     MothershipProductionPairIntent nextIntent = abortedIntent;
     nextIntent.operationUUID = 0x403; nextIntent.physicalBoundaryUUID = 0x503;
-    assert(registry.admitProductionPair(nextIntent, 1013, pair, resumed, &failure) && !resumed);
+    assert(registry.admitProductionPair(nextIntent, 1017, pair, resumed, &failure) && !resumed);
   }
 
   {
@@ -492,6 +537,11 @@ int main()
            pair.phase == MothershipProductionPairPhase::cleanupComplete);
     assert(reopened.loadPhysicalServiceTransitBoundary(0x501, boundary, &failure) && boundary.closed &&
            boundary.admissionReceiptSHA256 == digest('2') && boundary.cleanupReceiptSHA256 == digest('8'));
+    assert(reopened.loadProductionPair(0x404, pair, &failure) &&
+           pair.phase == MothershipProductionPairPhase::abortedBeforeCutover &&
+           pair.cleanupReceiptSHA256 == digest('e'));
+    assert(reopened.loadPhysicalServiceTransitBoundary(0x504, boundary, &failure) && boundary.closed &&
+           boundary.cleanupReceiptSHA256 == digest('e'));
     assert(reopened.loadLocalVMBoundary(0x801, localBoundary, &failure) && !localBoundary.retired &&
            localBoundary.executorSHA256 == digest('6'));
     MothershipLocalAuthorityRecoveryCohortRecord cohort = {};

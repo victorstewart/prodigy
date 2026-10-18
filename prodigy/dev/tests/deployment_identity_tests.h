@@ -88,6 +88,16 @@ static void testDeploymentIdentityReceipt(TestSuite& suite)
                    persisted.observedEndpointPort == 443 && persisted.observedEndpointMachineUUID == endpointMachineUUID,
                "deployment_identity_observes_normalized_persisted_plan_without_claiming_durability");
 
+  DeploymentPlan ipv6Plan = plan;
+  ipv6Plan.wormholes[0].externalAddress = IPAddress("2602:fac0:0:12ab:34cd::7", true);
+  brain.deploymentPlans.insert_or_assign(deploymentID, ipv6Plan);
+  DeploymentIdentityReport ipv6 = {};
+  suite.expect(queryDeploymentIdentity(brain, mothership, deploymentID, ipv6) && ipv6.profileEligible &&
+                   ipv6.observedEndpointIPv4.equal("2602:fac0:0:12ab:34cd::7"_ctv) &&
+                   ipv6.observedEndpointPort == 443 && ipv6.observedEndpointMachineUUID == endpointMachineUUID,
+               "deployment_identity_accepts_concrete_ipv6_endpoint");
+  brain.deploymentPlans.insert_or_assign(deploymentID, plan);
+
   // A recovered active deployment must remain observable after becomeMaster has
   // cleared the transient deploymentPlans map. A stale map entry must not win.
   ApplicationDeployment recovered = {};

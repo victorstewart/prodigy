@@ -27,6 +27,7 @@ from typing import Callable, Optional
 SCHEMA_VERSION = 2
 MAX_DURATION_MS = 60_000
 ROUTE_PROTOCOL = "186"
+ROUTE_PROTOCOL_RENDERINGS = {ROUTE_PROTOCOL, "bgp"}
 FIXED_STATE_ROOT = Path("/var/lib/prodigy/mothership-physical-faults")
 FIXED_STATE_PARENT = FIXED_STATE_ROOT.parent
 FIXED_STATE_GRANDPARENT = FIXED_STATE_PARENT.parent
@@ -234,8 +235,12 @@ def _entry_is_ours(entry: dict, prefix: str, metric: int) -> bool:
             observed = ipaddress.ip_network(f"{address}/{address.max_prefixlen}", strict=True)
     except (TypeError, ValueError):
         return False
+    # iproute2 renders protocol 186 either numerically or through the standard
+    # rt_protos name "bgp", depending on the guest's protocol-name database.
+    # Both describe the same kernel protocol byte supplied above; retain the
+    # exact host and per-operation metric checks as the ownership token.
     return (observed == expected and entry.get("type") == "blackhole"
-            and str(entry.get("protocol")) == ROUTE_PROTOCOL and entry_metric == metric)
+            and str(entry.get("protocol")) in ROUTE_PROTOCOL_RENDERINGS and entry_metric == metric)
 
 
 def _route_is_ours(entries: list[dict], prefix: str, metric: int) -> bool:

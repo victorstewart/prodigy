@@ -4,7 +4,7 @@
 Mothership uploads these sealed bytes to the exact admitted source machine.
 The source-machine ingress relay binds one exact non-loopback IPv4 address,
 while its upstream connections exercise the real source and inter-cluster
-target paths.  The durable owner binds the machine identity and requires
+target paths over numeric IPv4 or IPv6.  The durable owner binds the machine identity and requires
 witnessed source and target traffic before it may retire the source workload.
 """
 import argparse
@@ -26,6 +26,69 @@ import time
 MAX_OUTPUT = 8192
 
 
+def iptables_binary():
+    for candidate in ("/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def firewall_tag(args):
+    return "prodigy-production-pair-" + args.operation_id
+
+
+def firewall_rule(args, operation):
+    binary = iptables_binary()
+    if binary is None:
+        raise RuntimeError("exact selector firewall owner requires iptables")
+    return [binary, "-w", "5", operation, "INPUT", "-d", args.listen_address,
+            "-p", "tcp", "--dport", str(args.listen_port),
+            "-m", "conntrack", "--ctstate", "NEW",
+            "-m", "comment", "--comment", firewall_tag(args), "-j", "ACCEPT"]
+
+
+def firewall_rule_present(args):
+    if not args.manage_firewall:
+        return True
+    if os.geteuid() != 0:
+        raise RuntimeError("exact selector firewall owner requires root")
+    result = subprocess.run(firewall_rule(args, "-C"), check=False,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+def firewall_state_ready(args, state):
+    # Operations launched before the exact-firewall contract do not claim it
+    # in their sealed process argv.  They remain queryable solely so
+    # Mothership can prove zero traffic and compensate them; every new launch
+    # carries the flag and must retain its tagged rule.
+    return (not args.manage_firewall or "--manage-firewall" not in state.get("argv", []) or
+            firewall_rule_present(args))
+
+
+def ensure_firewall_rule(args):
+    if not args.manage_firewall or firewall_rule_present(args):
+        return
+    rule = firewall_rule(args, "-I")
+    result = subprocess.run(rule[:5] + ["1"] + rule[5:],
+                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode != 0 or not firewall_rule_present(args):
+        raise RuntimeError("exact selector firewall admission failed")
+
+
+def remove_firewall_rule(args):
+    if not args.manage_firewall:
+        return
+    # Delete only the operation-tagged exact rule.  A missing rule is already
+    # the desired state and pre-existing host policy is never broadened or
+    # removed by this owner.
+    while firewall_rule_present(args):
+        result = subprocess.run(firewall_rule(args, "-D"), check=False,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode != 0:
+            raise RuntimeError("exact selector firewall withdrawal failed")
+
+
 def fail(message):
     print(json.dumps({"success": False, "failure": message})[:MAX_OUTPUT])
     return 1
@@ -43,14 +106,14 @@ def ingress_ipv4(value):
         raise argparse.ArgumentTypeError("address must be an exact numeric non-loopback IPv4 address")
 
 
-def numeric_ipv4(value):
+def numeric_ip(value):
     try:
         parsed = ipaddress.ip_address(value)
-        if parsed.version != 4 or parsed.is_unspecified or parsed.is_multicast:
+        if parsed.is_unspecified or parsed.is_multicast:
             raise ValueError
         return str(parsed)
     except ValueError:
-        raise argparse.ArgumentTypeError("address must be a numeric unicast IPv4 address")
+        raise argparse.ArgumentTypeError("address must be a numeric unicast IPv4 or IPv6 address")
 
 
 def port(value):
@@ -294,6 +357,8 @@ def launch(args):
             if not same_identity(existing, args):
                 return fail("operation ID is already bound to a different selector identity")
             if exact_process(existing):
+                if not firewall_state_ready(args, existing):
+                    return fail("exact selector firewall admission is missing")
                 emit(existing)
                 return 0
             if existing.get("status") != "launching":
@@ -305,6 +370,7 @@ def launch(args):
                 unlink_state(args)
                 existing = None
         if existing is None:
+            ensure_firewall_rule(args)
             launch_nonce = secrets.token_hex(16)
             reservation = identity(args)
             reservation.update({"selectedTarget": False, "sourceFlows": 0, "targetFlows": 0,
@@ -352,6 +418,8 @@ def query(args):
             return fail("selector state does not exist")
         if not same_identity(state, args) or not exact_process(state):
             return fail("selector state does not match a live exact process")
+        if not firewall_state_ready(args, state):
+            return fail("exact selector firewall admission is missing")
         emit(state)
         return 0
     return mutate(args, run)
@@ -392,21 +460,39 @@ def drain(args):
     return mutate(args, run)
 
 
-def remove(args):
-    def cleanup_files():
+def pre_cutover_abort_safe(state):
+    return (not state.get("selectedTarget") and state.get("sourceFlows") == 0 and
+            state.get("targetFlows") == 0 and state.get("targetConnections") == 0 and
+            state.get("targetRequestBytes") == 0 and state.get("targetResponseBytes") == 0)
+
+
+def remove(args, require_pre_cutover_safe=False):
+    def cleanup_files(managed_firewall):
         # Never unlink the operation lock.  An opener holding the old inode
         # must serialize with all future callers, and this durable lock is the
         # tombstone that prevents an unlink/recreate split-brain race.
+        # Withdraw host policy before discarding its durable owner so a failed
+        # withdrawal remains exactly retryable.  Legacy selectors did not own
+        # a tagged rule and must not depend on iptables for compensation.
+        if managed_firewall:
+            remove_firewall_rule(args)
         unlink_state(args)
 
     def run(state):
         if state is None:
-            cleanup_files()
+            cleanup_files(args.manage_firewall)
             emit(None)
             return 0
         if not same_identity(state, args):
             return fail("operation ID is bound to a different selector identity")
         if exact_process(state):
+            if require_pre_cutover_safe:
+                if not firewall_state_ready(args, state):
+                    return fail("exact selector firewall admission is missing")
+                if not pre_cutover_abort_safe(state):
+                    emit(state, False,
+                         "pre-cutover abort requires the exact source-selected zero-flow selector state")
+                    return 1
             os.kill(state["pid"], signal.SIGTERM)
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline and exact_process(state):
@@ -415,7 +501,7 @@ def remove(args):
                 return fail("selector did not stop after bounded SIGTERM")
         elif proc_starttime(state.get("pid", 0)) is not None:
             return fail("selector PID exists but identity differs")
-        cleanup_files()
+        cleanup_files(args.manage_firewall and "--manage-firewall" in state.get("argv", []))
         emit(None)
         return 0
     return mutate(args, run)
@@ -586,7 +672,8 @@ def common_arguments(args):
 
 def parser():
     value = argparse.ArgumentParser()
-    value.add_argument("action", choices=("launch", "query", "select-target", "drain", "remove", "serve",
+    value.add_argument("action", choices=("launch", "query", "select-target", "drain", "remove",
+                                            "abort-before-cutover", "serve",
                                             "witness-source", "witness-target"))
     value.add_argument("--operation-id", required=True, type=operation)
     value.add_argument("--executor-cluster-id", required=True, type=operation)
@@ -596,12 +683,14 @@ def parser():
     value.add_argument("--listen-address", required=True, type=ingress_ipv4)
     value.add_argument("--listen-port", required=True, type=port)
     # These are exact workload addresses from typed deployment reports. They
-    # may be LAN, private-cloud, or public IPv4.  The selector listener is an
+    # may be LAN, private-cloud, or public IPv4/IPv6.  The selector listener is an
     # ingress relay on its admitted source machine and uses one exact IPv4.
-    value.add_argument("--source-address", required=True, type=numeric_ipv4)
+    value.add_argument("--source-address", required=True, type=numeric_ip)
     value.add_argument("--source-port", required=True, type=port)
-    value.add_argument("--target-address", required=True, type=numeric_ipv4)
+    value.add_argument("--target-address", required=True, type=numeric_ip)
     value.add_argument("--target-port", required=True, type=port)
+    value.add_argument("--manage-firewall", action="store_true",
+                       help="own one exact operation-tagged INPUT admission for the selector")
     return value
 
 
@@ -619,7 +708,8 @@ def main():
         if args.action == "witness-target":
             return witness(args, "target")
         return {"launch": launch, "query": query, "select-target": select_target,
-                "drain": drain, "remove": remove}[args.action](args)
+                "drain": drain, "remove": remove,
+                "abort-before-cutover": lambda value: remove(value, True)}[args.action](args)
     except RuntimeError as error:
         return fail(str(error))
     finally:

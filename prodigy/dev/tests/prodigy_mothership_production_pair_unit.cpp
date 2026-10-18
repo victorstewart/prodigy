@@ -84,7 +84,7 @@ static MothershipProductionPairIntent intent()
   value.targetWorkload.replicas = 1; value.targetWorkload.endpointMachineUUID = 0x502;
   value.targetWorkload.endpointIPv4 = "198.51.100.12"_ctv; value.targetWorkload.endpointTCPPort = 8080;
   value.physicalBoundaryUUID = 0x601;
-  value.selectorMachineUUID = value.sourceWorkload.endpointMachineUUID;
+  value.selectorMachineUUID = 0x504;
   value.selectorExecutorKind = MothershipPhysicalFaultExecutorKind::providerCloudVM;
   value.selectorCloudID = "provider-machine-501"_ctv;
   value.selectorAddress = "192.0.2.13"_ctv;
@@ -105,6 +105,7 @@ int main()
   assert(!mothershipProductionPairIngressAddressValid("127.0.0.1"_ctv));
   assert(!mothershipProductionPairIngressAddressValid("169.254.1.1"_ctv));
   assert(!mothershipProductionPairIngressAddressValid("224.0.0.1"_ctv));
+  assert(request.selectorMachineUUID != request.sourceWorkload.endpointMachineUUID);
   assert(mothershipProductionPairIntentValid(request, &failure));
 
   MothershipProductionPairRecord record = {};
@@ -134,7 +135,8 @@ int main()
   changed = request; changed.sourceRouteReceipt.localRuntimeRevision++;
   assert(!mothershipProductionPairIntentExactMatches(request, changed));
   changed = request; changed.selectorMachineUUID++;
-  assert(!mothershipProductionPairIntentValid(changed, &failure));
+  assert(mothershipProductionPairIntentValid(changed, &failure));
+  assert(!mothershipProductionPairIntentExactMatches(request, changed));
   changed = request; changed.ingressWitnessMachineUUID = request.selectorMachineUUID;
   assert(!mothershipProductionPairIntentValid(changed, &failure));
   changed = request; changed.selectorCloudID = "provider-machine-reassigned"_ctv;
@@ -143,6 +145,19 @@ int main()
   changed = request; changed.selectorExecutorKind = MothershipPhysicalFaultExecutorKind::localVM;
   assert(!mothershipProductionPairIntentValid(changed, &failure));
   changed = request; changed.protocolVersion = 4;
+  assert(!mothershipProductionPairIntentValid(changed, &failure));
+  changed = request;
+  changed.sourceWorkload.endpointIPv4 = "2001:db8:1::11"_ctv;
+  changed.targetWorkload.endpointIPv4 = "2001:db8:2::12"_ctv;
+  assert(mothershipProductionPairIntentValid(changed, &failure));
+  String ipv6Encoded = {}; auto ipv6RoundTripSource = changed;
+  BitseryEngine::serialize(ipv6Encoded, ipv6RoundTripSource);
+  MothershipProductionPairIntent ipv6RoundTrip = {};
+  assert(BitseryEngine::deserializeSafe(ipv6Encoded, ipv6RoundTrip));
+  assert(mothershipProductionPairIntentValid(ipv6RoundTrip, &failure));
+  assert(ipv6RoundTrip.sourceWorkload.endpointIPv4 == changed.sourceWorkload.endpointIPv4 &&
+         ipv6RoundTrip.targetWorkload.endpointIPv4 == changed.targetWorkload.endpointIPv4);
+  changed.sourceWorkload.endpointIPv4 = "not-an-address"_ctv;
   assert(!mothershipProductionPairIntentValid(changed, &failure));
 
   String encoded = {}; auto roundTripSource = request;
@@ -167,13 +182,34 @@ int main()
   assert(!mothershipProductionPairAbortBeforeTransit(aborted, digest('c'), 1002, &failure));
   assert(!mothershipProductionPairAdvance(aborted, MothershipProductionPairPhase::targetSelected,
                                           digest('c'), 1003, &failure));
-  assert(!mothershipProductionPairAbortBeforeTransit(skipped, digest('b'), 1002, &failure));
+  assert(mothershipProductionPairAbortBeforeTransit(skipped, digest('b'), 1002, &failure));
+  assert(skipped.phase == MothershipProductionPairPhase::abortedBeforeTransit);
+  assert(skipped.targetAdmissionReceiptSHA256.empty());
+  assert(mothershipProductionPairRecordValid(skipped, &failure));
+  assert(mothershipProductionPairAbortBeforeTransit(skipped, digest('b'), 1002, &failure));
+  assert(!mothershipProductionPairAbortBeforeTransit(skipped, digest('c'), 1002, &failure));
   MothershipProductionPairRecord afterTransit = {};
   assert(mothershipProductionPairBegin(request, 1000, afterTransit, &failure));
   assert(mothershipProductionPairAdvance(afterTransit, MothershipProductionPairPhase::targetAdmitted,
                                          digest('a'), 1001, &failure));
   assert(mothershipProductionPairMarkTransitApplied(afterTransit, digest('b'), 1002, &failure));
   assert(!mothershipProductionPairAbortBeforeTransit(afterTransit, digest('c'), 1003, &failure));
-  std::puts("PASS: production paired-migration state validation and idempotency");
+  assert(!mothershipProductionPairAbortBeforeCutover(afterTransit, digest('c'), 1003, &failure));
+  // The durable pending state is the coordinator write-ahead record.  A crash
+  // after it survives provider removal and lets the same abort resume without
+  // requiring a now-deleted live selector to be queried again.
+  assert(mothershipProductionPairPrepareAbortBeforeCutover(afterTransit, digest('c'), 1003, &failure));
+  assert(afterTransit.phase == MothershipProductionPairPhase::abortBeforeCutoverPending);
+  assert(mothershipProductionPairRecordValid(afterTransit, &failure));
+  assert(mothershipProductionPairPrepareAbortBeforeCutover(afterTransit, digest('c'), 1003, &failure));
+  assert(!mothershipProductionPairPrepareAbortBeforeCutover(afterTransit, digest('d'), 1003, &failure));
+  assert(!mothershipProductionPairAdvance(afterTransit, MothershipProductionPairPhase::targetSelected,
+                                          digest('d'), 1004, &failure));
+  assert(mothershipProductionPairAbortBeforeCutover(afterTransit, digest('d'), 1004, &failure));
+  assert(afterTransit.phase == MothershipProductionPairPhase::abortedBeforeCutover);
+  assert(mothershipProductionPairRecordValid(afterTransit, &failure));
+  assert(mothershipProductionPairAbortBeforeCutover(afterTransit, digest('d'), 1004, &failure));
+  assert(!mothershipProductionPairAbortBeforeCutover(afterTransit, digest('e'), 1004, &failure));
+  std::puts("PASS: production paired-migration state validation, abort write-ahead, and idempotency");
   return 0;
 }

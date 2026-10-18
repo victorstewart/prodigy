@@ -87,6 +87,12 @@ raise SystemExit(8)
         self.assertFalse(provider._entry_is_ours({**base, "dst": "198.51.100.0/24"},
                                                  "198.51.100.9/32", metric))
 
+    def test_iproute_named_bgp_protocol_is_the_same_kernel_protocol(self):
+        metric = provider._route_metric(self.request.operationID)
+        self.assertTrue(provider._entry_is_ours(
+            {"dst": "198.51.100.9", "type": "blackhole", "protocol": "bgp", "metric": metric},
+            "198.51.100.9/32", metric))
+
     def test_exact_retry_is_idempotent_and_retarget_rejected(self):
         first = self.execute()
         self.assertEqual(self.execute(), first)

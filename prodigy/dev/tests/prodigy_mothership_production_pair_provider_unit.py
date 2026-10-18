@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import ipaddress
+import importlib.util
 import os
 import pathlib
 import shutil
@@ -9,12 +10,96 @@ import subprocess
 import tempfile
 import threading
 import time
+import types
+from unittest import mock
 
 PROVIDER = pathlib.Path(__file__).resolve().parents[2] / "mothership" / "mothership.production.pair.provider.py"
 OPERATION = "0123456789abcdef0123456789abcdef"
 CLUSTER = "11111111111111111111111111111111"
 MACHINE = "22222222222222222222222222222222"
 WITNESS = "33333333333333333333333333333333"
+
+
+def verify_firewall_owner_contract():
+    spec = importlib.util.spec_from_file_location("production_pair_provider", PROVIDER)
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    args = types.SimpleNamespace(manage_firewall=True, operation_id=OPERATION,
+                                 listen_address="192.0.2.50", listen_port=32000)
+    installed = False
+    commands = []
+
+    def run(command, **_kwargs):
+        nonlocal installed
+        commands.append(command)
+        operation = command[3]
+        if operation == "-C":
+            return types.SimpleNamespace(returncode=0 if installed else 1)
+        if operation == "-I":
+            assert command[4:6] == ["INPUT", "1"]
+            installed = True
+            return types.SimpleNamespace(returncode=0)
+        if operation == "-D":
+            assert installed
+            installed = False
+            return types.SimpleNamespace(returncode=0)
+        raise AssertionError(command)
+
+    with mock.patch.object(provider, "iptables_binary", return_value="/usr/sbin/iptables"), \
+            mock.patch.object(provider.os, "geteuid", return_value=0), \
+            mock.patch.object(provider.subprocess, "run", side_effect=run):
+        provider.ensure_firewall_rule(args)
+        assert installed and provider.firewall_rule_present(args)
+        provider.ensure_firewall_rule(args)
+        provider.remove_firewall_rule(args)
+        assert not installed
+    insertions = [command for command in commands if command[3] == "-I"]
+    deletions = [command for command in commands if command[3] == "-D"]
+    assert len(insertions) == 1 and len(deletions) == 1
+    assert all(command[command.index("--comment") + 1] ==
+               "prodigy-production-pair-" + OPERATION for command in insertions + deletions)
+
+    legacy = {"argv": ["provider.py", "run-selector"], "pid": 123}
+    with mock.patch.object(provider, "mutate",
+                           side_effect=lambda _args, callback: callback(legacy)), \
+            mock.patch.object(provider, "same_identity", return_value=True), \
+            mock.patch.object(provider, "exact_process", return_value=False), \
+            mock.patch.object(provider, "proc_starttime", return_value=None), \
+            mock.patch.object(provider, "iptables_binary", return_value=None), \
+            mock.patch.object(provider, "unlink_state") as unlink_state, \
+            mock.patch.object(provider, "emit") as emit, \
+            mock.patch.object(provider, "remove_firewall_rule",
+                              side_effect=AssertionError("legacy cleanup touched iptables")):
+        assert provider.remove(args) == 0
+        unlink_state.assert_called_once_with(args)
+        emit.assert_called_once_with(None)
+
+    unsafe = {"selectedTarget": False, "sourceFlows": 1, "targetFlows": 0,
+              "targetConnections": 0, "targetRequestBytes": 0, "targetResponseBytes": 0}
+    with mock.patch.object(provider, "mutate",
+                           side_effect=lambda _args, callback: callback(unsafe)), \
+            mock.patch.object(provider, "same_identity", return_value=True), \
+            mock.patch.object(provider, "exact_process", return_value=True), \
+            mock.patch.object(provider, "firewall_state_ready", return_value=True), \
+            mock.patch.object(provider.os, "kill") as kill, \
+            mock.patch.object(provider, "unlink_state") as unlink_state, \
+            mock.patch.object(provider, "emit"):
+        assert provider.remove(args, True) == 1
+        kill.assert_not_called()
+        unlink_state.assert_not_called()
+
+    # Once the first checked removal succeeds, the state file is absent.  The
+    # same checked action must still be a successful retry for the coordinator
+    # after a crash before its terminal registry write.
+    with mock.patch.object(provider, "mutate",
+                           side_effect=lambda _args, callback: callback(None)), \
+            mock.patch.object(provider, "remove_firewall_rule"), \
+            mock.patch.object(provider, "unlink_state") as unlink_state, \
+            mock.patch.object(provider, "emit") as emit:
+        assert provider.remove(args, True) == 0
+        assert provider.remove(args, True) == 0
+        assert unlink_state.call_count == 2
+        assert emit.call_count == 2
 
 
 class EchoServer:
@@ -88,6 +173,7 @@ def nonloopback_ipv4():
 
 
 def main():
+    verify_firewall_owner_contract()
     root = tempfile.mkdtemp(prefix="prodigy-production-pair-provider-")
     source, target = EchoServer(b"S:"), EchoServer(b"T:")
     listen_address = nonloopback_ipv4()
@@ -161,6 +247,14 @@ def main():
                                  "--target-address", "198.51.100.20", "--target-port", "8443"],
                                 check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         assert remote.returncode == 1 and "selector state does not exist" in remote.stdout
+        remote6 = subprocess.run(["python3", str(PROVIDER), "query", "--operation-id", "abcdef0123456789abcdef0123456789",
+                                  "--executor-cluster-id", CLUSTER, "--executor-machine-id", MACHINE,
+                                  "--witness-machine-id", WITNESS,
+                                  "--state-dir", root, "--listen-address", listen_address, "--listen-port", str(free_port(listen_address)),
+                                  "--source-address", "2001:db8::10", "--source-port", "443",
+                                  "--target-address", "2001:db8::20", "--target-port", "8443"],
+                                 check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        assert remote6.returncode == 1 and "selector state does not exist" in remote6.stdout
         # Simultaneous retries must observe one selector through the stable
         # operation lock rather than racing a lock unlink/recreate.
         results, failures = [], []
@@ -195,6 +289,9 @@ def main():
         source_state = wait_state(lambda state: state["sourceFlows"] == 1)
         assert source_state["sourceConnections"] == 2
         assert source_state["sourceRequestBytes"] > 0 and source_state["sourceResponseBytes"] > 0
+        rejected_abort = command("abort-before-cutover", expected=1)
+        assert rejected_abort["success"] is False
+        assert command("query")["state"]["sourceFlows"] == 1
         assert command("select-target")["success"] and command("select-target")["success"]
         witnessed_target = command("witness-target")
         assert witnessed_target["witness"]["side"] == "target"
@@ -247,6 +344,13 @@ def main():
         os.chmod(state_file, 0o600)
         assert command("launch")["success"]
         assert command("remove")["success"]
+        # This is the provider half of the coordinator's crash cutpoint: a
+        # successful pre-cutover removal is safe to repeat after Mothership
+        # restarts before it writes the terminal registry record.
+        assert command("launch")["state"]["selectedTarget"] is False
+        assert command("abort-before-cutover")["success"]
+        assert command("abort-before-cutover")["success"]
+        assert command("query", expected=1)["success"] is False
         if hasattr(os, "memfd_create") and pathlib.Path("/proc/self/fd").is_dir():
             descriptor = os.memfd_create("prodigy-production-pair-provider", flags=0)
             try:

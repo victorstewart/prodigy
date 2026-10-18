@@ -12677,8 +12677,16 @@ private:
     uint32_t endpointMatches = 0;
     for (const auto& machine : cluster.topology.machines)
       if (machine.uuid == report.observedEndpointMachineUUID && machine.isBrain) ++endpointMatches;
-    struct in_addr endpoint = {};
+    struct in_addr endpoint4 = {};
+    struct in6_addr endpoint6 = {};
     String endpointText = report.observedEndpointIPv4;
+    const bool endpointIsIPv4 = ::inet_pton(AF_INET, endpointText.c_str(), &endpoint4) == 1;
+    const bool endpointIsIPv6 = ::inet_pton(AF_INET6, endpointText.c_str(), &endpoint6) == 1;
+    const bool endpointIsLoopback = endpointIsIPv4 ?
+        (uint32_t(ntohl(endpoint4.s_addr)) >> 24) == 127 :
+        (endpointIsIPv6 && IN6_IS_ADDR_LOOPBACK(&endpoint6));
+    const bool endpointIsUnspecified = endpointIsIPv4 ? endpoint4.s_addr == INADDR_ANY :
+        (endpointIsIPv6 && IN6_IS_ADDR_UNSPECIFIED(&endpoint6));
     if (!report.profileEligible || report.isStateful || report.useHostNetworkNamespace ||
         report.state != DeploymentState::running || report.applicationID == 0 ||
         report.applicationID != uint16_t(deploymentID >> 48) ||
@@ -12687,9 +12695,8 @@ private:
         !prodigyIsSHA256HexDigest(report.containerBlobSHA256) || report.containerBlobBytes == 0 ||
         report.authorityGeneration == 0 || report.masterUUID == 0 || report.masterBootNs <= 0 ||
         report.observedEndpointMachineUUID == 0 || endpointMatches != 1 ||
-        report.observedEndpointPort == 0 ||
-        ::inet_pton(AF_INET, endpointText.c_str(), &endpoint) != 1 ||
-        (uint32_t(ntohl(endpoint.s_addr)) >> 24) == 127 || endpoint.s_addr == INADDR_ANY)
+        report.observedEndpointPort == 0 || (!endpointIsIPv4 && !endpointIsIPv6) ||
+        endpointIsLoopback || endpointIsUnspecified)
     {
       failure.assign("production migration endpoint is not an exact healthy single-machine stateless TCP deployment"_ctv);
       return false;
@@ -13074,7 +13081,12 @@ private:
                                       executor, failure)) return false;
     Vector<String> arguments = {};
     productionPairProviderArguments(record, action, arguments);
-    const bool removal = std::strcmp(action, "remove") == 0;
+    // The selector is an externally reachable, operation-scoped ingress
+    // owner.  Its sealed provider owns one exact tagged host-firewall
+    // admission and removes only that rule during compensation or cleanup.
+    arguments.emplace_back("--manage-firewall"_ctv);
+    const bool removal = std::strcmp(action, "remove") == 0 ||
+        std::strcmp(action, "abort-before-cutover") == 0;
     if (!mothershipRunRemoteSealedPythonProvider(source, executor,
           "mothership-production-pair-upload", mothershipProductionPairProviderSource,
           sizeof(mothershipProductionPairProviderSource), arguments, 30'000, output, failure) ||
@@ -13297,15 +13309,14 @@ private:
         boundary.routeGeneration != record.intent.route.generation ||
         boundary.sourceClusterUUID != record.intent.route.sourceClusterUUID ||
         boundary.targetClusterUUID != record.intent.route.destinationClusterUUID ||
-        boundary.sourceMachineUUID != record.intent.sourceWorkload.endpointMachineUUID ||
         boundary.sourceMachineUUID != record.intent.selectorMachineUUID ||
         boundary.targetMachineUUID != record.intent.targetWorkload.endpointMachineUUID ||
         boundary.sourceExecutorKind != record.intent.selectorExecutorKind ||
         boundary.sourceLocalVMBoundaryUUID != record.intent.selectorLocalVMBoundaryUUID ||
         boundary.sourceCloudID != record.intent.selectorCloudID ||
-        boundary.sourceAddress != record.intent.sourceWorkload.endpointIPv4 ||
+        boundary.sourceAddress != record.intent.selectorAddress ||
         boundary.targetAddress != record.intent.targetWorkload.endpointIPv4 ||
-        boundary.sourceTCPPort != record.intent.sourceWorkload.endpointTCPPort ||
+        boundary.sourceTCPPort != record.intent.selectorTCPPort ||
         boundary.targetTCPPort != record.intent.targetWorkload.endpointTCPPort ||
         boundary.pathMTU != record.intent.route.pathMTU ||
         !cousinRouteAuthorizationDigest(record.intent.route, authorization) ||
@@ -13400,19 +13411,31 @@ private:
     return mothershipPhysicalFaultMachineObservationValid(observation);
   }
 
-  static bool topologyMachineOwnsAddress(const ClusterStatusReport& report, uint128_t machineUUID,
-                                         const String& address)
+  static bool topologyMachineForAddress(const ClusterStatusReport& report, const String& address,
+                                        uint128_t& machineUUID)
   {
+    machineUUID = 0;
     uint32_t matches = 0;
     for (const auto& machine : report.topology.machines)
     {
-      if (machine.uuid != machineUUID) continue;
       for (const auto& candidate : machine.addresses.privateAddresses)
-        if (candidate.address == address) ++matches;
+        if (candidate.address == address) { ++matches; machineUUID = machine.uuid; }
       for (const auto& candidate : machine.addresses.publicAddresses)
-        if (candidate.address == address) ++matches;
+        if (candidate.address == address) { ++matches; machineUUID = machine.uuid; }
     }
-    return matches == 1 && mothershipPhysicalFaultNumericAddressValid(address);
+    if (matches != 1 || !mothershipPhysicalFaultNumericAddressValid(address))
+    {
+      machineUUID = 0;
+      return false;
+    }
+    return true;
+  }
+
+  static bool topologyMachineOwnsAddress(const ClusterStatusReport& report, uint128_t machineUUID,
+                                         const String& address)
+  {
+    uint128_t owner = 0;
+    return topologyMachineForAddress(report, address, owner) && owner == machineUUID;
   }
 
   // The registering caller never selects executable bytes.  This primitive
@@ -14458,7 +14481,11 @@ private:
         mothershipParseUnsignedArgument(argv[3], UINT64_MAX, sourceDeploymentID) && sourceDeploymentID != 0 &&
         mothershipParseUnsignedArgument(argv[4], UINT64_MAX, targetDeploymentID) && targetDeploymentID != 0 &&
         mothershipProductionPairIngressAddressValid(listenerAddress) &&
-        mothershipParseUnsignedArgument(argv[6], UINT16_MAX, listenerPort) && listenerPort != 0;
+        mothershipParseUnsignedArgument(argv[6], UINT16_MAX, listenerPort) && listenerPort != 0 &&
+        listenerPort != uint16_t(ReservedPorts::neuron) &&
+        listenerPort != uint16_t(ReservedPorts::brain) &&
+        listenerPort != uint16_t(ReservedPorts::mothership) &&
+        listenerPort != uint16_t(ReservedPorts::clusterPairControl);
     if (!valid) failure.assign("usage: prepareProductionPair OPERATION_UUID ROUTE_UUID BOUNDARY_UUID SOURCE_DEPLOYMENT_ID TARGET_DEPLOYMENT_ID INGRESS_ADDRESS INGRESS_PORT"_ctv);
 
     MothershipProductionPairRecord record = {};
@@ -14507,6 +14534,7 @@ private:
       { failure.assign("production pair requires two distinct non-test three-Brain clusters"_ctv); valid = false; }
       ProdigyLocalCousinServicePermissionResponse sourcePermission = {}, targetPermission = {};
       DeploymentIdentityReport sourceTransport = {}, targetTransport = {}, sourceWorkload = {}, targetWorkload = {};
+      ClusterStatusReport admissionSourceStatus = {}, admissionTargetStatus = {};
       if (valid) valid = readLocalCousinServicePermission(source, intent.route.sourcePermissionUUID,
                                                           sourcePermission, failure) &&
           readLocalCousinServicePermission(target, intent.route.destinationPermissionUUID,
@@ -14521,15 +14549,28 @@ private:
             productionWorkloadIdentity(target, targetDeploymentID, intent.targetWorkload, targetWorkload, failure);
         if (valid)
         {
-          intent.selectorMachineUUID = intent.sourceWorkload.endpointMachineUUID;
+          valid = productionClusterHealthy(source, admissionSourceStatus, failure) &&
+              productionClusterHealthy(target, admissionTargetStatus, failure) &&
+              topologyMachineForAddress(admissionSourceStatus, intent.selectorAddress,
+                                        intent.selectorMachineUUID);
+          if (!valid && failure.empty())
+            failure.assign("production ingress address does not resolve to one exact live source machine"_ctv);
+        }
+        if (valid)
+        {
           valid = describePhysicalFaultExecutorBoundary(
               source, intent.selectorMachineUUID, intent.selectorExecutorKind,
               intent.selectorLocalVMBoundaryUUID, intent.selectorCloudID, failure);
-          // The ingress proof must originate outside the relay owner.  Pick
-          // one other currently admitted source topology member and bind its
-          // execution boundary into the immutable operation identity.
+          // The ingress proof must originate outside both the relay owner and
+          // the source endpoint owner.  A witness on the source workload host
+          // can turn a public selector probe into a provider hairpin instead
+          // of proving ingress from another admitted machine.
           for (const auto& machine : source.topology.machines)
-            if (valid && machine.uuid != intent.selectorMachineUUID && intent.ingressWitnessMachineUUID == 0)
+            if (valid && machine.uuid != intent.selectorMachineUUID &&
+                machine.uuid != intent.sourceWorkload.endpointMachineUUID &&
+                !topologyMachineOwnsAddress(admissionSourceStatus, machine.uuid,
+                                            intent.sourceWorkload.endpointIPv4) &&
+                intent.ingressWitnessMachineUUID == 0)
             {
               MothershipPhysicalFaultExecutorKind kind = MothershipPhysicalFaultExecutorKind::localVM;
               uint128_t boundary = 0; String cloudID = {}, candidateFailure = {};
@@ -14546,15 +14587,19 @@ private:
           if (valid) valid = mothershipProductionPairIntentValid(intent, &failure);
         }
       }
-      ClusterStatusReport admissionSourceStatus = {}, admissionTargetStatus = {};
       if (valid)
       {
-        valid = productionClusterHealthy(source, admissionSourceStatus, failure) &&
-            productionClusterHealthy(target, admissionTargetStatus, failure) &&
-            topologyMachineOwnsAddress(admissionSourceStatus, intent.selectorMachineUUID,
-                                       intent.selectorAddress);
-        if (!valid && failure.empty())
-          failure.assign("production ingress address is not owned by the exact admitted source machine"_ctv);
+        // Do not make an immutable prepared record until the exact route and
+        // its application receipts are freshly observable from both owners.
+        // Otherwise a receipt change between discovery and admission can
+        // strand an open coordinator which cannot be retried with new facts.
+        MothershipProductionPairRecord preflight = {};
+        ClusterStatusReport preflightSourceStatus = {}, preflightTargetStatus = {};
+        valid = mothershipProductionPairBegin(intent, Time::now<TimeResolution::ms>(),
+                                              preflight, &failure) &&
+            productionPairTransportReady(preflight, source, target, failure) &&
+            productionPairWorkloadsReady(preflight, source, target, true,
+                                         preflightSourceStatus, preflightTargetStatus, failure);
       }
       if (valid)
       {
@@ -14599,8 +14644,15 @@ private:
     bool selectorLaunchAttemptedDuringPrepare = false;
     if (valid && record.phase == MothershipProductionPairPhase::targetAdmitted)
     {
-      auto registry = openClusterRegistry(); String readFailure = {};
-      bool boundaryExists = registry.loadPhysicalServiceTransitBoundary(boundaryUUID, boundary, &readFailure);
+      String readFailure = {};
+      bool boundaryExists = false;
+      {
+        // TidesDB owns an exclusive process lock.  Do not retain this handle
+        // across the remote selector launch or the later phase transition,
+        // both of which have their own independently scoped registry writes.
+        auto registry = openClusterRegistry();
+        boundaryExists = registry.loadPhysicalServiceTransitBoundary(boundaryUUID, boundary, &readFailure);
+      }
       if (!boundaryExists)
       {
         if (!readFailure.equal("record not found"_ctv)) { failure = readFailure; valid = false; }
@@ -14611,7 +14663,7 @@ private:
           boundary.routeGeneration = record.intent.route.generation;
           boundary.sourceClusterUUID = record.intent.route.sourceClusterUUID;
           boundary.targetClusterUUID = record.intent.route.destinationClusterUUID;
-          boundary.sourceMachineUUID = record.intent.sourceWorkload.endpointMachineUUID;
+          boundary.sourceMachineUUID = record.intent.selectorMachineUUID;
           boundary.targetMachineUUID = record.intent.targetWorkload.endpointMachineUUID;
           boundary.sourceExecutorKind = record.intent.selectorExecutorKind;
           boundary.sourceLocalVMBoundaryUUID = record.intent.selectorLocalVMBoundaryUUID;
@@ -14627,9 +14679,12 @@ private:
               describePhysicalFaultExecutorBoundary(
                   target, boundary.targetMachineUUID, boundary.targetExecutorKind,
                   boundary.targetLocalVMBoundaryUUID, boundary.targetCloudID, failure);
-          boundary.sourceAddress = record.intent.sourceWorkload.endpointIPv4;
+          // This boundary models the actual inter-cluster relay leg.  The
+          // source-side packets originate on the selector machine, not on the
+          // retired workload endpoint behind that selector.
+          boundary.sourceAddress = record.intent.selectorAddress;
           boundary.targetAddress = record.intent.targetWorkload.endpointIPv4;
-          boundary.sourceTCPPort = record.intent.sourceWorkload.endpointTCPPort;
+          boundary.sourceTCPPort = record.intent.selectorTCPPort;
           boundary.targetTCPPort = record.intent.targetWorkload.endpointTCPPort;
           boundary.pathMTU = record.intent.route.pathMTU;
           boundary.admittedAtMs = record.transitionedAtMs;
@@ -14658,6 +14713,7 @@ private:
               mothershipPhysicalServiceTransitBoundaryValid(boundary, &failure);
           if (valid)
           {
+            auto registry = openClusterRegistry();
             MothershipPhysicalServiceTransitBoundary recordedBoundary = {};
             valid = registry.admitPhysicalServiceTransitBoundary(boundary, recordedBoundary, resumed, &failure);
             if (valid) boundary = std::move(recordedBoundary);
@@ -14675,8 +14731,13 @@ private:
         if (valid)
         {
           auto phaseRegistry = openClusterRegistry();
+          // advanceProductionPair clears its output on an opening/write
+          // failure.  Keep the admitted record intact so the compensation
+          // below can still address and remove the provisional selector.
+          MothershipProductionPairRecord advancedRecord = {};
           valid = phaseRegistry.advanceProductionPair(operationUUID, MothershipProductionPairPhase::transitApplied,
-                                                      transitReceipt, Time::now<TimeResolution::ms>(), record, resumed, &failure);
+                                                      transitReceipt, Time::now<TimeResolution::ms>(), advancedRecord, resumed, &failure);
+          if (valid) record = std::move(advancedRecord);
         }
       }
     }
@@ -14696,6 +14757,11 @@ private:
              MothershipProductionPairPhase::targetSelected : MothershipProductionPairPhase::transitApplied);
         if (valid) valid = productionPairSelectorPhaseMatches(record, selectorPhase, state, failure);
       }
+    }
+    else if (valid && record.phase == MothershipProductionPairPhase::abortBeforeCutoverPending)
+    {
+      failure.assign("production pair pre-cutover abort is pending; resume abortBeforeCutover"_ctv);
+      valid = false;
     }
 
     // Launch is intentionally provisional until both the physical boundary and
@@ -15024,9 +15090,9 @@ private:
         topologyMachine->kind != MachineConfig::MachineKind::vm ||
         topologyMachine->backing != ClusterMachineBacking::cloud ||
         topologyMachine->cloud.cloudID.empty() || topologyMachine->ssh.address.empty() ||
-        topologyMachine->ssh.port == 0 || topologyMachine->ssh.user.empty() ||
+        topologyMachine->ssh.port == 0 || topologyMachine->ssh.user != "root"_ctv ||
         topologyMachine->ssh.hostPublicKeyOpenSSH.empty())
-    { failure.assign("physical fault target is neither a registered local VM nor a provider cloud VM"_ctv); return false; }
+    { failure.assign("physical fault target is neither a registered local VM nor a root-managed provider cloud VM"_ctv); return false; }
     kind = MothershipPhysicalFaultExecutorKind::providerCloudVM;
     cloudID = topologyMachine->cloud.cloudID;
     return true;
@@ -15143,12 +15209,12 @@ private:
     MothershipPhysicalFaultMachineObservation sourceBefore = {}, targetBefore = {}, sourceAfter = {}, targetAfter = {};
     if (valid) valid = productionPairTransportReady(pair, source, target, failure) &&
         readManagedClusterStatus(source, sourceReport, failure) &&
-        topologyMachineOwnsAddress(sourceReport, boundary.sourceMachineUUID, boundary.sourceAddress) &&
+        topologyMachineOwnsAddress(sourceReport, boundary.sourceMachineUUID, pair.intent.selectorAddress) &&
         physicalFaultMachineObservation(sourceReport, source.clusterUUID, boundary.sourceMachineUUID, sourceBefore, failure) &&
         readManagedClusterStatus(target, targetReport, failure) &&
         topologyMachineOwnsAddress(targetReport, boundary.targetMachineUUID, boundary.targetAddress) &&
         physicalFaultMachineObservation(targetReport, target.clusterUUID, boundary.targetMachineUUID, targetBefore, failure);
-    if (!valid && failure.empty()) failure.assign("physical fault endpoints no longer own their admitted addresses"_ctv);
+    if (!valid && failure.empty()) failure.assign("physical fault selector or target endpoint no longer owns its admitted address"_ctv);
     MothershipPhysicalClusterNetworkFaultRequest request = {};
     if (valid)
     {
@@ -15762,8 +15828,9 @@ private:
     uint128_t operationUUID = 0;
     bool valid = argc == 2 && prodigyParseCanonicalHex128(String(argv[0]), operationUUID) && operationUUID != 0 &&
         (action == "query"_ctv || action == "selectTarget"_ctv || action == "drain"_ctv ||
-         action == "retireSource"_ctv || action == "cleanup"_ctv || action == "abortBeforeTransit"_ctv);
-    if (!valid) failure.assign("usage: productionPair OPERATION_UUID query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit"_ctv);
+         action == "retireSource"_ctv || action == "cleanup"_ctv || action == "abortBeforeTransit"_ctv ||
+         action == "abortBeforeCutover"_ctv);
+    if (!valid) failure.assign("usage: productionPair OPERATION_UUID query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit|abortBeforeCutover"_ctv);
     MothershipProductionPairRecord record = {};
     MothershipProdigyCluster source = {}, target = {};
     MothershipPhysicalServiceTransitBoundary physicalBoundary = {};
@@ -15777,8 +15844,8 @@ private:
       valid = valid && registry.getClusterByIdentity(sourceIdentity, source, &failure) &&
           registry.getClusterByIdentity(targetIdentity, target, &failure);
     }
-    if (valid && record.phase >= MothershipProductionPairPhase::transitApplied &&
-        record.phase < MothershipProductionPairPhase::cleanupComplete)
+    if (valid && (record.phase == MothershipProductionPairPhase::transitApplied ||
+                  record.phase == MothershipProductionPairPhase::abortBeforeCutoverPending))
     {
       auto registry = openClusterRegistry();
       valid = registry.loadPhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
@@ -15787,11 +15854,88 @@ private:
     }
 
     bool resumed = false;
-    if (valid && action == "abortBeforeTransit"_ctv)
+    if (valid && action == "abortBeforeCutover"_ctv)
     {
-      if (record.phase != MothershipProductionPairPhase::targetAdmitted &&
+      if (record.phase == MothershipProductionPairPhase::abortedBeforeCutover)
+      {
+        receiptSHA256 = record.cleanupReceiptSHA256;
+        MothershipPhysicalServiceTransitBoundary boundary = {};
+        auto registry = openClusterRegistry(); bool closeResumed = false;
+        valid = registry.closePhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
+                                                              receiptSHA256, boundary, closeResumed, &failure);
+        resumed = valid && closeResumed;
+      }
+      else
+      {
+        ProductionPairProviderState state = {}; String output = {}, queryEvidence = {}, providerEvidence = {};
+        if (record.phase == MothershipProductionPairPhase::transitApplied)
+        {
+          valid = runProductionPairProvider(record, source, "query", state, output, queryEvidence, failure) &&
+              productionPairSelectorPhaseMatches(record, MothershipProductionPairPhase::transitApplied, state, failure);
+          // Source counters are cumulative observations and may contain traffic
+          // from a failed, non-durable witness attempt.  Before selection, that
+          // traffic still reached only the source workload.  Safe compensation
+          // therefore requires zero live flows and proves the target side was
+          // never selected or observed; source history need not be zero.
+          if (valid && (state.selectedTarget || state.sourceFlows != 0 || state.targetFlows != 0 ||
+                        state.targetConnections != 0 || state.targetRequestBytes != 0 ||
+                        state.targetResponseBytes != 0))
+          { failure.assign("production pair pre-cutover abort requires the exact source-selected zero-flow selector state"_ctv); valid = false; }
+          if (valid)
+          {
+            Vector<String> evidence = {};
+            evidence.emplace_back("mothership-production-pair-pre-cutover-abort-pending-receipt-v1"_ctv);
+            evidence.push_back(record.targetAdmissionReceiptSHA256);
+            evidence.push_back(record.transitApplyReceiptSHA256);
+            evidence.push_back(queryEvidence);
+            evidence.push_back(physicalBoundary.admissionReceiptSHA256);
+            String encoded = {}; BitseryEngine::serialize(encoded, evidence);
+            valid = prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+          }
+          if (valid)
+          {
+            auto registry = openClusterRegistry(); bool pendingResumed = false;
+            valid = registry.prepareProductionPairAbortBeforeCutover(operationUUID, receiptSHA256,
+                Time::now<TimeResolution::ms>(), record, pendingResumed, &failure);
+            resumed = pendingResumed;
+          }
+        }
+        else if (record.phase != MothershipProductionPairPhase::abortBeforeCutoverPending)
+        { failure.assign("production pair pre-cutover abort requires an unwitnessed applied transit or durable pending abort"_ctv); valid = false; }
+        if (valid) valid = runProductionPairProvider(record, source, "abort-before-cutover", state, output,
+                                                     providerEvidence, failure);
+        if (valid)
+        {
+          Vector<String> evidence = {};
+          evidence.emplace_back("mothership-production-pair-pre-cutover-abort-receipt-v2"_ctv);
+          evidence.push_back(record.cleanupReceiptSHA256);
+          evidence.push_back(providerEvidence);
+          String encoded = {}; BitseryEngine::serialize(encoded, evidence);
+          valid = prodigyComputeSHA256Hex(encoded, receiptSHA256, &failure);
+        }
+        if (valid)
+        {
+          auto registry = openClusterRegistry(); bool abortResumed = false;
+          valid = registry.abortProductionPairBeforeCutover(operationUUID, receiptSHA256,
+              Time::now<TimeResolution::ms>(), record, abortResumed, &failure);
+          resumed = abortResumed;
+        }
+        if (valid)
+        {
+          MothershipPhysicalServiceTransitBoundary boundary = {};
+          auto registry = openClusterRegistry(); bool closeResumed = false;
+          valid = registry.closePhysicalServiceTransitBoundary(record.intent.physicalBoundaryUUID,
+                                                                receiptSHA256, boundary, closeResumed, &failure);
+          resumed = resumed || closeResumed;
+        }
+      }
+    }
+    else if (valid && action == "abortBeforeTransit"_ctv)
+    {
+      if (record.phase != MothershipProductionPairPhase::prepared &&
+          record.phase != MothershipProductionPairPhase::targetAdmitted &&
           record.phase != MothershipProductionPairPhase::abortedBeforeTransit)
-      { failure.assign("production pair pre-transit abort requires the target-admitted phase"_ctv); valid = false; }
+      { failure.assign("production pair pre-transit abort requires a prepared phase"_ctv); valid = false; }
       ProductionPairProviderState state = {}; String output = {}, providerEvidence = {};
       if (valid) valid = runProductionPairProvider(record, source, "remove", state, output, providerEvidence, failure);
       MothershipPhysicalServiceTransitBoundary boundary = {}; bool boundaryExists = false;
@@ -27457,8 +27601,8 @@ int main(int argc, char *argv[])
     message.append("\truns a bounded persistent TCP workload and prints one JSON receipt per planned request\n");
     message.append("prepareProductionPair [operationUUID] [activeRouteUUID] [physicalBoundaryUUID] [sourceDeploymentID] [targetDeploymentID] [sourceMachineIngressAddress] [ingressPort]\n");
     message.append("\tadmits two exact non-test stateless workloads, their production COUSIN transport, and one durable source-machine ingress relay\n");
-    message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit]\n");
-    message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, post-withdrawal cleanup, or pre-transit abort\n");
+    message.append("productionPair [operationUUID] [query|selectTarget|drain|retireSource|cleanup|abortBeforeTransit|abortBeforeCutover]\n");
+    message.append("\tcoordinates one-way target selection, zero-source-flow drain, durable source retirement, post-withdrawal cleanup, or a pre-transit/pre-cutover abort\n");
     message.append("registerLocalVMBoundary [cluster] [machineUUID] [boundaryUUID] [taskID] [hostAddress] [hostPort] [hostUser] [hostPrivateKey] [hostPublicKey] [statePath]\n");
     message.append("\tregisters the exact pinned external KVM owner for one VM member of a three-Brain deploymentMode=local cluster; Mothership owns and seals the launcher bytes\n");
     message.append("inspectLocalVMBoundaries [cluster]\n");

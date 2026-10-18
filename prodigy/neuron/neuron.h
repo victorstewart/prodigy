@@ -3142,6 +3142,19 @@ protected:
 
   virtual bool ensureHostNetworkingReady(String *failureReport = nullptr) override
   {
+    // Linux evaluates rp_filter as the maximum of conf/all and the ingress
+    // interface value. Keep the global floor disabled so the explicit
+    // per-netkit rp_filter=0 policy can apply to addressless L3 peers; physical
+    // interfaces retain their own distro-provided setting.
+    if (writeProcSysctlValue("/proc/sys/net/ipv4/conf/all/rp_filter", "0") == false)
+    {
+      if (failureReport)
+      {
+        failureReport->assign("failed to enable per-interface IPv4 source validation"_ctv);
+      }
+      return false;
+    }
+
     if (writeProcSysctlValue("/proc/sys/net/ipv4/ip_forward", "1") == false)
     {
       if (failureReport)

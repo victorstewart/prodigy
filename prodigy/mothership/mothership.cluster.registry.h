@@ -4172,6 +4172,50 @@ public:
     return true;
   }
 
+  bool abortProductionPairBeforeCutover(uint128_t operationUUID, const String& receiptSHA256,
+                                        int64_t nowMs, MothershipProductionPairRecord& recorded,
+                                        bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (operationUUID == 0 || !mothershipProductionPairReceiptValid(receiptSHA256) || nowMs <= 0)
+    { if (failure) failure->assign("production pair pre-cutover abort requires an operation, receipt, and timestamp"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord updated = recorded;
+    const bool wasAborted = updated.phase == MothershipProductionPairPhase::abortedBeforeCutover;
+    if (!mothershipProductionPairAbortBeforeCutover(updated, receiptSHA256, nowMs, failure)) return false;
+    resumed = wasAborted;
+    if (resumed) { if (failure) failure->clear(); return true; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    BitseryEngine::serialize(encoded, updated);
+    if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(updated);
+    if (failure) failure->clear();
+    return true;
+  }
+
+  bool prepareProductionPairAbortBeforeCutover(uint128_t operationUUID, const String& receiptSHA256,
+                                               int64_t nowMs, MothershipProductionPairRecord& recorded,
+                                               bool& resumed, String *failure = nullptr)
+  {
+    recorded = {}; resumed = false;
+    if (operationUUID == 0 || !mothershipProductionPairReceiptValid(receiptSHA256) || nowMs <= 0)
+    { if (failure) failure->assign("production pair pending pre-cutover abort requires an operation, receipt, and timestamp"_ctv); return false; }
+    G6OperationLock lock;
+    if (!lockG6Operations(lock, failure) || !loadProductionPair(operationUUID, recorded, failure)) return false;
+    MothershipProductionPairRecord updated = recorded;
+    const bool wasPending = updated.phase == MothershipProductionPairPhase::abortBeforeCutoverPending;
+    if (!mothershipProductionPairPrepareAbortBeforeCutover(updated, receiptSHA256, nowMs, failure)) return false;
+    resumed = wasPending;
+    if (resumed) { if (failure) failure->clear(); return true; }
+    String key = {}, encoded = {}; key.assignItoh(operationUUID);
+    BitseryEngine::serialize(encoded, updated);
+    if (!db.write(productionPairsColumnFamily, key, encoded, failure)) return false;
+    recorded = std::move(updated);
+    if (failure) failure->clear();
+    return true;
+  }
+
   bool loadPhysicalServiceTransitBoundary(uint128_t boundaryUUID,
                                           MothershipPhysicalServiceTransitBoundary& boundary,
                                           String *failure = nullptr)
@@ -4211,11 +4255,11 @@ public:
         pair.intent.route.routeUUID != requested.routeUUID || pair.intent.route.generation != requested.routeGeneration ||
         pair.intent.route.sourceClusterUUID != requested.sourceClusterUUID ||
         pair.intent.route.destinationClusterUUID != requested.targetClusterUUID ||
-        pair.intent.sourceWorkload.endpointMachineUUID != requested.sourceMachineUUID ||
+        pair.intent.selectorMachineUUID != requested.sourceMachineUUID ||
         pair.intent.targetWorkload.endpointMachineUUID != requested.targetMachineUUID ||
-        pair.intent.sourceWorkload.endpointIPv4 != requested.sourceAddress ||
+        pair.intent.selectorAddress != requested.sourceAddress ||
         pair.intent.targetWorkload.endpointIPv4 != requested.targetAddress ||
-        pair.intent.sourceWorkload.endpointTCPPort != requested.sourceTCPPort ||
+        pair.intent.selectorTCPPort != requested.sourceTCPPort ||
         pair.intent.targetWorkload.endpointTCPPort != requested.targetTCPPort)
     {
       if (failure && failure->empty()) failure->assign("physical service transit requires the exact target-admitted production pair"_ctv);
@@ -4312,10 +4356,11 @@ public:
     if (!lockG6Operations(lock, failure) || !loadPhysicalServiceTransitBoundary(boundaryUUID, recorded, failure)) return false;
     MothershipProductionPairRecord pair = {};
     if (!loadProductionPair(recorded.pairOperationUUID, pair, failure) ||
-        pair.phase != MothershipProductionPairPhase::cleanupComplete ||
+        (pair.phase != MothershipProductionPairPhase::cleanupComplete &&
+         pair.phase != MothershipProductionPairPhase::abortedBeforeCutover) ||
         pair.cleanupReceiptSHA256 != cleanupReceiptSHA256)
     {
-      if (failure && failure->empty()) failure->assign("physical transit cleanup requires the exact completed production pair receipt"_ctv);
+      if (failure && failure->empty()) failure->assign("physical transit closure requires the exact completed or pre-cutover-aborted production pair receipt"_ctv);
       return false;
     }
     if (recorded.closed)

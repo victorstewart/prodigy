@@ -91,6 +91,7 @@ if(NOT _containers MATCHES "syncDeclaredNetworkPairingPolicy\\(bool invalidateAu
 endif()
 string(FIND "${_container_egress}" "if (localSubnetContainsDaddr(daddr6))" _local_route_action)
 string(FIND "${_containers}" "host.addDirectRoute(address, 128, AF_INET6);" _local_route_install)
+string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv4/conf/all/rp_filter\", \"0\")" _per_interface_ipv4_source_validation)
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv4/ip_forward\", \"1\")" _public_ingress_forwarding)
 string(FIND "${_containers}" "bool applyHostNetkitIPv4SourceValidationPolicy" _container_ipv4_source_validation_owner)
 string(FIND "${_containers}" "{\"rp_filter\", \"0\", '0'}" _container_ipv4_rpf_policy)
@@ -103,7 +104,8 @@ string(FIND "${_containers}" "host.bringUp();\n    peer.bringUp();\n\n    if (ap
 string(FIND "${_all}" "writeProcSysctlValue(\"/proc/sys/net/ipv6/conf/all/forwarding\", \"1\")" _local_route_forwarding)
 string(REGEX MATCHALL "primary_program->setArrayElement\\(\"lc_subnet\"_ctv, 0, thisNeuron->lcsubnet6\\);" _primary_subnet_sync "${_containers}")
 list(LENGTH _primary_subnet_sync _primary_subnet_sync_count)
-if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR _public_ingress_forwarding EQUAL -1 OR
+if(_local_route_action EQUAL -1 OR _local_route_install EQUAL -1 OR
+   _per_interface_ipv4_source_validation EQUAL -1 OR _public_ingress_forwarding EQUAL -1 OR
    _container_ipv4_source_validation_owner EQUAL -1 OR _container_ipv4_rpf_policy EQUAL -1 OR
    _container_ipv4_accept_local_policy EQUAL -1 OR _container_udev_wait_owner EQUAL -1 OR
    _container_udev_wait_initialized EQUAL -1 OR _container_udev_wait_timeout EQUAL -1 OR

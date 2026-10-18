@@ -828,6 +828,7 @@ container_netkit_gso_ipv4="$(extract_link_detail_field gso_ipv4_max_size nsenter
 container_netkit_gro_ipv4="$(extract_link_detail_field gro_ipv4_max_size nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
 host_netkit_scrub_modes="$(extract_netkit_scrub_modes nsenter -t "${brain_pid}" -n ip -details link show dev "${host_netkit_if}")"
 container_netkit_scrub_modes="$(extract_netkit_scrub_modes nsenter -t "${container_pid}" -n ip -details link show dev "${container_netkit_if}")"
+host_global_rp_filter="$(read_netkit_ipv4_sysctl "${brain_pid}" all rp_filter)"
 host_netkit_rp_filter="$(read_netkit_ipv4_sysctl "${brain_pid}" "${host_netkit_if}" rp_filter)"
 host_netkit_accept_local="$(read_netkit_ipv4_sysctl "${brain_pid}" "${host_netkit_if}" accept_local)"
 egress_prog_id="$(find_netkit_prog_id "${brain_pid}" "${host_netkit_if}" "ct_egress")"
@@ -849,7 +850,7 @@ then
    fail "unable to read ct_net_policy for program ${egress_prog_id}"
 fi
 
-echo "observed host mtu=${host_netkit_mtu} host_gso=${host_netkit_gso} host_gso_segs=${host_netkit_gso_segs} host_gro=${host_netkit_gro} host_gso_ipv4=${host_netkit_gso_ipv4} host_gro_ipv4=${host_netkit_gro_ipv4} scrub=${host_netkit_scrub_modes} rp_filter=${host_netkit_rp_filter} accept_local=${host_netkit_accept_local} container mtu=${container_netkit_mtu} container_gso=${container_netkit_gso} container_gso_segs=${container_netkit_gso_segs} container_gro=${container_netkit_gro} container_gso_ipv4=${container_netkit_gso_ipv4} container_gro_ipv4=${container_netkit_gro_ipv4} scrub=${container_netkit_scrub_modes} policy interContainerMTU=${policy_mtu} brain=${brain_index} host_if=${host_netkit_if} container_if=${container_netkit_if} prog_id=${egress_prog_id} policy_map=${policy_map_id}"
+echo "observed host mtu=${host_netkit_mtu} host_gso=${host_netkit_gso} host_gso_segs=${host_netkit_gso_segs} host_gro=${host_netkit_gro} host_gso_ipv4=${host_netkit_gso_ipv4} host_gro_ipv4=${host_netkit_gro_ipv4} scrub=${host_netkit_scrub_modes} global_rp_filter=${host_global_rp_filter} rp_filter=${host_netkit_rp_filter} accept_local=${host_netkit_accept_local} container mtu=${container_netkit_mtu} container_gso=${container_netkit_gso} container_gso_segs=${container_netkit_gso_segs} container_gro=${container_netkit_gro} container_gso_ipv4=${container_netkit_gso_ipv4} container_gro_ipv4=${container_netkit_gro_ipv4} scrub=${container_netkit_scrub_modes} policy interContainerMTU=${policy_mtu} brain=${brain_index} host_if=${host_netkit_if} container_if=${container_netkit_if} prog_id=${egress_prog_id} policy_map=${policy_map_id}"
 
 assert_link_mtu "${host_netkit_mtu}" "brain${brain_index}/${host_netkit_if}"
 assert_link_mtu "${container_netkit_mtu}" "container/${container_netkit_if}"
@@ -865,6 +866,7 @@ assert_link_budget "${container_netkit_gso_ipv4}" "gso_ipv4_max_size" "container
 assert_link_budget "${container_netkit_gro_ipv4}" "gro_ipv4_max_size" "container/${container_netkit_if}"
 assert_netkit_scrub_modes "${host_netkit_scrub_modes}" "brain${brain_index}/${host_netkit_if}"
 assert_netkit_scrub_modes "${container_netkit_scrub_modes}" "container/${container_netkit_if}"
+assert_netkit_ipv4_sysctl "${host_global_rp_filter}" "0" "brain${brain_index}/all rp_filter"
 assert_netkit_ipv4_sysctl "${host_netkit_rp_filter}" "0" "brain${brain_index}/${host_netkit_if} rp_filter"
 assert_netkit_ipv4_sysctl "${host_netkit_accept_local}" "1" "brain${brain_index}/${host_netkit_if} accept_local"
 assert_policy_mtu "${policy_mtu}" "brain${brain_index}/${host_netkit_if}"

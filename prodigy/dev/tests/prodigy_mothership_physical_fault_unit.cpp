@@ -69,18 +69,24 @@ int main(void)
   };
   const std::string pairArguments = providerSection(
       "void productionPairProviderArguments", "bool parseProductionPairProviderOutput");
+  const std::string pairRunner = providerSection(
+      "bool runProductionPairProvider", "bool parseProductionPairIngressWitness");
   const std::string pairOutput = providerSection(
       "bool parseProductionPairProviderOutput", "bool mothershipRunRemoteSealedPythonProvider");
   const std::string pairWitness = providerSection(
       "bool parseProductionPairIngressWitness", "bool productionPairIngressWitness");
   const std::string productionPairCommand = providerSection(
       "void runProductionPair", "void runPrepareTestPairMigration");
+  const std::string prepareProductionPairCommand = providerSection(
+      "void runPrepareProductionPair", "void runRegisterLocalVMBoundary");
   const std::string localAction = providerSection(
       "bool runLocalVMBoundaryExecutorAction", "void runPrepareProductionPair");
   const std::string physicalReceipt = providerSection(
       "bool parsePhysicalFaultProviderReceipt", "bool describePhysicalFaultExecutorBoundary");
   const std::string physicalArguments = providerSection(
       "void physicalFaultProviderArguments", "bool runPhysicalFaultProvider");
+  const std::string physicalExecutorBoundary = providerSection(
+      "bool describePhysicalFaultExecutorBoundary", "bool resolvePhysicalFaultExecutor");
   suite.expect(!pairArguments.empty() && pairArguments.find("assignItoh") == std::string::npos &&
                    pairArguments.find("mothershipAssignProviderHex128(record.intent.operationUUID, operation);") != std::string::npos &&
                    pairArguments.find("mothershipAssignProviderHex128(record.intent.sourceWorkload.clusterUUID, executorCluster);") != std::string::npos &&
@@ -102,6 +108,52 @@ int main(void)
                    productionPairCommand.find("closePhysicalServiceTransitBoundaryBeforeTransit") <
                        productionPairCommand.find("abortProductionPairBeforeTransit"),
                "production_pair_pre_transit_abort_removes_then_closes_then_terminalizes");
+  suite.expect(!pairRunner.empty() && pairRunner.find("--manage-firewall") != std::string::npos,
+               "production_pair_selector_owns_exact_host_firewall_admission");
+  suite.expect(!productionPairCommand.empty() &&
+                   productionPairCommand.find("action == \"abortBeforeCutover\"_ctv") != std::string::npos &&
+                   productionPairCommand.find("mothership-production-pair-pre-cutover-abort-pending-receipt-v1") != std::string::npos &&
+                   productionPairCommand.find("mothership-production-pair-pre-cutover-abort-receipt-v2") != std::string::npos &&
+                   productionPairCommand.find("state.sourceConnections != 0") == std::string::npos &&
+                   productionPairCommand.find("state.sourceRequestBytes != 0") == std::string::npos &&
+                   productionPairCommand.find("state.sourceResponseBytes != 0") == std::string::npos &&
+                   productionPairCommand.find("state.sourceFlows != 0") != std::string::npos &&
+                   productionPairCommand.find("state.targetFlows != 0") != std::string::npos &&
+                   productionPairCommand.find("state.targetConnections != 0") != std::string::npos &&
+                   productionPairCommand.find("state.targetRequestBytes != 0") != std::string::npos &&
+                   productionPairCommand.find("state.targetResponseBytes != 0") != std::string::npos &&
+                   productionPairCommand.find("runProductionPairProvider(record, source, \"query\"") <
+                       productionPairCommand.find("prepareProductionPairAbortBeforeCutover") &&
+                   productionPairCommand.find("prepareProductionPairAbortBeforeCutover") <
+                       productionPairCommand.find("runProductionPairProvider(record, source, \"abort-before-cutover\"") &&
+                   productionPairCommand.find("runProductionPairProvider(record, source, \"abort-before-cutover\"") <
+                       productionPairCommand.find("abortProductionPairBeforeCutover"),
+               "production_pair_pre_cutover_abort_write_ahead_retries_checked_provider_removal");
+  suite.expect(!prepareProductionPairCommand.empty() &&
+                   prepareProductionPairCommand.find("TidesDB owns an exclusive process lock") != std::string::npos &&
+                   prepareProductionPairCommand.find("MothershipProductionPairRecord advancedRecord = {};") != std::string::npos &&
+                   prepareProductionPairCommand.find("advanceProductionPair(operationUUID, MothershipProductionPairPhase::transitApplied,\n"
+                                                     "                                                      transitReceipt, Time::now<TimeResolution::ms>(), advancedRecord") != std::string::npos &&
+                   prepareProductionPairCommand.find("if (valid) record = std::move(advancedRecord);") != std::string::npos,
+               "production_pair_prepare_releases_registry_and_preserves_compensation_identity");
+  suite.expect(!prepareProductionPairCommand.empty() &&
+                   prepareProductionPairCommand.find("ReservedPorts::neuron") != std::string::npos &&
+                   prepareProductionPairCommand.find("ReservedPorts::brain") != std::string::npos &&
+                   prepareProductionPairCommand.find("ReservedPorts::mothership") != std::string::npos &&
+                   prepareProductionPairCommand.find("ReservedPorts::clusterPairControl") != std::string::npos,
+               "production_pair_selector_rejects_all_runtime_reserved_ports");
+  suite.expect(!prepareProductionPairCommand.empty() &&
+                   prepareProductionPairCommand.find("machine.uuid != intent.selectorMachineUUID") != std::string::npos &&
+                   prepareProductionPairCommand.find("machine.uuid != intent.sourceWorkload.endpointMachineUUID") != std::string::npos &&
+                   prepareProductionPairCommand.find("!topologyMachineOwnsAddress(admissionSourceStatus, machine.uuid") != std::string::npos,
+               "production_pair_ingress_witness_excludes_selector_and_source_endpoint_owners");
+  suite.expect(!prepareProductionPairCommand.empty() &&
+                   prepareProductionPairCommand.find("boundary.sourceAddress = record.intent.selectorAddress;") != std::string::npos &&
+                   prepareProductionPairCommand.find("boundary.sourceTCPPort = record.intent.selectorTCPPort;") != std::string::npos,
+               "production_pair_physical_boundary_binds_the_selector_to_target_relay_leg");
+  suite.expect(!physicalExecutorBoundary.empty() &&
+                   physicalExecutorBoundary.find("topologyMachine->ssh.user != \"root\"_ctv") != std::string::npos,
+               "production_physical_fault_provider_requires_a_root_managed_cloud_vm_boundary");
   suite.expect(!localAction.empty() && localAction.find("assignItoh") == std::string::npos &&
                    localAction.find("mothershipAssignProviderHex128(operationUUID, operation);") != std::string::npos,
                "local_vm_fault_operation_uses_exact_provider_hex");

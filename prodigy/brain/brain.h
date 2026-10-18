@@ -11518,6 +11518,10 @@ public:
 
     quarantineReplicatedContainerRetirements();
     onMasterAuthorityRuntimeStateApplied();
+    // This continuation belongs to the authority-apply state machine rather
+    // than its overridable observer: production observers may not delegate to
+    // Brain, but a durable receipt must always re-drive a pending designation.
+    drivePendingDesignatedMasterElection("authority-apply:pending-designated-master");
     if (resumePreemptedLocalBundleExec && (persist || alreadyDurable) &&
         masterAuthorityRuntimeStateDurable &&
         durableMasterAuthorityRuntimeStateGeneration == masterAuthorityRuntimeState.generation)
@@ -12072,8 +12076,7 @@ public:
   }
 
   virtual void onMasterAuthorityRuntimeStateApplied(void)
-  {
-  }
+  {}
 
   virtual bool claimLocalClusterOwnership(uint128_t clusterUUID, String *failure = nullptr)
   {
@@ -19803,6 +19806,34 @@ public:
       // quarantined. Registration and heartbeat traffic from the surviving quorum
       // re-enter recovery without waiting for another missing transition.
       startMasterMissingRecovery(designatedPeer, reason);
+    }
+  }
+
+  // A relinquish command can arrive before the successor has durably applied
+  // the authority revision used by its election frontier.  The designation is
+  // retained, then retried by the existing election owners once that receipt
+  // commits; it must not depend on an unrelated later registration.
+  void drivePendingDesignatedMasterElection(const char *reason)
+  {
+    if (noMasterYet == false || weAreMaster || pendingDesignatedMasterPeerKey == 0 ||
+        masterAuthorityRuntimeStateDurable == false ||
+        durableMasterAuthorityRuntimeStateGeneration != masterAuthorityRuntimeState.generation)
+    {
+      return;
+    }
+
+    if (updateSelfPeerKeyMatchesLocal(pendingDesignatedMasterPeerKey))
+    {
+      basics_log("pending designated master retry elect-self reason=%s\n",
+                 reason ? reason : "unspecified");
+      (void)selfElectAsMaster(reason ? reason : "pending-designated-master", true);
+      return;
+    }
+
+    BrainView *designatedPeer = findBrainViewByUpdateSelfPeerKey(pendingDesignatedMasterPeerKey);
+    if (designatedPeer != nullptr && designatedPeer->quarantined == false)
+    {
+      electBrainToMaster(designatedPeer);
     }
   }
 
@@ -38893,7 +38924,14 @@ public:
           else if (acceptAuthorityElectionFrontier(bv, nonce, generation, digest) &&
                    noMasterYet && !weAreMaster)
           {
-            deriveMasterBrain();
+            if (pendingDesignatedMasterPeerKey != 0)
+            {
+              drivePendingDesignatedMasterElection("authority-frontier:pending-designated-master");
+            }
+            else
+            {
+              deriveMasterBrain();
+            }
           }
           break;
         }
@@ -44492,11 +44530,12 @@ public:
                 const Wormhole& endpoint = observedPlan->wormholes[0];
                 if (endpoint.source == ExternalAddressSource::registeredRoutablePrefix &&
                     endpoint.routablePrefixUUID != 0 && endpoint.layer4 == IPPROTO_TCP &&
-                    !endpoint.isQuic && !endpoint.hasDNSConfig && !endpoint.externalAddress.is6 &&
-                    endpoint.externalPort != 0)
+                    !endpoint.isQuic && !endpoint.hasDNSConfig &&
+                    endpoint.externalAddress.isNull() == false && endpoint.externalPort != 0)
                 {
-                  char address[INET_ADDRSTRLEN] = {};
-                  if (inet_ntop(AF_INET, endpoint.externalAddress.v6, address, sizeof(address)) != nullptr)
+                  char address[INET6_ADDRSTRLEN] = {};
+                  const int family = endpoint.externalAddress.is6 ? AF_INET6 : AF_INET;
+                  if (inet_ntop(family, endpoint.externalAddress.v6, address, sizeof(address)) != nullptr)
                   {
                     if (const DistributableExternalSubnet *prefix =
                             findRegisteredRoutablePrefix(brainConfig.distributableExternalSubnets,
