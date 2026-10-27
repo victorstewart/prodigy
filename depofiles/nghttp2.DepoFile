@@ -5,23 +5,18 @@ VERSION 1.69.0
 DEPENDS openssl VERSION 4.0.0
 SOURCE URL https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.gz
 SHA256 c866b7477cbb7512ab6863a685027adbb1bb8da8fc3bab7429ed43d3281d5aa9
-BUILD_SYSTEM AUTOCONF
-AUTOCONF_CONFIGURE_SH <<'EOF'
-mkdir -p "${DEPO_BUILD_DIR}"
-cd "${DEPO_BUILD_DIR}"
-
-env \
-  CC=clang \
-  CXX=clang++ \
-  CPPFLAGS="-I${dep:openssl}/include" \
-  CFLAGS=-fPIC \
-  LDFLAGS="-L${dep:openssl}/lib" \
-  "${DEPO_SOURCE_DIR}/configure" \
-  --enable-lib-only \
-  --enable-shared=no \
-  --prefix="${DEPO_PREFIX}" \
-  --with-openssl="${dep:openssl}"
-EOF
-AUTOCONF_BUILD make -C ${DEPO_BUILD_DIR} -j$(nproc)
-AUTOCONF_INSTALL make -C ${DEPO_BUILD_DIR} install
+# Upstream's CMake build does not regenerate release Autotools files when
+# source staging changes mtimes; no versioned aclocal/automake is needed.
+BUILD_SYSTEM CMAKE
+CMAKE_DEFINE CMAKE_C_COMPILER=clang
+CMAKE_DEFINE CMAKE_INSTALL_LIBDIR=lib
+CMAKE_DEFINE CMAKE_POSITION_INDEPENDENT_CODE=ON
+CMAKE_ARG "-DCMAKE_PREFIX_PATH=${dep:openssl}"
+CMAKE_DEFINE ENABLE_LIB_ONLY=ON
+CMAKE_DEFINE BUILD_SHARED_LIBS=OFF
+CMAKE_DEFINE BUILD_STATIC_LIBS=ON
+CMAKE_DEFINE BUILD_TESTING=OFF
+CMAKE_DEFINE ENABLE_FAILMALLOC=OFF
+CMAKE_DEFINE ENABLE_DOC=OFF
 TARGET nghttp2::nghttp2 STATIC lib/libnghttp2.a INTERFACE include
+DEFINES nghttp2::nghttp2 NGHTTP2_STATICLIB

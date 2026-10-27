@@ -563,6 +563,7 @@ add_executable(prodigy_sdk_c_selftest ${PRODIGY_ROOT}/prodigy/sdk/c/prodigy_neur
 add_executable(prodigy_sdk_cpp_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_sdk_cpp_unit.cpp)
 add_executable(prodigy_mesh_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_mesh_unit.cpp)
 add_executable(prodigy_deployments_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_deployments_unit.cpp ${PRODIGY_IAAS_AWS_SOURCE})
+add_executable(prodigy_compaction_search_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/compaction/compaction.unit.cpp)
 add_executable(prodigy_brain_config_ssh_replication_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_config_ssh_replication_unit.cpp)
 add_executable(prodigy_brain_replication_credentials_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_replication_credentials_unit.cpp)
 add_executable(prodigy_brain_spot_async_unit ${CMAKE_CURRENT_SOURCE_DIR}/tests/prodigy_brain_spot_async_unit.cpp)
@@ -667,6 +668,7 @@ set(PRODIGY_ALL_BUILD_TARGETS
    prodigy_sdk_cpp_unit
    prodigy_mesh_unit
    prodigy_deployments_unit
+   prodigy_compaction_search_unit
    prodigy_brain_config_ssh_replication_unit
    prodigy_brain_replication_credentials_unit
    prodigy_brain_spot_async_unit
@@ -881,6 +883,7 @@ target_compile_definitions(prodigy_sdk_c_selftest PUBLIC PRODIGY_SDK_FIXTURES_DI
 target_compile_definitions(prodigy_sdk_cpp_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_SDK_FIXTURE_DIR="${PRODIGY_ROOT}/prodigy/sdk/fixtures")
 target_compile_definitions(prodigy_mesh_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_deployments_unit PUBLIC PRODIGY_DEBUG=1 PRODIGY_ACME_HOOKS_DIR="${PRODIGY_ROOT}/prodigy/acme")
+target_compile_definitions(prodigy_compaction_search_unit PRIVATE PRODIGY_DEBUG=0)
 target_compile_definitions(prodigy_ring_recvmsg_multishot_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_machine_pinger_unit PUBLIC PRODIGY_DEBUG=1)
 target_compile_definitions(prodigy_brain_config_ssh_replication_unit PUBLIC PRODIGY_DEBUG=1)
@@ -929,6 +932,8 @@ target_compile_options(prodigy_sdk_c_selftest PUBLIC -O2)
 target_compile_options(prodigy_sdk_cpp_unit PUBLIC -O2)
 target_compile_options(prodigy_mesh_unit PUBLIC -O2)
 target_compile_options(prodigy_deployments_unit PUBLIC -O2)
+# Call the private dry-run compactor without widening the production API.
+target_compile_options(prodigy_compaction_search_unit PRIVATE -O2 -fno-access-control)
 target_compile_options(prodigy_brain_config_ssh_replication_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_replication_credentials_unit PUBLIC -O2)
 target_compile_options(prodigy_brain_spot_async_unit PUBLIC -O2)
@@ -1766,6 +1771,9 @@ set_tests_properties(prodigy_dev_stateful_topology_upgrade_matrix PROPERTIES SKI
       NAME prodigy_dev_deployments_unit
       COMMAND ${CMAKE_BINARY_DIR}/prodigy_deployments_unit
    )
+
+   add_test(NAME prodigy_compaction_search_unit COMMAND prodigy_compaction_search_unit)
+   set_tests_properties(prodigy_compaction_search_unit PROPERTIES LABELS "unit;planning;pre_runtime")
 
    add_test(
       NAME prodigy_brain_config_ssh_replication_unit
