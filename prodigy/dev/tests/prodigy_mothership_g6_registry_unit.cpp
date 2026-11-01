@@ -160,6 +160,67 @@ static void truthRetirementRegressions(const String& path)
   }
 }
 
+static void testTruthRetirementRegressions(const String& path)
+{
+  String failure;
+  MothershipProdigyCluster cluster = {};
+  cluster.name = "truth-test-owner"_ctv; cluster.clusterUUID = 0xa01;
+  cluster.deploymentMode = MothershipClusterDeploymentMode::test;
+  cluster.provider = MothershipClusterProvider::unknown;
+  cluster.includeLocalMachine = false; cluster.nBrains = 1;
+  cluster.test.specified = true; cluster.test.workspaceRoot = "/tmp/truth-test-owner"_ctv;
+  cluster.test.machineCount = 2; cluster.test.machineLogicalCores = 8;
+  cluster.test.machineMemoryMB = 16384; cluster.test.machineStorageMB = 262144;
+  cluster.test.interContainerMTU = 1448;
+  cluster.topology.version = 6;
+  for (uint32_t i = 0; i < 2; ++i) {
+    ClusterMachine machine = {}; machine.uuid = 0xa10 + i; machine.isBrain = i == 0;
+    machine.source = ClusterMachineSource::created; machine.backing = ClusterMachineBacking::owned;
+    machine.kind = MachineConfig::MachineKind::vm; machine.ownedLogicalCores = 8;
+    machine.ownedMemoryMB = 16384; machine.ownedStorageMB = 262144;
+    cluster.topology.machines.push_back(machine);
+  }
+  auto writeCluster = [&](const MothershipProdigyCluster& value) {
+    TidesDB db(path, TidesDB::Durability::full); MothershipProdigyClusterRecordV5 record = {};
+    record.cluster = value; record.internalTransportProfile = value.internalTransportProfile;
+    String payload, stored, identity; assert(BitseryEngine::serialize(payload, record));
+    stored.assign("PRODIGY-MOTHERSHIP-CLUSTER\nversion=5\n\n"_ctv); stored.append(payload);
+    identity.assignItoh(value.clusterUUID);
+    assert(db.write("clusters"_ctv, value.name, stored, &failure));
+    assert(db.write("clusters_by_uuid"_ctv, identity, value.name, &failure));
+  };
+  writeCluster(cluster);
+  MothershipApplicationPlacement placement, pending; bool resumed = false;
+  {
+    MothershipClusterRegistry registry(path);
+    assert(registry.beginTruthOwnerRetirement(cluster, placement, &failure));
+    assert(registry.admitTruthPlacement(cluster.clusterUUID, digest('a'), placement, resumed, &failure));
+    assert(registry.beginTruthOwnerRetirement(cluster, pending, &failure));
+    assert(pending.truthRetirementStartedGeneration != 0 && pending.truthRetirementCompletedGeneration == 0);
+    assert(!registry.removeCluster(cluster.name, &failure)); // The completion fence remains mandatory.
+  }
+  { // Both request configuration and topology are bound to the registered test inventory.
+    auto changed = cluster; changed.test.workspaceRoot = "/tmp/other-workspace"_ctv; writeCluster(changed);
+    MothershipClusterRegistry registry(path);
+    assert(!registry.beginTruthOwnerRetirement(cluster, placement, &failure));
+    assert(!registry.completeTruthOwnerRetirement(cluster, pending, digest('b'), &failure));
+  }
+  {
+    auto changed = cluster; ++changed.topology.version; writeCluster(changed);
+    MothershipClusterRegistry registry(path);
+    assert(!registry.beginTruthOwnerRetirement(cluster, placement, &failure));
+    assert(!registry.completeTruthOwnerRetirement(cluster, pending, digest('b'), &failure));
+  }
+  writeCluster(cluster);
+  {
+    MothershipClusterRegistry registry(path);
+    assert(registry.beginTruthOwnerRetirement(cluster, placement, &failure));
+    assert(registry.completeTruthOwnerRetirement(cluster, pending, digest('b'), &failure));
+    assert(registry.completeTruthOwnerRetirement(cluster, pending, digest('b'), &failure)); // Replay is idempotent.
+    assert(registry.removeCluster(cluster.name, &failure));
+  }
+}
+
 static DeploymentPlan graphPlan(uint16_t app, bool replica)
 {
   DeploymentPlan plan = {};
@@ -1425,6 +1486,8 @@ int main()
   graphAllMastersPlacementRegressions(path);
   String truthPath; truthPath.snprintf<"{}/truth-retirement"_ctv>(path);
   truthRetirementRegressions(truthPath);
+  String testTruthPath; testTruthPath.snprintf<"{}/truth-test-retirement"_ctv>(path);
+  testTruthRetirementRegressions(testTruthPath);
   String localUpgradePath;localUpgradePath.snprintf<"{}/local-interrupted-upgrade"_ctv>(path);
   interruptedLocalUpgradeRegressions(localUpgradePath);
   std::puts("PASS: G6 registry persists exact production-pair, transit, fault and retained-placement owners");

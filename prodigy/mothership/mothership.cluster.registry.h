@@ -994,30 +994,71 @@ static void serialize(S&& serializer, MothershipTruthRetirementInventory& invent
   serializer.text1b(inventory.providerCredentialName, UINT32_MAX);
   serializer.container(inventory.machines, 65536);
 }
+
+// Test clusters have no created-Vultr inventory.  Bind their complete durable
+// virtual-datacenter request and observed topology under a separate domain so
+// they can use the same Truth retirement transaction without weakening the
+// remote-cloud inventory rule.
+class MothershipTruthRetirementTestInventory {
+public:
+  String domain;
+  uint128_t clusterUUID = 0;
+  String clusterName;
+  uint32_t nBrains = 0;
+  MothershipProdigyClusterTestConfig test;
+  uint32_t spareMachineCount = 0;
+  ClusterTopology topology;
+};
+template <typename S>
+static void serialize(S&& serializer, MothershipTruthRetirementTestInventory& inventory)
+{
+  serializer.text1b(inventory.domain, UINT32_MAX);
+  serializer.value16b(inventory.clusterUUID);
+  serializer.text1b(inventory.clusterName, UINT32_MAX);
+  serializer.value4b(inventory.nBrains);
+  serializer.object(inventory.test);
+  serializer.value4b(inventory.spareMachineCount);
+  serializer.object(inventory.topology);
+}
 static inline bool mothershipTruthRetirementInventoryDigest(const MothershipProdigyCluster& cluster, String& digest)
 {
   digest.clear();
-  if (cluster.clusterUUID == 0 || cluster.name.empty() || cluster.providerCredentialName.empty() ||
-      cluster.deploymentMode != MothershipClusterDeploymentMode::remote ||
-      cluster.provider != MothershipClusterProvider::vultr || cluster.includeLocalMachine ||
-      cluster.nBrains == 0 || cluster.topology.machines.empty() || cluster.topology.machines.size() > 65536) return false;
-  MothershipTruthRetirementInventory inventory;
-  inventory.clusterUUID = cluster.clusterUUID; inventory.clusterName = cluster.name;
-  inventory.providerScope = cluster.providerScope; inventory.providerCredentialName = cluster.providerCredentialName;
-  uint32_t brains = 0;
-  for (const auto& machine : cluster.topology.machines) {
-    if (machine.source != ClusterMachineSource::created || machine.backing != ClusterMachineBacking::cloud ||
-        machine.kind != MachineConfig::MachineKind::vm || machine.uuid == 0 || machine.cloud.cloudID.empty()) return false;
-    if (machine.isBrain) ++brains;
-    MothershipTruthRetirementMachineIdentity identity;
-    identity.uuid = machine.uuid; identity.cloudID = machine.cloud.cloudID; identity.isBrain = machine.isBrain;
-    for (const auto& prior : inventory.machines)
-      if (prior.uuid == identity.uuid || prior.cloudID == identity.cloudID) return false;
-    inventory.machines.push_back(std::move(identity));
+  if (cluster.deploymentMode == MothershipClusterDeploymentMode::remote) {
+    if (cluster.clusterUUID == 0 || cluster.name.empty() || cluster.providerCredentialName.empty() ||
+        cluster.provider != MothershipClusterProvider::vultr || cluster.includeLocalMachine ||
+        cluster.nBrains == 0 || cluster.topology.machines.empty() || cluster.topology.machines.size() > 65536) return false;
+    MothershipTruthRetirementInventory inventory;
+    inventory.clusterUUID = cluster.clusterUUID; inventory.clusterName = cluster.name;
+    inventory.providerScope = cluster.providerScope; inventory.providerCredentialName = cluster.providerCredentialName;
+    uint32_t brains = 0;
+    for (const auto& machine : cluster.topology.machines) {
+      if (machine.source != ClusterMachineSource::created || machine.backing != ClusterMachineBacking::cloud ||
+          machine.kind != MachineConfig::MachineKind::vm || machine.uuid == 0 || machine.cloud.cloudID.empty()) return false;
+      if (machine.isBrain) ++brains;
+      MothershipTruthRetirementMachineIdentity identity;
+      identity.uuid = machine.uuid; identity.cloudID = machine.cloud.cloudID; identity.isBrain = machine.isBrain;
+      for (const auto& prior : inventory.machines)
+        if (prior.uuid == identity.uuid || prior.cloudID == identity.cloudID) return false;
+      inventory.machines.push_back(std::move(identity));
+    }
+    if (brains != cluster.nBrains) return false;
+    std::sort(inventory.machines.begin(), inventory.machines.end(),
+        [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+    String bytes; BitseryEngine::serialize(bytes, inventory);
+    return prodigyComputeSHA256Hex(bytes, digest);
   }
-  if (brains != cluster.nBrains) return false;
-  std::sort(inventory.machines.begin(), inventory.machines.end(),
-      [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+  if (cluster.deploymentMode != MothershipClusterDeploymentMode::test || cluster.clusterUUID == 0 ||
+      cluster.name.empty() || !cluster.test.specified || cluster.test.workspaceRoot.empty() ||
+      cluster.test.machineCount == 0 || cluster.nBrains == 0 || cluster.topology.machines.empty() ||
+      cluster.topology.machines.size() > 65536) return false;
+  MothershipTruthRetirementTestInventory inventory;
+  inventory.domain = "mothership-truth-retirement-test-inventory-v1"_ctv;
+  inventory.clusterUUID = cluster.clusterUUID;
+  inventory.clusterName = cluster.name;
+  inventory.nBrains = cluster.nBrains;
+  inventory.test = cluster.test;
+  inventory.spareMachineCount = cluster.test.spareMachineCount;
+  inventory.topology = cluster.topology;
   String bytes; BitseryEngine::serialize(bytes, inventory);
   return prodigyComputeSHA256Hex(bytes, digest);
 }
