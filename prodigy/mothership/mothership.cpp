@@ -4401,6 +4401,18 @@ static bool mothershipFaultVirtualDatacenterProvider(
   return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
 }
 
+static bool mothershipRepairVirtualDatacenterTransport(const MothershipProdigyCluster& cluster,
+                                                        const String& passELF, const String& expectedSHA256,
+                                                        String *failure = nullptr)
+{
+  Vector<String> arguments = {};
+  arguments.emplace_back("--repair-transport"_ctv);
+  arguments.push_back(cluster.test.workspaceRoot);
+  arguments.push_back(passELF);
+  arguments.push_back(expectedSHA256);
+  return mothershipRunVirtualDatacenterProvider(std::move(arguments), failure);
+}
+
 static bool mothershipProbeVirtualDatacenterProvider(
     const MothershipProdigyCluster& cluster,
     const String& address,
@@ -10215,6 +10227,36 @@ private:
       exit(EXIT_FAILURE);
     }
     basics_log("faultTestCluster success=1 identity=%s mode=%s machineIndices=%s\n", identity.c_str(), mode.c_str(), machineIndices.c_str());
+  }
+
+  void runRepairTestClusterTransport(int argc, char *argv[])
+  {
+    if (argc != 3)
+    {
+      basics_log("usage: repairTestClusterTransport [name|clusterUUID] [vdc peer-pass ELF] [expected SHA256]\n");
+      exit(EXIT_FAILURE);
+    }
+    String identity = {}, elfPath = {}, expectedSHA256 = {}, actualSHA256 = {}, failure = {};
+    identity.assign(argv[0]); elfPath.assign(argv[1]); expectedSHA256.assign(argv[2]);
+    MothershipProdigyCluster cluster = {};
+    uint64_t bytes = 0;
+    const bool valid = loadClusterForScopedMutation("repairTestClusterTransport", identity, cluster, failure) &&
+        cluster.deploymentMode == MothershipClusterDeploymentMode::test && cluster.test.enableFakeIpv4Boundary &&
+        cluster.test.machineCount != 0 && cluster.topology.machines.size() == cluster.test.machineCount &&
+        !cluster.test.workspaceRoot.empty() && prodigyIsSHA256HexDigest(expectedSHA256) &&
+        prodigyComputeFileSHA256Hex(elfPath, actualSHA256, &bytes, &failure) && bytes != 0 && actualSHA256 == expectedSHA256;
+    if (!valid)
+    {
+      basics_log("repairTestClusterTransport success=0 identity=%s failure=%s\n", identity.c_str(),
+                 failure.empty() ? "requires a live fake-boundary test cluster and exact peer-pass ELF" : failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    if (!mothershipRepairVirtualDatacenterTransport(cluster, elfPath, expectedSHA256, &failure))
+    {
+      basics_log("repairTestClusterTransport success=0 identity=%s failure=%s\n", identity.c_str(), failure.c_str());
+      exit(EXIT_FAILURE);
+    }
+    basics_log("repairTestClusterTransport success=1 identity=%s elfSHA256=%s\n", identity.c_str(), expectedSHA256.c_str());
   }
 
   void runRecoverRetainedFleet(int argc, char *argv[])
@@ -19332,6 +19374,7 @@ public:
         {"registerRoutableSubnet",          &Mothership::runRegisterRoutableSubnet         },
         {"removeCluster",                   &Mothership::runRemoveCluster                  },
         {"removeProviderCredential",        &Mothership::runRemoveProviderCredential       },
+        {"repairTestClusterTransport",      &Mothership::runRepairTestClusterTransport     },
         {"reserveApplicationID",            &Mothership::runReserveApplicationID           },
         {"reserveServiceID",                &Mothership::runReserveServiceID               },
         {"resizeKvmMachine",               &Mothership::runResizeKvmMachine               },

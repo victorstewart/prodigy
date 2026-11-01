@@ -1128,6 +1128,13 @@ add_custom_command(OUTPUT fake_ipv4_boundary_nat.ebpf.o
 
 add_custom_target(fake_ipv4_boundary_nat ALL DEPENDS fake_ipv4_boundary_nat.ebpf.o)
 
+add_custom_command(OUTPUT vdc_peer_pass.ebpf.o
+                   COMMAND "${PRODIGY_CLANG_EXECUTABLE}" ${PRODIGY_EBPF_COMPILE_FLAGS} -MMD -MF vdc_peer_pass.ebpf.o.d -c ${CMAKE_CURRENT_SOURCE_DIR}/vdc_peer_pass.ebpf.c -o vdc_peer_pass.ebpf.o
+                   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vdc_peer_pass.ebpf.c
+                   DEPFILE vdc_peer_pass.ebpf.o.d)
+add_custom_target(vdc_peer_pass DEPENDS vdc_peer_pass.ebpf.o)
+add_dependencies(mothership vdc_peer_pass)
+
 add_dependencies(prodigy
    tunnel_to_nic
    balancer_router
